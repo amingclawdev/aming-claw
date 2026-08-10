@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -12290,6 +12291,149 @@ def test_graph_operations_queue_keeps_same_run_snapshots_and_scrubs_evidence(con
         "another-secret",
     ):
         assert forbidden not in serialized
+
+
+def test_graph_operations_queue_bounds_nonterminal_window_and_continues_safely(
+    conn,
+):
+    head = "4" * 40
+    _activate_basic_graph(
+        conn,
+        "full-current-operations-window",
+        commit_sha=head,
+    )
+    conn.executemany(
+        """
+        INSERT INTO reconcile_run_metrics (
+          project_id, run_id, snapshot_id, commit_sha, snapshot_kind,
+          strategy, graph_delta_mode, status, created_at
+        ) VALUES (?, ?, ?, ?, 'full', 'current_full_reconcile',
+                  'full_rebuild', ?, ?)
+        """,
+        [
+            (
+                PID,
+                f"rtok-PublicWindowSecret-{index:04d}",
+                f"session-token-PublicWindowSnapshot-{index:04d}",
+                head,
+                "running" if index % 2 == 0 else "finalizing",
+                f"{index:020d}",
+            )
+            for index in range(1_005)
+        ],
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="current-full-4444444",
+        snapshot_id="full-4444444-abcd",
+        commit_sha=head,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="candidate_ready",
+        created_at="99999999999999999999",
+    )
+    conn.commit()
+
+    first = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={
+                "include_resolved": "false",
+                "reconcile_metric_limit": "1",
+                "reconcile_metric_nonterminal_limit": "2",
+            },
+        )
+    )
+    first_window = first["reconcile_metric_window"]
+    assert first_window == first["summary"]["reconcile_metric_window"]
+    assert first_window["semantics"] == (
+        "latest_sample_plus_effective_nonterminal_page"
+    )
+    assert first_window["returned_count"] == 3
+    assert first_window["latest_sample_count"] == 1
+    assert first_window["latest_sample_truncated"] is True
+    assert first_window["nonterminal_page_count"] == 2
+    assert first_window["has_more"] is True
+    assert first_window["truncated"] is True
+    assert first_window["effective_nonterminal_completeness"] == "partial"
+    assert first_window["continuation_scope"] == "effective_nonterminal_only"
+    assert first_window["latest_sample_repeated_on_continuation"] is True
+    assert first_window["remaining_count_claimed"] is False
+    continuation = first_window["continuation"]
+    assert continuation["supported"] is True
+    assert continuation["cursor_parameter"] == "reconcile_metric_cursor"
+    assert re.fullmatch(
+        r"rrm1\.[1-9][0-9]{0,18}\.[0-9a-f]{64}\.[0-9a-f]{64}",
+        continuation["next_cursor"],
+    )
+    first_operations = [
+        item
+        for item in first["operations"]
+        if item.get("operation_type") == "current_full_reconcile"
+    ]
+    assert len(first_operations) == 3
+    assert sum(item["status"] == "candidate_ready" for item in first_operations) == 1
+    first_running_digests = {
+        item["run_id_sha256"]
+        for item in first_operations
+        if item["status"] in {"running", "finalizing"}
+    }
+    assert len(first_running_digests) == 2
+    serialized_window = json.dumps(first_window, sort_keys=True)
+    assert "PublicWindowSecret" not in serialized_window
+    assert "PublicWindowSnapshot" not in serialized_window
+
+    second = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={
+                "include_resolved": "false",
+                "reconcile_metric_limit": "1",
+                "reconcile_metric_nonterminal_limit": "2",
+                "reconcile_metric_cursor": continuation["next_cursor"],
+            },
+        )
+    )
+    second_window = second["reconcile_metric_window"]
+    assert second_window["cursor_applied"] is True
+    second_operations = [
+        item
+        for item in second["operations"]
+        if item.get("operation_type") == "current_full_reconcile"
+    ]
+    assert len(second_operations) == 3
+    second_running_digests = {
+        item["run_id_sha256"]
+        for item in second_operations
+        if item["status"] in {"running", "finalizing"}
+    }
+    assert len(second_running_digests) == 2
+    assert first_running_digests.isdisjoint(second_running_digests)
+
+    tampered_cursor = continuation["next_cursor"][:-1] + (
+        "0" if continuation["next_cursor"][-1] != "0" else "1"
+    )
+    with pytest.raises(GovernanceError) as invalid:
+        server.handle_graph_governance_operations_queue(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                query={
+                    "reconcile_metric_limit": "1",
+                    "reconcile_metric_nonterminal_limit": "2",
+                    "reconcile_metric_cursor": tampered_cursor,
+                },
+            )
+        )
+    assert invalid.value.code == "invalid_reconcile_metric_cursor"
+    assert invalid.value.details == {
+        "reason_code": "cursor_identity_mismatch",
+        "zero_write": True,
+    }
 
 
 @pytest.mark.parametrize(
@@ -70875,6 +71019,11 @@ def test_reconcile_metrics_endpoint_reports_speedup(conn, monkeypatch):
     assert result["summary"]["speedup"]["speedup_x"] == 8
     assert result["summary"]["speedup"]["elapsed_reduction_pct"] == 87.5
     assert {row["run_id"] for row in result["metrics"]} == {"fast", "full"}
+    assert result["window"]["remaining_count_claimed"] is False
+    assert result["window"]["effective_nonterminal_completeness"] == "complete"
+    assert result["has_more"] is False
+    assert result["truncated"] is False
+    assert result["next_cursor"] == ""
 
 
 def test_pending_scope_recover_stale_endpoint_marks_running_failed(conn, monkeypatch):

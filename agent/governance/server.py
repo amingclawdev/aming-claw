@@ -63972,6 +63972,94 @@ def _public_reconcile_metrics_summary(value: Any) -> dict[str, Any]:
     }
 
 
+_PUBLIC_RECONCILE_METRIC_CURSOR_RE = re.compile(
+    r"rrm1\.[1-9][0-9]{0,18}\.[0-9a-f]{64}\.[0-9a-f]{64}"
+)
+
+
+def _public_reconcile_metric_window(
+    value: Any,
+    *,
+    cursor_parameter: str,
+) -> dict[str, Any]:
+    """Project a store window without exposing raw metric identities."""
+    window = value if isinstance(value, Mapping) else {}
+    raw_next_cursor = str(window.get("next_cursor") or "")
+    next_cursor = (
+        raw_next_cursor
+        if _PUBLIC_RECONCILE_METRIC_CURSOR_RE.fullmatch(raw_next_cursor)
+        else ""
+    )
+    has_more = bool(window.get("has_more"))
+    latest_sample_truncated = bool(window.get("latest_sample_truncated"))
+    return {
+        "schema_version": "reconcile_run_metrics.public_window.v1",
+        "semantics": "latest_sample_plus_effective_nonterminal_page",
+        "returned_count": _public_reconcile_metric_int(
+            window.get("returned_count"), maximum=2000
+        ),
+        "latest_sample_limit": _public_reconcile_metric_int(
+            window.get("latest_sample_limit"), maximum=1000
+        ),
+        "latest_sample_count": _public_reconcile_metric_int(
+            window.get("latest_sample_count"), maximum=1000
+        ),
+        "latest_sample_truncated": latest_sample_truncated,
+        "terminal_history_semantics": "latest_sample_only",
+        "nonterminal_page_limit": _public_reconcile_metric_int(
+            window.get("nonterminal_page_limit"), maximum=1000
+        ),
+        "nonterminal_page_count": _public_reconcile_metric_int(
+            window.get("nonterminal_page_count"), maximum=1000
+        ),
+        "has_more": has_more,
+        "truncated": bool(latest_sample_truncated or has_more),
+        "effective_nonterminal_completeness": (
+            "partial" if has_more else "complete"
+        ),
+        "continuation_scope": "effective_nonterminal_only",
+        "latest_sample_repeated_on_continuation": True,
+        "remaining_count_claimed": False,
+        "cursor_applied": bool(window.get("cursor_applied")),
+        "continuation": {
+            "supported": bool(has_more and next_cursor),
+            "cursor_parameter": str(cursor_parameter or "cursor"),
+            "next_cursor": next_cursor,
+        },
+    }
+
+
+def _reconcile_metric_window_or_error(
+    store: Any,
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    limit: int,
+    strategy: str,
+    nonterminal_limit: int,
+    cursor: str,
+) -> dict[str, Any]:
+    try:
+        return store.list_reconcile_run_metrics_window(
+            conn,
+            project_id,
+            limit=limit,
+            strategy=strategy,
+            nonterminal_limit=nonterminal_limit,
+            cursor=cursor,
+        )
+    except store.InvalidReconcileMetricCursor as exc:
+        raise GovernanceError(
+            "invalid_reconcile_metric_cursor",
+            "reconcile metric cursor does not match the requested queue scope",
+            400,
+            {
+                "reason_code": str(exc.reason_code or "invalid_cursor"),
+                "zero_write": True,
+            },
+        ) from exc
+
+
 @route("GET", "/api/graph-governance/{project_id}/operations/queue")
 def handle_graph_governance_operations_queue(ctx: RequestContext):
     """Return a unified dashboard queue for active governance operations."""
@@ -64197,11 +64285,28 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
         # Current-full rebuilds can outlive the initiating MCP connection.
         # Surface their durable run-id state so callers poll instead of
         # blindly replaying a long operation.
-        reconcile_metric_rows = store.list_reconcile_run_metrics(
+        reconcile_metric_limit = _query_int(
+            ctx.query,
+            "reconcile_metric_limit",
+            100,
+        )
+        reconcile_metric_window = _reconcile_metric_window_or_error(
+            store,
             conn,
             project_id,
-            limit=_query_int(ctx.query, "reconcile_metric_limit", 100),
+            limit=reconcile_metric_limit,
             strategy="current_full_reconcile",
+            nonterminal_limit=_query_int(
+                ctx.query,
+                "reconcile_metric_nonterminal_limit",
+                1000,
+            ),
+            cursor=str(ctx.query.get("reconcile_metric_cursor") or ""),
+        )
+        reconcile_metric_rows = list(reconcile_metric_window["rows"])
+        public_reconcile_metric_window = _public_reconcile_metric_window(
+            reconcile_metric_window,
+            cursor_parameter="reconcile_metric_cursor",
         )
         include_reconcile_terminal = _query_bool(
             ctx.query,
@@ -64515,7 +64620,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             store.summarize_reconcile_run_metrics(
                 conn,
                 project_id,
-                limit=_query_int(ctx.query, "reconcile_metric_limit", 100),
+                limit=reconcile_metric_limit,
             )
         )
         operations.sort(key=lambda item: (str(item.get("updated_at") or item.get("created_at") or ""), str(item.get("operation_id") or "")), reverse=True)
@@ -64526,6 +64631,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             "active_snapshot_id": safe_selected_active_snapshot_id,
             "count": len(operations),
             "operations": operations,
+            "reconcile_metric_window": public_reconcile_metric_window,
             "summary": {
                 "by_type": _count_by(operations, "operation_type"),
                 "by_status": _count_by(operations, "status"),
@@ -64575,6 +64681,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "feedback_queue": feedback_summary,
                 "graph_correction_patches": patch_summary,
                 "reconcile_metrics": reconcile_metrics,
+                "reconcile_metric_window": public_reconcile_metric_window,
                 "graph_stale": graph_stale_summary,
                 "semantic_snapshot": current_state["semantic_snapshot"],
                 "semantic_drift": current_state["semantic_drift"],
@@ -64605,11 +64712,23 @@ def handle_graph_governance_reconcile_metrics(ctx: RequestContext):
             backfill = {"project_id": project_id, "scanned": 0, "imported": 0}
         limit = _query_int(ctx.query, "limit", 50)
         strategy = str(ctx.query.get("strategy") or "")
-        rows = store.list_reconcile_run_metrics(
+        window = _reconcile_metric_window_or_error(
+            store,
             conn,
             project_id,
             limit=limit,
             strategy=strategy,
+            nonterminal_limit=_query_int(
+                ctx.query,
+                "nonterminal_limit",
+                1000,
+            ),
+            cursor=str(ctx.query.get("cursor") or ""),
+        )
+        rows = list(window["rows"])
+        public_window = _public_reconcile_metric_window(
+            window,
+            cursor_parameter="cursor",
         )
         return {
             "ok": True,
@@ -64618,6 +64737,10 @@ def handle_graph_governance_reconcile_metrics(ctx: RequestContext):
             "summary": store.summarize_reconcile_run_metrics(conn, project_id, limit=max(limit, 100)),
             "metrics": rows,
             "count": len(rows),
+            "window": public_window,
+            "has_more": public_window["has_more"],
+            "truncated": public_window["truncated"],
+            "next_cursor": public_window["continuation"]["next_cursor"],
         }
     finally:
         conn.close()

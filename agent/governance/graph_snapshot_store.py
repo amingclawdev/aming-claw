@@ -7,6 +7,7 @@ documentation, or test files.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import sqlite3
@@ -5434,6 +5435,146 @@ _RECONCILE_METRIC_TERMINAL_STATUSES = frozenset(
     {"candidate_ready", "complete", "failed", "terminalized_stale"}
 )
 _RECONCILE_METRIC_NONTERMINAL_STATUSES = frozenset({"running", "finalizing"})
+_RECONCILE_METRIC_WINDOW_MAX = 1000
+_RECONCILE_METRIC_CURSOR_RE = re.compile(
+    r"rrm1\.([1-9][0-9]{0,18})\.([0-9a-f]{64})\.([0-9a-f]{64})"
+)
+
+
+class InvalidReconcileMetricCursor(ValueError):
+    """A continuation cursor cannot prove its exact query position."""
+
+    def __init__(self, reason_code: str):
+        self.reason_code = str(reason_code or "invalid_cursor")
+        super().__init__(self.reason_code)
+
+
+class ReconcileMetricWindowOverflow(RuntimeError):
+    """The compatibility list API cannot truthfully return a partial window."""
+
+    def __init__(self, window: Mapping[str, Any]):
+        self.window = {
+            key: value for key, value in window.items() if key != "rows"
+        }
+        super().__init__("reconcile metric list exceeds the bounded window")
+
+
+def _reconcile_metric_cursor_scope_digest(
+    project_id: str,
+    strategy: str,
+) -> str:
+    canonical = json.dumps(
+        {
+            "project_id": str(project_id or ""),
+            "strategy": str(strategy or ""),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _reconcile_metric_cursor_tuple_digest(
+    *,
+    rowid: int,
+    scope_digest: str,
+    created_at: Any,
+    run_id: Any,
+    snapshot_id: Any,
+) -> str:
+    canonical = json.dumps(
+        [
+            str(scope_digest or ""),
+            int(rowid),
+            str(created_at or ""),
+            str(run_id or ""),
+            str(snapshot_id or ""),
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _reconcile_metric_next_cursor(
+    row: Mapping[str, Any],
+    *,
+    project_id: str,
+    strategy: str,
+) -> str:
+    rowid = int(row.get("_reconcile_metric_rowid") or 0)
+    if rowid < 1:
+        raise InvalidReconcileMetricCursor("cursor_rowid_missing")
+    scope_digest = _reconcile_metric_cursor_scope_digest(project_id, strategy)
+    tuple_digest = _reconcile_metric_cursor_tuple_digest(
+        rowid=rowid,
+        scope_digest=scope_digest,
+        created_at=row.get("created_at"),
+        run_id=row.get("run_id"),
+        snapshot_id=row.get("snapshot_id"),
+    )
+    return f"rrm1.{rowid}.{scope_digest}.{tuple_digest}"
+
+
+def _reconcile_metric_cursor_position(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    strategy: str,
+    cursor: str,
+) -> tuple[str, str, str] | None:
+    raw_cursor = str(cursor or "").strip()
+    if not raw_cursor:
+        return None
+    match = _RECONCILE_METRIC_CURSOR_RE.fullmatch(raw_cursor)
+    if match is None:
+        raise InvalidReconcileMetricCursor("cursor_malformed")
+    rowid = int(match.group(1))
+    if rowid > 9_223_372_036_854_775_807:
+        raise InvalidReconcileMetricCursor("cursor_rowid_out_of_range")
+    submitted_scope_digest = match.group(2)
+    submitted_tuple_digest = match.group(3)
+    expected_scope_digest = _reconcile_metric_cursor_scope_digest(
+        project_id,
+        strategy,
+    )
+    if not hmac.compare_digest(submitted_scope_digest, expected_scope_digest):
+        raise InvalidReconcileMetricCursor("cursor_scope_mismatch")
+
+    params: list[Any] = [rowid, project_id]
+    strategy_sql = ""
+    if strategy:
+        strategy_sql = " AND strategy=?"
+        params.append(strategy)
+    row = conn.execute(
+        f"""
+        SELECT rowid AS _reconcile_metric_rowid, created_at, run_id, snapshot_id
+        FROM reconcile_run_metrics
+        WHERE rowid=? AND project_id=?{strategy_sql}
+          AND LOWER(TRIM(status)) NOT IN (
+            'candidate_ready', 'complete', 'failed', 'terminalized_stale'
+          )
+        """,
+        params,
+    ).fetchone()
+    if row is None:
+        raise InvalidReconcileMetricCursor("cursor_position_missing")
+    row = dict(row)
+    actual_tuple_digest = _reconcile_metric_cursor_tuple_digest(
+        rowid=rowid,
+        scope_digest=expected_scope_digest,
+        created_at=row.get("created_at"),
+        run_id=row.get("run_id"),
+        snapshot_id=row.get("snapshot_id"),
+    )
+    if not hmac.compare_digest(submitted_tuple_digest, actual_tuple_digest):
+        raise InvalidReconcileMetricCursor("cursor_identity_mismatch")
+    return (
+        str(row.get("created_at") or ""),
+        str(row.get("run_id") or ""),
+        str(row.get("snapshot_id") or ""),
+    )
 
 
 def project_reconcile_run_metric_status(
@@ -5467,13 +5608,22 @@ def project_reconcile_run_metric_status(
     }
 
 
-def list_reconcile_run_metrics(
+def list_reconcile_run_metrics_window(
     conn: sqlite3.Connection,
     project_id: str,
     *,
     limit: int = 50,
     strategy: str = "",
-) -> list[dict[str, Any]]:
+    nonterminal_limit: int = _RECONCILE_METRIC_WINDOW_MAX,
+    cursor: str = "",
+) -> dict[str, Any]:
+    """Return a bounded latest sample plus a keyset nonterminal page.
+
+    ``limit`` retains its historical meaning as the latest-row sample size.
+    Effective nonterminal work is independently page-bounded and exposes an
+    opaque, scope-bound continuation cursor. No exact remaining count is
+    computed because that would turn a queue read into unbounded DB work.
+    """
     ensure_schema(conn)
     params: list[Any] = [project_id]
     where_sql = "project_id=?"
@@ -5481,25 +5631,68 @@ def list_reconcile_run_metrics(
         where_sql += " AND strategy=?"
         params.append(strategy)
     sample_limit = max(1, min(int(limit or 50), 1000))
+    page_limit = max(
+        1,
+        min(int(nonterminal_limit or _RECONCILE_METRIC_WINDOW_MAX), 1000),
+    )
     order_sql = " ORDER BY created_at DESC, run_id DESC, snapshot_id DESC"
     latest_rows = conn.execute(
-        f"SELECT * FROM reconcile_run_metrics WHERE {where_sql}{order_sql} LIMIT ?",
-        [*params, sample_limit],
+        f"""
+        SELECT rowid AS _reconcile_metric_rowid, *
+        FROM reconcile_run_metrics
+        WHERE {where_sql}{order_sql} LIMIT ?
+        """,
+        [*params, sample_limit + 1],
     ).fetchall()
+    latest_sample_truncated = len(latest_rows) > sample_limit
+    latest_rows = latest_rows[:sample_limit]
+
+    cursor_position = _reconcile_metric_cursor_position(
+        conn,
+        project_id,
+        strategy=strategy,
+        cursor=cursor,
+    )
+    nonterminal_where_sql = where_sql
+    nonterminal_params = list(params)
+    if cursor_position is not None:
+        created_at, run_id, snapshot_id = cursor_position
+        nonterminal_where_sql += (
+            " AND (created_at < ?"
+            " OR (created_at = ? AND run_id < ?)"
+            " OR (created_at = ? AND run_id = ? AND snapshot_id < ?))"
+        )
+        nonterminal_params.extend(
+            [created_at, created_at, run_id, created_at, run_id, snapshot_id]
+        )
     effective_nonterminal_rows = conn.execute(
         f"""
-        SELECT * FROM reconcile_run_metrics
-        WHERE {where_sql}
+        SELECT rowid AS _reconcile_metric_rowid, *
+        FROM reconcile_run_metrics
+        WHERE {nonterminal_where_sql}
           AND LOWER(TRIM(status)) NOT IN (
             'candidate_ready', 'complete', 'failed', 'terminalized_stale'
           )
         {order_sql}
+        LIMIT ?
         """,
-        params,
+        [*nonterminal_params, page_limit + 1],
     ).fetchall()
+    has_more = len(effective_nonterminal_rows) > page_limit
+    effective_nonterminal_rows = effective_nonterminal_rows[:page_limit]
+    next_cursor = (
+        _reconcile_metric_next_cursor(
+            dict(effective_nonterminal_rows[-1]),
+            project_id=project_id,
+            strategy=strategy,
+        )
+        if has_more and effective_nonterminal_rows
+        else ""
+    )
     selected: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in (*latest_rows, *effective_nonterminal_rows):
         row = dict(row)
+        row.pop("_reconcile_metric_rowid", None)
         projection = project_reconcile_run_metric_status(row)
         projected = {**row, **projection}
         identity = (
@@ -5508,7 +5701,7 @@ def list_reconcile_run_metrics(
             str(projected.get("snapshot_id") or ""),
         )
         selected.setdefault(identity, projected)
-    return sorted(
+    rows = sorted(
         selected.values(),
         key=lambda row: (
             str(row.get("created_at") or ""),
@@ -5517,6 +5710,47 @@ def list_reconcile_run_metrics(
         ),
         reverse=True,
     )
+    return {
+        "schema_version": "reconcile_run_metrics.window.v1",
+        "semantics": "latest_sample_plus_effective_nonterminal_page",
+        "rows": rows,
+        "returned_count": len(rows),
+        "latest_sample_limit": sample_limit,
+        "latest_sample_count": len(latest_rows),
+        "latest_sample_truncated": latest_sample_truncated,
+        "nonterminal_page_limit": page_limit,
+        "nonterminal_page_count": len(effective_nonterminal_rows),
+        "has_more": has_more,
+        "truncated": bool(latest_sample_truncated or has_more),
+        "next_cursor": next_cursor,
+        "cursor_applied": bool(str(cursor or "").strip()),
+        "remaining_count_claimed": False,
+        "effective_nonterminal_completeness": (
+            "partial" if has_more else "complete"
+        ),
+        "continuation_scope": "effective_nonterminal_only",
+        "latest_sample_repeated_on_continuation": True,
+        "terminal_history_semantics": "latest_sample_only",
+    }
+
+
+def list_reconcile_run_metrics(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    limit: int = 50,
+    strategy: str = "",
+) -> list[dict[str, Any]]:
+    """Compatibility list facade that fails closed on a partial queue."""
+    window = list_reconcile_run_metrics_window(
+        conn,
+        project_id,
+        limit=limit,
+        strategy=strategy,
+    )
+    if window["has_more"]:
+        raise ReconcileMetricWindowOverflow(window)
+    return list(window["rows"])
 
 
 _FULL_REBUILD_STRATEGIES = {"full_rebuild_fallback", "legacy_full_like", "full"}
@@ -5543,7 +5777,13 @@ def summarize_reconcile_run_metrics(
     *,
     limit: int = 100,
 ) -> dict[str, Any]:
-    rows = list_reconcile_run_metrics(conn, project_id, limit=limit)
+    window = list_reconcile_run_metrics_window(
+        conn,
+        project_id,
+        limit=limit,
+        nonterminal_limit=limit,
+    )
+    rows = list(window["rows"])
     buckets: dict[str, dict[str, Any]] = {}
     fallback_reasons: dict[str, dict[str, Any]] = {}
     latest_full_rebuild_fallback: dict[str, Any] = {}
@@ -6242,6 +6482,8 @@ __all__ = [
     "GRAPH_SNAPSHOT_SCHEMA_SQL",
     "GraphSnapshotBuildClaimConflictError",
     "GraphSnapshotConflictError",
+    "InvalidReconcileMetricCursor",
+    "ReconcileMetricWindowOverflow",
     "acquire_current_full_build_claim",
     "activate_graph_snapshot",
     "backfill_reconcile_run_metrics_from_snapshots",
@@ -6258,6 +6500,7 @@ __all__ = [
     "graph_payload_edges",
     "index_graph_snapshot",
     "list_reconcile_run_metrics",
+    "list_reconcile_run_metrics_window",
     "list_graph_snapshot_edges",
     "list_graph_snapshot_files",
     "list_graph_snapshot_nodes",

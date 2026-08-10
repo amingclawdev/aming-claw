@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import sqlite3
 import time
+import tracemalloc
 
 import pytest
 
@@ -628,6 +629,239 @@ def test_reconcile_run_metrics_terminal_history_vm_steps_stay_bounded(
         )
     ]
     assert approximate_vm_steps < 5000
+
+
+def test_reconcile_run_metrics_50k_window_bounds_cardinality_vm_memory_and_cursor(
+    conn,
+):
+    _ensure_schema(conn)
+    conn.executemany(
+        """
+        INSERT INTO reconcile_run_metrics (
+          project_id, run_id, snapshot_id, snapshot_kind, strategy,
+          graph_delta_mode, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                PID,
+                f"current-full-{index:05d}",
+                f"full-{index:05d}",
+                "full",
+                "current_full_reconcile",
+                "full_rebuild",
+                "running" if index % 2 == 0 else "finalizing",
+                f"{index:020d}",
+            )
+            for index in range(50_001)
+        ],
+    )
+    conn.commit()
+
+    approximate_vm_steps = 0
+
+    def count_vm_steps() -> int:
+        nonlocal approximate_vm_steps
+        approximate_vm_steps += 100
+        return 0
+
+    conn.set_progress_handler(count_vm_steps, 100)
+    tracemalloc.start()
+    try:
+        first = store.list_reconcile_run_metrics_window(
+            conn,
+            PID,
+            limit=1,
+            strategy="current_full_reconcile",
+            nonterminal_limit=128,
+        )
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        conn.set_progress_handler(None, 0)
+
+    assert first["returned_count"] == len(first["rows"]) == 128
+    assert first["latest_sample_count"] == 1
+    assert first["latest_sample_truncated"] is True
+    assert first["nonterminal_page_count"] == 128
+    assert first["has_more"] is True
+    assert first["truncated"] is True
+    assert first["remaining_count_claimed"] is False
+    assert first["effective_nonterminal_completeness"] == "partial"
+    assert first["next_cursor"].startswith("rrm1.")
+    assert "current-full-" not in first["next_cursor"]
+    assert approximate_vm_steps < 25_000
+    assert peak_bytes < 8_000_000
+    assert first["rows"] == sorted(
+        first["rows"],
+        key=lambda row: (
+            row["created_at"],
+            row["run_id"],
+            row["snapshot_id"],
+        ),
+        reverse=True,
+    )
+    first_keys = {
+        (row["project_id"], row["run_id"], row["snapshot_id"])
+        for row in first["rows"]
+    }
+    assert len(first_keys) == len(first["rows"])
+
+    second = store.list_reconcile_run_metrics_window(
+        conn,
+        PID,
+        limit=1,
+        strategy="current_full_reconcile",
+        nonterminal_limit=128,
+        cursor=first["next_cursor"],
+    )
+    second_keys = {
+        (row["project_id"], row["run_id"], row["snapshot_id"])
+        for row in second["rows"]
+    }
+    latest_key = (
+        PID,
+        "current-full-50000",
+        "full-50000",
+    )
+    assert second["cursor_applied"] is True
+    assert len(second["rows"]) == 129
+    assert first_keys & second_keys == {latest_key}
+    assert len(second_keys) == len(second["rows"])
+
+    with pytest.raises(store.ReconcileMetricWindowOverflow) as overflow:
+        store.list_reconcile_run_metrics(
+            conn,
+            PID,
+            limit=1,
+            strategy="current_full_reconcile",
+        )
+    assert overflow.value.window["has_more"] is True
+    assert "rows" not in overflow.value.window
+
+
+def test_reconcile_run_metric_cursor_rejects_cross_scope_and_rowid_reuse(conn):
+    _ensure_schema(conn)
+    project_id = "cursor-scope-project"
+    for index in range(3):
+        store.record_reconcile_run_metric(
+            conn,
+            project_id,
+            run_id=f"current-full-cursor-{index}",
+            snapshot_id=f"full-cursor-{index}",
+            strategy="current_full_reconcile",
+            status="running",
+            created_at=f"{index:020d}",
+        )
+    conn.commit()
+    first = store.list_reconcile_run_metrics_window(
+        conn,
+        project_id,
+        limit=1,
+        strategy="current_full_reconcile",
+        nonterminal_limit=1,
+    )
+    cursor = first["next_cursor"]
+
+    with pytest.raises(store.InvalidReconcileMetricCursor) as cross_scope:
+        store.list_reconcile_run_metrics_window(
+            conn,
+            project_id,
+            limit=1,
+            strategy="different_strategy",
+            nonterminal_limit=1,
+            cursor=cursor,
+        )
+    assert cross_scope.value.reason_code == "cursor_scope_mismatch"
+
+    cursor_parts = cursor.split(".")
+    out_of_range_cursor = ".".join(
+        ["rrm1", "9999999999999999999", *cursor_parts[2:]]
+    )
+    with pytest.raises(store.InvalidReconcileMetricCursor) as out_of_range:
+        store.list_reconcile_run_metrics_window(
+            conn,
+            project_id,
+            limit=1,
+            strategy="current_full_reconcile",
+            nonterminal_limit=1,
+            cursor=out_of_range_cursor,
+        )
+    assert out_of_range.value.reason_code == "cursor_rowid_out_of_range"
+
+    cursor_rowid = int(cursor.split(".", 2)[1])
+    conn.execute(
+        "DELETE FROM reconcile_run_metrics WHERE rowid=?",
+        (cursor_rowid,),
+    )
+    conn.execute(
+        """
+        INSERT INTO reconcile_run_metrics (
+          project_id, run_id, snapshot_id, strategy, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            project_id,
+            "current-full-cursor-reused",
+            "full-cursor-reused",
+            "current_full_reconcile",
+            "running",
+            "99999999999999999999",
+        ),
+    )
+    reused_rowid = conn.execute(
+        "SELECT rowid FROM reconcile_run_metrics WHERE project_id=? AND run_id=?",
+        (project_id, "current-full-cursor-reused"),
+    ).fetchone()[0]
+    assert reused_rowid == cursor_rowid
+
+    with pytest.raises(store.InvalidReconcileMetricCursor) as reused:
+        store.list_reconcile_run_metrics_window(
+            conn,
+            project_id,
+            limit=1,
+            strategy="current_full_reconcile",
+            nonterminal_limit=1,
+            cursor=cursor,
+        )
+    assert reused.value.reason_code == "cursor_identity_mismatch"
+
+
+def test_reconcile_metric_window_reports_sample_truncation_without_queue_overflow(
+    conn,
+):
+    _ensure_schema(conn)
+    for index in range(2):
+        store.record_reconcile_run_metric(
+            conn,
+            PID,
+            run_id=f"terminal-sample-{index}",
+            snapshot_id=f"full-terminal-sample-{index}",
+            strategy="current_full_reconcile",
+            status="candidate_ready",
+            created_at=f"{index:020d}",
+        )
+    conn.commit()
+
+    window = store.list_reconcile_run_metrics_window(
+        conn,
+        PID,
+        limit=1,
+        strategy="current_full_reconcile",
+        nonterminal_limit=1,
+    )
+
+    assert window["latest_sample_truncated"] is True
+    assert window["has_more"] is False
+    assert window["truncated"] is True
+    assert window["next_cursor"] == ""
+    assert window["effective_nonterminal_completeness"] == "complete"
+    assert store.list_reconcile_run_metrics(
+        conn,
+        PID,
+        limit=1,
+        strategy="current_full_reconcile",
+    ) == window["rows"]
 
 
 @pytest.mark.parametrize(
