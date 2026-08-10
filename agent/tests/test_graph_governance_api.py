@@ -12524,6 +12524,138 @@ def test_graph_operations_queue_preserves_known_semantic_identifier_namespaces(
     assert operation["target_label"] == run_id
 
 
+def test_graph_operations_queue_binds_exact_identifier_bytes_and_projects_active_snapshot(
+    conn,
+):
+    head = "3" * 40
+    raw_active_snapshot_id = "rtok-SelectedActiveSnapshotSecret9-é"
+    _activate_basic_graph(
+        conn,
+        raw_active_snapshot_id,
+        commit_sha=head,
+    )
+
+    def digest(raw: str) -> str:
+        return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    expected_active_snapshot_id = (
+        "snapshot-" + digest(raw_active_snapshot_id)[7:23]
+    )
+
+    def assert_selected_snapshot_projection(payload: dict[str, Any]) -> None:
+        assert payload["snapshot_id"] == expected_active_snapshot_id
+        assert payload["active_snapshot_id"] == expected_active_snapshot_id
+        assert payload["summary"]["current_state"]["snapshot_id"] == (
+            expected_active_snapshot_id
+        )
+        assert payload["summary"]["semantic_snapshot"]["snapshot_id"] == (
+            expected_active_snapshot_id
+        )
+        assert payload["summary"]["current_state"]["semantic_snapshot"][
+            "snapshot_id"
+        ] == expected_active_snapshot_id
+        assert raw_active_snapshot_id not in json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    empty_metrics_result = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={"include_resolved": "false"},
+        )
+    )
+    assert_selected_snapshot_projection(empty_metrics_result)
+
+    malicious_metric_identities = [
+        (
+            " current-full-0aa15ac",
+            " full-0aa15ac-07bb",
+        ),
+        (
+            "current-full-0aa15ac ",
+            "full-0aa15ac-07bb ",
+        ),
+        (
+            "current-full-PublicUnicodeSecret-é",
+            "full-PublicUnicodeSnapshotSecret-é",
+        ),
+        (
+            "current-full-PublicUnicodeSecret-é",
+            "full-PublicUnicodeSnapshotSecret-é",
+        ),
+    ]
+    for index, (raw_run_id, raw_metric_snapshot_id) in enumerate(
+        malicious_metric_identities
+    ):
+        conn.execute(
+            """
+            INSERT INTO reconcile_run_metrics
+              (project_id, run_id, snapshot_id, commit_sha, snapshot_kind,
+               strategy, graph_delta_mode, status, created_at)
+            VALUES (?, ?, ?, ?, 'full', 'current_full_reconcile',
+                    'full_rebuild', 'running', ?)
+            """,
+            (
+                PID,
+                raw_run_id,
+                raw_metric_snapshot_id,
+                head,
+                f"2026-08-10T00:00:0{index}Z",
+            ),
+        )
+    conn.commit()
+
+    result = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={"include_resolved": "false"},
+        )
+    )
+    assert_selected_snapshot_projection(result)
+
+    metric_operations = [
+        item
+        for item in result["operations"]
+        if item.get("operation_type") == "current_full_reconcile"
+    ]
+    expected_run_digests = {
+        digest(raw_run_id)
+        for raw_run_id, _raw_snapshot_id in malicious_metric_identities
+    }
+    expected_snapshot_digests = {
+        digest(raw_snapshot_id)
+        for _raw_run_id, raw_snapshot_id in malicious_metric_identities
+    }
+    assert {item["run_id_sha256"] for item in metric_operations} == (
+        expected_run_digests
+    )
+    assert {item["snapshot_id_sha256"] for item in metric_operations} == (
+        expected_snapshot_digests
+    )
+    assert {item["run_id"] for item in metric_operations} == {
+        "run-" + value[7:23] for value in expected_run_digests
+    }
+    assert {item["snapshot_id"] for item in metric_operations} == {
+        "snapshot-" + value[7:23] for value in expected_snapshot_digests
+    }
+    assert len({item["operation_id"] for item in metric_operations}) == len(
+        malicious_metric_identities
+    )
+
+    serialized = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    assert raw_active_snapshot_id not in serialized
+    assert "SelectedActiveSnapshotSecret9" not in serialized
+    for raw_run_id, raw_snapshot_id in malicious_metric_identities:
+        assert raw_run_id not in serialized
+        assert raw_snapshot_id not in serialized
+    assert "PublicUnicodeSecret" not in serialized
+    assert "PublicUnicodeSnapshotSecret" not in serialized
+
+
 def test_graph_operations_queue_projects_reconcile_metrics_fail_closed(
     conn,
 ):

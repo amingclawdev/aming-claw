@@ -63786,10 +63786,16 @@ _PUBLIC_RECONCILE_GRAPH_DELTA_MODES = frozenset(
 
 
 def _safe_reconcile_queue_identifier(value: Any, *, kind: str) -> tuple[str, str]:
-    raw = str(value or "").strip()
+    raw = "" if value is None else str(value)
+    canonical = raw.strip()
     digest = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
     kind_pattern = _RECONCILE_QUEUE_IDENTIFIER_KIND_RE.get(kind)
-    if raw and kind_pattern is not None and kind_pattern.fullmatch(raw):
+    if (
+        raw
+        and raw == canonical
+        and kind_pattern is not None
+        and kind_pattern.fullmatch(canonical)
+    ):
         return raw, digest
     return f"{kind}-{digest[7:23]}", digest
 
@@ -63979,24 +63985,54 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.operations.queue")
         status = store.graph_governance_status(conn, project_id)
-        snapshot_id = str(ctx.query.get("snapshot_id") or status.get("active_snapshot_id") or "")
+        selected_active_snapshot_id = str(
+            ctx.query.get("snapshot_id")
+            or status.get("active_snapshot_id")
+            or ""
+        )
         snapshot_summary: dict[str, Any] = {}
-        if snapshot_id:
-            snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
-            snapshot_summary = store.summarize_graph_snapshot(conn, project_id, snapshot_id)
+        if selected_active_snapshot_id:
+            selected_active_snapshot_id = _resolve_graph_snapshot_id(
+                conn,
+                project_id,
+                selected_active_snapshot_id,
+            )
+            snapshot_summary = store.summarize_graph_snapshot(
+                conn,
+                project_id,
+                selected_active_snapshot_id,
+            )
+        safe_selected_active_snapshot_id = (
+            _safe_reconcile_queue_identifier(
+                selected_active_snapshot_id,
+                kind="snapshot",
+            )[0]
+            if selected_active_snapshot_id
+            else ""
+        )
         job_limit = _query_int(ctx.query, "job_limit", 200)
         feedback_limit = _query_int(ctx.query, "feedback_limit", 100)
         # MF-2026-05-10-013: default-hide terminal node + edge rows so the
         # dashboard isn't drowned by cancelled / completed audit history.
         # Pass `?include_terminal=true` to see everything.
         include_terminal = _query_bool(ctx.query, "include_terminal", False)
-        node_jobs = _semantic_job_rows(conn, project_id, snapshot_id, limit=job_limit) if snapshot_id else []
-        edge_jobs = _edge_semantic_job_rows(conn, project_id, snapshot_id, limit=job_limit) if snapshot_id else []
+        node_jobs = _semantic_job_rows(
+            conn,
+            project_id,
+            selected_active_snapshot_id,
+            limit=job_limit,
+        ) if selected_active_snapshot_id else []
+        edge_jobs = _edge_semantic_job_rows(
+            conn,
+            project_id,
+            selected_active_snapshot_id,
+            limit=job_limit,
+        ) if selected_active_snapshot_id else []
         graph_structure_jobs = (
             graph_events.list_events(
                 conn,
                 project_id,
-                snapshot_id,
+                selected_active_snapshot_id,
                 event_types=[
                     "graph_structure_requested",
                     "graph_structure_completed",
@@ -64007,7 +64043,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 ],
                 limit=job_limit,
             )
-            if snapshot_id
+            if selected_active_snapshot_id
             else []
         )
         if not include_terminal:
@@ -64024,12 +64060,20 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 if _normalize_operation_status(str(j.get("status") or "")) not in {"complete", "cancelled", "failed"}
                 or str(j.get("event_type") or "") in {"graph_structure_requested", "graph_enrich_config_requested"}
             ]
-        node_job_counts = _semantic_job_status_counts(conn, project_id, snapshot_id) if snapshot_id else {}
-        edge_job_counts = _edge_semantic_job_status_counts(conn, project_id, snapshot_id) if snapshot_id else {}
+        node_job_counts = _semantic_job_status_counts(
+            conn,
+            project_id,
+            selected_active_snapshot_id,
+        ) if selected_active_snapshot_id else {}
+        edge_job_counts = _edge_semantic_job_status_counts(
+            conn,
+            project_id,
+            selected_active_snapshot_id,
+        ) if selected_active_snapshot_id else {}
         feedback_queue = (
             reconcile_feedback.build_feedback_review_queue(
                 project_id,
-                snapshot_id,
+                selected_active_snapshot_id,
                 include_status_observations=_query_bool(ctx.query, "include_status_observations", False),
                 include_resolved=_query_bool(ctx.query, "include_resolved", False),
                 include_claimed=True,
@@ -64037,7 +64081,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 limit=feedback_limit,
                 conn=conn,
             )
-            if snapshot_id
+            if selected_active_snapshot_id
             else {"summary": {}, "groups": [], "count": 0, "group_count": 0}
         )
         patch_summary = graph_correction_patches.correction_patch_summary(conn, project_id)
@@ -64178,15 +64222,18 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 metric.get("run_id"),
                 kind="run",
             )
-            snapshot_id_value = str(metric.get("snapshot_id") or "")
-            snapshot_id, snapshot_id_digest = _safe_reconcile_queue_identifier(
-                snapshot_id_value,
+            metric_snapshot_id_value = metric.get("snapshot_id")
+            (
+                metric_snapshot_id,
+                metric_snapshot_id_digest,
+            ) = _safe_reconcile_queue_identifier(
+                metric_snapshot_id_value,
                 kind="snapshot",
             )
             commit_sha, commit_sha_digest = _safe_reconcile_queue_commit(
                 metric.get("commit_sha")
             )
-            snapshot_disambiguator = snapshot_id_digest[7:]
+            snapshot_disambiguator = metric_snapshot_id_digest[7:]
             created_at = str(metric.get("created_at") or "")
             if not _RECONCILE_QUEUE_TIMESTAMP_RE.fullmatch(created_at):
                 created_at = ""
@@ -64209,8 +64256,8 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                     "project_id": safe_project_id,
                     "run_id": run_id,
                     "run_id_sha256": run_id_digest,
-                    "snapshot_id": snapshot_id,
-                    "snapshot_id_sha256": snapshot_id_digest,
+                    "snapshot_id": metric_snapshot_id,
+                    "snapshot_id_sha256": metric_snapshot_id_digest,
                     "commit_sha256": commit_sha_digest,
                     "status": status_value,
                     "status_reason_code": str(
@@ -64329,7 +64376,12 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "operation_id": f"{operation_type.replace('_', '-')}:{job.get('event_id')}",
                 "operation_type": operation_type,
                 "target_scope": job.get("target_type") or "snapshot",
-                "target_id": job.get("target_id") or snapshot_id,
+                "target_id": (
+                    safe_selected_active_snapshot_id
+                    if str(job.get("target_id") or "")
+                    in {"", selected_active_snapshot_id}
+                    else job.get("target_id")
+                ),
                 "target_label": (
                     event_type
                     .replace("graph_structure_", "graph structure ")
@@ -64362,7 +64414,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
         edge_missing = int(semantic_health.get("edge_semantic_missing_count") or 0)
         edge_eligible = int(semantic_health.get("edge_semantic_eligible_count") or 0)
         edge_current = int(semantic_health.get("edge_semantic_current_count") or 0)
-        if snapshot_id and node_stale > 0 and not node_jobs:
+        if selected_active_snapshot_id and node_stale > 0 and not node_jobs:
             operations.append({
                 "operation_id": "node-semantic:not-queued",
                 "operation_type": "node_semantic",
@@ -64380,7 +64432,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "last_result": f"{node_stale} stale node semantics, 0 queued",
                 "supported_actions": ["queue_node_semantics", "file_backlog", "view_trace"],
             })
-        if snapshot_id and edge_missing > 0 and not edge_jobs:
+        if selected_active_snapshot_id and edge_missing > 0 and not edge_jobs:
             operations.append({
                 "operation_id": "edge-semantic:not-queued",
                 "operation_type": "edge_semantic",
@@ -64411,7 +64463,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "operation_id": "feedback-review:queue",
                 "operation_type": "feedback_review",
                 "target_scope": "snapshot",
-                "target_id": snapshot_id,
+                "target_id": safe_selected_active_snapshot_id,
                 "target_label": "feedback queue",
                 "status": "queued",
                 "progress": {"done": 0, "total": feedback_count},
@@ -64449,10 +64501,16 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             conn,
             project_id,
             status=status,
-            snapshot_id=snapshot_id,
+            snapshot_id=selected_active_snapshot_id,
             snapshot_summary=snapshot_summary,
         )
         current_state["graph_stale"] = graph_stale_summary
+        current_state["snapshot_id"] = safe_selected_active_snapshot_id
+        current_state_semantic_snapshot = current_state.get("semantic_snapshot")
+        if isinstance(current_state_semantic_snapshot, dict):
+            current_state_semantic_snapshot["snapshot_id"] = (
+                safe_selected_active_snapshot_id
+            )
         reconcile_metrics = _public_reconcile_metrics_summary(
             store.summarize_reconcile_run_metrics(
                 conn,
@@ -64464,8 +64522,8 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
         return {
             "ok": True,
             "project_id": project_id,
-            "snapshot_id": snapshot_id,
-            "active_snapshot_id": status.get("active_snapshot_id", ""),
+            "snapshot_id": safe_selected_active_snapshot_id,
+            "active_snapshot_id": safe_selected_active_snapshot_id,
             "count": len(operations),
             "operations": operations,
             "summary": {
