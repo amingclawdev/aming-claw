@@ -63730,6 +63730,28 @@ def _dashboard_current_state(
     }
 
 
+_RECONCILE_QUEUE_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_RECONCILE_QUEUE_TIMESTAMP_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z"
+)
+
+
+def _safe_reconcile_queue_identifier(value: Any, *, kind: str) -> tuple[str, str]:
+    raw = str(value or "").strip()
+    digest = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if raw and _RECONCILE_QUEUE_IDENTIFIER_RE.fullmatch(raw):
+        return raw, digest
+    return f"{kind}-{digest[7:23]}", digest
+
+
+def _safe_reconcile_queue_commit(value: Any) -> tuple[str, str]:
+    raw = str(value or "").strip().lower()
+    digest = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if re.fullmatch(r"[0-9a-f]{40,64}", raw):
+        return raw, digest
+    return "", digest
+
+
 @route("GET", "/api/graph-governance/{project_id}/operations/queue")
 def handle_graph_governance_operations_queue(ctx: RequestContext):
     """Return a unified dashboard queue for active governance operations."""
@@ -63923,38 +63945,34 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             limit=_query_int(ctx.query, "reconcile_metric_limit", 100),
             strategy="current_full_reconcile",
         )
-        metric_status_rank = {
-            "complete": 5,
-            "failed": 4,
-            "candidate_ready": 3,
-            "finalizing": 2,
-            "running": 1,
-        }
-        current_full_by_run: dict[str, dict[str, Any]] = {}
-        for metric in reconcile_metric_rows:
-            run_id = str(metric.get("run_id") or "").strip()
-            if not run_id:
-                continue
-            existing_metric = current_full_by_run.get(run_id)
-            if existing_metric is None or metric_status_rank.get(
-                str(metric.get("status") or "").strip().lower(),
-                0,
-            ) > metric_status_rank.get(
-                str(existing_metric.get("status") or "").strip().lower(),
-                0,
-            ):
-                current_full_by_run[run_id] = metric
         include_reconcile_terminal = _query_bool(
             ctx.query,
             "include_resolved",
             False,
         )
-        for run_id, metric in current_full_by_run.items():
-            status_value = str(metric.get("status") or "unknown").strip().lower()
-            if status_value == "complete" and not include_reconcile_terminal:
+        for metric in reconcile_metric_rows:
+            status_value = str(metric.get("effective_status") or "unknown")
+            if (
+                status_value in {"complete", "terminalized_stale"}
+                and not include_reconcile_terminal
+            ):
                 continue
-            evidence = _json_loads(metric.get("evidence_json"), {})
-            evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+            run_id, run_id_digest = _safe_reconcile_queue_identifier(
+                metric.get("run_id"),
+                kind="run",
+            )
+            snapshot_id_value = str(metric.get("snapshot_id") or "")
+            snapshot_id, snapshot_id_digest = _safe_reconcile_queue_identifier(
+                snapshot_id_value,
+                kind="snapshot",
+            )
+            commit_sha, commit_sha_digest = _safe_reconcile_queue_commit(
+                metric.get("commit_sha")
+            )
+            snapshot_disambiguator = snapshot_id_digest[7:]
+            created_at = str(metric.get("created_at") or "")
+            if not _RECONCILE_QUEUE_TIMESTAMP_RE.fullmatch(created_at):
+                created_at = ""
             if status_value == "complete":
                 progress = {"done": 2, "total": 2}
             elif status_value == "candidate_ready":
@@ -63963,24 +63981,36 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 progress = {"done": 0, "total": 2}
             operations.append(
                 {
-                    "operation_id": f"current-full:{run_id}",
+                    "operation_id": (
+                        f"current-full:{run_id}:snapshot:{snapshot_disambiguator}"
+                    ),
+                    "legacy_operation_id": f"current-full:{run_id}",
                     "operation_type": "current_full_reconcile",
                     "target_scope": "snapshot",
-                    "target_id": str(metric.get("commit_sha") or ""),
+                    "target_id": commit_sha,
                     "target_label": run_id,
+                    "project_id": project_id,
                     "run_id": run_id,
+                    "run_id_sha256": run_id_digest,
+                    "snapshot_id": snapshot_id,
+                    "snapshot_id_sha256": snapshot_id_digest,
+                    "commit_sha256": commit_sha_digest,
                     "status": status_value,
+                    "status_reason_code": str(
+                        metric.get("status_reason_code") or ""
+                    ),
+                    "is_terminal": bool(metric.get("is_terminal")),
                     "progress": progress,
-                    "created_at": str(metric.get("created_at") or ""),
-                    "updated_at": str(metric.get("created_at") or ""),
+                    "created_at": created_at,
+                    "updated_at": created_at,
                     "claimed_by": "",
                     "worker_id": "governance_current_full_reconcile",
                     "lease_expires_at": "",
-                    "last_error": str(evidence.get("error") or ""),
-                    "last_result": str(evidence.get("phase") or status_value),
-                    "snapshot_id": str(metric.get("snapshot_id") or ""),
+                    "last_error": "",
+                    "last_result": str(
+                        metric.get("status_reason_code") or status_value
+                    ),
                     "elapsed_ms": int(metric.get("elapsed_ms") or 0),
-                    "evidence": evidence,
                     "supported_actions": ["view_trace", "file_backlog"],
                 }
             )

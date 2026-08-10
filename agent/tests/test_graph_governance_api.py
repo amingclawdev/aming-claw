@@ -12164,13 +12164,113 @@ def test_graph_operations_queue_exposes_current_full_run_id_status(conn):
         for item in result["operations"]
         if item.get("run_id") == "current-full-visible-running"
     )
-    assert operation["operation_id"] == (
+    assert operation["operation_id"].startswith(
+        "current-full:current-full-visible-running:snapshot:"
+    )
+    assert operation["legacy_operation_id"] == (
         "current-full:current-full-visible-running"
     )
     assert operation["operation_type"] == "current_full_reconcile"
     assert operation["status"] == "running"
     assert operation["progress"] == {"done": 0, "total": 2}
-    assert operation["last_result"] == "materializing_candidate"
+    assert operation["last_result"] == "running"
+
+
+def test_graph_operations_queue_keeps_same_run_snapshots_and_scrubs_evidence(conn):
+    head = "e" * 40
+    _activate_basic_graph(
+        conn,
+        "full-current-operations-safe-projection",
+        commit_sha=head,
+    )
+    for index, status in enumerate(("running", "finalizing")):
+        store.record_reconcile_run_metric(
+            conn,
+            PID,
+            run_id="current-full-shared-run",
+            snapshot_id=f"full-shared-snapshot-{index}",
+            commit_sha=head,
+            snapshot_kind="full",
+            strategy="current_full_reconcile",
+            graph_delta_mode="full_rebuild",
+            status=status,
+            evidence={
+                "phase": "must-not-project",
+                "error": "secret-current-full-error",
+                "credentials": {"token": "raw-current-full-token"},
+                "trace_summary_path": "/Users/private/reconcile/trace.json",
+            },
+            created_at=f"2026-08-10T00:00:0{index}Z",
+        )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="current-full-malformed-status",
+        snapshot_id="full-malformed-status",
+        commit_sha=head,
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="/Users/private/raw-status",
+        evidence={"error": "another-secret"},
+        created_at="2026-08-09T00:00:00Z",
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_operations_queue(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            query={
+                "include_resolved": "false",
+                "reconcile_metric_limit": "1",
+            },
+        )
+    )
+
+    operations = [
+        item
+        for item in result["operations"]
+        if item.get("operation_type") == "current_full_reconcile"
+        and item.get("run_id") == "current-full-shared-run"
+    ]
+    assert len(operations) == 2
+    assert len({item["operation_id"] for item in operations}) == 2
+    assert {item["snapshot_id"] for item in operations} == {
+        "full-shared-snapshot-0",
+        "full-shared-snapshot-1",
+    }
+    assert {
+        item["legacy_operation_id"] for item in operations
+    } == {"current-full:current-full-shared-run"}
+    assert all("evidence" not in item for item in operations)
+    malformed = next(
+        item
+        for item in result["operations"]
+        if item.get("run_id") == "current-full-malformed-status"
+    )
+    assert malformed["status"] == "unknown"
+    assert malformed["is_terminal"] is False
+    assert malformed["status_reason_code"] == "unrecognized_reconcile_status"
+    serialized = json.dumps(
+        [
+            item
+            for item in result["operations"]
+            if item.get("operation_type") == "current_full_reconcile"
+        ],
+        sort_keys=True,
+    )
+    for forbidden in (
+        "must-not-project",
+        "secret-current-full-error",
+        "raw-current-full-token",
+        "/Users/private/reconcile/trace.json",
+        "evidence_json",
+        "credentials",
+        "/Users/private/raw-status",
+        "another-secret",
+    ):
+        assert forbidden not in serialized
 
 
 @pytest.mark.parametrize(

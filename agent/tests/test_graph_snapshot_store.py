@@ -476,6 +476,96 @@ def test_reconcile_run_metrics_record_and_summarize(conn):
     assert summary["speedup"]["elapsed_reduction_pct"] == pytest.approx(86.9, rel=0.01)
 
 
+def test_reconcile_run_metrics_keep_every_effective_nonterminal_beyond_limit(conn):
+    _ensure_schema(conn)
+    for index in range(110):
+        store.record_reconcile_run_metric(
+            conn,
+            PID,
+            run_id=f"terminal-{index:03d}",
+            snapshot_id=f"full-terminal-{index:03d}",
+            snapshot_kind="full",
+            strategy="current_full_reconcile",
+            status="candidate_ready",
+            created_at=f"2026-08-10T02:00:{index:03d}Z",
+        )
+    for index in range(106):
+        store.record_reconcile_run_metric(
+            conn,
+            PID,
+            run_id=f"nonterminal-{index:03d}",
+            snapshot_id=f"full-nonterminal-{index:03d}",
+            snapshot_kind="full",
+            strategy="current_full_reconcile",
+            status="running" if index % 2 == 0 else "finalizing",
+            created_at=f"2026-08-10T01:00:{index:03d}Z",
+        )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="malformed-status",
+        snapshot_id="full-malformed-status",
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        status="../../private/credential.txt",
+        created_at="2026-08-10T00:00:000Z",
+    )
+
+    rows = store.list_reconcile_run_metrics(
+        conn,
+        PID,
+        limit=5,
+        strategy="current_full_reconcile",
+    )
+
+    assert len(rows) == 112
+    keys = [
+        (row["project_id"], row["run_id"], row["snapshot_id"])
+        for row in rows
+    ]
+    assert len(keys) == len(set(keys))
+    assert [row["run_id"] for row in rows[:5]] == [
+        "terminal-109",
+        "terminal-108",
+        "terminal-107",
+        "terminal-106",
+        "terminal-105",
+    ]
+    assert "terminal-104" not in {row["run_id"] for row in rows}
+    assert {
+        row["run_id"]
+        for row in rows
+        if row["effective_status"] in {"running", "finalizing"}
+    } == {f"nonterminal-{index:03d}" for index in range(106)}
+    malformed = next(row for row in rows if row["run_id"] == "malformed-status")
+    assert malformed["effective_status"] == "unknown"
+    assert malformed["is_terminal"] is False
+    assert malformed["status_reason_code"] == "unrecognized_reconcile_status"
+    assert rows == sorted(
+        rows,
+        key=lambda row: (
+            row["created_at"],
+            row["run_id"],
+            row["snapshot_id"],
+        ),
+        reverse=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["candidate_ready", "complete", "failed", "terminalized_stale"],
+)
+def test_reconcile_run_metric_status_projection_has_exact_terminal_set(status):
+    projection = store.project_reconcile_run_metric_status({"status": status})
+
+    assert projection == {
+        "effective_status": status,
+        "is_terminal": True,
+        "status_reason_code": "",
+    }
+
+
 def test_current_full_build_claim_fences_two_connections_before_materialization(
     tmp_path,
 ):

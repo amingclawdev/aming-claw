@@ -5404,6 +5404,43 @@ def backfill_reconcile_run_metrics_from_snapshots(
     return {"project_id": project_id, "scanned": len(rows), "imported": imported}
 
 
+_RECONCILE_METRIC_TERMINAL_STATUSES = frozenset(
+    {"candidate_ready", "complete", "failed", "terminalized_stale"}
+)
+_RECONCILE_METRIC_NONTERMINAL_STATUSES = frozenset({"running", "finalizing"})
+
+
+def project_reconcile_run_metric_status(
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the append-only metric status used by queue visibility.
+
+    C2B can extend this single projection with an append-only terminalization
+    overlay. Until then, unknown or malformed raw values stay visible as
+    unresolved work and are never interpreted as terminal.
+    """
+    raw_status = str(row.get("status") or "").strip().lower()
+    known_statuses = (
+        _RECONCILE_METRIC_TERMINAL_STATUSES
+        | _RECONCILE_METRIC_NONTERMINAL_STATUSES
+    )
+    if raw_status in known_statuses:
+        effective_status = raw_status
+        reason_code = ""
+    else:
+        effective_status = "unknown"
+        reason_code = (
+            "missing_reconcile_status"
+            if not raw_status
+            else "unrecognized_reconcile_status"
+        )
+    return {
+        "effective_status": effective_status,
+        "is_terminal": effective_status in _RECONCILE_METRIC_TERMINAL_STATUSES,
+        "status_reason_code": reason_code,
+    }
+
+
 def list_reconcile_run_metrics(
     conn: sqlite3.Connection,
     project_id: str,
@@ -5417,9 +5454,30 @@ def list_reconcile_run_metrics(
     if strategy:
         sql += " AND strategy=?"
         params.append(strategy)
-    sql += " ORDER BY created_at DESC LIMIT ?"
-    params.append(int(limit or 50))
-    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+    sql += " ORDER BY created_at DESC, run_id DESC, snapshot_id DESC"
+    rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+    sample_limit = max(1, min(int(limit or 50), 1000))
+    selected: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for position, row in enumerate(rows):
+        projection = project_reconcile_run_metric_status(row)
+        if position >= sample_limit and projection["is_terminal"]:
+            continue
+        projected = {**row, **projection}
+        identity = (
+            str(projected.get("project_id") or ""),
+            str(projected.get("run_id") or ""),
+            str(projected.get("snapshot_id") or ""),
+        )
+        selected.setdefault(identity, projected)
+    return sorted(
+        selected.values(),
+        key=lambda row: (
+            str(row.get("created_at") or ""),
+            str(row.get("run_id") or ""),
+            str(row.get("snapshot_id") or ""),
+        ),
+        reverse=True,
+    )
 
 
 _FULL_REBUILD_STRATEGIES = {"full_rebuild_fallback", "legacy_full_like", "full"}
