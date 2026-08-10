@@ -107,6 +107,8 @@ from agent.mcp.schema_contract import (
 )
 
 import os
+import errno
+import fcntl
 import shutil
 import signal
 import socket
@@ -319,28 +321,26 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-_CURRENT_FULL_BUILD_MANAGER_STARTED_AT = _utc_now()
-_CURRENT_FULL_BUILD_MANAGER_EPOCH = f"gcfepoch-{uuid.uuid4().hex}"
-_CURRENT_FULL_BUILD_MANAGER_PID = os.getpid()
-_CURRENT_FULL_BUILD_MANAGER_START_IDENTITY = hashlib.sha256(
-    (
-        f"{_CURRENT_FULL_BUILD_MANAGER_EPOCH}:"
-        f"{_CURRENT_FULL_BUILD_MANAGER_PID}:"
-        f"{_CURRENT_FULL_BUILD_MANAGER_STARTED_AT}"
-    ).encode("utf-8")
-).hexdigest()
 _CURRENT_FULL_BUILD_KEYS: set[tuple[str, str]] = set()
 _CURRENT_FULL_BUILD_KEYS_LOCK = RLock()
+_GOVERNANCE_MANAGER_CERTIFICATES: dict[str, dict[str, Any]] = {}
+_GOVERNANCE_MANAGER_CERTIFICATES_LOCK = RLock()
+_GOVERNANCE_SINGLETON_LEASE: Any | None = None
 
 
-def _current_full_build_manager_identity() -> dict[str, Any]:
-    return {
-        "manager_epoch": _CURRENT_FULL_BUILD_MANAGER_EPOCH,
-        "manager_pid": _CURRENT_FULL_BUILD_MANAGER_PID,
-        "manager_started_at": _CURRENT_FULL_BUILD_MANAGER_STARTED_AT,
-        "manager_start_identity": _CURRENT_FULL_BUILD_MANAGER_START_IDENTITY,
-        "server_derived": True,
-    }
+def _current_full_build_manager_identity(project_id: str = "") -> dict[str, Any]:
+    """Return only the private, durably certified current manager identity."""
+
+    with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
+        project = str(project_id or "")
+        if not project and len(_GOVERNANCE_MANAGER_CERTIFICATES) == 1:
+            project = next(iter(_GOVERNANCE_MANAGER_CERTIFICATES))
+        certificate = dict(_GOVERNANCE_MANAGER_CERTIFICATES.get(project) or {})
+    if not certificate:
+        raise RuntimeError("governance_manager_generation_not_certified")
+    from . import graph_snapshot_store as store
+
+    return store.manager_generation_certificate_public_receipt(certificate)
 
 
 def _acquire_current_full_process_build_key(
@@ -859,29 +859,405 @@ def _retry_on_busy(fn, *args, **kwargs):
         raise last_exc
 
 
-def _acquire_pid_lock():
-    """Write PID lockfile. Kill old process if still alive."""
-    lock_dir = os.path.join(
-        os.environ.get("SHARED_VOLUME_PATH",
-                        os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "shared-volume")),
-        "codex-tasks", "state")
-    os.makedirs(lock_dir, exist_ok=True)
-    lock_path = os.path.join(lock_dir, "governance.pid")
+class GovernanceSingletonError(RuntimeError):
+    """Copy-safe fatal singleton-startup failure."""
 
-    # Check old PID
-    if os.path.exists(lock_path):
+    def __init__(self, code: str):
+        self.code = str(code or "governance_singleton_failed")
+        super().__init__(self.code)
+
+
+class _GovernanceSingletonLease:
+    """Private lifetime owner of the governance process flock."""
+
+    def __init__(self, lock_handle: Any, receipt: Mapping[str, Any]):
+        self._lock_handle = lock_handle
+        self._receipt = dict(receipt)
+        self._released = False
+
+    def public_receipt(self) -> dict[str, Any]:
+        allowed = (
+            "generation_id",
+            "manager_pid",
+            "manager_started_at",
+            "process_start_identity",
+            "manager_start_identity",
+            "lock_identity",
+            "prior_manager_pid",
+            "observed_prior_generation_id",
+            "prior_process_start_identity",
+            "prior_pid_death_method",
+            "prior_pid_death_verified_at",
+            "lock_acquired_at",
+        )
+        return {
+            "schema_version": "governance_singleton_lease.v1",
+            **{key: self._receipt.get(key, 0 if key.endswith("_pid") else "") for key in allowed},
+            "server_derived": True,
+        }
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
         try:
-            old_pid = int(open(lock_path).read().strip())
-            if old_pid != os.getpid():
-                os.kill(old_pid, signal.SIGTERM)
-                import logging
-                logging.getLogger(__name__).info("Killed old governance process PID %d", old_pid)
-        except (ValueError, ProcessLookupError, PermissionError, OSError):
-            pass  # Old process already dead
+            fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._lock_handle.close()
 
-    # Write new PID
-    with open(lock_path, "w") as f:
-        f.write(str(os.getpid()))
+    def _close_in_forked_child(self) -> None:
+        """Drop the inherited descriptor without unlocking the parent's flock."""
+
+        if self._released:
+            return
+        self._released = True
+        self._lock_handle.close()
+
+
+def _process_start_identity(pid: int) -> str:
+    """Return an opaque exact OS process-start identity, or empty when absent."""
+
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(int(pid))],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    started = result.stdout if result.returncode == 0 else ""
+    if not started.strip():
+        return ""
+    exact = f"{int(pid)}\0".encode("utf-8") + started.encode("utf-8")
+    return "sha256:" + hashlib.sha256(exact).hexdigest()
+
+
+def _read_governance_pid_record(pid_path: Path) -> tuple[dict[str, Any], bytes]:
+    if not pid_path.exists():
+        return {}, b""
+    try:
+        raw = pid_path.read_bytes()
+    except OSError as exc:
+        raise GovernanceSingletonError("governance_pidfile_unreadable") from exc
+    if not raw or len(raw) > 4096:
+        raise GovernanceSingletonError("governance_pidfile_malformed")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise GovernanceSingletonError("governance_pidfile_malformed") from exc
+    stripped = text.strip()
+    if not stripped:
+        raise GovernanceSingletonError("governance_pidfile_malformed")
+    if stripped.isdigit():
+        pid = int(stripped)
+        if pid <= 0:
+            raise GovernanceSingletonError("governance_pidfile_malformed")
+        return {
+            "schema_version": "governance.pid.legacy",
+            "pid": pid,
+            "process_start_identity": "",
+        }, raw
+    try:
+        record = json.loads(stripped)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise GovernanceSingletonError("governance_pidfile_malformed") from exc
+    if not isinstance(record, Mapping) or record.get("schema_version") != "governance.pid.v1":
+        raise GovernanceSingletonError("governance_pidfile_malformed")
+    try:
+        pid = int(record.get("pid") or 0)
+    except (TypeError, ValueError) as exc:
+        raise GovernanceSingletonError("governance_pidfile_malformed") from exc
+    process_start_identity = str(record.get("process_start_identity") or "")
+    generation_id = str(record.get("generation_id") or "")
+    if pid <= 0 or not process_start_identity or not generation_id:
+        raise GovernanceSingletonError("governance_pidfile_malformed")
+    return {
+        "schema_version": "governance.pid.v1",
+        "pid": pid,
+        "process_start_identity": process_start_identity,
+        "generation_id": generation_id,
+    }, raw
+
+
+def _write_governance_pid_record_atomic(pid_path: Path, record: Mapping[str, Any]) -> None:
+    encoded = (
+        json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        + "\n"
+    ).encode("utf-8")
+    temporary = pid_path.with_name(
+        f".{pid_path.name}.{int(record['pid'])}.{uuid.uuid4().hex}.tmp"
+    )
+    fd = -1
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.set_inheritable(fd, False)
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, pid_path)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _strict_prior_pid_death(
+    pid: int,
+    *,
+    expected_process_start_identity: str,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+) -> tuple[str, str]:
+    """Return only when a non-destructive kill(pid, 0) proves ESRCH."""
+
+    del timeout_seconds, poll_interval_seconds
+    if int(pid) == os.getpid():
+        raise GovernanceSingletonError("governance_pidfile_points_to_current_process")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return expected_process_start_identity, _utc_now()
+    except PermissionError as exc:
+        raise GovernanceSingletonError("prior_governance_pid_unverifiable") from exc
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return expected_process_start_identity, _utc_now()
+        raise GovernanceSingletonError("prior_governance_pid_probe_failed") from exc
+    raise GovernanceSingletonError("prior_governance_pid_alive")
+
+
+def _acquire_pid_lock(
+    *,
+    lock_dir: str | Path | None = None,
+    lock_timeout_seconds: float = 1.0,
+    prior_pid_timeout_seconds: float = 5.0,
+    poll_interval_seconds: float = 0.02,
+) -> _GovernanceSingletonLease:
+    """Acquire a lifetime flock and prove the authoritative prior PID dead."""
+
+    if lock_dir is None:
+        lock_dir = Path(
+            os.environ.get(
+                "SHARED_VOLUME_PATH",
+                os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)), "..", "shared-volume"
+                ),
+            )
+        ) / "codex-tasks" / "state"
+    state_dir = Path(lock_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    singleton_path = state_dir / "governance.lock"
+    pid_path = state_dir / "governance.pid"
+    lock_handle = open(singleton_path, "a+b", buffering=0)
+    os.set_inheritable(lock_handle.fileno(), False)
+    deadline = time.monotonic() + max(0.0, float(lock_timeout_seconds))
+    while True:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                lock_handle.close()
+                raise GovernanceSingletonError("governance_singleton_lock_busy")
+            time.sleep(max(0.001, min(float(poll_interval_seconds), 0.05)))
+        except OSError as exc:
+            lock_handle.close()
+            raise GovernanceSingletonError("governance_singleton_lock_failed") from exc
+
+    try:
+        prior_record, original_pid_bytes = _read_governance_pid_record(pid_path)
+        prior_pid = int(prior_record.get("pid") or 0)
+        prior_start_identity = str(
+            prior_record.get("process_start_identity") or ""
+        )
+        observed_prior_generation_id = str(
+            prior_record.get("generation_id") or ""
+        )
+        prior_death_verified_at = ""
+        if prior_pid:
+            prior_start_identity, prior_death_verified_at = _strict_prior_pid_death(
+                prior_pid,
+                expected_process_start_identity=prior_start_identity,
+                timeout_seconds=prior_pid_timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        current_pid_bytes = pid_path.read_bytes() if pid_path.exists() else b""
+        if current_pid_bytes != original_pid_bytes:
+            raise GovernanceSingletonError("governance_pidfile_changed_during_takeover")
+
+        manager_pid = os.getpid()
+        process_start_identity = _process_start_identity(manager_pid)
+        if not process_start_identity:
+            raise GovernanceSingletonError("governance_process_start_identity_unavailable")
+        generation_id = f"govgen-{uuid.uuid4().hex}"
+        manager_started_at = _utc_now()
+        stat_result = os.fstat(lock_handle.fileno())
+        lock_identity = "sha256:" + hashlib.sha256(
+            (
+                f"{stat_result.st_dev}:{stat_result.st_ino}:{generation_id}"
+            ).encode("utf-8")
+        ).hexdigest()
+        manager_start_identity = "sha256:" + hashlib.sha256(
+            (
+                f"{generation_id}:{manager_pid}:{manager_started_at}:"
+                f"{process_start_identity}:{lock_identity}"
+            ).encode("utf-8")
+        ).hexdigest()
+        receipt = {
+            "generation_id": generation_id,
+            "manager_pid": manager_pid,
+            "manager_started_at": manager_started_at,
+            "process_start_identity": process_start_identity,
+            "manager_start_identity": manager_start_identity,
+            "lock_identity": lock_identity,
+            "prior_manager_pid": prior_pid,
+            "observed_prior_generation_id": observed_prior_generation_id,
+            "prior_process_start_identity": prior_start_identity,
+            "prior_pid_death_method": "esrch" if prior_pid else "",
+            "prior_pid_death_verified_at": prior_death_verified_at,
+            "lock_acquired_at": _utc_now(),
+        }
+        _write_governance_pid_record_atomic(
+            pid_path,
+            {
+                "schema_version": "governance.pid.v1",
+                "pid": manager_pid,
+                "process_start_identity": process_start_identity,
+                "generation_id": generation_id,
+            },
+        )
+        return _GovernanceSingletonLease(lock_handle, receipt)
+    except Exception:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_handle.close()
+        raise
+
+
+def _governance_generation_project_ids() -> list[str]:
+    from .db import _governance_root
+
+    project_ids = {"aming-claw"}
+    root = _governance_root()
+    if root.exists():
+        for project_dir in root.iterdir():
+            if project_dir.is_dir() and (project_dir / "governance.db").exists():
+                project_ids.add(project_dir.name)
+    return sorted(project_ids)
+
+
+def _certify_governance_manager_generation(
+    lease: _GovernanceSingletonLease,
+    *,
+    project_ids: Iterable[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Durably append this private lease to every known project history."""
+
+    from . import graph_snapshot_store as store
+
+    receipt = lease.public_receipt()
+    projects = sorted(
+        {
+            str(project_id or "").strip()
+            for project_id in (
+                project_ids
+                if project_ids is not None
+                else _governance_generation_project_ids()
+            )
+            if str(project_id or "").strip()
+        }
+    )
+    if not projects:
+        raise GovernanceSingletonError("governance_generation_project_scope_empty")
+    certificates: dict[str, dict[str, Any]] = {}
+    for project_id in projects:
+        conn = get_connection(project_id)
+        try:
+            certificate = store.record_manager_generation_certificate(
+                conn,
+                project_id,
+                generation_id=str(receipt["generation_id"]),
+                manager_pid=int(receipt["manager_pid"]),
+                manager_started_at=str(receipt["manager_started_at"]),
+                process_start_identity=str(receipt["process_start_identity"]),
+                manager_start_identity=str(receipt["manager_start_identity"]),
+                lock_identity=str(receipt["lock_identity"]),
+                prior_manager_pid=int(receipt["prior_manager_pid"]),
+                observed_prior_generation_id=str(
+                    receipt["observed_prior_generation_id"]
+                ),
+                prior_process_start_identity=str(
+                    receipt["prior_process_start_identity"]
+                ),
+                prior_pid_death_method=str(receipt["prior_pid_death_method"]),
+                prior_pid_death_verified_at=str(
+                    receipt["prior_pid_death_verified_at"]
+                ),
+                certified_at=str(receipt["lock_acquired_at"]),
+            )
+        finally:
+            conn.close()
+        certificates[project_id] = certificate
+    return certificates
+
+
+def _establish_governance_manager_generation() -> _GovernanceSingletonLease:
+    """Acquire, certify, then publish the sole current manager generation."""
+
+    global _GOVERNANCE_SINGLETON_LEASE
+    lease = _acquire_pid_lock()
+    try:
+        certificates = _certify_governance_manager_generation(lease)
+        with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
+            if _GOVERNANCE_SINGLETON_LEASE is not None:
+                raise GovernanceSingletonError(
+                    "governance_manager_generation_already_published"
+                )
+            _GOVERNANCE_MANAGER_CERTIFICATES.clear()
+            _GOVERNANCE_MANAGER_CERTIFICATES.update(certificates)
+            _GOVERNANCE_SINGLETON_LEASE = lease
+        return lease
+    except Exception:
+        with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
+            _GOVERNANCE_MANAGER_CERTIFICATES.clear()
+            _GOVERNANCE_SINGLETON_LEASE = None
+        lease.release()
+        raise
+
+
+def _release_governance_manager_generation(
+    lease: _GovernanceSingletonLease,
+) -> None:
+    global _GOVERNANCE_SINGLETON_LEASE
+    with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
+        if _GOVERNANCE_SINGLETON_LEASE is lease:
+            _GOVERNANCE_SINGLETON_LEASE = None
+            _GOVERNANCE_MANAGER_CERTIFICATES.clear()
+    lease.release()
+
+
+def _drop_governance_manager_generation_after_fork() -> None:
+    """Ensure a fork-only child cannot extend the parent's singleton lease."""
+
+    global _GOVERNANCE_SINGLETON_LEASE
+    lease = _GOVERNANCE_SINGLETON_LEASE
+    _GOVERNANCE_SINGLETON_LEASE = None
+    _GOVERNANCE_MANAGER_CERTIFICATES.clear()
+    if lease is not None:
+        lease._close_in_forked_child()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_drop_governance_manager_generation_after_fork)
 
 def _governance_scratch_dir(project_id: str) -> str:
     """Return the governance scratch directory for a project, creating it if needed."""
@@ -71768,7 +72144,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         )
         notes_extra.pop("current_full_reconcile", None)
         build_claim: dict[str, Any] = {}
-        build_manager = _current_full_build_manager_identity()
+        build_manager = _current_full_build_manager_identity(project_id)
         if resumed_candidate:
             snapshot_id = str(existing.get("snapshot_id") or "")
             result = {
@@ -71811,7 +72187,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     run_id=run_id,
                     snapshot_id=requested_snapshot_id,
                     commit_sha=target_commit,
-                    manager_epoch=str(build_manager["manager_epoch"]),
+                    manager_epoch=str(build_manager["generation_id"]),
                     manager_pid=int(build_manager["manager_pid"]),
                     manager_started_at=str(build_manager["manager_started_at"]),
                     manager_start_identity=str(
@@ -158541,16 +158917,17 @@ def create_server(port: int = None) -> HTTPServer:
     return server
 
 
-def main():
-    # Configure logging to INFO level for observability
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        stream=sys.stderr,
-    )
+def _run_governance_service():
+    """Start side effects and bind only after manager certification succeeds."""
 
-    # PID lock — kill old process, prevent zombies
-    _acquire_pid_lock()
+    with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
+        if (
+            _GOVERNANCE_SINGLETON_LEASE is None
+            or not _GOVERNANCE_MANAGER_CERTIFICATES
+        ):
+            raise GovernanceSingletonError(
+                "governance_manager_generation_not_published"
+            )
     print(f"Governance v{get_server_version()} (PID {SERVER_PID})")
 
     # Enable Redis Pub/Sub bridge for EventBus
@@ -158635,6 +159012,19 @@ def main():
     except KeyboardInterrupt:
         print("\nShutting down...")
         server.shutdown()
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stderr,
+    )
+    lease = _establish_governance_manager_generation()
+    try:
+        _run_governance_service()
+    finally:
+        _release_governance_manager_generation(lease)
 
 
 if __name__ == "__main__":

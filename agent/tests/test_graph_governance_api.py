@@ -4,12 +4,16 @@ from dataclasses import asdict, fields, replace
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import errno
+import fcntl
+import gc
 import hashlib
 import importlib.util
 import io
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -148,6 +152,467 @@ def _preload_candidate_server_module() -> tuple[Any, Path]:
         spec.loader.exec_module(candidate)
     assert Path(candidate.__file__).resolve() == requested_path
     return candidate, requested_path
+
+
+def _sleeping_process(*, ignore_sigterm: bool = False) -> subprocess.Popen[str]:
+    handler = (
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        if ignore_sigterm
+        else ""
+    )
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,signal,time;"
+                f"{handler}"
+                "print(os.getpid(), flush=True);"
+                "time.sleep(10)"
+            ),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _test_manager_certificate(project_id: str = PID) -> dict[str, Any]:
+    return {
+        "schema_version": "graph_reconcile_manager_generation_certificate.v1",
+        "project_id": project_id,
+        "certificate_id": f"gmcert-{project_id}",
+        "sequence": 1,
+        "generation_id": f"generation-{project_id}",
+        "manager_pid": os.getpid(),
+        "manager_started_at": "2026-08-10T00:00:00Z",
+        "process_start_identity": f"process-{project_id}",
+        "manager_start_identity": f"manager-{project_id}",
+        "lock_identity": f"lock-{project_id}",
+        "predecessor_certificate_id": "",
+        "predecessor_generation_id": "",
+        "predecessor_sequence": 0,
+        "predecessor_certificate_hash": "",
+        "prior_manager_pid": 0,
+        "observed_prior_generation_id": "",
+        "prior_process_start_identity": "",
+        "prior_pid_death_method": "",
+        "prior_pid_death_verified_at": "",
+        "certified_at": "2026-08-10T00:00:01Z",
+        "certificate_hash": "sha256:" + "a" * 64,
+    }
+def test_governance_singleton_lease_holds_real_noninherited_flock_for_lifetime(
+    tmp_path,
+):
+    state_dir = tmp_path / "state"
+    lease = server._acquire_pid_lock(
+        lock_dir=state_dir,
+        lock_timeout_seconds=0.1,
+        prior_pid_timeout_seconds=0.1,
+        poll_interval_seconds=0.005,
+    )
+    try:
+        fd = lease._lock_handle.fileno()
+        assert os.get_inheritable(fd) is False
+        gc.collect()
+        assert os.fstat(fd).st_ino > 0
+
+        code = """
+import pathlib, sys
+from agent.governance import server
+try:
+    server._acquire_pid_lock(
+        lock_dir=pathlib.Path(sys.argv[1]),
+        lock_timeout_seconds=0.08,
+        prior_pid_timeout_seconds=0.08,
+        poll_interval_seconds=0.005,
+    )
+except server.GovernanceSingletonError as exc:
+    print(exc.code)
+    raise SystemExit(23)
+raise SystemExit(0)
+"""
+        contender = subprocess.run(
+            [sys.executable, "-c", code, str(state_dir)],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        assert contender.returncode == 23
+        assert contender.stdout.strip() == "governance_singleton_lock_busy"
+        assert json.loads((state_dir / "governance.pid").read_text())["pid"] == os.getpid()
+    finally:
+        lease.release()
+
+
+def test_governance_singleton_live_prior_is_never_signaled_and_fails_closed(tmp_path):
+    prior = _sleeping_process(ignore_sigterm=True)
+    try:
+        prior_pid = int(prior.stdout.readline().strip())
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        pid_path = state_dir / "governance.pid"
+        pid_path.write_text(str(prior_pid), encoding="utf-8")
+        original = pid_path.read_bytes()
+
+        with pytest.raises(
+            server.GovernanceSingletonError,
+            match="prior_governance_pid_alive",
+        ):
+            server._acquire_pid_lock(
+                lock_dir=state_dir,
+                lock_timeout_seconds=0.1,
+                prior_pid_timeout_seconds=0.08,
+                poll_interval_seconds=0.005,
+            )
+        assert prior.poll() is None
+        assert pid_path.read_bytes() == original
+    finally:
+        prior.kill()
+        prior.wait(timeout=2)
+
+
+def test_governance_singleton_proves_only_already_dead_prior_esrch(tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    dead = _sleeping_process()
+    dead_pid = int(dead.stdout.readline().strip())
+    dead.kill()
+    dead.wait(timeout=2)
+    (state_dir / "governance.pid").write_text(str(dead_pid), encoding="utf-8")
+    dead_lease = server._acquire_pid_lock(
+        lock_dir=state_dir,
+        lock_timeout_seconds=0.1,
+        prior_pid_timeout_seconds=0.1,
+        poll_interval_seconds=0.005,
+    )
+    try:
+        receipt = dead_lease.public_receipt()
+        assert receipt["prior_manager_pid"] == dead_pid
+        assert receipt["prior_pid_death_method"] == "esrch"
+        assert receipt["prior_pid_death_verified_at"]
+        assert receipt["manager_pid"] == os.getpid()
+        assert receipt["manager_start_identity"]
+        assert receipt["lock_identity"]
+    finally:
+        dead_lease.release()
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_code"),
+    [
+        (PermissionError(errno.EPERM, "denied"), "prior_governance_pid_unverifiable"),
+        (OSError(errno.EIO, "io"), "prior_governance_pid_probe_failed"),
+    ],
+)
+def test_governance_singleton_only_esrch_counts_as_dead(
+    tmp_path,
+    monkeypatch,
+    raised,
+    expected_code,
+):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    pid_path = state_dir / "governance.pid"
+    pid_path.write_text("987654", encoding="utf-8")
+    monkeypatch.setattr(server, "_process_start_identity", lambda _pid: "start-x")
+
+    def reject_probe(_pid, _sig):
+        raise raised
+
+    monkeypatch.setattr(server.os, "kill", reject_probe)
+    with pytest.raises(server.GovernanceSingletonError) as caught:
+        server._acquire_pid_lock(
+            lock_dir=state_dir,
+            lock_timeout_seconds=0.1,
+            prior_pid_timeout_seconds=0.1,
+            poll_interval_seconds=0.005,
+        )
+    assert caught.value.code == expected_code
+    assert pid_path.read_text(encoding="utf-8") == "987654"
+
+
+def test_governance_manager_generation_public_receipt_is_fixed_and_safe(monkeypatch):
+    certificate = {
+        "schema_version": "graph_reconcile_manager_generation_certificate.v1",
+        "project_id": PID,
+        "certificate_id": "gmcert-safe",
+        "sequence": 7,
+        "generation_id": "generation-safe",
+        "manager_pid": 4301,
+        "manager_started_at": "2026-08-10T00:00:00Z",
+        "process_start_identity": "process-safe",
+        "manager_start_identity": "manager-safe",
+        "lock_identity": "lock-safe",
+        "predecessor_certificate_id": "gmcert-prior",
+        "predecessor_generation_id": "generation-prior",
+        "predecessor_sequence": 6,
+        "predecessor_certificate_hash": "sha256:" + "b" * 64,
+        "prior_manager_pid": 4300,
+        "observed_prior_generation_id": "generation-prior",
+        "prior_process_start_identity": "process-prior",
+        "prior_pid_death_method": "esrch",
+        "prior_pid_death_verified_at": "2026-08-10T00:00:01Z",
+        "certified_at": "2026-08-10T00:00:02Z",
+        "certificate_hash": "sha256:" + "a" * 64,
+        "raw_lock_path": "/secret/lock/path",
+        "shared_volume_path": "/secret/shared-volume",
+        "token": "secret-token-sentinel",
+        "evidence": {"exception": "secret-exception-sentinel"},
+    }
+    monkeypatch.setitem(server._GOVERNANCE_MANAGER_CERTIFICATES, PID, certificate)
+
+    receipt = server._current_full_build_manager_identity(PID)
+    serialized = json.dumps(receipt, sort_keys=True)
+    assert set(receipt) == {
+        "schema_version",
+        "project_id",
+        "certificate_id",
+        "sequence",
+        "generation_id",
+        "manager_pid",
+        "manager_started_at",
+        "process_start_identity",
+        "manager_start_identity",
+        "lock_identity",
+        "predecessor_certificate_id",
+        "predecessor_generation_id",
+        "predecessor_sequence",
+        "predecessor_certificate_hash",
+        "prior_manager_pid",
+        "observed_prior_generation_id",
+        "prior_process_start_identity",
+        "prior_pid_death_method",
+        "prior_pid_death_verified_at",
+        "certified_at",
+        "certificate_hash",
+        "server_derived",
+    }
+    assert "/secret/" not in serialized
+    assert "secret-token-sentinel" not in serialized
+    assert "secret-exception-sentinel" not in serialized
+
+
+def test_main_never_starts_components_or_binds_before_generation_certificate(
+    monkeypatch,
+):
+    calls = []
+
+    def fail_establish():
+        calls.append("establish")
+        raise server.GovernanceSingletonError("certificate_failed")
+
+    monkeypatch.setattr(server, "_establish_governance_manager_generation", fail_establish)
+    monkeypatch.setattr(server, "_run_governance_service", lambda: calls.append("run"))
+    with pytest.raises(server.GovernanceSingletonError, match="certificate_failed"):
+        server.main()
+    assert calls == ["establish"]
+
+
+@pytest.mark.parametrize(
+    ("raw_pidfile", "expected_code"),
+    [
+        (b"", "governance_pidfile_malformed"),
+        (b"not-a-pid", "governance_pidfile_malformed"),
+        (str(os.getpid()).encode("ascii"), "governance_pidfile_points_to_current_process"),
+    ],
+)
+def test_governance_singleton_rejects_malformed_or_current_pidfile(
+    tmp_path,
+    raw_pidfile,
+    expected_code,
+):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    pid_path = state_dir / "governance.pid"
+    pid_path.write_bytes(raw_pidfile)
+    with pytest.raises(server.GovernanceSingletonError) as caught:
+        server._acquire_pid_lock(lock_dir=state_dir, lock_timeout_seconds=0.05)
+    assert caught.value.code == expected_code
+    assert pid_path.read_bytes() == raw_pidfile
+
+
+def test_governance_singleton_pidfile_write_fault_releases_flock(
+    tmp_path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("injected-pidfile-write-fault")
+
+    monkeypatch.setattr(server, "_write_governance_pid_record_atomic", fail_write)
+    with pytest.raises(OSError, match="injected-pidfile-write-fault"):
+        server._acquire_pid_lock(lock_dir=state_dir, lock_timeout_seconds=0.05)
+    assert not (state_dir / "governance.pid").exists()
+    with open(state_dir / "governance.lock", "a+b", buffering=0) as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def test_governance_certificate_fault_releases_lease_and_publishes_nothing(
+    tmp_path,
+    monkeypatch,
+):
+    lease = server._acquire_pid_lock(
+        lock_dir=tmp_path / "state",
+        lock_timeout_seconds=0.05,
+    )
+    certificates: dict[str, dict[str, Any]] = {}
+    monkeypatch.setattr(server, "_GOVERNANCE_MANAGER_CERTIFICATES", certificates)
+    monkeypatch.setattr(server, "_GOVERNANCE_SINGLETON_LEASE", None)
+    monkeypatch.setattr(server, "_acquire_pid_lock", lambda: lease)
+
+    def fail_certificate(_lease):
+        raise RuntimeError("injected-certificate-fault")
+
+    monkeypatch.setattr(server, "_certify_governance_manager_generation", fail_certificate)
+    with pytest.raises(RuntimeError, match="injected-certificate-fault"):
+        server._establish_governance_manager_generation()
+    assert certificates == {}
+    assert server._GOVERNANCE_SINGLETON_LEASE is None
+    assert lease._lock_handle.closed is True
+
+
+def test_run_governance_service_rejects_unpublished_generation_before_components(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(server, "_GOVERNANCE_MANAGER_CERTIFICATES", {})
+    monkeypatch.setattr(server, "_GOVERNANCE_SINGLETON_LEASE", None)
+    monkeypatch.setattr(server, "get_redis", lambda: calls.append("redis"))
+    with pytest.raises(
+        server.GovernanceSingletonError,
+        match="governance_manager_generation_not_published",
+    ):
+        server._run_governance_service()
+    assert calls == []
+
+
+def test_forked_child_drops_inherited_singleton_descriptor(tmp_path, monkeypatch):
+    if not hasattr(os, "fork"):
+        pytest.skip("requires fork")
+    lease = server._acquire_pid_lock(
+        lock_dir=tmp_path / "state",
+        lock_timeout_seconds=0.05,
+    )
+    monkeypatch.setattr(server, "_GOVERNANCE_SINGLETON_LEASE", lease)
+    monkeypatch.setattr(
+        server,
+        "_GOVERNANCE_MANAGER_CERTIFICATES",
+        {PID: _test_manager_certificate()},
+    )
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            os.fstat(lease._lock_handle.fileno())
+        except (OSError, ValueError):
+            os.write(write_fd, b"closed")
+        else:
+            os.write(write_fd, b"open")
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    try:
+        assert os.read(read_fd, 16) == b"closed"
+        os.waitpid(child_pid, 0)
+    finally:
+        os.close(read_fd)
+        lease.release()
+
+
+def _lease_receipt(
+    generation: str,
+    manager_pid: int,
+    *,
+    prior_pid: int = 0,
+    prior_generation: str = "",
+) -> dict[str, Any]:
+    return {
+        "generation_id": generation,
+        "manager_pid": manager_pid,
+        "manager_started_at": f"2026-08-10T00:00:{manager_pid % 60:02d}Z",
+        "process_start_identity": f"process-{generation}",
+        "manager_start_identity": f"manager-{generation}",
+        "lock_identity": f"lock-{generation}",
+        "prior_manager_pid": prior_pid,
+        "observed_prior_generation_id": prior_generation,
+        "prior_process_start_identity": f"process-{prior_generation}" if prior_pid else "",
+        "prior_pid_death_method": "esrch" if prior_pid else "",
+        "prior_pid_death_verified_at": "2026-08-10T00:01:00Z" if prior_pid else "",
+        "lock_acquired_at": f"2026-08-10T00:02:{manager_pid % 60:02d}Z",
+    }
+
+
+class _FakeGenerationLease:
+    def __init__(self, receipt: Mapping[str, Any]):
+        self.receipt = dict(receipt)
+
+    def public_receipt(self) -> dict[str, Any]:
+        return dict(self.receipt)
+
+
+def test_server_certification_recovers_all_projects_after_partial_fault(
+    tmp_path,
+    monkeypatch,
+):
+    db_paths = {
+        "project-a": tmp_path / "a.sqlite",
+        "project-b": tmp_path / "b.sqlite",
+    }
+
+    def connection_for(project_id: str):
+        connection = sqlite3.connect(db_paths[project_id])
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    monkeypatch.setattr(server, "get_connection", connection_for)
+    g0 = _FakeGenerationLease(_lease_receipt("generation-0", 5200))
+    server._certify_governance_manager_generation(
+        g0, project_ids=["project-a", "project-b"]
+    )
+
+    normal_factory = server.get_connection
+
+    def fail_project_b(project_id: str):
+        if project_id == "project-b":
+            raise RuntimeError("injected-project-b-fault")
+        return normal_factory(project_id)
+
+    monkeypatch.setattr(server, "get_connection", fail_project_b)
+    g1 = _FakeGenerationLease(
+        _lease_receipt(
+            "generation-1",
+            5201,
+            prior_pid=5200,
+            prior_generation="generation-0",
+        )
+    )
+    with pytest.raises(RuntimeError, match="injected-project-b-fault"):
+        server._certify_governance_manager_generation(
+            g1, project_ids=["project-a", "project-b"]
+        )
+
+    monkeypatch.setattr(server, "get_connection", normal_factory)
+    g2 = _FakeGenerationLease(
+        _lease_receipt(
+            "generation-2",
+            5202,
+            prior_pid=5201,
+            prior_generation="generation-1",
+        )
+    )
+    result = server._certify_governance_manager_generation(
+        g2, project_ids=["project-a", "project-b"]
+    )
+    assert set(result) == {"project-a", "project-b"}
+    assert result["project-a"]["predecessor_generation_id"] == "generation-1"
+    assert result["project-b"]["predecessor_generation_id"] == "generation-0"
+    assert result["project-b"]["observed_prior_generation_id"] == "generation-1"
 
 
 def test_live_observer_guide_projects_signed_failure_domain_disposition(conn):
@@ -7871,6 +8336,11 @@ def _stub_current_full_reconcile(
 ):
     head = "a" * 40
     calls: list[dict] = []
+    monkeypatch.setitem(
+        server._GOVERNANCE_MANAGER_CERTIFICATES,
+        PID,
+        _test_manager_certificate(),
+    )
     if fixed_snapshot_id is not None:
         monkeypatch.setattr(
             store,
@@ -7932,6 +8402,11 @@ def test_current_full_build_claim_is_committed_before_builder_entry(
     _ensure_schema(connection)
     store.ensure_schema(connection)
     connection.commit()
+    monkeypatch.setitem(
+        server._GOVERNANCE_MANAGER_CERTIFICATES,
+        PID,
+        _test_manager_certificate(),
+    )
     monkeypatch.setattr(server, "get_connection", lambda _project_id: connection)
     monkeypatch.setattr(
         "agent.governance.db._governance_root", lambda: tmp_path / "state"
@@ -8718,6 +9193,11 @@ def test_protected_current_full_reconcile_records_authoritative_provenance(
     tmp_path,
 ):
     head = "d" * 40
+    monkeypatch.setitem(
+        server._GOVERNANCE_MANAGER_CERTIFICATES,
+        PID,
+        _test_manager_certificate(),
+    )
     backlog_id = "AC-PROTECTED-CURRENT-FULL-PROVENANCE"
     task_id = "cex-protected-current-full-provenance"
     parent_task_id = "cex-protected-current-full-parent"
@@ -9951,7 +10431,7 @@ def test_current_full_resumed_candidate_has_zero_claim_delta_and_zero_build(
         snapshot_id=snapshot_id,
         commit_sha=head,
         created_at="2099-01-01T00:00:00Z",
-        manager_epoch=owner["manager_epoch"],
+        manager_epoch=owner["generation_id"],
         manager_pid=owner["manager_pid"],
         manager_started_at=owner["manager_started_at"],
         manager_start_identity=owner["manager_start_identity"],
@@ -11439,7 +11919,7 @@ def test_current_full_snapshot_with_released_failed_claim_cannot_revive(
         run_id=run_id,
         snapshot_id=snapshot_id,
         commit_sha=head,
-        manager_epoch=owner["manager_epoch"],
+        manager_epoch=owner["generation_id"],
         manager_pid=owner["manager_pid"],
         manager_started_at=owner["manager_started_at"],
         manager_start_identity=owner["manager_start_identity"],
