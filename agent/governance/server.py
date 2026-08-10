@@ -116240,6 +116240,56 @@ def _onboard_legacy_operator_recovery_blocker(
     }
 
 
+def _onboard_legacy_operator_recovery_context_trigger(
+    context: Any,
+    eligibility: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recognize only server-derived RuntimeContext recovery dead ends."""
+
+    if eligibility.get("server_derived") is not True:
+        return {}
+    eligibility_mode = str(eligibility.get("mode") or "").strip()
+    if (
+        eligibility_mode == "replacement_exhausted"
+        and eligibility.get("eligible") is not True
+    ):
+        return {
+            "schema_version": "onboard_route_guide.legacy_recovery_trigger.v1",
+            "mode": "replacement_exhausted",
+            "eligibility_mode": eligibility_mode,
+            "server_derived": True,
+        }
+    blockers = {
+        str(item or "").strip()
+        for item in eligibility.get("blockers") or []
+        if str(item or "").strip()
+    }
+    pre_lineage_replacement_blockers = {
+        "runtime_context_rejoin_requires_existing_worker_lineage",
+        "mf_subagent_read_receipt",
+        "mf_subagent_startup",
+    }
+    last_recovery_action = str(
+        getattr(context, "last_recovery_action", "") or ""
+    ).strip()
+    if (
+        eligibility_mode == "blocked"
+        and eligibility.get("eligible") is not True
+        and blockers == pre_lineage_replacement_blockers
+        and last_recovery_action
+        == _RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION
+    ):
+        return {
+            "schema_version": "onboard_route_guide.legacy_recovery_trigger.v1",
+            "mode": "pre_lineage_replacement_exhausted",
+            "eligibility_mode": eligibility_mode,
+            "last_recovery_action": last_recovery_action,
+            "blockers": sorted(blockers),
+            "server_derived": True,
+        }
+    return {}
+
+
 def _onboard_legacy_operator_hotfix_attempt_projection(
     conn,
     *,
@@ -116304,23 +116354,30 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
         and _runtime_context_mf_sub_parent_task_id(context)
         == source_parent_execution_id
     ]
-    exhausted = []
+    recovery_contexts = []
     for context in candidates:
         eligibility = _runtime_context_session_rejoin_guidance_eligibility(
             conn,
             project_id=project_id,
             context=context,
         )
-        if str(eligibility.get("mode") or "").strip() == (
-            "replacement_exhausted"
-        ):
-            exhausted.append((context, eligibility))
-    if len(exhausted) != 1:
+        recovery_trigger = _onboard_legacy_operator_recovery_context_trigger(
+            context,
+            eligibility,
+        )
+        if recovery_trigger:
+            recovery_contexts.append(
+                (context, eligibility, recovery_trigger)
+            )
+    if len(recovery_contexts) != 1:
         return _onboard_legacy_operator_recovery_blocker(
-            "replacement_exhausted_runtime_context_not_unique",
+            "irrecoverable_runtime_context_not_unique",
             source_backlog_id=backlog_id,
             source_parent_execution_id=source_parent_execution_id,
-            details={"candidate_count": len(exhausted)},
+            details={
+                "candidate_count": len(recovery_contexts),
+                "runtime_context_count": len(candidates),
+            },
         )
 
     local_anchor = _onboard_completed_hotfix_predecessor_anchors(
@@ -116383,7 +116440,7 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
             details={"route_resolution_error": route_error},
         )
 
-    context, eligibility = exhausted[0]
+    context, eligibility, recovery_trigger = recovery_contexts[0]
     route_issue_body = {
         "project_id": project_id,
         "caller_role": "observer",
@@ -116474,7 +116531,7 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
         "allowed_writer_roles": ["observer"],
         "source": "managed_observer_hotfix_recovery",
         "source_of_authority": (
-            "completed_hotfix_predecessor+replacement_exhausted_RuntimeContext"
+            "completed_hotfix_predecessor+irrecoverable_RuntimeContext"
         ),
         "action_scope": {
             "project_id": project_id,
@@ -116508,7 +116565,11 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
                 getattr(context, "runtime_context_id", "") or ""
             ),
             "task_id": str(getattr(context, "task_id", "") or ""),
-            "mode": "replacement_exhausted",
+            "mode": str(recovery_trigger.get("mode") or ""),
+            "eligibility_mode": str(
+                recovery_trigger.get("eligibility_mode") or ""
+            ),
+            "recovery_trigger": dict(recovery_trigger),
             "server_derived": True,
             "caller_claims_trusted": False,
             "eligibility": dict(eligibility),

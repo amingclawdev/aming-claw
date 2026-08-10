@@ -72,6 +72,26 @@ _WORKER_MCP_HOST_ONLY_TOOLS = frozenset(
 )
 
 
+def _copy_safe_observer_route_context_issue_result(value: Any) -> Any:
+    """Remove raw route authorization from the public MCP result."""
+
+    def scrub(item: Any) -> Any:
+        if isinstance(item, dict):
+            return {
+                key: False if key == "raw_route_token_exposed" else scrub(nested)
+                for key, nested in item.items()
+                if key != "route_token"
+            }
+        if isinstance(item, list):
+            return [scrub(nested) for nested in item]
+        return item
+
+    result = scrub(value)
+    if isinstance(result, dict):
+        result["raw_route_token_exposed"] = False
+    return result
+
+
 def _int_arg(args: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
     try:
         value = int(args.get(key, default))
@@ -2983,13 +3003,13 @@ TOOLS: list[dict] = [
     {
         "name": "observer_route_context_issue",
         "description": (
-            "Mint an Aming-owned, write-authorizing observer route token "
-            "(decision route_token) without any external route provider. "
+            "Mint an Aming-owned, write-authorizing observer route context "
+            "without any external route provider. "
             "Authorizes observer orchestration/close actions and observer-prefilled "
             "child action-scope refs for QA-owned timeline evidence, but blocks "
-            "direct file edits. Also returns a consumable route_token_ref + "
-            "merge_queue_id and an execute_backlog_row_payload; handoffs should pass "
-            "the ref, not the raw token. For mf_batch lanes, any returned "
+            "direct file edits. The MCP result returns only a consumable "
+            "route_token_ref plus copy-safe identity/diagnostics and never a raw "
+            "route_token. For mf_batch lanes, any returned "
             "merge_queue_id is route-issue local diagnostic context; batch merge "
             "semantics use runtime_context.current_values.merge_queue_id."
         ),
@@ -3850,7 +3870,13 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         # observer role so the endpoint's caller_role authorization check passes
         # (unless an explicit caller_role was already supplied by the caller).
         body.setdefault("caller_role", "observer")
-        return _http("POST", f"/api/projects/{pid}/observer/route-context/issue", body)
+        return _copy_safe_observer_route_context_issue_result(
+            _http(
+                "POST",
+                f"/api/projects/{pid}/observer/route-context/issue",
+                body,
+            )
+        )
 
     if name == "observer_route_context_renew":
         pid = args["project_id"]

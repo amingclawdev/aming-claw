@@ -54493,6 +54493,55 @@ def test_compact_legacy_recovery_without_exact_predecessor_is_explicitly_blocked
     ]
 
 
+def test_legacy_operator_recovery_trigger_accepts_only_exact_dead_end_shapes():
+    context = SimpleNamespace(
+        last_recovery_action=(
+            server._RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION
+        )
+    )
+    blocked = {
+        "server_derived": True,
+        "eligible": False,
+        "mode": "blocked",
+        "blockers": [
+            "runtime_context_rejoin_requires_existing_worker_lineage",
+            "mf_subagent_read_receipt",
+            "mf_subagent_startup",
+        ],
+    }
+    trigger = server._onboard_legacy_operator_recovery_context_trigger(
+        context,
+        blocked,
+    )
+    assert trigger["mode"] == "pre_lineage_replacement_exhausted"
+    assert trigger["server_derived"] is True
+
+    assert server._onboard_legacy_operator_recovery_context_trigger(
+        context,
+        {
+            **blocked,
+            "eligible": True,
+            "mode": "active_context_auth_only",
+        },
+    ) == {}
+    assert server._onboard_legacy_operator_recovery_context_trigger(
+        SimpleNamespace(last_recovery_action="mf_subagent_initial_join_issued"),
+        blocked,
+    ) == {}
+    assert server._onboard_legacy_operator_recovery_context_trigger(
+        context,
+        {**blocked, "server_derived": False},
+    ) == {}
+    assert server._onboard_legacy_operator_recovery_context_trigger(
+        context,
+        {
+            "server_derived": True,
+            "eligible": False,
+            "mode": "replacement_exhausted",
+        },
+    )["mode"] == "replacement_exhausted"
+
+
 @pytest.mark.parametrize("persisted_prelineage_cex", ["exact", "legacy_empty"])
 def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drift(
     conn,

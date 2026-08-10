@@ -767,6 +767,83 @@ def _dispatcher(recorder: _Recorder, manager: _Recorder | None = None) -> ToolDi
     )
 
 
+def _assert_route_issue_result_is_copy_safe(result: dict) -> None:
+    def walk(value):
+        if isinstance(value, dict):
+            assert "route_token" not in value
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(result)
+    serialized = json.dumps(result, sort_keys=True)
+    assert "raw-write-authority" not in serialized
+    assert "nested-raw-write-authority" not in serialized
+    assert result["route_token_ref"] == "rtok-copy-safe"
+    assert result["route_identity"] == {"route_id": "route-copy-safe"}
+    assert result["diagnostics"] == {"scope": "exact"}
+    assert result["raw_route_token_exposed"] is False
+    assert result["nested"]["raw_route_token_exposed"] is False
+
+
+def test_observer_route_context_issue_mcp_boundaries_strip_raw_route_token(monkeypatch):
+    for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
+        schema = next(
+            item for item in registry
+            if item["name"] == "observer_route_context_issue"
+        )
+        assert "never a raw route_token" in schema["description"]
+
+    raw_result = {
+        "ok": True,
+        "route_token_ref": "rtok-copy-safe",
+        "route_token": {"token": "raw-write-authority"},
+        "route_identity": {"route_id": "route-copy-safe"},
+        "diagnostics": {"scope": "exact"},
+        "nested": {
+            "route_token": {"token": "nested-raw-write-authority"},
+            "raw_route_token_exposed": True,
+        },
+    }
+
+    class RouteIssueRecorder(_Recorder):
+        def api(self, method: str, path: str, data: dict | None = None) -> dict:
+            self.calls.append((method, path, data))
+            return raw_result
+
+    recorder = RouteIssueRecorder()
+    direct = _dispatcher(recorder).dispatch(
+        "observer_route_context_issue",
+        {
+            "project_id": "aming-claw",
+            "task_id": "copy-safe-route-issue",
+            "caller_role": "observer",
+        },
+    )
+    _assert_route_issue_result_is_copy_safe(direct)
+    assert raw_result["route_token"]["token"] == "raw-write-authority"
+
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http",
+        lambda *args, **kwargs: raw_result,
+    )
+    stdio = governance_mcp_server._dispatch_tool(
+        "observer_route_context_issue",
+        {
+            "project_id": "aming-claw",
+            "task_id": "copy-safe-route-issue",
+            "caller_role": "observer",
+        },
+    )
+    _assert_route_issue_result_is_copy_safe(stdio)
+    assert raw_result["nested"]["route_token"]["token"] == (
+        "nested-raw-write-authority"
+    )
+
+
 def test_backlog_upsert_accepts_structured_acceptance_scope_without_breaking_strings():
     for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
         tool = next(item for item in registry if item["name"] == "backlog_upsert")

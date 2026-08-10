@@ -72,6 +72,26 @@ _ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES = [
 ]
 
 
+def _copy_safe_observer_route_context_issue_result(value: Any) -> Any:
+    """Remove raw route authorization from the public MCP result."""
+
+    def scrub(item: Any) -> Any:
+        if isinstance(item, dict):
+            return {
+                key: False if key == "raw_route_token_exposed" else scrub(nested)
+                for key, nested in item.items()
+                if key != "route_token"
+            }
+        if isinstance(item, list):
+            return [scrub(nested) for nested in item]
+        return item
+
+    result = scrub(value)
+    if isinstance(result, dict):
+        result["raw_route_token_exposed"] = False
+    return result
+
+
 def _int_arg(args: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
     try:
         value = int(args.get(key, default))
@@ -1641,7 +1661,8 @@ TOOLS: list[dict] = [
             "such as merge, task_timeline_append, and backlog_close. For mf_batch "
             "lanes, route issue may return a route-local merge_queue_id for "
             "diagnostics, but batch merge semantics use "
-            "runtime_context.current_values.merge_queue_id."
+            "runtime_context.current_values.merge_queue_id. The MCP result is "
+            "copy-safe: it exposes route_token_ref and never a raw route_token."
         ),
         "inputSchema": {
             "type": "object",
@@ -5087,7 +5108,13 @@ class ToolDispatcher:
                 for key, value in args.items()
                 if key != "project_id" and value is not None
             }
-            return self._api("POST", f"/api/projects/{pid}/observer/route-context/issue", body)
+            return _copy_safe_observer_route_context_issue_result(
+                self._api(
+                    "POST",
+                    f"/api/projects/{pid}/observer/route-context/issue",
+                    body,
+                )
+            )
 
         if name == "observer_route_context_renew":
             pid = args["project_id"]
