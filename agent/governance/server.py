@@ -70319,6 +70319,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     request_started_at = _utc_now()
     request_started_monotonic = time.monotonic()
     conn = get_connection(project_id)
+    process_build_key: tuple[str, str] | None = None
     try:
         current_full_auth = _require_current_full_reconcile_auth(
             ctx,
@@ -70526,7 +70527,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             explicit_snapshot_id or store.snapshot_id_for("full", target_commit)
         ).strip()
         build_claim: dict[str, Any] = {}
-        process_build_key: tuple[str, str] | None = None
         build_manager = _current_full_build_manager_identity()
         if resumed_candidate:
             snapshot_id = str(existing.get("snapshot_id") or "")
@@ -70600,9 +70600,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     "rebuild_started": False,
                     "fail_closed": True,
                 }
-            finally:
-                if not build_claim:
-                    _release_current_full_process_build_key(process_build_key)
             try:
                 # Candidate persistence may outlive a client connection.  The
                 # active ref is intentionally deferred to the final evidence
@@ -70642,6 +70639,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     semantic_config_path=body.get("semantic_config_path"),
                     semantic_enqueue_stale=bool(body.get("enqueue_stale", False)),
                 )
+                conn.commit()
             except Exception as exc:
                 conn.rollback()
                 try:
@@ -70663,13 +70661,25 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         },
                         created_at=request_started_at,
                     )
-                finally:
-                    _release_current_full_process_build_key(process_build_key)
+                except Exception as terminal_exc:
+                    conn.rollback()
+                    raise GovernanceError(
+                        "current_full_build_failure_terminalization_failed",
+                        "current-full build failed and its durable claim could not be terminalized",
+                        500,
+                        {
+                            "run_id": run_id,
+                            "snapshot_id": requested_snapshot_id,
+                            "build_error": str(exc),
+                            "terminalization_error": str(terminal_exc),
+                            "durable_claim_left_active": True,
+                            "fail_closed": True,
+                        },
+                    ) from terminal_exc
                 if isinstance(exc, (KeyError, ValueError)):
                     _raise_graph_api_validation(exc)
                 raise
 
-            conn.commit()
             build_elapsed_ms = int(
                 (time.monotonic() - request_started_monotonic) * 1000
             )
@@ -70689,28 +70699,25 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         else "invalid reconcile result"
                     )
                 )
-                try:
-                    store.terminalize_current_full_build_claim(
-                        conn,
-                        project_id,
-                        claim_id=str(build_claim["claim_id"]),
-                        run_id=run_id,
-                        snapshot_id=requested_snapshot_id,
-                        commit_sha=target_commit,
-                        terminal_status="failed",
-                        manager_start_identity=str(
-                            build_manager["manager_start_identity"]
-                        ),
-                        elapsed_ms=build_elapsed_ms,
-                        metric_evidence={
-                            "phase": "candidate_materialization_rejected",
-                            "error": error,
-                            "idempotency_scope": idempotency_scope,
-                        },
-                        created_at=request_started_at,
-                    )
-                finally:
-                    _release_current_full_process_build_key(process_build_key)
+                store.terminalize_current_full_build_claim(
+                    conn,
+                    project_id,
+                    claim_id=str(build_claim["claim_id"]),
+                    run_id=run_id,
+                    snapshot_id=requested_snapshot_id,
+                    commit_sha=target_commit,
+                    terminal_status="failed",
+                    manager_start_identity=str(
+                        build_manager["manager_start_identity"]
+                    ),
+                    elapsed_ms=build_elapsed_ms,
+                    metric_evidence={
+                        "phase": "candidate_materialization_rejected",
+                        "error": error,
+                        "idempotency_scope": idempotency_scope,
+                    },
+                    created_at=request_started_at,
+                )
                 if result_snapshot_id != requested_snapshot_id:
                     raise GovernanceError(
                         "current_full_candidate_snapshot_identity_mismatch",
@@ -70724,35 +70731,32 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         },
                     )
                 return 201, result
-            try:
-                store.terminalize_current_full_build_claim(
-                    conn,
-                    project_id,
-                    claim_id=str(build_claim["claim_id"]),
-                    run_id=run_id,
-                    snapshot_id=requested_snapshot_id,
-                    commit_sha=target_commit,
-                    terminal_status="candidate_ready",
-                    manager_start_identity=str(
-                        build_manager["manager_start_identity"]
-                    ),
-                    elapsed_ms=build_elapsed_ms,
-                    trace_summary_path=str(
-                        (result.get("trace") or {}).get("summary_path") or ""
-                    )
-                    if isinstance(result.get("trace"), Mapping)
-                    else "",
-                    metric_evidence={
-                        "phase": "candidate_ready",
-                        "activate_requested": activate_requested,
-                        "idempotency_scope": idempotency_scope,
-                        "request_id": str(ctx.request_id),
-                        "claim_id": str(build_claim["claim_id"]),
-                    },
-                    created_at=request_started_at,
+            store.terminalize_current_full_build_claim(
+                conn,
+                project_id,
+                claim_id=str(build_claim["claim_id"]),
+                run_id=run_id,
+                snapshot_id=requested_snapshot_id,
+                commit_sha=target_commit,
+                terminal_status="candidate_ready",
+                manager_start_identity=str(
+                    build_manager["manager_start_identity"]
+                ),
+                elapsed_ms=build_elapsed_ms,
+                trace_summary_path=str(
+                    (result.get("trace") or {}).get("summary_path") or ""
                 )
-            finally:
-                _release_current_full_process_build_key(process_build_key)
+                if isinstance(result.get("trace"), Mapping)
+                else "",
+                metric_evidence={
+                    "phase": "candidate_ready",
+                    "activate_requested": activate_requested,
+                    "idempotency_scope": idempotency_scope,
+                    "request_id": str(ctx.request_id),
+                    "claim_id": str(build_claim["claim_id"]),
+                },
+                created_at=request_started_at,
+            )
 
         elapsed_ms = int((time.monotonic() - request_started_monotonic) * 1000)
         result = dict(result)
@@ -70800,29 +70804,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             started_at=request_started_at,
             updated_at=_utc_now(),
         )
-        if resumed_candidate:
-            store.record_reconcile_run_metric(
-                conn,
-                project_id,
-                run_id=run_id,
-                snapshot_id=graph_epoch_snapshot_id,
-                commit_sha=target_commit,
-                snapshot_kind="full",
-                strategy="current_full_reconcile",
-                graph_delta_mode="full_rebuild",
-                status="candidate_ready",
-                elapsed_ms=int(result.get("elapsed_ms") or elapsed_ms),
-                trace_summary_path=str((result.get("trace") or {}).get("summary_path") or "") if isinstance(result.get("trace"), Mapping) else "",
-                evidence={
-                    "phase": "candidate_ready",
-                    "activate_requested": activate_requested,
-                    "idempotency_scope": idempotency_scope,
-                    "request_id": str(ctx.request_id),
-                },
-                created_at=request_started_at,
-            )
-            conn.commit()
-
         if not activate_requested:
             result["activated"] = False
             result.setdefault("candidate_only", True)
@@ -70832,7 +70813,13 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 snapshot_id=graph_epoch_snapshot_id,
                 target_commit_sha=target_commit,
             )
-            if merge_queue_id and queue_item_id:
+            if resumed_candidate:
+                result["merge_queue_graph_epoch_auto_record"] = {
+                    "status": "skipped",
+                    "recorded": False,
+                    "reason": "resumed_candidate_read_only",
+                }
+            elif merge_queue_id and queue_item_id:
                 result["merge_queue_graph_epoch_auto_record"] = record_merge_queue_graph_epoch_after_reconcile(
                     conn,
                     project_id=project_id,
@@ -70858,7 +70845,8 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     "recorded": False,
                     "reason": "candidate_only_without_explicit_merge_queue_scope",
                 }
-            conn.commit()
+            if not resumed_candidate:
+                conn.commit()
             return (200 if resumed_candidate else 201), result
 
         from .db import sqlite_write_lock
@@ -71252,6 +71240,8 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             result["current_full_reconcile_runtime_context_scope"] = dict(runtime_context_scope)
         return (200 if resumed_candidate else 201), result
     finally:
+        if process_build_key is not None:
+            _release_current_full_process_build_key(process_build_key)
         conn.close()
 
 

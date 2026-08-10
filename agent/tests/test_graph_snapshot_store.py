@@ -758,6 +758,130 @@ def test_candidate_ready_terminalization_atomically_fails_persisted_commit_drift
     assert evidence["candidate_released_as_ready"] is False
 
 
+def test_candidate_ready_terminalization_accepts_complete_companion_files(conn):
+    owner = _claim_owner("complete-companions")
+    claim = store.acquire_current_full_build_claim(
+        conn,
+        PID,
+        run_id="run-complete-companions",
+        snapshot_id="full-complete-companions",
+        commit_sha="3" * 40,
+        **owner,
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-complete-companions",
+        commit_sha="3" * 40,
+        snapshot_kind="full",
+        graph_json={"deps_graph": {"nodes": []}},
+        file_inventory=[{"path": "agent/governance/server.py"}],
+        drift_ledger=[],
+        notes=json.dumps({"run_id": "run-complete-companions"}),
+    )
+    conn.commit()
+
+    integrity = store.validate_snapshot_companion_integrity(snapshot)
+    terminal = store.terminalize_current_full_build_claim(
+        conn,
+        PID,
+        claim_id=claim["claim_id"],
+        run_id="run-complete-companions",
+        snapshot_id="full-complete-companions",
+        commit_sha="3" * 40,
+        terminal_status="candidate_ready",
+        manager_start_identity=owner["manager_start_identity"],
+    )
+
+    assert integrity["valid"] is True
+    assert terminal["status"] == "released"
+    assert terminal["terminal_status"] == "candidate_ready"
+
+
+@pytest.mark.parametrize(
+    ("filename", "replacement", "expected_error"),
+    [
+        (
+            "graph.json",
+            b'{"corrupt":true}',
+            "current_full_candidate_graph_companion_hash_mismatch",
+        ),
+        (
+            "file_inventory.json",
+            None,
+            "current_full_candidate_inventory_companion_missing",
+        ),
+    ],
+)
+def test_candidate_ready_terminalization_atomically_fails_companion_corruption(
+    conn,
+    filename,
+    replacement,
+    expected_error,
+):
+    suffix = filename.replace(".", "-")
+    run_id = f"run-companion-{suffix}"
+    snapshot_id = f"full-companion-{suffix}"
+    owner = _claim_owner(suffix)
+    claim = store.acquire_current_full_build_claim(
+        conn,
+        PID,
+        run_id=run_id,
+        snapshot_id=snapshot_id,
+        commit_sha="4" * 40,
+        **owner,
+    )
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=snapshot_id,
+        commit_sha="4" * 40,
+        snapshot_kind="full",
+        graph_json={"deps_graph": {"nodes": []}},
+        file_inventory=[{"path": "agent/governance/server.py"}],
+        drift_ledger=[],
+        notes=json.dumps({"run_id": run_id}),
+    )
+    conn.commit()
+    companion = store.snapshot_companion_dir(PID, snapshot_id) / filename
+    if replacement is None:
+        companion.unlink()
+    else:
+        companion.write_bytes(replacement)
+
+    with pytest.raises(
+        store.GraphSnapshotBuildClaimConflictError,
+        match=expected_error,
+    ):
+        store.terminalize_current_full_build_claim(
+            conn,
+            PID,
+            claim_id=claim["claim_id"],
+            run_id=run_id,
+            snapshot_id=snapshot_id,
+            commit_sha="4" * 40,
+            terminal_status="candidate_ready",
+            manager_start_identity=owner["manager_start_identity"],
+        )
+
+    assert dict(
+        conn.execute(
+            "SELECT status, terminal_status FROM "
+            "graph_current_full_build_claim_history WHERE claim_id = ?",
+            (claim["claim_id"],),
+        ).fetchone()
+    ) == {"status": "released", "terminal_status": "failed"}
+    metric = conn.execute(
+        "SELECT status, evidence_json FROM reconcile_run_metrics "
+        "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+        (PID, run_id, snapshot_id),
+    ).fetchone()
+    assert metric["status"] == "failed"
+    evidence = json.loads(metric["evidence_json"])
+    assert evidence["error"] == expected_error
+    assert evidence["candidate_released_as_ready"] is False
+
+
 def test_reconcile_run_metrics_backfills_from_snapshot_notes(conn, tmp_path):
     _ensure_schema(conn)
     trace_dir = tmp_path / "trace"

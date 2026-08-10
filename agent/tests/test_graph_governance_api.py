@@ -8079,6 +8079,101 @@ def test_current_full_preclaim_commit_fault_never_acquires_process_key(
     ).fetchone()[0] == 0
 
 
+def test_current_full_post_builder_commit_fault_fails_claim_and_releases_key(
+    monkeypatch, tmp_path
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    snapshot_id = "full-post-builder-commit-fault"
+    run_id = "run-post-builder-commit-fault"
+    db_path = tmp_path / "post-builder-commit-fault.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+
+    class PostBuilderCommitFaultConnection(_NoCloseConn):
+        fail_next_commit = False
+
+        def commit(self):
+            if self.fail_next_commit:
+                self.fail_next_commit = False
+                raise RuntimeError("post-builder commit fault")
+            return self._conn.commit()
+
+    wrapped = PostBuilderCommitFaultConnection(connection)
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+
+    def build_then_fault(conn_arg, project_id, _root, **kwargs):
+        calls.append({"project_id": project_id, **kwargs})
+        store.create_graph_snapshot(
+            conn_arg,
+            project_id,
+            snapshot_id=snapshot_id,
+            commit_sha=head,
+            snapshot_kind="full",
+            graph_json=_graph(),
+            notes=json.dumps({"run_id": run_id}),
+        )
+        wrapped.fail_next_commit = True
+        return {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "snapshot_status": "candidate",
+        }
+
+    monkeypatch.setattr(
+        state_reconcile, "run_state_only_full_reconcile", build_then_fault
+    )
+    try:
+        with pytest.raises(RuntimeError, match="post-builder commit fault"):
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "coordinator",
+                    method="POST",
+                    body={
+                        "target_commit_sha": head,
+                        "snapshot_id": snapshot_id,
+                        "run_id": run_id,
+                        "activate": False,
+                        "semantic_enrich": False,
+                    },
+                )
+            )
+
+        assert len(calls) == 1
+        assert (PID, snapshot_id) not in server._CURRENT_FULL_BUILD_KEYS
+        assert dict(
+            connection.execute(
+                "SELECT status, terminal_status FROM "
+                "graph_current_full_build_claim_history WHERE project_id = ? "
+                "AND run_id = ? AND snapshot_id = ?",
+                (PID, run_id, snapshot_id),
+            ).fetchone()
+        ) == {"status": "released", "terminal_status": "failed"}
+        assert connection.execute(
+            "SELECT status FROM reconcile_run_metrics WHERE project_id = ? "
+            "AND run_id = ? AND snapshot_id = ?",
+            (PID, run_id, snapshot_id),
+        ).fetchone()[0] == "failed"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM graph_snapshots WHERE project_id = ? "
+            "AND snapshot_id = ?",
+            (PID, snapshot_id),
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
 def test_current_full_durable_claim_conflict_reports_rebuild_not_started(
     conn, monkeypatch, tmp_path
 ):
@@ -9605,6 +9700,109 @@ def test_current_full_resumed_candidate_has_zero_claim_delta_and_zero_build(
     assert conn.execute(
         "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
     ).fetchone()[0] == claim_count_before
+
+
+def test_current_full_cross_run_resume_is_physically_read_only(
+    monkeypatch, tmp_path
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    snapshot_id = "full-resume-physical-read-only"
+    origin_run_id = "run-resume-physical-origin"
+    consumer_run_id = "run-resume-physical-consumer"
+    db_path = tmp_path / "resume-physical-read-only.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+
+    class CountingConnection(_NoCloseConn):
+        commit_calls = 0
+
+        def commit(self):
+            self.commit_calls += 1
+            return self._conn.commit()
+
+    wrapped = CountingConnection(connection)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    monkeypatch.setattr(
+        server, "get_connection", lambda _project_id: wrapped
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    try:
+        first_status, _first = server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "snapshot_id": snapshot_id,
+                    "run_id": origin_run_id,
+                    "activate": False,
+                    "semantic_enrich": False,
+                },
+            )
+        )
+        assert first_status == 201
+        before_changes = connection.total_changes
+        before_commit_calls = wrapped.commit_calls
+        before_claims = connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0]
+        before_metrics = connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0]
+
+        resumed_status, resumed = (
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "coordinator",
+                    method="POST",
+                    body={
+                        "target_commit_sha": head,
+                        "snapshot_id": snapshot_id,
+                        "run_id": consumer_run_id,
+                        "activate": False,
+                        "semantic_enrich": False,
+                    },
+                )
+            )
+        )
+
+        assert resumed_status == 200
+        assert resumed["resumed_candidate"] is True
+        assert resumed["merge_queue_graph_epoch_auto_record"]["reason"] == (
+            "resumed_candidate_read_only"
+        )
+        assert len(calls) == 1
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commit_calls
+        assert connection.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history"
+        ).fetchone()[0] == before_claims
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics"
+        ).fetchone()[0] == before_metrics
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconcile_run_metrics WHERE project_id = ? "
+            "AND run_id = ? AND snapshot_id = ?",
+            (PID, consumer_run_id, snapshot_id),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT status FROM reconcile_run_metrics WHERE project_id = ? "
+            "AND run_id = ? AND snapshot_id = ?",
+            (PID, origin_run_id, snapshot_id),
+        ).fetchone()[0] == "candidate_ready"
+    finally:
+        connection.close()
 
 
 def test_current_full_snapshot_with_active_claim_cannot_resume_or_mutate(

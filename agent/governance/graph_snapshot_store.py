@@ -698,6 +698,95 @@ def write_companion_files(
     }
 
 
+def validate_snapshot_companion_integrity(
+    snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify the durable snapshot row against its exact companion bytes."""
+
+    project_id = str(snapshot.get("project_id") or "").strip()
+    snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
+    base_dir = snapshot_companion_dir(project_id, snapshot_id)
+    files: dict[str, dict[str, Any]] = {}
+    required = (
+        ("graph", "graph.json", "graph_sha256"),
+        ("inventory", "file_inventory.json", "inventory_sha256"),
+        ("drift", "drift_ledger.json", "drift_sha256"),
+    )
+    for label, filename, hash_field in required:
+        path = base_dir / filename
+        expected_hash = str(snapshot.get(hash_field) or "").strip()
+        try:
+            payload = path.read_bytes()
+        except FileNotFoundError:
+            return {
+                "valid": False,
+                "error": f"current_full_candidate_{label}_companion_missing",
+                "files": files,
+            }
+        except OSError as exc:
+            return {
+                "valid": False,
+                "error": f"current_full_candidate_{label}_companion_unreadable",
+                "files": files,
+                "os_error": type(exc).__name__,
+            }
+        actual_hash = _sha256_bytes(payload)
+        files[label] = {
+            "path": str(path),
+            "expected_sha256": expected_hash,
+            "actual_sha256": actual_hash,
+            "matches": actual_hash == expected_hash,
+        }
+        if actual_hash != expected_hash:
+            return {
+                "valid": False,
+                "error": f"current_full_candidate_{label}_companion_hash_mismatch",
+                "files": files,
+            }
+
+    manifest_path = base_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_bytes().decode("utf-8"))
+    except FileNotFoundError:
+        return {
+            "valid": False,
+            "error": "current_full_candidate_manifest_missing",
+            "files": files,
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {
+            "valid": False,
+            "error": "current_full_candidate_manifest_invalid",
+            "files": files,
+            "manifest_error": type(exc).__name__,
+        }
+    expected_manifest = {
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "graph_sha256": str(snapshot.get("graph_sha256") or "").strip(),
+        "inventory_sha256": str(snapshot.get("inventory_sha256") or "").strip(),
+        "drift_sha256": str(snapshot.get("drift_sha256") or "").strip(),
+    }
+    mismatches = sorted(
+        key
+        for key, value in expected_manifest.items()
+        if not isinstance(manifest, Mapping) or str(manifest.get(key) or "") != value
+    )
+    if mismatches:
+        return {
+            "valid": False,
+            "error": "current_full_candidate_manifest_binding_mismatch",
+            "files": files,
+            "manifest_mismatch_fields": mismatches,
+        }
+    return {
+        "valid": True,
+        "error": "",
+        "files": files,
+        "manifest_path": str(manifest_path),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Snapshot retention policy
 # ---------------------------------------------------------------------------
@@ -4807,6 +4896,7 @@ def terminalize_current_full_build_claim(
     now = utc_now()
     terminalization_error = ""
     persisted_snapshot: dict[str, Any] = {}
+    companion_integrity: dict[str, Any] = {}
     try:
         conn.execute("BEGIN IMMEDIATE")
         claim_row = conn.execute(
@@ -4869,6 +4959,15 @@ def terminalize_current_full_build_claim(
                 terminalization_error = "current_full_candidate_snapshot_run_mismatch"
             elif not expected_hashes_present:
                 terminalization_error = "current_full_candidate_materialization_incomplete"
+            else:
+                companion_integrity = validate_snapshot_companion_integrity(
+                    persisted_snapshot
+                )
+                if not companion_integrity["valid"]:
+                    terminalization_error = str(
+                        companion_integrity.get("error")
+                        or "current_full_candidate_companion_integrity_invalid"
+                    )
         effective_status = "failed" if terminalization_error else status
         effective_evidence = dict(metric_evidence or {})
         if terminalization_error:
@@ -4878,6 +4977,7 @@ def terminalize_current_full_build_claim(
                     "error": terminalization_error,
                     "requested_terminal_status": status,
                     "candidate_released_as_ready": False,
+                    "companion_integrity": companion_integrity,
                 }
             )
         record_reconcile_run_metric(
@@ -4915,7 +5015,11 @@ def terminalize_current_full_build_claim(
     if terminalization_error:
         raise GraphSnapshotBuildClaimConflictError(
             terminalization_error,
-            {**claim, "persisted_snapshot": persisted_snapshot},
+            {
+                **claim,
+                "persisted_snapshot": persisted_snapshot,
+                "companion_integrity": companion_integrity,
+            },
         )
     row = conn.execute(
         "SELECT * FROM graph_current_full_build_claim_history WHERE claim_id = ?",
