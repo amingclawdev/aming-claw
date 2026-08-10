@@ -782,6 +782,20 @@ def test_candidate_ready_terminalization_accepts_complete_companion_files(conn):
     conn.commit()
 
     integrity = store.validate_snapshot_companion_integrity(snapshot)
+    manifest_path = (
+        store.snapshot_companion_dir(PID, snapshot["snapshot_id"])
+        / "manifest.json"
+    )
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    store.write_companion_files(
+        PID,
+        snapshot["snapshot_id"],
+        graph_json={"deps_graph": {"nodes": []}},
+        file_inventory=[{"path": "agent/governance/server.py"}],
+        drift_ledger=[],
+    )
+    assert manifest_path.read_bytes() == manifest_bytes
     terminal = store.terminalize_current_full_build_claim(
         conn,
         PID,
@@ -794,8 +808,76 @@ def test_candidate_ready_terminalization_accepts_complete_companion_files(conn):
     )
 
     assert integrity["valid"] is True
+    assert set(manifest) == {
+        "project_id",
+        "snapshot_id",
+        "graph_sha256",
+        "inventory_sha256",
+        "drift_sha256",
+        "created_at",
+    }
+    assert manifest["created_at"] == snapshot["created_at"]
+    assert manifest_bytes == store._json(manifest).encode("utf-8")
     assert terminal["status"] == "released"
     assert terminal["terminal_status"] == "candidate_ready"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("extra_field", "current_full_candidate_manifest_schema_mismatch"),
+        ("forged_created_at", "current_full_candidate_manifest_binding_mismatch"),
+        ("pretty_json", "current_full_candidate_manifest_not_canonical"),
+        ("reordered_json", "current_full_candidate_manifest_not_canonical"),
+    ],
+)
+def test_snapshot_companion_manifest_is_exactly_bound_and_canonical(
+    conn,
+    mutation,
+    expected_error,
+):
+    snapshot_id = f"full-manifest-exact-{mutation}"
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=snapshot_id,
+        commit_sha="5" * 40,
+        snapshot_kind="full",
+        graph_json={"deps_graph": {"nodes": []}},
+        file_inventory=[],
+        drift_ledger=[],
+    )
+    conn.commit()
+    manifest_path = store.snapshot_companion_dir(PID, snapshot_id) / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    if mutation == "extra_field":
+        manifest["legacy"] = True
+        replacement = store._json(manifest).encode("utf-8")
+    elif mutation == "forged_created_at":
+        manifest["created_at"] = "2026-08-09T00:00:00Z"
+        replacement = store._json(manifest).encode("utf-8")
+    elif mutation == "pretty_json":
+        replacement = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+    elif mutation == "reordered_json":
+        replacement = json.dumps(
+            dict(reversed(list(manifest.items()))),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    else:
+        raise AssertionError(f"unhandled mutation: {mutation}")
+    manifest_path.write_bytes(replacement)
+
+    integrity = store.validate_snapshot_companion_integrity(snapshot)
+
+    assert integrity["valid"] is False
+    assert integrity["error"] == expected_error
+    assert "manifest_path" not in integrity
+    assert all("path" not in value for value in integrity["files"].values())
 
 
 @pytest.mark.parametrize(

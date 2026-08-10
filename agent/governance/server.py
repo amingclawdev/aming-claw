@@ -69945,13 +69945,18 @@ def _current_full_candidate_resume_tuple(
         (project_id, origin_run_id, snapshot_id),
     ).fetchone()
     origin_metric = dict(origin_metric_row) if origin_metric_row else {}
-    origin_metric_evidence_value = _json_loads(
-        origin_metric.get("evidence_json"), None
-    )
+    origin_metric_evidence_raw = origin_metric.get("evidence_json")
+    origin_metric_evidence_value = _json_loads(origin_metric_evidence_raw, None)
     origin_metric_evidence = (
         dict(origin_metric_evidence_value)
         if isinstance(origin_metric_evidence_value, Mapping)
         else {}
+    )
+    origin_metric_evidence_canonical = bool(
+        isinstance(origin_metric_evidence_raw, str)
+        and isinstance(origin_metric_evidence_value, Mapping)
+        and origin_metric_evidence_raw
+        == snapshot_store._json(dict(origin_metric_evidence_value))
     )
     active_claim_count = int(
         conn.execute(
@@ -70022,6 +70027,8 @@ def _current_full_candidate_resume_tuple(
         elif not origin_metric_evidence:
             errors.append("candidate_metric_evidence_missing")
         else:
+            if not origin_metric_evidence_canonical:
+                errors.append("candidate_metric_evidence_not_canonical")
             if str(origin_metric_evidence.get("phase") or "") != "candidate_ready":
                 errors.append("candidate_metric_phase_mismatch")
             if str(origin_metric_evidence.get("claim_id") or "") != str(
@@ -70053,6 +70060,7 @@ def _current_full_candidate_resume_tuple(
         "origin_metric_evidence_valid": bool(
             isinstance(origin_metric_evidence_value, Mapping)
             and origin_metric_evidence
+            and origin_metric_evidence_canonical
             and str(origin_metric_evidence.get("phase") or "")
             == "candidate_ready"
             and str(origin_metric_evidence.get("claim_id") or "")
@@ -70062,6 +70070,7 @@ def _current_full_candidate_resume_tuple(
         "origin_metric_claim_id": str(
             origin_metric_evidence.get("claim_id") or ""
         ),
+        "origin_metric_evidence_canonical": origin_metric_evidence_canonical,
         "request_metric_status": request_metric_status,
         "companion_integrity": companion_integrity,
     }
@@ -70984,6 +70993,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         conn.commit()
         try:
             with sqlite_write_lock():
+                conn.execute("BEGIN IMMEDIATE")
                 # Two same-run requests may both observe candidate_ready before
                 # either acquires the SQLite writer lock.  Recheck terminal
                 # state under the lock so only the winner can append reconcile
@@ -71041,6 +71051,53 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                         target_commit_sha=target_commit,
                         head_commit=head_commit,
                     )
+                locked_snapshot_row = conn.execute(
+                    """
+                    SELECT * FROM graph_snapshots
+                    WHERE project_id = ? AND snapshot_id = ?
+                    """,
+                    (project_id, graph_epoch_snapshot_id),
+                ).fetchone()
+                locked_snapshot = (
+                    dict(locked_snapshot_row) if locked_snapshot_row else {}
+                )
+                locked_notes = _json_loads(locked_snapshot.get("notes"), {})
+                locked_snapshot["notes_payload"] = (
+                    dict(locked_notes)
+                    if isinstance(locked_notes, Mapping)
+                    else {}
+                )
+                locked_request_metric_row = conn.execute(
+                    """
+                    SELECT * FROM reconcile_run_metrics
+                    WHERE project_id = ? AND run_id = ? AND snapshot_id = ?
+                    """,
+                    (project_id, run_id, graph_epoch_snapshot_id),
+                ).fetchone()
+                locked_resume_tuple = _current_full_candidate_resume_tuple(
+                    conn,
+                    project_id=project_id,
+                    run_id=run_id,
+                    target_commit_sha=target_commit,
+                    snapshot=locked_snapshot,
+                    request_metric=(
+                        dict(locked_request_metric_row)
+                        if locked_request_metric_row
+                        else {}
+                    ),
+                )
+                if not locked_resume_tuple.get("valid"):
+                    conn.rollback()
+                    return 409, {
+                        "ok": False,
+                        "project_id": project_id,
+                        "error": "current_full_candidate_resume_tuple_invalid",
+                        "run_id": run_id,
+                        "snapshot_id": graph_epoch_snapshot_id,
+                        "resume_tuple": locked_resume_tuple,
+                        "rebuild_started": False,
+                        "fail_closed": True,
+                    }
                 activation = store.activate_graph_snapshot(
                     conn,
                     project_id,

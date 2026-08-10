@@ -629,6 +629,7 @@ def write_companion_files(
     graph_json: dict[str, Any] | None = None,
     file_inventory: list[dict[str, Any]] | None = None,
     drift_ledger: list[dict[str, Any]] | None = None,
+    created_at: str = "",
 ) -> dict[str, str]:
     base_dir = _snapshot_root(project_id, snapshot_id)
     try:
@@ -681,15 +682,28 @@ def write_companion_files(
             ) from exc
         raise
 
+    manifest_created_at = str(created_at or "").strip()
+    manifest_path = base_dir / "manifest.json"
+    if not manifest_created_at:
+        try:
+            existing_manifest = json.loads(manifest_path.read_bytes())
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+            existing_manifest = {}
+        if isinstance(existing_manifest, Mapping):
+            manifest_created_at = str(
+                existing_manifest.get("created_at") or ""
+            ).strip()
+    if not manifest_created_at:
+        manifest_created_at = utc_now()
     manifest = {
         "project_id": project_id,
         "snapshot_id": snapshot_id,
         "graph_sha256": graph_sha,
         "inventory_sha256": inventory_sha,
         "drift_sha256": drift_sha,
-        "created_at": utc_now(),
+        "created_at": manifest_created_at,
     }
-    (base_dir / "manifest.json").write_text(_json(manifest), encoding="utf-8")
+    manifest_path.write_text(_json(manifest), encoding="utf-8")
     return {
         "graph_sha256": graph_sha,
         "inventory_sha256": inventory_sha,
@@ -732,7 +746,7 @@ def validate_snapshot_companion_integrity(
             }
         actual_hash = _sha256_bytes(payload)
         files[label] = {
-            "path": str(path),
+            "artifact": filename,
             "expected_sha256": expected_hash,
             "actual_sha256": actual_hash,
             "matches": actual_hash == expected_hash,
@@ -746,7 +760,8 @@ def validate_snapshot_companion_integrity(
 
     manifest_path = base_dir / "manifest.json"
     try:
-        manifest = json.loads(manifest_path.read_bytes().decode("utf-8"))
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
     except FileNotFoundError:
         return {
             "valid": False,
@@ -766,11 +781,29 @@ def validate_snapshot_companion_integrity(
         "graph_sha256": str(snapshot.get("graph_sha256") or "").strip(),
         "inventory_sha256": str(snapshot.get("inventory_sha256") or "").strip(),
         "drift_sha256": str(snapshot.get("drift_sha256") or "").strip(),
+        "created_at": str(snapshot.get("created_at") or "").strip(),
     }
+    if not isinstance(manifest, Mapping) or set(manifest) != set(expected_manifest):
+        actual_keys = (
+            sorted(str(key) for key in manifest)
+            if isinstance(manifest, Mapping)
+            else []
+        )
+        return {
+            "valid": False,
+            "error": "current_full_candidate_manifest_schema_mismatch",
+            "files": files,
+            "manifest_missing_fields": sorted(
+                set(expected_manifest) - set(actual_keys)
+            ),
+            "manifest_extra_fields": sorted(
+                set(actual_keys) - set(expected_manifest)
+            ),
+        }
     mismatches = sorted(
         key
         for key, value in expected_manifest.items()
-        if not isinstance(manifest, Mapping) or str(manifest.get(key) or "") != value
+        if str(manifest.get(key) or "") != value
     )
     if mismatches:
         return {
@@ -779,11 +812,17 @@ def validate_snapshot_companion_integrity(
             "files": files,
             "manifest_mismatch_fields": mismatches,
         }
+    if manifest_bytes != _json(dict(manifest)).encode("utf-8"):
+        return {
+            "valid": False,
+            "error": "current_full_candidate_manifest_not_canonical",
+            "files": files,
+        }
     return {
         "valid": True,
         "error": "",
         "files": files,
-        "manifest_path": str(manifest_path),
+        "manifest": {"canonical": True, "bound_created_at": True},
     }
 
 
@@ -1814,14 +1853,15 @@ def create_graph_snapshot(
         ref_value = branch_value
     if ref_value == "active" and not branch_value:
         ref_value = ""
+    now = utc_now()
     shas = write_companion_files(
         project_id,
         sid,
         graph_json=graph_json,
         file_inventory=file_inventory,
         drift_ledger=drift_ledger,
+        created_at=now,
     )
-    now = utc_now()
     conn.execute(
         """
         INSERT INTO graph_snapshots
@@ -1855,6 +1895,7 @@ def create_graph_snapshot(
         "ref_name": ref_value,
         "branch_ref": branch_value,
         "status": status,
+        "created_at": now,
         "path": shas["path"],
         "graph_sha256": shas["graph_sha256"],
         "inventory_sha256": shas["inventory_sha256"],

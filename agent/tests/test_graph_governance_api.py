@@ -9549,6 +9549,142 @@ def test_current_full_reconcile_explicit_candidate_resumes_across_run_ids(
     ).fetchone()[0] == 1
 
 
+def test_current_full_activation_rechecks_candidate_inside_immediate_transaction(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    old_snapshot_id = "full-current-toctou-old"
+    _activate_basic_graph(conn, old_snapshot_id, commit_sha="b" * 40)
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_require_current_full_reconcile_auth",
+        lambda *_args, **_kwargs: {"role_source": "operator_token"},
+    )
+    candidate_status, candidate = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={
+                    "target_commit_sha": head,
+                    "activate": False,
+                    "semantic_enrich": False,
+                    "run_id": "current-full-toctou-build",
+                },
+            )
+        )
+    )
+    assert candidate_status == 201
+    snapshot_id = candidate["candidate_snapshot_id"]
+    manifest_path = store.snapshot_companion_dir(PID, snapshot_id) / "manifest.json"
+    original_validate = store.validate_snapshot_companion_integrity
+    validation_states: list[tuple[bool, bool]] = []
+
+    def validate_with_transaction_state(snapshot):
+        integrity = original_validate(snapshot)
+        validation_states.append((conn.in_transaction, integrity["valid"]))
+        return integrity
+
+    class CorruptBeforeWriterLock:
+        def __enter__(self):
+            assert validation_states == [(False, True)]
+            manifest_path.write_bytes(b"not-json")
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            return False
+
+    monkeypatch.setattr(store, "validate_snapshot_companion_integrity", validate_with_transaction_state)
+    monkeypatch.setattr(
+        "agent.governance.db.sqlite_write_lock",
+        lambda: CorruptBeforeWriterLock(),
+    )
+    before_changes = conn.total_changes
+    before_active = dict(store.get_active_graph_snapshot(conn, PID))
+    before_snapshots = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT snapshot_id, commit_sha, status FROM graph_snapshots "
+            "WHERE project_id = ? ORDER BY snapshot_id",
+            (PID,),
+        ).fetchall()
+    ]
+    before_metrics = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT run_id, snapshot_id, status, evidence_json "
+            "FROM reconcile_run_metrics WHERE project_id = ? "
+            "ORDER BY run_id, snapshot_id",
+            (PID,),
+        ).fetchall()
+    ]
+    before_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+    before_ref_events = conn.execute(
+        "SELECT COUNT(*) FROM graph_ref_events WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx_with_role(
+            {"project_id": PID},
+            "coordinator",
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "activate": True,
+                "semantic_enrich": False,
+                "run_id": "current-full-toctou-activate",
+                "snapshot_id": snapshot_id,
+                "expected_old_snapshot_id": old_snapshot_id,
+            },
+        )
+    )
+
+    assert status == 409
+    assert result["error"] == "current_full_candidate_resume_tuple_invalid"
+    assert result["rebuild_started"] is False
+    assert "current_full_candidate_manifest_invalid" in result["resume_tuple"][
+        "errors"
+    ]
+    assert validation_states == [(False, True), (True, False)]
+    assert conn.in_transaction is False
+    assert conn.total_changes == before_changes
+    assert dict(store.get_active_graph_snapshot(conn, PID)) == before_active
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT snapshot_id, commit_sha, status FROM graph_snapshots "
+            "WHERE project_id = ? ORDER BY snapshot_id",
+            (PID,),
+        ).fetchall()
+    ] == before_snapshots
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT run_id, snapshot_id, status, evidence_json "
+            "FROM reconcile_run_metrics WHERE project_id = ? "
+            "ORDER BY run_id, snapshot_id",
+            (PID,),
+        ).fetchall()
+    ] == before_metrics
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == before_timeline_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_ref_events WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == before_ref_events
+    assert str(tmp_path) not in json.dumps(result, ensure_ascii=False)
+    assert len(calls) == 1
+
+
 def test_current_full_reconcile_explicit_candidate_preserves_stale_cas_refusal(
     conn,
     monkeypatch,
@@ -9854,6 +9990,18 @@ def test_current_full_cross_run_resume_is_physically_read_only(
         ("delete_drift", "current_full_candidate_drift_companion_missing"),
         ("corrupt_manifest", "current_full_candidate_manifest_invalid"),
         (
+            "manifest_extra_field",
+            "current_full_candidate_manifest_schema_mismatch",
+        ),
+        (
+            "manifest_forged_created_at",
+            "current_full_candidate_manifest_binding_mismatch",
+        ),
+        (
+            "manifest_pretty_json",
+            "current_full_candidate_manifest_not_canonical",
+        ),
+        (
             "drift_db_hash",
             "current_full_candidate_graph_companion_hash_mismatch",
         ),
@@ -9910,6 +10058,27 @@ def test_current_full_cross_run_resume_rejects_physical_companion_drift_read_onl
             (companion_dir / "drift_ledger.json").unlink()
         elif mutation == "corrupt_manifest":
             (companion_dir / "manifest.json").write_bytes(b"not-json")
+        elif mutation in {
+            "manifest_extra_field",
+            "manifest_forged_created_at",
+            "manifest_pretty_json",
+        }:
+            manifest_path = companion_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_bytes())
+            if mutation == "manifest_extra_field":
+                manifest["legacy"] = True
+                manifest_bytes = store._json(manifest).encode("utf-8")
+            elif mutation == "manifest_forged_created_at":
+                manifest["created_at"] = "2026-08-09T00:00:00Z"
+                manifest_bytes = store._json(manifest).encode("utf-8")
+            else:
+                manifest_bytes = json.dumps(
+                    manifest,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ).encode("utf-8")
+            manifest_path.write_bytes(manifest_bytes)
         elif mutation == "drift_db_hash":
             connection.execute(
                 "UPDATE graph_snapshots SET graph_sha256 = ? "
@@ -9962,6 +10131,10 @@ def test_current_full_cross_run_resume_rejects_physical_companion_drift_read_onl
         assert result["resume_tuple"]["companion_integrity"]["error"] == (
             expected_error
         )
+        response_json = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        assert str(tmp_path) not in response_json
+        assert str(companion_dir) not in response_json
+        assert "manifest_path" not in response_json
         assert len(calls) == 1
         assert connection.total_changes == before_changes
         assert wrapped.commit_calls == before_commit_calls
@@ -10007,6 +10180,8 @@ def test_current_full_cross_run_resume_rejects_physical_companion_drift_read_onl
         ("wrong_phase", "candidate_metric_phase_mismatch"),
         ("missing_evidence", "candidate_metric_evidence_missing"),
         ("malformed_evidence", "candidate_metric_evidence_malformed"),
+        ("pretty_evidence", "candidate_metric_evidence_not_canonical"),
+        ("reordered_evidence", "candidate_metric_evidence_not_canonical"),
     ],
 )
 def test_current_full_cross_run_resume_rejects_unbound_origin_metric_read_only(
@@ -10088,6 +10263,36 @@ def test_current_full_cross_run_resume_rejects_unbound_origin_metric_read_only(
                 "UPDATE reconcile_run_metrics SET evidence_json = 'not-json' "
                 "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
                 (PID, origin_run_id, snapshot_id),
+            )
+        elif mutation == "pretty_evidence":
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET evidence_json = ? "
+                "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+                (
+                    json.dumps(
+                        evidence,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                    PID,
+                    origin_run_id,
+                    snapshot_id,
+                ),
+            )
+        elif mutation == "reordered_evidence":
+            connection.execute(
+                "UPDATE reconcile_run_metrics SET evidence_json = ? "
+                "WHERE project_id = ? AND run_id = ? AND snapshot_id = ?",
+                (
+                    json.dumps(
+                        dict(reversed(list(evidence.items()))),
+                        ensure_ascii=False,
+                    ),
+                    PID,
+                    origin_run_id,
+                    snapshot_id,
+                ),
             )
         else:
             raise AssertionError(f"unhandled mutation: {mutation}")
