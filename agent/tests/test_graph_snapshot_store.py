@@ -309,6 +309,7 @@ def _insert_terminalization_overlay(
         "source_metric_identity_sequence": source["metric_identity_sequence"],
         "source_raw_status": source["raw_status"],
         "source_fingerprint": source["fingerprint"],
+        "replacement_proof_kind": replacement["proof_kind"],
         "replacement_run_id": replacement["run_id"],
         "replacement_snapshot_id": replacement["snapshot_id"],
         "replacement_metric_identity_sequence": replacement[
@@ -363,6 +364,7 @@ def test_terminalization_append_is_atomic_safe_and_replay_zero_write(conn):
         "terminalization_id_sha256",
         "source_identity_sha256",
         "replacement_identity_sha256",
+        "replacement_count",
         "manager_certificate_hash",
         "ledger_hash",
         "timeline_event_hash",
@@ -436,6 +438,73 @@ def test_terminalization_append_is_atomic_safe_and_replay_zero_write(conn):
         "WHERE event_type='graph.reconcile_run_terminalized'"
     ).fetchall()) == before_events
     assert conn.in_transaction is False
+
+
+def test_terminalization_append_accepts_generation_quiesced_source_without_replacement(
+    conn,
+):
+    fixture = _terminalization_proof_fixture(conn, suffix="generation-quiesced")
+    conn.execute(
+        "DELETE FROM reconcile_run_metrics WHERE project_id=? AND run_id=?",
+        (PID, fixture["replacement_run_id"]),
+    )
+    task_timeline.ensure_schema(conn)
+    conn.commit()
+
+    first = store.record_reconcile_run_terminalization(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+        backlog_id="terminalization-backlog-generation-quiesced",
+        task_id="terminalization-task-generation-quiesced",
+        manager_certificate=fixture["certificate"],
+    )
+
+    assert first["writes_performed"] is True
+    assert first["replayed"] is False
+    assert first["replacement_count"] == 0
+    ledger = dict(conn.execute(
+        "SELECT * FROM graph_reconcile_run_terminalizations "
+        "WHERE project_id=? AND source_run_id=? AND source_snapshot_id=?",
+        (PID, fixture["source_run_id"], fixture["source_snapshot_id"]),
+    ).fetchone())
+    assert ledger["replacement_proof_kind"] == "manager_generation"
+    assert store.reconcile_run_terminalization_overlay(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+    )["effective_status"] == "terminalized_stale"
+
+    store.record_manager_generation_certificate(
+        conn,
+        PID,
+        **_generation(
+            "generation-quiesced-next",
+            manager_pid=5102,
+            prior_manager_pid=int(fixture["certificate"]["manager_pid"]),
+            prior_process_start_identity=str(
+                fixture["certificate"]["process_start_identity"]
+            ),
+            observed_prior_generation_id=str(
+                fixture["certificate"]["generation_id"]
+            ),
+        ),
+    )
+    next_certificate = store.current_manager_generation_certificate(conn, PID)
+    before_changes = conn.total_changes
+    replay = store.record_reconcile_run_terminalization(
+        conn,
+        PID,
+        run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+        backlog_id="terminalization-backlog-generation-quiesced",
+        task_id="terminalization-task-generation-quiesced",
+        manager_certificate=next_certificate,
+    )
+    assert replay == {**first, "writes_performed": False, "replayed": True}
+    assert conn.total_changes == before_changes
 
 
 @pytest.mark.parametrize("fault_stage", ["after_timeline", "after_ledger", "before_commit"])
@@ -771,6 +840,26 @@ def test_terminalization_ledger_schema_is_exact_pk_and_append_only(conn):
     with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
         conn.execute(sql, [malformed[key] for key in columns])
     conn.rollback()
+
+
+def test_terminalization_ledger_schema_migrates_replacement_proof_kind(conn):
+    store.ensure_schema(conn)
+    conn.execute(
+        "ALTER TABLE graph_reconcile_run_terminalizations "
+        "DROP COLUMN replacement_proof_kind"
+    )
+    conn.commit()
+
+    store.ensure_schema(conn)
+
+    columns = {
+        row["name"]: row
+        for row in conn.execute(
+            "PRAGMA table_info(graph_reconcile_run_terminalizations)"
+        ).fetchall()
+    }
+    assert columns["replacement_proof_kind"]["dflt_value"] == "'materialized'"
+    assert columns["replacement_proof_kind"]["notnull"] == 1
 
 
 def test_terminalization_overlay_reader_missing_is_safe_and_read_only(conn):
@@ -1207,15 +1296,14 @@ def test_terminalization_proof_scope_is_type_exact(
             "typed": replacement_value,
         },
     )
-    with pytest.raises(
-        store.ReconcileRunTerminalizationProofError,
-        match="terminalization_replacement_missing",
-    ):
-        store.reconcile_run_terminalization_proof(
-            conn, PID, run_id=fixture["source_run_id"],
-            snapshot_id=fixture["source_snapshot_id"],
-            manager_certificate=fixture["certificate"],
-        )
+    proof = store.reconcile_run_terminalization_proof(
+        conn, PID, run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+        manager_certificate=fixture["certificate"],
+    )
+    assert store.reconcile_run_terminalization_safe_receipt(proof)[
+        "replacement_count"
+    ] == 0
 
 
 def test_terminalization_proof_replacement_zero_one_many_and_active_claim(conn):
@@ -1225,14 +1313,73 @@ def test_terminalization_proof_replacement_zero_one_many_and_active_claim(conn):
         (PID, missing["replacement_run_id"]),
     )
     conn.commit()
+    missing_proof = store.reconcile_run_terminalization_proof(
+        conn, PID, run_id=missing["source_run_id"],
+        snapshot_id=missing["source_snapshot_id"],
+        manager_certificate=missing["certificate"],
+    )
+    assert store.reconcile_run_terminalization_safe_receipt(missing_proof)[
+        "replacement_count"
+    ] == 0
+
+    legacy_invalid = _terminalization_proof_fixture(
+        conn, suffix="legacy-invalid-replacement"
+    )
+    conn.execute(
+        "DELETE FROM reconcile_run_metrics WHERE project_id=? AND run_id=?",
+        (PID, legacy_invalid["replacement_run_id"]),
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="legacy-candidate-without-claim",
+        snapshot_id="full-legacy-candidate-without-claim",
+        commit_sha=legacy_invalid["commit_sha"],
+        snapshot_kind="full",
+        strategy="current_full_reconcile",
+        graph_delta_mode="full_rebuild",
+        status="candidate_ready",
+        evidence={
+            "phase": "candidate_ready",
+            "idempotency_scope": legacy_invalid["source_scope"],
+        },
+        created_at="2026-08-10T00:00:03Z",
+    )
+    conn.commit()
+    legacy_proof = store.reconcile_run_terminalization_proof(
+        conn, PID, run_id=legacy_invalid["source_run_id"],
+        snapshot_id=legacy_invalid["source_snapshot_id"],
+        manager_certificate=legacy_invalid["certificate"],
+    )
+    assert store.reconcile_run_terminalization_safe_receipt(legacy_proof)[
+        "replacement_count"
+    ] == 0
+
+    same_generation = _terminalization_proof_fixture(
+        conn, suffix="same-generation"
+    )
+    conn.execute(
+        "DELETE FROM reconcile_run_metrics WHERE project_id=? AND run_id=?",
+        (PID, same_generation["replacement_run_id"]),
+    )
+    conn.execute(
+        "UPDATE reconcile_run_metrics SET created_at='2026-08-10T00:00:10Z' "
+        "WHERE project_id=? AND run_id=? AND snapshot_id=?",
+        (
+            PID,
+            same_generation["source_run_id"],
+            same_generation["source_snapshot_id"],
+        ),
+    )
+    conn.commit()
     with pytest.raises(
         store.ReconcileRunTerminalizationProofError,
-        match="terminalization_replacement_missing",
+        match="terminalization_source_not_generation_quiesced",
     ):
         store.reconcile_run_terminalization_proof(
-            conn, PID, run_id=missing["source_run_id"],
-            snapshot_id=missing["source_snapshot_id"],
-            manager_certificate=missing["certificate"],
+            conn, PID, run_id=same_generation["source_run_id"],
+            snapshot_id=same_generation["source_snapshot_id"],
+            manager_certificate=same_generation["certificate"],
         )
 
     many = _terminalization_proof_fixture(conn, suffix="many")
@@ -1435,15 +1582,14 @@ def test_terminalization_proof_uses_strict_utc_instants_and_duplicate_free_json(
         (PID, fixture["replacement_run_id"], fixture["replacement_snapshot_id"]),
     )
     conn.commit()
-    with pytest.raises(
-        store.ReconcileRunTerminalizationProofError,
-        match="terminalization_replacement_missing",
-    ):
-        store.reconcile_run_terminalization_proof(
-            conn, PID, run_id=fixture["source_run_id"],
-            snapshot_id=fixture["source_snapshot_id"],
-            manager_certificate=fixture["certificate"],
-        )
+    proof = store.reconcile_run_terminalization_proof(
+        conn, PID, run_id=fixture["source_run_id"],
+        snapshot_id=fixture["source_snapshot_id"],
+        manager_certificate=fixture["certificate"],
+    )
+    assert store.reconcile_run_terminalization_safe_receipt(proof)[
+        "replacement_count"
+    ] == 0
 
     conn.execute(
         "UPDATE reconcile_run_metrics SET created_at='2026-08-10T00:00:00Z', "

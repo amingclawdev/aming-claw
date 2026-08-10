@@ -412,6 +412,8 @@ CREATE TABLE IF NOT EXISTS graph_reconcile_run_terminalizations (
   source_metric_identity_sequence INTEGER NOT NULL CHECK(source_metric_identity_sequence > 0),
   source_raw_status TEXT NOT NULL CHECK(source_raw_status IN ('running','finalizing')),
   source_fingerprint TEXT NOT NULL,
+  replacement_proof_kind TEXT NOT NULL DEFAULT 'materialized'
+    CHECK(replacement_proof_kind IN ('materialized','manager_generation')),
   replacement_run_id TEXT NOT NULL,
   replacement_snapshot_id TEXT NOT NULL,
   replacement_metric_identity_sequence INTEGER NOT NULL CHECK(replacement_metric_identity_sequence > 0),
@@ -526,6 +528,7 @@ def utc_now() -> str:
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(GRAPH_SNAPSHOT_SCHEMA_SQL)
     _ensure_graph_snapshot_ref_columns(conn)
+    _ensure_reconcile_terminalization_ledger_columns(conn)
     _migrate_pending_scope_reconcile_branch_identity(conn)
 
 
@@ -1015,6 +1018,20 @@ def _ensure_graph_snapshot_ref_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE graph_snapshots ADD COLUMN ref_name TEXT NOT NULL DEFAULT ''")
     if "branch_ref" not in columns:
         conn.execute("ALTER TABLE graph_snapshots ADD COLUMN branch_ref TEXT NOT NULL DEFAULT ''")
+
+
+def _ensure_reconcile_terminalization_ledger_columns(
+    conn: sqlite3.Connection,
+) -> None:
+    if not _table_exists(conn, "graph_reconcile_run_terminalizations"):
+        return
+    columns = _table_columns(conn, "graph_reconcile_run_terminalizations")
+    if "replacement_proof_kind" not in columns:
+        conn.execute(
+            "ALTER TABLE graph_reconcile_run_terminalizations ADD COLUMN "
+            "replacement_proof_kind TEXT NOT NULL DEFAULT 'materialized' "
+            "CHECK(replacement_proof_kind IN ('materialized','manager_generation'))"
+        )
 
 
 def _migrate_pending_scope_reconcile_branch_identity(conn: sqlite3.Connection) -> None:
@@ -4198,10 +4215,34 @@ def _terminalization_replacements(
                 snapshot_id=replacement_row["snapshot_id"],
             )
         if not c1_proof.get("valid"):
-            invalid_seen = True
+            if conn.execute(
+                "SELECT 1 FROM graph_current_full_build_claim_history "
+                "WHERE project_id=? AND snapshot_id=? LIMIT 1",
+                (project_id, replacement_row["snapshot_id"]),
+            ).fetchone():
+                invalid_seen = True
             continue
         replacements.append(replacement)
     return replacements, invalid_seen
+
+
+def _terminalization_generation_replacement(
+    source: Mapping[str, Any], certificate: Mapping[str, Any]
+) -> dict[str, Any]:
+    _terminalization_require(
+        source["created_at_dt"] < _terminalization_utc(
+            certificate.get("manager_started_at")
+        ),
+        "terminalization_source_not_generation_quiesced",
+    )
+    return {
+        "proof_kind": "manager_generation",
+        "run_id": "",
+        "snapshot_id": "",
+        "metric_identity_sequence": int(certificate["sequence"]),
+        "raw_status": "complete",
+        "fingerprint": str(certificate["certificate_hash"]),
+    }
 
 
 def _terminalization_source_is_stale(
@@ -4249,22 +4290,21 @@ def reconcile_run_terminalization_proof(
         conn, project, source
     )
     _terminalization_require(
-        replacements,
-        (
-            "terminalization_replacement_invalid"
-            if invalid_replacement_seen
-            else "terminalization_replacement_missing"
-        ),
+        not invalid_replacement_seen, "terminalization_replacement_invalid"
     )
     _terminalization_require(
-        len(replacements) == 1, "terminalization_replacement_ambiguous"
+        len(replacements) <= 1, "terminalization_replacement_ambiguous"
     )
-    replacement = replacements[0]
+    replacement = (
+        {**replacements[0]["sealed"], "proof_kind": "materialized"}
+        if replacements
+        else _terminalization_generation_replacement(source, certificate)
+    )
     payload = {
         "schema_version": "reconcile_run_terminalization.proof.v1",
         "project_id": project,
         "source": source["sealed"],
-        "replacement": replacement["sealed"],
+        "replacement": replacement,
         "manager_certificate": certificate,
     }
     return _ReconcileRunTerminalizationProof(payload)
@@ -4284,6 +4324,7 @@ def reconcile_run_terminalization_safe_receipt(
     source = payload["source"]
     replacement = payload["replacement"]
     certificate = payload["manager_certificate"]
+    replacement_count = 1 if replacement["proof_kind"] == "materialized" else 0
     return {
         "schema_version": "reconcile_run_terminalization.safe_receipt.v1",
         "source_identity_sha256": _stable_sha256(
@@ -4292,32 +4333,39 @@ def reconcile_run_terminalization_safe_receipt(
         "source_fingerprint": source["fingerprint"],
         "replacement_identity_sha256": _stable_sha256(
             ["terminalization", payload["project_id"], replacement["run_id"], replacement["snapshot_id"]]
+            if replacement_count == 1
+            else [
+                "terminalization",
+                "manager_generation",
+                payload["project_id"],
+                certificate["certificate_id"],
+            ]
         ),
         "replacement_fingerprint": replacement["fingerprint"],
         "manager_certificate_hash": certificate["certificate_hash"],
         "proof_sha256": proof._seal,
-        "replacement_count": 1,
+        "replacement_count": replacement_count,
         "server_derived": True,
     }
 
 
 def _terminalization_proof_snapshot_ids(
     proof: _ReconcileRunTerminalizationProof,
-) -> tuple[str, str]:
-    """Return the two process-fence identities from one sealed store proof."""
+) -> tuple[str, ...]:
+    """Return every process-fence snapshot identity from one sealed proof."""
 
     reconcile_run_terminalization_safe_receipt(proof)
     payload = json.loads(proof._canonical)
-    return (
-        str(payload["source"]["snapshot_id"]),
-        str(payload["replacement"]["snapshot_id"]),
-    )
+    snapshot_ids = [str(payload["source"]["snapshot_id"])]
+    if payload["replacement"]["proof_kind"] == "materialized":
+        snapshot_ids.append(str(payload["replacement"]["snapshot_id"]))
+    return tuple(snapshot_ids)
 
 
 _RECONCILE_TERMINALIZATION_LEDGER_FIELDS = (
     "terminalization_id", "project_id", "source_run_id", "source_snapshot_id",
     "source_metric_identity_sequence", "source_raw_status", "source_fingerprint",
-    "replacement_run_id", "replacement_snapshot_id",
+    "replacement_proof_kind", "replacement_run_id", "replacement_snapshot_id",
     "replacement_metric_identity_sequence", "replacement_raw_status",
     "replacement_fingerprint", "manager_certificate_id",
     "manager_certificate_hash", "timeline_event_id", "timeline_event_hash",
@@ -4490,37 +4538,44 @@ def reconcile_run_terminalization_overlay(
             _terminalization_source_is_stale(conn, project_id, snapshot_id),
             "terminalization_source_not_stale",
         )
-        replacements, invalid_seen = _terminalization_replacements(
-            conn, project_id, source
-        )
-        _terminalization_require(
-            not invalid_seen and len(replacements) == 1,
-            "terminalization_replacement_invalid",
-        )
-        replacement = replacements[0]
-        _terminalization_require(
-            ledger["replacement_run_id"] == replacement["sealed"]["run_id"]
-            and ledger["replacement_snapshot_id"]
-            == replacement["sealed"]["snapshot_id"]
-            and ledger["replacement_metric_identity_sequence"]
-            == replacement["sealed"]["metric_identity_sequence"]
-            and ledger["replacement_raw_status"]
-            == replacement["sealed"]["raw_status"]
-            and hmac.compare_digest(
-                ledger["replacement_fingerprint"],
-                replacement["sealed"]["fingerprint"],
-            ),
-            "terminalization_replacement_drift",
-        )
         certificate = _terminalization_historical_certificate(
             conn, project_id, ledger["manager_certificate_id"],
             ledger["manager_certificate_hash"],
+        )
+        replacement_kind = ledger["replacement_proof_kind"]
+        if replacement_kind == "materialized":
+            replacements, invalid_seen = _terminalization_replacements(
+                conn, project_id, source
+            )
+            _terminalization_require(
+                not invalid_seen and len(replacements) == 1,
+                "terminalization_replacement_invalid",
+            )
+            replacement = {
+                **replacements[0]["sealed"],
+                "proof_kind": "materialized",
+            }
+        else:
+            replacement = _terminalization_generation_replacement(
+                source, certificate
+            )
+        _terminalization_require(
+            ledger["replacement_run_id"] == replacement["run_id"]
+            and ledger["replacement_snapshot_id"] == replacement["snapshot_id"]
+            and ledger["replacement_metric_identity_sequence"]
+            == replacement["metric_identity_sequence"]
+            and ledger["replacement_raw_status"] == replacement["raw_status"]
+            and hmac.compare_digest(
+                ledger["replacement_fingerprint"],
+                replacement["fingerprint"],
+            ),
+            "terminalization_replacement_drift",
         )
         proof = _ReconcileRunTerminalizationProof({
             "schema_version": "reconcile_run_terminalization.proof.v1",
             "project_id": project_id,
             "source": source["sealed"],
-            "replacement": replacement["sealed"],
+            "replacement": replacement,
             "manager_certificate": certificate,
         })
         safe_receipt = reconcile_run_terminalization_safe_receipt(proof)
@@ -4546,15 +4601,28 @@ def reconcile_run_terminalization_overlay(
             conn, project_id, run_id, snapshot_id,
             allowed_statuses=frozenset({"running", "finalizing"}),
         )
-        replacements_after, invalid_after = _terminalization_replacements(
-            conn, project_id, source_after
-        )
+        if replacement_kind == "materialized":
+            replacements_after, invalid_after = _terminalization_replacements(
+                conn, project_id, source_after
+            )
+            replacement_after = (
+                {
+                    **replacements_after[0]["sealed"],
+                    "proof_kind": "materialized",
+                }
+                if len(replacements_after) == 1
+                else {}
+            )
+        else:
+            invalid_after = False
+            replacement_after = _terminalization_generation_replacement(
+                source_after, certificate
+            )
         _terminalization_require(
             source_after["sealed"] == source["sealed"]
             and _terminalization_source_is_stale(conn, project_id, snapshot_id)
             and not invalid_after
-            and len(replacements_after) == 1
-            and replacements_after[0]["sealed"] == replacement["sealed"]
+            and replacement_after == replacement
             and int(conn.execute("PRAGMA data_version").fetchone()[0])
             == data_version,
             "terminalization_overlay_state_changed",
@@ -4582,6 +4650,7 @@ def reconcile_run_terminalization_overlay(
         ),
         "source_identity_sha256": safe_receipt["source_identity_sha256"],
         "replacement_identity_sha256": safe_receipt["replacement_identity_sha256"],
+        "replacement_count": safe_receipt["replacement_count"],
         "ledger_hash": ledger["ledger_hash"],
         "timeline_event_hash": ledger["timeline_event_hash"],
         "manager_certificate_hash": ledger["manager_certificate_hash"],
@@ -4602,6 +4671,7 @@ def _terminalization_append_receipt(
         "terminalization_id_sha256": overlay["terminalization_id_sha256"],
         "source_identity_sha256": overlay["source_identity_sha256"],
         "replacement_identity_sha256": overlay["replacement_identity_sha256"],
+        "replacement_count": int(overlay["replacement_count"]),
         "manager_certificate_hash": overlay["manager_certificate_hash"],
         "ledger_hash": overlay["ledger_hash"],
         "timeline_event_hash": overlay["timeline_event_hash"],
@@ -4764,6 +4834,7 @@ def record_reconcile_run_terminalization(
                 "source_metric_identity_sequence": source["metric_identity_sequence"],
                 "source_raw_status": source["raw_status"],
                 "source_fingerprint": source["fingerprint"],
+                "replacement_proof_kind": replacement["proof_kind"],
                 "replacement_run_id": replacement["run_id"],
                 "replacement_snapshot_id": replacement["snapshot_id"],
                 "replacement_metric_identity_sequence": replacement[
