@@ -117633,6 +117633,8 @@ def _onboard_guide_capsule_bounded_copy(
                     break
                 key = str(raw_key)
                 if _onboard_guide_capsule_key_is_raw_auth(key):
+                    if child == f"<host-realized {key}>":
+                        projected[key] = child
                     continue
                 projected[key] = project(child, depth + 1)
             return projected
@@ -117763,11 +117765,6 @@ def _guide_executable_action_safe_body(
 
     def project(item: Any, item_path: str, key: str = "") -> Any:
         if key in _GUIDE_RAW_AUTH_BODY_FIELDS:
-            if isinstance(item, str) and (
-                item.startswith("<") or item.startswith("env:")
-            ):
-                replacements.append(item_path)
-                return item
             replacements.append(item_path)
             return f"<host-realized {key}>"
         if isinstance(item, Mapping):
@@ -119240,6 +119237,11 @@ def _onboard_worker_read_runtime_facade_projection(
         "fence_token_env",
     ):
         body.pop(redundant_field, None)
+    # A completed initial join may project only its safe ref.  Keep the raw
+    # authorization slots explicit so the host can spread the process-local
+    # envelope into exactly the declared paths before the read-receipt write.
+    body["session_token"] = "<host-realized session_token>"
+    body["fence_token"] = "<host-realized fence_token>"
     required_body = {
         "project_id": project_id,
         "runtime_context_id": runtime_context_id,

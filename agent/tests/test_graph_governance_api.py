@@ -108501,6 +108501,32 @@ def test_compact_worker_read_projects_registry_verified_route_cutover(
     assert refreshed_section["canonical_executable_action"].get("mcp_tool") == (
         "runtime_context_read_receipt"
     ), refreshed_section["canonical_executable_action"]
+    read_action = refreshed_section["canonical_executable_action"]
+    read_body = read_action["copy_safe_body"]
+    required_paths = read_action["host_realization"]["required_replacement_paths"]
+    assert read_body["session_token"].startswith("<")
+    assert read_body["fence_token"].startswith("<")
+    assert "copy_safe_body.session_token" in required_paths
+    assert "copy_safe_body.fence_token" in required_paths
+
+    realized_read_body = dict(read_body)
+    host_values = {
+        "copy_safe_body.session_token": joined["session_token"],
+        "copy_safe_body.fence_token": joined["fence_token"],
+        "copy_safe_body.read_receipt_hash": _fake_sha("route-cutover-receipt"),
+        "copy_safe_body.launch_text_hash": _fake_sha("route-cutover-launch"),
+    }
+    for path in required_paths:
+        assert path in host_values, path
+        realized_read_body[path.removeprefix("copy_safe_body.")] = host_values[path]
+    assert realized_read_body["session_token"] == joined["session_token"]
+    assert realized_read_body["fence_token"] == joined["fence_token"]
+    assert all(
+        not realized_read_body[
+            path.removeprefix("copy_safe_body.")
+        ].startswith("<")
+        for path in required_paths
+    )
     assert joined["session_token"] not in json.dumps(
         refreshed_section,
         sort_keys=True,
@@ -108605,8 +108631,8 @@ def test_compact_worker_read_projects_current_runtime_context_receipt_facade(
     )
     assert "payload" not in body
     assert "contract_context_read_receipt" not in body
-    assert body["session_token"].startswith("<read from env:")
-    assert body["fence_token"].startswith("<read from env:")
+    assert body["session_token"] == "<host-realized session_token>"
+    assert body["fence_token"] == "<host-realized fence_token>"
     assert action["host_realization"]["required_replacement_paths"]
     hash_contract = action["host_realization"]["hash_replacement_contract"]
     assert hash_contract["schema_version"] == (
@@ -146234,6 +146260,57 @@ def test_guide_canonical_executable_action_is_secret_safe_and_schema_shaped():
         "replayed_request": "reject_zero_write",
         "unrealized_placeholder": "reject_zero_write",
         "raw_secret_exposed": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "raw_auth",
+    [
+        "env:raw-shaped-secret",
+        "<marker-shaped-raw-secret>",
+        "ordinary-raw-secret",
+        {"nested": "raw-secret"},
+    ],
+)
+def test_guide_normal_action_never_trusts_auth_placeholder_shapes(raw_auth):
+    action = server._guide_canonical_executable_action(
+        project_id=PID,
+        action="record_runtime_context_read_receipt",
+        mcp_tool="runtime_context_read_receipt",
+        body={
+            "session_token": raw_auth,
+            "fence_token": raw_auth,
+        },
+    )
+
+    assert action["copy_safe_body"]["session_token"] == (
+        "<host-realized session_token>"
+    )
+    assert action["copy_safe_body"]["fence_token"] == (
+        "<host-realized fence_token>"
+    )
+    assert action["host_realization"]["required_replacement_paths"] == [
+        "copy_safe_body.session_token",
+        "copy_safe_body.fence_token",
+    ]
+    if isinstance(raw_auth, str):
+        assert raw_auth not in json.dumps(action, sort_keys=True)
+
+
+def test_guide_capsule_retains_only_exact_host_realized_auth_placeholders():
+    projected = server._onboard_guide_capsule_bounded_copy(
+        {
+            "session_token": "<host-realized session_token>",
+            "fence_token": "env:raw-fence-shaped-secret",
+            "route_token": "<raw-route-shaped-secret>",
+            "qa_session_token": "raw-qa-secret",
+            "safe_ref": "session-token-ref:copy-safe",
+        }
+    )
+
+    assert projected == {
+        "session_token": "<host-realized session_token>",
+        "safe_ref": "session-token-ref:copy-safe",
     }
 
 
