@@ -140404,9 +140404,18 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             raw_scope = json.loads(root_registry_row["scope_json"] or "")
             registry_json_valid = bool(
                 isinstance(raw_actions, list)
-                and all(isinstance(item, str) and item.strip() for item in raw_actions)
+                and raw_actions
+                and all(
+                    isinstance(item, str) and item == item.strip() and item
+                    for item in raw_actions
+                )
+                and len(raw_actions) == len(set(raw_actions))
                 and isinstance(raw_refs, list)
-                and all(isinstance(item, str) and item.strip() for item in raw_refs)
+                and all(
+                    isinstance(item, str) and item == item.strip() and item
+                    for item in raw_refs
+                )
+                and len(raw_refs) == len(set(raw_refs))
                 and isinstance(raw_scope, dict)
             )
             if registry_json_valid:
@@ -140437,6 +140446,9 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         and str(root_registry_row["caller_role"] or "") == "observer"
         and historical_action
         and historical_action in registry_actions
+        and registry_actions.issubset(
+            set(_OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS)
+        )
         and historical_refs.issubset(registry_refs)
         and registry_scope == expected_scope
         and isinstance(historical_scope, Mapping)

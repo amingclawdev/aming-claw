@@ -87790,6 +87790,66 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         ),
         (
             "observer_materialized",
+            "root_route_registry_non_direct_action",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_unknown_action",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_wildcard_action",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_duplicate_action",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_noncanonical_action",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_duplicate_ref",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_noncanonical_ref",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_extra_ref",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_minimal_actions",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_live_actions",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
             "root_route_registry_required_ref_removed",
             False,
             "active_root_route_registry_authority",
@@ -88266,6 +88326,16 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "root_route_registry_revoked",
             "root_route_registry_tampered",
             "root_route_registry_action_removed",
+            "root_route_registry_non_direct_action",
+            "root_route_registry_unknown_action",
+            "root_route_registry_wildcard_action",
+            "root_route_registry_duplicate_action",
+            "root_route_registry_noncanonical_action",
+            "root_route_registry_duplicate_ref",
+            "root_route_registry_noncanonical_ref",
+            "root_route_registry_extra_ref",
+            "root_route_registry_minimal_actions",
+            "root_route_registry_live_actions",
             "root_route_registry_required_ref_removed",
             "root_route_registry_scope_tampered",
             "root_route_registry_malformed_json",
@@ -88295,6 +88365,16 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "root_route_registry_revoked",
             "root_route_registry_tampered",
             "root_route_registry_action_removed",
+            "root_route_registry_non_direct_action",
+            "root_route_registry_unknown_action",
+            "root_route_registry_wildcard_action",
+            "root_route_registry_duplicate_action",
+            "root_route_registry_noncanonical_action",
+            "root_route_registry_duplicate_ref",
+            "root_route_registry_noncanonical_ref",
+            "root_route_registry_extra_ref",
+            "root_route_registry_minimal_actions",
+            "root_route_registry_live_actions",
             "root_route_registry_required_ref_removed",
             "root_route_registry_scope_tampered",
             "root_route_registry_malformed_json",
@@ -88430,6 +88510,79 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             """,
             (json.dumps(["backlog_close"]), PID, close_route_token_ref),
         )
+    elif tamper in {
+        "root_route_registry_non_direct_action",
+        "root_route_registry_unknown_action",
+        "root_route_registry_wildcard_action",
+        "root_route_registry_duplicate_action",
+        "root_route_registry_noncanonical_action",
+        "root_route_registry_minimal_actions",
+        "root_route_registry_live_actions",
+    }:
+        action_sets = {
+            "root_route_registry_non_direct_action": [
+                "backlog_close",
+                "task_timeline_append",
+                "mf_parallel_enter",
+            ],
+            "root_route_registry_unknown_action": [
+                "backlog_close",
+                "task_timeline_append",
+                "unknown_route_action",
+            ],
+            "root_route_registry_wildcard_action": [
+                "backlog_close",
+                "task_timeline_append",
+                "*",
+            ],
+            "root_route_registry_duplicate_action": [
+                "backlog_close",
+                "task_timeline_append",
+                "task_timeline_append",
+            ],
+            "root_route_registry_noncanonical_action": [
+                "backlog_close",
+                "task_timeline_append",
+                "task_timeline_append ",
+            ],
+            "root_route_registry_minimal_actions": ["task_timeline_append"],
+            "root_route_registry_live_actions": [
+                "graph_query",
+                "task_timeline_append",
+                "observer_direct_mutation_exception",
+            ],
+        }
+        conn.execute(
+            """
+            UPDATE observer_route_token_refs SET allowed_actions_json = ?
+            WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (json.dumps(action_sets[tamper]), PID, close_route_token_ref),
+        )
+    elif tamper in {
+        "root_route_registry_duplicate_ref",
+        "root_route_registry_noncanonical_ref",
+        "root_route_registry_extra_ref",
+    }:
+        required_ref = f"contract_runtime:{parent_execution_id}"
+        refs = {
+            "root_route_registry_duplicate_ref": [required_ref, required_ref],
+            "root_route_registry_noncanonical_ref": [
+                required_ref,
+                f"{required_ref} ",
+            ],
+            "root_route_registry_extra_ref": [
+                required_ref,
+                f"graph_query_trace:{graph_trace_id}",
+            ],
+        }[tamper]
+        conn.execute(
+            """
+            UPDATE observer_route_token_refs SET evidence_refs_json = ?
+            WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (json.dumps(refs), PID, close_route_token_ref),
+        )
     elif tamper == "root_route_registry_required_ref_removed":
         conn.execute(
             """
@@ -88533,6 +88686,33 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             ),
         )
 
+    actual_close_route_token_ref = close_route_token_ref
+    if tamper in {
+        "root_route_registry_minimal_actions",
+        "root_route_registry_live_actions",
+        "root_route_registry_expired_history",
+        "root_route_registry_superseded_history",
+    }:
+        actual_close_route_token_ref = f"{close_route_token_ref}-request"
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=actual_close_route_token_ref,
+            token={
+                **route_identity,
+                "route_token_ref": actual_close_route_token_ref,
+                "caller_role": "observer",
+                "allowed_actions": ["backlog_close"],
+                "scope": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": parent_execution_id,
+                },
+                "expires_at": "2999-01-01T00:00:00Z",
+                "evidence_refs": [f"contract_runtime:{parent_execution_id}"],
+            },
+        )
+
     monkeypatch.setattr(
         server,
         "_runtime_context_child_lane_close_authority_projection",
@@ -88592,6 +88772,13 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         "root_route_registry_revoked",
         "root_route_registry_tampered",
         "root_route_registry_action_removed",
+        "root_route_registry_non_direct_action",
+        "root_route_registry_unknown_action",
+        "root_route_registry_wildcard_action",
+        "root_route_registry_duplicate_action",
+        "root_route_registry_noncanonical_action",
+        "root_route_registry_duplicate_ref",
+        "root_route_registry_noncanonical_ref",
         "root_route_registry_required_ref_removed",
         "root_route_registry_scope_tampered",
         "root_route_registry_malformed_json",
@@ -88735,19 +88922,6 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     assert graph_gate["verified_trace_ids"] == [graph_trace_id]
     assert precheck["can_close"] is True
 
-    if tamper in {
-        "root_route_registry_expired_history",
-        "root_route_registry_superseded_history",
-    }:
-        conn.execute(
-            """
-            UPDATE observer_route_token_refs SET status = 'active'
-            WHERE project_id = ? AND route_token_ref = ?
-            """,
-            (PID, close_route_token_ref),
-        )
-        conn.commit()
-
     real_subprocess_run = server.subprocess.run
 
     def fake_commit_verify(args, *run_args, **run_kwargs):
@@ -88764,7 +88938,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 "actor": "observer",
                 "commit": close_commit,
                 "contract_execution_id": parent_execution_id,
-                "route_token_ref": close_route_token_ref,
+                "route_token_ref": actual_close_route_token_ref,
             },
         )
     )
