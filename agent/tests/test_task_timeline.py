@@ -206,6 +206,70 @@ def test_first_deep_text_preserves_scalar_and_nested_shared_identity_parity():
     assert value["route_context_hash"][0] is shared
 
 
+def test_first_deep_mapping_rejects_cycle_and_overdepth_search_without_mutation():
+    from agent.governance import task_timeline
+
+    self_cycle = {}
+    self_cycle["self"] = self_cycle
+    left = {}
+    right = {"left": left}
+    left["right"] = right
+    overdepth = {"leaf": "unchanged"}
+    for _ in range(504):
+        overdepth = {"nested": [overdepth]}
+
+    assert task_timeline._first_deep_mapping(self_cycle, "target") == {}
+    assert task_timeline._first_deep_mapping(left, "target") == {}
+    assert task_timeline._first_deep_mapping(overdepth, "target") == {}
+    assert self_cycle["self"] is self_cycle
+    assert left["right"] is right and right["left"] is left
+
+
+def test_first_deep_mapping_rejects_unsafe_matched_mapping_contents():
+    from agent.governance import task_timeline
+
+    cyclic_gate = {"close_ready": True}
+    cyclic_gate["self"] = cyclic_gate
+    deep_gate = {"close_ready": True}
+    for _ in range(504):
+        deep_gate = {"nested": [deep_gate]}
+    tuple_cycle_list = []
+    tuple_cycle = (tuple_cycle_list,)
+    tuple_cycle_list.append(tuple_cycle)
+    deep_tuple = "leaf"
+    for _ in range(504):
+        deep_tuple = (deep_tuple,)
+
+    for gate in (
+        cyclic_gate,
+        deep_gate,
+        {"trace_ids": tuple_cycle},
+        {"trace_ids": deep_tuple},
+    ):
+        event = {
+            "status": "passed",
+            "event_kind": "mf_subagent_finish_gate",
+            "payload": {"mf_subagent_finish_gate": gate},
+        }
+        assert task_timeline._first_deep_mapping(
+            event, "mf_subagent_finish_gate"
+        ) == {}
+        assert task_timeline._mf_subagent_finish_gate_projection(event) == {}
+        assert "mf_subagent_startup" not in task_timeline._route_event_categories(event)
+    assert cyclic_gate["self"] is cyclic_gate
+
+
+def test_first_deep_mapping_preserves_shallow_nested_and_shared_dag_parity():
+    from agent.governance import task_timeline
+
+    shared = {"trace_ids": ["trace-shared"]}
+    target = {"left": shared, "right": shared, "close_ready": True}
+    value = {"outer": [{"target": target}]}
+
+    assert task_timeline._first_deep_mapping(value, "target") is target
+    assert target["left"] is target["right"] is shared
+
+
 def _terminalization_timeline_args():
     return {
         "project_id": "proj",

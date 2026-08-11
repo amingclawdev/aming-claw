@@ -5474,20 +5474,68 @@ def _route_architecture_review_required(
     return False
 
 
-def _first_deep_mapping(value: Any, key: str) -> dict[str, Any]:
-    if isinstance(value, dict):
-        if key in value and isinstance(value.get(key), dict):
-            return value.get(key) or {}
-        for child in value.values():
-            found = _first_deep_mapping(child, key)
+_ROUTE_IDENTITY_TRAVERSAL_MAX_DEPTH = 128
+
+
+def _route_identity_container_graph_safe(
+    value: Any, depth: int, active_ids: set[int]
+) -> bool:
+    if not isinstance(value, (dict, list, tuple)):
+        return True
+    if depth > _ROUTE_IDENTITY_TRAVERSAL_MAX_DEPTH:
+        return False
+    container_id = id(value)
+    if container_id in active_ids:
+        return False
+    active_ids.add(container_id)
+    try:
+        children = value.values() if isinstance(value, dict) else value
+        return all(
+            _route_identity_container_graph_safe(child, depth + 1, active_ids)
+            for child in children
+        )
+    finally:
+        active_ids.remove(container_id)
+
+
+def _first_deep_mapping(
+    value: Any,
+    key: str,
+    *,
+    _depth: int = 0,
+    _active_container_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    if (
+        _depth > _ROUTE_IDENTITY_TRAVERSAL_MAX_DEPTH
+        or not isinstance(value, (dict, list))
+    ):
+        return {}
+    container_id = id(value)
+    active_ids = _active_container_ids if _active_container_ids is not None else set()
+    if container_id in active_ids:
+        return {}
+    active_ids.add(container_id)
+    try:
+        if isinstance(value, dict):
+            if key in value and isinstance(value.get(key), dict):
+                candidate = value.get(key) or {}
+                if _route_identity_container_graph_safe(
+                    candidate, _depth + 1, active_ids
+                ):
+                    return candidate
+                return {}
+            children = value.values()
+        else:
+            children = value
+        for child in children:
+            found = _first_deep_mapping(
+                child, key, _depth=_depth + 1, _active_container_ids=active_ids
+            )
             if found:
                 return found
-    elif isinstance(value, list):
-        for child in value:
-            found = _first_deep_mapping(child, key)
-            if found:
-                return found
-    return {}
+        return {}
+    finally:
+        active_ids.remove(container_id)
 
 
 def _first_deep_value(value: Any, key: str) -> Any:
@@ -5504,9 +5552,6 @@ def _first_deep_value(value: Any, key: str) -> Any:
             if found not in (None, "", [], {}):
                 return found
     return None
-
-
-_ROUTE_IDENTITY_TRAVERSAL_MAX_DEPTH = 128
 
 
 def _first_deep_text(
