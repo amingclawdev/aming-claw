@@ -84,6 +84,52 @@ STRICT_GOVERNANCE_POLICY = {
 }
 
 
+def test_first_deep_text_rejects_self_cycle_without_mutation():
+    from agent.governance import task_timeline
+
+    value = {}
+    value["self"] = value
+    assert task_timeline._first_deep_text(value, "route_context_hash") == ""
+    assert value["self"] is value
+
+
+def test_route_identity_rejects_two_container_cycle_without_mutation():
+    from agent.governance import task_timeline
+
+    parent = {}
+    child = {"parent": parent}
+    parent["child"] = child
+    assert task_timeline._route_identity(parent) == {}
+    assert parent["child"] is child
+    assert child["parent"] is parent
+
+
+def test_route_identity_rejects_overdepth_identity_without_mutation():
+    from agent.governance import task_timeline
+
+    value = {**ROUTE_IDENTITY, "route_id": "route-overdepth"}
+    for _ in range(504):
+        value = {"nested": [value]}
+    original = value
+    assert task_timeline._route_identity(value) == {}
+    for _ in range(504):
+        value = value["nested"][0]
+    assert value == {**ROUTE_IDENTITY, "route_id": "route-overdepth"}
+    assert original["nested"]
+
+
+def test_route_identity_preserves_shallow_and_shared_acyclic_parity():
+    from agent.governance import task_timeline
+
+    identity = {**ROUTE_IDENTITY, "route_id": "route-shallow"}
+    shared = {"identity": identity}
+    value = {"left": shared, "right": shared}
+    assert task_timeline._route_identity(value) == identity
+    assert task_timeline._first_deep_text(value, "missing") == ""
+    assert value["left"] is value["right"] is shared
+    assert shared["identity"] is identity
+
+
 def _terminalization_timeline_args():
     return {
         "project_id": "proj",

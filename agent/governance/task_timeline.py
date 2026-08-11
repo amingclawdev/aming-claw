@@ -5506,20 +5506,45 @@ def _first_deep_value(value: Any, key: str) -> Any:
     return None
 
 
-def _first_deep_text(value: Any, key: str) -> str:
-    if isinstance(value, dict):
-        if key in value and str(value.get(key) or "").strip():
-            return str(value.get(key) or "").strip()
-        for child in value.values():
-            found = _first_deep_text(child, key)
+_ROUTE_IDENTITY_TRAVERSAL_MAX_DEPTH = 128
+
+
+def _first_deep_text(
+    value: Any,
+    key: str,
+    *,
+    _depth: int = 0,
+    _active_container_ids: set[int] | None = None,
+) -> str:
+    if (
+        _depth > _ROUTE_IDENTITY_TRAVERSAL_MAX_DEPTH
+        or not isinstance(value, (dict, list))
+    ):
+        return ""
+    container_id = id(value)
+    active_ids = _active_container_ids if _active_container_ids is not None else set()
+    if container_id in active_ids:
+        return ""
+    active_ids.add(container_id)
+    try:
+        if isinstance(value, dict):
+            if key in value and str(value.get(key) or "").strip():
+                return str(value.get(key) or "").strip()
+            children = value.values()
+        else:
+            children = value
+        for child in children:
+            found = _first_deep_text(
+                child,
+                key,
+                _depth=_depth + 1,
+                _active_container_ids=active_ids,
+            )
             if found:
                 return found
-    elif isinstance(value, list):
-        for child in value:
-            found = _first_deep_text(child, key)
-            if found:
-                return found
-    return ""
+        return ""
+    finally:
+        active_ids.remove(container_id)
 
 
 def _route_identity(value: Any) -> dict[str, str]:
