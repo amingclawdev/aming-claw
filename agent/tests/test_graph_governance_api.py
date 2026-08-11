@@ -19933,6 +19933,93 @@ def _append_observer_materialized_qa_verification(
     )
 
 
+def _append_observer_materialized_qa_followup_verdict(
+    *,
+    conn,
+    prior_event: Mapping[str, Any],
+    status: str,
+    renew_route: bool = False,
+) -> dict:
+    """Append a later verdict on the exact persisted QA materialization lane."""
+
+    payload = copy.deepcopy(prior_event["payload"])
+    route_token_ref = payload["route_token_ref"]
+    if renew_route:
+        prior_gate = payload["route_token_gate"]
+        conn.execute(
+            """
+            UPDATE observer_route_token_refs
+               SET status = 'superseded'
+             WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (PID, route_token_ref),
+        )
+        route_token_ref = "rtok-parentless-direct-main-materialized-qa-renewed"
+        renewed_identity = {
+            "route_id": "route-parentless-direct-main-materialized-qa-renewed",
+            "route_context_hash": _fake_sha(
+                "route-parentless-direct-main-materialized-qa-renewed"
+            ),
+            "prompt_contract_id": (
+                "rprompt-parentless-direct-main-materialized-qa-renewed"
+            ),
+            "prompt_contract_hash": _fake_sha(
+                "prompt-parentless-direct-main-materialized-qa-renewed"
+            ),
+            "visible_injection_manifest_hash": _fake_sha(
+                "visible-parentless-direct-main-materialized-qa-renewed"
+            ),
+            "route_token_ref": route_token_ref,
+        }
+        observer_route_context.persist_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=route_token_ref,
+            token={
+                **renewed_identity,
+                "caller_role": "observer",
+                "allowed_actions": ["task_timeline_append"],
+                "scope": copy.deepcopy(prior_gate["scope"]),
+                "expires_at": "2999-01-01T00:00:00Z",
+                "evidence_refs": copy.deepcopy(prior_gate["evidence_refs"]),
+            },
+        )
+        renewed_gate = {
+            **copy.deepcopy(prior_gate),
+            **renewed_identity,
+            "route_token_ref": route_token_ref,
+        }
+        payload["route_token_ref"] = route_token_ref
+        payload["route_token_gate"] = renewed_gate
+        source_authority = copy.deepcopy(
+            payload["source_backed_contract_gate_authority"]
+        )
+        source_authority["route_token_gate"] = renewed_gate
+        payload["source_backed_contract_gate_authority"] = source_authority
+    return server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": prior_event["backlog_id"],
+                "task_id": prior_event["task_id"],
+                "route_token_ref": route_token_ref,
+                "event_type": prior_event["event_type"],
+                "event_kind": prior_event["event_kind"],
+                "phase": prior_event["phase"],
+                "status": status,
+                "actor": prior_event["actor"],
+                "parent_event_id": prior_event["parent_event_id"],
+                "commit_sha": prior_event["commit_sha"],
+                "verification": copy.deepcopy(prior_event["verification"]),
+                "payload": payload,
+                "artifact_refs": copy.deepcopy(prior_event["artifact_refs"]),
+            },
+        )
+    )
+
+
 def _graph_with_dependency() -> dict:
     graph = _graph("L7.1")
     graph["deps_graph"]["nodes"].append(
@@ -87653,6 +87740,78 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
             False,
             "independent_verification_after_implementation",
         ),
+        (
+            "observer_materialized",
+            "later_failed",
+            False,
+            "latest_materialized_qa_verdict_passing",
+        ),
+        (
+            "observer_materialized",
+            "later_rejected",
+            False,
+            "latest_materialized_qa_verdict_passing",
+        ),
+        (
+            "observer_materialized",
+            "later_blocked",
+            False,
+            "latest_materialized_qa_verdict_passing",
+        ),
+        (
+            "observer_materialized",
+            "later_revoked",
+            False,
+            "latest_materialized_qa_verdict_passing",
+        ),
+        (
+            "observer_materialized",
+            "later_failed_renewed_route",
+            False,
+            "latest_materialized_qa_verdict_passing",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_revoked",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_tampered",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_expired_history",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_superseded_history",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
+            "implementation_authority_drift",
+            False,
+            "implementation_after_observer_direct_exception",
+        ),
+        (
+            "observer_materialized",
+            "close_ready_authority_drift",
+            False,
+            "close_ready_after_implementation",
+        ),
+        (
+            "observer_materialized",
+            "root_exception_authority_drift",
+            False,
+            "operator_approval.close_satisfying_shape",
+        ),
     ],
 )
 def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
@@ -87945,7 +88104,33 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         qa_commit = str(qa_event["commit_sha"])
         qa_parent = int(qa_event["parent_event_id"])
 
-        if tamper == "expired_qa":
+        if tamper.startswith("later_"):
+            later_status = (
+                "failed"
+                if tamper == "later_failed_renewed_route"
+                else tamper.removeprefix("later_")
+            )
+            later_qa_event = (
+                _append_observer_materialized_qa_followup_verdict(
+                    conn=conn,
+                    prior_event=qa_event,
+                    status=later_status,
+                    renew_route=(tamper == "later_failed_renewed_route"),
+                )
+            )
+            assert int(later_qa_event["id"]) > int(qa_event["id"])
+            assert later_qa_event["actor"] == qa_event["actor"]
+            assert later_qa_event["parent_event_id"] == qa_event["parent_event_id"]
+            assert later_qa_event["commit_sha"] == qa_event["commit_sha"]
+            assert (
+                later_qa_event["payload"]["qa_evidence_provenance"]
+                == qa_event["payload"]["qa_evidence_provenance"]
+            )
+            if tamper == "later_failed_renewed_route":
+                assert later_qa_event["payload"]["route_token_ref"] != (
+                    qa_event["payload"]["route_token_ref"]
+                )
+        elif tamper == "expired_qa":
             qa_session_id = qa_payload["qa_evidence_provenance"][
                 "evidence_owner_session"
             ]
@@ -88032,6 +88217,16 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 """,
                 (PID, qa_payload["route_token_ref"]),
             )
+        elif tamper in {
+            "close_ready_authority_drift",
+            "implementation_authority_drift",
+            "root_exception_authority_drift",
+            "root_route_registry_revoked",
+            "root_route_registry_tampered",
+            "root_route_registry_expired_history",
+            "root_route_registry_superseded_history",
+        }:
+            pass
         else:
             raise AssertionError(f"unhandled materialized QA tamper: {tamper}")
 
@@ -88039,7 +88234,19 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "closed_materializer",
             "expired_materialization_route",
             "expired_qa",
+            "later_blocked",
+            "later_failed",
+            "later_failed_renewed_route",
+            "later_rejected",
+            "later_revoked",
             "revoked_materialization_route",
+            "close_ready_authority_drift",
+            "implementation_authority_drift",
+            "root_exception_authority_drift",
+            "root_route_registry_revoked",
+            "root_route_registry_tampered",
+            "root_route_registry_expired_history",
+            "root_route_registry_superseded_history",
         }:
             conn.execute(
                 """
@@ -88114,6 +88321,71 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     assert int(qa_event["id"]) < int(reconcile_event["id"])
     assert int(reconcile_event["id"]) < int(close_ready_event["id"])
 
+    if tamper == "implementation_authority_drift":
+        conn.execute(
+            "UPDATE task_timeline_events SET status = 'failed' WHERE id = ?",
+            (int(implementation_event["id"]),),
+        )
+    elif tamper == "close_ready_authority_drift":
+        conn.execute(
+            "UPDATE task_timeline_events SET status = 'failed' WHERE id = ?",
+            (int(close_ready_event["id"]),),
+        )
+    elif tamper == "root_exception_authority_drift":
+        root_payload = copy.deepcopy(accepted_pre_mutation["payload"])
+        root_payload["operator_approval"] = {
+            "approved": False,
+            "approved_by": "",
+        }
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (
+                json.dumps(root_payload, sort_keys=True),
+                int(accepted_pre_mutation["id"]),
+            ),
+        )
+    elif tamper == "root_route_registry_revoked":
+        conn.execute(
+            """
+            UPDATE observer_route_token_refs
+               SET status = 'revoked'
+             WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (PID, close_route_token_ref),
+        )
+    elif tamper == "root_route_registry_tampered":
+        conn.execute(
+            """
+            UPDATE observer_route_token_refs
+               SET route_context_hash = ?
+             WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (
+                _fake_sha("tampered-parentless-direct-main-root-route"),
+                PID,
+                close_route_token_ref,
+            ),
+        )
+    elif tamper in {
+        "root_route_registry_expired_history",
+        "root_route_registry_superseded_history",
+    }:
+        conn.execute(
+            """
+            UPDATE observer_route_token_refs SET status = ?
+            WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (
+                (
+                    "expired"
+                    if tamper == "root_route_registry_expired_history"
+                    else "superseded"
+                ),
+                PID,
+                close_route_token_ref,
+            ),
+        )
+
     monkeypatch.setattr(
         server,
         "_runtime_context_child_lane_close_authority_projection",
@@ -88165,12 +88437,103 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     )
     assert storage_fingerprint() == storage_before_precheck
     projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
+    actual_zero_write_tampers = {
+        "close_ready_authority_drift",
+        "implementation_authority_drift",
+        "later_failed",
+        "root_exception_authority_drift",
+        "root_route_registry_revoked",
+        "root_route_registry_tampered",
+    }
+    if tamper in actual_zero_write_tampers:
+        real_subprocess_run = server.subprocess.run
+
+        def fake_failed_close_commit_verify(args, *run_args, **run_kwargs):
+            if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return real_subprocess_run(args, *run_args, **run_kwargs)
+
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            fake_failed_close_commit_verify,
+        )
+        if tamper == "later_failed":
+            storage_before_wrong_route = storage_fingerprint()
+            with pytest.raises(GovernanceError) as wrong_route_exc:
+                server.handle_backlog_close(
+                    _ctx(
+                        {"project_id": PID, "bug_id": backlog_id},
+                        method="POST",
+                        body={
+                            "actor": "observer",
+                            "commit": close_commit,
+                            "contract_execution_id": parent_execution_id,
+                            "route_token_ref": "rtok-unauthorized-foreign-route",
+                        },
+                    )
+                )
+            assert wrong_route_exc.value.code == "route_token_required"
+            wrong_route_failure = json.dumps(
+                wrong_route_exc.value.details, sort_keys=True
+            )
+            assert "materialized_qa_rejection" not in wrong_route_failure
+            assert "event_count" not in wrong_route_failure
+            assert "latest_event_id" not in wrong_route_failure
+            assert qa_event["payload"]["route_token_ref"] not in wrong_route_failure
+            assert storage_fingerprint() == storage_before_wrong_route
+        storage_before_failed_close = storage_fingerprint()
+        with pytest.raises(GovernanceError) as exc:
+            server.handle_backlog_close(
+                _ctx(
+                    {"project_id": PID, "bug_id": backlog_id},
+                    method="POST",
+                    body={
+                        "actor": "observer",
+                        "commit": close_commit,
+                        "contract_execution_id": parent_execution_id,
+                        "route_token_ref": close_route_token_ref,
+                    },
+                )
+            )
+        assert exc.value.code == (
+            "route_token_required"
+            if tamper == "root_route_registry_revoked"
+            else "contract_runtime_close_authority_incomplete"
+        )
+        close_failure = json.dumps(exc.value.details, sort_keys=True)
+        assert qa_event["payload"]["qa_evidence_provenance"][
+            "evidence_owner_session"
+        ] not in close_failure
+        assert qa_event["payload"]["route_token_ref"] not in close_failure
+        if tamper != "root_route_registry_revoked":
+            assert close_route_token_ref not in close_failure
+        assert str(project_root) not in close_failure
+        assert storage_fingerprint() == storage_before_failed_close
     if not expected_close:
         assert projection["status"] == "incomplete"
         direct_gate = projection["parentless_direct_main_close_authority_gate"]
         assert direct_gate["passed"] is False
         assert expected_missing in direct_gate["missing_requirement_ids"]
         assert precheck["can_close"] is False
+        if tamper in {
+            "close_ready_authority_drift",
+            "implementation_authority_drift",
+        }:
+            isolation = direct_gate["checks"][
+                "materialized_qa_fallback_isolation_gate"
+            ]
+            assert isolation["eligible"] is False
+            failed_check = (
+                "close_ready_authority_passed"
+                if tamper == "close_ready_authority_drift"
+                else "implementation_authority_passed"
+            )
+            assert isolation["non_qa_checks"][failed_check] is False
+        if tamper == "root_exception_authority_drift":
+            assert direct_gate["checks"][
+                "accepted_observer_direct_exception"
+            ] is False
         if qa_append_mode.startswith("observer_materialized"):
             provenance = qa_event["payload"]["qa_evidence_provenance"]
             failure_diagnostics = json.dumps(direct_gate, sort_keys=True)
@@ -88207,6 +88570,19 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     assert graph_gate["passed"] is True
     assert graph_gate["verified_trace_ids"] == [graph_trace_id]
     assert precheck["can_close"] is True
+
+    if tamper in {
+        "root_route_registry_expired_history",
+        "root_route_registry_superseded_history",
+    }:
+        conn.execute(
+            """
+            UPDATE observer_route_token_refs SET status = 'active'
+            WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (PID, close_route_token_ref),
+        )
+        conn.commit()
 
     real_subprocess_run = server.subprocess.run
 

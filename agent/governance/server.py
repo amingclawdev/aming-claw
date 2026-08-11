@@ -139735,6 +139735,11 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
     normalized_commit = str(close_commit or "").strip().lower()
     implementation_id = int(implementation_event.get("id") or 0)
     event_id = int(event.get("id") or 0)
+    verdict_status = str(event.get("status") or "").strip().lower()
+    close_satisfying = verdict_status in _QA_TIMELINE_CLOSE_STATUSES
+    superseding_failure = verdict_status in (
+        _QA_TIMELINE_AUDIT_STATUSES | {"revoked"}
+    )
     if not (
         implementation_id > 0
         and event_id > implementation_id
@@ -139750,8 +139755,7 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
         in _QA_TIMELINE_VERIFICATION_EVENT_KINDS
         and str(event.get("phase") or "").strip().lower().replace("-", "_")
         in _QA_TIMELINE_VERIFICATION_PHASES
-        and str(event.get("status") or "").strip().lower()
-        in _QA_TIMELINE_CLOSE_STATUSES
+        and (close_satisfying or superseding_failure)
     ):
         return {}
 
@@ -140059,36 +140063,53 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
         == {"project_id": project_id, "backlog_id": backlog_id, "task_id": task_id}
     ):
         return {}
-    qa_proof = {
-        "schema_version": "qa_session_scope_proof.v1",
-        "source": "authenticated_qa_session",
-        "verified": True,
-        "role": "qa",
-        "observer_impersonation": False,
-        "project_id": project_id,
-        "backlog_id": backlog_id,
-        "task_id": task_id,
-        "commit_sha": normalized_commit,
-        "principal_id": principal_id,
-        "qa_session_id": qa_session_id,
-        "qa_scope_binding_ref": qa_scope_binding_ref,
-        "graph_trace_ids": payload_trace_ids,
-        "query_source": "qa",
-        "query_purpose": "independent_verification",
-        "db_verified_graph_trace": True,
-        "snapshot_id": next(iter(snapshot_ids)),
-        "snapshot_commit_sha": next(iter(snapshot_commits)),
-        "evidence_status": str(event.get("status") or "").strip().lower(),
-        "authority_scope": "close_satisfying",
-        "close_satisfying": True,
-        "audit_only": False,
-        "passing_status_required_for_close": True,
-    }
-    qa_authority = task_timeline.source_backed_qa_session_authority(qa_proof)
-
     normalized_event = dict(event)
     normalized_payload = dict(payload)
-    normalized_payload["source_backed_contract_gate_authority"] = qa_authority
+    lineage_key_hash = stable_sha256(
+        {
+            "schema_version": (
+                "parentless_direct_main.materialized_qa_lineage_key.v1"
+            ),
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "candidate_commit_sha": normalized_commit,
+            "implementation_event_id": implementation_id,
+            "qa_principal": principal_id,
+            "qa_session_id": qa_session_id,
+            "qa_scope_binding_ref": qa_scope_binding_ref,
+            "qa_report_ref": qa_report_ref,
+        }
+    )
+    if close_satisfying:
+        qa_proof = {
+            "schema_version": "qa_session_scope_proof.v1",
+            "source": "authenticated_qa_session",
+            "verified": True,
+            "role": "qa",
+            "observer_impersonation": False,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "commit_sha": normalized_commit,
+            "principal_id": principal_id,
+            "qa_session_id": qa_session_id,
+            "qa_scope_binding_ref": qa_scope_binding_ref,
+            "graph_trace_ids": payload_trace_ids,
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "db_verified_graph_trace": True,
+            "snapshot_id": next(iter(snapshot_ids)),
+            "snapshot_commit_sha": next(iter(snapshot_commits)),
+            "evidence_status": verdict_status,
+            "authority_scope": "close_satisfying",
+            "close_satisfying": True,
+            "audit_only": False,
+            "passing_status_required_for_close": True,
+        }
+        normalized_payload["source_backed_contract_gate_authority"] = (
+            task_timeline.source_backed_qa_session_authority(qa_proof)
+        )
     normalized_payload["direct_main_materialized_qa_authority"] = {
         "schema_version": "parentless_direct_main.materialized_qa_authority.v1",
         "server_derived": True,
@@ -140099,14 +140120,20 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
         "qa_session_bound": True,
         "qa_scope_bound": True,
         "qa_report_materialization_bound": True,
-        "observer_materializer_bound": True,
+        "observer_submitter_session_verified": True,
+        "observer_submitter_route_verified": True,
+        "observer_submitter_principal_persisted_binding": False,
         "route_lineage_bound": True,
         "graph_review_context_bound": True,
         "graph_trace_count": len(payload_trace_ids),
+        "lineage_key_hash": lineage_key_hash,
+        "verdict_status": verdict_status,
+        "close_satisfying": close_satisfying,
+        "superseding_failure": superseding_failure,
     }
     normalized_event["payload"] = normalized_payload
 
-    if (
+    if close_satisfying and (
         not task_timeline._event_has_test_evidence(normalized_event)
         and task_timeline._event_has_test_evidence(dict(implementation_event))
     ):
@@ -140122,6 +140149,9 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
     return {
         "event": normalized_event,
         "authority": normalized_payload["direct_main_materialized_qa_authority"],
+        "lineage_key_hash": lineage_key_hash,
+        "close_satisfying": close_satisfying,
+        "superseding_failure": superseding_failure,
     }
 
 
@@ -140343,6 +140373,40 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             }
         },
     }
+    root_ref = str(direct_identity.get("route_token_ref") or "").strip()
+    root_registry_row = (
+        conn.execute(
+            """
+            SELECT status, route_id, route_context_hash, prompt_contract_id,
+                   prompt_contract_hash, visible_injection_manifest_hash,
+                   backlog_id, task_id, caller_role
+            FROM observer_route_token_refs
+            WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (project_id, root_ref),
+        ).fetchone()
+        if conn is not None and root_ref
+        else None
+    )
+    root_registry_passed = conn is None or bool(
+        root_registry_row
+        and str(root_registry_row["status"] or "")
+        in {"active", "expired", "superseded"}
+        and str(root_registry_row["backlog_id"] or "") == bug_id
+        and str(root_registry_row["task_id"] or "") == requested_execution_id
+        and str(root_registry_row["caller_role"] or "") == "observer"
+        and all(
+            str(root_registry_row[field] or "").strip()
+            == str(direct_identity.get(field) or "").strip()
+            for field in (
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "visible_injection_manifest_hash",
+            )
+        )
+    )
     implementation_event = task_timeline._latest_passing_close_event(
         events,
         "implementation",
@@ -140351,9 +140415,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             0,
         ),
     )
-    normalized_events: list[dict[str, Any]] = []
-    materialized_qa_authorities: list[dict[str, Any]] = []
-    materialized_qa_event_ids: set[int] = set()
+    materialized_by_lineage: dict[str, list[dict[str, Any]]] = {}
     for event in events:
         normalized = (
             _contract_runtime_parentless_direct_main_materialized_qa_event(
@@ -140369,12 +140431,73 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             else {}
         )
         if normalized:
-            normalized_event = dict(normalized["event"])
-            normalized_events.append(normalized_event)
-            materialized_qa_authorities.append(dict(normalized["authority"]))
-            materialized_qa_event_ids.add(int(normalized_event.get("id") or 0))
-        else:
-            normalized_events.append(event)
+            materialized_by_lineage.setdefault(
+                str(normalized["lineage_key_hash"]), []
+            ).append(normalized)
+    latest_materialized_by_lineage = {
+        lineage_key_hash: max(
+            lineage_events,
+            key=lambda item: int(item["event"].get("id") or 0),
+        )
+        for lineage_key_hash, lineage_events in materialized_by_lineage.items()
+    }
+    latest_materialized_event_ids = {
+        int(item["event"].get("id") or 0)
+        for item in latest_materialized_by_lineage.values()
+    }
+    materialized_qa_event_ids = set(latest_materialized_event_ids)
+    materialized_passing_event_ids = {
+        int(item["event"].get("id") or 0)
+        for item in latest_materialized_by_lineage.values()
+        if item.get("close_satisfying") is True
+    }
+    materialized_blocking_event_ids = {
+        int(latest["event"].get("id") or 0)
+        for lineage_key_hash, latest in latest_materialized_by_lineage.items()
+        if latest.get("superseding_failure") is True
+        and any(
+            item.get("close_satisfying") is True
+            for item in materialized_by_lineage[lineage_key_hash]
+        )
+    }
+    selected_materialized_events = {
+        int(item["event"].get("id") or 0): dict(item["event"])
+        for item in latest_materialized_by_lineage.values()
+    }
+    all_materialized_event_ids = {
+        int(item["event"].get("id") or 0)
+        for items in materialized_by_lineage.values()
+        for item in items
+    }
+    materialized_qa_authorities = [
+        dict(item["authority"]) for item in latest_materialized_by_lineage.values()
+    ]
+    normalized_events = [
+        selected_materialized_events.get(int(event.get("id") or 0), event)
+        for event in events
+    ]
+    materialized_qa_monotonic_gate = {
+        "schema_version": (
+            "parentless_direct_main.materialized_qa_monotonic_verdict_gate.v1"
+        ),
+        "passed": not bool(materialized_blocking_event_ids),
+        "status": (
+            "passed" if not materialized_blocking_event_ids else "failed"
+        ),
+        "lineage_count": len(materialized_by_lineage),
+        "latest_event_ids": sorted(latest_materialized_event_ids),
+        "passing_event_ids": sorted(materialized_passing_event_ids),
+        "blocking_event_ids": sorted(materialized_blocking_event_ids),
+        "superseded_event_ids": sorted(
+            all_materialized_event_ids - latest_materialized_event_ids
+        ),
+        "latest_verdict_required": True,
+        "route_renewal_changes_lineage_key": False,
+        "raw_session_ref_exposed": False,
+        "raw_scope_ref_exposed": False,
+        "raw_report_ref_exposed": False,
+        "raw_route_ref_exposed": False,
+    }
     verification = task_timeline.mf_close_gate_verification(
         normalized_events,
         contract=contract,
@@ -140385,7 +140508,78 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         if isinstance(verification.get("observer_direct_close_exception_gate"), Mapping)
         else {}
     )
-    if materialized_qa_authorities and not bool(direct_gate.get("passed")):
+    graph_trace_gate = _contract_runtime_parentless_direct_main_graph_trace_gate(
+        conn,
+        project_id=project_id,
+        backlog_id=bug_id,
+        task_id=requested_execution_id,
+        timeline_events=events,
+        direct_event=direct_event,
+        direct_identity=direct_identity,
+        direct_gate=direct_gate,
+    )
+    original_missing_ids = set(direct_gate.get("missing_requirement_ids") or [])
+    normalized_close_commit = str(close_commit or "").strip().lower()
+
+    def selected_non_qa_event_passed(field: str, key: str) -> bool:
+        summary = direct_gate.get(field) or {}
+        return bool(
+            isinstance(summary, Mapping)
+            and task_timeline._close_event_key(dict(summary)) == key
+            and task_timeline._event_passed(dict(summary))
+            and str(summary.get("commit_sha") or "").strip().lower() == normalized_close_commit
+        )
+
+    changed_file_scope = direct_gate.get("changed_file_scope") or {}
+    close_commit_gate = direct_gate.get("close_commit_evidence_gate") or {}
+    fallback_non_qa_checks = {
+        "root_route_authority_passed": root_registry_passed
+        and (direct_gate.get("accepted_exception") or {}).get("accepted") is True,
+        "implementation_authority_passed": selected_non_qa_event_passed(
+            "implementation_event", "implementation"
+        ),
+        "changed_file_scope_passed": bool(changed_file_scope.get("changed_files"))
+        and bool(changed_file_scope.get("allowed_files"))
+        and not bool(changed_file_scope.get("unexpected_changed_files")),
+        "test_authority_passed": any(
+            item.get("close_satisfying") is True
+            and task_timeline._event_has_test_evidence(dict(item["event"]))
+            for item in latest_materialized_by_lineage.values()
+        ),
+        "close_ready_authority_passed": selected_non_qa_event_passed(
+            "close_ready_event", "close_ready"
+        ),
+        "close_commit_authority_passed": str(close_commit_gate.get("status") or "").strip()
+        == "passed"
+        and all(
+            str(close_commit_gate.get(field) or "").strip().lower() == normalized_close_commit
+            for field in ("close_commit", "matching_evidence_commit")
+        ),
+        "pre_implementation_graph_authority_passed": graph_trace_gate.get("passed") is True,
+    }
+    route_incompatibility_only = bool(
+        "independent_verification_after_implementation" in original_missing_ids
+        and original_missing_ids.issubset({
+            "independent_verification_after_implementation", "tests_or_test_results"
+        })
+        and all(fallback_non_qa_checks.values())
+    )
+    materialized_fallback_gate = {
+        "schema_version": "parentless_direct_main.materialized_qa_fallback_isolation_gate.v1",
+        "eligible": bool(
+            materialized_passing_event_ids
+            and not materialized_blocking_event_ids
+            and route_incompatibility_only
+        ),
+        "original_db_backed_gate_passed": bool(direct_gate.get("passed")),
+        "route_incompatibility_only": route_incompatibility_only,
+        "original_missing_requirement_ids": sorted(original_missing_ids),
+        "non_qa_checks": fallback_non_qa_checks,
+        "conn_none_scope": "exact_materialized_qa_route_incompatibility_only",
+    }
+    if materialized_fallback_gate["eligible"] and not bool(
+        direct_gate.get("passed")
+    ):
         materialized_only_events = [
             event
             for event in normalized_events
@@ -140419,17 +140613,43 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
                     "authorities": materialized_qa_authorities,
                     "persisted_timeline_mutated": False,
                 },
+                "materialized_qa_fallback_isolation_gate": (
+                    materialized_fallback_gate
+                ),
             }
-    graph_trace_gate = _contract_runtime_parentless_direct_main_graph_trace_gate(
-        conn,
-        project_id=project_id,
-        backlog_id=bug_id,
-        task_id=requested_execution_id,
-        timeline_events=events,
-        direct_event=direct_event,
-        direct_identity=direct_identity,
-        direct_gate=direct_gate,
-    )
+    if materialized_blocking_event_ids:
+        direct_gate = {
+            **direct_gate,
+            "accepted": False,
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": list(
+                dict.fromkeys(
+                    [
+                        *(direct_gate.get("missing_requirement_ids") or []),
+                        "latest_materialized_qa_verdict_passing",
+                    ]
+                )
+            ),
+            "materialized_qa_monotonic_verdict_gate": (
+                materialized_qa_monotonic_gate
+            ),
+        }
+    if not root_registry_passed:
+        direct_gate = {
+            **direct_gate,
+            "accepted": False,
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": list(
+                dict.fromkeys(
+                    [
+                        *(direct_gate.get("missing_requirement_ids") or []),
+                        "active_root_route_registry_authority",
+                    ]
+                )
+            ),
+        }
     missing_ids = list(direct_gate.get("missing_requirement_ids") or [])
     if not bool(graph_trace_gate.get("passed")):
         missing_ids = list(
@@ -140490,6 +140710,13 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
                 ),
                 "pre_implementation_graph_trace_gate": graph_trace_gate,
                 "materialized_qa_authorities": materialized_qa_authorities,
+                "materialized_qa_monotonic_verdict_gate": (
+                    materialized_qa_monotonic_gate
+                ),
+                "materialized_qa_fallback_isolation_gate": (
+                    materialized_fallback_gate
+                ),
+                "root_route_registry_authority_passed": root_registry_passed,
                 "row_declared_file_scope_applied": bool(row_declared_files),
                 **row_scope_diagnostics,
             },
@@ -140538,6 +140765,13 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             "pre_implementation_graph_trace_gate_passed": True,
             "pre_implementation_graph_trace_gate": graph_trace_gate,
             "materialized_qa_authorities": materialized_qa_authorities,
+            "materialized_qa_monotonic_verdict_gate": (
+                materialized_qa_monotonic_gate
+            ),
+            "materialized_qa_fallback_isolation_gate": (
+                materialized_fallback_gate
+            ),
+            "root_route_registry_authority_passed": root_registry_passed,
             "worker_or_successor_contract_required": False,
             "row_declared_file_scope_applied": bool(row_declared_files),
             **row_scope_diagnostics,
@@ -161670,6 +161904,38 @@ def handle_backlog_close(ctx: RequestContext):
             action="backlog_close",
             backlog_id=bug_id,
         )
+        materialized_qa_lane = conn.execute(
+            """
+            SELECT COUNT(*) AS event_count, COALESCE(MAX(id), 0) AS latest_event_id
+            FROM task_timeline_events
+            WHERE project_id = ? AND backlog_id = ?
+              AND json_extract(payload_json, '$.schema_version') = ?
+              AND json_extract(
+                    payload_json,
+                    '$.qa_evidence_provenance.authorization_source'
+                  ) = 'qa_session_token_ref'
+            """,
+            (pid, bug_id, "independent_qa_verification.v1"),
+        ).fetchone()
+        timeline_gate = None
+        if materialized_qa_lane and int(materialized_qa_lane["event_count"] or 0):
+            try:
+                timeline_gate = _verify_mf_close_timeline_gate(
+                    conn, pid, bug_id, row, body, route_gate=route_gate
+                )
+            except GovernanceError as exc:
+                raise GovernanceError(
+                    exc.code,
+                    "ContractRuntime close authority rejected the materialized QA lane",
+                    exc.status,
+                    {
+                        "schema_version": "backlog_close.materialized_qa_rejection.v1",
+                        "passed": False,
+                        "event_count": int(materialized_qa_lane["event_count"]),
+                        "latest_event_id": int(materialized_qa_lane["latest_event_id"]),
+                        "zero_write_rejection": True,
+                    },
+                ) from exc
         hotfix_audit_event = _record_hotfix_backlog_close_tag(
             conn,
             project_id=pid,
@@ -161686,14 +161952,10 @@ def handle_backlog_close(ctx: RequestContext):
             commit_sha=commit_sha,
         )
         try:
-            timeline_gate = _verify_mf_close_timeline_gate(
-                conn,
-                pid,
-                bug_id,
-                row,
-                body,
-                route_gate=route_gate,
-            )
+            if timeline_gate is None:
+                timeline_gate = _verify_mf_close_timeline_gate(
+                    conn, pid, bug_id, row, body, route_gate=route_gate
+                )
         except GovernanceError as exc:
             blocked_event = _record_backlog_close_blocked_event(
                 conn,
