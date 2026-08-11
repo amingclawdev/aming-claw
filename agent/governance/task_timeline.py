@@ -5528,8 +5528,11 @@ def _first_deep_text(
     active_ids.add(container_id)
     try:
         if isinstance(value, dict):
-            if key in value and str(value.get(key) or "").strip():
-                return str(value.get(key) or "").strip()
+            candidate = value.get(key)
+            if key in value and not isinstance(candidate, (Mapping, list, tuple)):
+                cleaned = str(candidate or "").strip()
+                if cleaned:
+                    return cleaned
             children = value.values()
         else:
             children = value

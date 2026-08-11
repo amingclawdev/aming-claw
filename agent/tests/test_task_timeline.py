@@ -130,6 +130,82 @@ def test_route_identity_preserves_shallow_and_shared_acyclic_parity():
     assert shared["identity"] is identity
 
 
+def test_first_deep_text_rejects_matched_cycle_container_values():
+    from agent.governance import task_timeline
+
+    self_mapping = {}
+    self_mapping["self"] = self_mapping
+    self_list = []
+    self_list.append(self_list)
+    two_cycle_mapping = {}
+    two_cycle_list = [two_cycle_mapping]
+    two_cycle_mapping["list"] = two_cycle_list
+    for candidate in (self_mapping, self_list, two_cycle_mapping, two_cycle_list):
+        assert task_timeline._first_deep_text(
+            {"route_context_hash": candidate},
+            "route_context_hash",
+        ) == ""
+    assert self_mapping["self"] is self_mapping
+    assert self_list[0] is self_list
+    assert two_cycle_mapping["list"][0] is two_cycle_mapping
+
+
+def test_first_deep_text_rejects_matched_depth_20000_container_values():
+    from agent.governance import task_timeline
+
+    for container_kind in ("mapping", "list", "tuple"):
+        candidate = "leaf"
+        for _ in range(20_000):
+            if container_kind == "mapping":
+                candidate = {"nested": candidate}
+            elif container_kind == "list":
+                candidate = [candidate]
+            else:
+                candidate = (candidate,)
+        assert task_timeline._first_deep_text(
+            {"route_context_hash": candidate},
+            "route_context_hash",
+        ) == ""
+
+
+def test_route_identity_rejects_matched_container_values():
+    from agent.governance import task_timeline
+
+    self_list = []
+    self_list.append(self_list)
+    for candidate in (
+        {"nested": "pseudo-identity"},
+        self_list,
+        ("pseudo-identity",),
+    ):
+        assert task_timeline._route_identity(
+            {
+                "route_context_hash": candidate,
+                "prompt_contract_id": "rprompt-container-rejected",
+            }
+        ) == {}
+    assert self_list[0] is self_list
+
+
+def test_first_deep_text_preserves_scalar_and_nested_shared_identity_parity():
+    from agent.governance import task_timeline
+
+    shared = {"route_context_hash": " sha256:nested-shared "}
+    value = {
+        "route_context_hash": [shared],
+        "prompt_contract_id": "rprompt-nested-shared",
+        "scalar": 17,
+        "truthy": True,
+    }
+    assert task_timeline._route_identity(value) == {
+        "route_context_hash": "sha256:nested-shared",
+        "prompt_contract_id": "rprompt-nested-shared",
+    }
+    assert task_timeline._first_deep_text(value, "scalar") == "17"
+    assert task_timeline._first_deep_text(value, "truthy") == "True"
+    assert value["route_context_hash"][0] is shared
+
+
 def _terminalization_timeline_args():
     return {
         "project_id": "proj",
