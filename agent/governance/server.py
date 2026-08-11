@@ -140379,7 +140379,8 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             """
             SELECT status, route_id, route_context_hash, prompt_contract_id,
                    prompt_contract_hash, visible_injection_manifest_hash,
-                   backlog_id, task_id, caller_role
+                   backlog_id, task_id, caller_role, allowed_actions_json,
+                   evidence_refs_json, scope_json
             FROM observer_route_token_refs
             WHERE project_id = ? AND route_token_ref = ?
             """,
@@ -140388,13 +140389,58 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         if conn is not None and root_ref
         else None
     )
+    historical_route_gate = _contract_runtime_close_authority_first_deep_mapping(
+        direct_event,
+        "route_token_gate",
+    )
+    registry_actions: set[str] = set()
+    registry_refs: set[str] = set()
+    registry_scope: dict[str, Any] = {}
+    registry_json_valid = False
+    if root_registry_row is not None:
+        try:
+            raw_actions = json.loads(root_registry_row["allowed_actions_json"] or "")
+            raw_refs = json.loads(root_registry_row["evidence_refs_json"] or "")
+            raw_scope = json.loads(root_registry_row["scope_json"] or "")
+            registry_json_valid = bool(
+                isinstance(raw_actions, list)
+                and all(isinstance(item, str) and item.strip() for item in raw_actions)
+                and isinstance(raw_refs, list)
+                and all(isinstance(item, str) and item.strip() for item in raw_refs)
+                and isinstance(raw_scope, dict)
+            )
+            if registry_json_valid:
+                registry_actions = {item.strip() for item in raw_actions}
+                registry_refs = {item.strip() for item in raw_refs}
+                registry_scope = raw_scope
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    historical_action = str(historical_route_gate.get("action") or "").strip()
+    historical_refs = {
+        str(item or "").strip()
+        for item in historical_route_gate.get("evidence_refs") or []
+        if str(item or "").strip()
+    }
+    historical_scope = historical_route_gate.get("scope") or {}
+    expected_scope = {
+        "project_id": project_id,
+        "backlog_id": bug_id,
+        "task_id": requested_execution_id,
+    }
     root_registry_passed = conn is None or bool(
         root_registry_row
+        and registry_json_valid
         and str(root_registry_row["status"] or "")
         in {"active", "expired", "superseded"}
         and str(root_registry_row["backlog_id"] or "") == bug_id
         and str(root_registry_row["task_id"] or "") == requested_execution_id
         and str(root_registry_row["caller_role"] or "") == "observer"
+        and historical_action
+        and historical_action in registry_actions
+        and historical_refs.issubset(registry_refs)
+        and all(registry_scope.get(key) == value for key, value in expected_scope.items())
+        and isinstance(historical_scope, Mapping)
+        and all(historical_scope.get(key) == value for key, value in expected_scope.items())
         and all(
             str(root_registry_row[field] or "").strip()
             == str(direct_identity.get(field) or "").strip()
