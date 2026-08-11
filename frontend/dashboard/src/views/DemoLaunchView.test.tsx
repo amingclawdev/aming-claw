@@ -6,6 +6,7 @@ import {
   demoEnvironmentStatus,
   demoLaunchPrompts,
   environmentFromCreateResponse,
+  exactOwnerRuntimeCommit,
   shortCommit,
 } from "./DemoLaunchView";
 
@@ -16,6 +17,13 @@ export const demoLaunchFixtureEnvironment: DemoEnvironment = {
   project_id: "daily-planner-lite-vibe-visual-happy-20260616-043027",
   fixture_root: "/var/folders/ft/q0j_8c5167n0294b0mmkml200000gn/T/ac-vibe-queue-demo/visual-happy-20260616-043027",
   baseline_commit: "881326a51cb48363afcb6acb1d055b6183dceffb",
+  owner_runtime_identity: {
+    schema_version: "demo_owner_runtime_identity.v1",
+    status: "exact",
+    loaded_commit: "0203ffe0faaca03a4cc5d5c2e164e8a20604d5f5",
+    loaded_source_sha256: "sha256:2d16f020b0b61f7789f2f7747be9a969a969699c93916ab7767c512151458447",
+    runtime_stale: false,
+  },
   created_at: "2026-06-16T04:30:27Z",
   dashboard_url: "http://127.0.0.1:40000/dashboard?project_id=daily-planner-lite-vibe-visual-happy-20260616-043027",
   backlog_url: "http://127.0.0.1:40000/dashboard?project_id=daily-planner-lite-vibe-visual-happy-20260616-043027&view=backlog",
@@ -58,7 +66,8 @@ export const demoLaunchFixtureEnvironment: DemoEnvironment = {
         "Parallel implementation shape:",
         "Focus/UI lane",
         "Reminder/domain lane",
-        "The observer must use the system CLI agent service or a host-created bounded worker/subagent.",
+        "Each bounded worker must be a separate Codex Desktop host-created subagent.",
+        "Do not use the CLI Agent Service.",
         "Do not act as the worker from the observer session.",
       ].join("\n"),
     },
@@ -82,6 +91,7 @@ export const demoLaunchFixtureEnvironment: DemoEnvironment = {
 export const demoLaunchFixtureResponse: DemoEnvironmentsResponse = {
   ok: true,
   project_id: "aming-claw",
+  owner_runtime_identity: demoLaunchFixtureEnvironment.owner_runtime_identity,
   templates: [
     {
       id: DAILY_PLANNER_TEMPLATE_ID,
@@ -113,11 +123,18 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   });
   const status = demoEnvironmentStatus(created);
   const shortBaseline = shortCommit(created.baseline_commit);
+  const ownerRuntimeCommit = exactOwnerRuntimeCommit(created.owner_runtime_identity);
 
   if (template.id !== DAILY_PLANNER_TEMPLATE_ID) throw new Error("daily planner template was not selected");
   if (links.length !== 5) throw new Error("all operational demo links should be present");
   if (status.label !== "Ready") throw new Error("ready environment should render with ready status");
   if (shortBaseline !== "881326a51cb4") throw new Error("baseline commit should be shortened for compact panels");
+  if (ownerRuntimeCommit !== "0203ffe0faaca03a4cc5d5c2e164e8a20604d5f5") throw new Error("owner runtime must expose the full immutable RC commit");
+  if (ownerRuntimeCommit === created.baseline_commit) throw new Error("owner runtime RC must be separate from the generated fixture baseline");
+  if (exactOwnerRuntimeCommit(undefined) !== "Unavailable") throw new Error("missing owner runtime identity must fail closed");
+  if (exactOwnerRuntimeCommit({ ...created.owner_runtime_identity!, runtime_stale: true }) !== "Unavailable") throw new Error("stale owner runtime identity must fail closed");
+  if (exactOwnerRuntimeCommit({ ...created.owner_runtime_identity!, status: "unavailable" }) !== "Unavailable") throw new Error("non-exact owner runtime identity must fail closed");
+  if (exactOwnerRuntimeCommit({ ...created.owner_runtime_identity!, loaded_source_sha256: "sha256:invalid" }) !== "Unavailable") throw new Error("invalid owner runtime source identity must fail closed");
   if (!created.launch_prompt.includes("Daily Planner Lite")) throw new Error("launch prompt must be surfaced");
   if (!created.launch_prompt.includes("Intent:")) throw new Error("launch prompt must include explicit intent");
   if (!created.launch_prompt.includes("Today Focus and reminder visual planner board")) throw new Error("launch prompt must name the demo requirement");
@@ -130,7 +147,8 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   if (!prompts.some((prompt) => prompt.id === "mf_parallel" && prompt.prompt.includes("mf_parallel"))) throw new Error("mf_parallel prompt must be available");
   if (!prompts.some((prompt) => prompt.id === "mf_batch_parallel" && prompt.prompt.includes("mf_batch_parallel"))) throw new Error("mf_batch_parallel prompt must be available");
   if (!prompts.some((prompt) => prompt.prompt.includes("Copy-safe prompt rule:"))) throw new Error("copy-safe prompt rule must be surfaced");
-  if (!prompts.some((prompt) => prompt.prompt.includes("system CLI agent service or a host-created bounded worker/subagent"))) throw new Error("worker prompt must force a host-created worker lane");
+  if (prompts.some((prompt) => prompt.prompt.includes("system CLI agent service"))) throw new Error("worker prompt must not advertise CLI Agent Service as a lane launcher");
+  if (!prompts.some((prompt) => prompt.prompt.includes("separate Codex Desktop host-created subagent"))) throw new Error("worker prompt must force a host-created Codex Desktop worker lane");
   if (!prompts.some((prompt) => prompt.prompt.includes("Do not act as the worker from the observer session"))) throw new Error("observer must not impersonate worker");
   if (!prompts.some((prompt) => prompt.prompt.includes("query_source=qa") && prompt.prompt.includes("query_purpose=independent_verification"))) throw new Error("QA graph query identity must be explicit");
   if (mixedIdPrompts.map((prompt) => prompt.label).join("|") !== "Direct Main|MF Parallel|MF Batch Parallel") throw new Error("underscore and hyphen ids must resolve to stable labels and order");

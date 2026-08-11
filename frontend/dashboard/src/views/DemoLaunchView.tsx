@@ -5,6 +5,7 @@ import type {
   DemoEnvironmentCreateResponse,
   DemoEnvironmentsResponse,
   DemoLaunchPrompt,
+  DemoOwnerRuntimeIdentity,
   DemoTemplate,
 } from "../lib/api";
 
@@ -131,6 +132,19 @@ export function shortCommit(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
   return trimmed.length > 12 ? trimmed.slice(0, 12) : trimmed;
+}
+
+export function exactOwnerRuntimeCommit(
+  identity: DemoOwnerRuntimeIdentity | undefined,
+): string {
+  const commit = identity?.loaded_commit?.trim() ?? "";
+  const source = identity?.loaded_source_sha256?.trim() ?? "";
+  return identity?.status === "exact"
+    && identity.runtime_stale === false
+    && /^[0-9a-f]{40}$/.test(commit)
+    && /^sha256:[0-9a-f]{64}$/.test(source)
+    ? commit
+    : "Unavailable";
 }
 
 function normalizeResponse(response: DemoEnvironmentsResponse, projectId: string): DemoEnvironmentsResponse {
@@ -286,6 +300,14 @@ export default function DemoLaunchView({ projectId }: Props) {
           </div>
           <h3>{template.label || DAILY_PLANNER_TEMPLATE.label}</h3>
           {template.description ? <p>{template.description}</p> : null}
+          <dl className="demo-env-meta">
+            <div className="demo-env-meta-wide">
+              <dt>Owner runtime RC</dt>
+              <dd className="mono" data-testid="demo-owner-runtime-rc">
+                {exactOwnerRuntimeCommit(response?.owner_runtime_identity)}
+              </dd>
+            </div>
+          </dl>
         </div>
         <button
           type="button"
@@ -386,6 +408,12 @@ function DemoEnvironmentCard(props: {
         <div>
           <dt>Baseline</dt>
           <dd className="mono" title={env.baseline_commit}>{shortCommit(env.baseline_commit)}</dd>
+        </div>
+        <div className="demo-env-meta-wide">
+          <dt>Owner runtime RC</dt>
+          <dd className="mono" data-testid={`demo-environment-owner-runtime-${env.id}`}>
+            {exactOwnerRuntimeCommit(env.owner_runtime_identity)}
+          </dd>
         </div>
         <div>
           <dt>Created</dt>

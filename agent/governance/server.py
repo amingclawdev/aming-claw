@@ -3404,6 +3404,31 @@ def _demo_environment_templates() -> list[dict[str, Any]]:
     ]
 
 
+def _demo_owner_runtime_identity() -> dict[str, Any]:
+    """Return the fixed public identity of the governance runtime serving Demo."""
+
+    identity = governance_loaded_runtime_identity(get_server_version())
+    loaded_commit = str(identity.get("loaded_commit") or "").strip().lower()
+    loaded_source_sha256 = str(
+        identity.get("loaded_source_sha256") or ""
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", loaded_commit):
+        loaded_commit = ""
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", loaded_source_sha256):
+        loaded_source_sha256 = ""
+    return {
+        "schema_version": "demo_owner_runtime_identity.v1",
+        "status": (
+            "exact"
+            if loaded_commit and loaded_source_sha256
+            else "unavailable"
+        ),
+        "loaded_commit": loaded_commit,
+        "loaded_source_sha256": loaded_source_sha256,
+        "runtime_stale": bool(identity.get("runtime_stale")),
+    }
+
+
 def _read_demo_environment_registry(project_id: str) -> list[dict[str, Any]]:
     path = _demo_environment_registry_path(project_id)
     if not path.exists():
@@ -3519,10 +3544,18 @@ def _demo_launch_prompt_target_lines(environment: Mapping[str, Any]) -> list[str
     graph_url = str(environment.get("graph_url") or "")
     planner_preview_url = str(environment.get("planner_preview_url") or "")
     planner_preview_command = str(environment.get("planner_preview_command") or "")
+    owner_runtime = environment.get("owner_runtime_identity")
+    owner_runtime = owner_runtime if isinstance(owner_runtime, Mapping) else {}
+    owner_runtime_commit = str(owner_runtime.get("loaded_commit") or "")
+    owner_runtime_source_sha256 = str(
+        owner_runtime.get("loaded_source_sha256") or ""
+    )
     return [
         "Target project:",
         f"project_id: {project_id}",
         f"fixture_root: {fixture_root}",
+        f"owner_runtime_loaded_commit: {owner_runtime_commit}",
+        f"owner_runtime_source_sha256: {owner_runtime_source_sha256}",
         f"baseline_commit: {baseline_commit}",
         f"dashboard_url: {dashboard_url}",
         f"backlog_url: {backlog_url}",
@@ -3775,6 +3808,7 @@ def _demo_environment_from_fixture(
         "project_id": target_project_id,
         "fixture_root": str(fixture_root),
         "baseline_commit": str(fixture_result.get("baseline_commit") or ""),
+        "owner_runtime_identity": _demo_owner_runtime_identity(),
         "created_at": created_at,
         "dashboard_url": str(fixture_result.get("dashboard_url") or _demo_dashboard_url(target_project_id, "backlog")),
         "backlog_url": str(dashboard_links.get("backlog") or _demo_dashboard_url(target_project_id, "backlog")),
@@ -3809,6 +3843,7 @@ def handle_project_demo_environments_list(ctx: RequestContext):
     return {
         "ok": True,
         "project_id": project_id,
+        "owner_runtime_identity": _demo_owner_runtime_identity(),
         "templates": _demo_environment_templates(),
         "environments": _visible_demo_environments(project_id),
     }

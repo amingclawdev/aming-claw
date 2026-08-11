@@ -1372,6 +1372,14 @@ export interface DemoLaunchPrompt {
   prompt: string;
 }
 
+export interface DemoOwnerRuntimeIdentity {
+  schema_version: "demo_owner_runtime_identity.v1" | string;
+  status: "exact" | "unavailable" | string;
+  loaded_commit: string;
+  loaded_source_sha256: string;
+  runtime_stale: boolean;
+}
+
 export interface DemoEnvironment {
   id: string;
   template_id: string;
@@ -1379,6 +1387,7 @@ export interface DemoEnvironment {
   project_id: string;
   fixture_root: string;
   baseline_commit: string;
+  owner_runtime_identity?: DemoOwnerRuntimeIdentity;
   created_at: string;
   dashboard_url: string;
   backlog_url: string;
@@ -1395,6 +1404,7 @@ export interface DemoEnvironment {
 export interface DemoEnvironmentsResponse {
   ok?: boolean;
   project_id: string;
+  owner_runtime_identity?: DemoOwnerRuntimeIdentity;
   templates?: DemoTemplate[];
   environments?: DemoEnvironment[];
   error?: string;

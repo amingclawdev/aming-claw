@@ -334,6 +334,7 @@ The dashboard shows:
 - [Docs Drift Demo](docs/drift-demo/README.md)
 - [Backlog Duplicate Demo](docs/backlog-dupe-demo/README.md)
 - [HN Multi-Agent Challenge Demo](docs/hn-demo/README.md)
+- [Three-lane Browser dogfood runbook](docs/demos/three-lane-browser-dogfood.md)
 
 The preferred demo path is a live Claude Code or Codex session acting as the
 observer. Fixture scripts are setup and release-check helpers, not a substitute
