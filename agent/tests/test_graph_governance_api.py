@@ -104030,6 +104030,115 @@ def test_contract_runtime_dead_initial_join_recovery_rejects_authority_drift_zer
     assert "\n".join(conn.iterdump()) == before_dump
 
 
+def test_contract_runtime_dead_initial_join_recovery_binds_exact_audit_row_bytes(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="contract-runtime-dead-initial-join-audit-bytes",
+        source_backed_contract_runtime=True,
+    )
+    expired = replace(
+        case["context"],
+        lease_id="mfrlease-expired-contract-recovery-audit-bytes",
+        lease_expires_at="2000-01-01T00:00:00Z",
+    )
+    upsert_branch_context(conn, expired, now_iso="2099-08-02T01:00:00Z")
+    initial_join_event_id = int(case["initial_join_event"]["id"])
+    row = conn.execute(
+        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+        (initial_join_event_id,),
+    ).fetchone()
+    forged_a = json.loads(row["payload_json"])
+    forged_a["worker_id"] = "forged-A"
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(forged_a, sort_keys=True), initial_join_event_id),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
+    )
+    guide_a = _compact_worker_read_guide(
+        conn,
+        backlog_id=case["backlog_id"],
+        contract_execution_id=case["parent_task_id"],
+    )
+    body_a = dict(guide_a["canonical_executable_action"]["copy_safe_body"])
+    hash_a = body_a["recovery_authority_hash"]
+
+    forged_b = dict(forged_a)
+    forged_b["worker_id"] = "forged-B"
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(forged_b, sort_keys=True), initial_join_event_id),
+    )
+    conn.commit()
+    guide_b = _compact_worker_read_guide(
+        conn,
+        backlog_id=case["backlog_id"],
+        contract_execution_id=case["parent_task_id"],
+    )
+    body_b = dict(guide_b["canonical_executable_action"]["copy_safe_body"])
+    hash_b = body_b["recovery_authority_hash"]
+    assert hash_b != hash_a
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(forged_b, indent=1, sort_keys=True), initial_join_event_id),
+    )
+    conn.commit()
+    guide_c = _compact_worker_read_guide(
+        conn,
+        backlog_id=case["backlog_id"],
+        contract_execution_id=case["parent_task_id"],
+    )
+    hash_c = guide_c["canonical_executable_action"]["copy_safe_body"][
+        "recovery_authority_hash"
+    ]
+    assert hash_c != hash_b
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+    before_recovery_count = conn.execute(
+        """
+        SELECT COUNT(*) FROM contract_runtime_executions
+        WHERE contract_execution_id LIKE
+          'cex-contract-dead-initial-join-recovery-%'
+        """
+    ).fetchone()[0]
+
+    with pytest.raises(ValidationError) as rejected:
+        server.handle_project_contract_runtime_recover(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=body_b,
+            )
+        )
+
+    assert "authority" in str(rejected.value).lower()
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM contract_runtime_executions
+        WHERE contract_execution_id LIKE
+          'cex-contract-dead-initial-join-recovery-%'
+        """
+    ).fetchone()[0] == before_recovery_count
+
+
 def test_contract_runtime_dead_initial_join_recovery_refuses_active_lease(
     conn,
     monkeypatch,

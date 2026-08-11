@@ -119771,6 +119771,80 @@ def _onboard_work_type_storage_projection(
     }
 
 
+def _contract_runtime_dead_initial_join_durable_rows_hash(
+    conn,
+    *,
+    project_id: str,
+    execution_id: str,
+    runtime_context_id: str,
+    eligibility: Mapping[str, Any],
+) -> str:
+    """Hash the exact persisted rows used by dead-join recovery authority."""
+
+    authority = (
+        eligibility.get("authority")
+        if isinstance(eligibility.get("authority"), Mapping)
+        else {}
+    )
+
+    def timeline_id(field: str) -> int:
+        value = str(authority.get(field) or "")
+        return (
+            int(value[9:])
+            if re.fullmatch(r"timeline:[1-9][0-9]*", value)
+            else 0
+        )
+
+    initial_join_id = timeline_id("initial_join_event_ref")
+    anchor_id = timeline_id("canonical_identity_binding_anchor_ref")
+    cutover_id = str(
+        authority.get("canonical_identity_cutover_audit_id") or ""
+    ).strip()
+    if not initial_join_id:
+        return ""
+    queries = {
+        "source_contract": (
+            "SELECT * FROM contract_runtime_executions "
+            "WHERE contract_execution_id = ?",
+            (execution_id,),
+        ),
+        "runtime_context": (
+            "SELECT * FROM parallel_branch_runtime_contexts "
+            "WHERE project_id = ? AND runtime_context_id = ?",
+            (project_id, runtime_context_id),
+        ),
+        "initial_join": (
+            "SELECT * FROM task_timeline_events WHERE id = ?",
+            (initial_join_id,),
+        ),
+    }
+    if str(authority.get("identity_contract_version") or "") == (
+        "runtime_context.initial_join_identity.v2"
+    ):
+        if not anchor_id or not cutover_id:
+            return ""
+        queries.update(
+            {
+                "identity_anchor": (
+                    "SELECT * FROM task_timeline_events WHERE id = ?",
+                    (anchor_id,),
+                ),
+                "cutover": (
+                    "SELECT * FROM parallel_branch_runtime_access_audit "
+                    "WHERE audit_id = ?",
+                    (cutover_id,),
+                ),
+            }
+        )
+    rows: dict[str, list[Any]] = {}
+    for name, (sql, parameters) in queries.items():
+        row = conn.execute(sql, parameters).fetchone()
+        if row is None:
+            return ""
+        rows[name] = list(row)
+    return stable_sha256(rows)
+
+
 def _contract_runtime_dead_initial_join_recovery_authority(
     conn,
     *,
@@ -119887,6 +119961,18 @@ def _contract_runtime_dead_initial_join_recovery_authority(
     ):
         return {}
 
+    durable_rows_hash = (
+        _contract_runtime_dead_initial_join_durable_rows_hash(
+            conn,
+            project_id=project_id,
+            execution_id=execution_id,
+            runtime_context_id=runtime_context_id,
+            eligibility=eligibility,
+        )
+    )
+    if not durable_rows_hash:
+        return {}
+
     try:
         execution_state_revision = int(
             record.get("execution_state_revision") or 0
@@ -119932,6 +120018,7 @@ def _contract_runtime_dead_initial_join_recovery_authority(
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "dispatch_authority_hash": _stable_public_hash(dispatch_anchor),
+        "durable_authority_rows_hash": durable_rows_hash,
         "initial_join_authority_hash": _stable_public_hash(
             dict(eligibility.get("authority") or {})
         ),
