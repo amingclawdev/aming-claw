@@ -153433,11 +153433,81 @@ def _timeline_gate_observer_materialized_qa_event(event: Mapping[str, Any]) -> b
     )
 
 
+def _timeline_gate_materialized_qa_private_values(
+    events: Sequence[Mapping[str, Any]], route_token_refs: Sequence[str]
+) -> frozenset[str]:
+    private_keys = frozenset(
+        "evidence_owner_session materialized_from materialized_from_report "
+        "qa_report_ref qa_scope_binding_ref qa_session_id submitter_session".split()
+    )
+    values = {str(ref).strip() for ref in route_token_refs if str(ref).strip()}
+    qa_sessions: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for raw_key, child in value.items():
+                key = str(raw_key)
+                if key in private_keys and isinstance(child, str) and child.strip():
+                    values.add(child.strip())
+                    if key in {"evidence_owner_session", "qa_session_id"}:
+                        qa_sessions.add(child.strip())
+                if isinstance(child, (Mapping, list, tuple)):
+                    collect(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                collect(child)
+
+    for event in events:
+        collect(event)
+    values.update(f"qa_session:{session}" for session in qa_sessions)
+    return frozenset(values)
+
+
+def _timeline_gate_exact_private_values_sanitized(value: Any, private_values: frozenset[str]) -> Any:
+    dropped = object()
+
+    def sanitize(child: Any) -> Any:
+        if isinstance(child, Mapping):
+            cleaned = {}
+            for key, nested in child.items():
+                sanitized = sanitize(nested)
+                if sanitized is not dropped:
+                    cleaned[key] = sanitized
+            return cleaned
+        if isinstance(child, (list, tuple)):
+            cleaned_items = [
+                sanitized
+                for item in child
+                if (sanitized := sanitize(item)) is not dropped
+            ]
+            return tuple(cleaned_items) if isinstance(child, tuple) else cleaned_items
+        if not isinstance(child, str):
+            return child
+        if child in private_values:
+            return dropped
+        try:
+            parsed = json.loads(child)
+        except (json.JSONDecodeError, TypeError):
+            return child
+        if not isinstance(parsed, (dict, list)):
+            return child
+        if (sanitized := sanitize(parsed)) == parsed:
+            return child
+        return json.dumps(
+            sanitized,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    return sanitize(value)
+
+
 def _timeline_gate_public_materialized_qa_sanitized(
     response: Mapping[str, Any],
     *,
     materialized_event_ids: Sequence[int],
     materialized_route_token_refs: Sequence[str],
+    materialized_private_values: frozenset[str],
 ) -> dict[str, Any]:
     """Remove materialization capabilities from the public timeline-gate copy."""
 
@@ -153498,7 +153568,10 @@ def _timeline_gate_public_materialized_qa_sanitized(
                     if key not in _TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS
                 }
             public_events[index] = public_event
-    return sanitized
+    return _timeline_gate_exact_private_values_sanitized(
+        sanitized,
+        materialized_private_values,
+    )
 
 
 @route("GET", "/api/backlog/{project_id}/{bug_id}/timeline-gate")
@@ -153582,6 +153655,10 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
         materialized_qa_route_token_refs = [
             _event_route_token_ref(event) for event in materialized_qa_events
         ]
+        materialized_qa_private_values = _timeline_gate_materialized_qa_private_values(
+            materialized_qa_events,
+            materialized_qa_route_token_refs,
+        )
         contract: dict[str, Any] = {}
         route_context_gate: dict[str, Any] = {}
         runtime_projection: dict[str, Any] = {}
@@ -153885,6 +153962,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             result,
             materialized_event_ids=materialized_qa_event_ids,
             materialized_route_token_refs=materialized_qa_route_token_refs,
+            materialized_private_values=materialized_qa_private_values,
         )
         result["request_id"] = ctx.request_id
         return _timeline_warm_cache_store(

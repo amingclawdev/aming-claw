@@ -88369,6 +88369,59 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                     f"UPDATE task_timeline_events SET {column} = ? WHERE id = ?",
                     (value, int(later_qa_event["id"])),
                 )
+            if tamper == "cross_session_enriched_later_failed":
+                original_public_sanitizer = (
+                    server._timeline_gate_public_materialized_qa_sanitized
+                )
+                qa_session_ref = (
+                    "qa_session:"
+                    + prior_provenance["evidence_owner_session"]
+                )
+                adversarial_malformed_json = '{"opaque_alias":'
+                adversarial_ordinary_json = (
+                    '{ "root_alias" : "' + close_route_token_ref + '" }'
+                )
+
+                def inject_adversarial_public_aliases(response, **kwargs):
+                    augmented = dict(response)
+                    augmented["adversarial_materialized_qa_aliases"] = {
+                        "exact_alias": later_qa_event["payload"]["route_token_ref"],
+                        "nested_alias": {
+                            "session_alias": prior_provenance[
+                                "evidence_owner_session"
+                            ],
+                            "root_alias": close_route_token_ref,
+                        },
+                        "list_alias": [
+                            later_provenance["materialized_from_report"],
+                            close_route_token_ref,
+                            {
+                                "scope_alias": qa_event["artifact_refs"][
+                                    "qa_scope_binding_ref"
+                                ],
+                                "root_alias": close_route_token_ref,
+                            },
+                        ],
+                        "tuple_alias": (
+                            prior_provenance["submitter_session"],
+                            close_route_token_ref,
+                        ),
+                        "json_alias": json.dumps(
+                            {
+                                "qa_session_ref_alias": qa_session_ref,
+                                "root_alias": close_route_token_ref,
+                            }
+                        ),
+                        "malformed_json_alias": adversarial_malformed_json,
+                        "ordinary_json_alias": adversarial_ordinary_json,
+                    }
+                    return original_public_sanitizer(augmented, **kwargs)
+
+                monkeypatch.setattr(
+                    server,
+                    "_timeline_gate_public_materialized_qa_sanitized",
+                    inject_adversarial_public_aliases,
+                )
         elif tamper.startswith("later_"):
             later_status = (
                 "failed"
@@ -89084,6 +89137,29 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                             "resource"
                         ]["public_authority"] == "legacy_advisory"
                         assert all(ref not in public_matrix for ref in private_refs)
+                        if tamper == "cross_session_enriched_later_failed":
+                            aliases = matrix_response[
+                                "adversarial_materialized_qa_aliases"
+                            ]
+                            assert aliases["nested_alias"] == {
+                                "root_alias": close_route_token_ref
+                            }
+                            assert aliases["list_alias"] == [
+                                close_route_token_ref,
+                                {"root_alias": close_route_token_ref},
+                            ]
+                            assert aliases["tuple_alias"] == (
+                                close_route_token_ref,
+                            )
+                            assert json.loads(aliases["json_alias"]) == {
+                                "root_alias": close_route_token_ref
+                            }
+                            assert aliases["malformed_json_alias"] == (
+                                adversarial_malformed_json
+                            )
+                            assert aliases["ordinary_json_alias"] == (
+                                adversarial_ordinary_json
+                            )
                         if matrix_include_events:
                             public_events = {
                                 int(event["id"]): event
