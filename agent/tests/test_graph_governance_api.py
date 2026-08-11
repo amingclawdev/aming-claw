@@ -52907,6 +52907,191 @@ def test_timeline_gate_public_sanitizer_bounds_parsed_depth_without_mutation():
         assert alternating_leaf(value, depth) == private_ref
 
 
+def test_timeline_gate_materialized_qa_private_value_collector_bounds_depth_and_cycles():
+    route_ref = "rtok-materialized-private-collector"
+    ordinary_root_ref = "rtok-ordinary-root-collector"
+    below_cap_session = "qa-session-below-cap-collector"
+    shared_report_ref = "qa_report:shared-collector"
+    overdepth_report_ref = "qa_report:overdepth-collector"
+
+    def alternating_depth(leaf, depth):
+        value = leaf
+        for _ in range(depth):
+            value = {"nested": [value]}
+        return value
+
+    def alternating_leaf(value, depth):
+        for _ in range(depth):
+            value = value["nested"][0]
+        return value
+
+    overdepth = alternating_depth(
+        {"qa_report_ref": overdepth_report_ref},
+        504,
+    )
+    self_cycle = {}
+    self_cycle["self"] = self_cycle
+    shared = {
+        "qa_report_ref": shared_report_ref,
+        "root_ref": ordinary_root_ref,
+    }
+    event = {
+        "id": 41,
+        "event_kind": "qa_verification",
+        "payload": {
+            "route_token_ref": route_ref,
+            "below_cap": {"qa_session_id": below_cap_session},
+            "overdepth": overdepth,
+            "self_cycle": self_cycle,
+            "shared_left": shared,
+            "shared_right": shared,
+        },
+    }
+    private_values = server._timeline_gate_materialized_qa_private_values(
+        [event],
+        [route_ref],
+    )
+    assert route_ref in private_values
+    assert below_cap_session in private_values
+    assert f"qa_session:{below_cap_session}" in private_values
+    assert shared_report_ref in private_values
+    assert overdepth_report_ref not in private_values
+
+    sanitized = server._timeline_gate_public_materialized_qa_sanitized(
+        {"events": [event]},
+        materialized_event_ids=[41],
+        materialized_route_token_refs=[route_ref],
+        materialized_private_values=private_values,
+    )
+    public_response = json.dumps(sanitized, sort_keys=True)
+    assert overdepth_report_ref not in public_response
+    assert shared_report_ref not in public_response
+    assert ordinary_root_ref in public_response
+    assert event["payload"]["self_cycle"]["self"] is self_cycle
+    assert event["payload"]["shared_left"] is event["payload"]["shared_right"]
+    assert alternating_leaf(overdepth, 504) == {
+        "qa_report_ref": overdepth_report_ref
+    }
+
+
+def test_route_action_scope_lineage_stripper_bounds_depth_and_cycles():
+    private_proof = "private-route-action-scope-proof"
+    ordinary_root_ref = "rtok-ordinary-root-stripper"
+
+    def alternating_depth(leaf, depth):
+        value = leaf
+        for _ in range(depth):
+            value = {"nested": [value]}
+        return value
+
+    def alternating_leaf(value, depth):
+        for _ in range(depth):
+            value = value["nested"][0]
+        return value
+
+    overdepth = alternating_depth(
+        {"route_action_scope_lineage": {"proof": private_proof}},
+        504,
+    )
+    self_cycle = {}
+    self_cycle["self"] = self_cycle
+    list_cycle = []
+    list_cycle.append(list_cycle)
+    shared = {"root_ref": ordinary_root_ref}
+    payload = {
+        "ordinary": {
+            "keep": "stable",
+            "nested": [
+                {
+                    "route_action_scope_lineage": {"proof": private_proof},
+                    "root_ref": ordinary_root_ref,
+                }
+            ],
+        },
+        "overdepth": overdepth,
+        "self_cycle": self_cycle,
+        "list_cycle": list_cycle,
+        "shared_left": shared,
+        "shared_right": shared,
+    }
+    stripped = server._strip_route_action_scope_lineage_value(payload)
+    assert stripped["ordinary"] == {
+        "keep": "stable",
+        "nested": [{"root_ref": ordinary_root_ref}],
+    }
+    assert stripped["self_cycle"] == {"self": {}}
+    assert stripped["list_cycle"] == [[]]
+    assert stripped["shared_left"] == {"root_ref": ordinary_root_ref}
+    assert stripped["shared_right"] == {"root_ref": ordinary_root_ref}
+    assert private_proof not in json.dumps(stripped, sort_keys=True)
+    assert payload["self_cycle"]["self"] is self_cycle
+    assert payload["list_cycle"][0] is list_cycle
+    assert payload["shared_left"] is payload["shared_right"] is shared
+    assert alternating_leaf(overdepth, 504) == {
+        "route_action_scope_lineage": {"proof": private_proof}
+    }
+
+
+def test_server_close_timeline_reachable_deep_helpers_bound_unsafe_graphs():
+    self_cycle = {}
+    self_cycle["self"] = self_cycle
+    cycle_left = {}
+    cycle_right = {"left": cycle_left}
+    cycle_left["right"] = cycle_right
+    overdepth = {
+        "observer_impersonation": True,
+        "route_id": "route-overdepth",
+        "reason": "enter_direct_fix_successor",
+        "status": "failed",
+        "graph_trace_ids": ["trace-overdepth"],
+        "route_token_gate": {"allowed": True},
+    }
+    for _ in range(504):
+        overdepth = {"nested": [overdepth]}
+
+    for unsafe in (self_cycle, cycle_left, overdepth):
+        assert not server._qa_request_has_impersonation_claim(unsafe)
+        assert server._deep_route_public_text(unsafe, "route_id") == ""
+        assert server._timeline_first_deep_text(unsafe, "route_id") == ""
+        assert not server._direct_fix_blocker_signal(unsafe)
+        assert not server._contract_runtime_value_reports_failed_qa(unsafe)
+        assert server._contract_runtime_scrub_blocker_statuses_for_resume(unsafe) == {}
+        assert server._contract_runtime_close_authority_first_deep_mapping(
+            unsafe, "route_token_gate"
+        ) == {}
+        assert not server._contract_runtime_parentless_direct_main_graph_trace_key_present(
+            unsafe
+        )
+
+    shared = {
+        "observer_impersonation": True,
+        "route_id": "route-shared",
+        "reason": "enter_direct_fix_successor",
+        "status": "failed",
+        "graph_trace_ids": ["trace-shared"],
+        "route_token_gate": {"allowed": True},
+    }
+    shallow = {"left": shared, "right": shared}
+    assert server._qa_request_has_impersonation_claim(shallow)
+    assert server._deep_route_public_text(shallow, "route_id") == "route-shared"
+    assert server._timeline_first_deep_text(shallow, "route_id") == "route-shared"
+    assert server._direct_fix_blocker_signal(shallow)
+    assert server._contract_runtime_value_reports_failed_qa(shallow)
+    assert server._contract_runtime_scrub_blocker_statuses_for_resume(shallow) == {
+        "left": {**shared, "status": "resumed"},
+        "right": {**shared, "status": "resumed"},
+    }
+    assert server._contract_runtime_close_authority_first_deep_mapping(
+        shallow, "route_token_gate"
+    ) == {"allowed": True}
+    assert server._contract_runtime_parentless_direct_main_graph_trace_key_present(
+        shallow
+    )
+    assert self_cycle["self"] is self_cycle
+    assert cycle_left["right"] is cycle_right and cycle_right["left"] is cycle_left
+    assert shallow["left"] is shallow["right"] is shared
+
+
 @pytest.mark.parametrize(
     ("base_source", "candidate_source", "expected_reason"),
     [
@@ -88532,6 +88717,34 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                     )
                     for depth in (128, 192, 256)
                 }
+                adversarial_collector_private_ref = (
+                    "qa_report:overdepth-handler-collector"
+                )
+                adversarial_collector_deep_alias = (
+                    adversarial_alternating_container(
+                        {"qa_report_ref": adversarial_collector_private_ref},
+                        504,
+                    )
+                )
+                stored_later_payload = json.loads(
+                    conn.execute(
+                        "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+                        (int(later_qa_event["id"]),),
+                    ).fetchone()[0]
+                )
+                stored_later_payload["collector_deep_alias"] = (
+                    adversarial_collector_deep_alias
+                )
+                conn.execute(
+                    "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+                    (
+                        json.dumps(stored_later_payload, sort_keys=True),
+                        int(later_qa_event["id"]),
+                    ),
+                )
+                later_qa_event["payload"]["collector_deep_alias"] = (
+                    adversarial_collector_deep_alias
+                )
 
                 adversarial_below_cap_json = adversarial_nested_json(
                     close_route_token_ref,
@@ -89172,6 +89385,26 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         )
     )
     assert storage_fingerprint() == storage_before_precheck
+    if tamper == "cross_session_enriched_later_failed":
+        assert adversarial_collector_private_ref not in json.dumps(
+            precheck,
+            sort_keys=True,
+        )
+        restored_later_payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+                (int(later_qa_event["id"]),),
+            ).fetchone()[0]
+        )
+        restored_later_payload.pop("collector_deep_alias")
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (
+                json.dumps(restored_later_payload, sort_keys=True),
+                int(later_qa_event["id"]),
+            ),
+        )
+        later_qa_event["payload"].pop("collector_deep_alias")
     projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
     if tamper.startswith("cross_session_"):
         cross_session_gate = projection[
@@ -89227,6 +89460,8 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 later_qa_event["artifact_refs"]["qa_scope_binding_ref"],
                 later_qa_event["payload"]["route_token_ref"],
             }
+            if tamper == "cross_session_enriched_later_failed":
+                private_refs.add(adversarial_collector_private_ref)
             if tamper == "cross_session_enriched_later_failed":
                 cache_probe_query = {
                     "close_commit": close_commit,
@@ -89434,6 +89669,12 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             assert stored_later_payload["route_token_ref"] == (
                 later_qa_event["payload"]["route_token_ref"]
             )
+            if tamper == "cross_session_enriched_later_failed":
+                assert adversarial_alternating_leaf(
+                    adversarial_collector_deep_alias,
+                    504,
+                ) == {"qa_report_ref": adversarial_collector_private_ref}
+                assert "collector_deep_alias" not in stored_later_payload
             resolved_later_route = observer_route_context.resolve_route_token_ref(
                 conn,
                 project_id=PID,

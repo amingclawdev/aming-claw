@@ -13180,6 +13180,54 @@ def _require_bounded_qa_session_authority(
     return session, proof
 
 
+_CLOSE_TRAVERSAL_MAX_DEPTH = 128
+
+
+def _server_close_timeline_container_graph_safe(value: Any) -> bool:
+    containers = (Mapping, list, tuple, set, frozenset)
+    active_ids: set[int] = set()
+    stack = [(value, 0, False)]
+    while stack:
+        current, depth, leaving = stack.pop()
+        if not isinstance(current, containers):
+            continue
+        container_id = id(current)
+        if leaving:
+            active_ids.remove(container_id)
+            continue
+        if depth > _CLOSE_TRAVERSAL_MAX_DEPTH or container_id in active_ids:
+            return False
+        active_ids.add(container_id)
+        stack.append((current, depth, True))
+        children = current.values() if isinstance(current, Mapping) else current
+        stack.extend((child, depth + 1, False) for child in children)
+    return True
+
+
+_CLOSE_TRAVERSAL_STATE = local()
+
+
+def _bounded_close_helper(fallback):
+    def decorate(fn):
+        @wraps(fn)
+        def bounded(value: Any, *args, **kwargs):
+            active = getattr(_CLOSE_TRAVERSAL_STATE, "active_helpers", frozenset())
+            if fn in active:
+                return fn(value, *args, **kwargs)
+            if not _server_close_timeline_container_graph_safe(value):
+                return fallback(value)
+            _CLOSE_TRAVERSAL_STATE.active_helpers = active | {fn}
+            try:
+                return fn(value, *args, **kwargs)
+            finally:
+                _CLOSE_TRAVERSAL_STATE.active_helpers = active
+
+        return bounded
+
+    return decorate
+
+
+@_bounded_close_helper(lambda _: False)
 def _qa_request_has_impersonation_claim(value: Any) -> bool:
     if isinstance(value, Mapping):
         for key, child in value.items():
@@ -82243,16 +82291,37 @@ _ROUTE_ACTION_SCOPE_LINEAGE_KEYS = (
 )
 
 
-def _strip_route_action_scope_lineage_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            key: _strip_route_action_scope_lineage_value(child)
-            for key, child in value.items()
-            if key not in _ROUTE_ACTION_SCOPE_LINEAGE_KEYS
-        }
-    if isinstance(value, list):
-        return [_strip_route_action_scope_lineage_value(item) for item in value]
-    return value
+def _strip_route_action_scope_lineage_value(
+    value: Any,
+    depth: int = 0,
+    active_container_ids: set[int] | None = None,
+) -> Any:
+    if not isinstance(value, (Mapping, list)):
+        return value
+    if (
+        depth > _TIMELINE_GATE_PUBLIC_SANITIZER_MAX_DEPTH
+        or id(value) in (active_container_ids or set())
+    ):
+        return {} if isinstance(value, Mapping) else []
+    active_ids = active_container_ids if active_container_ids is not None else set()
+    active_ids.add(id(value))
+    try:
+        if isinstance(value, Mapping):
+            return {
+                key: _strip_route_action_scope_lineage_value(
+                    child,
+                    depth + 1,
+                    active_ids,
+                )
+                for key, child in value.items()
+                if key not in _ROUTE_ACTION_SCOPE_LINEAGE_KEYS
+            }
+        return [
+            _strip_route_action_scope_lineage_value(item, depth + 1, active_ids)
+            for item in value
+        ]
+    finally:
+        active_ids.remove(id(value))
 
 
 def _strip_caller_route_action_scope_lineage(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -82403,6 +82472,7 @@ def _route_gate_lineage_mapping(
     return {}
 
 
+@_bounded_close_helper(lambda _: "")
 def _deep_route_public_text(value: Any, field: str) -> str:
     if isinstance(value, Mapping):
         if field in value and str(value.get(field) or "").strip():
@@ -83361,6 +83431,7 @@ def _timeline_claimed_route_identity(
     return merged
 
 
+@_bounded_close_helper(lambda _: "")
 def _timeline_first_deep_text(value: Any, key: str) -> str:
     if isinstance(value, Mapping):
         token = str(value.get(key) or "").strip()
@@ -125477,6 +125548,7 @@ def _direct_fix_definition_allows_parent(
     return False
 
 
+@_bounded_close_helper(lambda _: False)
 def _direct_fix_blocker_signal(value: Any) -> bool:
     if isinstance(value, Mapping):
         for key, child in value.items():
@@ -125594,6 +125666,7 @@ def _contract_runtime_qa_failure_text_signal(value: Any) -> bool:
     return any(marker in text for marker in _CONTRACT_RUNTIME_QA_FAILURE_TEXT_MARKERS)
 
 
+@_bounded_close_helper(lambda _: False)
 def _contract_runtime_value_reports_failed_qa(
     value: Any,
     *,
@@ -126326,6 +126399,7 @@ _RESUMED_SUCCESSOR_BLOCKING_STATUSES = frozenset(
 )
 
 
+@_bounded_close_helper(lambda value: {} if isinstance(value, Mapping) else [])
 def _contract_runtime_scrub_blocker_statuses_for_resume(value: Any) -> Any:
     if isinstance(value, Mapping):
         scrubbed: dict[Any, Any] = {}
@@ -138966,6 +139040,7 @@ def _contract_runtime_close_authority_seed_events(
     ]
 
 
+@_bounded_close_helper(lambda _: {})
 def _contract_runtime_close_authority_first_deep_mapping(
     value: Any,
     key: str,
@@ -139134,6 +139209,7 @@ def _contract_runtime_parentless_direct_main_marker(
     )
 
 
+@_bounded_close_helper(lambda _: False)
 def _contract_runtime_parentless_direct_main_graph_trace_key_present(
     value: Any,
 ) -> bool:
@@ -153433,38 +153509,50 @@ def _timeline_gate_observer_materialized_qa_event(event: Mapping[str, Any]) -> b
     )
 
 
+_TIMELINE_GATE_PUBLIC_SANITIZER_MAX_DEPTH = 128
+
+
 def _timeline_gate_materialized_qa_private_values(
     events: Sequence[Mapping[str, Any]], route_token_refs: Sequence[str]
 ) -> frozenset[str]:
     private_keys = frozenset(
         "evidence_owner_session materialized_from materialized_from_report "
-        "qa_report_ref qa_scope_binding_ref qa_session_id submitter_session".split()
+        "qa_report_ref qa_scope_binding_ref qa_session_id route_token_ref "
+        "submitter_session".split()
     )
     values = {str(ref).strip() for ref in route_token_refs if str(ref).strip()}
     qa_sessions: set[str] = set()
+    active_container_ids: set[int] = set()
 
-    def collect(value: Any) -> None:
-        if isinstance(value, Mapping):
-            for raw_key, child in value.items():
-                key = str(raw_key)
-                if key in private_keys and isinstance(child, str) and child.strip():
-                    values.add(child.strip())
-                    if key in {"evidence_owner_session", "qa_session_id"}:
-                        qa_sessions.add(child.strip())
-                if isinstance(child, (Mapping, list, tuple)):
-                    collect(child)
-        elif isinstance(value, (list, tuple)):
-            for child in value:
-                collect(child)
+    def collect(value: Any, depth: int = 0) -> None:
+        if (
+            depth > _TIMELINE_GATE_PUBLIC_SANITIZER_MAX_DEPTH
+            or not isinstance(value, (Mapping, list, tuple))
+        ):
+            return
+        container_id = id(value)
+        if container_id in active_container_ids:
+            return
+        active_container_ids.add(container_id)
+        try:
+            if isinstance(value, Mapping):
+                for raw_key, child in value.items():
+                    key = str(raw_key)
+                    if key in private_keys and isinstance(child, str) and child.strip():
+                        values.add(child.strip())
+                        if key in {"evidence_owner_session", "qa_session_id"}:
+                            qa_sessions.add(child.strip())
+                    collect(child, depth + 1)
+            else:
+                for child in value:
+                    collect(child, depth + 1)
+        finally:
+            active_container_ids.remove(container_id)
 
     for event in events:
         collect(event)
     values.update(f"qa_session:{session}" for session in qa_sessions)
     return frozenset(values)
-
-
-_TIMELINE_GATE_PUBLIC_SANITIZER_MAX_DEPTH = 128
-
 
 def _timeline_gate_exact_private_values_sanitized(value: Any, private_values: frozenset[str]) -> Any:
     dropped = object()
