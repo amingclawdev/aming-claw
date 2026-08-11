@@ -751,16 +751,26 @@ def _contract_runtime_primary_close_gate_accepted(
 def _contract_runtime_meta_contains_truthy_key(
     value: Any,
     keys: set[str],
+    *,
+    _graph_validated: bool = False,
 ) -> bool:
+    if not _graph_validated and not _route_identity_container_graph_safe(
+        value, 0, set()
+    ):
+        return False
     if isinstance(value, Mapping):
         for key, child in value.items():
             if str(key) in keys and _truthy(child):
                 return True
-            if _contract_runtime_meta_contains_truthy_key(child, keys):
+            if _contract_runtime_meta_contains_truthy_key(
+                child, keys, _graph_validated=True
+            ):
                 return True
     elif isinstance(value, list):
         return any(
-            _contract_runtime_meta_contains_truthy_key(item, keys)
+            _contract_runtime_meta_contains_truthy_key(
+                item, keys, _graph_validated=True
+            )
             for item in value
         )
     return False
@@ -3583,7 +3593,13 @@ def _event_marker(event: dict[str, Any]) -> str:
     )
 
 
-def _read_receipt_hash_from_container(value: Any) -> str:
+def _read_receipt_hash_from_container(
+    value: Any, *, _graph_validated: bool = False
+) -> str:
+    if not _graph_validated and not _route_identity_container_graph_safe(
+        value, 0, set()
+    ):
+        return ""
     if not isinstance(value, dict):
         return ""
     for key in ("read_receipt_hash", "worker_read_receipt_hash"):
@@ -3593,7 +3609,9 @@ def _read_receipt_hash_from_container(value: Any) -> str:
     for key in ("read_receipt", "worker_contract", "evidence", "payload"):
         nested = value.get(key)
         if isinstance(nested, dict):
-            found = _read_receipt_hash_from_container(nested)
+            found = _read_receipt_hash_from_container(
+                nested, _graph_validated=True
+            )
             if found:
                 return found
     return ""
@@ -5480,7 +5498,7 @@ _ROUTE_IDENTITY_TRAVERSAL_MAX_DEPTH = 128
 def _route_identity_container_graph_safe(
     value: Any, depth: int, active_ids: set[int]
 ) -> bool:
-    if not isinstance(value, (dict, list, tuple)):
+    if not isinstance(value, (Mapping, list, tuple)):
         return True
     if depth > _ROUTE_IDENTITY_TRAVERSAL_MAX_DEPTH:
         return False
@@ -5489,7 +5507,7 @@ def _route_identity_container_graph_safe(
         return False
     active_ids.add(container_id)
     try:
-        children = value.values() if isinstance(value, dict) else value
+        children = value.values() if isinstance(value, Mapping) else value
         return all(
             _route_identity_container_graph_safe(child, depth + 1, active_ids)
             for child in children
@@ -5538,20 +5556,45 @@ def _first_deep_mapping(
         active_ids.remove(container_id)
 
 
-def _first_deep_value(value: Any, key: str) -> Any:
-    if isinstance(value, dict):
-        if key in value and value.get(key) not in (None, "", [], {}):
-            return value.get(key)
-        for child in value.values():
-            found = _first_deep_value(child, key)
+def _first_deep_value(
+    value: Any,
+    key: str,
+    *,
+    _depth: int = 0,
+    _active_container_ids: set[int] | None = None,
+) -> Any:
+    if (
+        _depth > _ROUTE_IDENTITY_TRAVERSAL_MAX_DEPTH
+        or not isinstance(value, (dict, list))
+    ):
+        return None
+    container_id = id(value)
+    active_ids = _active_container_ids if _active_container_ids is not None else set()
+    if container_id in active_ids:
+        return None
+    active_ids.add(container_id)
+    try:
+        if isinstance(value, dict):
+            candidate = value.get(key)
+            if key in value and candidate not in (None, "", [], {}):
+                if _route_identity_container_graph_safe(
+                    candidate, _depth + 1, active_ids
+                ):
+                    return candidate
+                return None
+            children = value.values()
+        else:
+            children = value
+        for child in children:
+            found = _first_deep_value(
+                child, key, _depth=_depth + 1,
+                _active_container_ids=active_ids,
+            )
             if found not in (None, "", [], {}):
                 return found
-    elif isinstance(value, list):
-        for child in value:
-            found = _first_deep_value(child, key)
-            if found not in (None, "", [], {}):
-                return found
-    return None
+        return None
+    finally:
+        active_ids.remove(container_id)
 
 
 def _first_deep_text(
@@ -10556,6 +10599,8 @@ def mf_blocker_resolution_gate_verification(
 
 def _canonical_cross_ref_scope_token(value: Any) -> str:
     if isinstance(value, Mapping):
+        if not _route_identity_container_graph_safe(value, 0, set()):
+            return ""
         normalized: dict[str, str] = {}
         for key, raw in value.items():
             text = str(raw or "").strip()

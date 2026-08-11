@@ -270,6 +270,94 @@ def test_first_deep_mapping_preserves_shallow_nested_and_shared_dag_parity():
     assert target["left"] is target["right"] is shared
 
 
+def test_first_deep_value_rejects_cycle_and_overdepth_search_without_mutation():
+    from agent.governance import task_timeline
+
+    self_cycle = {}
+    self_cycle["self"] = self_cycle
+    left = {}
+    right = {"left": left}
+    left["right"] = right
+    overdepth = {"leaf": "unchanged"}
+    for _ in range(504):
+        overdepth = {"nested": [overdepth]}
+
+    assert task_timeline._first_deep_value(self_cycle, "owned_files") is None
+    assert task_timeline._first_deep_value(left, "owned_files") is None
+    assert task_timeline._first_deep_value(overdepth, "owned_files") is None
+    assert self_cycle["self"] is self_cycle
+    assert left["right"] is right and right["left"] is left
+
+
+def test_first_deep_value_rejects_unsafe_matched_owned_files_containers():
+    from agent.governance import task_timeline
+
+    self_list = []
+    self_list.append(self_list)
+    tuple_cycle_list = []
+    tuple_cycle = (tuple_cycle_list,)
+    tuple_cycle_list.append(tuple_cycle)
+    deep_tuple = "leaf"
+    for _ in range(504):
+        deep_tuple = (deep_tuple,)
+
+    for candidate in (self_list, tuple_cycle, deep_tuple):
+        assert task_timeline._first_deep_value(
+            {"owned_files": candidate}, "owned_files"
+        ) is None
+    assert self_list[0] is self_list
+    assert tuple_cycle_list[0] is tuple_cycle
+
+
+def test_first_deep_value_preserves_shallow_nested_and_shared_dag_parity():
+    from agent.governance import task_timeline
+
+    owned_files = ["agent/governance/task_timeline.py"]
+    shared = {"owned_files": owned_files}
+    value = {"left": shared, "right": shared, "revision": 17}
+
+    assert task_timeline._first_deep_value(value, "owned_files") is owned_files
+    assert task_timeline._first_deep_value(value, "revision") == 17
+    assert value["left"] is value["right"] is shared
+
+
+def test_reachable_route_deep_helpers_reject_unsafe_graphs_with_shallow_parity():
+    from agent.governance import task_timeline
+
+    meta_cycle = {}
+    meta_cycle["payload"] = meta_cycle
+    receipt_left = {}
+    receipt_right = {"evidence": receipt_left}
+    receipt_left["payload"] = receipt_right
+    scope_cycle = {}
+    scope_cycle["project_id"] = scope_cycle
+    deep_scope_json = '{"project_id":"proj"}'
+    for _ in range(504):
+        deep_scope_json = '{"payload":' + deep_scope_json + "}"
+    overdepth = {"self_attesting": True}
+    for _ in range(504):
+        overdepth = {"payload": [overdepth]}
+
+    assert not task_timeline._contract_runtime_meta_contains_truthy_key(
+        meta_cycle, {"self_attesting"}
+    )
+    assert not task_timeline._contract_runtime_meta_contains_truthy_key(
+        overdepth, {"self_attesting"}
+    )
+    assert task_timeline._read_receipt_hash_from_container(receipt_left) == ""
+    assert task_timeline._canonical_cross_ref_scope_token(scope_cycle) == ""
+    assert task_timeline._canonical_cross_ref_scope_token(deep_scope_json) == ""
+    assert task_timeline._contract_runtime_meta_contains_truthy_key(
+        {"payload": {"self_attesting": True}}, {"self_attesting"}
+    )
+    assert task_timeline._read_receipt_hash_from_container(
+        {"payload": {"read_receipt_hash": "sha256:shallow"}}
+    ) == "sha256:shallow"
+    assert task_timeline._canonical_cross_ref_scope_token(
+        {"project_id": "proj", "backlog_id": "AC-1", "task_id": "task-1"}
+    ) == '{"backlog_id":"AC-1","project_id":"proj","task_id":"task-1"}'
+
+
 def _terminalization_timeline_args():
     return {
         "project_id": "proj",
