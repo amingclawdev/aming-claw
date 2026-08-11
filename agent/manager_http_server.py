@@ -10,6 +10,7 @@ PR-1 refactor: Uses stdlib ThreadingHTTPServer + BaseHTTPRequestHandler
 (dropped aiohttp dependency) for consistency with agent/governance/server.py.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -595,12 +596,24 @@ def _git_commit_matches(observed: object, expected: object) -> bool:
     return longer.startswith(shorter)
 
 
+def _governance_runtime_source_sha256() -> str:
+    """Return the exact checked-out governance server source fingerprint."""
+    try:
+        source = (
+            _project_root() / "agent" / "governance" / "server.py"
+        ).read_bytes()
+    except OSError as exc:
+        raise RuntimeError("runtime_checkout: governance source is unreadable") from exc
+    return "sha256:" + hashlib.sha256(source).hexdigest()
+
+
 def _wait_for_health(
     proc: subprocess.Popen,
     expected_runtime_head: str,
+    expected_source_sha256: str,
     timeout: float = _HEALTH_CHECK_TIMEOUT,
 ) -> bool:
-    """Wait for health bound to the spawned PID, listener, and loaded commit."""
+    """Wait for health bound to the spawned PID, listener, commit, and source."""
     import urllib.request
     import urllib.error
 
@@ -620,7 +633,15 @@ def _wait_for_health(
                 if resp.status == 200:
                     payload = json.loads(resp.read().decode("utf-8"))
                     loaded = payload.get("loaded_runtime_identity") or {}
-                    source_hash = str(loaded.get("loaded_source_sha256") or "")
+                    loaded_source_hash = str(
+                        loaded.get("loaded_source_sha256") or ""
+                    )
+                    worktree_source_hash = str(
+                        loaded.get("worktree_source_sha256") or ""
+                    )
+                    top_source_hash = str(
+                        payload.get("runtime_loaded_source_sha256") or ""
+                    )
                     exact_identity = (
                         payload.get("pid") == proc.pid
                         and loaded.get("loaded_pid") == proc.pid
@@ -634,8 +655,11 @@ def _wait_for_health(
                         )
                         and payload.get("runtime_stale") is False
                         and loaded.get("runtime_stale") is False
-                        and source_hash.startswith("sha256:")
-                        and len(source_hash) == 71
+                        and len(expected_source_sha256) == 71
+                        and expected_source_sha256.startswith("sha256:")
+                        and top_source_hash == expected_source_sha256
+                        and loaded_source_hash == expected_source_sha256
+                        and worktree_source_hash == expected_source_sha256
                     )
                     if exact_identity:
                         if proc.poll() is not None:
@@ -925,6 +949,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                 if branch_ref
                 else _ensure_plugin_clone_checkout(chain_version)
             )
+            expected_source_sha256 = _governance_runtime_source_sha256()
             runtime_branch_state = _runtime_checkout_branch_state()
         except Exception as exc:
             log.error(
@@ -1011,7 +1036,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
             return
 
         # Step 3: Health-poll /api/health up to 30s
-        healthy = _wait_for_health(proc, runtime_head)
+        healthy = _wait_for_health(proc, runtime_head, expected_source_sha256)
 
         if not healthy:
             self._send_json(
@@ -1063,7 +1088,9 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         # The version write is a network round trip. Re-prove the complete
         # spawned runtime identity immediately before returning success so a
         # process/listener transition during that write cannot be hidden.
-        if not _wait_for_health(proc, runtime_head, timeout=5):
+        if not _wait_for_health(
+            proc, runtime_head, expected_source_sha256, timeout=5
+        ):
             detail = "Governance runtime identity changed after version update"
             self._send_json(
                 {

@@ -344,6 +344,7 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
                 manager_http_server._wait_for_health(
                     proc,
                     "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+                    "sha256:" + "a" * 64,
                     timeout=0.01,
                 )
             )
@@ -358,11 +359,13 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
             "version": "a0266c5d",
             "worktree_head_version": "a0266c5d",
             "runtime_loaded_version": "a0266c5d",
+            "runtime_loaded_source_sha256": "sha256:" + "a" * 64,
             "runtime_stale": False,
             "loaded_runtime_identity": {
                 "loaded_pid": 84539,
                 "loaded_commit": "a0266c5d",
                 "loaded_source_sha256": "sha256:" + "a" * 64,
+                "worktree_source_sha256": "sha256:" + "a" * 64,
                 "runtime_stale": False,
             },
         }
@@ -380,7 +383,49 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
                 manager_http_server._wait_for_health(
                     proc,
                     "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+                    "sha256:" + "a" * 64,
                     timeout=0.05,
+                )
+            )
+
+    def test_health_rejects_contradictory_source_identities(self):
+        proc = MagicMock()
+        proc.pid = 84539
+        proc.poll.return_value = None
+        payload = {
+            "status": "ok",
+            "pid": 84539,
+            "version": "a0266c5d",
+            "worktree_head_version": "a0266c5d",
+            "runtime_loaded_version": "a0266c5d",
+            "runtime_loaded_source_sha256": "sha256:" + "b" * 64,
+            "runtime_stale": False,
+            "loaded_runtime_identity": {
+                "loaded_pid": 84539,
+                "loaded_commit": "a0266c5d",
+                "loaded_source_sha256": "sha256:" + "a" * 64,
+                "worktree_source_sha256": "sha256:" + "c" * 64,
+                "runtime_stale": False,
+            },
+        }
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with patch.object(
+            manager_http_server,
+            "_governance_listener_pids",
+            return_value=(84539,),
+        ), patch("urllib.request.urlopen", return_value=response), patch.object(
+            manager_http_server, "_HEALTH_CHECK_INTERVAL", 0
+        ):
+            self.assertFalse(
+                manager_http_server._wait_for_health(
+                    proc,
+                    "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+                    "sha256:" + "a" * 64,
+                    timeout=0.01,
                 )
             )
 
@@ -394,11 +439,13 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
             "version": "a0266c5d",
             "worktree_head_version": "a0266c5d",
             "runtime_loaded_version": "8fa1b07c",
+            "runtime_loaded_source_sha256": "sha256:" + "a" * 64,
             "runtime_stale": True,
             "loaded_runtime_identity": {
                 "loaded_pid": 84539,
                 "loaded_commit": "8fa1b07c",
                 "loaded_source_sha256": "sha256:" + "a" * 64,
+                "worktree_source_sha256": "sha256:" + "a" * 64,
                 "runtime_stale": True,
             },
         }
@@ -418,6 +465,7 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
                 manager_http_server._wait_for_health(
                     proc,
                     "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+                    "sha256:" + "a" * 64,
                     timeout=0.01,
                 )
             )
@@ -432,11 +480,13 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
             "version": "a0266c5d",
             "worktree_head_version": "a0266c5d",
             "runtime_loaded_version": "a0266c5d",
+            "runtime_loaded_source_sha256": "sha256:" + "a" * 64,
             "runtime_stale": False,
             "loaded_runtime_identity": {
                 "loaded_pid": 84539,
                 "loaded_commit": "a0266c5d",
                 "loaded_source_sha256": "sha256:" + "a" * 64,
+                "worktree_source_sha256": "sha256:" + "a" * 64,
                 "runtime_stale": False,
             },
         }
@@ -456,6 +506,7 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
                 manager_http_server._wait_for_health(
                     proc,
                     "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+                    "sha256:" + "a" * 64,
                     timeout=0.01,
                 )
             )
