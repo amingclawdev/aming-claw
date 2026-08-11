@@ -32316,7 +32316,6 @@ def _runtime_context_verified_allocation_route_successor(
     ):
         return {}
     receipt_payload = dict(payload)
-    receipt_payload.pop("source_of_truth", None)
     receipt_payload.pop("revision_receipt", None)
     receipt_material = _contract_revision_receipt_material(
         context=context,

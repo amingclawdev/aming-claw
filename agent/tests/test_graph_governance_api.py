@@ -107659,6 +107659,7 @@ def _append_worker_route_cutover_revision(
             payload={
                 "schema_version": "parallel_branch_allocate_contract_revision.v1",
                 "source": "parallel_branch_allocate",
+                "source_of_truth": "Contract/Revision/Event",
                 "contract_execution_id": contract_execution_id,
                 "successor_contract_execution_id": contract_execution_id,
                 "runtime_context_id": runtime_context.runtime_context_id,
@@ -107707,6 +107708,7 @@ def _append_worker_route_cutover_revision(
         payload={
             "schema_version": "parallel_branch_allocate_contract_revision.v1",
             "source": "parallel_branch_allocate",
+            "source_of_truth": "Contract/Revision/Event",
             "contract_execution_id": contract_execution_id,
             "successor_contract_execution_id": contract_execution_id,
             "runtime_context_id": runtime_context.runtime_context_id,
