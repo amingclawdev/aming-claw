@@ -107641,6 +107641,7 @@ def _append_worker_route_cutover_revision(
     backlog_id: str,
     suffix: str,
     registry_verified: bool = True,
+    persist_registry: bool = True,
 ) -> dict[str, str]:
     contract_execution_id = successor["contract_execution_id"]
     dispatch_identity = _worker_dispatch_route_identity(
@@ -107686,17 +107687,18 @@ def _append_worker_route_cutover_revision(
             f"visible-cutover:{suffix}"
         ),
     }
-    _persist_append_route_token_ref(
-        conn,
-        backlog_id=backlog_id,
-        task_id=contract_execution_id,
-        allowed_actions=[
-            "parallel_branch_allocate",
-            "runtime_context_read_receipt",
-            "task_timeline_append",
-        ],
-        **route_identity,
-    )
+    if persist_registry:
+        _persist_append_route_token_ref(
+            conn,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+            allowed_actions=[
+                "parallel_branch_allocate",
+                "runtime_context_read_receipt",
+                "task_timeline_append",
+            ],
+            **route_identity,
+        )
     append_branch_contract_revision(
         conn,
         runtime_context,
@@ -107806,6 +107808,10 @@ def test_initial_join_route_authority_accepts_registry_verified_allocation_cutov
         "wrong_actor",
         "missing_read_action",
         "unknown_predecessor",
+        "receipt_payload_tamper",
+        "unregistered_registry",
+        "expired_registry",
+        "wrong_registry_scope",
     ],
 )
 def test_initial_join_route_authority_rejects_unverified_revision_cutover(
@@ -107824,13 +107830,14 @@ def test_initial_join_route_authority_rejects_unverified_revision_cutover(
         parent_task_is_contract_execution=True,
         required_worker_count=1,
     )
-    _append_worker_route_cutover_revision(
+    cutover = _append_worker_route_cutover_revision(
         conn,
         successor=successor,
         runtime_context=runtime_context,
         backlog_id=backlog_id,
         suffix="initial-join-unverified",
         registry_verified=tamper != "registry_unverified",
+        persist_registry=tamper != "unregistered_registry",
     )
     latest = get_latest_branch_contract_revision(
         conn,
@@ -107853,7 +107860,26 @@ def test_initial_join_route_authority_rejects_unverified_revision_cutover(
         payload["revision_receipt"]["previous_revision_hash"] = _fake_sha(
             "unknown-route-predecessor"
         )
-    if tamper != "registry_unverified":
+    elif tamper == "receipt_payload_tamper":
+        payload["coherent_tamper"] = "revision-receipt-must-bind-current-payload"
+    elif tamper == "expired_registry":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET expires_at = ? "
+            "WHERE project_id = ? AND route_token_ref = ?",
+            ("2000-01-01T00:00:00Z", PID, cutover["route_token_ref"]),
+        )
+    elif tamper == "wrong_registry_scope":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET backlog_id = ? "
+            "WHERE project_id = ? AND route_token_ref = ?",
+            ("AC-FOREIGN", PID, cutover["route_token_ref"]),
+        )
+    if tamper not in {
+        "registry_unverified",
+        "unregistered_registry",
+        "expired_registry",
+        "wrong_registry_scope",
+    }:
         conn.execute(
             """
             UPDATE parallel_branch_runtime_contract_revisions

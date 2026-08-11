@@ -32142,6 +32142,11 @@ def _runtime_context_verified_allocation_route_successor(
         else {}
     )
     route_identity = _parallel_branch_runtime_contract_route_identity(revision)
+    stored_route_identity = (
+        revision.get("route_identity")
+        if isinstance(revision.get("route_identity"), Mapping)
+        else {}
+    )
     payload_identity = (
         payload.get("route_identity")
         if isinstance(payload.get("route_identity"), Mapping)
@@ -32219,6 +32224,62 @@ def _runtime_context_verified_allocation_route_successor(
         and str(receipt.get("canonical_visible_contract_text_hash") or "")
         == str(revision.get("revision_id") or "")
         and re.fullmatch(r"sha256:[0-9a-f]{64}", previous_revision_hash)
+    ):
+        return {}
+    from . import observer_route_context
+    from .parallel_branch_runtime import (
+        _canonical_contract_hash,
+        _contract_revision_receipt_material,
+    )
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=expected_scope["project_id"],
+            route_token_ref=exact_identity["route_token_ref"],
+            route_id=exact_identity["route_id"],
+            route_context_hash=exact_identity["route_context_hash"],
+            prompt_contract_id=exact_identity["prompt_contract_id"],
+            task_id=parent_task_id,
+            backlog_id=expected_scope["backlog_id"],
+        )
+    except (observer_route_context.RouteTokenRefError, sqlite3.Error, ValueError):
+        return {}
+    resolved = dict(resolved or {})
+    resolved_scope = (
+        resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {}
+    )
+    resolved_actions = resolved.get("allowed_actions")
+    if not (
+        resolved.get("resolved_from_ref") is True
+        and str(resolved.get("status") or "") == "active"
+        and str(resolved.get("caller_role") or "") == "observer"
+        and all(
+            str(resolved.get(field) or "").strip() == exact_identity[field]
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+        and {key: str(resolved_scope.get(key) or "") for key in expected_scope}
+        == expected_scope
+        and isinstance(resolved_actions, list)
+        and {"parallel_branch_allocate", "runtime_context_read_receipt"}.issubset(
+            {str(item or "") for item in resolved_actions}
+        )
+    ):
+        return {}
+    receipt_payload = dict(payload)
+    receipt_payload.pop("source_of_truth", None)
+    receipt_payload.pop("revision_receipt", None)
+    receipt_material = _contract_revision_receipt_material(
+        context=context,
+        runtime_context_id=runtime_context_id,
+        revision_id="",
+        explicit_revision_id=False,
+        contract_version=str(revision.get("contract_version") or ""),
+        payload=receipt_payload,
+        route_identity=stored_route_identity,
+        previous_revision_hash=previous_revision_hash,
+    )
+    if _canonical_contract_hash(receipt_material) != str(
+        revision.get("revision_id") or ""
     ):
         return {}
     previous = conn.execute(
