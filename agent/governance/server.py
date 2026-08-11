@@ -14636,15 +14636,43 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
     lanes = ctx.body.get("lanes")
     if not isinstance(lanes, list):
         raise ValidationError("lanes must be an array")
-    raw_expected_lane_count = ctx.body.get("expected_lane_count")
-    if raw_expected_lane_count in (None, ""):
-        raw_expected_lane_count = ctx.body.get("expected_worker_count")
-    if raw_expected_lane_count in (None, ""):
-        raw_expected_lane_count = 2
-    try:
-        expected_lane_count = int(raw_expected_lane_count)
-    except (TypeError, ValueError) as exc:
-        raise ValidationError("expected_lane_count must be an integer") from exc
+    parsed_lane_counts: dict[str, int] = {}
+    for field in ("expected_lane_count", "expected_worker_count"):
+        raw_count = ctx.body.get(field)
+        if raw_count in (None, ""):
+            continue
+        if type(raw_count) is int:
+            parsed_lane_counts[field] = raw_count
+        elif isinstance(raw_count, str) and raw_count in {"1", "2"}:
+            parsed_lane_counts[field] = int(raw_count)
+        else:
+            raise GovernanceError(
+                "parallel_branch_allocate_precheck_lane_count_alias_invalid",
+                f"{field} must be an integer",
+                422,
+                {
+                    "field": field,
+                    "actual": "<invalid>",
+                    "actual_type": type(raw_count).__name__,
+                    "writes_performed": False,
+                },
+            )
+    if len(set(parsed_lane_counts.values())) > 1:
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_lane_count_alias_conflict",
+            "expected_lane_count and expected_worker_count must match",
+            422,
+            {
+                "expected_lane_count": parsed_lane_counts.get(
+                    "expected_lane_count"
+                ),
+                "expected_worker_count": parsed_lane_counts.get(
+                    "expected_worker_count"
+                ),
+                "writes_performed": False,
+            },
+        )
+    expected_lane_count = next(iter(parsed_lane_counts.values()), 2)
     if expected_lane_count not in {1, 2}:
         raise GovernanceError(
             "parallel_branch_allocate_precheck_lane_count_mismatch",
@@ -14832,6 +14860,14 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             and cardinality_policy.get("batch_row_scoped_successor") is True
             and allocation_precheck_policy.get("verified_batch_child") is True
         )
+        verified_standalone_single_lane = bool(
+            cardinality_source == "observer_selected_standalone_cardinality"
+            and cardinality_policy.get("batch_row_scoped_successor") is False
+            and allocation_precheck_policy.get("scope")
+            == "standalone_contract"
+            and allocation_precheck_policy.get("declared_batch_child") is False
+            and allocation_precheck_policy.get("verified_batch_child") is False
+        )
         batch_target_authority: dict[str, Any] = {}
         if declared_batch_child:
             batch_target_authority = (
@@ -14948,7 +14984,9 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                     "writes_performed": False,
                 },
             )
-        if authoritative_lane_count == 1 and not verified_batch_child:
+        if authoritative_lane_count == 1 and not (
+            verified_batch_child or verified_standalone_single_lane
+        ):
             raise GovernanceError(
                 "parallel_branch_allocate_precheck_single_lane_authority_required",
                 (
@@ -14962,6 +15000,9 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                     "cardinality_source": cardinality_source,
                     "batch_row_scoped_successor": bool(
                         cardinality_policy.get("batch_row_scoped_successor")
+                    ),
+                    "standalone_authority_verified": (
+                        verified_standalone_single_lane
                     ),
                     "writes_performed": False,
                 },
@@ -15018,7 +15059,7 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             lane_owned_files=lane_owned_files,
             acceptance_claim_source=copy_safe_bodies,
         )
-        if not atomic:
+        if not atomic and verified_batch_child:
             acceptance_scope_closure = {
                 **acceptance_scope_closure,
                 "schema_version": (
@@ -15027,6 +15068,17 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                 "scope_mode": "mf_parallel_batch_child_persisted_lane",
                 "atomic_union_authoritative": False,
                 "per_child_contract_authoritative": True,
+            }
+        elif not atomic and verified_standalone_single_lane:
+            acceptance_scope_closure = {
+                **acceptance_scope_closure,
+                "schema_version": (
+                    "mf_parallel.standalone_single_lane_acceptance_scope.v1"
+                ),
+                "scope_mode": "mf_parallel_standalone_persisted_lane",
+                "atomic_union_authoritative": False,
+                "per_child_contract_authoritative": False,
+                "standalone_contract_authoritative": True,
             }
         all_errors = list(
             dict.fromkeys([*lane_errors, *acceptance_errors])

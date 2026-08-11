@@ -7283,6 +7283,7 @@ def _enter_standalone_mf_parallel_for_allocation_precheck(
     task_id: str,
     owned_files: list[str],
     suffix: str,
+    required_worker_count: int = 2,
 ) -> str:
     observer_session_id = _insert_active_observer_session_ref(
         conn,
@@ -7318,12 +7319,16 @@ def _enter_standalone_mf_parallel_for_allocation_precheck(
                 "observer_route_token_ref": enter_route_ref,
                 "onboard_service_waiver": True,
                 "owned_files": owned_files,
-                "metadata": {"required_worker_count": 2},
+                "metadata": {
+                    "required_worker_count": required_worker_count,
+                },
             },
         )
     )
     assert entered["contract_execution_id"] == contract_execution_id
-    assert entered["worker_cardinality_policy"]["required_worker_count"] == 2
+    assert entered["worker_cardinality_policy"]["required_worker_count"] == (
+        required_worker_count
+    )
     return contract_execution_id
 
 
@@ -21590,6 +21595,164 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
         assert Path(allocated["context"]["worktree_path"]).exists()
 
 
+def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_single_lane(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-PRECHECK-STANDALONE-ONE"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = ["agent/governance/server.py"]
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(row_files),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-PRECHECK-STANDALONE-ONE",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": row_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    contract_execution_id = _enter_standalone_mf_parallel_for_allocation_precheck(
+        conn,
+        backlog_id=backlog_id,
+        task_id="allocation-precheck-standalone-one",
+        owned_files=row_files,
+        suffix="standalone-one",
+        required_worker_count=1,
+    )
+    route_token_ref = "rtok-allocation-precheck-standalone-one"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        target_files=row_files,
+    )
+    conn.commit()
+    zero_write_tables = (
+        "parallel_branch_runtime_contexts",
+        "parallel_branch_runtime_contract_revisions",
+        "parallel_branch_merge_queue_items",
+        "task_timeline_events",
+    )
+    before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    }
+    before_total_changes = conn.total_changes
+
+    response = server.handle_graph_governance_parallel_branch_allocate_precheck(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "base_commit": candidate_commit,
+                "target_head_commit": candidate_commit,
+                "expected_lane_count": 1,
+                "expected_worker_count": 1,
+                "lanes": [
+                    {
+                        "task_id": "standalone-one-worker",
+                        "backlog_id": backlog_id,
+                        "contract_execution_id": contract_execution_id,
+                        "worker_id": "slot-standalone-one",
+                        "route_token_ref": route_token_ref,
+                        "owned_files": row_files,
+                    }
+                ],
+            },
+        )
+    )
+
+    assert response["status"] == "ready"
+    assert response["expected_lane_count"] == 1
+    assert response["lane_count"] == 1
+    assert response["atomic"] is False
+    assert response["allocation_scope"] == "standalone_contract"
+    policy = response["effective_allocation_precheck_policy"]
+    assert policy["cardinality_source"] == (
+        "observer_selected_standalone_cardinality"
+    )
+    assert policy["expected_lane_count"] == 1
+    assert policy["atomic"] is False
+    assert policy["verified_batch_child"] is False
+    assert policy["declared_batch_child"] is False
+    assert response["acceptance_scope_closure"]["schema_version"] == (
+        "mf_parallel.standalone_single_lane_acceptance_scope.v1"
+    )
+    assert response["acceptance_scope_closure"]["scope_mode"] == (
+        "mf_parallel_standalone_persisted_lane"
+    )
+    assert response["acceptance_scope_closure"][
+        "atomic_union_authoritative"
+    ] is False
+    assert response["acceptance_scope_closure"][
+        "per_child_contract_authoritative"
+    ] is False
+    assert response["acceptance_scope_closure"][
+        "standalone_contract_authoritative"
+    ] is True
+    receipt = response["copy_safe_allocation_bodies"][0][
+        "allocation_precheck"
+    ]
+    assert receipt == {
+        "schema_version": "parallel_branch_allocate_precheck.receipt.v1",
+        "status": "ready",
+        "submit_unchanged": True,
+        "zero_write": True,
+        "expected_lane_count": 1,
+        "atomic": False,
+        "scope": "standalone_contract",
+        "cardinality_source": "observer_selected_standalone_cardinality",
+    }
+    assert response["zero_write_proof"]["writes_performed"] is False
+    assert conn.total_changes == before_total_changes
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    } == before
+    assert not (repository_root / ".worktrees").exists()
+    copy_safe_body = response["copy_safe_allocation_bodies"][0]
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=copy_safe_body,
+        )
+    )
+    assert status == 201
+    assert allocated["context"]["task_id"] == "standalone-one-worker"
+    assert allocated["context"]["worker_id"] == "slot-standalone-one"
+    assert allocated["context"]["worktree_path"] == (
+        copy_safe_body["worktree_path"]
+    )
+    assert Path(allocated["context"]["worktree_path"]).exists()
+
+
 def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
     conn,
     tmp_path,
@@ -23049,6 +23212,66 @@ def test_parallel_branch_allocate_rejects_non_batch_failed_qa_rework_intent(
     assert conn.total_changes == before_changes
     assert "\n".join(conn.iterdump()) == before_dump
     assert not (repository_root / ".worktrees").exists()
+
+
+@pytest.mark.parametrize(
+    ("expected_lane_count", "expected_worker_count", "error_code"),
+    [
+        (1, 2, "parallel_branch_allocate_precheck_lane_count_alias_conflict"),
+        (2, 1, "parallel_branch_allocate_precheck_lane_count_alias_conflict"),
+        ("one", 1, "parallel_branch_allocate_precheck_lane_count_alias_invalid"),
+        (1, "two", "parallel_branch_allocate_precheck_lane_count_alias_invalid"),
+        (True, 1, "parallel_branch_allocate_precheck_lane_count_alias_invalid"),
+        (1, False, "parallel_branch_allocate_precheck_lane_count_alias_invalid"),
+        (1.5, 1, "parallel_branch_allocate_precheck_lane_count_alias_invalid"),
+        (1.0, 1, "parallel_branch_allocate_precheck_lane_count_alias_invalid"),
+        (1, 2.0, "parallel_branch_allocate_precheck_lane_count_alias_invalid"),
+        ([], 1, "parallel_branch_allocate_precheck_lane_count_alias_invalid"),
+        (" 1 ", 1, "parallel_branch_allocate_precheck_lane_count_alias_invalid"),
+        ("01", 1, "parallel_branch_allocate_precheck_lane_count_alias_invalid"),
+        (
+            "rtok-PublicCardinalitySecret9",
+            1,
+            "parallel_branch_allocate_precheck_lane_count_alias_invalid",
+        ),
+    ],
+)
+def test_parallel_branch_allocate_precheck_rejects_cardinality_alias_drift_before_io(
+    conn,
+    monkeypatch,
+    expected_lane_count,
+    expected_worker_count,
+    error_code,
+):
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: pytest.fail(
+            "cardinality alias validation must precede repository access"
+        ),
+    )
+    before_total_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "expected_lane_count": expected_lane_count,
+                    "expected_worker_count": expected_worker_count,
+                    "lanes": [],
+                },
+            )
+        )
+
+    assert rejected.value.code == error_code
+    assert rejected.value.details["writes_performed"] is False
+    assert "PublicCardinalitySecret9" not in json.dumps(
+        rejected.value.details,
+        sort_keys=True,
+    )
+    assert conn.total_changes == before_total_changes
 
 
 @pytest.mark.parametrize(
