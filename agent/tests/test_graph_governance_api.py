@@ -19744,6 +19744,195 @@ def _append_authenticated_qa_verification(
     return server.handle_task_timeline_append(qa_timeline_ctx)
 
 
+def _append_observer_materialized_qa_verification(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str,
+    commit_sha: str,
+    snapshot_id: str,
+    implementation_event_id: int,
+    principal_id: str = "qa:direct-main-materialized",
+    include_test_evidence: bool = True,
+) -> dict:
+    """Append the exact observer-materialized QA shape used by Direct Main."""
+
+    _activate_basic_graph(conn, snapshot_id, commit_sha=commit_sha)
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=commit_sha,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{commit_sha}",
+        qa_scope_binding_ref,
+    ]
+    qa_session = server.role_service.register(
+        conn,
+        principal_id,
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    qa_graph_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "commit_sha": commit_sha,
+        },
+    )
+    qa_graph_ctx._session.update(
+        {
+            "session_id": qa_session["session_id"],
+            "principal_id": principal_id,
+            "scope": qa_scope,
+        }
+    )
+    qa_graph_trace_ids = [
+        server.handle_graph_governance_query(qa_graph_ctx)["trace_id"]
+        for _ in range(3)
+    ]
+
+    submitter_session = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-parentless-direct-main-materializer",
+    )
+    submitter_principal = "observer:direct-main-materializer"
+    qa_report_ref = f"qa_report:{qa_session['session_id']}"
+    route_token_ref = "rtok-parentless-direct-main-materialized-qa"
+    route_identity = {
+        "route_id": "route-parentless-direct-main-materialized-qa",
+        "route_context_hash": _fake_sha(
+            "route-parentless-direct-main-materialized-qa"
+        ),
+        "prompt_contract_id": "rprompt-parentless-direct-main-materialized-qa",
+        "prompt_contract_hash": _fake_sha(
+            "prompt-parentless-direct-main-materialized-qa"
+        ),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-parentless-direct-main-materialized-qa"
+        ),
+        "route_token_ref": route_token_ref,
+    }
+    route_evidence_refs = [
+        f"timeline_event:{implementation_event_id}",
+        f"qa_session:{qa_session['session_id']}",
+        qa_scope_binding_ref,
+        f"commit:{commit_sha}",
+    ]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            **route_identity,
+            "caller_role": "observer",
+            "allowed_actions": ["task_timeline_append"],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": route_evidence_refs,
+        },
+    )
+    provenance = {
+        "schema_version": "qa_evidence_provenance.v1",
+        "authorization_source": "qa_session_token_ref",
+        "evidence_owner_actor": principal_id,
+        "evidence_owner_role": "qa",
+        "evidence_owner_session": qa_session["session_id"],
+        "submitter_principal": submitter_principal,
+        "submitter_session": submitter_session,
+        "materialized_from": qa_report_ref,
+        "materialized_from_report": qa_report_ref,
+        "observer_impersonation": False,
+        "parent_materialization_authorized": True,
+        "authenticated_qa_binding": {
+            "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+            "independent_verification_session_matched": True,
+            "qa_principal": principal_id,
+            "qa_session_id": qa_session["session_id"],
+            "qa_scope_binding_ref": qa_scope_binding_ref,
+        },
+    }
+    shared_materialization = {
+        "authorization_source": "qa_session_token_ref",
+        "evidence_owner_actor": principal_id,
+        "evidence_owner_role": "qa",
+        "evidence_owner_session": qa_session["session_id"],
+        "submitter_principal": submitter_principal,
+        "submitter_session": submitter_session,
+        "materialized_from": qa_report_ref,
+        "materialized_from_report": qa_report_ref,
+        "observer_impersonation": False,
+        "parent_materialization_authorized": True,
+        "qa_evidence_provenance": provenance,
+    }
+    return server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": route_token_ref,
+                "event_type": "qa.independent_verification",
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "status": "passed",
+                "actor": principal_id,
+                "parent_event_id": implementation_event_id,
+                "commit_sha": commit_sha,
+                "verification": {
+                    **(
+                        {
+                            "tests_run": [
+                                "pytest -q agent/tests/test_graph_governance_api.py"
+                            ]
+                        }
+                        if include_test_evidence
+                        else {}
+                    ),
+                    "diff_check": {"unexpected_files": []},
+                    "live_regression": {"status": "passed"},
+                },
+                "payload": {
+                    **shared_materialization,
+                    "schema_version": "independent_qa_verification.v1",
+                    "reviewer_role": "qa",
+                    "candidate_commit_sha": commit_sha,
+                    "graph_trace_ids": qa_graph_trace_ids,
+                },
+                "artifact_refs": {
+                    **shared_materialization,
+                    "qa_report_ref": qa_report_ref,
+                    "qa_scope_binding_ref": qa_scope_binding_ref,
+                    "graph_trace_ids": qa_graph_trace_ids,
+                    **(
+                        {"test_evidence_refs": ["qa-test-evidence:focused"]}
+                        if include_test_evidence
+                        else {}
+                    ),
+                },
+            },
+        )
+    )
+
+
 def _graph_with_dependency() -> dict:
     graph = _graph("L7.1")
     graph["deps_graph"]["nodes"].append(
@@ -87385,10 +87574,95 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
     )
 
 
+@pytest.mark.parametrize(
+    ("qa_append_mode", "tamper", "expected_close", "expected_missing"),
+    [
+        ("direct", "", True, ""),
+        ("observer_materialized", "", True, ""),
+        ("observer_materialized_implementation_tests", "", True, ""),
+        ("observer_materialized_expired_qa", "expired_qa", True, ""),
+        (
+            "observer_materialized_closed_observer",
+            "closed_materializer",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized_expired_route",
+            "expired_materialization_route",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized_missing_tests",
+            "",
+            False,
+            "tests_or_test_results",
+        ),
+        (
+            "observer_materialized",
+            "foreign_session_report",
+            False,
+            "independent_verification_after_implementation",
+        ),
+        (
+            "observer_materialized",
+            "stale_commit",
+            False,
+            "independent_verification_after_implementation",
+        ),
+        (
+            "observer_materialized",
+            "reordered_parent",
+            False,
+            "independent_verification_after_implementation",
+        ),
+        (
+            "observer_materialized",
+            "forged_qa_owner",
+            False,
+            "independent_verification_after_implementation",
+        ),
+        (
+            "observer_materialized",
+            "forged_qa_scope",
+            False,
+            "independent_verification_after_implementation",
+        ),
+        (
+            "observer_materialized",
+            "graph_mismatch",
+            False,
+            "independent_verification_after_implementation",
+        ),
+        (
+            "observer_materialized",
+            "missing_candidate_commit",
+            False,
+            "independent_verification_after_implementation",
+        ),
+        (
+            "observer_materialized",
+            "forged_verification_provenance",
+            False,
+            "independent_verification_after_implementation",
+        ),
+        (
+            "observer_materialized",
+            "revoked_materialization_route",
+            False,
+            "independent_verification_after_implementation",
+        ),
+    ],
+)
 def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     conn,
     monkeypatch,
     tmp_path,
+    qa_append_mode,
+    tamper,
+    expected_close,
+    expected_missing,
 ):
     backlog_id = "AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN"
     project_root = tmp_path / "parentless-direct-main"
@@ -87569,7 +87843,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         "agent/governance/server.py",
         "agent/tests/test_graph_governance_api.py",
     ]
-    server.handle_task_timeline_append(
+    implementation_event = server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -87584,6 +87858,17 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 "commit_sha": close_commit,
                 "payload": {
                     **route_identity,
+                    **(
+                        {
+                            "test_results": {
+                                "status": "passed",
+                                "commands": ["python3 -m pytest -q focused"],
+                            }
+                        }
+                        if qa_append_mode
+                        == "observer_materialized_implementation_tests"
+                        else {}
+                    ),
                     "changed_files": [
                         "agent/governance/server.py",
                         "agent/tests/test_graph_governance_api.py",
@@ -87628,14 +87913,180 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     assert "independent_verification_after_implementation" in impersonated_gate[
         "missing_requirement_ids"
     ]
-    _append_authenticated_qa_verification(
-        conn,
-        backlog_id=backlog_id,
-        task_id=parent_execution_id,
-        commit_sha=close_commit,
-        snapshot_id="full-parentless-direct-main",
+    if qa_append_mode.startswith("observer_materialized"):
+        qa_event = _append_observer_materialized_qa_verification(
+            conn,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            commit_sha=close_commit,
+            snapshot_id="full-parentless-direct-main",
+            implementation_event_id=int(implementation_event["id"]),
+            include_test_evidence=(
+                qa_append_mode
+                not in {
+                    "observer_materialized_implementation_tests",
+                    "observer_materialized_missing_tests",
+                }
+            ),
+        )
+    else:
+        qa_event = _append_authenticated_qa_verification(
+            conn,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            commit_sha=close_commit,
+            snapshot_id="full-parentless-direct-main",
+        )
+    if tamper:
+        qa_payload = copy.deepcopy(qa_event["payload"])
+        qa_artifacts = copy.deepcopy(qa_event["artifact_refs"])
+        qa_verification = copy.deepcopy(qa_event["verification"])
+        qa_actor = str(qa_event["actor"])
+        qa_commit = str(qa_event["commit_sha"])
+        qa_parent = int(qa_event["parent_event_id"])
+
+        if tamper == "expired_qa":
+            qa_session_id = qa_payload["qa_evidence_provenance"][
+                "evidence_owner_session"
+            ]
+            conn.execute(
+                "UPDATE sessions SET status = 'expired' WHERE session_id = ?",
+                (qa_session_id,),
+            )
+        elif tamper == "closed_materializer":
+            submitter_session = qa_payload["qa_evidence_provenance"][
+                "submitter_session"
+            ]
+            conn.execute(
+                """
+                UPDATE observer_sessions
+                   SET status = 'closed'
+                 WHERE project_id = ? AND session_id = ?
+                """,
+                (PID, submitter_session),
+            )
+        elif tamper == "expired_materialization_route":
+            conn.execute(
+                """
+                UPDATE observer_route_token_refs
+                   SET status = 'expired'
+                 WHERE project_id = ? AND route_token_ref = ?
+                """,
+                (PID, qa_payload["route_token_ref"]),
+            )
+        elif tamper == "foreign_session_report":
+            foreign_session = "qa-session-foreign-materialization"
+            foreign_report = f"qa_report:{foreign_session}"
+            for container in (qa_payload, qa_artifacts):
+                provenance = container["qa_evidence_provenance"]
+                provenance["evidence_owner_session"] = foreign_session
+                provenance["materialized_from"] = foreign_report
+                provenance["materialized_from_report"] = foreign_report
+                provenance["authenticated_qa_binding"][
+                    "qa_session_id"
+                ] = foreign_session
+                container["evidence_owner_session"] = foreign_session
+                container["materialized_from"] = foreign_report
+                container["materialized_from_report"] = foreign_report
+            qa_artifacts["qa_report_ref"] = foreign_report
+        elif tamper == "stale_commit":
+            qa_commit = _fake_sha("stale-materialized-qa-commit")
+            qa_payload["candidate_commit_sha"] = qa_commit
+        elif tamper == "reordered_parent":
+            qa_parent = int(implementation_event["id"]) - 1
+        elif tamper == "forged_qa_owner":
+            qa_actor = "qa:forged-materialized-owner"
+            for container in (qa_payload, qa_artifacts):
+                provenance = container["qa_evidence_provenance"]
+                provenance["evidence_owner_actor"] = qa_actor
+                provenance["authenticated_qa_binding"][
+                    "qa_principal"
+                ] = qa_actor
+                container["evidence_owner_actor"] = qa_actor
+        elif tamper == "forged_qa_scope":
+            forged_scope = "qa_scope_binding:forged"
+            for container in (qa_payload, qa_artifacts):
+                container["qa_evidence_provenance"][
+                    "authenticated_qa_binding"
+                ]["qa_scope_binding_ref"] = forged_scope
+            qa_artifacts["qa_scope_binding_ref"] = forged_scope
+        elif tamper == "graph_mismatch":
+            forged_trace_ids = ["gqt-forged-materialized-qa"]
+            qa_payload["graph_trace_ids"] = forged_trace_ids
+            qa_artifacts["graph_trace_ids"] = forged_trace_ids
+        elif tamper == "missing_candidate_commit":
+            qa_payload.pop("candidate_commit_sha")
+        elif tamper == "forged_verification_provenance":
+            qa_verification["qa_evidence_provenance"] = copy.deepcopy(
+                qa_payload["qa_evidence_provenance"]
+            )
+            qa_verification["qa_evidence_provenance"][
+                "evidence_owner_actor"
+            ] = "qa:forged-verification-container"
+        elif tamper == "revoked_materialization_route":
+            conn.execute(
+                """
+                UPDATE observer_route_token_refs
+                   SET status = 'revoked'
+                 WHERE project_id = ? AND route_token_ref = ?
+                """,
+                (PID, qa_payload["route_token_ref"]),
+            )
+        else:
+            raise AssertionError(f"unhandled materialized QA tamper: {tamper}")
+
+        if tamper not in {
+            "closed_materializer",
+            "expired_materialization_route",
+            "expired_qa",
+            "revoked_materialization_route",
+        }:
+            conn.execute(
+                """
+                UPDATE task_timeline_events
+                   SET actor = ?, commit_sha = ?, parent_event_id = ?,
+                       payload_json = ?, verification_json = ?,
+                       artifact_refs_json = ?
+                 WHERE id = ?
+                """,
+                (
+                    qa_actor,
+                    qa_commit,
+                    qa_parent,
+                    json.dumps(qa_payload, sort_keys=True),
+                    json.dumps(qa_verification, sort_keys=True),
+                    json.dumps(qa_artifacts, sort_keys=True),
+                    int(qa_event["id"]),
+                ),
+            )
+        conn.commit()
+
+    reconcile_event = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": "graph.reconcile",
+                "event_kind": "reconcile",
+                "phase": "reconcile",
+                "status": "passed",
+                "actor": "observer",
+                "commit_sha": close_commit,
+                "payload": {
+                    **route_identity,
+                    "target_commit_sha": close_commit,
+                    "reconcile_mode": "current_full",
+                    "current_full_reconcile": True,
+                    "reconciled_commit_sha": close_commit,
+                    "graph_reconciled": True,
+                    "scope_reconciled": True,
+                },
+            },
+        )
     )
-    server.handle_task_timeline_append(
+    close_ready_event = server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -87659,6 +88110,9 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             },
         )
     )
+    assert int(implementation_event["id"]) < int(qa_event["id"])
+    assert int(qa_event["id"]) < int(reconcile_event["id"])
+    assert int(reconcile_event["id"]) < int(close_ready_event["id"])
 
     monkeypatch.setattr(
         server,
@@ -87675,17 +88129,68 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         },
     )
 
+    conn.commit()
+
+    def storage_fingerprint() -> dict:
+        timeline_row = conn.execute(
+            """
+            SELECT COUNT(*) AS event_count, COALESCE(MAX(id), 0) AS max_event_id
+            FROM task_timeline_events
+            WHERE project_id = ? AND backlog_id = ?
+            """,
+            (PID, backlog_id),
+        ).fetchone()
+        backlog_row = conn.execute(
+            """
+            SELECT COUNT(*) AS row_count, status, "commit", fixed_at,
+                   updated_at, last_failure_reason
+            FROM backlog_bugs
+            WHERE bug_id = ?
+            """,
+            (backlog_id,),
+        ).fetchone()
+        return {
+            "total_changes": conn.total_changes,
+            "timeline": tuple(timeline_row),
+            "backlog": tuple(backlog_row),
+            "database_sha256": hashlib.sha256(conn.serialize()).hexdigest(),
+        }
+
+    storage_before_precheck = storage_fingerprint()
     precheck = server.handle_backlog_timeline_gate(
         _ctx(
             {"project_id": PID, "bug_id": backlog_id},
             query={"close_commit": close_commit},
         )
     )
+    assert storage_fingerprint() == storage_before_precheck
     projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
+    if not expected_close:
+        assert projection["status"] == "incomplete"
+        direct_gate = projection["parentless_direct_main_close_authority_gate"]
+        assert direct_gate["passed"] is False
+        assert expected_missing in direct_gate["missing_requirement_ids"]
+        assert precheck["can_close"] is False
+        if qa_append_mode.startswith("observer_materialized"):
+            provenance = qa_event["payload"]["qa_evidence_provenance"]
+            failure_diagnostics = json.dumps(direct_gate, sort_keys=True)
+            assert provenance["evidence_owner_session"] not in failure_diagnostics
+            assert qa_event["payload"]["route_token_ref"] not in failure_diagnostics
+            assert str(project_root) not in failure_diagnostics
+        return
     assert projection["status"] == "projected_parentless_direct_main"
     assert projection["accepted"] is True
     direct_gate = projection["parentless_direct_main_close_authority_gate"]
     assert direct_gate["passed"] is True
+    if qa_append_mode.startswith("observer_materialized"):
+        materialized_authorities = direct_gate["checks"][
+            "materialized_qa_authorities"
+        ]
+        assert materialized_authorities[0]["graph_trace_count"] == 3
+        assert "qa_session_id" not in materialized_authorities[0]
+        assert "qa_scope_binding_ref" not in materialized_authorities[0]
+        assert "qa_report_ref" not in materialized_authorities[0]
+        assert "graph_trace_ids" not in materialized_authorities[0]
     assert direct_gate["checks"]["row_declared_file_scope_applied"] is True
     assert direct_gate["checks"]["scope_source"] == (
         "backlog.target_files + backlog.test_files"

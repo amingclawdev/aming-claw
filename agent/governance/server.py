@@ -139709,6 +139709,422 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
     }
 
 
+def _contract_runtime_parentless_direct_main_materialized_qa_event(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    close_commit: str,
+    implementation_event: Mapping[str, Any],
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rebind one exact observer-materialized QA report for read-only close.
+
+    Observer materialization intentionally uses a separate observer route, so
+    its route identity must not be adopted as the Direct Main root route.  This
+    adapter validates the durable QA/session/graph/report lineage instead and
+    returns a copy carrying the equivalent QA-session authority.  The stored
+    timeline event is never changed.
+    """
+
+    from . import task_timeline
+
+    if conn is None:
+        return {}
+    normalized_commit = str(close_commit or "").strip().lower()
+    implementation_id = int(implementation_event.get("id") or 0)
+    event_id = int(event.get("id") or 0)
+    if not (
+        implementation_id > 0
+        and event_id > implementation_id
+        and int(event.get("parent_event_id") or 0) == implementation_id
+        and str(event.get("project_id") or "").strip() == project_id
+        and str(event.get("backlog_id") or "").strip() == backlog_id
+        and str(event.get("task_id") or "").strip() == task_id
+        and str(event.get("commit_sha") or "").strip().lower()
+        == normalized_commit
+        and str(implementation_event.get("commit_sha") or "").strip().lower()
+        == normalized_commit
+        and str(event.get("event_kind") or "").strip().lower().replace("-", "_")
+        in _QA_TIMELINE_VERIFICATION_EVENT_KINDS
+        and str(event.get("phase") or "").strip().lower().replace("-", "_")
+        in _QA_TIMELINE_VERIFICATION_PHASES
+        and str(event.get("status") or "").strip().lower()
+        in _QA_TIMELINE_CLOSE_STATUSES
+    ):
+        return {}
+
+    payload = (
+        dict(event.get("payload"))
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    artifact_refs = (
+        dict(event.get("artifact_refs"))
+        if isinstance(event.get("artifact_refs"), Mapping)
+        else {}
+    )
+    verification_evidence = (
+        dict(event.get("verification"))
+        if isinstance(event.get("verification"), Mapping)
+        else {}
+    )
+    payload_provenance = (
+        payload.get("qa_evidence_provenance")
+        if isinstance(payload.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    artifact_provenance = (
+        artifact_refs.get("qa_evidence_provenance")
+        if isinstance(artifact_refs.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    if not payload_provenance or dict(payload_provenance) != dict(
+        artifact_provenance
+    ):
+        return {}
+    provenance = dict(payload_provenance)
+    binding = (
+        provenance.get("authenticated_qa_binding")
+        if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
+        else {}
+    )
+    principal_id = str(event.get("actor") or "").strip()
+    qa_session_id = str(provenance.get("evidence_owner_session") or "").strip()
+    qa_scope_binding_ref = str(
+        binding.get("qa_scope_binding_ref") or ""
+    ).strip()
+    expected_qa_scope_binding_ref = _qa_scope_binding_ref(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=normalized_commit,
+    )
+    qa_report_ref = f"qa_report:{qa_session_id}" if qa_session_id else ""
+    submitter_principal = str(
+        provenance.get("submitter_principal") or ""
+    ).strip()
+    submitter_session = str(
+        provenance.get("submitter_session") or ""
+    ).strip()
+    expected_materialization_fields = {
+        "authorization_source": "qa_session_token_ref",
+        "evidence_owner_actor": principal_id,
+        "evidence_owner_role": "qa",
+        "evidence_owner_session": qa_session_id,
+        "materialized_from": qa_report_ref,
+        "materialized_from_report": qa_report_ref,
+        "observer_impersonation": False,
+        "parent_materialization_authorized": True,
+        "submitter_principal": submitter_principal,
+        "submitter_session": submitter_session,
+    }
+    if not (
+        str(payload.get("schema_version") or "").strip()
+        == "independent_qa_verification.v1"
+        and str(payload.get("reviewer_role") or "").strip().lower() == "qa"
+        and str(payload.get("candidate_commit_sha") or "").strip().lower()
+        == normalized_commit
+        and str(provenance.get("schema_version") or "").strip()
+        == "qa_evidence_provenance.v1"
+        and str(binding.get("schema_version") or "").strip()
+        == "contract_runtime.authenticated_qa_binding.v1"
+        and binding.get("independent_verification_session_matched") is True
+        and str(binding.get("qa_principal") or "").strip() == principal_id
+        and str(binding.get("qa_session_id") or "").strip() == qa_session_id
+        and qa_session_id
+        and qa_scope_binding_ref == expected_qa_scope_binding_ref
+        and qa_report_ref
+        and submitter_principal.startswith("observer:")
+        and submitter_session
+        and artifact_refs.get("qa_report_ref") == qa_report_ref
+        and artifact_refs.get("qa_scope_binding_ref") == qa_scope_binding_ref
+    ):
+        return {}
+    for source in (payload, artifact_refs, provenance):
+        if any(source.get(key) != value for key, value in expected_materialization_fields.items()):
+            return {}
+    verification_provenance = verification_evidence.get("qa_evidence_provenance")
+    if isinstance(verification_provenance, Mapping) and dict(
+        verification_provenance
+    ) != provenance:
+        return {}
+    if any(
+        key in verification_evidence and verification_evidence.get(key) != value
+        for key, value in expected_materialization_fields.items()
+    ):
+        return {}
+
+    qa_session = conn.execute(
+        """
+        SELECT principal_id, project_id, role, scope_json, status
+        FROM sessions
+        WHERE session_id = ?
+        """,
+        (qa_session_id,),
+    ).fetchone()
+    if qa_session is None or not (
+        str(qa_session["principal_id"] or "").strip() == principal_id
+        and str(qa_session["project_id"] or "").strip() == project_id
+        and str(qa_session["role"] or "").strip() == "qa"
+        and str(qa_session["status"] or "").strip() in {"active", "expired"}
+    ):
+        return {}
+    try:
+        qa_scope = json.loads(qa_session["scope_json"] or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    required_qa_scope = {
+        f"backlog:{backlog_id}",
+        f"task:{task_id}",
+        f"commit:{normalized_commit}",
+        qa_scope_binding_ref,
+    }
+    if not isinstance(qa_scope, list) or not required_qa_scope.issubset(
+        {str(item or "").strip() for item in qa_scope}
+    ):
+        return {}
+
+    submitter = conn.execute(
+        """
+        SELECT project_id, status
+        FROM observer_sessions
+        WHERE session_id = ?
+        """,
+        (submitter_session,),
+    ).fetchone()
+    if submitter is None or not (
+        str(submitter["project_id"] or "").strip() == project_id
+        and str(submitter["status"] or "").strip() in {"active", "closed"}
+    ):
+        return {}
+
+    payload_trace_ids = _runtime_context_service_dedupe(
+        _runtime_context_service_query_values(payload, "graph_trace_ids")
+    )
+    artifact_trace_ids = _runtime_context_service_dedupe(
+        _runtime_context_service_query_values(artifact_refs, "graph_trace_ids")
+    )
+    if not payload_trace_ids or payload_trace_ids != artifact_trace_ids:
+        return {}
+    placeholders = ",".join("?" for _ in payload_trace_ids)
+    trace_rows = conn.execute(
+        f"""
+        SELECT t.trace_id, t.project_id, t.snapshot_id, t.query_source,
+               t.query_purpose, t.actor, t.task_id, t.backlog_id,
+               t.commit_sha, t.qa_session_id, t.qa_scope_binding_ref,
+               t.status, t.graph_basis, t.graph_basis_decision_json,
+               t.graph_basis_decision_hash, t.canonical_base_snapshot_id,
+               t.base_commit_sha, t.candidate_commit_sha,
+               t.changed_files_json, t.candidate_diff_hash,
+               t.changed_files_source, t.candidate_overlay_json,
+               t.candidate_overlay_hash, t.root_identity_json,
+               t.root_identity_hash, t.query_root_identity_hash,
+               t.canonical_project_identity_hash,
+               t.repository_identity_hash,
+               s.commit_sha AS snapshot_commit_sha
+        FROM graph_query_traces t
+        JOIN graph_snapshots s
+          ON s.project_id = t.project_id AND s.snapshot_id = t.snapshot_id
+        WHERE t.project_id = ? AND t.trace_id IN ({placeholders})
+        """,
+        (project_id, *payload_trace_ids),
+    ).fetchall()
+    if len(trace_rows) != len(payload_trace_ids):
+        return {}
+    rows_by_trace = {
+        str(row["trace_id"] or "").strip(): row for row in trace_rows
+    }
+    snapshot_ids: set[str] = set()
+    snapshot_commits: set[str] = set()
+    review_context_hashes: set[str] = set()
+    expected_trace_fields = {
+        "project_id": project_id,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "actor": principal_id,
+        "task_id": task_id,
+        "backlog_id": backlog_id,
+        "commit_sha": normalized_commit,
+        "qa_session_id": qa_session_id,
+        "qa_scope_binding_ref": qa_scope_binding_ref,
+        "status": "complete",
+    }
+    for trace_id in payload_trace_ids:
+        row = rows_by_trace.get(trace_id)
+        if row is None or any(
+            str(row[field] or "").strip() != expected
+            for field, expected in expected_trace_fields.items()
+        ):
+            return {}
+        review_context, review_mismatches = _qa_graph_review_context_from_trace_row(row)
+        if review_mismatches or str(
+            review_context.get("candidate_commit_sha") or ""
+        ).strip().lower() != normalized_commit:
+            return {}
+        review_context_hashes.add(stable_sha256(review_context))
+        snapshot_ids.add(str(row["snapshot_id"] or "").strip())
+        snapshot_commits.add(str(row["snapshot_commit_sha"] or "").strip())
+    if (
+        len(snapshot_ids) != 1
+        or len(snapshot_commits) != 1
+        or len(review_context_hashes) != 1
+    ):
+        return {}
+
+    route_authority = (
+        payload.get("source_backed_contract_gate_authority")
+        if isinstance(payload.get("source_backed_contract_gate_authority"), Mapping)
+        else {}
+    )
+    route_gate = (
+        payload.get("route_token_gate")
+        if isinstance(payload.get("route_token_gate"), Mapping)
+        else {}
+    )
+    authority_route_gate = (
+        route_authority.get("route_token_gate")
+        if isinstance(route_authority.get("route_token_gate"), Mapping)
+        else {}
+    )
+    route_token_ref = str(route_gate.get("route_token_ref") or "").strip()
+    required_route_refs = {
+        f"timeline_event:{implementation_id}",
+        f"qa_session:{qa_session_id}",
+        qa_scope_binding_ref,
+        f"commit:{normalized_commit}",
+    }
+    route_scope = (
+        route_gate.get("scope")
+        if isinstance(route_gate.get("scope"), Mapping)
+        else {}
+    )
+    if not (
+        task_timeline._source_backed_route_gate_authority_valid(route_authority)
+        and dict(authority_route_gate) == dict(route_gate)
+        and task_timeline._source_backed_route_gate_accepted(route_gate)
+        and str(route_gate.get("action") or "").strip()
+        == "task_timeline_append"
+        and str(route_gate.get("caller_role") or "").strip() == "observer"
+        and route_token_ref
+        and str(payload.get("route_token_ref") or "").strip()
+        == route_token_ref
+        and str(route_scope.get("project_id") or "").strip() == project_id
+        and str(route_scope.get("backlog_id") or "").strip() == backlog_id
+        and str(route_scope.get("task_id") or "").strip() == task_id
+        and required_route_refs.issubset(
+            {str(item or "").strip() for item in route_gate.get("evidence_refs") or []}
+        )
+    ):
+        return {}
+    route_row = conn.execute(
+        """
+        SELECT route_id, route_context_hash, prompt_contract_id,
+               prompt_contract_hash, visible_injection_manifest_hash,
+               backlog_id, task_id, caller_role, allowed_actions_json,
+               evidence_refs_json, scope_json, status
+        FROM observer_route_token_refs
+        WHERE project_id = ? AND route_token_ref = ?
+        """,
+        (project_id, route_token_ref),
+    ).fetchone()
+    try:
+        registered_actions = set(json.loads(route_row["allowed_actions_json"] or "[]"))
+        registered_refs = set(json.loads(route_row["evidence_refs_json"] or "[]"))
+        registered_scope = json.loads(route_row["scope_json"] or "{}")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    route_identity_fields = (
+        "route_id", "route_context_hash", "prompt_contract_id",
+        "prompt_contract_hash", "visible_injection_manifest_hash",
+    )
+    if not (
+        str(route_row["status"] or "").strip() in {"active", "expired", "superseded"}
+        and all(
+            str(route_row[field] or "").strip()
+            == str(route_gate.get(field) or "").strip()
+            for field in route_identity_fields
+        )
+        and str(route_row["backlog_id"] or "").strip() == backlog_id
+        and str(route_row["task_id"] or "").strip() == task_id
+        and str(route_row["caller_role"] or "").strip() == "observer"
+        and "task_timeline_append" in registered_actions
+        and required_route_refs.issubset(registered_refs)
+        and isinstance(registered_scope, Mapping)
+        and {
+            key: str(registered_scope.get(key) or "").strip()
+            for key in ("project_id", "backlog_id", "task_id")
+        }
+        == {"project_id": project_id, "backlog_id": backlog_id, "task_id": task_id}
+    ):
+        return {}
+    qa_proof = {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session",
+        "verified": True,
+        "role": "qa",
+        "observer_impersonation": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "commit_sha": normalized_commit,
+        "principal_id": principal_id,
+        "qa_session_id": qa_session_id,
+        "qa_scope_binding_ref": qa_scope_binding_ref,
+        "graph_trace_ids": payload_trace_ids,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "db_verified_graph_trace": True,
+        "snapshot_id": next(iter(snapshot_ids)),
+        "snapshot_commit_sha": next(iter(snapshot_commits)),
+        "evidence_status": str(event.get("status") or "").strip().lower(),
+        "authority_scope": "close_satisfying",
+        "close_satisfying": True,
+        "audit_only": False,
+        "passing_status_required_for_close": True,
+    }
+    qa_authority = task_timeline.source_backed_qa_session_authority(qa_proof)
+
+    normalized_event = dict(event)
+    normalized_payload = dict(payload)
+    normalized_payload["source_backed_contract_gate_authority"] = qa_authority
+    normalized_payload["direct_main_materialized_qa_authority"] = {
+        "schema_version": "parentless_direct_main.materialized_qa_authority.v1",
+        "server_derived": True,
+        "read_only_projection": True,
+        "timeline_event_id": event_id,
+        "implementation_event_id": implementation_id,
+        "qa_principal_bound": True,
+        "qa_session_bound": True,
+        "qa_scope_bound": True,
+        "qa_report_materialization_bound": True,
+        "observer_materializer_bound": True,
+        "route_lineage_bound": True,
+        "graph_review_context_bound": True,
+        "graph_trace_count": len(payload_trace_ids),
+    }
+    normalized_event["payload"] = normalized_payload
+
+    if (
+        not task_timeline._event_has_test_evidence(normalized_event)
+        and task_timeline._event_has_test_evidence(dict(implementation_event))
+    ):
+        normalized_verification = dict(normalized_event.get("verification") or {})
+        normalized_verification["test_results"] = {
+            "schema_version": "parentless_direct_main.implementation_test_projection.v1",
+            "read_only_projection": True,
+            "source_event_id": implementation_id,
+            "source_commit_sha": normalized_commit,
+        }
+        normalized_event["verification"] = normalized_verification
+
+    return {
+        "event": normalized_event,
+        "authority": normalized_payload["direct_main_materialized_qa_authority"],
+    }
+
+
 def _contract_runtime_parentless_direct_main_close_authority_gate(
     *,
     conn=None,
@@ -139927,8 +140343,40 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             }
         },
     }
-    verification = task_timeline.mf_close_gate_verification(
+    implementation_event = task_timeline._latest_passing_close_event(
         events,
+        "implementation",
+        after_event_id=_contract_runtime_parentless_direct_main_event_order(
+            direct_event,
+            0,
+        ),
+    )
+    normalized_events: list[dict[str, Any]] = []
+    materialized_qa_authorities: list[dict[str, Any]] = []
+    materialized_qa_event_ids: set[int] = set()
+    for event in events:
+        normalized = (
+            _contract_runtime_parentless_direct_main_materialized_qa_event(
+                conn,
+                project_id=project_id,
+                backlog_id=bug_id,
+                task_id=requested_execution_id,
+                close_commit=close_commit,
+                implementation_event=implementation_event,
+                event=event,
+            )
+            if implementation_event
+            else {}
+        )
+        if normalized:
+            normalized_event = dict(normalized["event"])
+            normalized_events.append(normalized_event)
+            materialized_qa_authorities.append(dict(normalized["authority"]))
+            materialized_qa_event_ids.add(int(normalized_event.get("id") or 0))
+        else:
+            normalized_events.append(event)
+    verification = task_timeline.mf_close_gate_verification(
+        normalized_events,
         contract=contract,
         conn=conn,
     )
@@ -139937,6 +140385,41 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         if isinstance(verification.get("observer_direct_close_exception_gate"), Mapping)
         else {}
     )
+    if materialized_qa_authorities and not bool(direct_gate.get("passed")):
+        materialized_only_events = [
+            event
+            for event in normalized_events
+            if (
+                str(event.get("event_kind") or "")
+                .strip()
+                .lower()
+                .replace("-", "_")
+                not in _QA_TIMELINE_VERIFICATION_EVENT_KINDS
+                or int(event.get("id") or 0) in materialized_qa_event_ids
+            )
+        ]
+        projected_direct_gate = (
+            task_timeline._observer_direct_close_exception_gate(
+                materialized_only_events,
+                contract,
+                verification.get("close_commit_evidence_gate") or {},
+                conn=None,
+            )
+        )
+        if projected_direct_gate.get("passed"):
+            direct_gate = {
+                **projected_direct_gate,
+                "materialized_qa_authority": {
+                    "schema_version": (
+                        "parentless_direct_main.materialized_qa_selection.v1"
+                    ),
+                    "server_derived": True,
+                    "read_only_projection": True,
+                    "accepted_event_ids": sorted(materialized_qa_event_ids),
+                    "authorities": materialized_qa_authorities,
+                    "persisted_timeline_mutated": False,
+                },
+            }
     graph_trace_gate = _contract_runtime_parentless_direct_main_graph_trace_gate(
         conn,
         project_id=project_id,
@@ -140006,6 +140489,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
                     graph_trace_gate.get("passed")
                 ),
                 "pre_implementation_graph_trace_gate": graph_trace_gate,
+                "materialized_qa_authorities": materialized_qa_authorities,
                 "row_declared_file_scope_applied": bool(row_declared_files),
                 **row_scope_diagnostics,
             },
@@ -140053,6 +140537,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             "observer_direct_close_exception_gate_passed": True,
             "pre_implementation_graph_trace_gate_passed": True,
             "pre_implementation_graph_trace_gate": graph_trace_gate,
+            "materialized_qa_authorities": materialized_qa_authorities,
             "worker_or_successor_contract_required": False,
             "row_declared_file_scope_applied": bool(row_declared_files),
             **row_scope_diagnostics,
