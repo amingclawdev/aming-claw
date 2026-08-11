@@ -92798,6 +92798,13 @@ def test_onboard_guide_capsule_single_flight_revision_invalidation_and_eviction(
         "contract_execution_id": "cex-capsule",
         "execution_state_revision": 1,
         "projection_hash": "sha256:capsule-r1",
+        "runtime_context_auth_generation": (
+            server._onboard_guide_capsule_auth_generation(
+                project_id=PID,
+                backlog_id="AC-CAPSULE-SINGLE-FLIGHT",
+                contract_execution_id="cex-capsule",
+            )
+        ),
         "terminal": False,
     }
     entered = Event()
@@ -92901,6 +92908,90 @@ def test_onboard_guide_capsule_single_flight_revision_invalidation_and_eviction(
     assert "raw-access-secret" not in serialized
     assert "raw-api-key-secret" not in serialized
     assert "wstok-copy-safe" in serialized
+
+
+def test_onboard_guide_capsule_auth_generation_fences_stale_builder_publish():
+    scope = (PID, "AC-CAPSULE-AUTH-GENERATION", "cex-capsule-auth-generation")
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        server._ONBOARD_GUIDE_CAPSULE_CACHE.clear()
+        server._ONBOARD_GUIDE_CAPSULE_INFLIGHT.clear()
+        initial_generation = server._ONBOARD_GUIDE_CAPSULE_AUTH_GENERATION
+    identity = {
+        "project_id": scope[0],
+        "backlog_id": scope[1],
+        "selected_role": "mf_sub",
+        "selected_work_type": "parallel_worker",
+        "contract_execution_id": scope[2],
+        "execution_state_revision": 1,
+        "projection_hash": "sha256:pre-join-projection",
+        "runtime_context_auth_generation": initial_generation,
+        "terminal": False,
+    }
+
+    def stale_builder():
+        return {
+            "action_input": {
+                "host_precursor_action": {"action": "initial_join"}
+            }
+        }
+
+    # The identity was captured before the request registered in the
+    # single-flight map.  A successful auth transition in that gap must still
+    # make its later publish impossible; the epoch must never ABA back to zero.
+    server._onboard_guide_capsule_invalidate_runtime_context_auth_transition(
+        project_id=scope[0],
+        backlog_id=scope[1],
+        contract_execution_id=scope[2],
+    )
+    stale, stale_metrics = server._onboard_guide_capsule_get_or_create(
+        identity,
+        stale_builder,
+    )
+    assert stale["stale_runtime_context_auth_generation"] is True
+    assert stale["guide_capsule_ref"] == ""
+    assert stale_metrics["status"] == "runtime_context_auth_generation_changed"
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        assert server._onboard_guide_capsule_cache_key(identity) not in (
+            server._ONBOARD_GUIDE_CAPSULE_CACHE
+        )
+
+    fresh_identity = {
+        **identity,
+        "runtime_context_auth_generation": (
+            server._onboard_guide_capsule_auth_generation(
+                project_id=scope[0],
+                backlog_id=scope[1],
+                contract_execution_id=scope[2],
+            )
+        ),
+    }
+    fresh, fresh_metrics = server._onboard_guide_capsule_get_or_create(
+        fresh_identity,
+        lambda: {
+            "action_input": {
+                "canonical_executable_action": {
+                    "mcp_tool": "runtime_context_read_receipt"
+                }
+            }
+        },
+    )
+    assert fresh_metrics["status"] == "miss"
+    assert fresh["guide_capsule_ref"].startswith("gcap-")
+    assert not fresh.get("stale_runtime_context_auth_generation")
+
+    missing, missing_metrics = server._onboard_guide_capsule_get_or_create(
+        {
+            key: value
+            for key, value in fresh_identity.items()
+            if key != "runtime_context_auth_generation"
+        },
+        lambda: pytest.fail("missing-generation identity ran its builder"),
+    )
+    assert missing["guide_capsule_ref"] == ""
+    assert missing["stale_runtime_context_auth_generation"] is True
+    assert missing_metrics["status"] == (
+        "runtime_context_auth_generation_required"
+    )
 
 
 def test_completed_repair_barrier_is_non_schedulable_and_compact_visible(
@@ -93155,6 +93246,13 @@ def test_runtime_context_canonical_write_immediately_invalidates_prior_capsule(
         "contract_execution_id": execution_id,
         "execution_state_revision": 3,
         "projection_hash": "sha256:capsule-canonical-projection-3",
+        "runtime_context_auth_generation": (
+            server._onboard_guide_capsule_auth_generation(
+                project_id=PID,
+                backlog_id=backlog_id,
+                contract_execution_id=execution_id,
+            )
+        ),
         "terminal": False,
     }
     stale_capsule, _ = server._onboard_guide_capsule_get_or_create(
@@ -93322,6 +93420,13 @@ def _install_close_gate_capsule_runtime(monkeypatch, *, result_mode):
             "contract_execution_id": execution_id,
             "execution_state_revision": 3,
             "projection_hash": "sha256:capsule-close-gate-projection-3",
+            "runtime_context_auth_generation": (
+                server._onboard_guide_capsule_auth_generation(
+                    project_id=PID,
+                    backlog_id=backlog_id,
+                    contract_execution_id=execution_id,
+                )
+            ),
             "terminal": False,
         },
         lambda: {"next_action": {"action": "record_post_action_summary"}},
@@ -101963,6 +102068,13 @@ def test_contract_runtime_generic_facade_writes_observer_onboarding_line(conn):
         "contract_execution_id": record["contract_execution_id"],
         "execution_state_revision": record["execution_state_revision"],
         "projection_hash": "sha256:generic-onboard-before-write",
+        "runtime_context_auth_generation": (
+            server._onboard_guide_capsule_auth_generation(
+                project_id=PID,
+                backlog_id=backlog_id,
+                contract_execution_id=record["contract_execution_id"],
+            )
+        ),
         "terminal": False,
     }
     unrelated_capsule, _ = server._onboard_guide_capsule_get_or_create(
@@ -102107,6 +102219,13 @@ def test_contract_runtime_line_bypass_atomically_links_open_diagnostic(conn):
         "contract_execution_id": record["contract_execution_id"],
         "execution_state_revision": record["execution_state_revision"],
         "projection_hash": "sha256:bypass-before-write",
+        "runtime_context_auth_generation": (
+            server._onboard_guide_capsule_auth_generation(
+                project_id=PID,
+                backlog_id=backlog_id,
+                contract_execution_id=record["contract_execution_id"],
+            )
+        ),
         "terminal": False,
     }
     stale_capsule, _ = server._onboard_guide_capsule_get_or_create(
@@ -108152,7 +108271,17 @@ def test_compact_worker_read_projects_registry_verified_route_cutover(
     assert guide["worker_read_runtime_facade_projection"][
         "route_authority_source"
     ] in {"branch_contract_revision", "branch_contract_revision_successor"}
-    body = guide["copy_safe_body"]
+    assert guide["host_precursor_required"] is True, (
+        guide["worker_read_runtime_facade_projection"].get(
+            "initial_join_route_ready"
+        ),
+        guide["worker_read_runtime_facade_projection"].get(
+            "initial_join_route_mismatch_fields"
+        ),
+    )
+    assert guide["canonical_executable_action"] == {}
+    assert guide["mcp_tool"] == "runtime_context_session_token_initial_join"
+    body = guide["host_precursor_action"]["copy_safe_body"]
     assert {
         field: body[field]
         for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
@@ -108201,17 +108330,217 @@ def test_compact_worker_read_projects_registry_verified_route_cutover(
         "execution_state_revision": guide["execution_state_revision"],
         "projection_hash": guide["projection_hash"],
     }
-    executable = section["canonical_executable_action"]
-    assert executable["copy_safe_body"] == {
-        key: value
-        for key, value in body.items()
-        if key not in {"session_token", "fence_token"}
+    precursor = section["host_precursor_action"]
+    assert precursor["action"] == (
+        "request_runtime_context_initial_join_host_envelope"
+    )
+    assert precursor["mcp_tool"] == (
+        "runtime_context_session_token_initial_join"
+    )
+    precursor_body = precursor["copy_safe_body"]
+    assert precursor_body["runtime_context_id"] == runtime_context.runtime_context_id
+    assert precursor_body["task_id"] == runtime_context.task_id
+    assert precursor_body["parent_task_id"] == successor["contract_execution_id"]
+    assert precursor_body["worker_id"] == runtime_context.worker_id
+    assert precursor_body["worker_slot_id"] == runtime_context.worker_slot_id
+    assert precursor_body["worker_session_id"].startswith("<actual host")
+    assert precursor_body["reason"].startswith("<operator reason:")
+    assert {
+        field: precursor_body[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == cutover
+    assert section["successor_after_precursor"] == {
+        "refresh_required": True,
+        "expected_contract_action": "record_runtime_context_read_receipt",
+        "mcp_tool": "runtime_context_read_receipt",
     }
-    assert executable["route_identity"] == cutover
+    assert "canonical_executable_action" not in section
     assert len(json.dumps(section, sort_keys=True).encode("utf-8")) <= 6 * 1024
     serialized = json.dumps(action_input, sort_keys=True)
     assert "session-guide-worker-read-route-cutover" not in serialized
     assert "fence-guide-worker-read-route-cutover" not in serialized
+
+    join_body = dict(precursor_body)
+    join_body.update(
+        {
+            "worker_session_id": "/root/compact-route-cutover-worker",
+            "reason": "host executes the projected initial join precursor",
+        }
+    )
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    fetch_started = Event()
+    stale_fetch_futures = []
+    race_pool = ThreadPoolExecutor(max_workers=1)
+    real_invalidate = (
+        server._onboard_guide_capsule_invalidate_runtime_context_auth_transition
+    )
+
+    def fetch_old_capsule():
+        fetch_started.set()
+        return server._onboard_guide_capsule_fetch(
+            project_id=PID,
+            guide_capsule_ref=guide["guide_capsule_ref"],
+            sections=["action_input"],
+            backlog_id=backlog_id,
+            role="mf_sub",
+            work_type="parallel_worker",
+        )
+
+    def probe_commit_epoch_atomicity(**kwargs):
+        # The production caller must still hold the capsule lock here.  A
+        # concurrent fetch may start, but cannot return the committed join
+        # under the prior generation.
+        future = race_pool.submit(fetch_old_capsule)
+        stale_fetch_futures.append(future)
+        assert fetch_started.wait(timeout=3)
+        assert not future.done()
+        return real_invalidate(**kwargs)
+
+    monkeypatch.setattr(
+        server,
+        "_onboard_guide_capsule_invalidate_runtime_context_auth_transition",
+        probe_commit_epoch_atomicity,
+    )
+    try:
+        joined = (
+            server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=join_body,
+            )
+        )
+        )
+        assert len(stale_fetch_futures) == 1
+        stale_after_join = stale_fetch_futures[0].result(timeout=3)
+    finally:
+        race_pool.shutdown(wait=True)
+    assert joined["status"] == "session_token_initial_join_issued"
+    assert stale_after_join["status"] == "refresh_required"
+    assert stale_after_join["reason"] in {
+        "guide_capsule_missing_or_expired",
+        "guide_capsule_stale_runtime_transition",
+    }
+
+    refreshed_current = server._contract_chain_current_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        rebuild_if_missing=True,
+    )
+    refreshed_current = (
+        server._contract_chain_current_with_runtime_authority_overlay(
+            refreshed_current
+        )
+    )
+    refreshed_resume = server._onboard_runtime_resume_from_current_projection(
+        refreshed_current
+    )
+    refreshed_action = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        next_action=refreshed_current["next_legal_action"],
+        current_projection=refreshed_current,
+        runtime_resume=refreshed_resume,
+    )
+    assert not refreshed_action.get("host_precursor_action"), refreshed_action
+    refreshed = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="mf_sub",
+        work_type="parallel_worker",
+        record=record,
+        next_action=refreshed_action,
+        current_projection=refreshed_current,
+        runtime_resume=refreshed_resume,
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+    assert refreshed["guide_capsule_ref"] != guide["guide_capsule_ref"]
+
+    monkeypatch.setattr(server, "_ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES", 1)
+    refreshed_overflow = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="mf_sub",
+        work_type="parallel_worker",
+        record=record,
+        next_action=refreshed_action,
+        current_projection=refreshed_current,
+        runtime_resume=refreshed_resume,
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES",
+        max_capsule_bytes,
+    )
+    assert refreshed_overflow["guide_capsule_ref"] == refreshed["guide_capsule_ref"]
+    refreshed_section = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": refreshed["guide_capsule_ref"],
+                "sections": ["action_input"],
+                "backlog_id": backlog_id,
+                "role": "mf_sub",
+                "work_type": "parallel_worker",
+            },
+        )
+    )["sections"]["action_input"]
+    assert not refreshed_section.get("host_precursor_action")
+    assert refreshed_section["canonical_executable_action"].get("mcp_tool") == (
+        "runtime_context_read_receipt"
+    ), refreshed_section["canonical_executable_action"]
+    assert joined["session_token"] not in json.dumps(
+        refreshed_section,
+        sort_keys=True,
+    )
+    assert joined["fence_token"] not in json.dumps(
+        refreshed_section,
+        sort_keys=True,
+    )
+
+    cache_hit = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="mf_sub",
+        work_type="parallel_worker",
+        record=record,
+        next_action=refreshed_action,
+        current_projection=refreshed_current,
+        runtime_resume=refreshed_resume,
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+    assert cache_hit["guide_capsule_ref"] == refreshed["guide_capsule_ref"]
+    with server._ONBOARD_GUIDE_CAPSULE_LOCK:
+        server._ONBOARD_GUIDE_CAPSULE_CACHE.clear()
+    rebuilt = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="mf_sub",
+        work_type="parallel_worker",
+        record=record,
+        next_action=refreshed_action,
+        current_projection=refreshed_current,
+        runtime_resume=refreshed_resume,
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+    assert rebuilt["guide_capsule_ref"] != refreshed["guide_capsule_ref"]
+    assert rebuilt["canonical_executable_action"]["mcp_tool"] == (
+        "runtime_context_read_receipt"
+    )
 
 
 def test_compact_worker_read_projects_current_runtime_context_receipt_facade(
@@ -108494,8 +108823,10 @@ def test_compact_worker_read_rematerializes_missing_exact_linked_worktree(
             sort_keys=True,
         )
     )
-    assert ready["canonical_executable_action"]["action"] == (
-        "record_runtime_context_read_receipt"
+    assert ready["host_precursor_required"] is True
+    assert ready["canonical_executable_action"] == {}
+    assert ready["host_precursor_action"]["mcp_tool"] == (
+        "runtime_context_session_token_initial_join"
     )
     refreshed = get_branch_context(conn, PID, worker_task_id)
     assert refreshed is not None

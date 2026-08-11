@@ -38539,7 +38539,16 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
         except Exception:
             conn.rollback()
             raise
-        conn.commit()
+        # Publish the durable auth transition and its process-local capsule
+        # epoch as one reader-visible critical section.  Capsule fetch/publish
+        # cannot observe committed join state under the prior epoch.
+        with _ONBOARD_GUIDE_CAPSULE_LOCK:
+            conn.commit()
+            _onboard_guide_capsule_invalidate_runtime_context_auth_transition(
+                project_id=project_id,
+                backlog_id=str(context.backlog_id or "").strip(),
+                contract_execution_id=contract_execution_id,
+            )
         result["audit_event_ref"] = initial_join_event_ref
         result["audit_event_id"] = audit_event.get("id", "")
         result["canonical_identity_binding_anchor_ref"] = (
@@ -43703,6 +43712,7 @@ def _runtime_context_pre_lineage_guidance_authority(
     contract_runtime_sequence: Mapping[str, Any],
     effective_read_receipt_ref: str,
     effective_startup_ref: str,
+    route_identity_override: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the same authority gate with server-projected copy-safe identity."""
 
@@ -43726,7 +43736,12 @@ def _runtime_context_pre_lineage_guidance_authority(
         ).get("contract_execution_id")
         or ""
     ).strip()
-    route_identity = _runtime_context_latest_route_identity(conn, context)
+    route_identity = (
+        dict(route_identity_override)
+        if isinstance(route_identity_override, Mapping)
+        and route_identity_override
+        else _runtime_context_latest_route_identity(conn, context)
+    )
     worker_id = str(getattr(context, "worker_id", "") or "").strip()
     actual_host_worker_id = str(
         getattr(context, "actual_host_worker_id", "") or ""
@@ -45146,6 +45161,7 @@ def _runtime_context_session_rejoin_guidance_eligibility(
     *,
     project_id: str,
     context: Any,
+    route_identity_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project whether the advertised rejoin action can pass current gates."""
 
@@ -45219,6 +45235,7 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                 contract_runtime_sequence=contract_runtime_sequence,
                 effective_read_receipt_ref=effective_read_receipt_ref,
                 effective_startup_ref=effective_startup_ref,
+                route_identity_override=route_identity_override,
             )
         )
         eligible = authority.get("eligible") is True
@@ -46759,7 +46776,13 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     immediate_actionable_payloads
                 )
             )
-        conn.commit()
+        with _ONBOARD_GUIDE_CAPSULE_LOCK:
+            conn.commit()
+            _onboard_guide_capsule_invalidate_runtime_context_auth_transition(
+                project_id=project_id,
+                backlog_id=str(context.backlog_id or "").strip(),
+                contract_execution_id=resolved_contract_execution_id,
+            )
         legacy_template_repair_transaction = ""
         result["audit_event_ref"] = f"timeline:{audit_event.get('id', '')}"
         result["audit_event_id"] = audit_event.get("id", "")
@@ -117514,6 +117537,7 @@ _ONBOARD_GUIDE_CAPSULE_CACHE: OrderedDict[tuple[str, ...], dict[str, Any]] = (
     OrderedDict()
 )
 _ONBOARD_GUIDE_CAPSULE_INFLIGHT: dict[tuple[str, ...], Event] = {}
+_ONBOARD_GUIDE_CAPSULE_AUTH_GENERATION = 0
 _ONBOARD_GUIDE_CAPSULE_METRICS = {
     "hits": 0,
     "misses": 0,
@@ -117523,7 +117547,19 @@ _ONBOARD_GUIDE_CAPSULE_METRICS = {
     "expirations": 0,
     "invalidations": 0,
     "single_flight_joins": 0,
+    "auth_generation_rejections": 0,
 }
+
+
+def _onboard_guide_capsule_auth_generation(
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+) -> int:
+    del project_id, backlog_id, contract_execution_id
+    with _ONBOARD_GUIDE_CAPSULE_LOCK:
+        return int(_ONBOARD_GUIDE_CAPSULE_AUTH_GENERATION)
 
 
 def _onboard_guide_capsule_serialized_bytes(value: Any) -> int:
@@ -118015,6 +118051,13 @@ def _onboard_guide_capsule_scope_identity(
         "contract_execution_id": contract_execution_id,
         "execution_state_revision": revision,
         "projection_hash": projection_hash,
+        "runtime_context_auth_generation": (
+            _onboard_guide_capsule_auth_generation(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=contract_execution_id,
+            )
+        ),
         "terminal": terminal,
     }
 
@@ -118070,6 +118113,7 @@ def _onboard_guide_capsule_cache_key(
         str(identity.get("contract_execution_id") or ""),
         str(identity.get("execution_state_revision") or 0),
         str(identity.get("projection_hash") or ""),
+        str(identity.get("runtime_context_auth_generation") or 0),
     )
 
 
@@ -118189,10 +118233,63 @@ def _onboard_guide_capsule_invalidate_contract_runtime_transition(
     return len(invalidated)
 
 
+def _onboard_guide_capsule_invalidate_runtime_context_auth_transition(
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+) -> int:
+    """Invalidate guide capsules after an accepted host-auth transition."""
+
+    global _ONBOARD_GUIDE_CAPSULE_AUTH_GENERATION
+
+    scope = (
+        str(project_id or "").strip(),
+        str(backlog_id or "").strip(),
+        str(contract_execution_id or "").strip(),
+    )
+    if not all(scope):
+        return 0
+    with _ONBOARD_GUIDE_CAPSULE_LOCK:
+        # One process-wide monotonic epoch deliberately invalidates unrelated
+        # capsule identities too.  It cannot be evicted back to zero, so a
+        # request that captured an older identity before entering single-flight
+        # can never publish after any accepted host-auth transition.
+        _ONBOARD_GUIDE_CAPSULE_AUTH_GENERATION += 1
+        invalidated = [
+            key
+            for key in _ONBOARD_GUIDE_CAPSULE_CACHE
+            if key[0] == scope[0]
+            and key[1] == scope[1]
+            and key[4] == scope[2]
+        ]
+        for key in invalidated:
+            _ONBOARD_GUIDE_CAPSULE_CACHE.pop(key, None)
+            _ONBOARD_GUIDE_CAPSULE_METRICS["invalidations"] += 1
+    return len(invalidated)
+
+
 def _onboard_guide_capsule_get_or_create(
     identity: Mapping[str, Any],
     builder,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if "runtime_context_auth_generation" not in identity:
+        with _ONBOARD_GUIDE_CAPSULE_LOCK:
+            _ONBOARD_GUIDE_CAPSULE_METRICS["auth_generation_rejections"] += 1
+            metrics = dict(_ONBOARD_GUIDE_CAPSULE_METRICS)
+        return {
+            "schema_version": _ONBOARD_GUIDE_CAPSULE_SCHEMA_VERSION,
+            "guide_capsule_ref": "",
+            "identity": dict(identity),
+            "sections": {},
+            "stale_runtime_context_auth_generation": True,
+        }, {
+            "status": "runtime_context_auth_generation_required",
+            "hit": False,
+            "miss": False,
+            "age_ms": 0,
+            **metrics,
+        }
     key = _onboard_guide_capsule_cache_key(identity)
     now = time.monotonic()
     leader = False
@@ -118262,6 +118359,29 @@ def _onboard_guide_capsule_get_or_create(
             "ttl_seconds": _ONBOARD_GUIDE_CAPSULE_TTL_SECONDS,
         }
         with _ONBOARD_GUIDE_CAPSULE_LOCK:
+            expected_auth_generation = int(
+                identity.get("runtime_context_auth_generation") or 0
+            )
+            current_auth_generation = int(
+                _ONBOARD_GUIDE_CAPSULE_AUTH_GENERATION
+            )
+            if expected_auth_generation != current_auth_generation:
+                _ONBOARD_GUIDE_CAPSULE_METRICS[
+                    "auth_generation_rejections"
+                ] += 1
+                return {
+                    "schema_version": _ONBOARD_GUIDE_CAPSULE_SCHEMA_VERSION,
+                    "guide_capsule_ref": "",
+                    "identity": dict(identity),
+                    "sections": {},
+                    "stale_runtime_context_auth_generation": True,
+                }, {
+                    "status": "runtime_context_auth_generation_changed",
+                    "hit": False,
+                    "miss": True,
+                    "age_ms": 0,
+                    **dict(_ONBOARD_GUIDE_CAPSULE_METRICS),
+                }
             _ONBOARD_GUIDE_CAPSULE_CACHE[key] = entry
             _ONBOARD_GUIDE_CAPSULE_CACHE.move_to_end(key)
             while (
@@ -118611,6 +118731,10 @@ def _onboard_guide_capsule_validate_current_projection(
         if str(identity.get("project_id") or "") != project_id:
             return None
         backlog_id = str(identity.get("backlog_id") or "")
+        stored_auth_generation = int(
+            identity.get("runtime_context_auth_generation") or 0
+        )
+        current_auth_generation = int(_ONBOARD_GUIDE_CAPSULE_AUTH_GENERATION)
     if not backlog_id:
         return None
     current = _onboard_guide_capsule_current_projection(
@@ -118623,6 +118747,8 @@ def _onboard_guide_capsule_validate_current_projection(
         return None
     current_identity = _onboard_guide_capsule_projection_identity(current)
     mismatches: list[str] = []
+    if stored_auth_generation != current_auth_generation:
+        mismatches.append("runtime_context_auth_generation")
     current_projection_hash = str(
         current_identity.get("projection_hash") or ""
     ).strip()
@@ -118994,6 +119120,109 @@ def _onboard_worker_read_runtime_facade_projection(
         ),
         successor_contract_execution_id=execution_id,
     )
+    initial_join_recorded = (
+        str(getattr(context, "last_recovery_action", "") or "").strip()
+        == "mf_subagent_initial_join_issued"
+    )
+    initial_join_state = (
+        _runtime_context_session_rejoin_guidance_eligibility(
+            conn,
+            project_id=project_id,
+            context=context,
+            route_identity_override=route_identity,
+        )
+        if initial_join_recorded
+        else {}
+    )
+    initial_join_verified = (
+        initial_join_state.get("eligible") is True
+        and str(initial_join_state.get("mode") or "")
+        == "pre_lineage_bootstrap_auth_only"
+    )
+    host_handoff = _mf_sub_worker_host_envelope_handoff(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        target_project_root=target_project_root,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        session_token_ref=session_token_ref,
+        merge_queue_id=str(getattr(context, "merge_queue_id", "") or ""),
+        route_identity=route_identity,
+    )
+    initial_join = (
+        host_handoff.get("initial_join")
+        if isinstance(host_handoff.get("initial_join"), Mapping)
+        else {}
+    )
+    expected_initial_join_route, _initial_join_route_source = (
+        _runtime_context_initial_join_expected_route_identity(
+            conn,
+            context,
+            accepted_dispatch_anchor,
+        )
+    )
+    initial_join_route = expected_initial_join_route
+    initial_join_route_mismatches = [
+        field
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if not _runtime_context_non_placeholder_text(
+            initial_join_route.get(field)
+        )
+        or str(initial_join_route.get(field) or "").strip()
+        != str(route_identity.get(field) or "").strip()
+    ]
+    initial_join_route_ready = (
+        route_authority_source
+        in {
+            "branch_contract_revision",
+            "branch_contract_revision_successor",
+            "resolved_renewed_route_token_ref",
+        }
+        and not initial_join_route_mismatches
+    )
+    if initial_join_recorded and not initial_join_verified:
+        return blocked(
+            "runtime_context_initial_join_authority_invalid",
+            list(initial_join_state.get("blockers") or ["initial_join_authority"]),
+        )
+    host_precursor_action = (
+        {
+            "schema_version": "guide.host_precursor_action.v1",
+            "source_of_authority": (
+                "accepted_dispatch+RuntimeContext.current_values"
+            ),
+            "action": str(initial_join.get("action") or ""),
+            "facade": str(initial_join.get("tool") or ""),
+            "mcp_tool": str(initial_join.get("tool") or ""),
+            "method": str(initial_join.get("method") or "POST"),
+            "path": str(initial_join.get("path") or ""),
+            "body_source": "copy_safe_body",
+            "copy_safe_body": dict(
+                initial_join.get("copy_safe_body") or {}
+            ),
+            "host_realization": dict(
+                initial_join.get("host_realization") or {}
+            ),
+            "route_identity": dict(route_identity),
+            "canonical_lineage": {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "contract_execution_id": execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+            },
+            "valid_only_before_worker_read_or_startup": True,
+            "refresh_after_success": True,
+            "raw_auth_process_local_only": True,
+        }
+        if initial_join
+        and not initial_join_verified
+        and initial_join_route_ready
+        else {}
+    )
     receipt = actionable.get("read_receipt_facade_payload_skeleton")
     body = (
         dict(receipt.get("copy_safe_body"))
@@ -119045,6 +119274,8 @@ def _onboard_worker_read_runtime_facade_projection(
         "session_token_ref": session_token_ref,
         "route_authority_source": route_authority_source,
         "fresh_worker_identity_complete": True,
+        "initial_join_route_ready": initial_join_route_ready,
+        "initial_join_route_mismatch_fields": initial_join_route_mismatches,
         "zero_write_projection": True,
         "raw_session_token_exposed": False,
         "raw_fence_token_exposed": False,
@@ -119062,6 +119293,7 @@ def _onboard_worker_read_runtime_facade_projection(
         "copy_safe_body": body,
         "actionable": True,
         "host_realization": dict(receipt.get("host_realization") or {}),
+        "host_precursor_action": host_precursor_action,
         "worker_read_runtime_facade_projection": facade_projection,
     }
 
@@ -119969,6 +120201,11 @@ def _onboard_route_guide_compact_service_response(
             ),
         )
     )
+    host_precursor_action = (
+        dict(next_action.get("host_precursor_action"))
+        if isinstance(next_action.get("host_precursor_action"), Mapping)
+        else {}
+    )
     direct_main_evidence_shapes = (
         _onboard_parentless_direct_main_compact_evidence_guidance(
             project_id=project_id,
@@ -120011,29 +120248,59 @@ def _onboard_route_guide_compact_service_response(
                     "canonical_executable_action": (
                         canonical_executable_action
                     ),
+                    "host_precursor_action": host_precursor_action,
                 },
                 section_name="action_input",
-                overflow_fallback={
-                    "schema_version": (
-                        "onboard_route_guide.action_input_continuation.v1"
-                    ),
-                    "source_path": action_input_path,
-                    "canonical_executable_action": (
-                        canonical_executable_action
-                    ),
-                    "source_binding": {
-                        "contract_execution_id": identity[
-                            "contract_execution_id"
-                        ],
-                        "execution_state_revision": identity[
-                            "execution_state_revision"
-                        ],
-                        "projection_hash": identity["projection_hash"],
-                    },
-                    "continuation_complete": bool(
-                        canonical_executable_action
-                    ),
-                },
+                overflow_fallback=(
+                    {
+                        "schema_version": (
+                            "onboard_route_guide.action_input_continuation.v1"
+                        ),
+                        "source_path": action_input_path,
+                        "host_precursor_action": host_precursor_action,
+                        "successor_after_precursor": {
+                            "refresh_required": True,
+                            "expected_contract_action": str(
+                                canonical_executable_action.get("action") or ""
+                            ),
+                            "mcp_tool": str(
+                                canonical_executable_action.get("mcp_tool") or ""
+                            ),
+                        },
+                        "source_binding": {
+                            "contract_execution_id": identity[
+                                "contract_execution_id"
+                            ],
+                            "execution_state_revision": identity[
+                                "execution_state_revision"
+                            ],
+                            "projection_hash": identity["projection_hash"],
+                        },
+                        "continuation_complete": True,
+                    }
+                    if host_precursor_action
+                    else {
+                        "schema_version": (
+                            "onboard_route_guide.action_input_continuation.v1"
+                        ),
+                        "source_path": action_input_path,
+                        "canonical_executable_action": (
+                            canonical_executable_action
+                        ),
+                        "source_binding": {
+                            "contract_execution_id": identity[
+                                "contract_execution_id"
+                            ],
+                            "execution_state_revision": identity[
+                                "execution_state_revision"
+                            ],
+                            "projection_hash": identity["projection_hash"],
+                        },
+                        "continuation_complete": bool(
+                            canonical_executable_action
+                        ),
+                    }
+                ),
             ),
             "role_guidance": _onboard_guide_capsule_bounded_section(
                 {
@@ -120097,6 +120364,38 @@ def _onboard_route_guide_compact_service_response(
         identity,
         build_sections,
     )
+    if entry.get("stale_runtime_context_auth_generation") is True:
+        return _onboard_guide_capsule_refresh_response(
+            project_id=project_id,
+            reason="guide_capsule_runtime_context_auth_transition",
+            entry=entry,
+        )
+    host_precursor_required = bool(host_precursor_action)
+    public_canonical_executable_action = (
+        {} if host_precursor_required else canonical_executable_action
+    )
+    public_action_input = {} if host_precursor_required else action_input
+    public_action_input_path = (
+        "host_precursor_action.copy_safe_body"
+        if host_precursor_required
+        else action_input_path
+    )
+    public_facade = str(
+        (
+            host_precursor_action
+            if host_precursor_required
+            else canonical_executable_action
+        ).get("facade")
+        or ""
+    )
+    public_mcp_tool = str(
+        (
+            host_precursor_action
+            if host_precursor_required
+            else canonical_executable_action
+        ).get("mcp_tool")
+        or ""
+    )
     response = {
         "schema_version": _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION,
         "ok": True,
@@ -120113,15 +120412,41 @@ def _onboard_route_guide_compact_service_response(
         "contract_execution_id": identity["contract_execution_id"],
         "execution_state_revision": identity["execution_state_revision"],
         "projection_hash": identity["projection_hash"],
-        "action_input": action_input,
-        "action_input_path": action_input_path,
-        "canonical_executable_action": canonical_executable_action,
+        "action_input": public_action_input,
+        "action_input_path": public_action_input_path,
+        "canonical_executable_action": public_canonical_executable_action,
         "copy_safe_body": dict(
-            canonical_executable_action.get("copy_safe_body") or {}
+            public_canonical_executable_action.get("copy_safe_body") or {}
         ),
-        "facade": str(canonical_executable_action.get("facade") or ""),
-        "mcp_tool": str(canonical_executable_action.get("mcp_tool") or ""),
-        "actionable": bool(canonical_executable_action),
+        "facade": public_facade,
+        "mcp_tool": public_mcp_tool,
+        "actionable": bool(
+            host_precursor_action or public_canonical_executable_action
+        ),
+        "host_precursor_required": host_precursor_required,
+        "host_precursor_action": host_precursor_action,
+        "deferred_contract_action": (
+            {
+                "refresh_required": True,
+                "expected_contract_action": str(
+                    canonical_executable_action.get("action") or ""
+                ),
+                "mcp_tool": str(
+                    canonical_executable_action.get("mcp_tool") or ""
+                ),
+            }
+            if host_precursor_required
+            else {}
+        ),
+        "execution_sequence": (
+            [
+                "host_precursor_action",
+                "refresh_onboard_route_guide",
+                "canonical_contract_action",
+            ]
+            if host_precursor_required
+            else ["canonical_contract_action"]
+        ),
         "worker_read_runtime_facade_projection": dict(
             worker_read_projection
         ),
@@ -120173,6 +120498,7 @@ def _onboard_route_guide_compact_service_response(
                 "contract_execution_id",
                 "execution_state_revision",
                 "projection_hash",
+                "runtime_context_auth_generation",
             ],
             "ttl_seconds": _ONBOARD_GUIDE_CAPSULE_TTL_SECONDS,
             "max_entries": _ONBOARD_GUIDE_CAPSULE_MAX_ENTRIES,
@@ -120225,6 +120551,14 @@ def _onboard_route_guide_compact_service_response(
         "selected_work_type": selected_work_type,
         "guide_capsule_ref": entry["guide_capsule_ref"],
         "status": "compact_response_size_exceeded",
+        "reason": (
+            "host_precursor_action_requires_action_input_section"
+            if host_precursor_required
+            else "compact_response_size_limit"
+        ),
+        "required_sections": (
+            ["action_input"] if host_precursor_required else []
+        ),
         "max_serialized_bytes": _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES,
         "advisory_only": True,
         "authorizes_write": False,
