@@ -415,6 +415,60 @@ def _find_governance_process() -> Optional[int]:
         return None
 
 
+def _governance_listener_pids(port: Optional[int] = None) -> tuple[int, ...]:
+    """Return only the process IDs that own the governance TCP listener."""
+    port = _governance_port() if port is None else int(port)
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["netstat", "-ano"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"netstat failed with exit code {result.returncode}")
+        pids = set()
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper() == "TCP":
+                local_address, state = parts[1], parts[-2].upper()
+                if local_address.rsplit(":", 1)[-1] == str(port) and state == "LISTENING":
+                    pids.add(int(parts[-1]))
+        return tuple(sorted(pid for pid in pids if pid > 0))
+
+    result = subprocess.run(
+        ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"lsof failed with exit code {result.returncode}")
+    pids = {int(value) for value in result.stdout.split() if value.isdigit()}
+    return tuple(sorted(pid for pid in pids if pid > 0))
+
+
+def _pid_exists(pid: int) -> bool:
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return result.returncode == 0 and str(pid) in result.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _listener_and_process_stopped(pid: int, port: int) -> bool:
+    return not _pid_exists(pid) and not _governance_listener_pids(port)
+
+
 def _stop_governance_process() -> bool:
     """Attempt to stop the currently running governance process.
 
@@ -425,67 +479,57 @@ def _stop_governance_process() -> bool:
     """
     port = _governance_port()
     try:
+        listener_pids = _governance_listener_pids(port)
+        if not listener_pids:
+            return True
+        if len(listener_pids) != 1:
+            log.error(
+                "manager_http_server: ambiguous governance listener owners on port %d: %s",
+                port,
+                listener_pids,
+            )
+            return False
+        pid = listener_pids[0]
+        log.info("manager_http_server: stopping governance LISTEN owner PID %d", pid)
+        if _governance_listener_pids(port) != (pid,):
+            log.error("manager_http_server: governance listener owner changed before stop")
+            return False
         if sys.platform == "win32":
-            # Find PID using netstat
             result = subprocess.run(
-                ["netstat", "-ano"],
-                capture_output=True, text=True, timeout=5
+                ["taskkill", "/PID", str(pid)], capture_output=True, timeout=5
             )
-            for line in result.stdout.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    parts = line.split()
-                    pid = int(parts[-1])
-                    log.info("manager_http_server: sending SIGTERM to governance PID %d", pid)
-                    # SIGTERM equivalent on Windows
-                    subprocess.run(
-                        ["taskkill", "/PID", str(pid)],
-                        capture_output=True, timeout=5
-                    )
-                    # Wait up to 5s for graceful exit
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
-                        check = subprocess.run(
-                            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                            capture_output=True, text=True, timeout=3
-                        )
-                        if str(pid) not in check.stdout:
-                            log.info("manager_http_server: governance PID %d exited", pid)
-                            return True
-                        time.sleep(0.5)
-                    # Still alive → SIGKILL
-                    log.warning("manager_http_server: governance PID %d still alive after 5s, force-killing", pid)
-                    subprocess.run(
-                        ["taskkill", "/F", "/PID", str(pid)],
-                        capture_output=True, timeout=5
-                    )
-                    time.sleep(1)
-                    return True
+            if result.returncode != 0:
+                return False
         else:
-            result = subprocess.run(
-                ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.stdout.strip():
-                pid = int(result.stdout.strip().split()[0])
-                os.kill(pid, signal.SIGTERM)
-                # Wait up to 5s
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    try:
-                        os.kill(pid, 0)  # probe: still alive?
-                    except OSError:
-                        log.info("manager_http_server: governance PID %d exited after SIGTERM", pid)
-                        return True
-                    time.sleep(0.5)
-                # Still alive → SIGKILL
-                log.warning("manager_http_server: governance PID %d still alive after 5s, sending SIGKILL", pid)
-                os.kill(pid, signal.SIGKILL)
-                time.sleep(1)
+            os.kill(pid, signal.SIGTERM)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if _listener_and_process_stopped(pid, port):
+                log.info("manager_http_server: governance listener PID %d exited", pid)
                 return True
+            time.sleep(0.5)
+
+        log.warning("manager_http_server: governance listener PID %d did not exit; force-killing", pid)
+        if _governance_listener_pids(port) != (pid,):
+            log.error("manager_http_server: governance listener owner changed before force-kill")
+            return False
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5
+            )
+            if result.returncode != 0:
+                return False
+        else:
+            os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if _listener_and_process_stopped(pid, port):
+                return True
+            time.sleep(0.25)
     except Exception as exc:
         log.warning("manager_http_server: failed to stop governance: %s", exc)
-
-    return True  # Proceed even if we couldn't confirm stop
+    return False
 
 
 def _spawn_governance_process(chain_version: str) -> subprocess.Popen:
@@ -540,8 +584,23 @@ def _spawn_governance_process(chain_version: str) -> subprocess.Popen:
     return proc
 
 
-def _wait_for_health(timeout: float = _HEALTH_CHECK_TIMEOUT) -> bool:
-    """Poll governance health endpoint until it responds 200 or timeout."""
+def _git_commit_matches(observed: object, expected: object) -> bool:
+    observed_text = str(observed or "").strip().lower()
+    expected_text = str(expected or "").strip().lower()
+    if min(len(observed_text), len(expected_text)) < 7:
+        return False
+    if any(ch not in "0123456789abcdef" for ch in observed_text + expected_text):
+        return False
+    shorter, longer = sorted((observed_text, expected_text), key=len)
+    return longer.startswith(shorter)
+
+
+def _wait_for_health(
+    proc: subprocess.Popen,
+    expected_runtime_head: str,
+    timeout: float = _HEALTH_CHECK_TIMEOUT,
+) -> bool:
+    """Wait for health bound to the spawned PID, listener, and loaded commit."""
     import urllib.request
     import urllib.error
 
@@ -549,12 +608,41 @@ def _wait_for_health(timeout: float = _HEALTH_CHECK_TIMEOUT) -> bool:
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            log.error("manager_http_server: spawned governance PID %d exited", proc.pid)
+            return False
         try:
+            if _governance_listener_pids() != (proc.pid,):
+                time.sleep(_HEALTH_CHECK_INTERVAL)
+                continue
             req = urllib.request.Request(f"{gov_url}/api/health", method="GET")
             with urllib.request.urlopen(req, timeout=3) as resp:
                 if resp.status == 200:
-                    log.info("manager_http_server: governance health check passed")
-                    return True
+                    payload = json.loads(resp.read().decode("utf-8"))
+                    loaded = payload.get("loaded_runtime_identity") or {}
+                    source_hash = str(loaded.get("loaded_source_sha256") or "")
+                    exact_identity = (
+                        payload.get("pid") == proc.pid
+                        and loaded.get("loaded_pid") == proc.pid
+                        and payload.get("runtime_loaded_version") == loaded.get("loaded_commit")
+                        and _git_commit_matches(
+                            loaded.get("loaded_commit"), expected_runtime_head
+                        )
+                        and _git_commit_matches(
+                            payload.get("worktree_head_version", payload.get("version")),
+                            expected_runtime_head,
+                        )
+                        and payload.get("runtime_stale") is False
+                        and loaded.get("runtime_stale") is False
+                        and source_hash.startswith("sha256:")
+                        and len(source_hash) == 71
+                    )
+                    if exact_identity:
+                        log.info(
+                            "manager_http_server: governance PID %d exact runtime health passed",
+                            proc.pid,
+                        )
+                        return True
         except Exception:
             pass
         time.sleep(_HEALTH_CHECK_INTERVAL)
@@ -854,13 +942,35 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Step 1: Stop old governance (probe → SIGTERM 5s → SIGKILL)
+        # Step 1: Stop the exact TCP listener owner and prove it exited.
         try:
             stopped = _stop_governance_process()
-            if not stopped:
-                log.warning("manager_http_server: could not confirm old governance stopped")
         except Exception as exc:
             log.error("manager_http_server: error stopping governance: %s", exc)
+            stopped = False
+        if not stopped:
+            detail = "Could not prove the old governance listener stopped"
+            self._send_json(
+                {
+                    "ok": False,
+                    "step": "stop",
+                    "detail": detail,
+                    "pid": None,
+                    "requested_branch_ref": branch_ref,
+                    **runtime_branch_state,
+                    "runtime_deployment_verification": (
+                        derive_runtime_deployment_verification_status(
+                            http_status=500,
+                            runtime_checkout_advanced=True,
+                            healthy=False,
+                            step="stop",
+                            detail=detail,
+                        )
+                    ),
+                },
+                500,
+            )
+            return
 
         # Step 2: Spawn new governance with correct CWD/PYTHONPATH
         try:
@@ -889,7 +999,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
             return
 
         # Step 3: Health-poll /api/health up to 30s
-        healthy = _wait_for_health()
+        healthy = _wait_for_health(proc, runtime_head)
 
         if not healthy:
             self._send_json(
@@ -945,9 +1055,9 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                 "pid": proc.pid,
                 "chain_version": chain_version,
                 "runtime_checkout_advanced": True,
-                "runtime_head": runtime_head,
                 "requested_branch_ref": branch_ref,
                 **runtime_branch_state,
+                "runtime_head": runtime_head,
                 "runtime_deployment_verification": (
                     derive_runtime_deployment_verification_status(
                         http_status=200,

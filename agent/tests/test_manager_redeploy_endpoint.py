@@ -34,6 +34,7 @@ from agent.manager_http_server import (
     MANAGER_HTTP_HOST,
     MANAGER_HTTP_PORT,
 )
+import agent.manager_http_server as manager_http_server
 
 
 def _make_request(server_address, method, path, body=None):
@@ -175,6 +176,63 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
         # version-update NOT called
         mock_write.assert_not_called()
 
+    @patch(
+        "agent.manager_http_server._ensure_plugin_clone_checkout",
+        return_value="stopblocked000000000000000000000000000",
+    )
+    @patch("agent.manager_http_server._write_chain_version")
+    @patch("agent.manager_http_server._wait_for_health")
+    @patch("agent.manager_http_server._spawn_governance_process")
+    @patch("agent.manager_http_server._stop_governance_process", return_value=False)
+    def test_unconfirmed_stop_aborts_before_spawn(
+        self, mock_stop, mock_spawn, mock_health, mock_write, mock_checkout
+    ):
+        status, body = _make_request(
+            self.server_address,
+            "POST",
+            "/api/manager/redeploy/governance",
+            {"chain_version": "stopblocked"},
+        )
+
+        self.assertEqual(status, 500)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["step"], "stop")
+        mock_stop.assert_called_once_with()
+        mock_spawn.assert_not_called()
+        mock_health.assert_not_called()
+        mock_write.assert_not_called()
+
+    @patch(
+        "agent.manager_http_server._ensure_plugin_clone_checkout",
+        return_value="a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+    )
+    @patch("agent.manager_http_server._write_chain_version")
+    @patch(
+        "agent.manager_http_server._governance_listener_pids",
+        return_value=(67041,),
+    )
+    @patch("agent.manager_http_server._spawn_governance_process")
+    @patch("agent.manager_http_server._stop_governance_process", return_value=True)
+    def test_surviving_old_listener_cannot_make_exited_spawn_look_healthy(
+        self, mock_stop, mock_spawn, mock_listener, mock_write, mock_checkout
+    ):
+        spawned = MagicMock()
+        spawned.pid = 84539
+        spawned.poll.return_value = 1
+        mock_spawn.return_value = spawned
+
+        status, body = _make_request(
+            self.server_address,
+            "POST",
+            "/api/manager/redeploy/governance",
+            {"chain_version": "a0266c5d"},
+        )
+
+        self.assertEqual(status, 500)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["runtime_deployment_verification"]["status"], "health_probe_failed")
+        mock_write.assert_not_called()
+
     def test_redeploy_unknown_target_404(self):
         """Unknown target returns 404."""
         status, body = _make_request(
@@ -197,6 +255,144 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertFalse(body["ok"])
         self.assertIn("chain_version", body["detail"])
+
+
+class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
+    def test_listener_probe_selects_only_tcp_listen_owners(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="67041\n67041\n", stderr=""
+        )
+        with patch.object(
+            manager_http_server.subprocess, "run", return_value=completed
+        ) as mock_run:
+            pids = manager_http_server._governance_listener_pids(40000)
+
+        self.assertEqual(pids, (67041,))
+        command = mock_run.call_args.args[0]
+        self.assertEqual(
+            command,
+            ["lsof", "-nP", "-iTCP:40000", "-sTCP:LISTEN", "-t"],
+        )
+
+    def test_ambiguous_listener_owners_fail_closed_without_signaling(self):
+        with patch.object(
+            manager_http_server,
+            "_governance_listener_pids",
+            return_value=(67041, 84539),
+        ), patch.object(manager_http_server.os, "kill") as mock_kill:
+            self.assertFalse(manager_http_server._stop_governance_process())
+        mock_kill.assert_not_called()
+
+    def test_no_listener_is_already_stopped(self):
+        with patch.object(
+            manager_http_server, "_governance_listener_pids", return_value=()
+        ), patch.object(manager_http_server.os, "kill") as mock_kill:
+            self.assertTrue(manager_http_server._stop_governance_process())
+        mock_kill.assert_not_called()
+
+    def test_stop_signals_only_the_exact_listener_owner(self):
+        with patch.object(
+            manager_http_server,
+            "_governance_listener_pids",
+            side_effect=[(67041,), (67041,)],
+        ), patch.object(
+            manager_http_server,
+            "_listener_and_process_stopped",
+            return_value=True,
+        ), patch.object(manager_http_server.os, "kill") as mock_kill:
+            self.assertTrue(manager_http_server._stop_governance_process())
+        mock_kill.assert_called_once_with(67041, manager_http_server.signal.SIGTERM)
+
+    def test_health_rejects_old_listener_after_spawned_process_exits(self):
+        proc = MagicMock()
+        proc.pid = 84539
+        proc.poll.return_value = 1
+        with patch.object(
+            manager_http_server,
+            "_governance_listener_pids",
+            return_value=(67041,),
+        ):
+            self.assertFalse(
+                manager_http_server._wait_for_health(
+                    proc,
+                    "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+                    timeout=0.01,
+                )
+            )
+
+    def test_health_accepts_exact_spawned_listener_and_loaded_runtime(self):
+        proc = MagicMock()
+        proc.pid = 84539
+        proc.poll.return_value = None
+        payload = {
+            "status": "ok",
+            "pid": 84539,
+            "version": "a0266c5d",
+            "worktree_head_version": "a0266c5d",
+            "runtime_loaded_version": "a0266c5d",
+            "runtime_stale": False,
+            "loaded_runtime_identity": {
+                "loaded_pid": 84539,
+                "loaded_commit": "a0266c5d",
+                "loaded_source_sha256": "sha256:" + "a" * 64,
+                "runtime_stale": False,
+            },
+        }
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with patch.object(
+            manager_http_server,
+            "_governance_listener_pids",
+            return_value=(84539,),
+        ), patch("urllib.request.urlopen", return_value=response):
+            self.assertTrue(
+                manager_http_server._wait_for_health(
+                    proc,
+                    "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+                    timeout=0.05,
+                )
+            )
+
+    def test_health_rejects_stale_loaded_commit_even_when_pid_and_listener_match(self):
+        proc = MagicMock()
+        proc.pid = 84539
+        proc.poll.return_value = None
+        payload = {
+            "status": "ok",
+            "pid": 84539,
+            "version": "a0266c5d",
+            "worktree_head_version": "a0266c5d",
+            "runtime_loaded_version": "8fa1b07c",
+            "runtime_stale": True,
+            "loaded_runtime_identity": {
+                "loaded_pid": 84539,
+                "loaded_commit": "8fa1b07c",
+                "loaded_source_sha256": "sha256:" + "a" * 64,
+                "runtime_stale": True,
+            },
+        }
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with patch.object(
+            manager_http_server,
+            "_governance_listener_pids",
+            return_value=(84539,),
+        ), patch("urllib.request.urlopen", return_value=response), patch.object(
+            manager_http_server, "_HEALTH_CHECK_INTERVAL", 0
+        ):
+            self.assertFalse(
+                manager_http_server._wait_for_health(
+                    proc,
+                    "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+                    timeout=0.01,
+                )
+            )
 
 
 class TestManagerHTTPServerImports(unittest.TestCase):
