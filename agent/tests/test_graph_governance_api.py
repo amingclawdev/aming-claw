@@ -7205,6 +7205,8 @@ def _prepare_guide_bound_mf_batch_entry(
     suffix: str,
     required_worker_count: int = 1,
     observer_session_id: str = "",
+    target_head_commit: str = "",
+    graph_snapshot_id: str = "",
 ) -> dict[str, Any]:
     backlog_id = f"AC-MF-BATCH-GUIDE-{suffix}"
     child_ids = [
@@ -7260,8 +7262,8 @@ def _prepare_guide_bound_mf_batch_entry(
         task_id=f"batch-guide-{suffix}",
         observer_session_id=observer_session_id,
         route_token_ref=route_token_ref,
-        target_head_commit=f"target-head-{suffix}",
-        graph_snapshot_id=f"scope-target-head-{suffix}",
+        target_head_commit=(target_head_commit or f"target-head-{suffix}"),
+        graph_snapshot_id=(graph_snapshot_id or f"scope-target-head-{suffix}"),
         required_worker_count=required_worker_count,
     )
     assert guide["next_legal_action"]["action_input_ready"] is True
@@ -133393,6 +133395,242 @@ def test_mf_batch_guide_entry_replay_survives_timeline_window_and_active_epoch(
     assert blocked["error"] == "integration_epoch_dispatch_base_frozen"
     assert durable_counts() == before_replay
 
+
+def test_entered_batch_without_epoch_projects_current_successor_read_only(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    repo = _git_repo(tmp_path)
+    historical_head = batch_jobs.git_commit(repo)
+    (repo / "current-world.txt").write_text("current\n", encoding="utf-8")
+    subprocess.run(["git", "add", "current-world.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "current world"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    current_head = batch_jobs.git_commit(repo)
+    current_snapshot_id = f"full-{current_head[:12]}-{'1' * 12}"
+    current_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=current_snapshot_id,
+        commit_sha=current_head,
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.activate_graph_snapshot(conn, PID, current_snapshot["snapshot_id"])
+    prepared = _prepare_guide_bound_mf_batch_entry(
+        conn,
+        suffix="NO-EPOCH-CURRENT-WORLD",
+        required_worker_count=2,
+        target_head_commit=historical_head,
+        graph_snapshot_id="full-entered-batch-historical",
+    )
+    entered = server.handle_project_mf_batch_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=prepared["action_input"],
+        )
+    )
+    assert entered["writes_performed"] is True
+    assert parallel_branch_runtime.get_active_integration_epoch(conn, PID) is None
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repo,
+    )
+    before = {
+        "changes": conn.total_changes,
+        "timeline": conn.execute(
+            "SELECT COUNT(*) FROM task_timeline_events"
+        ).fetchone()[0],
+        "queue": conn.execute(
+            "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
+        ).fetchone()[0],
+        "runtime": conn.execute(
+            "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+        ).fetchone()[0],
+    }
+
+    full = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": prepared["backlog_id"],
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+            },
+        )
+    )
+    compact = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": prepared["backlog_id"],
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+                "response_view": "compact",
+            },
+        )
+    )
+    compact_replay = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": prepared["backlog_id"],
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+                "response_view": "compact",
+            },
+        )
+    )
+    capsule = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": compact["guide_capsule_ref"],
+                "sections": ["next_action", "action_input"],
+                "backlog_id": prepared["backlog_id"],
+                "role": "observer",
+                "work_type": "multi_backlog_parallel",
+            },
+        )
+    )
+
+    for action in (
+        full["next_legal_action"],
+        compact["next_legal_action"],
+        capsule["sections"]["next_action"],
+    ):
+        assert action["id"] == "resume_entered_batch_successor"
+        assert action["action"] == "mf_parallel_enter"
+        assert action["current_target_head"] == current_head
+        assert action["current_graph_snapshot_id"] == current_snapshot["snapshot_id"]
+        assert action["stale_target_head"] is True
+        assert action["stale_count"] == 2
+        successor = action["successor_action_input"]["static_body"]
+        assert successor["target_head_commit"] == current_head
+        assert successor["graph_snapshot_id"] == current_snapshot["snapshot_id"]
+        assert successor["merge_queue_item"]["base_commit"] == historical_head
+        assert successor["merge_queue_item"]["validated_target_head"] == historical_head
+    assert full["runtime_resume"]["source"] == "durable_entered_batch"
+    assert compact_replay["next_legal_action"] == compact["next_legal_action"]
+    assert compact_replay["guide_capsule_ref"] == compact["guide_capsule_ref"]
+    assert capsule["ok"] is True
+    assert conn.total_changes == before["changes"]
+    assert conn.execute("SELECT COUNT(*) FROM task_timeline_events").fetchone()[0] == before["timeline"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
+    ).fetchone()[0] == before["queue"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
+    ).fetchone()[0] == before["runtime"]
+
+    file_db = tmp_path / "entered-batch-resume.db"
+    disk = sqlite3.connect(file_db)
+    conn.backup(disk)
+    disk.close()
+    before_bytes = file_db.read_bytes()
+    read_only = sqlite3.connect(f"file:{file_db}?mode=ro", uri=True)
+    read_only.row_factory = sqlite3.Row
+    before_physical = (
+        read_only.total_changes,
+        read_only.execute("PRAGMA page_count").fetchone()[0],
+        read_only.execute("PRAGMA freelist_count").fetchone()[0],
+        tuple(
+            read_only.execute(
+                "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+        ),
+    )
+    physical_projection = server._entered_batch_successor_resume_projection(
+        read_only,
+        project_id=PID,
+        coordination_backlog_id=prepared["backlog_id"],
+    )
+    after_physical = (
+        read_only.total_changes,
+        read_only.execute("PRAGMA page_count").fetchone()[0],
+        read_only.execute("PRAGMA freelist_count").fetchone()[0],
+        tuple(
+            read_only.execute(
+                "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+        ),
+    )
+    read_only.close()
+    assert physical_projection["next_legal_action"] == full["next_legal_action"]
+    assert after_physical == before_physical
+    assert file_db.read_bytes() == before_bytes
+
+    dirty_path = repo / "uncommitted.txt"
+    dirty_path.write_text("dirty\n", encoding="utf-8")
+    before_blocked = conn.total_changes
+    dirty = server._entered_batch_successor_resume_projection(
+        conn,
+        project_id=PID,
+        coordination_backlog_id=prepared["backlog_id"],
+    )
+    assert dirty["blocker"]["code"] == "entered_batch_current_worktree_not_clean"
+    assert dirty["next_legal_action"]["action"] == "no_runtime_action"
+    assert conn.total_changes == before_blocked
+    dirty_path.unlink()
+
+    graph_path = store.snapshot_graph_path(PID, current_snapshot["snapshot_id"])
+    graph_bytes = graph_path.read_bytes()
+    graph_path.write_bytes(b"{}")
+    before_blocked = conn.total_changes
+    corrupt_graph = server._entered_batch_successor_resume_projection(
+        conn,
+        project_id=PID,
+        coordination_backlog_id=prepared["backlog_id"],
+    )
+    assert corrupt_graph["blocker"]["code"] == (
+        "entered_batch_current_graph_snapshot_invalid"
+    )
+    assert corrupt_graph["next_legal_action"]["id"] == (
+        "entered_batch_successor_resume_blocked"
+    )
+    assert conn.total_changes == before_blocked
+    graph_path.write_bytes(graph_bytes)
+
+    event_row = conn.execute(
+        """
+        SELECT id, payload_json FROM task_timeline_events
+         WHERE project_id = ? AND backlog_id = ?
+           AND event_type = 'mf_batch_parallel.entered'
+        """,
+        (PID, prepared["backlog_id"]),
+    ).fetchone()
+    tampered_payload = json.loads(event_row["payload_json"])
+    tampered_payload["fanout_policy"]["per_row_successors"][0]["body"][
+        "merge_queue_item"
+    ]["queue_item_id"] = "foreign-queue-item"
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (json.dumps(tampered_payload, sort_keys=True), event_row["id"]),
+    )
+    conn.commit()
+    before_blocked = conn.total_changes
+    tampered = server._entered_batch_successor_resume_projection(
+        conn,
+        project_id=PID,
+        coordination_backlog_id=prepared["backlog_id"],
+    )
+    assert tampered["blocker"]["code"] == (
+        "entered_batch_successor_identity_ambiguous"
+    )
+    assert tampered["next_legal_action"]["action"] == "no_runtime_action"
+    assert conn.total_changes == before_blocked
 
 @pytest.mark.parametrize(
     ("field", "mutate", "expected_code"),

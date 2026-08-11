@@ -102410,6 +102410,344 @@ def _contract_runtime_shared_batch_enter_binding_verified(
     )
 
 
+def _entered_batch_successor_resume_projection(
+    conn,
+    *,
+    project_id: str,
+    coordination_backlog_id: str,
+) -> dict[str, Any]:
+    """Project the next durable batch child without reopening the batch.
+
+    An accepted batch enter can outlive its integration epoch: before the
+    first row is materialized there is deliberately no active epoch.  The
+    guide must therefore recognize the immutable enter event + durable queue
+    tuple itself.  This reader never creates schemas or updates the historical
+    queue; only the executable target HEAD and active graph are refreshed from
+    current server authority.
+    """
+
+    from . import graph_snapshot_store
+
+    blocked_base = {
+        "schema_version": "mf_batch_parallel.entered_successor_resume.v1",
+        "source": "durable_entered_batch",
+        "precedence": "entered_batch_before_fresh_batch",
+        "project_id": project_id,
+        "backlog_id": coordination_backlog_id,
+        "scheduler_eligible": False,
+        "position_skippable": False,
+        "writes_performed": False,
+    }
+
+    def blocked(code: str) -> dict[str, Any]:
+        return {
+            **blocked_base,
+            "status": "entered_batch_successor_blocked",
+            "blocked": True,
+            "blocker": {"code": code, "copy_safe": True},
+            "next_legal_action": {
+                "schema_version": "onboard_route_guide.next_action.v1",
+                "id": "entered_batch_successor_resume_blocked",
+                "action": "no_runtime_action",
+                "source": "durable_entered_batch",
+                "blocked": True,
+                "blocker": {"code": code, "copy_safe": True},
+            },
+        }
+
+    try:
+        event_rows = conn.execute(
+            """
+            SELECT id, task_id, event_type, phase, event_kind, status,
+                   payload_json, created_at
+              FROM task_timeline_events
+             WHERE project_id = ? AND backlog_id = ?
+               AND event_type = 'mf_batch_parallel.entered'
+             ORDER BY id DESC
+             LIMIT 3
+            """,
+            (project_id, coordination_backlog_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    if not event_rows:
+        return {}
+    if len(event_rows) != 1:
+        return blocked("entered_batch_event_ambiguous")
+    event = event_rows[0]
+    if not (
+        str(event["phase"] or "") == "orchestration"
+        and str(event["event_kind"] or "") == "contract_binding"
+        and str(event["status"] or "") == "accepted"
+    ):
+        return blocked("entered_batch_event_not_authoritative")
+    try:
+        payload = json.loads(str(event["payload_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return blocked("entered_batch_event_payload_invalid")
+    if not isinstance(payload, Mapping):
+        return blocked("entered_batch_event_payload_invalid")
+    batch_id = str(payload.get("batch_id") or "").strip()
+    merge_queue_id = _contract_runtime_mf_batch_parent_merge_queue_id(payload)
+    if not batch_id or not merge_queue_id:
+        return blocked("entered_batch_identity_incomplete")
+    try:
+        queue_rows = conn.execute(
+            """
+            SELECT * FROM parallel_branch_merge_queue_items
+             WHERE project_id = ? AND merge_queue_id = ?
+             ORDER BY queue_index, queue_item_id
+            """,
+            (project_id, merge_queue_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return blocked("entered_batch_queue_unavailable")
+    queue = [dict(row) for row in queue_rows]
+    if not queue or not _contract_runtime_shared_batch_enter_binding_verified(
+        payload,
+        project_id=project_id,
+        batch_id=batch_id,
+        coordination_backlog_id=coordination_backlog_id,
+        merge_queue_id=merge_queue_id,
+        queue_rows=queue,
+    ):
+        return blocked("entered_batch_queue_binding_invalid")
+    planned = [row for row in queue if str(row.get("status") or "") == "planned"]
+    if not planned:
+        return blocked("entered_batch_has_no_planned_successor")
+    selected = planned[0]
+    fanout = payload.get("fanout_policy")
+    successors = (
+        fanout.get("per_row_successors")
+        if isinstance(fanout, Mapping)
+        and isinstance(fanout.get("per_row_successors"), list)
+        else []
+    )
+    matching_successors = []
+    for item in successors:
+        if not isinstance(item, Mapping):
+            continue
+        body = item.get("body") if isinstance(item.get("body"), Mapping) else {}
+        merge_item = (
+            body.get("merge_queue_item")
+            if isinstance(body.get("merge_queue_item"), Mapping)
+            else {}
+        )
+        if (
+            str(item.get("backlog_id") or "") == str(selected.get("backlog_id") or "")
+            and str(body.get("task_id") or "") == str(selected.get("task_id") or "")
+            and str(body.get("merge_queue_id") or "") == merge_queue_id
+            and str(merge_item.get("queue_item_id") or "")
+            == str(selected.get("queue_item_id") or "")
+        ):
+            matching_successors.append(dict(item))
+    if len(matching_successors) != 1:
+        return blocked("entered_batch_successor_identity_ambiguous")
+    successor = matching_successors[0]
+    successor_body = dict(successor.get("body") or {})
+    durable_successor_item = dict(
+        successor_body.get("merge_queue_item")
+        if isinstance(successor_body.get("merge_queue_item"), Mapping)
+        else {}
+    )
+    for field in (
+        "project_id",
+        "merge_queue_id",
+        "queue_item_id",
+        "backlog_id",
+        "task_id",
+        "queue_index",
+        "status",
+        "target_ref",
+        "base_commit",
+        "validated_target_head",
+        "current_target_head",
+        "snapshot_id",
+    ):
+        durable_successor_item[field] = selected.get(field)
+    successor_body["merge_queue_item"] = durable_successor_item
+
+    try:
+        project_root = project_service.resolve_project_root(
+            project_id,
+            None,
+            fallback_self=False,
+        )
+    except Exception:
+        project_root = None
+    if project_root is None:
+        return blocked("entered_batch_current_project_root_unavailable")
+    canonical_root = Path(project_root).resolve()
+    if not _git_clean_worktree_verified(canonical_root):
+        return blocked("entered_batch_current_worktree_not_clean")
+    current_head = str(_git_head_commit(canonical_root) or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", current_head):
+        return blocked("entered_batch_current_head_not_full")
+    try:
+        resolved_head = _parallel_branch_resolve_canonical_commit(
+            canonical_root,
+            current_head,
+            field="current_target_head",
+        )
+    except GovernanceError:
+        return blocked("entered_batch_current_head_not_canonical")
+    if resolved_head != current_head:
+        return blocked("entered_batch_current_head_not_canonical")
+    historical_base = str(selected.get("base_commit") or "").strip().lower()
+    if not (
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", historical_base)
+        and _git_commit_is_ancestor(canonical_root, historical_base, current_head)
+    ):
+        return blocked("entered_batch_historical_base_not_ancestor")
+    try:
+        active_row = conn.execute(
+            """
+            SELECT s.*
+              FROM graph_snapshot_refs AS r
+              JOIN graph_snapshots AS s
+                ON s.project_id = r.project_id
+               AND s.snapshot_id = r.snapshot_id
+             WHERE r.project_id = ? AND r.ref_name = 'active'
+               AND r.commit_sha = ? AND s.commit_sha = ?
+            """,
+            (project_id, current_head, current_head),
+        ).fetchone()
+    except sqlite3.Error:
+        active_row = None
+    active_snapshot = dict(active_row) if active_row is not None else {}
+    if not (
+        active_snapshot
+        and str(active_snapshot.get("snapshot_kind") or "") == "full"
+        and str(active_snapshot.get("status") or "") == "active"
+    ):
+        return blocked("entered_batch_current_graph_snapshot_unavailable")
+    integrity = graph_snapshot_store.validate_snapshot_companion_integrity(
+        active_snapshot
+    )
+    if integrity.get("valid") is not True:
+        return blocked("entered_batch_current_graph_snapshot_invalid")
+    current_snapshot_id = str(active_snapshot.get("snapshot_id") or "").strip()
+    if not re.fullmatch(
+        r"full-(?:[0-9a-f]{7}-[0-9a-f]{4}|[0-9a-f]{12}-[0-9a-f]{12})",
+        current_snapshot_id,
+    ):
+        return blocked("entered_batch_current_graph_snapshot_identity_invalid")
+    stale_queue_item_count = sum(
+        1
+        for row in queue
+        if str(row.get("current_target_head") or "").strip().lower()
+        != current_head
+    )
+
+    successor_body["target_head_commit"] = current_head
+    successor_body["graph_snapshot_id"] = current_snapshot_id
+    child_backlog_id = str(selected.get("backlog_id") or "").strip()
+    child_task_id = str(selected.get("task_id") or "").strip()
+    parent_execution_id = str(
+        payload.get("parent_contract_execution_id") or ""
+    ).strip()
+    successor_execution_id = _mf_parallel_execution_id(
+        project_id,
+        child_backlog_id,
+        parent_execution_id,
+        child_task_id,
+    )
+    target_files = _runtime_context_public_file_values(
+        successor.get("target_files") or successor.get("owned_files") or []
+    )
+    route_issue_body = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": child_backlog_id,
+        "task_id": successor_execution_id,
+        "target_files": target_files,
+        "allowed_actions": _observer_route_context_issue_allowed_actions(
+            ["mf_parallel_enter", "mf_parallel_revise"]
+        ),
+        "evidence_refs": [
+            f"timeline:{int(event['id'])}",
+            f"backlog:{child_backlog_id}",
+            f"merge_queue:{merge_queue_id}",
+        ],
+    }
+    successor_action_input = {
+        "schema_version": "mf_batch_parallel.entered_successor_action_input.v1",
+        "interface": "mf_parallel_enter",
+        "source": "durable_entered_batch",
+        "copy_safe": True,
+        "static_body": successor_body,
+        "dynamic_fields": {
+            "observer_session_id": {
+                "required": True,
+                "placeholder": "<active_observer_session_id>",
+                "source": "observer_session_register.session_id",
+            },
+            "observer_route_token_ref": {
+                "required": True,
+                "placeholder": "<route_token_ref>",
+                "source": "observer_route_context_issue.route_token_ref",
+            },
+        },
+        "contract_execution_id_required": False,
+        "raw_session_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    action = {
+        "schema_version": "onboard_route_guide.next_action.v1",
+        "id": "resume_entered_batch_successor",
+        "action": "mf_parallel_enter",
+        "interface": "mf_parallel_enter",
+        "path": "/api/projects/{project_id}/mf-parallel/enter",
+        "source": "durable_entered_batch",
+        "precedence": "entered_batch_before_fresh_batch",
+        "requires_role": "observer",
+        "requires_active_observer_session": True,
+        "requires_route_token_ref": True,
+        "action_input_interface": "observer_route_context_issue",
+        "action_input": route_issue_body,
+        "action_input_copy_safe": True,
+        "action_input_ready": True,
+        "successor_action_input_interface": "mf_parallel_enter",
+        "successor_action_input": successor_action_input,
+        "allowed_actions": list(route_issue_body["allowed_actions"]),
+        "batch_id": batch_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": str(selected.get("queue_item_id") or ""),
+        "backlog_id": child_backlog_id,
+        "task_id": child_task_id,
+        "historical_base_commit": historical_base,
+        "current_target_head": current_head,
+        "current_graph_snapshot_id": current_snapshot_id,
+        "stale_target_head": stale_queue_item_count > 0,
+        "stale_count": stale_queue_item_count,
+        "server_derived_authority": {
+            "event_ref": f"timeline:{int(event['id'])}",
+            "entered_batch_verified": True,
+            "durable_queue_verified": True,
+            "current_target_head_verified": True,
+            "current_graph_snapshot_verified": True,
+            "historical_lineage_preserved": True,
+        },
+        "raw_session_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    return {
+        **blocked_base,
+        "status": "entered_batch_successor_ready",
+        "blocked": False,
+        "scheduler_eligible": True,
+        "batch_id": batch_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": str(selected.get("queue_item_id") or ""),
+        "historical_base_commit": historical_base,
+        "current_target_head": current_head,
+        "current_graph_snapshot_id": current_snapshot_id,
+        "stale_target_head": stale_queue_item_count > 0,
+        "stale_count": stale_queue_item_count,
+        "next_legal_action": action,
+    }
+
+
 def _contract_runtime_shared_batch_child_lane_merge_authority(
     conn,
     *,
@@ -118713,7 +119051,29 @@ def _onboard_guide_capsule_current_projection(
 
     active_epoch = get_active_integration_epoch(conn, project_id)
     if active_epoch is None:
-        return current
+        entered_batch_resume = _entered_batch_successor_resume_projection(
+            conn,
+            project_id=project_id,
+            coordination_backlog_id=backlog_id,
+        )
+        if not entered_batch_resume:
+            return current
+        overlay = dict(current)
+        overlay.update(
+            {
+                "schema_version": str(
+                    current.get("schema_version")
+                    or "backlog_contract_chain_current.v1"
+                ),
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "entered_batch_successor_resume": dict(
+                    entered_batch_resume
+                ),
+            }
+        )
+        overlay["projection_hash"] = contract_chain_projection_hash(overlay)
+        return overlay
     resume = _server_integration_epoch_resume_payload(conn, active_epoch)
     canonical_backlog_id = str(
         resume.get("backlog_id")
@@ -120054,6 +120414,28 @@ def _onboard_route_guide_compact_service_response(
                 )
                 else {}
             ),
+            "batch_id": str(next_action.get("batch_id") or ""),
+            "merge_queue_id": str(next_action.get("merge_queue_id") or ""),
+            "queue_item_id": str(next_action.get("queue_item_id") or ""),
+            "historical_base_commit": str(
+                next_action.get("historical_base_commit") or ""
+            ),
+            "current_target_head": str(
+                next_action.get("current_target_head") or ""
+            ),
+            "current_graph_snapshot_id": str(
+                next_action.get("current_graph_snapshot_id") or ""
+            ),
+            "stale_target_head": (
+                bool(next_action.get("stale_target_head"))
+                if "stale_target_head" in next_action
+                else None
+            ),
+            "stale_count": (
+                int(next_action.get("stale_count") or 0)
+                if "stale_count" in next_action
+                else None
+            ),
             "omitted_server_authority_fields": list(
                 next_action.get("omitted_server_authority_fields") or []
             ),
@@ -120968,6 +121350,67 @@ def _onboard_route_guide_service_response(
             "integration_epoch": integration_epoch_to_dict(active_epoch),
             "next_legal_action": resume,
             "failure_domain_disposition": failure_domain_disposition,
+            "position_skippable": False,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+    entered_batch_resume = _entered_batch_successor_resume_projection(
+        conn,
+        project_id=project_id,
+        coordination_backlog_id=backlog_id,
+    )
+    if entered_batch_resume:
+        current_projection = _onboard_guide_capsule_current_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+        )
+        next_action = dict(
+            entered_batch_resume.get("next_legal_action") or {}
+        )
+        try:
+            record = _contract_runtime_store(conn).get(
+                _onboard_service_execution_id(project_id, backlog_id)
+            )
+        except ContractRuntimeError:
+            record = {}
+        target_files = _runtime_context_public_file_values(
+            (
+                next_action.get("action_input") or {}
+            ).get("target_files")
+            if isinstance(next_action.get("action_input"), Mapping)
+            else []
+        )
+        if response_view == "compact":
+            return _onboard_route_guide_compact_service_response(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                role=role,
+                work_type=work_type,
+                record=record,
+                next_action=next_action,
+                current_projection=current_projection,
+                runtime_resume=entered_batch_resume,
+                target_files=target_files,
+                projection_degraded=False,
+            )
+        return {
+            "schema_version": "onboard_route_guide.entered_batch_resume.v1",
+            "ok": True,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "selected_role": str(role or "").strip(),
+            "selected_work_type": str(work_type or "").strip(),
+            "selected_backlog_source": "durable_entered_batch",
+            "service": {
+                "id": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+                "kind": "guide_service",
+                "source": "durable_entered_batch",
+            },
+            "contract_chain_current": current_projection,
+            "runtime_resume": entered_batch_resume,
+            "next_legal_action": next_action,
             "position_skippable": False,
             "raw_route_token_required": False,
             "raw_route_token_exposed": False,
