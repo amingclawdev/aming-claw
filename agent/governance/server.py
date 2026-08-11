@@ -153549,17 +153549,19 @@ def _timeline_gate_public_materialized_qa_sanitized(
     }
     if not materialized_ids and not materialized_refs:
         return dict(response)
-    sanitized = deepcopy(dict(response))
+    sanitized = dict(response)
 
     public_events = sanitized.get("events")
     if isinstance(public_events, list):
+        public_events = list(public_events)
+        sanitized["events"] = public_events
         for index, event in enumerate(public_events):
             if not isinstance(event, Mapping) or (
                 int(event.get("id") or 0) not in materialized_ids
                 and _event_route_token_ref(event) not in materialized_refs
             ):
                 continue
-            public_event = deepcopy(dict(event))
+            public_event = dict(event)
             for key in _TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS:
                 public_event.pop(key, None)
             for container_key in ("payload", "verification", "artifact_refs"):

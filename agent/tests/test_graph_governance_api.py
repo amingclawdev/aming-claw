@@ -52859,6 +52859,54 @@ def test_timeline_gate_public_sanitizer_bounds_cycles_and_deep_json():
     assert private_ref not in json.dumps(sanitized, sort_keys=True)
 
 
+def test_timeline_gate_public_sanitizer_bounds_parsed_depth_without_mutation():
+    private_ref = "rtok-materialized-private-parsed-depth"
+    ordinary_root_ref = "rtok-ordinary-root-parsed-depth"
+
+    def alternating_depth(leaf, depth):
+        value = leaf
+        for _ in range(depth):
+            value = {"nested": [value]}
+        return value
+
+    def alternating_leaf(value, depth):
+        for _ in range(depth):
+            value = value["nested"][0]
+        return value
+
+    parsed_depths = {
+        depth: alternating_depth(private_ref, depth)
+        for depth in (128, 192, 256)
+    }
+    self_cycle = {}
+    self_cycle["self"] = self_cycle
+    shared = {"root_ref": ordinary_root_ref}
+    response = {
+        **{f"parsed_{depth}": value for depth, value in parsed_depths.items()},
+        "self_cycle": self_cycle,
+        "shared_left": shared,
+        "shared_right": shared,
+        "tuple_alias": (private_ref, ordinary_root_ref),
+    }
+    sanitized = server._timeline_gate_public_materialized_qa_sanitized(
+        response,
+        materialized_event_ids=[],
+        materialized_route_token_refs=[private_ref],
+        materialized_private_values=frozenset({private_ref}),
+    )
+    assert isinstance(sanitized, dict)
+    assert private_ref not in json.dumps(sanitized, sort_keys=True)
+    assert sanitized["self_cycle"] == {}
+    assert sanitized["shared_left"] == {"root_ref": ordinary_root_ref}
+    assert sanitized["shared_right"] == {"root_ref": ordinary_root_ref}
+    assert sanitized["tuple_alias"] == (ordinary_root_ref,)
+    assert response["self_cycle"]["self"] is self_cycle
+    assert response["shared_left"] is response["shared_right"] is shared
+    assert response["tuple_alias"] == (private_ref, ordinary_root_ref)
+    for depth, value in parsed_depths.items():
+        assert alternating_leaf(value, depth) == private_ref
+
+
 @pytest.mark.parametrize(
     ("base_source", "candidate_source", "expected_reason"),
     [
@@ -88466,6 +88514,25 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                         value = {"nested": value}
                     return json.dumps(value, separators=(",", ":"))
 
+                def adversarial_alternating_container(leaf, depth):
+                    value = leaf
+                    for _ in range(depth):
+                        value = {"nested": [value]}
+                    return value
+
+                def adversarial_alternating_leaf(value, depth):
+                    for _ in range(depth):
+                        value = value["nested"][0]
+                    return value
+
+                adversarial_parsed_depths = {
+                    depth: adversarial_alternating_container(
+                        later_qa_event["payload"]["route_token_ref"],
+                        depth,
+                    )
+                    for depth in (128, 192, 256)
+                }
+
                 adversarial_below_cap_json = adversarial_nested_json(
                     close_route_token_ref,
                     16,
@@ -88527,6 +88594,10 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                             504,
                         ),
                         "below_cap_json_alias": adversarial_below_cap_json,
+                        **{
+                            f"parsed_{depth}_alias": value
+                            for depth, value in adversarial_parsed_depths.items()
+                        },
                         "shared_left_alias": adversarial_shared,
                         "shared_right_alias": adversarial_shared,
                     }
@@ -89287,6 +89358,17 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                             assert aliases["below_cap_json_alias"] == (
                                 adversarial_below_cap_json
                             )
+                            for depth in adversarial_parsed_depths:
+                                public_value = aliases[f"parsed_{depth}_alias"]
+                                public_depth = 0
+                                while (
+                                    isinstance(public_value, Mapping)
+                                    and "nested" in public_value
+                                ):
+                                    assert len(public_value["nested"]) == 1
+                                    public_value = public_value["nested"][0]
+                                    public_depth += 1
+                                assert public_depth < depth
                             assert aliases["shared_left_alias"] == {
                                 "root_alias": close_route_token_ref
                             }
@@ -89358,6 +89440,11 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 route_token_ref=later_qa_event["payload"]["route_token_ref"],
             )
             assert "task_timeline_append" in resolved_later_route["allowed_actions"]
+            if tamper == "cross_session_enriched_later_failed":
+                for depth, value in adversarial_parsed_depths.items():
+                    assert adversarial_alternating_leaf(value, depth) == (
+                        later_qa_event["payload"]["route_token_ref"]
+                    )
     actual_zero_write_tampers = {
         "close_ready_authority_drift",
         "cross_session_later_failed",
