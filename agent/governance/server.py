@@ -153470,6 +153470,8 @@ def _timeline_gate_exact_private_values_sanitized(value: Any, private_values: fr
         if isinstance(child, Mapping):
             cleaned = {}
             for key, nested in child.items():
+                if isinstance(key, str) and key in private_values:
+                    continue
                 sanitized = sanitize(nested)
                 if sanitized is not dropped:
                     cleaned[key] = sanitized

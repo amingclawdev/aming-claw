@@ -52784,6 +52784,44 @@ def test_qa_overlay_hint_projection_allows_unrelated_source_changes(
     )
 
 
+def test_timeline_gate_public_sanitizer_removes_exact_private_mapping_keys():
+    private_ref = "rtok-materialized-private-key"
+    ordinary_root_ref = "rtok-ordinary-root-key"
+    substring_key = f"prefix-{private_ref}-suffix"
+    malformed_json = '{"opaque":'
+    ordinary_json = '{ "root" : "rtok-ordinary-root-key" }'
+    sanitized = server._timeline_gate_public_materialized_qa_sanitized(
+        {
+            private_ref: "remove-private-key",
+            substring_key: "preserve-substring-key",
+            ordinary_root_ref: "preserve-root-key",
+            7: "preserve-non-string-key",
+            "tuple_alias": (private_ref, ordinary_root_ref),
+            "json_key_alias": json.dumps(
+                {
+                    private_ref: "remove-private-json-key",
+                    ordinary_root_ref: "preserve-root-json-key",
+                }
+            ),
+            "malformed_json": malformed_json,
+            "ordinary_json": ordinary_json,
+        },
+        materialized_event_ids=[],
+        materialized_route_token_refs=[private_ref],
+        materialized_private_values=frozenset({private_ref}),
+    )
+    assert private_ref not in sanitized
+    assert sanitized[substring_key] == "preserve-substring-key"
+    assert sanitized[ordinary_root_ref] == "preserve-root-key"
+    assert sanitized[7] == "preserve-non-string-key"
+    assert sanitized["tuple_alias"] == (ordinary_root_ref,)
+    assert json.loads(sanitized["json_key_alias"]) == {
+        ordinary_root_ref: "preserve-root-json-key"
+    }
+    assert sanitized["malformed_json"] == malformed_json
+    assert sanitized["ordinary_json"] == ordinary_json
+
+
 @pytest.mark.parametrize(
     ("base_source", "candidate_source", "expected_reason"),
     [
@@ -88414,6 +88452,20 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                         ),
                         "malformed_json_alias": adversarial_malformed_json,
                         "ordinary_json_alias": adversarial_ordinary_json,
+                        "mapping_key_alias": {
+                            later_qa_event["payload"]["route_token_ref"]: (
+                                "remove-private-key"
+                            ),
+                            close_route_token_ref: "preserve-root-key",
+                        },
+                        "json_key_alias": json.dumps(
+                            {
+                                later_provenance["materialized_from_report"]: (
+                                    "remove-private-json-key"
+                                ),
+                                close_route_token_ref: "preserve-root-json-key",
+                            }
+                        ),
                     }
                     return original_public_sanitizer(augmented, **kwargs)
 
@@ -89160,6 +89212,12 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                             assert aliases["ordinary_json_alias"] == (
                                 adversarial_ordinary_json
                             )
+                            assert aliases["mapping_key_alias"] == {
+                                close_route_token_ref: "preserve-root-key"
+                            }
+                            assert json.loads(aliases["json_key_alias"]) == {
+                                close_route_token_ref: "preserve-root-json-key"
+                            }
                         if matrix_include_events:
                             public_events = {
                                 int(event["id"]): event
