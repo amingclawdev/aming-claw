@@ -52822,6 +52822,43 @@ def test_timeline_gate_public_sanitizer_removes_exact_private_mapping_keys():
     assert sanitized["ordinary_json"] == ordinary_json
 
 
+def test_timeline_gate_public_sanitizer_bounds_cycles_and_deep_json():
+    private_ref = "rtok-materialized-private-cycle"
+    ordinary_root_ref = "rtok-ordinary-root-cycle"
+
+    def nested_json(leaf, depth):
+        value = leaf
+        for _ in range(depth):
+            value = {"nested": value}
+        return json.dumps(value, separators=(",", ":"))
+
+    self_cycle = {}
+    self_cycle["self"] = self_cycle
+    shared = {"root_ref": ordinary_root_ref}
+    below_cap_json = nested_json(ordinary_root_ref, 16)
+    sanitized = server._timeline_gate_public_materialized_qa_sanitized(
+        {
+            "self_cycle": self_cycle,
+            "deep_private_json": nested_json(private_ref, 504),
+            "deep_nonprivate_json": nested_json(ordinary_root_ref, 504),
+            "below_cap_json": below_cap_json,
+            "shared_left": shared,
+            "shared_right": shared,
+        },
+        materialized_event_ids=[],
+        materialized_route_token_refs=[private_ref],
+        materialized_private_values=frozenset({private_ref}),
+    )
+    assert isinstance(sanitized, dict)
+    assert sanitized["self_cycle"] == {}
+    assert "deep_private_json" not in sanitized
+    assert "deep_nonprivate_json" not in sanitized
+    assert sanitized["below_cap_json"] == below_cap_json
+    assert sanitized["shared_left"] == {"root_ref": ordinary_root_ref}
+    assert sanitized["shared_right"] == {"root_ref": ordinary_root_ref}
+    assert private_ref not in json.dumps(sanitized, sort_keys=True)
+
+
 @pytest.mark.parametrize(
     ("base_source", "candidate_source", "expected_reason"),
     [
@@ -88419,6 +88456,20 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 adversarial_ordinary_json = (
                     '{ "root_alias" : "' + close_route_token_ref + '" }'
                 )
+                adversarial_cycle = {}
+                adversarial_cycle["self"] = adversarial_cycle
+                adversarial_shared = {"root_alias": close_route_token_ref}
+
+                def adversarial_nested_json(leaf, depth):
+                    value = leaf
+                    for _ in range(depth):
+                        value = {"nested": value}
+                    return json.dumps(value, separators=(",", ":"))
+
+                adversarial_below_cap_json = adversarial_nested_json(
+                    close_route_token_ref,
+                    16,
+                )
 
                 def inject_adversarial_public_aliases(response, **kwargs):
                     augmented = dict(response)
@@ -88466,6 +88517,18 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                                 close_route_token_ref: "preserve-root-json-key",
                             }
                         ),
+                        "cycle_alias": adversarial_cycle,
+                        "deep_private_json_alias": adversarial_nested_json(
+                            later_qa_event["payload"]["route_token_ref"],
+                            504,
+                        ),
+                        "deep_nonprivate_json_alias": adversarial_nested_json(
+                            close_route_token_ref,
+                            504,
+                        ),
+                        "below_cap_json_alias": adversarial_below_cap_json,
+                        "shared_left_alias": adversarial_shared,
+                        "shared_right_alias": adversarial_shared,
                     }
                     return original_public_sanitizer(augmented, **kwargs)
 
@@ -89217,6 +89280,18 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                             }
                             assert json.loads(aliases["json_key_alias"]) == {
                                 close_route_token_ref: "preserve-root-json-key"
+                            }
+                            assert aliases["cycle_alias"] == {}
+                            assert "deep_private_json_alias" not in aliases
+                            assert "deep_nonprivate_json_alias" not in aliases
+                            assert aliases["below_cap_json_alias"] == (
+                                adversarial_below_cap_json
+                            )
+                            assert aliases["shared_left_alias"] == {
+                                "root_alias": close_route_token_ref
+                            }
+                            assert aliases["shared_right_alias"] == {
+                                "root_alias": close_route_token_ref
                             }
                         if matrix_include_events:
                             public_events = {

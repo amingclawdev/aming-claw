@@ -153463,26 +153463,48 @@ def _timeline_gate_materialized_qa_private_values(
     return frozenset(values)
 
 
+_TIMELINE_GATE_PUBLIC_SANITIZER_MAX_DEPTH = 128
+
+
 def _timeline_gate_exact_private_values_sanitized(value: Any, private_values: frozenset[str]) -> Any:
     dropped = object()
+    unsafe = object()
+    active_container_ids: set[int] = set()
 
-    def sanitize(child: Any) -> Any:
-        if isinstance(child, Mapping):
-            cleaned = {}
-            for key, nested in child.items():
-                if isinstance(key, str) and key in private_values:
-                    continue
-                sanitized = sanitize(nested)
-                if sanitized is not dropped:
-                    cleaned[key] = sanitized
-            return cleaned
-        if isinstance(child, (list, tuple)):
-            cleaned_items = [
-                sanitized
-                for item in child
-                if (sanitized := sanitize(item)) is not dropped
-            ]
-            return tuple(cleaned_items) if isinstance(child, tuple) else cleaned_items
+    def sanitize(child: Any, depth: int = 0, *, fail_on_unsafe: bool = False) -> Any:
+        if depth > _TIMELINE_GATE_PUBLIC_SANITIZER_MAX_DEPTH:
+            return unsafe
+        if isinstance(child, (Mapping, list, tuple)):
+            container_id = id(child)
+            if container_id in active_container_ids:
+                return unsafe
+            active_container_ids.add(container_id)
+            try:
+                if isinstance(child, Mapping):
+                    cleaned = {}
+                    for key, nested in child.items():
+                        if isinstance(key, str) and key in private_values:
+                            continue
+                        item = sanitize(nested, depth + 1, fail_on_unsafe=fail_on_unsafe)
+                        if item is unsafe:
+                            if fail_on_unsafe:
+                                return unsafe
+                            continue
+                        if item is not dropped:
+                            cleaned[key] = item
+                    return cleaned
+                cleaned_items = []
+                for nested in child:
+                    item = sanitize(nested, depth + 1, fail_on_unsafe=fail_on_unsafe)
+                    if item is unsafe:
+                        if fail_on_unsafe:
+                            return unsafe
+                        continue
+                    if item is not dropped:
+                        cleaned_items.append(item)
+                return tuple(cleaned_items) if isinstance(child, tuple) else cleaned_items
+            finally:
+                active_container_ids.remove(container_id)
         if not isinstance(child, str):
             return child
         if child in private_values:
@@ -153491,9 +153513,14 @@ def _timeline_gate_exact_private_values_sanitized(value: Any, private_values: fr
             parsed = json.loads(child)
         except (json.JSONDecodeError, TypeError):
             return child
+        except RecursionError:
+            return unsafe
         if not isinstance(parsed, (dict, list)):
             return child
-        if (sanitized := sanitize(parsed)) == parsed:
+        sanitized = sanitize(parsed, depth + 1, fail_on_unsafe=True)
+        if sanitized is dropped or sanitized is unsafe:
+            return dropped
+        if sanitized == parsed:
             return child
         return json.dumps(
             sanitized,
@@ -153501,7 +153528,8 @@ def _timeline_gate_exact_private_values_sanitized(value: Any, private_values: fr
             separators=(",", ":"),
         )
 
-    return sanitize(value)
+    sanitized = sanitize(value)
+    return sanitized if isinstance(sanitized, Mapping) else {}
 
 
 def _timeline_gate_public_materialized_qa_sanitized(
@@ -153523,32 +153551,6 @@ def _timeline_gate_public_materialized_qa_sanitized(
         return dict(response)
     sanitized = deepcopy(dict(response))
 
-    def sanitize_enrichment(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, child in list(value.items()):
-                if (
-                    key == "server_route_lineage_enrichment"
-                    and isinstance(child, dict)
-                    and child.get("schema_version")
-                    == "server_route_lineage_enrichment.v1"
-                ):
-                    for summary_key in ("enriched_events", "failed_events"):
-                        summaries = child.get(summary_key)
-                        if not isinstance(summaries, list):
-                            continue
-                        for summary in summaries:
-                            if (
-                                isinstance(summary, dict)
-                                and int(summary.get("id") or 0) in materialized_ids
-                            ):
-                                summary.pop("route_token_ref", None)
-                else:
-                    sanitize_enrichment(child)
-        elif isinstance(value, list):
-            for item in value:
-                sanitize_enrichment(item)
-
-    sanitize_enrichment(sanitized)
     public_events = sanitized.get("events")
     if isinstance(public_events, list):
         for index, event in enumerate(public_events):
