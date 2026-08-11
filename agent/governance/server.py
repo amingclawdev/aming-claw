@@ -20963,7 +20963,11 @@ def _runtime_context_revision_payload(
     latest_revision_payload: Mapping[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     revision = latest_revision_payload if isinstance(latest_revision_payload, Mapping) else {}
-    payload = revision.get("payload") if isinstance(revision.get("payload"), Mapping) else {}
+    payload = (
+        revision.get("payload")
+        if isinstance(revision.get("payload"), Mapping)
+        else {}
+    )
     contract = payload.get("contract") if isinstance(payload.get("contract"), Mapping) else {}
     receipt = (
         payload.get("revision_receipt")
@@ -32107,6 +32111,262 @@ def _runtime_context_latest_route_identity(conn, context) -> dict[str, Any]:
     return dict(route_identity)
 
 
+def _runtime_context_verified_allocation_route_successor(
+    conn,
+    context,
+    *,
+    revision: Mapping[str, Any],
+    dispatch_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return one exact server-authored allocation cutover, or fail closed."""
+
+    payload = revision.get("payload") if isinstance(revision.get("payload"), Mapping) else {}
+    route_gate = (
+        revision.get("route_gate")
+        if isinstance(revision.get("route_gate"), Mapping)
+        else {}
+    )
+    token_gate = (
+        route_gate.get("route_token_gate")
+        if isinstance(route_gate.get("route_token_gate"), Mapping)
+        else {}
+    )
+    scope = (
+        token_gate.get("scope")
+        if isinstance(token_gate.get("scope"), Mapping)
+        else {}
+    )
+    receipt = (
+        payload.get("revision_receipt")
+        if isinstance(payload.get("revision_receipt"), Mapping)
+        else {}
+    )
+    route_identity = _parallel_branch_runtime_contract_route_identity(revision)
+    payload_identity = (
+        payload.get("route_identity")
+        if isinstance(payload.get("route_identity"), Mapping)
+        else {}
+    )
+    runtime_context_id = str(getattr(context, "runtime_context_id", "") or "")
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    expected_scope = {
+        "project_id": str(getattr(context, "project_id", "") or ""),
+        "backlog_id": str(getattr(context, "backlog_id", "") or ""),
+        "task_id": parent_task_id,
+    }
+    previous_revision_hash = str(
+        receipt.get("previous_revision_hash") or ""
+    ).strip()
+    allowed_actions = token_gate.get("allowed_actions")
+    exact_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not all(exact_identity.values()) or not all(
+        str(container.get(field) or "").strip() == exact_identity[field]
+        for container in (payload_identity, route_gate)
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ):
+        return {}
+    if not (
+        str(revision.get("project_id") or "") == expected_scope["project_id"]
+        and str(revision.get("runtime_context_id") or "") == runtime_context_id
+        and str(revision.get("task_id") or "")
+        == str(getattr(context, "task_id", "") or "")
+        and str(revision.get("parent_task_id") or "") == parent_task_id
+        and str(revision.get("backlog_id") or "") == expected_scope["backlog_id"]
+        and str(revision.get("contract_version") or "") == "mf_parallel.v2"
+        and str(revision.get("route_evidence_type") or "")
+        == "parallel_branch_allocate"
+        and str(revision.get("actor") or "") == "parallel_branch_allocate"
+        and str(payload.get("schema_version") or "")
+        == "parallel_branch_allocate_contract_revision.v1"
+        and str(payload.get("source") or "") == "parallel_branch_allocate"
+        and str(payload.get("source_of_truth") or "")
+        == "Contract/Revision/Event"
+        and str(payload.get("contract_execution_id") or "") == parent_task_id
+        and str(payload.get("successor_contract_execution_id") or "")
+        == parent_task_id
+        and str(payload.get("runtime_context_id") or "") == runtime_context_id
+        and str(route_gate.get("schema_version") or "")
+        == "parallel_branch_allocate_route_gate.v1"
+        and str(route_gate.get("allowed_action") or "")
+        == "parallel_branch_allocate"
+        and str(route_gate.get("caller_role") or "") == "observer"
+        and str(route_gate.get("decision") or "") == "allocated"
+        and str(route_gate.get("source") or "") == "parallel_branch_allocate"
+        and str(token_gate.get("schema_version") or "")
+        == "parallel_branch_allocate.route_token_ref_gate.v1"
+        and str(token_gate.get("allowed_action") or "")
+        == "parallel_branch_allocate"
+        and isinstance(allowed_actions, list)
+        and {"parallel_branch_allocate", "runtime_context_read_receipt"}.issubset(
+            {str(item or "") for item in allowed_actions}
+        )
+        and str(token_gate.get("caller_role") or "") == "observer"
+        and str(token_gate.get("decision") or "")
+        == "route_token_ref_resolved"
+        and token_gate.get("registry_verified") is True
+        and token_gate.get("resolved_from_ref") is True
+        and str(token_gate.get("route_token_ref") or "")
+        == exact_identity["route_token_ref"]
+        and {key: str(scope.get(key) or "") for key in expected_scope}
+        == expected_scope
+        and str(receipt.get("schema_version") or "")
+        == "agent_task_contract_revision_receipt.v1"
+        and str(receipt.get("source_of_truth") or "")
+        == "Contract/Revision/Event"
+        and str(receipt.get("canonical_visible_contract_text_hash") or "")
+        == str(revision.get("revision_id") or "")
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", previous_revision_hash)
+    ):
+        return {}
+    previous = conn.execute(
+        """
+        SELECT task_id, parent_task_id, backlog_id, route_identity_json
+        FROM parallel_branch_runtime_contract_revisions
+        WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+        """,
+        (expected_scope["project_id"], runtime_context_id, previous_revision_hash),
+    ).fetchone()
+    if previous is None:
+        return {}
+    try:
+        previous_identity = json.loads(str(previous["route_identity_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    expected_previous_identity = {
+        field: str(dispatch_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not (
+        str(previous["task_id"] or "")
+        == str(getattr(context, "task_id", "") or "")
+        and str(previous["parent_task_id"] or "") == parent_task_id
+        and str(previous["backlog_id"] or "") == expected_scope["backlog_id"]
+        and isinstance(previous_identity, Mapping)
+        and {
+            field: str(previous_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+        == expected_previous_identity
+    ):
+        return {}
+    return exact_identity
+
+
+def _runtime_context_current_route_authority(
+    conn,
+    context,
+    dispatch_identity: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    revision = _runtime_context_latest_contract_revision_payload(conn, context)
+    revision_identity = _parallel_branch_runtime_contract_route_identity(revision)
+    if revision_identity and dispatch_identity:
+        mismatches = _runtime_context_route_identity_mismatch_fields(
+            dispatch_identity,
+            revision_identity,
+        )
+        if mismatches:
+            successor = _runtime_context_verified_allocation_route_successor(
+                conn,
+                context,
+                revision=revision,
+                dispatch_identity=dispatch_identity,
+            )
+            if successor:
+                return successor, "branch_contract_revision_successor"
+            raise GovernanceError(
+                "runtime_context_initial_join_route_authority_conflict",
+                "runtime-context route contract revision conflicts with the accepted ContractRuntime dispatch",
+                409,
+                {
+                    "runtime_context_id": str(
+                        getattr(context, "runtime_context_id", "") or ""
+                    ),
+                    "task_id": str(getattr(context, "task_id", "") or ""),
+                    "route_identity_mismatch_fields": mismatches,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                },
+            )
+        payload = (
+            revision.get("payload")
+            if isinstance(revision.get("payload"), Mapping)
+            else {}
+        )
+        receipt = (
+            payload.get("revision_receipt")
+            if isinstance(payload.get("revision_receipt"), Mapping)
+            else {}
+        )
+        previous_revision_hash = str(
+            receipt.get("previous_revision_hash") or ""
+        ).strip()
+        if (
+            str(revision.get("route_evidence_type") or "")
+            == "parallel_branch_allocate"
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", previous_revision_hash)
+        ):
+            previous = conn.execute(
+                """
+                SELECT route_identity_json
+                FROM parallel_branch_runtime_contract_revisions
+                WHERE project_id = ? AND runtime_context_id = ?
+                  AND revision_id = ?
+                """,
+                (
+                    str(getattr(context, "project_id", "") or ""),
+                    str(getattr(context, "runtime_context_id", "") or ""),
+                    previous_revision_hash,
+                ),
+            ).fetchone()
+            try:
+                previous_identity = (
+                    json.loads(str(previous["route_identity_json"] or "{}"))
+                    if previous is not None
+                    else {}
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                previous_identity = {}
+            predecessor_mismatches = (
+                _runtime_context_route_identity_mismatch_fields(
+                    previous_identity,
+                    revision_identity,
+                )
+                if isinstance(previous_identity, Mapping)
+                else []
+            )
+            if predecessor_mismatches:
+                successor = _runtime_context_verified_allocation_route_successor(
+                    conn,
+                    context,
+                    revision=revision,
+                    dispatch_identity=previous_identity,
+                )
+                if successor:
+                    return successor, "branch_contract_revision_successor"
+                raise GovernanceError(
+                    "runtime_context_initial_join_route_authority_conflict",
+                    "runtime-context route contract revision lacks a valid server-authored successor proof",
+                    409,
+                    {
+                        "runtime_context_id": str(
+                            getattr(context, "runtime_context_id", "") or ""
+                        ),
+                        "task_id": str(getattr(context, "task_id", "") or ""),
+                        "route_identity_mismatch_fields": predecessor_mismatches,
+                        "mutation_performed": False,
+                        "fail_closed": True,
+                    },
+                )
+    if revision_identity:
+        return dict(revision_identity), "branch_contract_revision"
+    if dispatch_identity:
+        return dict(dispatch_identity), "contract_runtime_dispatch"
+    return {}, ""
+
+
 def _runtime_context_latest_parent_route_identity(
     revision_payload: Mapping[str, Any],
     fallback_route_identity: Mapping[str, Any],
@@ -33403,37 +33663,16 @@ def _runtime_context_initial_join_expected_route_identity(
     context,
     dispatch_identity_anchor: Mapping[str, Any],
 ) -> tuple[dict[str, Any], str]:
-    revision_identity = _runtime_context_latest_route_identity(conn, context)
     dispatch_identity = (
         dispatch_identity_anchor.get("route_identity")
         if isinstance(dispatch_identity_anchor.get("route_identity"), Mapping)
         else {}
     )
-    if revision_identity and dispatch_identity:
-        mismatches = _runtime_context_route_identity_mismatch_fields(
-            dispatch_identity,
-            revision_identity,
-        )
-        if mismatches:
-            raise GovernanceError(
-                "runtime_context_initial_join_route_authority_conflict",
-                "runtime-context route contract revision conflicts with the accepted ContractRuntime dispatch",
-                409,
-                {
-                    "runtime_context_id": str(
-                        getattr(context, "runtime_context_id", "") or ""
-                    ),
-                    "task_id": str(getattr(context, "task_id", "") or ""),
-                    "route_identity_mismatch_fields": mismatches,
-                    "mutation_performed": False,
-                    "fail_closed": True,
-                },
-            )
-    if revision_identity:
-        return dict(revision_identity), "branch_contract_revision"
-    if dispatch_identity:
-        return dict(dispatch_identity), "contract_runtime_dispatch"
-    return {}, ""
+    return _runtime_context_current_route_authority(
+        conn,
+        context,
+        dispatch_identity,
+    )
 
 
 def _runtime_context_initial_join_resolved_ref_route_identity(
@@ -118457,10 +118696,39 @@ def _onboard_worker_read_runtime_facade_projection(
     ).strip()
     target_project_root = _runtime_context_effective_target_project_root(context)
     session_token_ref = runtime_context_session_token_ref(context)
-    route_identity = {
+    dispatch_route_identity = {
         field: str(dispatch_action.get(field) or "").strip()
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     }
+    accepted_dispatch_anchor = (
+        _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            contract_execution_id=execution_id,
+        )
+    )
+    accepted_dispatch_route_identity = (
+        accepted_dispatch_anchor.get("route_identity")
+        if isinstance(accepted_dispatch_anchor.get("route_identity"), Mapping)
+        else {}
+    )
+    if accepted_dispatch_route_identity:
+        dispatch_route_identity = {
+            field: str(accepted_dispatch_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+    try:
+        route_identity, route_authority_source = (
+            _runtime_context_current_route_authority(
+                conn,
+                context,
+                dispatch_route_identity,
+            )
+        )
+    except GovernanceError as exc:
+        return blocked(exc.code, ["route_identity"])
     identity_mismatches = [
         field
         for field, expected, actual in (
@@ -118655,6 +118923,7 @@ def _onboard_worker_read_runtime_facade_projection(
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "session_token_ref": session_token_ref,
+        "route_authority_source": route_authority_source,
         "fresh_worker_identity_complete": True,
         "zero_write_projection": True,
         "raw_session_token_exposed": False,

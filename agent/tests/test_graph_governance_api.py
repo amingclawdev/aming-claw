@@ -107633,6 +107633,406 @@ def _compact_worker_read_guide(
     )
 
 
+def _append_worker_route_cutover_revision(
+    conn,
+    *,
+    successor: dict[str, Any],
+    runtime_context: BranchTaskRuntimeContext,
+    backlog_id: str,
+    suffix: str,
+    registry_verified: bool = True,
+) -> dict[str, str]:
+    contract_execution_id = successor["contract_execution_id"]
+    dispatch_identity = _worker_dispatch_route_identity(
+        conn,
+        contract_execution_id=contract_execution_id,
+    )
+    if not server._runtime_context_latest_contract_revision_payload(
+        conn,
+        runtime_context,
+    ):
+        append_branch_contract_revision(
+            conn,
+            runtime_context,
+            contract_version="mf_parallel.v2",
+            payload={
+                "schema_version": "parallel_branch_allocate_contract_revision.v1",
+                "source": "parallel_branch_allocate",
+                "contract_execution_id": contract_execution_id,
+                "successor_contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "route_identity": dispatch_identity,
+            },
+            route_gate={
+                "schema_version": "parallel_branch_allocate_route_gate.v1",
+                "allowed_action": "parallel_branch_allocate",
+                "caller_role": "observer",
+                "decision": "allocated",
+                "source": "parallel_branch_allocate",
+                **dispatch_identity,
+            },
+            route_identity=dispatch_identity,
+            route_evidence_type="parallel_branch_allocate",
+            actor="parallel_branch_allocate",
+            now_iso="2099-08-10T10:00:00Z",
+        )
+    route_identity = {
+        "route_id": f"route-cutover-{suffix}",
+        "route_context_hash": _fake_sha(f"route-cutover:{suffix}"),
+        "prompt_contract_id": f"rprompt-cutover-{suffix}",
+        "prompt_contract_hash": _fake_sha(f"prompt-cutover:{suffix}"),
+        "route_token_ref": f"rtok-cutover-{suffix}",
+        "visible_injection_manifest_hash": _fake_sha(
+            f"visible-cutover:{suffix}"
+        ),
+    }
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "runtime_context_read_receipt",
+            "task_timeline_append",
+        ],
+        **route_identity,
+    )
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        contract_version="mf_parallel.v2",
+        payload={
+            "schema_version": "parallel_branch_allocate_contract_revision.v1",
+            "source": "parallel_branch_allocate",
+            "contract_execution_id": contract_execution_id,
+            "successor_contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "route_identity": route_identity,
+        },
+        route_gate={
+            "schema_version": "parallel_branch_allocate_route_gate.v1",
+            "allowed_action": "parallel_branch_allocate",
+            "caller_role": "observer",
+            "decision": "allocated",
+            "source": "parallel_branch_allocate",
+            **route_identity,
+            "route_token_gate": {
+                "schema_version": "parallel_branch_allocate.route_token_ref_gate.v1",
+                "allowed_action": "parallel_branch_allocate",
+                "allowed_actions": [
+                    "parallel_branch_allocate",
+                    "runtime_context_read_receipt",
+                    "task_timeline_append",
+                ],
+                "caller_role": "observer",
+                "decision": "route_token_ref_resolved",
+                "registry_verified": registry_verified,
+                "resolved_from_ref": True,
+                "route_token_ref": route_identity["route_token_ref"],
+                "scope": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": contract_execution_id,
+                },
+            },
+        },
+        route_identity=route_identity,
+        route_evidence_type="parallel_branch_allocate",
+        actor="parallel_branch_allocate",
+        now_iso="2099-08-10T10:01:00Z",
+    )
+    return route_identity
+
+
+def _worker_dispatch_route_identity(
+    conn,
+    *,
+    contract_execution_id: str,
+) -> dict[str, str]:
+    record = server._contract_runtime_store(conn).get(contract_execution_id)
+    dispatch = server._contract_runtime_dispatch_ticket_authority(
+        record,
+        server._runtime_current_state_from_record(record),
+    )
+    action = dispatch["next_legal_action"]
+    return {
+        field: str(action.get(field) or "")
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+
+
+def test_initial_join_route_authority_accepts_registry_verified_allocation_cutover(
+    conn,
+):
+    backlog_id = "AC-INITIAL-JOIN-ROUTE-CUTOVER"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="initial-join-route-cutover-parent",
+        worker_task_id="initial-join-route-cutover-worker",
+        fence_token="fence-initial-join-route-cutover",
+        token="session-initial-join-route-cutover",
+        pinned_revision="",
+        parent_task_is_contract_execution=True,
+        required_worker_count=1,
+    )
+    cutover = _append_worker_route_cutover_revision(
+        conn,
+        successor=successor,
+        runtime_context=runtime_context,
+        backlog_id=backlog_id,
+        suffix="initial-join",
+    )
+    dispatch_identity = _worker_dispatch_route_identity(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+    )
+
+    expected, source = server._runtime_context_initial_join_expected_route_identity(
+        conn,
+        runtime_context,
+        {"route_identity": dispatch_identity},
+    )
+
+    assert expected == cutover
+    assert source == "branch_contract_revision_successor"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "registry_unverified",
+        "wrong_scope",
+        "wrong_actor",
+        "missing_read_action",
+        "unknown_predecessor",
+    ],
+)
+def test_initial_join_route_authority_rejects_unverified_revision_cutover(
+    conn,
+    tamper,
+):
+    backlog_id = "AC-INITIAL-JOIN-ROUTE-CUTOVER-UNVERIFIED"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="initial-join-route-cutover-unverified-parent",
+        worker_task_id="initial-join-route-cutover-unverified-worker",
+        fence_token="fence-initial-join-route-cutover-unverified",
+        token="session-initial-join-route-cutover-unverified",
+        pinned_revision="",
+        parent_task_is_contract_execution=True,
+        required_worker_count=1,
+    )
+    _append_worker_route_cutover_revision(
+        conn,
+        successor=successor,
+        runtime_context=runtime_context,
+        backlog_id=backlog_id,
+        suffix="initial-join-unverified",
+        registry_verified=tamper != "registry_unverified",
+    )
+    latest = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        runtime_context.runtime_context_id,
+    )
+    assert latest is not None
+    payload = copy.deepcopy(latest.payload)
+    route_gate = copy.deepcopy(latest.route_gate)
+    actor = latest.actor
+    if tamper == "wrong_scope":
+        route_gate["route_token_gate"]["scope"]["backlog_id"] = "AC-FOREIGN"
+    elif tamper == "wrong_actor":
+        actor = "caller-claimed-observer"
+    elif tamper == "missing_read_action":
+        route_gate["route_token_gate"]["allowed_actions"] = [
+            "parallel_branch_allocate"
+        ]
+    elif tamper == "unknown_predecessor":
+        payload["revision_receipt"]["previous_revision_hash"] = _fake_sha(
+            "unknown-route-predecessor"
+        )
+    if tamper != "registry_unverified":
+        conn.execute(
+            """
+            UPDATE parallel_branch_runtime_contract_revisions
+            SET payload_json = ?, route_gate_json = ?, actor = ?
+            WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?
+            """,
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                json.dumps(route_gate, sort_keys=True, separators=(",", ":")),
+                actor,
+                PID,
+                runtime_context.runtime_context_id,
+                latest.revision_id,
+            ),
+        )
+    dispatch_identity = _worker_dispatch_route_identity(
+        conn,
+        contract_execution_id=successor["contract_execution_id"],
+    )
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as conflict:
+        server._runtime_context_initial_join_expected_route_identity(
+            conn,
+            runtime_context,
+            {"route_identity": dispatch_identity},
+        )
+
+    assert conflict.value.code == "runtime_context_initial_join_route_authority_conflict"
+    assert conflict.value.details["mutation_performed"] is False
+    assert conn.total_changes == before_changes
+
+
+def test_runtime_context_initial_join_uses_registry_verified_allocation_cutover(
+    conn,
+    tmp_path,
+):
+    backlog_id = "AC-INITIAL-JOIN-ROUTE-CUTOVER-HANDLER"
+    target_root = tmp_path / "initial-join-route-cutover-handler"
+    target_root.mkdir()
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="initial-join-route-cutover-handler-parent",
+        worker_task_id="initial-join-route-cutover-handler-worker",
+        fence_token="fence-initial-join-route-cutover-handler",
+        token="session-initial-join-route-cutover-handler",
+        target_project_root=str(target_root),
+        worktree_path=str(target_root),
+        pinned_revision="",
+        parent_task_is_contract_execution=True,
+        required_worker_count=1,
+    )
+    cutover = _append_worker_route_cutover_revision(
+        conn,
+        successor=successor,
+        runtime_context=runtime_context,
+        backlog_id=backlog_id,
+        suffix="initial-join-handler",
+    )
+
+    result = server.handle_graph_governance_runtime_context_session_token_initial_join(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body={
+                "task_id": runtime_context.task_id,
+                "parent_task_id": successor["contract_execution_id"],
+                "contract_execution_id": successor["contract_execution_id"],
+                "target_project_root": str(target_root),
+                "worker_id": runtime_context.worker_id,
+                "worker_slot_id": runtime_context.worker_slot_id,
+                "agent_id": runtime_context.worker_id,
+                "actual_host_worker_id": runtime_context.worker_id,
+                "worker_session_id": "/root/route-cutover-handler-worker",
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                **cutover,
+                "reason": "host adapter uses the current allocated route",
+                "ttl_seconds": 1200,
+                "now_iso": "2099-08-10T10:02:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "session_token_initial_join_issued"
+    assert result["route_identity"] == cutover
+    assert result["host_envelope"]["route_identity"] == cutover
+    assert result["route_identity_source"] in {
+        "branch_contract_revision_successor",
+        "resolved_renewed_route_token_ref",
+    }
+
+
+def test_compact_worker_read_projects_registry_verified_route_cutover(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-GUIDE-WORKER-READ-ROUTE-CUTOVER"
+    successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="guide-worker-read-route-cutover-parent",
+        worker_task_id="guide-worker-read-route-cutover-worker",
+        fence_token="fence-guide-worker-read-route-cutover",
+        token="session-guide-worker-read-route-cutover",
+        pinned_revision="",
+        parent_task_is_contract_execution=True,
+        required_worker_count=1,
+    )
+    current = server._contract_chain_current_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        rebuild_if_missing=True,
+    )
+    current = server._contract_chain_current_with_runtime_authority_overlay(current)
+    resume = server._onboard_runtime_resume_from_current_projection(current)
+    cutover = _append_worker_route_cutover_revision(
+        conn,
+        successor=successor,
+        runtime_context=runtime_context,
+        backlog_id=backlog_id,
+        suffix="worker-guide",
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
+    )
+    before_changes = conn.total_changes
+
+    projected_action = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        next_action=current["next_legal_action"],
+        current_projection=current,
+        runtime_resume=resume,
+    )
+    record = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    guide = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="mf_sub",
+        work_type="parallel_worker",
+        record=record,
+        next_action=projected_action,
+        current_projection=current,
+        runtime_resume=resume,
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+
+    assert conn.total_changes == before_changes
+    assert guide["worker_read_runtime_facade_projection"]["status"] == "ready"
+    assert guide["worker_read_runtime_facade_projection"][
+        "route_authority_source"
+    ] in {"branch_contract_revision", "branch_contract_revision_successor"}
+    body = guide["copy_safe_body"]
+    assert {
+        field: body[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == cutover
+
+
 def test_compact_worker_read_projects_current_runtime_context_receipt_facade(
     conn,
     monkeypatch,
