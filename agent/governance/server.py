@@ -494,6 +494,7 @@ def _record_reconcile_run_terminalization(
 
 
 _RECONCILE_TERMINALIZATION_ACTION = "graph_reconcile_run_terminalize_stale"
+_RECONCILE_RELEASE_PREFLIGHT_ACTION = "graph_reconcile_release_preflight"
 _RECONCILE_TERMINALIZATION_CANDIDATE_RE = re.compile(
     r"rterm1\.([1-9][0-9]{0,18})\.([0-9a-f]{64})"
 )
@@ -622,7 +623,7 @@ def _resolve_reconcile_terminalization_candidate(
 
 def _consume_reconcile_terminalization_action(
     body: Mapping[str, Any],
-) -> tuple[dict[str, Any], dict[str, str] | None]:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Remove the reserved manager selector before any normal build path."""
 
     projected = dict(body)
@@ -632,26 +633,458 @@ def _consume_reconcile_terminalization_action(
     notes = dict(raw_notes)
     raw_action = notes.pop("_manager_action", None)
     projected["notes_extra"] = notes
-    valid = (
+    action = (
+        str(raw_action.get("action") or "")
+        if isinstance(raw_action, Mapping)
+        else ""
+    )
+    terminalization_valid = (
         isinstance(raw_action, Mapping)
         and set(raw_action) == {"action", "candidate_id"}
-        and str(raw_action.get("action") or "")
-        == _RECONCILE_TERMINALIZATION_ACTION
+        and action == _RECONCILE_TERMINALIZATION_ACTION
         and bool(
             _RECONCILE_TERMINALIZATION_CANDIDATE_RE.fullmatch(
                 str(raw_action.get("candidate_id") or "")
             )
         )
     )
-    if not valid:
+    release_preflight_valid = (
+        isinstance(raw_action, Mapping)
+        and set(raw_action) == {"action", "apply"}
+        and action == _RECONCILE_RELEASE_PREFLIGHT_ACTION
+        and isinstance(raw_action.get("apply"), bool)
+    )
+    if not (terminalization_valid or release_preflight_valid):
         _raise_reconcile_terminalization_rejection(
             "reconcile_terminalization_manager_action_invalid",
             "reserved reconcile manager action is invalid",
             422,
         )
+    if release_preflight_valid:
+        return projected, {
+            "action": _RECONCILE_RELEASE_PREFLIGHT_ACTION,
+            "apply": bool(raw_action["apply"]),
+        }
     return projected, {
         "action": _RECONCILE_TERMINALIZATION_ACTION,
         "candidate_id": str(raw_action["candidate_id"]),
+    }
+
+
+def _release_materialization_size_bytes(
+    store: Any, project_id: str, snapshot_id: str
+) -> int:
+    """Measure one trusted active snapshot without following symlinks."""
+
+    root = store._snapshot_root(str(project_id or ""), str(snapshot_id or ""))
+    if not root.is_dir():
+        return 0
+    total = 0
+    for filename in (
+        "graph.json",
+        "file_inventory.json",
+        "drift_ledger.json",
+        "manifest.json",
+    ):
+        path = root / filename
+        try:
+            if path.is_symlink() or not path.is_file():
+                return 0
+            total += max(0, int(path.stat().st_size))
+        except OSError:
+            return 0
+    return total
+
+
+def _release_available_bytes(path: Path) -> int:
+    try:
+        return max(0, int(shutil.disk_usage(path).free))
+    except OSError:
+        return -1
+
+
+def _raise_graph_release_preflight(code: str, message: str) -> NoReturn:
+    raise GovernanceError(
+        code,
+        message,
+        409,
+        {
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "public_safe": True,
+            "secret_safe": True,
+        },
+    )
+
+
+def _graph_release_referenced_snapshot_ids(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> set[str]:
+    """Return snapshot identities retained by durable exact-graph traces."""
+
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='graph_query_traces'"
+    ).fetchone() is None:
+        return set()
+    columns = {
+        str(row["name"] or "")
+        for row in conn.execute("PRAGMA table_info(graph_query_traces)").fetchall()
+    }
+    identity_columns = [
+        column
+        for column in ("snapshot_id", "canonical_base_snapshot_id")
+        if column in columns
+    ]
+    if "project_id" not in columns or not identity_columns:
+        return set()
+    selects = [
+        f"SELECT {column} AS snapshot_id FROM graph_query_traces "
+        f"WHERE project_id=? AND {column}!=''"
+        for column in identity_columns
+    ]
+    rows = conn.execute(
+        "SELECT snapshot_id FROM ("
+        + " UNION ".join(selects)
+        + ") ORDER BY snapshot_id LIMIT 2001",
+        tuple(str(project_id or "") for _ in identity_columns),
+    ).fetchall()
+    if len(rows) > 2000:
+        _raise_graph_release_preflight(
+            "graph_release_preflight_trace_reference_window_unbounded",
+            "release preflight requires a bounded exact-trace reference window",
+        )
+    return {str(row["snapshot_id"] or "") for row in rows}
+
+
+def _graph_release_build_fence_state(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    allowed_process_key: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    project = str(project_id or "")
+    with _CURRENT_FULL_BUILD_KEYS_LOCK:
+        process_active_count = sum(
+            1
+            for key in _CURRENT_FULL_BUILD_KEYS
+            if key[0] == project and key != allowed_process_key
+        )
+    durable_active_count = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM graph_current_full_build_claim_history "
+            "WHERE project_id=? AND status='active'",
+            (project,),
+        ).fetchone()[0]
+    )
+    return {
+        "clear": process_active_count == 0 and durable_active_count == 0,
+        "process_active_count": process_active_count,
+        "durable_active_count": durable_active_count,
+    }
+
+
+def _graph_release_recovery_retention_preflight(
+    conn: sqlite3.Connection,
+    store: Any,
+    project_id: str,
+    *,
+    apply: bool,
+    backlog_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Plan or apply bounded stale-run recovery plus snapshot retention."""
+
+    project = str(project_id or "")
+    active = conn.execute(
+        """
+        SELECT s.*
+        FROM graph_snapshot_refs r
+        JOIN graph_snapshots s
+          ON s.project_id=r.project_id AND s.snapshot_id=r.snapshot_id
+        WHERE r.project_id=? AND r.ref_name='active'
+        """,
+        (project,),
+    ).fetchone()
+    if active is None:
+        _raise_graph_release_preflight(
+            "graph_release_preflight_active_snapshot_required",
+            "release preflight requires one active snapshot",
+        )
+    active_snapshot_id = str(active["snapshot_id"] or "")
+    integrity = store.validate_snapshot_companion_integrity(dict(active))
+    if integrity.get("valid") is not True:
+        _raise_graph_release_preflight(
+            "graph_release_preflight_active_snapshot_invalid",
+            "release preflight requires exact active snapshot companions",
+        )
+
+    metric_window = store.list_reconcile_run_metrics_window(
+        conn,
+        project,
+        limit=100,
+        strategy="current_full_reconcile",
+        nonterminal_limit=1000,
+        cursor="",
+    )
+    if metric_window.get("has_more") or str(
+        metric_window.get("effective_nonterminal_completeness") or "complete"
+    ) != "complete":
+        _raise_graph_release_preflight(
+            "graph_release_preflight_nonterminal_window_unbounded",
+            "release preflight requires the complete bounded nonterminal window",
+        )
+    recovery_candidates: list[dict[str, str]] = []
+    unresolved_count = 0
+    for metric in metric_window.get("rows") or []:
+        if not isinstance(metric, Mapping) or bool(metric.get("is_terminal")):
+            continue
+        effective_status = str(
+            metric.get("effective_status") or metric.get("status") or ""
+        )
+        if effective_status not in {"running", "finalizing", "unknown"}:
+            continue
+        projected = _reconcile_terminalization_candidate_projection(
+            conn, store, project, metric
+        )
+        candidate_id = str(projected.get("candidate_id") or "")
+        if candidate_id:
+            recovery_candidates.append({"candidate_id": candidate_id})
+        else:
+            unresolved_count += 1
+
+    referenced_snapshot_ids = _graph_release_referenced_snapshot_ids(conn, project)
+    build_fence = _graph_release_build_fence_state(conn, project)
+    if apply and not build_fence["clear"]:
+        _raise_graph_release_preflight(
+            "graph_release_preflight_build_fence_active",
+            "release preflight cannot run retention while a build fence is active",
+        )
+    selection = store.select_snapshot_retention_candidates(
+        conn,
+        project,
+        extra_bundle_snapshot_ids=referenced_snapshot_ids,
+    )
+    protected_ids = {
+        str(item.get("snapshot_id") or "")
+        for item in selection.get("protected") or []
+        if isinstance(item, Mapping)
+    }
+    raw_retention_candidates = [
+        dict(item)
+        for item in selection.get("candidates") or []
+        if isinstance(item, Mapping)
+    ]
+    if any(
+        str(item.get("snapshot_id") or "") in protected_ids
+        for item in raw_retention_candidates
+    ):
+        _raise_graph_release_preflight(
+            "graph_release_preflight_retention_selection_invalid",
+            "release preflight retention selection overlaps protected snapshots",
+        )
+    reclaimable_bytes = sum(
+        max(0, int(item.get("size_bytes") or 0))
+        for item in raw_retention_candidates
+    )
+    active_root = store._snapshot_root(project, active_snapshot_id)
+    active_materialization_bytes = _release_materialization_size_bytes(
+        store, project, active_snapshot_id
+    )
+    if active_materialization_bytes <= 0 or not active_root.parent.exists():
+        _raise_graph_release_preflight(
+            "graph_release_preflight_size_evidence_required",
+            "release preflight could not measure the active snapshot",
+        )
+    per_materialization = max(
+        active_materialization_bytes,
+        max(
+            (max(0, int(item.get("size_bytes") or 0)) for item in raw_retention_candidates),
+            default=0,
+        ),
+    )
+    available_before = _release_available_bytes(active_root.parent)
+    if available_before < 0:
+        _raise_graph_release_preflight(
+            "graph_release_preflight_disk_evidence_unavailable",
+            "release preflight could not read filesystem headroom",
+    )
+    materialization_count = 3
+    storage_copy_multiplier = 2
+    required_bytes = (
+        per_materialization * materialization_count * storage_copy_multiplier
+    )
+    projected_after_apply = available_before + reclaimable_bytes
+    headroom_ready_now = available_before >= required_bytes
+    headroom_ready_after_apply = projected_after_apply >= required_bytes
+    ready_now = (
+        headroom_ready_now
+        and not recovery_candidates
+        and unresolved_count == 0
+        and build_fence["clear"]
+    )
+    ready_after_apply = (
+        headroom_ready_after_apply
+        and unresolved_count == 0
+        and build_fence["clear"]
+    )
+    if apply and not ready_after_apply:
+        _raise_graph_release_preflight(
+            "graph_release_preflight_insufficient_recoverable_headroom",
+            "release preflight cannot prove enough recoverable headroom",
+        )
+
+    terminalized_count = 0
+    retention_apply: Mapping[str, Any] = {}
+    if apply:
+        with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
+            with _CURRENT_FULL_BUILD_KEYS_LOCK:
+                locked_fence = _graph_release_build_fence_state(conn, project)
+                if not locked_fence["clear"]:
+                    _raise_graph_release_preflight(
+                        "graph_release_preflight_build_fence_active",
+                        "release preflight cannot run retention while a build fence is active",
+                    )
+                for item in recovery_candidates:
+                    candidate = _resolve_reconcile_terminalization_candidate(
+                        conn, store, project, item["candidate_id"]
+                    )
+                    receipt = _record_reconcile_run_terminalization(
+                        project,
+                        run_id=candidate["run_id"],
+                        snapshot_id=candidate["snapshot_id"],
+                        backlog_id=str(backlog_id or ""),
+                        task_id=str(task_id or ""),
+                    )
+                    if receipt.get("writes_performed") or receipt.get("replayed"):
+                        terminalized_count += 1
+                retention_apply = store.run_snapshot_retention_gc(
+                    conn,
+                    project,
+                    dry_run=False,
+                    actor="release_preflight",
+                    extra_bundle_snapshot_ids=referenced_snapshot_ids,
+                )
+    available_after = (
+        _release_available_bytes(active_root.parent)
+        if apply
+        else available_before
+    )
+    available_after = max(0, available_after)
+    deleted = [
+        item
+        for item in retention_apply.get("deleted_dirs") or []
+        if isinstance(item, Mapping)
+    ]
+    retention_errors = list(retention_apply.get("errors") or [])
+    active_after = conn.execute(
+        "SELECT snapshot_id FROM graph_snapshot_refs "
+        "WHERE project_id=? AND ref_name='active'",
+        (project,),
+    ).fetchone()
+    active_snapshot_preserved = bool(
+        active_after is not None
+        and str(active_after["snapshot_id"] or "") == active_snapshot_id
+        and (
+            not apply
+            or store.validate_snapshot_companion_integrity(dict(active)).get("valid")
+            is True
+        )
+    )
+    safe_retention_candidates = []
+    for item in raw_retention_candidates:
+        safe_id, identity_sha256 = _safe_reconcile_queue_identifier(
+            item.get("snapshot_id"), kind="snapshot"
+        )
+        kind = str(item.get("snapshot_kind") or "unknown")
+        status = str(item.get("status") or "unknown")
+        safe_retention_candidates.append(
+            {
+                "snapshot_id": safe_id,
+                "snapshot_id_sha256": identity_sha256,
+                "snapshot_kind": kind if kind in {"scope", "full"} else "unknown",
+                "status": status
+                if status
+                in {
+                    "candidate_ready",
+                    "complete",
+                    "failed",
+                    "terminalized_stale",
+                    "unknown",
+                }
+                else "unknown",
+                "size_bytes": max(0, int(item.get("size_bytes") or 0)),
+                "dir_exists": bool(item.get("dir_exists")),
+                "in_db": bool(item.get("in_db")),
+            }
+        )
+    apply_ok = not apply or (
+        terminalized_count == len(recovery_candidates)
+        and not retention_errors
+        and retention_apply.get("ok") is True
+        and active_snapshot_preserved
+    )
+    active_safe, active_sha256 = _safe_reconcile_queue_identifier(
+        active_snapshot_id, kind="snapshot"
+    )
+    return {
+        "schema_version": "graph_release.recovery_retention_preflight.v1",
+        "project_id": project,
+        "mode": "apply" if apply else "plan",
+        "ready": (
+            bool(
+                available_after >= required_bytes
+                and unresolved_count == 0
+                and apply_ok
+            )
+            if apply
+            else ready_now
+        ),
+        "ready_after_apply": ready_after_apply,
+        "active_snapshot": {
+            "snapshot_id": active_safe,
+            "snapshot_id_sha256": active_sha256,
+            "commit_sha256": "sha256:"
+            + hashlib.sha256(
+                str(active["commit_sha"] or "").encode("utf-8")
+            ).hexdigest(),
+            "companion_integrity_valid": True,
+        },
+        "orphan_recovery": {
+            "candidate_count": len(recovery_candidates),
+            "unresolved_count": unresolved_count,
+            "terminalized_count": terminalized_count,
+            "candidates": recovery_candidates,
+        },
+        "retention": {
+            "keep_last_n": max(
+                0, int((selection.get("config") or {}).get("keep_last_n") or 0)
+            ),
+            "protected_count": max(0, int(selection.get("protected_count") or 0)),
+            "candidate_count": len(raw_retention_candidates),
+            "candidates": safe_retention_candidates,
+            "reclaimable_bytes": reclaimable_bytes,
+            "deleted_count": len(deleted),
+            "freed_bytes": max(0, int(retention_apply.get("freed_bytes") or 0)),
+            "error_count": len(retention_errors),
+            "db_evidence_preserved": True,
+            "active_snapshot_preserved": active_snapshot_preserved,
+        },
+        "headroom": {
+            "materialization_count": materialization_count,
+            "storage_copy_multiplier": storage_copy_multiplier,
+            "per_materialization_estimate_bytes": per_materialization,
+            "required_bytes": required_bytes,
+            "available_bytes": available_after,
+            "reclaimable_bytes": reclaimable_bytes,
+            "projected_after_apply_bytes": projected_after_apply,
+            "ready_now": headroom_ready_now,
+            "ready_after_apply": headroom_ready_after_apply,
+        },
+        "build_fence": build_fence,
+        "writes_performed": bool(apply and (terminalized_count or deleted)),
+        "close_satisfying": False,
+        "graph_reconciled": False,
     }
 
 
@@ -8600,9 +9033,11 @@ def _require_current_full_reconcile_auth(
 
 
 def _require_reconcile_terminalization_auth(
-    ctx: RequestContext, conn
+    ctx: RequestContext,
+    conn,
+    required_action: str = _RECONCILE_TERMINALIZATION_ACTION,
 ) -> dict[str, Any]:
-    """Require the exact managed-observer route; operator tokens are invalid."""
+    """Require one exact managed-observer maintenance route."""
 
     if str(ctx.token or "").strip() or not _current_full_route_proof_requested(ctx):
         raise GovernanceError(
@@ -8611,7 +9046,7 @@ def _require_reconcile_terminalization_auth(
             403,
             {
                 "required_role": "observer",
-                "required_action": _RECONCILE_TERMINALIZATION_ACTION,
+                "required_action": required_action,
                 "zero_write_rejection": True,
                 "writes_performed": False,
                 "public_safe": True,
@@ -8623,13 +9058,13 @@ def _require_reconcile_terminalization_auth(
         return _require_current_full_reconcile_auth(
             ctx,
             conn,
-            _RECONCILE_TERMINALIZATION_ACTION,
-            accepted_route_actions=[_RECONCILE_TERMINALIZATION_ACTION],
+            required_action,
+            accepted_route_actions=[required_action],
             route_ref_renew_within_seconds=0,
         )
     except GovernanceError as exc:
         exc.details.update(
-            required_action=_RECONCILE_TERMINALIZATION_ACTION,
+            required_action=required_action,
             zero_write_rejection=True,
             writes_performed=False,
             public_safe=True,
@@ -72738,8 +73173,65 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         terminalization_conn = get_connection(project_id)
         try:
             terminalization_auth = _require_reconcile_terminalization_auth(
-                ctx, terminalization_conn
+                ctx,
+                terminalization_conn,
+                str(manager_action.get("action") or ""),
             )
+            route_scope = terminalization_auth.get("route_token_scope")
+            route_scope = (
+                dict(route_scope) if isinstance(route_scope, Mapping) else {}
+            )
+            if manager_action["action"] == _RECONCILE_RELEASE_PREFLIGHT_ACTION:
+                from . import task_timeline as terminalization_timeline
+
+                changes_before_prewarm = terminalization_conn.total_changes
+                _prewarm_reconcile_terminalization_schemas(
+                    terminalization_conn,
+                    terminalization_store,
+                    terminalization_timeline,
+                )
+                result = _graph_release_recovery_retention_preflight(
+                    terminalization_conn,
+                    terminalization_store,
+                    project_id,
+                    apply=bool(manager_action["apply"]),
+                    backlog_id=str(route_scope.get("backlog_id") or ""),
+                    task_id=str(route_scope.get("task_id") or ""),
+                )
+                schema_writes = (
+                    terminalization_conn.total_changes > changes_before_prewarm
+                )
+                result["schema_migration_writes_performed"] = schema_writes
+                result["writes_performed"] = bool(
+                    result.get("writes_performed") or schema_writes
+                )
+                result.update(
+                    {
+                        "ok": True,
+                        "action": _RECONCILE_RELEASE_PREFLIGHT_ACTION,
+                        "maintenance_only": True,
+                        "rebuild_started": False,
+                        "snapshot_materialized": False,
+                        "route_proof": {
+                            "observer_session_id": str(
+                                terminalization_auth.get("observer_session_id")
+                                or ""
+                            ),
+                            "route_token_ref": str(
+                                terminalization_auth.get("route_token_ref") or ""
+                            ),
+                            "scope": route_scope,
+                            "allowed_actions": list(
+                                terminalization_auth.get(
+                                    "route_token_allowed_actions"
+                                )
+                                or []
+                            ),
+                            "raw_route_token_persisted": False,
+                        },
+                    }
+                )
+                return (201 if result["writes_performed"] else 200), result
             candidate = _resolve_reconcile_terminalization_candidate(
                 terminalization_conn,
                 terminalization_store,
@@ -72750,8 +73242,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             close = getattr(terminalization_conn, "close", None)
             if callable(close):
                 close()
-        route_scope = terminalization_auth.get("route_token_scope")
-        route_scope = dict(route_scope) if isinstance(route_scope, Mapping) else {}
         append_receipt = _record_reconcile_run_terminalization(
             project_id,
             run_id=candidate["run_id"],
@@ -73866,13 +74356,31 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "error": str(exc),
             }
         try:
-            retention_gc = store.run_snapshot_retention_gc(
-                conn,
-                project_id,
-                dry_run=False,
-                actor=f"post_activate:{str(body.get('actor') or 'dashboard_user')}",
-            )
-            conn.commit()
+            with _CURRENT_FULL_BUILD_KEYS_LOCK:
+                build_fence = _graph_release_build_fence_state(
+                    conn,
+                    project_id,
+                    allowed_process_key=process_build_key,
+                )
+                if not build_fence["clear"]:
+                    retention_gc = {
+                        "ok": False,
+                        "error": "graph_release_retention_build_fence_active",
+                        "dry_run": False,
+                    }
+                else:
+                    referenced_snapshot_ids = _graph_release_referenced_snapshot_ids(
+                        conn,
+                        project_id,
+                    )
+                    retention_gc = store.run_snapshot_retention_gc(
+                        conn,
+                        project_id,
+                        dry_run=False,
+                        actor=f"post_activate:{str(body.get('actor') or 'dashboard_user')}",
+                        extra_bundle_snapshot_ids=referenced_snapshot_ids,
+                    )
+                    conn.commit()
         except Exception as exc:
             conn.rollback()
             retention_gc = {"ok": False, "error": str(exc), "dry_run": False}
