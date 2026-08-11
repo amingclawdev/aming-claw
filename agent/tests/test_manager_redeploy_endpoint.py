@@ -233,6 +233,34 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
         self.assertEqual(body["runtime_deployment_verification"]["status"], "health_probe_failed")
         mock_write.assert_not_called()
 
+    @patch(
+        "agent.manager_http_server._ensure_plugin_clone_checkout",
+        return_value="a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+    )
+    @patch("agent.manager_http_server._write_chain_version", return_value=True)
+    @patch("agent.manager_http_server._wait_for_health", side_effect=[True, False])
+    @patch("agent.manager_http_server._spawn_governance_process")
+    @patch("agent.manager_http_server._stop_governance_process", return_value=True)
+    def test_post_version_identity_loss_cannot_return_success(
+        self, mock_stop, mock_spawn, mock_health, mock_write, mock_checkout
+    ):
+        spawned = MagicMock()
+        spawned.pid = 84539
+        mock_spawn.return_value = spawned
+
+        status, body = _make_request(
+            self.server_address,
+            "POST",
+            "/api/manager/redeploy/governance",
+            {"chain_version": "a0266c5d"},
+        )
+
+        self.assertEqual(status, 500)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["step"], "post_version_identity_probe")
+        self.assertEqual(mock_health.call_count, 2)
+        mock_write.assert_called_once_with("a0266c5d")
+
     def test_redeploy_unknown_target_404(self):
         """Unknown target returns 404."""
         status, body = _make_request(
@@ -393,6 +421,45 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
                     timeout=0.01,
                 )
             )
+
+    def test_health_rechecks_process_and_listener_after_reading_response(self):
+        proc = MagicMock()
+        proc.pid = 84539
+        proc.poll.side_effect = [None, 1]
+        payload = {
+            "status": "ok",
+            "pid": 84539,
+            "version": "a0266c5d",
+            "worktree_head_version": "a0266c5d",
+            "runtime_loaded_version": "a0266c5d",
+            "runtime_stale": False,
+            "loaded_runtime_identity": {
+                "loaded_pid": 84539,
+                "loaded_commit": "a0266c5d",
+                "loaded_source_sha256": "sha256:" + "a" * 64,
+                "runtime_stale": False,
+            },
+        }
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with patch.object(
+            manager_http_server,
+            "_governance_listener_pids",
+            side_effect=[(84539,), ()],
+        ), patch("urllib.request.urlopen", return_value=response), patch.object(
+            manager_http_server, "_HEALTH_CHECK_INTERVAL", 0
+        ):
+            self.assertFalse(
+                manager_http_server._wait_for_health(
+                    proc,
+                    "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+                    timeout=0.01,
+                )
+            )
+        self.assertEqual(proc.poll.call_count, 2)
 
 
 class TestManagerHTTPServerImports(unittest.TestCase):

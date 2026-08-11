@@ -638,6 +638,18 @@ def _wait_for_health(
                         and len(source_hash) == 71
                     )
                     if exact_identity:
+                        if proc.poll() is not None:
+                            log.error(
+                                "manager_http_server: governance PID %d exited during health probe",
+                                proc.pid,
+                            )
+                            return False
+                        if _governance_listener_pids() != (proc.pid,):
+                            log.error(
+                                "manager_http_server: governance PID %d lost listener ownership during health probe",
+                                proc.pid,
+                            )
+                            return False
                         log.info(
                             "manager_http_server: governance PID %d exact runtime health passed",
                             proc.pid,
@@ -1041,6 +1053,34 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                             healthy=True,
                             step="write_chain_version",
                             detail="Governance running but failed to write chain_version",
+                        )
+                    ),
+                },
+                500,
+            )
+            return
+
+        # The version write is a network round trip. Re-prove the complete
+        # spawned runtime identity immediately before returning success so a
+        # process/listener transition during that write cannot be hidden.
+        if not _wait_for_health(proc, runtime_head, timeout=5):
+            detail = "Governance runtime identity changed after version update"
+            self._send_json(
+                {
+                    "ok": False,
+                    "step": "post_version_identity_probe",
+                    "detail": detail,
+                    "pid": proc.pid,
+                    "requested_branch_ref": branch_ref,
+                    **runtime_branch_state,
+                    "runtime_head": runtime_head,
+                    "runtime_deployment_verification": (
+                        derive_runtime_deployment_verification_status(
+                            http_status=500,
+                            runtime_checkout_advanced=True,
+                            healthy=False,
+                            step="post_version_identity_probe",
+                            detail=detail,
                         )
                     ),
                 },
