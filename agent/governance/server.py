@@ -32242,21 +32242,71 @@ def _runtime_context_verified_allocation_route_successor(
             task_id=parent_task_id,
             backlog_id=expected_scope["backlog_id"],
         )
-    except (observer_route_context.RouteTokenRefError, sqlite3.Error, ValueError):
+    except observer_route_context.RouteTokenRefError as exc:
+        failure = dict(getattr(exc, "details", {}) or {})
+        if not (
+            str(getattr(exc, "code", "") or "")
+            == "route_token_ref_not_active"
+            and str(failure.get("status") or "") == "superseded"
+        ):
+            return {}
+        try:
+            resolved = observer_route_context.resolve_route_token_ref_renewal_descendant(
+                conn,
+                project_id=expected_scope["project_id"],
+                route_token_ref=exact_identity["route_token_ref"],
+            )
+        except (observer_route_context.RouteTokenRefError, sqlite3.Error, ValueError):
+            return {}
+    except (sqlite3.Error, ValueError):
         return {}
     resolved = dict(resolved or {})
     resolved_scope = (
         resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {}
     )
     resolved_actions = resolved.get("allowed_actions")
+    resolved_identity = {
+        field: str(resolved.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    renewal_resolution = (
+        resolved.get("renewal_resolution")
+        if isinstance(resolved.get("renewal_resolution"), Mapping)
+        else {}
+    )
+    requested_renewal_identity = (
+        renewal_resolution.get("requested_route_identity")
+        if isinstance(renewal_resolution.get("requested_route_identity"), Mapping)
+        else {}
+    )
+    resolved_renewal_identity = (
+        renewal_resolution.get("resolved_route_identity")
+        if isinstance(renewal_resolution.get("resolved_route_identity"), Mapping)
+        else {}
+    )
+    renewal_identity_valid = not renewal_resolution or (
+        str(renewal_resolution.get("status") or "")
+        == "resolved_active_descendant"
+        and renewal_resolution.get("exact_scope_verified") is True
+        and renewal_resolution.get("registry_verified") is True
+        and all(
+            str(requested_renewal_identity.get(field) or "").strip()
+            == exact_identity[field]
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+        and all(
+            str(resolved_renewal_identity.get(field) or "").strip()
+            == resolved_identity[field]
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+    )
     if not (
         resolved.get("resolved_from_ref") is True
         and str(resolved.get("status") or "") == "active"
         and str(resolved.get("caller_role") or "") == "observer"
-        and all(
-            str(resolved.get(field) or "").strip() == exact_identity[field]
-            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-        )
+        and all(resolved_identity.values())
+        and renewal_identity_valid
+        and (bool(renewal_resolution) or resolved_identity == exact_identity)
         and {key: str(resolved_scope.get(key) or "") for key in expected_scope}
         == expected_scope
         and isinstance(resolved_actions, list)
@@ -32313,7 +32363,7 @@ def _runtime_context_verified_allocation_route_successor(
         == expected_previous_identity
     ):
         return {}
-    return exact_identity
+    return resolved_identity
 
 
 def _runtime_context_current_route_authority(

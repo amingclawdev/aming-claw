@@ -107692,6 +107692,7 @@ def _append_worker_route_cutover_revision(
             conn,
             backlog_id=backlog_id,
             task_id=contract_execution_id,
+            target_files=["agent/governance/server.py"],
             allowed_actions=[
                 "parallel_branch_allocate",
                 "runtime_context_read_receipt",
@@ -107746,6 +107747,37 @@ def _append_worker_route_cutover_revision(
     return route_identity
 
 
+def _renew_worker_route_cutover(
+    conn,
+    *,
+    cutover: dict[str, str],
+    backlog_id: str,
+    contract_execution_id: str,
+) -> dict[str, str]:
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=cutover["route_token_ref"],
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        caller_role="observer",
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "runtime_context_read_receipt",
+            "task_timeline_append",
+        ],
+        target_files=["agent/governance/server.py"],
+        owned_files=["agent/governance/server.py"],
+        ttl_hours=48.0,
+        now=datetime(2099, 8, 10, 10, 1, 30, tzinfo=timezone.utc),
+        evidence_refs=["test:renew-worker-route-cutover"],
+    )
+    return {
+        field: str(renewed["route_identity"].get(field) or "")
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+
+
 def _worker_dispatch_route_identity(
     conn,
     *,
@@ -107763,8 +107795,10 @@ def _worker_dispatch_route_identity(
     }
 
 
+@pytest.mark.parametrize("renew_cutover", [False, True])
 def test_initial_join_route_authority_accepts_registry_verified_allocation_cutover(
     conn,
+    renew_cutover,
 ):
     backlog_id = "AC-INITIAL-JOIN-ROUTE-CUTOVER"
     successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
@@ -107785,6 +107819,13 @@ def test_initial_join_route_authority_accepts_registry_verified_allocation_cutov
         backlog_id=backlog_id,
         suffix="initial-join",
     )
+    if renew_cutover:
+        cutover = _renew_worker_route_cutover(
+            conn,
+            cutover=cutover,
+            backlog_id=backlog_id,
+            contract_execution_id=successor["contract_execution_id"],
+        )
     dispatch_identity = _worker_dispatch_route_identity(
         conn,
         contract_execution_id=successor["contract_execution_id"],
@@ -107812,6 +107853,8 @@ def test_initial_join_route_authority_accepts_registry_verified_allocation_cutov
         "unregistered_registry",
         "expired_registry",
         "wrong_registry_scope",
+        "superseded_without_descendant",
+        "superseded_with_unrelated_ref",
     ],
 )
 def test_initial_join_route_authority_rejects_unverified_revision_cutover(
@@ -107874,11 +107917,45 @@ def test_initial_join_route_authority_rejects_unverified_revision_cutover(
             "WHERE project_id = ? AND route_token_ref = ?",
             ("AC-FOREIGN", PID, cutover["route_token_ref"]),
         )
+    elif tamper in {
+        "superseded_without_descendant",
+        "superseded_with_unrelated_ref",
+    }:
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status = ? "
+            "WHERE project_id = ? AND route_token_ref = ?",
+            ("superseded", PID, cutover["route_token_ref"]),
+        )
+        if tamper == "superseded_with_unrelated_ref":
+            unrelated = {
+                "route_id": "route-cutover-unrelated",
+                "route_context_hash": _fake_sha("route-cutover-unrelated"),
+                "prompt_contract_id": "rprompt-cutover-unrelated",
+                "prompt_contract_hash": _fake_sha("prompt-cutover-unrelated"),
+                "route_token_ref": "rtok-cutover-unrelated",
+                "visible_injection_manifest_hash": _fake_sha(
+                    "visible-cutover-unrelated"
+                ),
+            }
+            _persist_append_route_token_ref(
+                conn,
+                backlog_id=backlog_id,
+                task_id=successor["contract_execution_id"],
+                target_files=["agent/governance/server.py"],
+                allowed_actions=[
+                    "parallel_branch_allocate",
+                    "runtime_context_read_receipt",
+                    "task_timeline_append",
+                ],
+                **unrelated,
+            )
     if tamper not in {
         "registry_unverified",
         "unregistered_registry",
         "expired_registry",
         "wrong_registry_scope",
+        "superseded_without_descendant",
+        "superseded_with_unrelated_ref",
     }:
         conn.execute(
             """
@@ -107913,9 +107990,11 @@ def test_initial_join_route_authority_rejects_unverified_revision_cutover(
     assert conn.total_changes == before_changes
 
 
+@pytest.mark.parametrize("renew_cutover", [False, True])
 def test_runtime_context_initial_join_uses_registry_verified_allocation_cutover(
     conn,
     tmp_path,
+    renew_cutover,
 ):
     backlog_id = "AC-INITIAL-JOIN-ROUTE-CUTOVER-HANDLER"
     target_root = tmp_path / "initial-join-route-cutover-handler"
@@ -107940,6 +108019,13 @@ def test_runtime_context_initial_join_uses_registry_verified_allocation_cutover(
         backlog_id=backlog_id,
         suffix="initial-join-handler",
     )
+    if renew_cutover:
+        cutover = _renew_worker_route_cutover(
+            conn,
+            cutover=cutover,
+            backlog_id=backlog_id,
+            contract_execution_id=successor["contract_execution_id"],
+        )
 
     result = server.handle_graph_governance_runtime_context_session_token_initial_join(
         _ctx_with_role(
@@ -107980,9 +108066,11 @@ def test_runtime_context_initial_join_uses_registry_verified_allocation_cutover(
     }
 
 
+@pytest.mark.parametrize("renew_cutover", [False, True])
 def test_compact_worker_read_projects_registry_verified_route_cutover(
     conn,
     monkeypatch,
+    renew_cutover,
 ):
     backlog_id = "AC-GUIDE-WORKER-READ-ROUTE-CUTOVER"
     successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
@@ -108011,6 +108099,13 @@ def test_compact_worker_read_projects_registry_verified_route_cutover(
         backlog_id=backlog_id,
         suffix="worker-guide",
     )
+    if renew_cutover:
+        cutover = _renew_worker_route_cutover(
+            conn,
+            cutover=cutover,
+            backlog_id=backlog_id,
+            contract_execution_id=successor["contract_execution_id"],
+        )
     monkeypatch.setattr(
         server,
         "_runtime_context_worker_worktree_liveness",
