@@ -112078,6 +112078,14 @@ _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS = (
     "backlog_close",
     "merge",
 )
+# Historical Direct Main routes could also authorize the read-only preflight
+# surface.  Keep that compatibility out of newly issued full-round routes, but
+# do not invalidate an otherwise exact durable root route solely because it
+# preserves the action that was legal when the route was issued.
+_OPERATOR_SUPERVISED_DIRECT_MAIN_HISTORICAL_ROOT_ROUTE_ACTIONS = (
+    *_OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS,
+    "preflight_check",
+)
 _ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES = ("agent/governance/server.py",)
 _CONTRACT_RUNTIME_ROUTE_TOKEN_REQUIRED_ACTIONS = (
     "contract_runtime_current",
@@ -140519,7 +140527,9 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         and historical_action
         and historical_action in registry_actions
         and registry_actions.issubset(
-            set(_OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS)
+            set(
+                _OPERATOR_SUPERVISED_DIRECT_MAIN_HISTORICAL_ROOT_ROUTE_ACTIONS
+            )
         )
         and historical_refs.issubset(registry_refs)
         and registry_scope == expected_scope

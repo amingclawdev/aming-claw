@@ -88250,6 +88250,12 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         ),
         (
             "observer_materialized",
+            "root_route_registry_historical_preflight_actions",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
             "root_route_registry_required_ref_removed",
             False,
             "active_root_route_registry_authority",
@@ -88951,6 +88957,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "root_route_registry_extra_ref",
             "root_route_registry_minimal_actions",
             "root_route_registry_live_actions",
+            "root_route_registry_historical_preflight_actions",
             "root_route_registry_required_ref_removed",
             "root_route_registry_scope_tampered",
             "root_route_registry_malformed_json",
@@ -89140,6 +89147,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         "root_route_registry_noncanonical_action",
         "root_route_registry_minimal_actions",
         "root_route_registry_live_actions",
+        "root_route_registry_historical_preflight_actions",
     }:
         action_sets = {
             "root_route_registry_non_direct_action": [
@@ -89172,6 +89180,13 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 "graph_query",
                 "task_timeline_append",
                 "observer_direct_mutation_exception",
+            ],
+            "root_route_registry_historical_preflight_actions": [
+                "graph_query",
+                "task_timeline_append",
+                "backlog_close",
+                "graph_current_full_reconcile",
+                "preflight_check",
             ],
         }
         conn.execute(
