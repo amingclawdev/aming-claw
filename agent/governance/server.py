@@ -3404,16 +3404,41 @@ def _demo_environment_templates() -> list[dict[str, Any]]:
     ]
 
 
+def _demo_loaded_commit_full(value: Any) -> str:
+    """Expand the frozen loaded SHA without substituting the current HEAD."""
+
+    loaded_commit = str(value or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40}", loaded_commit):
+        return loaded_commit
+    if not re.fullmatch(r"[0-9a-f]{7,39}", loaded_commit):
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{loaded_commit}^{{commit}}"],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+    resolved = str(proc.stdout or "").strip().lower() if proc.returncode == 0 else ""
+    return (
+        resolved
+        if re.fullmatch(r"[0-9a-f]{40}", resolved)
+        and resolved.startswith(loaded_commit)
+        else ""
+    )
+
+
 def _demo_owner_runtime_identity() -> dict[str, Any]:
     """Return the fixed public identity of the governance runtime serving Demo."""
 
     identity = governance_loaded_runtime_identity(get_server_version())
-    loaded_commit = str(identity.get("loaded_commit") or "").strip().lower()
+    loaded_commit = _demo_loaded_commit_full(identity.get("loaded_commit"))
     loaded_source_sha256 = str(
         identity.get("loaded_source_sha256") or ""
     ).strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{40}", loaded_commit):
-        loaded_commit = ""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", loaded_source_sha256):
         loaded_source_sha256 = ""
     return {
