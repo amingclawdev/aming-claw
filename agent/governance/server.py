@@ -140075,10 +140075,6 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
             "task_id": task_id,
             "candidate_commit_sha": normalized_commit,
             "implementation_event_id": implementation_id,
-            "qa_principal": principal_id,
-            "qa_session_id": qa_session_id,
-            "qa_scope_binding_ref": qa_scope_binding_ref,
-            "qa_report_ref": qa_report_ref,
         }
     )
     if close_satisfying:
@@ -153395,6 +153391,112 @@ def _timeline_gate_contract_runtime_projection_body(
     return body
 
 
+_TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS = frozenset(
+    {
+        "authorization_source",
+        "artifact_refs_json",
+        "child_route_lineage",
+        "evidence_refs",
+        "evidence_owner_actor", "evidence_owner_role", "evidence_owner_session",
+        "graph_query_trace_ids",
+        "graph_trace_ids",
+        "materialized_from", "materialized_from_report",
+        "observer_impersonation",
+        "parent_materialization_authorized",
+        "parent_route_lineage",
+        "payload_json",
+        "qa_evidence_provenance", "qa_report_ref", "qa_scope_binding_ref",
+        "qa_session_id",
+        "route_action_scope_lineage",
+        "route_action_scope_lineage_resolution",
+        "route_lineage",
+        "route_token_gate", "route_token_ref",
+        "source_backed_contract_gate_authority",
+        "submitter_principal", "submitter_session",
+        "verification_json",
+    }
+)
+
+
+def _timeline_gate_observer_materialized_qa_event(event: Mapping[str, Any]) -> bool:
+    kind = str(event.get("event_kind") or "").strip().lower().replace("-", "_")
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    return bool(
+        kind in _QA_TIMELINE_VERIFICATION_EVENT_KINDS
+        and str(payload.get("schema_version") or "").strip()
+        == "independent_qa_verification.v1"
+        and "qa_evidence_provenance" in payload
+    )
+
+
+def _timeline_gate_public_materialized_qa_sanitized(
+    response: Mapping[str, Any],
+    *,
+    materialized_event_ids: Sequence[int],
+    materialized_route_token_refs: Sequence[str],
+) -> dict[str, Any]:
+    """Remove materialization capabilities from the public timeline-gate copy."""
+
+    materialized_ids = {
+        int(event_id) for event_id in materialized_event_ids if int(event_id) > 0
+    }
+    materialized_refs = {
+        str(ref).strip() for ref in materialized_route_token_refs if str(ref).strip()
+    }
+    if not materialized_ids and not materialized_refs:
+        return dict(response)
+    sanitized = deepcopy(dict(response))
+
+    def sanitize_enrichment(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in list(value.items()):
+                if (
+                    key == "server_route_lineage_enrichment"
+                    and isinstance(child, dict)
+                    and child.get("schema_version")
+                    == "server_route_lineage_enrichment.v1"
+                ):
+                    for summary_key in ("enriched_events", "failed_events"):
+                        summaries = child.get(summary_key)
+                        if not isinstance(summaries, list):
+                            continue
+                        for summary in summaries:
+                            if (
+                                isinstance(summary, dict)
+                                and int(summary.get("id") or 0) in materialized_ids
+                            ):
+                                summary.pop("route_token_ref", None)
+                else:
+                    sanitize_enrichment(child)
+        elif isinstance(value, list):
+            for item in value:
+                sanitize_enrichment(item)
+
+    sanitize_enrichment(sanitized)
+    public_events = sanitized.get("events")
+    if isinstance(public_events, list):
+        for index, event in enumerate(public_events):
+            if not isinstance(event, Mapping) or (
+                int(event.get("id") or 0) not in materialized_ids
+                and _event_route_token_ref(event) not in materialized_refs
+            ):
+                continue
+            public_event = deepcopy(dict(event))
+            for key in _TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS:
+                public_event.pop(key, None)
+            for container_key in ("payload", "verification", "artifact_refs"):
+                container = public_event.get(container_key)
+                if not isinstance(container, Mapping):
+                    continue
+                public_event[container_key] = {
+                    key: child
+                    for key, child in dict(container).items()
+                    if key not in _TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS
+                }
+            public_events[index] = public_event
+    return sanitized
+
+
 @route("GET", "/api/backlog/{project_id}/{bug_id}/timeline-gate")
 @_timeline_warm_cache_endpoint
 def handle_backlog_timeline_gate(ctx: RequestContext):
@@ -153435,7 +153537,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                 "include_compact_ledger": str(
                     bool(include_compact_ledger)
                 ).lower(),
-                "public_authority": "legacy_advisory",
+                "public_authority": "legacy_advisory.materialized_qa_sanitized.v1",
             }
         )
         cache_key, cache_watermark, cached_response, cache_metadata = (
@@ -153450,7 +153552,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                         ctx.query,
                         "contract_execution_id",
                     ),
-                    "public_authority": "legacy_advisory",
+                    "public_authority": "legacy_advisory.materialized_qa_sanitized.v1",
                 },
             )
         )
@@ -153464,6 +153566,18 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             backlog_id=bug_id,
             limit=limit,
         )
+        materialized_qa_events = [
+            event
+            for event in events
+            if _timeline_gate_observer_materialized_qa_event(event)
+        ]
+        materialized_qa_event_ids = [
+            int(event.get("id") or 0)
+            for event in materialized_qa_events
+        ]
+        materialized_qa_route_token_refs = [
+            _event_route_token_ref(event) for event in materialized_qa_events
+        ]
         contract: dict[str, Any] = {}
         route_context_gate: dict[str, Any] = {}
         runtime_projection: dict[str, Any] = {}
@@ -153763,6 +153877,11 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             )
         if include_events:
             result["events"] = events
+        result = _timeline_gate_public_materialized_qa_sanitized(
+            result,
+            materialized_event_ids=materialized_qa_event_ids,
+            materialized_route_token_refs=materialized_qa_route_token_refs,
+        )
         result["request_id"] = ctx.request_id
         return _timeline_warm_cache_store(
             cache_key,

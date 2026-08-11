@@ -19754,6 +19754,9 @@ def _append_observer_materialized_qa_verification(
     implementation_event_id: int,
     principal_id: str = "qa:direct-main-materialized",
     include_test_evidence: bool = True,
+    include_route_lineage: bool = False,
+    materialization_suffix: str = "",
+    status: str = "passed",
 ) -> dict:
     """Append the exact observer-materialized QA shape used by Direct Main."""
 
@@ -19804,24 +19807,29 @@ def _append_observer_materialized_qa_verification(
         for _ in range(3)
     ]
 
-    submitter_session = _insert_active_observer_session_ref(
-        conn,
-        session_id="obs-parentless-direct-main-materializer",
-    )
+    suffix = f"-{materialization_suffix}" if materialization_suffix else ""
+    submitter_session = "obs-parentless-direct-main-materializer"
+    if not materialization_suffix:
+        submitter_session = _insert_active_observer_session_ref(
+            conn,
+            session_id=submitter_session,
+        )
     submitter_principal = "observer:direct-main-materializer"
     qa_report_ref = f"qa_report:{qa_session['session_id']}"
-    route_token_ref = "rtok-parentless-direct-main-materialized-qa"
+    route_token_ref = f"rtok-parentless-direct-main-materialized-qa{suffix}"
     route_identity = {
-        "route_id": "route-parentless-direct-main-materialized-qa",
+        "route_id": f"route-parentless-direct-main-materialized-qa{suffix}",
         "route_context_hash": _fake_sha(
-            "route-parentless-direct-main-materialized-qa"
+            f"route-parentless-direct-main-materialized-qa{suffix}"
         ),
-        "prompt_contract_id": "rprompt-parentless-direct-main-materialized-qa",
+        "prompt_contract_id": (
+            f"rprompt-parentless-direct-main-materialized-qa{suffix}"
+        ),
         "prompt_contract_hash": _fake_sha(
-            "prompt-parentless-direct-main-materialized-qa"
+            f"prompt-parentless-direct-main-materialized-qa{suffix}"
         ),
         "visible_injection_manifest_hash": _fake_sha(
-            "visible-parentless-direct-main-materialized-qa"
+            f"visible-parentless-direct-main-materialized-qa{suffix}"
         ),
         "route_token_ref": route_token_ref,
     }
@@ -19848,6 +19856,42 @@ def _append_observer_materialized_qa_verification(
             "evidence_refs": route_evidence_refs,
         },
     )
+    if include_route_lineage:
+        parent_lineage = {
+            "route_id": f"route-parentless-direct-main-root{suffix}",
+            "route_context_hash": _fake_sha(
+                f"route-parentless-direct-main-root{suffix}"
+            ),
+            "prompt_contract_id": f"rprompt-parentless-direct-main-root{suffix}",
+            "prompt_contract_hash": _fake_sha(
+                f"prompt-parentless-direct-main-root{suffix}"
+            ),
+            "visible_injection_manifest_hash": _fake_sha(
+                f"visible-parentless-direct-main-root{suffix}"
+            ),
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        }
+        observer_route_context.persist_route_token_ref_lineage(
+            conn,
+            project_id=PID,
+            route_token_ref=route_token_ref,
+            parent_route_lineage=parent_lineage,
+            child_route_lineage={
+                **route_identity,
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+        )
+        resolved_materialization = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=route_token_ref,
+        )
+        assert resolved_materialization["parent_route_lineage"]
+        assert resolved_materialization["child_route_lineage"]
     provenance = {
         "schema_version": "qa_evidence_provenance.v1",
         "authorization_source": "qa_session_token_ref",
@@ -19893,7 +19937,7 @@ def _append_observer_materialized_qa_verification(
                 "event_type": "qa.independent_verification",
                 "event_kind": "independent_verification",
                 "phase": "verification",
-                "status": "passed",
+                "status": status,
                 "actor": principal_id,
                 "parent_event_id": implementation_event_id,
                 "commit_sha": commit_sha,
@@ -87772,6 +87816,54 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         ),
         (
             "observer_materialized",
+            "cross_session_later_failed",
+            False,
+            "latest_materialized_qa_verdict_passing",
+        ),
+        (
+            "observer_materialized",
+            "cross_session_enriched_later_failed",
+            False,
+            "latest_materialized_qa_verdict_passing",
+        ),
+        (
+            "observer_materialized",
+            "cross_session_failed_then_passed",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
+            "cross_session_foreign_project",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
+            "cross_session_foreign_backlog",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
+            "cross_session_foreign_task",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
+            "cross_session_foreign_commit",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
+            "cross_session_foreign_implementation",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
             "root_route_registry_revoked",
             False,
             "active_root_route_registry_authority",
@@ -88189,6 +88281,9 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                     "observer_materialized_missing_tests",
                 }
             ),
+            include_route_lineage=(
+                tamper == "cross_session_enriched_later_failed"
+            ),
         )
     else:
         qa_event = _append_authenticated_qa_verification(
@@ -88206,7 +88301,75 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         qa_commit = str(qa_event["commit_sha"])
         qa_parent = int(qa_event["parent_event_id"])
 
-        if tamper.startswith("later_"):
+        if tamper.startswith("cross_session_"):
+            if tamper == "cross_session_failed_then_passed":
+                conn.execute(
+                    "UPDATE task_timeline_events SET status = 'failed' WHERE id = ?",
+                    (int(qa_event["id"]),),
+                )
+                later_status = "passed"
+            else:
+                later_status = "failed"
+            later_qa_event = _append_observer_materialized_qa_verification(
+                conn,
+                backlog_id=backlog_id,
+                task_id=parent_execution_id,
+                commit_sha=close_commit,
+                snapshot_id="full-parentless-direct-main-session-b",
+                implementation_event_id=int(implementation_event["id"]),
+                principal_id="qa:direct-main-materialized-session-b",
+                materialization_suffix="session-b",
+                status=later_status,
+            )
+            prior_provenance = qa_event["payload"]["qa_evidence_provenance"]
+            later_provenance = later_qa_event["payload"][
+                "qa_evidence_provenance"
+            ]
+            assert int(later_qa_event["id"]) > int(qa_event["id"])
+            assert later_qa_event["actor"] != qa_event["actor"]
+            assert later_provenance["evidence_owner_session"] != (
+                prior_provenance["evidence_owner_session"]
+            )
+            assert later_provenance["materialized_from_report"] != (
+                prior_provenance["materialized_from_report"]
+            )
+            assert later_qa_event["payload"]["route_token_ref"] != (
+                qa_event["payload"]["route_token_ref"]
+            )
+            assert set(later_qa_event["payload"]["graph_trace_ids"]).isdisjoint(
+                qa_event["payload"]["graph_trace_ids"]
+            )
+            assert later_qa_event["parent_event_id"] == qa_event["parent_event_id"]
+            assert later_qa_event["commit_sha"] == qa_event["commit_sha"]
+            foreign_columns = {
+                "cross_session_foreign_project": (
+                    "project_id",
+                    "project-foreign-materialized-qa",
+                ),
+                "cross_session_foreign_backlog": (
+                    "backlog_id",
+                    "AC-FOREIGN-MATERIALIZED-QA",
+                ),
+                "cross_session_foreign_task": (
+                    "task_id",
+                    "onboard-service-foreign-materialized-qa",
+                ),
+                "cross_session_foreign_commit": (
+                    "commit_sha",
+                    _fake_sha("foreign-materialized-qa-commit"),
+                ),
+                "cross_session_foreign_implementation": (
+                    "parent_event_id",
+                    int(implementation_event["id"]) + 10000,
+                ),
+            }
+            if tamper in foreign_columns:
+                column, value = foreign_columns[tamper]
+                conn.execute(
+                    f"UPDATE task_timeline_events SET {column} = ? WHERE id = ?",
+                    (value, int(later_qa_event["id"])),
+                )
+        elif tamper.startswith("later_"):
             later_status = (
                 "failed"
                 if tamper == "later_failed_renewed_route"
@@ -88351,6 +88514,13 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
 
         if tamper not in {
             "closed_materializer",
+            "cross_session_later_failed",
+            "cross_session_failed_then_passed",
+            "cross_session_foreign_project",
+            "cross_session_foreign_backlog",
+            "cross_session_foreign_task",
+            "cross_session_foreign_commit",
+            "cross_session_foreign_implementation",
             "expired_materialization_route",
             "expired_qa",
             "later_blocked",
@@ -88764,8 +88934,151 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     )
     assert storage_fingerprint() == storage_before_precheck
     projection = precheck["timeline_gate"]["contract_runtime_close_authority_projection"]
+    if tamper.startswith("cross_session_"):
+        cross_session_gate = projection[
+            "parentless_direct_main_close_authority_gate"
+        ]["checks"]["materialized_qa_monotonic_verdict_gate"]
+        assert cross_session_gate["lineage_count"] == 1
+        expected_latest_id = (
+            int(qa_event["id"])
+            if tamper.startswith("cross_session_foreign_")
+            else int(later_qa_event["id"])
+        )
+        assert cross_session_gate["latest_event_ids"] == [expected_latest_id]
+        assert cross_session_gate["status"] == (
+            "failed"
+            if tamper in {
+                "cross_session_later_failed",
+                "cross_session_enriched_later_failed",
+            }
+            else "passed"
+        )
+        public_precheck = json.dumps(precheck, sort_keys=True)
+        later_provenance = later_qa_event["payload"]["qa_evidence_provenance"]
+        for private_ref in (
+            later_provenance["evidence_owner_session"],
+            later_provenance["materialized_from_report"],
+            later_qa_event["payload"]["route_token_ref"],
+        ):
+            assert private_ref not in public_precheck
+        if tamper in {
+            "cross_session_failed_then_passed",
+            "cross_session_enriched_later_failed",
+        }:
+            raw_gate_events = task_timeline.list_backlog_gate_events(
+                conn,
+                PID,
+                backlog_id=backlog_id,
+                limit=1000,
+            )
+            assert int(qa_event["id"]) in {
+                int(event["id"])
+                for event in raw_gate_events
+                if server._timeline_gate_observer_materialized_qa_event(event)
+            }
+            server._timeline_warm_cache_clear()
+            matrix_storage_before = storage_fingerprint()
+            private_refs = {
+                prior_provenance["evidence_owner_session"],
+                prior_provenance["materialized_from_report"],
+                qa_event["artifact_refs"]["qa_scope_binding_ref"],
+                qa_event["payload"]["route_token_ref"],
+                later_provenance["evidence_owner_session"],
+                later_provenance["materialized_from_report"],
+                later_qa_event["artifact_refs"]["qa_scope_binding_ref"],
+                later_qa_event["payload"]["route_token_ref"],
+            }
+            for view_value in (None, "full", "compact", "repair"):
+                for matrix_include_events in (False, True):
+                    matrix_query = {"close_commit": close_commit}
+                    if view_value is not None:
+                        matrix_query["view"] = view_value
+                    if matrix_include_events:
+                        matrix_query["include_events"] = "true"
+                    server._timeline_warm_cache_clear()
+                    matrix_responses = [
+                        server.handle_backlog_timeline_gate(
+                            _ctx(
+                                {"project_id": PID, "bug_id": backlog_id},
+                                query=matrix_query,
+                            )
+                        )
+                        for _ in range(2)
+                    ]
+                    assert matrix_responses[0]["warm_cache"]["status"] == "miss"
+                    assert matrix_responses[1]["warm_cache"]["status"] == "hit"
+                    for matrix_response in matrix_responses:
+                        public_matrix = json.dumps(matrix_response, sort_keys=True)
+                        assert all(ref not in public_matrix for ref in private_refs)
+                        if matrix_include_events:
+                            public_events = {
+                                int(event["id"]): event
+                                for event in matrix_response["events"]
+                            }
+                            for event_id in (
+                                int(qa_event["id"]),
+                                int(later_qa_event["id"]),
+                            ):
+                                materialized_copy = public_events[event_id]
+                                for container_key in (
+                                    "payload",
+                                    "verification",
+                                    "artifact_refs",
+                                ):
+                                    assert not (
+                                        set(materialized_copy[container_key])
+                                        & server._TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS
+                                    )
+                            root_copy = public_events[int(accepted_pre_mutation["id"])]
+                            assert close_route_token_ref in json.dumps(
+                                root_copy,
+                                sort_keys=True,
+                            )
+                        if view_value in (None, "full"):
+                            enrichment = matrix_response["timeline_gate"][
+                                "server_route_lineage_enrichment"
+                            ]
+                            summary_key = (
+                                "enriched_events"
+                                if tamper
+                                == "cross_session_enriched_later_failed"
+                                else "failed_events"
+                            )
+                            matching_summaries = [
+                                item
+                                for item in enrichment[summary_key]
+                                if int(item["id"])
+                                in {
+                                    int(qa_event["id"]),
+                                    int(later_qa_event["id"]),
+                                }
+                            ]
+                            assert len(matching_summaries) == 1, [
+                                (item.get("id"), item.get("event_kind"), item.get("status"))
+                                for item in enrichment[summary_key]
+                            ]
+                            assert "route_token_ref" not in matching_summaries[0]
+                            assert close_route_token_ref in public_matrix
+            assert storage_fingerprint() == matrix_storage_before
+            stored_later_payload = json.loads(
+                conn.execute(
+                    "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+                    (int(later_qa_event["id"]),),
+                ).fetchone()[0]
+            )
+            assert stored_later_payload["route_token_ref"] == (
+                later_qa_event["payload"]["route_token_ref"]
+            )
+            resolved_later_route = observer_route_context.resolve_route_token_ref(
+                conn,
+                project_id=PID,
+                route_token_ref=later_qa_event["payload"]["route_token_ref"],
+            )
+            assert "task_timeline_append" in resolved_later_route["allowed_actions"]
     actual_zero_write_tampers = {
         "close_ready_authority_drift",
+        "cross_session_later_failed",
+        "cross_session_enriched_later_failed",
         "implementation_authority_drift",
         "later_failed",
         "root_exception_authority_drift",
@@ -88852,6 +89165,16 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "evidence_owner_session"
         ] not in close_failure
         assert qa_event["payload"]["route_token_ref"] not in close_failure
+        if tamper in {
+            "cross_session_later_failed",
+            "cross_session_enriched_later_failed",
+        }:
+            later_provenance = later_qa_event["payload"][
+                "qa_evidence_provenance"
+            ]
+            assert later_provenance["evidence_owner_session"] not in close_failure
+            assert later_provenance["materialized_from_report"] not in close_failure
+            assert later_qa_event["payload"]["route_token_ref"] not in close_failure
         if tamper not in {
             "root_route_registry_revoked",
             "root_route_registry_required_ref_removed",
@@ -88946,6 +89269,12 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     assert closed["ok"] is True
     assert closed["status"] == "FIXED"
     assert closed["gate_summary"]["can_close"] is True
+    if tamper.startswith("cross_session_"):
+        public_close = json.dumps(closed, sort_keys=True)
+        later_provenance = later_qa_event["payload"]["qa_evidence_provenance"]
+        assert later_provenance["evidence_owner_session"] not in public_close
+        assert later_provenance["materialized_from_report"] not in public_close
+        assert later_qa_event["payload"]["route_token_ref"] not in public_close
 
 
 def test_parentless_direct_main_qa_timeline_accepts_explicit_service_parent_once(
