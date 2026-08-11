@@ -12206,6 +12206,291 @@ def _qa_post_merge_resolve_commit(project_root: Path, commit_sha: str) -> str:
     return full_commit
 
 
+def _qa_exact_candidate_direct_main_post_merge_provenance(
+    conn,
+    *,
+    project_id: str,
+    row: Any,
+    canonical_project_root: Path,
+    candidate_commit_sha: str,
+    canonical_head_commit: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    """Re-derive post-merge QA authority for a parentless Direct Main lane.
+
+    A parentless ``operator_supervised_direct_main`` execution intentionally has
+    no branch RuntimeContext or durable ``live_merge`` event.  When its exact
+    candidate becomes an ancestor of canonical HEAD before independent QA can
+    append its verdict, the branch-only provenance gate must not demand those
+    impossible identities.  This path is applicable only when the server can
+    re-derive the admitted Direct Main exception and implementation from the
+    timeline, then prove clean version sync, the current active graph, and (for
+    the governance repository itself) the loaded runtime at canonical HEAD.
+    """
+
+    trace_id = str(row["trace_id"] or "").strip()
+    backlog_id = str(row["backlog_id"] or "").strip()
+    task_id = str(row["task_id"] or "").strip()
+    candidate_commit = str(candidate_commit_sha or "").strip().lower()
+    canonical_head = str(canonical_head_commit or "").strip().lower()
+
+    from .parallel_branch_runtime import get_branch_context
+
+    # A real branch lane remains exclusively governed by the existing
+    # RuntimeContext + live_merge provenance path below.
+    if get_branch_context(conn, project_id, task_id) is not None:
+        return {}, [], False
+
+    try:
+        direct_record = _contract_runtime_store(conn).get(task_id)
+    except ContractRuntimeError:
+        direct_record = {}
+    if not (
+        task_id.startswith("onboard-service-")
+        and _onboard_service_record(direct_record)
+        and str(direct_record.get("project_id") or "").strip() == project_id
+        and str(direct_record.get("backlog_id") or "").strip() == backlog_id
+        and not str(
+            direct_record.get("parent_contract_execution_id") or ""
+        ).strip()
+        and str(
+            direct_record.get("root_contract_execution_id") or ""
+        ).strip()
+        == task_id
+    ):
+        return {}, [], False
+
+    mismatches: list[dict[str, Any]] = []
+
+    def mismatch(field: str, expected: Any, actual: Any) -> None:
+        mismatches.append(
+            {
+                "trace_id": trace_id,
+                "field": field,
+                "expected": expected,
+                "actual": actual,
+            }
+        )
+
+    try:
+        from . import graph_snapshot_store, task_timeline
+
+        timeline_events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            limit=1000,
+        )
+    except Exception:
+        timeline_events = []
+
+    backlog_row = conn.execute(
+        """
+        SELECT target_files, test_files
+          FROM backlog_bugs
+         WHERE bug_id = ?
+        """,
+        (backlog_id,),
+    ).fetchone()
+    row_declared_files: list[str] = []
+    if backlog_row is not None:
+        for key in ("target_files", "test_files"):
+            try:
+                raw_files = json.loads(str(backlog_row[key] or "[]"))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                raw_files = []
+            if isinstance(raw_files, list):
+                row_declared_files.extend(
+                    str(path or "").strip()
+                    for path in raw_files
+                    if str(path or "").strip()
+                )
+    row_declared_files = _runtime_context_service_dedupe(row_declared_files)
+
+    direct_event: dict[str, Any] = {}
+    direct_gate: dict[str, Any] = {}
+    direct_identity: dict[str, str] = {}
+    for raw_event in timeline_events:
+        event = dict(raw_event) if isinstance(raw_event, Mapping) else {}
+        if not event:
+            continue
+        identity = _observer_root_route_identity_from_event(event)
+        event_gate = task_timeline.observer_direct_pre_mutation_authority_gate(
+            event,
+            identity,
+            row_declared_files=row_declared_files,
+        )
+        if not event_gate.get("accepted"):
+            continue
+        if not _contract_runtime_close_authority_route_token_backed_event(
+            event,
+            identity,
+            require_source_backed_authority=True,
+        ):
+            continue
+        direct_event = event
+        direct_gate = event_gate
+        direct_identity = identity
+
+    # A selected onboard service without the source-backed Direct Main event is
+    # not this lane.  Let the ordinary branch provenance path reject or accept
+    # it under its own identities.
+    if not direct_event:
+        return {}, [], False
+
+    direct_event_id = _contract_runtime_projection_timeline_event_id(direct_event)
+    implementation_event = task_timeline._latest_passing_close_event(
+        timeline_events,
+        "implementation",
+        after_event_id=direct_event_id,
+    )
+    implementation_event_id = _contract_runtime_projection_timeline_event_id(
+        implementation_event
+    )
+    implementation_scope = task_timeline._observer_direct_changed_file_scope(
+        implementation_event,
+        {"close_context": {"target_files": row_declared_files}},
+    )
+    implementation_identity = _observer_root_route_identity_from_event(
+        implementation_event
+    )
+    implementation_valid = bool(
+        implementation_event
+        and str(implementation_event.get("commit_sha") or "").strip().lower()
+        == candidate_commit
+        and implementation_scope.get("passed") is True
+        and _contract_runtime_close_authority_route_token_backed_event(
+            implementation_event,
+            implementation_identity,
+            require_source_backed_authority=True,
+        )
+    )
+    if not implementation_valid:
+        mismatch(
+            "implementation_event",
+            "source-backed Direct Main implementation at exact candidate commit",
+            f"timeline:{implementation_event_id}" if implementation_event_id else "missing",
+        )
+
+    root_route_ref = str(direct_identity.get("route_token_ref") or "").strip()
+    root_route_gate = _contract_runtime_close_authority_first_deep_mapping(
+        direct_event,
+        "route_token_gate",
+    )
+    if not (
+        root_route_ref
+        and root_route_gate.get("registry_verified") is True
+        and str(root_route_gate.get("route_token_ref") or "").strip()
+        == root_route_ref
+    ):
+        mismatch(
+            "root_route_registry",
+            "append-time server-verified Direct Main route registry authority",
+            root_route_ref or "missing",
+        )
+
+    version_row = conn.execute(
+        """
+        SELECT git_head, dirty_files, git_synced_at
+          FROM project_version
+         WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()
+    synced_head = str(version_row["git_head"] or "").strip().lower() if version_row else ""
+    git_synced_at = str(version_row["git_synced_at"] or "").strip() if version_row else ""
+    try:
+        synced_dirty_files = json.loads(
+            str(version_row["dirty_files"] or "[]") if version_row else "[]"
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        synced_dirty_files = ["invalid_dirty_files_json"]
+    if synced_head != canonical_head or synced_dirty_files or not git_synced_at:
+        mismatch(
+            "version_sync",
+            {"git_head": canonical_head, "dirty_files": [], "git_synced_at": "present"},
+            {
+                "git_head": synced_head,
+                "dirty_files": synced_dirty_files,
+                "git_synced_at": git_synced_at,
+            },
+        )
+
+    active_snapshot = graph_snapshot_store.get_active_graph_snapshot(
+        conn,
+        project_id,
+    ) or {}
+    active_snapshot_id = str(active_snapshot.get("snapshot_id") or "").strip()
+    active_snapshot_commit = str(active_snapshot.get("commit_sha") or "").strip().lower()
+    if not active_snapshot_id or active_snapshot_commit != canonical_head:
+        mismatch(
+            "active_graph",
+            {"snapshot_id": "present", "commit_sha": canonical_head},
+            {
+                "snapshot_id": active_snapshot_id,
+                "commit_sha": active_snapshot_commit,
+            },
+        )
+
+    self_root = Path(__file__).resolve().parents[2]
+    governance_runtime_version = ""
+    if Path(canonical_project_root).resolve() == self_root:
+        governance_runtime_version = str(
+            get_governance_runtime_version(default="") or ""
+        ).strip().lower()
+        if not (
+            governance_runtime_version
+            and (
+                canonical_head.startswith(governance_runtime_version)
+                or governance_runtime_version.startswith(canonical_head)
+            )
+        ):
+            mismatch(
+                "governance_runtime_version",
+                canonical_head,
+                governance_runtime_version or "missing",
+            )
+
+    if mismatches:
+        return {}, mismatches, True
+
+    authority = {
+        "schema_version": "qa_exact_candidate.direct_main_post_merge_provenance.v1",
+        "verified": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "source": (
+            "direct_main_timeline+route_registry+git_ancestry+"
+            "version_sync+active_graph+loaded_runtime"
+        ),
+        "trace_id": trace_id,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "candidate_commit_sha": candidate_commit,
+        "canonical_head_commit_sha": canonical_head,
+        "direct_exception_event_id": direct_event_id,
+        "direct_exception_event_ref": f"timeline:{direct_event_id}",
+        "implementation_event_id": implementation_event_id,
+        "implementation_event_ref": f"timeline:{implementation_event_id}",
+        "root_route_token_ref": root_route_ref,
+        "active_snapshot_id": active_snapshot_id,
+        "version_sync_git_head": synced_head,
+        "git_synced_at": git_synced_at,
+        "governance_runtime_version": governance_runtime_version,
+        "qa_performed_post_merge": True,
+        "candidate_is_ancestor": True,
+        "canonical_head_graph_current": True,
+        "canonical_head_runtime_current": True,
+        "branch_runtime_context_required": False,
+        "branch_runtime_context_synthesized": False,
+        "live_merge_event_synthesized": False,
+        "direct_pre_mutation_authority_hash": stable_sha256(direct_gate),
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority, [], True
+
+
 def _qa_exact_candidate_post_merge_provenance(
     conn,
     *,
@@ -12259,6 +12544,19 @@ def _qa_exact_candidate_post_merge_provenance(
             }
         )
         return {}, mismatches
+
+    direct_provenance, direct_mismatches, direct_applicable = (
+        _qa_exact_candidate_direct_main_post_merge_provenance(
+            conn,
+            project_id=project_id,
+            row=row,
+            canonical_project_root=canonical_project_root,
+            candidate_commit_sha=candidate_commit,
+            canonical_head_commit=canonical_head,
+        )
+    )
+    if direct_applicable:
+        return direct_provenance, direct_mismatches
 
     from .parallel_branch_runtime import (
         get_branch_context,

@@ -386,6 +386,208 @@ def test_governance_singleton_proves_only_already_dead_prior_esrch(tmp_path):
         dead_lease.release()
 
 
+def test_exact_candidate_post_merge_qa_accepts_parentless_direct_main_without_runtime_context(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DIRECT-MAIN-POSTMERGE-EXACT-QA"
+    project_root = tmp_path / "direct-main-postmerge-exact-qa"
+    candidate_commit = _init_test_git_repo(project_root)
+    (project_root / "postmerge.txt").write_text("current head\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "postmerge.txt"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "advance canonical head"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    canonical_head = batch_jobs.git_commit(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+
+    parent_execution_id, route_token_ref, route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+        )
+    )
+    graph_trace_id = "gqt-20260811-da1ec70001"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_identity=route_identity,
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_canonical_parentless_direct_main_pre_mutation_body(
+                append_base={
+                    "backlog_id": backlog_id,
+                    "task_id": parent_execution_id,
+                    "route_token_ref": route_token_ref,
+                },
+                route_identity=route_identity,
+                allowed_files=["agent/governance/server.py"],
+                graph_trace_ids=[graph_trace_id],
+            ),
+        )
+    )
+    implementation = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": parent_execution_id,
+                "event_type": "mf.implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "passed",
+                "actor": "observer",
+                "commit_sha": candidate_commit,
+                "route_token_ref": route_token_ref,
+                "payload": {
+                    "changed_files": ["agent/governance/server.py"],
+                    "test_results": {"focused": "passed"},
+                },
+            },
+        )
+    )
+    assert implementation["payload"]["source_backed_contract_gate_authority"][
+        "route_token_gate"
+    ]["allowed"] is True
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO project_version
+            (project_id, chain_version, updated_at, updated_by, git_head,
+             dirty_files, git_synced_at)
+        VALUES (?, ?, ?, 'test', ?, '[]', ?)
+        """,
+        (
+            PID,
+            canonical_head,
+            "2026-08-11T00:00:00Z",
+            canonical_head,
+            "2026-08-11T00:00:00Z",
+        ),
+    )
+    _activate_basic_graph(
+        conn,
+        "full-direct-main-postmerge-head",
+        commit_sha=canonical_head,
+    )
+    conn.commit()
+
+    authority, mismatches = server._qa_exact_candidate_post_merge_provenance(
+        conn,
+        project_id=PID,
+        row={
+            "trace_id": "gqt-direct-main-exact-candidate-qa",
+            "backlog_id": backlog_id,
+            "task_id": parent_execution_id,
+        },
+        canonical_project_root=project_root,
+        candidate_commit_sha=candidate_commit,
+        canonical_head_commit=canonical_head,
+    )
+
+    assert mismatches == []
+    assert authority["schema_version"] == (
+        "qa_exact_candidate.direct_main_post_merge_provenance.v1"
+    )
+    assert authority["verified"] is True
+    assert authority["qa_performed_post_merge"] is True
+    assert authority["candidate_commit_sha"] == candidate_commit
+    assert authority["canonical_head_commit_sha"] == canonical_head
+    assert authority["implementation_event_ref"] == (
+        f"timeline:{implementation['id']}"
+    )
+    assert authority["branch_runtime_context_required"] is False
+    assert authority["branch_runtime_context_synthesized"] is False
+    assert authority["live_merge_event_synthesized"] is False
+    assert authority["authority_hash"] == server.stable_sha256(
+        {key: value for key, value in authority.items() if key != "authority_hash"}
+    )
+
+    conn.execute(
+        "UPDATE project_version SET dirty_files = ? WHERE project_id = ?",
+        (json.dumps(["agent/governance/server.py"]), PID),
+    )
+    conn.commit()
+    dirty_authority, dirty_mismatches = (
+        server._qa_exact_candidate_post_merge_provenance(
+            conn,
+            project_id=PID,
+            row={
+                "trace_id": "gqt-direct-main-exact-candidate-qa",
+                "backlog_id": backlog_id,
+                "task_id": parent_execution_id,
+            },
+            canonical_project_root=project_root,
+            candidate_commit_sha=candidate_commit,
+            canonical_head_commit=canonical_head,
+        )
+    )
+    assert dirty_authority == {}
+    assert {item["field"] for item in dirty_mismatches} == {"version_sync"}
+
+    conn.execute(
+        "UPDATE project_version SET dirty_files = '[]' WHERE project_id = ?",
+        (PID,),
+    )
+    conn.commit()
+    from agent.governance import parallel_branch_runtime
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_branch_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            runtime_context_id="mfrctx-real-branch-stays-strict",
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            parent_task_id=parent_execution_id,
+            root_task_id=parent_execution_id,
+            attempt=1,
+        ),
+    )
+    branch_authority, branch_mismatches = (
+        server._qa_exact_candidate_post_merge_provenance(
+            conn,
+            project_id=PID,
+            row={
+                "trace_id": "gqt-direct-main-exact-candidate-qa",
+                "backlog_id": backlog_id,
+                "task_id": parent_execution_id,
+            },
+            canonical_project_root=project_root,
+            candidate_commit_sha=candidate_commit,
+            canonical_head_commit=canonical_head,
+        )
+    )
+    assert branch_authority == {}
+    assert {item["field"] for item in branch_mismatches} == {
+        "canonical_head_commit"
+    }
+
+
 @pytest.mark.parametrize(
     ("raised", "expected_code"),
     [
