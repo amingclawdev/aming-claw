@@ -144193,7 +144193,7 @@ def handle_task_timeline_append(ctx: RequestContext):
         return result
 
 
-_TIMELINE_WARM_CACHE_SCHEMA_VERSION = "task_timeline.warm_cache.v2"
+_TIMELINE_WARM_CACHE_SCHEMA_VERSION = "task_timeline.warm_cache.v3"
 try:
     _TIMELINE_WARM_CACHE_TTL_SECONDS = max(
         0.1,
@@ -144892,7 +144892,11 @@ def _timeline_warm_cache_prepare(
         "current_generation": generation,
     }
     identity_hash = "sha256:" + hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(
+            {**identity, "_cache_schema": _TIMELINE_WARM_CACHE_SCHEMA_VERSION},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     ).hexdigest()
     resource_key_hash = "sha256:" + hashlib.sha256(
         json.dumps(stable_identity, sort_keys=True, separators=(",", ":")).encode(
@@ -153537,7 +153541,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                 "include_compact_ledger": str(
                     bool(include_compact_ledger)
                 ).lower(),
-                "public_authority": "legacy_advisory.materialized_qa_sanitized.v1",
+                "public_authority": "legacy_advisory",
             }
         )
         cache_key, cache_watermark, cached_response, cache_metadata = (
@@ -153552,7 +153556,7 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                         ctx.query,
                         "contract_execution_id",
                     ),
-                    "public_authority": "legacy_advisory.materialized_qa_sanitized.v1",
+                    "public_authority": "legacy_advisory",
                 },
             )
         )

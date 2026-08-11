@@ -88988,6 +88988,77 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 later_qa_event["artifact_refs"]["qa_scope_binding_ref"],
                 later_qa_event["payload"]["route_token_ref"],
             }
+            if tamper == "cross_session_enriched_later_failed":
+                cache_probe_query = {
+                    "close_commit": close_commit,
+                    "include_events": "true",
+                }
+                cache_probe = server.handle_backlog_timeline_gate(
+                    _ctx(
+                        {"project_id": PID, "bug_id": backlog_id},
+                        query=cache_probe_query,
+                    )
+                )
+                assert cache_probe["warm_cache"]["status"] == "miss"
+                cache_identity = cache_probe["warm_cache"]["identity"]
+                assert cache_identity["resource"]["public_authority"] == (
+                    "legacy_advisory"
+                )
+                assert dict(cache_identity["query"])["public_authority"] == [
+                    "legacy_advisory"
+                ]
+                assert all(
+                    ref not in json.dumps(cache_probe, sort_keys=True)
+                    for ref in private_refs
+                )
+                legacy_identity_hash = "sha256:" + hashlib.sha256(
+                    json.dumps(
+                        cache_identity,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                legacy_stable_identity = {
+                    key: value
+                    for key, value in cache_identity.items()
+                    if key != "current_generation"
+                }
+                legacy_resource_key_hash = "sha256:" + hashlib.sha256(
+                    json.dumps(
+                        legacy_stable_identity,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                legacy_payload = copy.deepcopy(cache_probe)
+                legacy_payload.pop("warm_cache", None)
+                legacy_payload["unsanitized_materialization_ref"] = (
+                    qa_event["payload"]["route_token_ref"]
+                )
+                server._timeline_warm_cache_clear()
+                server._TIMELINE_WARM_CACHE[legacy_identity_hash] = {
+                    "stored_at": time.monotonic(),
+                    "ttl_seconds": 60.0,
+                    "payload": legacy_payload,
+                    "response_bytes": len(json.dumps(legacy_payload)),
+                }
+                server._TIMELINE_WARM_CACHE_RESOURCE_KEYS[
+                    legacy_resource_key_hash
+                ] = legacy_identity_hash
+                replay_probe = server.handle_backlog_timeline_gate(
+                    _ctx(
+                        {"project_id": PID, "bug_id": backlog_id},
+                        query=cache_probe_query,
+                    )
+                )
+                assert replay_probe["warm_cache"]["status"] == "miss"
+                assert replay_probe["warm_cache"]["identity_hash"] != (
+                    legacy_identity_hash
+                )
+                assert all(
+                    ref not in json.dumps(replay_probe, sort_keys=True)
+                    for ref in private_refs
+                )
             for view_value in (None, "full", "compact", "repair"):
                 for matrix_include_events in (False, True):
                     matrix_query = {"close_commit": close_commit}
@@ -89009,6 +89080,9 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                     assert matrix_responses[1]["warm_cache"]["status"] == "hit"
                     for matrix_response in matrix_responses:
                         public_matrix = json.dumps(matrix_response, sort_keys=True)
+                        assert matrix_response["warm_cache"]["identity"][
+                            "resource"
+                        ]["public_authority"] == "legacy_advisory"
                         assert all(ref not in public_matrix for ref in private_refs)
                         if matrix_include_events:
                             public_events = {
