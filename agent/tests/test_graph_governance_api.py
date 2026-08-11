@@ -41,6 +41,7 @@ from agent.governance import observer_route_context
 from agent.governance import observer_session
 from agent.governance import parallel_branch_runtime
 from agent.governance import graph_snapshot_store as store
+from agent.governance import graph_query_trace
 from agent.governance import reconcile_feedback
 from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
 from agent.governance import server
@@ -823,6 +824,51 @@ def test_terminalization_auth_requires_exact_managed_observer_route_action(
     assert renewal_windows and set(renewal_windows) == {0}
     assert conn.total_changes == before_exact
 
+    release_ref = "rtok-release-preflight-exact-route"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=release_ref,
+        allowed_actions=["graph_reconcile_release_preflight"],
+    )
+    before_release = conn.total_changes
+    release = server._require_reconcile_terminalization_auth(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": release_ref,
+            },
+        ),
+        conn,
+        "graph_reconcile_release_preflight",
+    )
+    assert release["route_token_allowed_actions"] == [
+        "graph_reconcile_release_preflight"
+    ]
+    assert conn.total_changes == before_release
+
+    with pytest.raises(GovernanceError) as wrong_action:
+        server._require_reconcile_terminalization_auth(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": exact_ref,
+                },
+            ),
+            conn,
+            "graph_reconcile_release_preflight",
+        )
+    assert wrong_action.value.details["zero_write_rejection"] is True
+
     with pytest.raises(GovernanceError) as operator:
         server._require_reconcile_terminalization_auth(
             _ctx_with_role(
@@ -975,6 +1021,668 @@ def test_terminalization_schema_prewarm_is_read_only_after_ready():
         )
     finally:
         connection.close()
+
+
+def test_release_preflight_plan_binds_recovery_retention_and_headroom_safely(
+    conn,
+    monkeypatch,
+):
+    _activate_basic_graph(
+        conn,
+        "full-release-preflight-active",
+        commit_sha="a" * 40,
+    )
+    candidate_id = "rterm1.17." + "f" * 64
+    monkeypatch.setattr(
+        store,
+        "list_reconcile_run_metrics_window",
+        lambda *_args, **_kwargs: {
+            "rows": [
+                {
+                    "project_id": PID,
+                    "run_id": "sessionToken-private-run",
+                    "snapshot_id": "full-private-running-snapshot",
+                    "status": "running",
+                    "effective_status": "running",
+                    "is_terminal": False,
+                }
+            ],
+            "has_more": False,
+            "truncated": False,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_reconcile_terminalization_candidate_projection",
+        lambda *_args, **_kwargs: {"candidate_id": candidate_id},
+    )
+    monkeypatch.setattr(
+        store,
+        "select_snapshot_retention_candidates",
+        lambda *_args, **_kwargs: {
+            "config": {"keep_last_n": 10, "source": "project_config"},
+            "protected_count": 1,
+            "candidate_count": 1,
+            "protected": [{"snapshot_id": "full-release-preflight-active"}],
+            "candidates": [
+                {
+                    "snapshot_id": "sessionToken-private-retention-snapshot",
+                    "snapshot_kind": "full",
+                    "status": "candidate_ready",
+                    "size_bytes": 4096,
+                    "dir_exists": True,
+                    "in_db": True,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "validate_snapshot_companion_integrity",
+        lambda *_args, **_kwargs: {"valid": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        server,
+        "_release_materialization_size_bytes",
+        lambda *_args, **_kwargs: 2000,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server.shutil,
+        "disk_usage",
+        lambda _path: server.shutil._ntuple_diskusage(40_000, 19_000, 21_000),
+    )
+
+    before = conn.total_changes
+    result = server._graph_release_recovery_retention_preflight(
+        conn,
+        store,
+        PID,
+        apply=False,
+        backlog_id="AC-RELEASE-PREFLIGHT",
+        task_id="release-preflight-task",
+    )
+
+    assert conn.total_changes == before
+    assert result["schema_version"] == "graph_release.recovery_retention_preflight.v1"
+    assert result["mode"] == "plan"
+    assert result["ready"] is False
+    assert result["ready_after_apply"] is True
+    assert result["orphan_recovery"] == {
+        "candidate_count": 1,
+        "unresolved_count": 0,
+        "terminalized_count": 0,
+        "candidates": [{"candidate_id": candidate_id}],
+    }
+    assert result["headroom"] == {
+        "materialization_count": 3,
+        "storage_copy_multiplier": 2,
+        "per_materialization_estimate_bytes": 4096,
+        "required_bytes": 24_576,
+        "available_bytes": 21_000,
+        "reclaimable_bytes": 4096,
+        "projected_after_apply_bytes": 25_096,
+        "ready_now": False,
+        "ready_after_apply": True,
+    }
+    assert result["retention"]["candidate_count"] == 1
+    serialized = json.dumps(result, sort_keys=True)
+    assert "sessionToken-private" not in serialized
+
+
+def test_release_preflight_apply_terminalizes_before_retention_and_scrubs_paths(
+    conn,
+    monkeypatch,
+):
+    _activate_basic_graph(
+        conn,
+        "full-release-preflight-apply",
+        commit_sha="b" * 40,
+    )
+    candidate_id = "rterm1.23." + "e" * 64
+    calls = []
+    monkeypatch.setattr(
+        store,
+        "list_reconcile_run_metrics_window",
+        lambda *_args, **_kwargs: {
+            "rows": [
+                {
+                    "project_id": PID,
+                    "run_id": "current-full-bbbbbbb",
+                    "snapshot_id": "full-bbbbbbb-bbbb",
+                    "status": "running",
+                    "effective_status": "running",
+                    "is_terminal": False,
+                }
+            ],
+            "has_more": False,
+            "truncated": False,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_reconcile_terminalization_candidate_projection",
+        lambda *_args, **_kwargs: {"candidate_id": candidate_id},
+    )
+    monkeypatch.setattr(
+        server,
+        "_resolve_reconcile_terminalization_candidate",
+        lambda *_args, **_kwargs: {
+            "run_id": "current-full-bbbbbbb",
+            "snapshot_id": "full-bbbbbbb-bbbb",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_record_reconcile_run_terminalization",
+        lambda *_args, **_kwargs: calls.append("terminalize") or {
+            "writes_performed": True,
+            "replayed": False,
+        },
+    )
+    selection = {
+        "config": {"keep_last_n": 10, "source": "project_config"},
+        "protected_count": 1,
+        "candidate_count": 1,
+        "protected": [{"snapshot_id": "full-release-preflight-apply"}],
+        "candidates": [
+            {
+                "snapshot_id": "full-old-retention-candidate",
+                "snapshot_kind": "full",
+                "status": "candidate_ready",
+                "size_bytes": 4096,
+                "dir_exists": True,
+                "in_db": True,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        store,
+        "select_snapshot_retention_candidates",
+        lambda *_args, **_kwargs: selection,
+    )
+    monkeypatch.setattr(
+        store,
+        "run_snapshot_retention_gc",
+        lambda *_args, **_kwargs: calls.append("retention") or {
+            "ok": True,
+            "deleted_dirs": [
+                {
+                    "snapshot_id": "full-old-retention-candidate",
+                    "path": "/Users/private/graph-snapshots/full-old-retention-candidate",
+                    "size_bytes": 4096,
+                }
+            ],
+            "freed_bytes": 4096,
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "validate_snapshot_companion_integrity",
+        lambda *_args, **_kwargs: {"valid": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        server,
+        "_release_materialization_size_bytes",
+        lambda *_args, **_kwargs: 2000,
+        raising=False,
+    )
+    free_values = iter((21_000, 25_096))
+    monkeypatch.setattr(
+        server.shutil,
+        "disk_usage",
+        lambda _path: server.shutil._ntuple_diskusage(
+            40_000, 19_000, next(free_values)
+        ),
+    )
+
+    result = server._graph_release_recovery_retention_preflight(
+        conn,
+        store,
+        PID,
+        apply=True,
+        backlog_id="AC-RELEASE-PREFLIGHT",
+        task_id="release-preflight-task",
+    )
+
+    assert calls == ["terminalize", "retention"]
+    assert result["mode"] == "apply"
+    assert result["ready"] is True
+    assert result["orphan_recovery"]["terminalized_count"] == 1
+    assert result["retention"]["deleted_count"] == 1
+    assert result["retention"]["freed_bytes"] == 4096
+    assert result["build_fence"] == {
+        "clear": True,
+        "process_active_count": 0,
+        "durable_active_count": 0,
+    }
+    serialized = json.dumps(result, sort_keys=True)
+    assert "/Users/private" not in serialized
+
+    process_key = (PID, "full-concurrent-release-preflight-build")
+    server._CURRENT_FULL_BUILD_KEYS.add(process_key)
+    try:
+        before_calls = list(calls)
+        with pytest.raises(GovernanceError) as rejected:
+            server._graph_release_recovery_retention_preflight(
+                conn,
+                store,
+                PID,
+                apply=True,
+                backlog_id="AC-RELEASE-PREFLIGHT",
+                task_id="release-preflight-task",
+            )
+        assert rejected.value.code == "graph_release_preflight_build_fence_active"
+        assert rejected.value.details["zero_write_rejection"] is True
+        assert calls == before_calls
+    finally:
+        server._CURRENT_FULL_BUILD_KEYS.discard(process_key)
+
+
+def test_release_preflight_rejects_unbounded_nonterminal_window_zero_write(
+    conn,
+    monkeypatch,
+):
+    _activate_basic_graph(
+        conn,
+        "full-release-preflight-window",
+        commit_sha="c" * 40,
+    )
+    monkeypatch.setattr(
+        store,
+        "list_reconcile_run_metrics_window",
+        lambda *_args, **_kwargs: {
+            "rows": [],
+            "has_more": True,
+            "truncated": True,
+        },
+    )
+    before = conn.total_changes
+    with pytest.raises(GovernanceError) as rejected:
+        server._graph_release_recovery_retention_preflight(
+            conn,
+            store,
+            PID,
+            apply=False,
+            backlog_id="AC-RELEASE-PREFLIGHT",
+            task_id="release-preflight-task",
+        )
+    assert rejected.value.code == "graph_release_preflight_nonterminal_window_unbounded"
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == before
+
+
+def test_release_preflight_accepts_truncated_terminal_history_when_nonterminal_complete(
+    conn,
+    monkeypatch,
+):
+    _activate_basic_graph(
+        conn,
+        "full-release-preflight-terminal-history",
+        commit_sha="c" * 40,
+    )
+    monkeypatch.setattr(
+        store,
+        "list_reconcile_run_metrics_window",
+        lambda *_args, **_kwargs: {
+            "rows": [],
+            "has_more": False,
+            "truncated": True,
+            "latest_sample_truncated": True,
+            "effective_nonterminal_completeness": "complete",
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "select_snapshot_retention_candidates",
+        lambda *_args, **_kwargs: {
+            "config": {"keep_last_n": 10},
+            "protected_count": 1,
+            "candidate_count": 0,
+            "protected": [
+                {"snapshot_id": "full-release-preflight-terminal-history"}
+            ],
+            "candidates": [],
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "validate_snapshot_companion_integrity",
+        lambda *_args, **_kwargs: {"valid": True},
+    )
+    monkeypatch.setattr(
+        server,
+        "_release_materialization_size_bytes",
+        lambda *_args, **_kwargs: 1000,
+    )
+    monkeypatch.setattr(
+        server.shutil,
+        "disk_usage",
+        lambda _path: server.shutil._ntuple_diskusage(20_000, 10_000, 10_000),
+    )
+
+    result = server._graph_release_recovery_retention_preflight(
+        conn,
+        store,
+        PID,
+        apply=False,
+        backlog_id="AC-RELEASE-PREFLIGHT",
+        task_id="release-preflight-task",
+    )
+
+    assert result["ready"] is True
+    assert result["orphan_recovery"]["unresolved_count"] == 0
+
+
+def test_release_preflight_manager_action_dispatches_before_root_or_build(
+    conn,
+    monkeypatch,
+):
+    observed = {}
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_reconcile_terminalization_auth",
+        lambda _ctx, _conn, required_action=server._RECONCILE_TERMINALIZATION_ACTION: {
+            "observer_session_id": "obs-release-preflight",
+            "route_token_ref": "rtok-release-preflight",
+            "route_token_scope": {
+                "project_id": PID,
+                "backlog_id": "AC-RELEASE-PREFLIGHT",
+                "task_id": "release-preflight-task",
+            },
+            "route_token_allowed_actions": [required_action],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_prewarm_reconcile_terminalization_schemas",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def preflight(_conn, _store, project_id, **kwargs):
+        observed.update(project_id=project_id, **kwargs)
+        return {
+            "schema_version": "graph_release.recovery_retention_preflight.v1",
+            "project_id": project_id,
+            "mode": "plan",
+            "ready": True,
+            "writes_performed": False,
+            "close_satisfying": False,
+            "graph_reconciled": False,
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_graph_release_recovery_retention_preflight",
+        preflight,
+    )
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("release preflight must dispatch before root/build")
+        ),
+    )
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-RELEASE-PREFLIGHT",
+                "task_id": "release-preflight-task",
+                "observer_session_id": "obs-release-preflight",
+                "observer_route_token_ref": "rtok-release-preflight",
+                "notes_extra": {
+                    "_manager_action": {
+                        "action": "graph_reconcile_release_preflight",
+                        "apply": False,
+                    },
+                    "caller-note": "must-not-enter-normal-build-notes",
+                },
+            },
+        )
+    )
+
+    assert status == 200
+    assert observed == {
+        "project_id": PID,
+        "apply": False,
+        "backlog_id": "AC-RELEASE-PREFLIGHT",
+        "task_id": "release-preflight-task",
+    }
+    assert result["action"] == "graph_reconcile_release_preflight"
+    assert result["maintenance_only"] is True
+    assert result["rebuild_started"] is False
+    assert result["snapshot_materialized"] is False
+    assert result["route_proof"]["raw_route_token_persisted"] is False
+
+
+def test_release_preflight_protects_snapshots_referenced_by_graph_traces(
+    conn,
+    monkeypatch,
+):
+    _activate_basic_graph(
+        conn,
+        "full-release-preflight-trace-active",
+        commit_sha="d" * 40,
+    )
+    graph_query_trace.ensure_schema(conn)
+    referenced_snapshot = "full-referenced-by-exact-qa-trace"
+    conn.execute(
+        """
+        INSERT INTO graph_query_traces (
+          trace_id,project_id,snapshot_id,actor,query_source,query_purpose,
+          status,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "gqt-release-preflight-reference",
+            PID,
+            referenced_snapshot,
+            "qa",
+            "qa",
+            "independent_verification",
+            "complete",
+            "2026-08-11T00:00:00Z",
+            "2026-08-11T00:00:00Z",
+        ),
+    )
+    conn.commit()
+    observed = {}
+
+    def selection(_conn, _project_id, **kwargs):
+        observed.update(kwargs)
+        return {
+            "config": {"keep_last_n": 10},
+            "protected_count": 2,
+            "candidate_count": 0,
+            "protected": [
+                {"snapshot_id": "full-release-preflight-trace-active"},
+                {"snapshot_id": referenced_snapshot},
+            ],
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(store, "select_snapshot_retention_candidates", selection)
+    monkeypatch.setattr(
+        store,
+        "list_reconcile_run_metrics_window",
+        lambda *_args, **_kwargs: {
+            "rows": [],
+            "has_more": False,
+            "truncated": False,
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "validate_snapshot_companion_integrity",
+        lambda *_args, **_kwargs: {"valid": True},
+    )
+    monkeypatch.setattr(
+        server,
+        "_release_materialization_size_bytes",
+        lambda *_args, **_kwargs: 1000,
+    )
+    monkeypatch.setattr(
+        server.shutil,
+        "disk_usage",
+        lambda _path: server.shutil._ntuple_diskusage(20_000, 10_000, 10_000),
+    )
+    before = conn.total_changes
+
+    result = server._graph_release_recovery_retention_preflight(
+        conn,
+        store,
+        PID,
+        apply=False,
+        backlog_id="AC-RELEASE-PREFLIGHT",
+        task_id="release-preflight-task",
+    )
+
+    assert observed["extra_bundle_snapshot_ids"] == {referenced_snapshot}
+    assert result["retention"]["candidate_count"] == 0
+    assert conn.total_changes == before
+
+
+def test_release_preflight_rejects_unbounded_trace_reference_window_zero_write(
+    conn,
+):
+    graph_query_trace.ensure_schema(conn)
+    conn.executemany(
+        """
+        INSERT INTO graph_query_traces (
+          trace_id,project_id,snapshot_id,actor,query_source,query_purpose,
+          status,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        [
+            (
+                f"gqt-release-preflight-bound-{index:04d}",
+                PID,
+                f"full-release-preflight-bound-{index:04d}",
+                "qa",
+                "qa",
+                "independent_verification",
+                "complete",
+                "2026-08-11T00:00:00Z",
+                "2026-08-11T00:00:00Z",
+            )
+            for index in range(2001)
+        ],
+    )
+    conn.commit()
+    before = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server._graph_release_referenced_snapshot_ids(conn, PID)
+
+    assert rejected.value.code == (
+        "graph_release_preflight_trace_reference_window_unbounded"
+    )
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == before
+
+
+def test_release_preflight_apply_never_reports_ready_when_retention_fails(
+    conn,
+    monkeypatch,
+):
+    _activate_basic_graph(
+        conn,
+        "full-release-preflight-gc-failure",
+        commit_sha="e" * 40,
+    )
+    monkeypatch.setattr(
+        store,
+        "list_reconcile_run_metrics_window",
+        lambda *_args, **_kwargs: {
+            "rows": [],
+            "has_more": False,
+            "truncated": False,
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "select_snapshot_retention_candidates",
+        lambda *_args, **_kwargs: {
+            "config": {"keep_last_n": 10},
+            "protected_count": 1,
+            "candidate_count": 1,
+            "protected": [{"snapshot_id": "full-release-preflight-gc-failure"}],
+            "candidates": [
+                {
+                    "snapshot_id": "full-old-gc-failure",
+                    "snapshot_kind": "full",
+                    "status": "candidate_ready",
+                    "size_bytes": 1000,
+                    "dir_exists": True,
+                    "in_db": True,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "run_snapshot_retention_gc",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "deleted_dirs": [],
+            "freed_bytes": 0,
+            "errors": [{"path": "/Users/private/gc-failure"}],
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "validate_snapshot_companion_integrity",
+        lambda *_args, **_kwargs: {"valid": True},
+    )
+    monkeypatch.setattr(
+        server,
+        "_release_materialization_size_bytes",
+        lambda *_args, **_kwargs: 1000,
+    )
+    monkeypatch.setattr(
+        server.shutil,
+        "disk_usage",
+        lambda _path: server.shutil._ntuple_diskusage(20_000, 10_000, 10_000),
+    )
+
+    result = server._graph_release_recovery_retention_preflight(
+        conn,
+        store,
+        PID,
+        apply=True,
+        backlog_id="AC-RELEASE-PREFLIGHT",
+        task_id="release-preflight-task",
+    )
+
+    assert result["ready"] is False
+    assert result["retention"]["error_count"] == 1
+    assert "/Users/private" not in json.dumps(result, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    "manager_action",
+    [
+        {"action": "graph_reconcile_release_preflight", "apply": 1},
+        {"action": "graph_reconcile_release_preflight", "apply": False, "path": "/tmp"},
+        {"action": "graph_reconcile_release_preflight"},
+    ],
+)
+def test_release_preflight_manager_action_shape_fails_closed(manager_action):
+    with pytest.raises(GovernanceError) as rejected:
+        server._consume_reconcile_terminalization_action(
+            {"notes_extra": {"_manager_action": manager_action}}
+        )
+    assert rejected.value.code == "reconcile_terminalization_manager_action_invalid"
+    assert rejected.value.details["zero_write_rejection"] is True
 
 
 def test_main_never_starts_components_or_binds_before_generation_certificate(
@@ -10565,6 +11273,35 @@ def test_current_full_reconcile_custom_run_ref_uses_graph_status_active_authorit
         observer_session_id="obs-current-full-custom-run-ref",
         route_token_ref=route_token_ref,
     )
+    graph_query_trace.ensure_schema(conn)
+    referenced_snapshot_id = "full-exact-qa-retention-reference"
+    conn.execute(
+        """
+        INSERT INTO graph_query_traces (
+          trace_id,project_id,snapshot_id,actor,query_source,query_purpose,
+          status,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "gqt-post-activate-retention-reference",
+            PID,
+            referenced_snapshot_id,
+            "qa",
+            "qa",
+            "independent_verification",
+            "complete",
+            "2026-08-11T00:00:00Z",
+            "2026-08-11T00:00:00Z",
+        ),
+    )
+    conn.commit()
+    retention_calls = []
+    monkeypatch.setattr(
+        store,
+        "run_snapshot_retention_gc",
+        lambda *_args, **kwargs: retention_calls.append(kwargs)
+        or {"ok": True, "deleted_dirs": [], "errors": []},
+    )
 
     status, result = server.handle_graph_governance_current_full_reconcile(
         _ctx(
@@ -10601,6 +11338,13 @@ def test_current_full_reconcile_custom_run_ref_uses_graph_status_active_authorit
     }
     assert calls[0]["ref_name"] == "active"
     assert calls[0]["branch_ref"] == ""
+    assert retention_calls == [
+        {
+            "dry_run": False,
+            "actor": "post_activate:dashboard_user",
+            "extra_bundle_snapshot_ids": {referenced_snapshot_id},
+        }
+    ]
     assert store.graph_governance_status(conn, PID)["active_snapshot_id"] == (
         "full-current"
     )
