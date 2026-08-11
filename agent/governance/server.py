@@ -140438,9 +140438,9 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         and historical_action
         and historical_action in registry_actions
         and historical_refs.issubset(registry_refs)
-        and all(registry_scope.get(key) == value for key, value in expected_scope.items())
+        and registry_scope == expected_scope
         and isinstance(historical_scope, Mapping)
-        and all(historical_scope.get(key) == value for key, value in expected_scope.items())
+        and dict(historical_scope) == expected_scope
         and all(
             str(root_registry_row[field] or "").strip()
             == str(direct_identity.get(field) or "").strip()

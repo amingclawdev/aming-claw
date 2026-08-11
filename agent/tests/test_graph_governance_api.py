@@ -87808,6 +87808,24 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         ),
         (
             "observer_materialized",
+            "root_route_registry_scope_widened",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_registry_scope_wrong_container",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
+            "root_route_historical_scope_widened",
+            False,
+            "active_root_route_registry_authority",
+        ),
+        (
+            "observer_materialized",
             "root_route_registry_expired_history",
             True,
             "",
@@ -88251,6 +88269,9 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "root_route_registry_required_ref_removed",
             "root_route_registry_scope_tampered",
             "root_route_registry_malformed_json",
+            "root_route_registry_scope_widened",
+            "root_route_registry_scope_wrong_container",
+            "root_route_historical_scope_widened",
             "root_route_registry_expired_history",
             "root_route_registry_superseded_history",
         }:
@@ -88277,6 +88298,9 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "root_route_registry_required_ref_removed",
             "root_route_registry_scope_tampered",
             "root_route_registry_malformed_json",
+            "root_route_registry_scope_widened",
+            "root_route_registry_scope_wrong_container",
+            "root_route_historical_scope_widened",
             "root_route_registry_expired_history",
             "root_route_registry_superseded_history",
         }:
@@ -88440,6 +88464,55 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             """,
             (PID, close_route_token_ref),
         )
+    elif tamper == "root_route_registry_scope_widened":
+        conn.execute(
+            """
+            UPDATE observer_route_token_refs SET scope_json = ?
+            WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "project_id": PID,
+                        "backlog_id": backlog_id,
+                        "task_id": parent_execution_id,
+                        "backlog_ids": [backlog_id, "AC-FOREIGN"],
+                        "task_ids": [parent_execution_id, "task-foreign"],
+                        "target_files": ["agent/governance/foreign.py"],
+                    }
+                ),
+                PID,
+                close_route_token_ref,
+            ),
+        )
+    elif tamper == "root_route_registry_scope_wrong_container":
+        conn.execute(
+            """
+            UPDATE observer_route_token_refs SET scope_json = ?
+            WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (
+                json.dumps(
+                    [{"project_id": PID, "backlog_id": backlog_id,
+                      "task_id": parent_execution_id}]
+                ),
+                PID,
+                close_route_token_ref,
+            ),
+        )
+    elif tamper == "root_route_historical_scope_widened":
+        root_payload = copy.deepcopy(accepted_pre_mutation["payload"])
+        root_payload["route_token_gate"]["scope"]["backlog_ids"] = [
+            backlog_id,
+            "AC-FOREIGN",
+        ]
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (
+                json.dumps(root_payload, sort_keys=True),
+                int(accepted_pre_mutation["id"]),
+            ),
+        )
     elif tamper in {
         "root_route_registry_expired_history",
         "root_route_registry_superseded_history",
@@ -88522,6 +88595,9 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         "root_route_registry_required_ref_removed",
         "root_route_registry_scope_tampered",
         "root_route_registry_malformed_json",
+        "root_route_registry_scope_widened",
+        "root_route_registry_scope_wrong_container",
+        "root_route_historical_scope_widened",
     }
     if tamper in actual_zero_write_tampers:
         real_subprocess_run = server.subprocess.run
@@ -88580,6 +88656,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 "root_route_registry_revoked",
                 "root_route_registry_required_ref_removed",
                 "root_route_registry_malformed_json",
+                "root_route_registry_scope_wrong_container",
             }
             else "contract_runtime_close_authority_incomplete"
         )
@@ -88592,6 +88669,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "root_route_registry_revoked",
             "root_route_registry_required_ref_removed",
             "root_route_registry_malformed_json",
+            "root_route_registry_scope_wrong_container",
         }:
             assert close_route_token_ref not in close_failure
         assert str(project_root) not in close_failure
