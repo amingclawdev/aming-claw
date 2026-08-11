@@ -91032,6 +91032,7 @@ def _contract_runtime_recovery_requested(value: Any) -> bool:
         "replay_from_current_definition",
         "definition_hash_mismatch",
         "stale_pinned_execution",
+        "invalid_runtime_context_authority",
     }
 
 
@@ -119770,6 +119771,284 @@ def _onboard_work_type_storage_projection(
     }
 
 
+def _contract_runtime_dead_initial_join_recovery_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove one current-definition execution is dead before worker lineage.
+
+    This is deliberately narrower than ordinary RuntimeContext recovery.  It
+    applies only after an accepted dispatch and initial join, when no worker
+    read/startup evidence exists and the original lease is no longer active.
+    The historical execution remains immutable; callers may only start one
+    deterministic fresh execution from the current source definition.
+    """
+
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    runtime_guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_action = _runtime_next_action_from_guide(runtime_guide)
+    if not (
+        execution_id
+        and backlog_id
+        and str(record.get("project_id") or "").strip() == project_id
+        and str(next_action.get("stage_id") or "").strip() == "worker_read"
+        and str(next_action.get("line_id") or "").strip()
+        == "worker_read_runtime_guide"
+        and str(next_action.get("evidence_kind") or "").strip()
+        == "read_receipt"
+        and str(next_action.get("owner_role") or "").strip() == "mf_sub"
+        and "mf_sub" in list(next_action.get("allowed_writer_roles") or [])
+    ):
+        return {}
+
+    context_projection = (
+        _contract_runtime_authoritative_runtime_context_projection(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+    )
+    current_values = (
+        context_projection.get("current_values")
+        if isinstance(context_projection.get("current_values"), Mapping)
+        else {}
+    )
+    runtime_context_id = str(
+        current_values.get("runtime_context_id") or ""
+    ).strip()
+    if not runtime_context_id:
+        return {}
+
+    from .parallel_branch_runtime import get_branch_context_by_runtime_context_id
+
+    context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        runtime_context_id,
+    )
+    if context is None:
+        return {}
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    if not (
+        str(getattr(context, "project_id", "") or "").strip() == project_id
+        and str(getattr(context, "backlog_id", "") or "").strip()
+        == backlog_id
+        and parent_task_id == execution_id
+        and str(getattr(context, "last_recovery_action", "") or "").strip()
+        == "mf_subagent_initial_join_issued"
+        and task_id
+    ):
+        return {}
+
+    dispatch_anchor = (
+        _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            contract_execution_id=execution_id,
+        )
+    )
+    if not dispatch_anchor:
+        return {}
+
+    eligibility = _runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=project_id,
+        context=context,
+    )
+    blockers = tuple(
+        sorted(
+            {
+                str(item or "").strip()
+                for item in list(eligibility.get("blockers") or [])
+                if str(item or "").strip()
+            }
+        )
+    )
+    if (
+        eligibility.get("eligible") is True
+        or "initial_join_lease_not_active" not in blockers
+        or any(
+            not (
+                blocker.startswith("initial_join_")
+                or blocker.startswith("canonical_initial_join_")
+            )
+            for blocker in blockers
+        )
+    ):
+        return {}
+
+    try:
+        execution_state_revision = int(
+            record.get("execution_state_revision") or 0
+        )
+    except (TypeError, ValueError):
+        return {}
+    definition_hash = str(record.get("definition_hash") or "").strip()
+    instruction_bundle_hash = str(
+        record.get("instruction_bundle_hash") or ""
+    ).strip()
+    runtime_guide_hash = str(
+        runtime_guide.get("runtime_guide_hash") or ""
+    ).strip()
+    if not (
+        execution_state_revision > 0
+        and definition_hash.startswith("sha256:")
+        and instruction_bundle_hash.startswith("sha256:")
+        and runtime_guide_hash.startswith("sha256:")
+    ):
+        return {}
+
+    core = {
+        "schema_version": (
+            "contract_runtime.dead_initial_join_recovery_authority.v1"
+        ),
+        "source_of_authority": (
+            "ContractRuntime.current+accepted_dispatch+"
+            "RuntimeContext.current+timeline"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "source_contract_execution_id": execution_id,
+        "contract_id": str(record.get("contract_id") or "").strip(),
+        "version": str(record.get("version") or "").strip(),
+        "revision": str(record.get("revision") or "").strip(),
+        "definition_hash": definition_hash,
+        "instruction_bundle_hash": instruction_bundle_hash,
+        "execution_state_revision": execution_state_revision,
+        "runtime_guide_hash": runtime_guide_hash,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "dispatch_authority_hash": _stable_public_hash(dispatch_anchor),
+        "initial_join_authority_hash": _stable_public_hash(
+            dict(eligibility.get("authority") or {})
+        ),
+        "initial_join_authority_blockers": list(blockers),
+        "initial_join_lease_inactive": True,
+        "worker_lineage_present": False,
+        "historical_parent_immutable": True,
+        "authoritative_pass_synthesized": False,
+    }
+    authority_hash = stable_sha256(core)
+    return {
+        **core,
+        "authority_hash": authority_hash,
+        "recovery_contract_execution_id": _contract_runtime_stable_id(
+            "cex-contract-dead-initial-join-recovery",
+            project_id,
+            backlog_id,
+            execution_id,
+            authority_hash,
+        ),
+    }
+
+
+def _contract_runtime_dead_initial_join_recovery_projection(
+    authority: Mapping[str, Any],
+    *,
+    route_token_ref: str = "",
+) -> dict[str, Any]:
+    if not authority:
+        return {}
+    project_id = str(authority.get("project_id") or "").strip()
+    backlog_id = str(authority.get("backlog_id") or "").strip()
+    execution_id = str(
+        authority.get("source_contract_execution_id") or ""
+    ).strip()
+    authority_hash = str(authority.get("authority_hash") or "").strip()
+    body = {
+        "backlog_id": backlog_id,
+        "recovery_policy": "invalid_runtime_context_authority",
+        "stale_contract_execution_id": execution_id,
+        "recovery_authority_hash": authority_hash,
+    }
+    if route_token_ref:
+        body["route_token_ref"] = route_token_ref
+    facade_state = {
+        "schema_version": (
+            "onboard_route_guide.worker_read_runtime_facade_projection.v1"
+        ),
+        "status": "recovery_required",
+        "blocker_id": "worker_read_runtime_guide_projection_incomplete",
+        "reason": "runtime_context_initial_join_authority_invalid",
+        "reason_code": "runtime_context_initial_join_authority_invalid",
+        "runtime_context_id": str(
+            authority.get("runtime_context_id") or ""
+        ),
+        "task_id": str(authority.get("task_id") or ""),
+        "selected_contract_line": "worker_read_runtime_guide",
+        "worker_actionable": False,
+        "observer_recovery_actionable": True,
+        "fail_closed": True,
+        "zero_write_projection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    return {
+        "schema_version": (
+            "contract_runtime.dead_initial_join_recovery_projection.v1"
+        ),
+        "status": "recovery_required",
+        "reason_code": "runtime_context_initial_join_authority_invalid",
+        "owner_role": "observer",
+        "id": "start_recovery_contract_execution",
+        "action": "start_recovery_contract_execution",
+        "interface": "contract_runtime.recover",
+        "facade": "contract_runtime.recover",
+        "mcp_tool": "contract_runtime_recover",
+        "method": "POST",
+        "path": f"/api/projects/{project_id}/contract-runtime/recover",
+        "body_source": "copy_safe_body",
+        "copy_safe_body": body,
+        "action_input": body,
+        "actionable": True,
+        "worker_actionable": False,
+        "observer_recovery_actionable": True,
+        "historical_execution_immutable": True,
+        "historical_evidence_replayed": False,
+        "authoritative_pass_synthesized": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "worker_read_runtime_facade_projection": facade_state,
+        "runtime_context_recovery_authority": {
+            "schema_version": str(authority.get("schema_version") or ""),
+            "source_contract_execution_id": execution_id,
+            "recovery_contract_execution_id": str(
+                authority.get("recovery_contract_execution_id") or ""
+            ),
+            "authority_hash": authority_hash,
+            "mode": "start_fresh_contract_execution",
+            "server_derived": True,
+            "caller_claims_trusted": False,
+        },
+        "recovery": {
+            "policy": "start_new_execution",
+            "reason": "invalid_runtime_context_authority",
+            "source_contract_execution_id": execution_id,
+            "recovery_contract_execution_id": str(
+                authority.get("recovery_contract_execution_id") or ""
+            ),
+            "recovery_authority_hash": authority_hash,
+        },
+    }
+
+
 def _onboard_worker_read_runtime_facade_projection(
     conn,
     *,
@@ -119833,6 +120112,21 @@ def _onboard_worker_read_runtime_facade_projection(
             "contract_execution_scope_mismatch",
             ["project_id", "backlog_id"],
         )
+    recovery_authority = (
+        _contract_runtime_dead_initial_join_recovery_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+    )
+    recovery = _contract_runtime_dead_initial_join_recovery_projection(
+        recovery_authority
+    )
+    if recovery:
+        return {
+            **projected,
+            **recovery,
+        }
     dispatch = _contract_runtime_dispatch_ticket_authority(
         record,
         _runtime_current_state_from_record(record),
@@ -120775,7 +121069,17 @@ def _onboard_route_guide_compact_service_response(
     )
     worker_read_ready = (
         worker_read_selected
-        and str(worker_read_projection.get("status") or "") == "ready"
+        and (
+            str(worker_read_projection.get("status") or "") == "ready"
+            or (
+                str(worker_read_projection.get("status") or "")
+                == "recovery_required"
+                and worker_read_projection.get(
+                    "observer_recovery_actionable"
+                )
+                is True
+            )
+        )
     )
     canonical_body = (
         dict(next_action.get("copy_safe_body") or {})
@@ -159126,6 +159430,9 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
         body.get("stale_contract_execution_id") or ""
     ).strip()
     recovery_policy = str(body.get("recovery_policy") or "").strip()
+    requested_authority_hash = str(
+        body.get("recovery_authority_hash") or ""
+    ).strip()
     if not backlog_id:
         raise ValidationError("backlog_id is required")
     if not stale_execution_id:
@@ -159167,18 +159474,93 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                 {"required_role": "observer"},
             )
 
+        recovery_reason = "stale_pinned_execution"
+        dead_initial_join_authority: dict[str, Any] = {}
+        source_record = stale_record
         try:
-            runtime.current_record(stale_execution_id, actor_role=actor_role)
+            source_record = runtime.current_record(
+                stale_execution_id,
+                actor_role=actor_role,
+            )
         except StalePinnedContractExecutionError as stale:
+            if recovery_policy == "invalid_runtime_context_authority":
+                raise ValidationError(
+                    "runtime context authority recovery requires a current "
+                    "source definition",
+                    {
+                        "contract_execution_id": stale_execution_id,
+                        "fail_closed": True,
+                    },
+                )
             recovery_execution_id = _contract_runtime_stale_recovery_id(stale)
         else:
-            raise ValidationError(
-                "contract runtime recovery requires a stale pinned execution",
-                {
-                    "contract_execution_id": stale_execution_id,
-                    "safe_to_continue_existing_execution": True,
-                },
+            if recovery_policy != "invalid_runtime_context_authority":
+                raise ValidationError(
+                    "contract runtime recovery requires a stale pinned "
+                    "execution or exact invalid runtime authority",
+                    {
+                        "contract_execution_id": stale_execution_id,
+                        "safe_to_continue_existing_execution": True,
+                    },
+                )
+            if conn.in_transaction:
+                conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            stale_record = runtime.store.get(stale_execution_id)
+            source_record = runtime.current_record(
+                stale_execution_id,
+                actor_role=actor_role,
             )
+            locked_actor_role = _contract_runtime_effective_actor_role(
+                ctx,
+                conn,
+                action="contract_runtime_recover",
+                backlog_id=backlog_id,
+                contract_execution_id=stale_execution_id,
+                record=stale_record,
+            )
+            if _normalized_contract_runtime_action(locked_actor_role) != (
+                "observer"
+            ):
+                raise PermissionDeniedError(
+                    locked_actor_role or "anonymous",
+                    "contract_runtime_recover",
+                    {"required_role": "observer"},
+                )
+            dead_initial_join_authority = (
+                _contract_runtime_dead_initial_join_recovery_authority(
+                    conn,
+                    project_id=project_id,
+                    record=stale_record,
+                )
+            )
+            actual_authority_hash = str(
+                dead_initial_join_authority.get("authority_hash") or ""
+            )
+            if not (
+                actual_authority_hash
+                and requested_authority_hash
+                and hmac.compare_digest(
+                    actual_authority_hash,
+                    requested_authority_hash,
+                )
+            ):
+                raise ValidationError(
+                    "runtime context recovery authority does not match "
+                    "current durable state",
+                    {
+                        "contract_execution_id": stale_execution_id,
+                        "fail_closed": True,
+                        "zero_write": True,
+                    },
+                )
+            recovery_execution_id = str(
+                dead_initial_join_authority.get(
+                    "recovery_contract_execution_id"
+                )
+                or ""
+            )
+            recovery_reason = "invalid_runtime_context_authority"
 
         historical_evidence = (
             _contract_runtime_stale_record_evidence_projection(stale_record)
@@ -159207,6 +159589,28 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                         "stale_contract_execution_id": stale_execution_id,
                     },
                 )
+            if recovery_reason == "invalid_runtime_context_authority" and (
+                str(recovery_metadata.get("recovery_reason") or "")
+                != recovery_reason
+                or not hmac.compare_digest(
+                    str(
+                        recovery_metadata.get("recovery_authority_hash")
+                        or ""
+                    ),
+                    requested_authority_hash,
+                )
+            ):
+                raise ValidationError(
+                    "recovery execution is bound to different runtime "
+                    "authority",
+                    {
+                        "recovery_contract_execution_id": (
+                            recovery_execution_id
+                        ),
+                        "stale_contract_execution_id": stale_execution_id,
+                        "fail_closed": True,
+                    },
+                )
             persisted_target = recovery_metadata.get("current_repair_target")
             if (
                 isinstance(persisted_target, Mapping)
@@ -159228,9 +159632,30 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
             )
             idempotent = True
         else:
+            if recovery_reason == "invalid_runtime_context_authority":
+                locked_authority = (
+                    _contract_runtime_dead_initial_join_recovery_authority(
+                        conn,
+                        project_id=project_id,
+                        record=stale_record,
+                    )
+                )
+                if not hmac.compare_digest(
+                    str(locked_authority.get("authority_hash") or ""),
+                    requested_authority_hash,
+                ):
+                    raise ValidationError(
+                        "runtime context recovery authority changed before "
+                        "execution start",
+                        {
+                            "contract_execution_id": stale_execution_id,
+                            "fail_closed": True,
+                            "zero_write": True,
+                        },
+                    )
             backlog_lineage = dict(
-                stale_record.get("backlog_lineage")
-                if isinstance(stale_record.get("backlog_lineage"), Mapping)
+                source_record.get("backlog_lineage")
+                if isinstance(source_record.get("backlog_lineage"), Mapping)
                 else {}
             )
             backlog_lineage.update(
@@ -159248,7 +159673,7 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                 "facade": "contract_runtime_recovery",
                 "generic_crud_exposed": False,
                 "recovery_policy": "start_new_execution",
-                "recovery_reason": "stale_pinned_execution",
+                "recovery_reason": recovery_reason,
                 "stale_contract_execution_id": stale_execution_id,
                 "stale_completed_line_count": historical_evidence[
                     "completed_line_count"
@@ -159259,36 +159684,94 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
                 "historical_evidence_replayed": False,
                 "authoritative_pass_synthesized": False,
             }
+            if dead_initial_join_authority:
+                recovery_metadata["recovery_authority_hash"] = str(
+                    dead_initial_join_authority.get("authority_hash") or ""
+                )
+                recovery_metadata["recovery_authority"] = dict(
+                    dead_initial_join_authority
+                )
+                backlog_lineage["recovery_authority_hash"] = str(
+                    dead_initial_join_authority.get("authority_hash") or ""
+                )
             if current_repair_target:
                 recovery_metadata["current_repair_target"] = (
                     current_repair_target
                 )
-            recovery_record = runtime.start_execution(
-                str(stale_record.get("contract_id") or ""),
-                project_id=project_id,
-                backlog_id=backlog_id,
-                actor_role=actor_role,
-                contract_execution_id=recovery_execution_id,
-                version=str(stale_record.get("version") or "") or None,
-                revision=str(stale_record.get("revision") or "") or None,
-                route_token_ref=route_token_ref,
-                parent_contract_execution_id=str(
-                    stale_record.get("parent_contract_execution_id") or ""
-                ),
-                root_contract_execution_id=str(
-                    stale_record.get("root_contract_execution_id") or ""
-                ),
-                contract_chain_id=str(
-                    stale_record.get("contract_chain_id") or ""
-                ),
-                role_binding=(
-                    dict(stale_record.get("role_binding") or {})
-                    if isinstance(stale_record.get("role_binding"), Mapping)
+            try:
+                recovery_record = runtime.start_execution(
+                    str(source_record.get("contract_id") or ""),
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    actor_role=actor_role,
+                    contract_execution_id=recovery_execution_id,
+                    version=str(source_record.get("version") or "") or None,
+                    revision=str(source_record.get("revision") or "") or None,
+                    route_token_ref=route_token_ref,
+                    parent_contract_execution_id=str(
+                        source_record.get("parent_contract_execution_id") or ""
+                    ),
+                    root_contract_execution_id=str(
+                        source_record.get("root_contract_execution_id") or ""
+                    ),
+                    contract_chain_id=str(
+                        source_record.get("contract_chain_id") or ""
+                    ),
+                    role_binding=(
+                        dict(source_record.get("role_binding") or {})
+                        if isinstance(
+                            source_record.get("role_binding"), Mapping
+                        )
+                        else {}
+                    ),
+                    backlog_lineage=backlog_lineage,
+                    metadata=recovery_metadata,
+                )
+            except ContractRuntimeError as exc:
+                if "contract execution already exists:" not in str(exc):
+                    raise
+                conn.rollback()
+                recovery_record = runtime.store.get(recovery_execution_id)
+                concurrent_metadata = (
+                    recovery_record.get("metadata")
+                    if isinstance(recovery_record.get("metadata"), Mapping)
                     else {}
-                ),
-                backlog_lineage=backlog_lineage,
-                metadata=recovery_metadata,
-            )
+                )
+                if (
+                    str(
+                        concurrent_metadata.get(
+                            "stale_contract_execution_id"
+                        )
+                        or ""
+                    )
+                    != stale_execution_id
+                    or str(concurrent_metadata.get("recovery_reason") or "")
+                    != recovery_reason
+                    or (
+                        recovery_reason
+                        == "invalid_runtime_context_authority"
+                        and not hmac.compare_digest(
+                            str(
+                                concurrent_metadata.get(
+                                    "recovery_authority_hash"
+                                )
+                                or ""
+                            ),
+                            requested_authority_hash,
+                        )
+                    )
+                ):
+                    raise ValidationError(
+                        "concurrent recovery execution is bound to different "
+                        "authority",
+                        {
+                            "recovery_contract_execution_id": (
+                                recovery_execution_id
+                            ),
+                            "fail_closed": True,
+                        },
+                    )
+                idempotent = True
         recovery_record = runtime.current_record(
             recovery_execution_id,
             actor_role=actor_role,
@@ -159305,6 +159788,7 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
             "schema_version": "contract_runtime.recovery_response.v1",
             "status": "recovery_execution_started",
             "recovery_policy": "start_new_execution",
+            "recovery_reason": recovery_reason,
             "stale_contract_execution_id": stale_execution_id,
             "recovery_contract_execution_id": recovery_execution_id,
             "idempotent": idempotent,
@@ -159319,6 +159803,10 @@ def handle_project_contract_runtime_recover(ctx: RequestContext):
     )
     if current_repair_target:
         response["current_repair_target"] = current_repair_target
+    if dead_initial_join_authority:
+        response["recovery_authority_hash"] = str(
+            dead_initial_join_authority.get("authority_hash") or ""
+        )
     return response
 
 

@@ -103830,6 +103830,398 @@ def test_generic_contract_runtime_recovery_preserves_stale_evidence_without_repl
     assert runtime.store.get(recovery_id)["completed_lines"] == []
 
 
+def test_contract_runtime_recovery_starts_fresh_execution_for_dead_initial_join_authority(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="contract-runtime-dead-initial-join",
+        source_backed_contract_runtime=True,
+    )
+    execution_id = case["parent_task_id"]
+    runtime = server._contract_runtime(conn)
+    original_record = copy.deepcopy(runtime.store.get(execution_id))
+    expired = replace(
+        case["context"],
+        lease_id="mfrlease-expired-contract-recovery",
+        lease_expires_at="2000-01-01T00:00:00Z",
+    )
+    upsert_branch_context(conn, expired, now_iso="2099-08-02T01:00:00Z")
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
+    )
+    authority = server._contract_runtime_dead_initial_join_recovery_authority(
+        conn,
+        project_id=PID,
+        record=runtime.store.get(execution_id),
+    )
+    assert authority
+
+    before_guide_changes = conn.total_changes
+    before_guide_dump = "\n".join(conn.iterdump())
+    guide = _compact_worker_read_guide(
+        conn,
+        backlog_id=case["backlog_id"],
+        contract_execution_id=execution_id,
+    )
+
+    assert conn.total_changes == before_guide_changes
+    assert "\n".join(conn.iterdump()) == before_guide_dump
+    projection = guide["worker_read_runtime_facade_projection"]
+    assert projection["status"] == "recovery_required", json.dumps(
+        projection,
+        sort_keys=True,
+    )
+    assert projection["reason_code"] == (
+        "runtime_context_initial_join_authority_invalid"
+    )
+    assert projection["worker_actionable"] is False
+    assert projection["observer_recovery_actionable"] is True
+    action = guide["canonical_executable_action"]
+    assert action["action"] == "start_recovery_contract_execution"
+    assert action["mcp_tool"] == "contract_runtime_recover"
+    assert action["path"].endswith("/contract-runtime/recover")
+    body = action["copy_safe_body"]
+    assert body["backlog_id"] == case["backlog_id"]
+    assert body["stale_contract_execution_id"] == execution_id
+    assert body["recovery_policy"] == (
+        "invalid_runtime_context_authority"
+    )
+    assert body["recovery_authority_hash"].startswith("sha256:")
+    assert "session_token" not in json.dumps(body, sort_keys=True)
+    assert "fence_token" not in json.dumps(body, sort_keys=True)
+
+    before_wrong_role_changes = conn.total_changes
+    before_wrong_role_dump = "\n".join(conn.iterdump())
+    with pytest.raises(PermissionDeniedError):
+        server.handle_project_contract_runtime_recover(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body=body,
+            )
+        )
+    assert conn.total_changes == before_wrong_role_changes
+    assert "\n".join(conn.iterdump()) == before_wrong_role_dump
+
+    recovered = server.handle_project_contract_runtime_recover(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=body,
+        )
+    )
+
+    recovery_id = recovered["recovery_contract_execution_id"]
+    assert recovered["ok"] is True
+    assert recovered["status"] == "recovery_execution_started"
+    assert recovered["recovery_reason"] == (
+        "invalid_runtime_context_authority"
+    )
+    assert recovered["recovery_authority_hash"] == (
+        body["recovery_authority_hash"]
+    )
+    assert recovered["existing_record_preserved"] is True
+    assert recovered["historical_evidence_replayed"] is False
+    assert recovered["authoritative_pass_synthesized"] is False
+    serialized_recovery = json.dumps(recovered, sort_keys=True)
+    assert str(case["target_root"]) not in serialized_recovery
+    assert expired.lease_id not in serialized_recovery
+    assert "wstok-" not in serialized_recovery
+    assert runtime.store.get(execution_id) == original_record
+    recovery_record = runtime.store.get(recovery_id)
+    assert recovery_record["completed_lines"] == []
+    assert recovery_record["metadata"]["recovery_reason"] == (
+        "invalid_runtime_context_authority"
+    )
+    assert recovery_record["metadata"]["recovery_authority_hash"] == (
+        body["recovery_authority_hash"]
+    )
+    assert recovery_record["backlog_lineage"][
+        "stale_contract_execution_id"
+    ] == execution_id
+
+    before_replay_changes = conn.total_changes
+    before_replay_dump = "\n".join(conn.iterdump())
+    replay = server.handle_project_contract_runtime_recover(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=body,
+        )
+    )
+    assert replay["idempotent"] is True
+    assert replay["recovery_contract_execution_id"] == recovery_id
+    assert conn.total_changes == before_replay_changes
+    assert "\n".join(conn.iterdump()) == before_replay_dump
+
+
+def test_contract_runtime_dead_initial_join_recovery_rejects_authority_drift_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="contract-runtime-dead-initial-join-drift",
+        source_backed_contract_runtime=True,
+    )
+    expired = replace(
+        case["context"],
+        lease_id="mfrlease-expired-contract-recovery-drift",
+        lease_expires_at="2000-01-01T00:00:00Z",
+    )
+    upsert_branch_context(conn, expired, now_iso="2099-08-02T01:00:00Z")
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
+    )
+    guide = _compact_worker_read_guide(
+        conn,
+        backlog_id=case["backlog_id"],
+        contract_execution_id=case["parent_task_id"],
+    )
+    body = dict(guide["canonical_executable_action"]["copy_safe_body"])
+    drifted = replace(
+        expired,
+        lease_id="mfrlease-expired-contract-recovery-drifted-after-guide",
+    )
+    upsert_branch_context(conn, drifted, now_iso="2099-08-02T01:00:01Z")
+    conn.commit()
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    with pytest.raises(ValidationError) as rejected:
+        server.handle_project_contract_runtime_recover(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=body,
+            )
+        )
+
+    assert "authority" in str(rejected.value).lower()
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+def test_contract_runtime_dead_initial_join_recovery_refuses_active_lease(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="contract-runtime-live-initial-join",
+        source_backed_contract_runtime=True,
+    )
+    runtime = server._contract_runtime(conn)
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    authority = server._contract_runtime_dead_initial_join_recovery_authority(
+        conn,
+        project_id=PID,
+        record=runtime.store.get(case["parent_task_id"]),
+    )
+    guide = _compact_worker_read_guide(
+        conn,
+        backlog_id=case["backlog_id"],
+        contract_execution_id=case["parent_task_id"],
+    )
+
+    assert authority == {}
+    assert guide.get("canonical_executable_action", {}).get("action") != (
+        "start_recovery_contract_execution"
+    )
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+def test_contract_runtime_dead_initial_join_recovery_fault_rolls_back(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="contract-runtime-dead-initial-join-fault",
+        source_backed_contract_runtime=True,
+    )
+    expired = replace(
+        case["context"],
+        lease_id="mfrlease-expired-contract-recovery-fault",
+        lease_expires_at="2000-01-01T00:00:00Z",
+    )
+    upsert_branch_context(conn, expired, now_iso="2099-08-02T01:00:00Z")
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
+    )
+    guide = _compact_worker_read_guide(
+        conn,
+        backlog_id=case["backlog_id"],
+        contract_execution_id=case["parent_task_id"],
+    )
+    body = dict(guide["canonical_executable_action"]["copy_safe_body"])
+    runtime = server._contract_runtime(conn)
+    start_execution = runtime.start_execution
+
+    def fail_after_insert(*args, **kwargs):
+        start_execution(*args, **kwargs)
+        raise RuntimeError("injected recovery fault after execution insert")
+
+    monkeypatch.setattr(runtime, "start_execution", fail_after_insert)
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: runtime)
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+    before_count = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0]
+
+    with pytest.raises(RuntimeError, match="injected recovery fault"):
+        server.handle_project_contract_runtime_recover(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=body,
+            )
+        )
+
+    assert conn.in_transaction is False
+    assert "\n".join(conn.iterdump()) == before_dump
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0] == before_count
+    assert conn.total_changes > before_changes
+
+
+def test_contract_runtime_dead_initial_join_recovery_converges_across_connections(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="contract-runtime-dead-initial-join-race",
+        source_backed_contract_runtime=True,
+    )
+    expired = replace(
+        case["context"],
+        lease_id="mfrlease-expired-contract-recovery-race",
+        lease_expires_at="2000-01-01T00:00:00Z",
+    )
+    upsert_branch_context(conn, expired, now_iso="2099-08-02T01:00:00Z")
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
+    )
+    guide = _compact_worker_read_guide(
+        conn,
+        backlog_id=case["backlog_id"],
+        contract_execution_id=case["parent_task_id"],
+    )
+    body = dict(guide["canonical_executable_action"]["copy_safe_body"])
+    database_path = tmp_path / "contract-runtime-recovery-race.db"
+    copied = sqlite3.connect(database_path)
+    conn.backup(copied)
+    copied.close()
+
+    def file_connection(_project_id):
+        opened = sqlite3.connect(
+            database_path,
+            timeout=10,
+            check_same_thread=False,
+        )
+        opened.row_factory = sqlite3.Row
+        return opened
+
+    monkeypatch.setattr(server, "get_connection", file_connection)
+    monkeypatch.setattr(
+        "agent.governance.db.get_connection",
+        file_connection,
+    )
+
+    def recover():
+        return server.handle_project_contract_runtime_recover(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=body,
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: recover(), range(2)))
+
+    assert {result["idempotent"] for result in results} == {False, True}
+    assert len(
+        {result["recovery_contract_execution_id"] for result in results}
+    ) == 1
+    check = sqlite3.connect(database_path)
+    try:
+        recovery_rows = check.execute(
+            """
+            SELECT COUNT(*) FROM contract_runtime_executions
+            WHERE contract_execution_id = ?
+            """,
+            (results[0]["recovery_contract_execution_id"],),
+        ).fetchone()[0]
+    finally:
+        check.close()
+    assert recovery_rows == 1
+
+    before_replay_bytes = database_path.read_bytes()
+    replay = recover()
+    assert replay["idempotent"] is True
+    assert database_path.read_bytes() == before_replay_bytes
+
+
 def test_contract_runtime_recovery_is_observer_admin_evidence_action():
     lane = observer_route_context._route_lane_requirements_for_actions(
         ["contract_runtime_recover"]
