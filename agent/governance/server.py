@@ -102593,6 +102593,21 @@ def _entered_batch_successor_resume_projection(
         return blocked("entered_batch_current_head_not_canonical")
     if resolved_head != current_head:
         return blocked("entered_batch_current_head_not_canonical")
+    target_ref = str(selected.get("target_ref") or "").strip()
+    target_head = str(
+        _git_output(
+            canonical_root,
+            ["rev-parse", "--verify", f"{target_ref}^{{commit}}"],
+            timeout=10,
+        )
+        or ""
+    ).strip().lower()
+    if not (
+        target_ref
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target_head)
+        and target_head == current_head
+    ):
+        return blocked("entered_batch_current_target_ref_not_head")
     historical_base = str(selected.get("base_commit") or "").strip().lower()
     if not (
         re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", historical_base)

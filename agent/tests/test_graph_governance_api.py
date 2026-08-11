@@ -133572,6 +133572,32 @@ def test_entered_batch_without_epoch_projects_current_successor_read_only(
     assert after_physical == before_physical
     assert file_db.read_bytes() == before_bytes
 
+    subprocess.run(
+        ["git", "checkout", "--detach", historical_head],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    before_blocked = conn.total_changes
+    wrong_checkout = server._entered_batch_successor_resume_projection(
+        conn,
+        project_id=PID,
+        coordination_backlog_id=prepared["backlog_id"],
+    )
+    assert wrong_checkout["blocker"]["code"] == (
+        "entered_batch_current_target_ref_not_head"
+    )
+    assert wrong_checkout["next_legal_action"]["action"] == "no_runtime_action"
+    assert conn.total_changes == before_blocked
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
     dirty_path = repo / "uncommitted.txt"
     dirty_path.write_text("dirty\n", encoding="utf-8")
     before_blocked = conn.total_changes
