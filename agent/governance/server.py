@@ -117629,6 +117629,7 @@ def _onboard_guide_capsule_bounded_section(
     value: Any,
     *,
     section_name: str,
+    overflow_fallback: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     projected = _onboard_guide_capsule_bounded_copy(value)
     if not isinstance(projected, Mapping):
@@ -117637,6 +117638,15 @@ def _onboard_guide_capsule_bounded_section(
     measured = _onboard_guide_capsule_serialized_bytes(projected)
     if measured <= _ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES:
         return projected
+    if isinstance(overflow_fallback, Mapping):
+        fallback = _onboard_guide_capsule_bounded_copy(overflow_fallback)
+        if isinstance(fallback, Mapping):
+            fallback = dict(fallback)
+            if (
+                _onboard_guide_capsule_serialized_bytes(fallback)
+                <= _ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES
+            ):
+                return fallback
     return {
         "schema_version": "onboard_route_guide.capsule_section_truncated.v1",
         "section": section_name,
@@ -120003,6 +120013,27 @@ def _onboard_route_guide_compact_service_response(
                     ),
                 },
                 section_name="action_input",
+                overflow_fallback={
+                    "schema_version": (
+                        "onboard_route_guide.action_input_continuation.v1"
+                    ),
+                    "source_path": action_input_path,
+                    "canonical_executable_action": (
+                        canonical_executable_action
+                    ),
+                    "source_binding": {
+                        "contract_execution_id": identity[
+                            "contract_execution_id"
+                        ],
+                        "execution_state_revision": identity[
+                            "execution_state_revision"
+                        ],
+                        "projection_hash": identity["projection_hash"],
+                    },
+                    "continuation_complete": bool(
+                        canonical_executable_action
+                    ),
+                },
             ),
             "role_guidance": _onboard_guide_capsule_bounded_section(
                 {

@@ -108074,7 +108074,10 @@ def test_compact_worker_read_projects_registry_verified_route_cutover(
     monkeypatch,
     renew_cutover,
 ):
-    backlog_id = "AC-GUIDE-WORKER-READ-ROUTE-CUTOVER"
+    backlog_id = (
+        "AC-GUIDE-WORKER-READ-ROUTE-CUTOVER-"
+        + ("RENEWED" if renew_cutover else "DIRECT")
+    )
     successor, runtime_context = _setup_mf_parallel_contract_runtime_worker_dispatch(
         conn,
         backlog_id=backlog_id,
@@ -108154,6 +108157,61 @@ def test_compact_worker_read_projects_registry_verified_route_cutover(
         field: body[field]
         for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     } == cutover
+    max_capsule_bytes = server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+    monkeypatch.setattr(server, "_ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES", 1)
+    overflow = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="mf_sub",
+        work_type="parallel_worker",
+        record=record,
+        next_action=projected_action,
+        current_projection=current,
+        runtime_resume=resume,
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+    assert overflow["status"] == "compact_response_size_exceeded"
+    assert overflow["guide_capsule_ref"] == guide["guide_capsule_ref"]
+    monkeypatch.setattr(
+        server,
+        "_ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES",
+        max_capsule_bytes,
+    )
+    action_input = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": overflow["guide_capsule_ref"],
+                "sections": ["action_input"],
+                "backlog_id": backlog_id,
+                "role": "mf_sub",
+                "work_type": "parallel_worker",
+            },
+        )
+    )
+    assert action_input["ok"] is True, action_input
+    section = action_input["sections"]["action_input"]
+    assert section.get("truncated") is not True, section
+    assert section["schema_version"].endswith("action_input_continuation.v1")
+    assert section["continuation_complete"] is True
+    assert section["source_binding"] == {
+        "contract_execution_id": successor["contract_execution_id"],
+        "execution_state_revision": guide["execution_state_revision"],
+        "projection_hash": guide["projection_hash"],
+    }
+    executable = section["canonical_executable_action"]
+    assert executable["copy_safe_body"] == {
+        key: value
+        for key, value in body.items()
+        if key not in {"session_token", "fence_token"}
+    }
+    assert executable["route_identity"] == cutover
+    assert len(json.dumps(section, sort_keys=True).encode("utf-8")) <= 6 * 1024
+    serialized = json.dumps(action_input, sort_keys=True)
+    assert "session-guide-worker-read-route-cutover" not in serialized
+    assert "fence-guide-worker-read-route-cutover" not in serialized
 
 
 def test_compact_worker_read_projects_current_runtime_context_receipt_facade(
