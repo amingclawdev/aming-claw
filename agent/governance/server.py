@@ -117934,7 +117934,7 @@ def _guide_canonical_executable_action(
         if value not in (None, "")
     }
     projected_host_realization = {
-        "mode": "replace_only_declared_placeholders_then_spread_to_mcp",
+        "mode": "replace_declared_placeholders_then_spread_to_mcp",
         "mcp_invocation": f"{normalized_tool}(**copy_safe_body)",
         "adapter_fields_included": ["project_id"],
         "required_replacement_paths": list(dict.fromkeys(replacement_paths)),

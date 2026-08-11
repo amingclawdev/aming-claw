@@ -108856,6 +108856,9 @@ def test_compact_worker_read_projects_current_runtime_context_receipt_facade(
     assert "contract_context_read_receipt" not in body
     assert body["session_token"] == "<host-realized session_token>"
     assert body["fence_token"] == "<host-realized fence_token>"
+    assert action["host_realization"]["mode"] == (
+        "replace_declared_placeholders_then_spread_to_mcp"
+    )
     assert action["host_realization"]["required_replacement_paths"]
     hash_contract = action["host_realization"]["hash_replacement_contract"]
     assert hash_contract["schema_version"] == (
@@ -146516,6 +146519,9 @@ def test_guide_normal_action_never_trusts_auth_placeholder_shapes(raw_auth):
         "copy_safe_body.session_token",
         "copy_safe_body.fence_token",
     ]
+    assert action["host_realization"]["mode"] == (
+        "replace_declared_placeholders_then_spread_to_mcp"
+    )
     if isinstance(raw_auth, str):
         assert raw_auth not in json.dumps(action, sort_keys=True)
 
