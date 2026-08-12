@@ -56573,6 +56573,81 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         )
     )
     assert read["ok"] is True
+    joined_read_context = get_branch_context(
+        conn,
+        PID,
+        allocated.task_id,
+    )
+    assert joined_read_context is not None
+    eligibility = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=joined_read_context,
+    )
+    assert eligibility["eligible"] is True, json.dumps(
+        eligibility,
+        sort_keys=True,
+    )
+    assert eligibility["mode"] == "safe_ref_prestartup_reissue"
+    assert eligibility["post_receipt_pre_startup_recovery"] is True
+    assert eligibility["authority"]["read_receipt_ref"].startswith(
+        f"contract_runtime:{contract_execution_id}:completed_lines:"
+    )
+    assert eligibility["authority"]["initial_join_event_ref"].startswith(
+        "timeline:"
+    )
+    assert eligibility["required_response_handling"] == {
+        "parse_mcp_content_text_in_same_call": True,
+        "inject_host_envelope_env_process_locally": True,
+        "submit_only_server_projected_reissue_body": True,
+        "continue_directly_to_worker_startup": True,
+        "if_envelope_lost": (
+            "stop_and_report_safe_ref_prestartup_reissue_loss"
+        ),
+    }
+    with pytest.raises(GovernanceError) as guide_error:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": allocated.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": contract_execution_id,
+                    "session_token_ref": joined["session_token_ref"],
+                    "target_project_root": str(target_root),
+                },
+            )
+        )
+    assert guide_error.value.code == "fence_invalidated_or_unknown"
+    guide_details = guide_error.value.details
+    assert guide_details["next_legal_action"] == (
+        "reissue_runtime_session_token"
+    )
+    assert guide_details["recovery_actions"][0] == {
+        "id": "request_runtime_context_safe_ref_prestartup_reissue",
+        "action": "reissue_runtime_session_token",
+        "description": (
+            "Perform the next legal runtime-context worker step, then retry."
+        ),
+    }
+    guide_reissue_body = copy.deepcopy(
+        guide_details["actionable_payloads"]
+        ["session_token_reissue_submission"]["copy_safe_body"]
+    )
+    assert guide_reissue_body["contract_execution_id"] == (
+        contract_execution_id
+    )
+    assert guide_reissue_body["session_token_ref"] == (
+        joined["session_token_ref"]
+    )
+    assert {
+        field: guide_reissue_body[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == route_identity
+    assert "session_token" not in guide_reissue_body
+    assert "fence_token" not in guide_reissue_body
 
     # The latest ref remains a copy-safe recovery identifier after its lease
     # expires.  It is not presented to, or accepted by, an ordinary write gate.
@@ -56591,27 +56666,7 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     conn.commit()
     monkeypatch.setattr(server, "_utc_now", lambda: "2099-08-05T04:01:00Z")
 
-    guide_payloads = server._runtime_context_worker_recovery_payloads(
-        project_id=PID,
-        runtime_context_id=allocated.runtime_context_id,
-        task_id=allocated.task_id,
-        parent_task_id=contract_execution_id,
-        worker_id=allocated.worker_id,
-        worker_slot_id=allocated.worker_slot_id,
-        target_project_root=str(target_root),
-        backlog_id=backlog_id,
-        agent_id=allocated.agent_id,
-        allocation_owner=allocated.allocation_owner,
-        actual_host_worker_id=allocated.worker_id,
-        worker_session_id=desktop_session_id,
-        host_session_id=desktop_session_id,
-        route_identity=route_identity,
-        session_token_ref=joined["session_token_ref"],
-        contract_execution_id=contract_execution_id,
-    )
-    reissue_body = copy.deepcopy(
-        guide_payloads["session_token_reissue_submission"]["copy_safe_body"]
-    )
+    reissue_body = copy.deepcopy(guide_reissue_body)
     assert reissue_body["contract_execution_id"] == contract_execution_id
     assert reissue_body["session_token_ref"] == joined["session_token_ref"]
     assert "session_token" not in reissue_body

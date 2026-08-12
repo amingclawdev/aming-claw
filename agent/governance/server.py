@@ -21835,6 +21835,29 @@ def _runtime_context_projection_response(
             else {}
         ),
     )
+    projected_prestartup_reissue = (
+        session_token_rejoin_eligibility.get(
+            "session_token_reissue_submission"
+        )
+        if isinstance(
+            session_token_rejoin_eligibility.get(
+                "session_token_reissue_submission"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    if projected_prestartup_reissue:
+        current_actionable_payloads["session_token_reissue_submission"] = (
+            deepcopy(dict(projected_prestartup_reissue))
+        )
+        renewal_hints = current_actionable_payloads.get(
+            "session_renewal_hints"
+        )
+        if isinstance(renewal_hints, dict):
+            renewal_hints["reissue"] = deepcopy(
+                dict(projected_prestartup_reissue)
+            )
     _runtime_context_patch_actionable_payload_worker_scope(
         current_actionable_payloads,
         worker_scope_files,
@@ -30150,6 +30173,7 @@ def _runtime_context_worker_recovery_payloads(
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "agent_id": allocated_governed_worker_id,
+        "allocation_owner": normalized_allocation_owner,
         "actual_host_worker_id": allocated_governed_worker_id,
         "worker_session_id": normalized_worker_session_id,
         "host_startup_id": normalized_host_startup_id,
@@ -32293,9 +32317,19 @@ def _runtime_context_worker_recovery_details(
             and session_token_rejoin_eligibility.get("mode")
             == "bounded_post_lineage_replacement_auth_only"
         )
+        safe_ref_prestartup_reissue = bool(
+            session_token_rejoin_eligibility.get("eligible") is True
+            and session_token_rejoin_eligibility.get("mode")
+            == "safe_ref_prestartup_reissue"
+        )
         if auth_material_missing:
             diagnostics["reason"] = "worker_auth_material_missing"
-            if missing_worker_lineage and not pre_lineage_bootstrap_recovery:
+            if safe_ref_prestartup_reissue:
+                next_legal_action = "reissue_runtime_session_token"
+                recovery_action_id = (
+                    "request_runtime_context_safe_ref_prestartup_reissue"
+                )
+            elif missing_worker_lineage and not pre_lineage_bootstrap_recovery:
                 next_legal_action = "request_runtime_context_initial_join_host_envelope"
                 recovery_action_id = "request_runtime_context_initial_join_host_envelope"
                 session_token_initial_join_submission = {
@@ -32584,6 +32618,29 @@ def _runtime_context_worker_recovery_details(
                 session_token_rejoin_eligibility
             ),
         )
+        projected_prestartup_reissue = (
+            session_token_rejoin_eligibility.get(
+                "session_token_reissue_submission"
+            )
+            if isinstance(
+                session_token_rejoin_eligibility.get(
+                    "session_token_reissue_submission"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        if projected_prestartup_reissue:
+            actionable_payloads["session_token_reissue_submission"] = (
+                deepcopy(dict(projected_prestartup_reissue))
+            )
+            renewal_hints = actionable_payloads.get(
+                "session_renewal_hints"
+            )
+            if isinstance(renewal_hints, dict):
+                renewal_hints["reissue"] = deepcopy(
+                    dict(projected_prestartup_reissue)
+                )
         if session_token_initial_join_submission:
             actionable_payloads["session_token_initial_join_submission"] = (
                 session_token_initial_join_submission
@@ -46204,6 +46261,8 @@ def _runtime_context_session_rejoin_guidance_eligibility(
 
     from .parallel_branch_runtime import (
         ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
+        BranchRuntimeFenceError,
+        runtime_context_session_token_ref,
     )
 
     status = str(getattr(context, "status", "") or "").strip()
@@ -46258,6 +46317,176 @@ def _runtime_context_session_rejoin_guidance_eligibility(
         )
         if not present
     ]
+    # A worker can legitimately lose the process-local initial-join envelope
+    # after its read receipt advances ContractRuntime but before startup.  An
+    # ordinary rejoin deliberately requires both read and startup lineage, so
+    # projecting initial_join/rejoin here deadlocks the exact current startup
+    # line.  Reuse the narrower safe-ref pre-startup reissue authority instead:
+    # it independently revalidates the single initial join, canonical worker /
+    # CEX / route binding, current ContractRuntime startup line, stage
+    # checkpoint and active-or-expired lease before rotating credentials.
+    if (
+        effective_read_receipt_ref
+        and not effective_startup_ref
+        and status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
+        and str(getattr(context, "last_recovery_action", "") or "").strip()
+        == "mf_subagent_initial_join_issued"
+    ):
+        route_identity = (
+            dict(route_identity_override)
+            if isinstance(route_identity_override, Mapping)
+            and route_identity_override
+            else _runtime_context_latest_route_identity(conn, context)
+        )
+        runtime_context_id = str(
+            getattr(context, "runtime_context_id", "") or ""
+        ).strip()
+        task_id = str(getattr(context, "task_id", "") or "").strip()
+        parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+        worker_id = str(getattr(context, "worker_id", "") or "").strip()
+        worker_slot_id = str(
+            getattr(context, "worker_slot_id", "") or worker_id
+        ).strip()
+        actual_host_worker_id = str(
+            getattr(context, "actual_host_worker_id", "") or ""
+        ).strip()
+        host_session_id = str(
+            getattr(context, "host_session_id", "") or ""
+        ).strip()
+        sequence_execution_id = str(
+            contract_runtime_sequence.get("contract_execution_id") or ""
+        ).strip()
+        if not route_identity and sequence_execution_id:
+            dispatch_anchor = (
+                _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+                    conn,
+                    project_id=project_id,
+                    context=context,
+                    runtime_context_id=runtime_context_id,
+                    contract_execution_id=sequence_execution_id,
+                )
+            )
+            dispatch_route_identity = (
+                dispatch_anchor.get("route_identity")
+                if isinstance(dispatch_anchor.get("route_identity"), Mapping)
+                else {}
+            )
+            if dispatch_route_identity:
+                route_identity, _route_identity_source = (
+                    _runtime_context_current_route_authority(
+                        conn,
+                        context,
+                        dispatch_route_identity,
+                    )
+                )
+        recovery_payloads = _runtime_context_worker_recovery_payloads(
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            backlog_id=str(
+                getattr(context, "backlog_id", "") or ""
+            ).strip(),
+            parent_task_id=parent_task_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_slot_id,
+            target_project_root=(
+                _runtime_context_effective_target_project_root(context)
+            ),
+            agent_id=str(getattr(context, "agent_id", "") or "").strip(),
+            allocation_owner=str(
+                getattr(context, "allocation_owner", "") or ""
+            ).strip(),
+            actual_host_worker_id=actual_host_worker_id,
+            worker_session_id=host_session_id,
+            host_startup_id=str(
+                getattr(context, "host_startup_id", "") or ""
+            ).strip(),
+            host_session_id=host_session_id,
+            branch_ref=str(
+                getattr(context, "branch_ref", "") or ""
+            ).strip(),
+            base_commit=str(
+                getattr(context, "base_commit", "") or ""
+            ).strip(),
+            target_head_commit=str(
+                getattr(context, "target_head_commit", "") or ""
+            ).strip(),
+            merge_queue_id=str(
+                getattr(context, "merge_queue_id", "") or ""
+            ).strip(),
+            route_identity=route_identity,
+            fence_token_hash=str(
+                getattr(context, "fence_token_verifier", "") or ""
+            ).strip(),
+            session_token_ref=runtime_context_session_token_ref(context),
+            read_receipt_event_ref=effective_read_receipt_ref,
+            contract_execution_id=sequence_execution_id,
+        )
+        reissue_submission = recovery_payloads.get(
+            "session_token_reissue_submission"
+        )
+        safe_ref_body = (
+            dict(reissue_submission.get("copy_safe_body") or {})
+            if isinstance(reissue_submission, Mapping)
+            else {}
+        )
+        try:
+            authority_ctx = RequestContext(
+                "runtime_context_session_token_reissue",
+                "POST",
+                {
+                    "project_id": project_id,
+                    "runtime_context_id": runtime_context_id,
+                },
+                {},
+                safe_ref_body,
+                "server-derived-prestartup-reissue-guidance",
+                "",
+                "",
+            )
+            safe_ref_authority, loss_replacement_authority = (
+                _runtime_context_safe_ref_prestartup_reissue_authority(
+                    authority_ctx,
+                    conn,
+                    project_id=project_id,
+                    runtime_context_id=runtime_context_id,
+                    body=safe_ref_body,
+                    now_iso=_utc_now(),
+                )
+            )
+        except (GovernanceError, BranchRuntimeFenceError) as exc:
+            safe_ref_authority = None
+            loss_replacement_authority = {}
+            projection["safe_ref_prestartup_reissue_diagnostics"] = {
+                "status": "fail_closed",
+                "error": str(getattr(exc, "code", "") or type(exc).__name__),
+            }
+        if safe_ref_authority is not None:
+            projection.update(
+                {
+                    "eligible": True,
+                    "mode": "safe_ref_prestartup_reissue",
+                    "authority": asdict(safe_ref_authority),
+                    "safe_ref_loss_replacement_authority": dict(
+                        loss_replacement_authority
+                    ),
+                    "post_receipt_pre_startup_recovery": True,
+                    "session_token_reissue_submission": deepcopy(
+                        dict(reissue_submission)
+                    ),
+                    "blockers": [],
+                    "required_response_handling": {
+                        "parse_mcp_content_text_in_same_call": True,
+                        "inject_host_envelope_env_process_locally": True,
+                        "submit_only_server_projected_reissue_body": True,
+                        "continue_directly_to_worker_startup": True,
+                        "if_envelope_lost": (
+                            "stop_and_report_safe_ref_prestartup_reissue_loss"
+                        ),
+                    },
+                }
+            )
+            return projection
     if (
         len(missing_lineage) == 2
         and str(getattr(context, "last_recovery_action", "") or "").strip()
