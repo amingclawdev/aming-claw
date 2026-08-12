@@ -100784,6 +100784,7 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
             "task_id": worker_task_id,
             "worker_id": "worker-dispatch-copy-safe-a",
             "agent_id": "host-dispatch-copy-safe-a",
+            "observer_command_id": "cmd-dispatch-copy-safe-a",
             "merge_queue_id": "mq-dispatch-copy-safe-a",
             "route_token_ref": "rtok-dispatch-copy-safe-child-a",
             "owned_files": [server_file],
@@ -100792,6 +100793,7 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
             "task_id": "dispatch-copy-safe-worker-b",
             "worker_id": "worker-dispatch-copy-safe-b",
             "agent_id": "host-dispatch-copy-safe-b",
+            "observer_command_id": "cmd-dispatch-copy-safe-b",
             "merge_queue_id": "mq-dispatch-copy-safe-b",
             "route_token_ref": "rtok-dispatch-copy-safe-child-b",
             "owned_files": [test_file],
@@ -100833,6 +100835,9 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
                             "task_id": lane["task_id"],
                             "worker_id": lane["worker_id"],
                             "agent_id": lane["agent_id"],
+                            "observer_command_id": lane[
+                                "observer_command_id"
+                            ],
                             "target_project_root": str(tmp_path),
                             "workspace_root": str(tmp_path),
                             "worktree_path": str(worktree_path),
@@ -100884,6 +100889,7 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
                     "task_id": lane["task_id"],
                     "worker_id": lane["worker_id"],
                     "agent_id": lane["agent_id"],
+                    "observer_command_id": lane["observer_command_id"],
                     "target_project_root": str(tmp_path),
                     "workspace_root": str(tmp_path),
                     "worktree_path": str(worktree_path),
@@ -101095,6 +101101,9 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
     }
     assert {worker["task_id"] for worker in bounded_workers} == {
         lane["task_id"] for lane in lanes
+    }
+    assert {worker["observer_command_id"] for worker in bounded_workers} == {
+        lane["observer_command_id"] for lane in lanes
     }
     assert {worker["worktree_path"] for worker in bounded_workers} == {
         str(tmp_path / "workers" / lane["task_id"])
@@ -113204,6 +113213,77 @@ def test_mf_parallel_dispatch_ticket_authority_rejects_ambiguous_dispatch():
         "status": "invalid",
         "error": "canonical ContractRuntime dispatch authority is ambiguous",
     }
+
+
+def test_mf_parallel_dispatch_ticket_authority_selects_exact_atomic_lane():
+    workers = [
+        {
+            "runtime_context_id": "mfrctx-atomic-focus",
+            "task_id": "atomic-focus",
+            "worker_id": "worker-atomic-focus",
+            "worker_slot_id": "slot-atomic-focus",
+            "observer_command_id": "cmd-atomic-focus",
+        },
+        {
+            "runtime_context_id": "mfrctx-atomic-reminder",
+            "task_id": "atomic-reminder",
+            "worker_id": "worker-atomic-reminder",
+            "worker_slot_id": "slot-atomic-reminder",
+            "observer_command_id": "cmd-atomic-reminder",
+        },
+    ]
+    record = {
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "contract_execution_id": "cex-atomic-lane-ticket",
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "actor_role": "observer",
+                "payload": {"bounded_workers": workers},
+            }
+        ],
+    }
+    current = {
+        "next_legal_action": {
+            "line_id": "worker_read_runtime_guide",
+            "runtime_context_id": "mfrctx-atomic-focus",
+            "task_id": "atomic-focus",
+        }
+    }
+
+    legacy = server._contract_runtime_dispatch_ticket_authority(record, current)
+    assert legacy["status"] == "projected"
+    assert legacy["next_legal_action"]["task_id"] == "atomic-focus"
+
+    reminder = server._contract_runtime_dispatch_ticket_authority(
+        record,
+        current,
+        requested_runtime_context_id="mfrctx-atomic-reminder",
+        requested_task_id="atomic-reminder",
+    )
+    assert reminder["status"] == "projected"
+    assert reminder["next_legal_action"]["runtime_context_id"] == (
+        "mfrctx-atomic-reminder"
+    )
+    assert reminder["next_legal_action"]["task_id"] == "atomic-reminder"
+    assert reminder["next_legal_action"]["observer_command_id"] == (
+        "cmd-atomic-reminder"
+    )
+
+    for runtime_context_id, task_id in (
+        ("mfrctx-atomic-focus", "atomic-reminder"),
+        ("mfrctx-atomic-unknown", "atomic-unknown"),
+        ("mfrctx-atomic-reminder", ""),
+    ):
+        rejected = server._contract_runtime_dispatch_ticket_authority(
+            record,
+            current,
+            requested_runtime_context_id=runtime_context_id,
+            requested_task_id=task_id,
+        )
+        assert rejected["status"] == "invalid"
 
 
 def test_mf_parallel_dispatch_ticket_authority_projects_failed_qa_replacement():
@@ -140973,10 +141053,16 @@ def test_desktop_ticket_resolver_uses_server_owned_contract_runtime(monkeypatch)
     assert launch_identity["target_project_root"] == canonical_root
     assert launch_identity["worktree_path"] == worktree_path
     monkeypatch.setattr(server, "get_connection", lambda _project_id: Connection())
+    authority_selectors = {}
+
+    def resolve_authority(_conn, **kwargs):
+        authority_selectors.update(kwargs)
+        return authority
+
     monkeypatch.setattr(
         server,
         "_observer_runtime_text_contract_runtime_authority",
-        lambda _conn, **_kwargs: authority,
+        resolve_authority,
     )
     body = {
         "project_id": PID,
@@ -140996,6 +141082,12 @@ def test_desktop_ticket_resolver_uses_server_owned_contract_runtime(monkeypatch)
     )
 
     assert result["ok"] is True
+    assert authority_selectors["requested_runtime_context_id"] == (
+        "mfrctx-desktop-resolver"
+    )
+    assert authority_selectors["requested_task_id"] == (
+        "desktop-resolver-worker"
+    )
     assert result["server_owned_authority_resolution"] is True
     ticket = result["execution_ticket"]
     assert ticket["status"] == "issued"
@@ -141023,6 +141115,80 @@ def test_desktop_ticket_resolver_uses_server_owned_contract_runtime(monkeypatch)
                 },
             )
         )
+
+
+def test_runtime_text_prepare_rejects_atomic_lane_selector_before_route_write(
+    monkeypatch,
+):
+    class Connection:
+        def close(self):
+            pass
+
+    selected = {}
+    route_helper_called = False
+
+    def resolve_authority(_conn, **kwargs):
+        selected.update(kwargs)
+        return {
+            "ticket_authority_status": "invalid",
+            "ticket_authority_error": (
+                "atomic mf_parallel dispatch cannot resolve the active worker "
+                "line instance"
+            ),
+        }
+
+    def route_helper(*_args, **_kwargs):
+        nonlocal route_helper_called
+        route_helper_called = True
+        raise AssertionError("route helper must not run for an invalid lane selector")
+
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: Connection())
+    monkeypatch.setattr(
+        server,
+        "_resolve_observer_runtime_text_branch_runtime_evidence",
+        lambda _project_id, _body: {
+            "runtime_context_id": "mfrctx-runtime-text-reminder",
+            "context": {
+                "runtime_context_id": "mfrctx-runtime-text-reminder",
+                "task_id": "runtime-text-reminder",
+                "backlog_id": "AC-RUNTIME-TEXT-ATOMIC-SELECTOR",
+                "contract_execution_id": "cex-runtime-text-atomic-selector",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_observer_runtime_text_contract_runtime_authority",
+        resolve_authority,
+    )
+    monkeypatch.setattr(
+        server,
+        "_observer_runtime_text_prepare_worker_route_identity",
+        route_helper,
+    )
+
+    rejected = server.handle_observer_runtime_text_prepare(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-RUNTIME-TEXT-ATOMIC-SELECTOR",
+                "contract_execution_id": "cex-runtime-text-atomic-selector",
+                "runtime_context_id": "mfrctx-runtime-text-reminder",
+                "task_id": "runtime-text-reminder",
+                "observer_command_id": "cmd-runtime-text-reminder",
+            },
+        )
+    )
+
+    assert selected["requested_runtime_context_id"] == (
+        "mfrctx-runtime-text-reminder"
+    )
+    assert selected["requested_task_id"] == "runtime-text-reminder"
+    assert route_helper_called is False
+    assert rejected["ok"] is False
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
 
 
 def test_qa_ticket_resolver_projects_contract_runtime_qa_authority(monkeypatch):

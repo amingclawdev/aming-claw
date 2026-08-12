@@ -89072,6 +89072,9 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
                 or ()
             )
         )
+        observer_command_id = str(
+            revision_body.get("observer_command_id") or execution_id
+        ).strip()
         dispatch_payloads.append(
             {
                 "schema_version": "mf_parallel.dispatch_bounded_worker.v2",
@@ -89099,7 +89102,7 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
                     or getattr(context, "allocation_owner", "")
                     or worker_id
                 ).strip(),
-                "observer_command_id": execution_id,
+                "observer_command_id": observer_command_id,
                 "target_project_root": (
                     runtime_context_effective_target_project_root(context)
                 ),
@@ -149171,6 +149174,9 @@ def _contract_runtime_current_dispatch_authority_line(
 def _contract_runtime_dispatch_ticket_authority(
     record: Mapping[str, Any],
     current_state: Mapping[str, Any],
+    *,
+    requested_runtime_context_id: str = "",
+    requested_task_id: str = "",
 ) -> dict[str, Any]:
     """Project the accepted mf_parallel dispatch during the pre-worker window."""
 
@@ -149213,25 +149219,43 @@ def _contract_runtime_dispatch_ticket_authority(
         {"payload": payload}
     )
     if bounded_workers:
-        next_runtime_context_id = str(
-            actual_next.get("runtime_context_id") or ""
+        requested_runtime_context_id = str(
+            requested_runtime_context_id or ""
         ).strip()
-        next_task_id = str(actual_next.get("task_id") or "").strip()
+        requested_task_id = str(requested_task_id or "").strip()
+        selector_supplied = bool(
+            requested_runtime_context_id or requested_task_id
+        )
+        if selector_supplied and not (
+            requested_runtime_context_id and requested_task_id
+        ):
+            return {
+                "status": "invalid",
+                "error": (
+                    "atomic mf_parallel dispatch requires exact runtime_context_id "
+                    "and task_id selectors"
+                ),
+            }
+        next_runtime_context_id = (
+            requested_runtime_context_id
+            if selector_supplied
+            else str(actual_next.get("runtime_context_id") or "").strip()
+        )
+        next_task_id = (
+            requested_task_id
+            if selector_supplied
+            else str(actual_next.get("task_id") or "").strip()
+        )
         matching_workers = [
             worker
             for worker in bounded_workers
             if (
-                (
-                    next_runtime_context_id
-                    and str(worker.get("runtime_context_id") or "").strip()
-                    == next_runtime_context_id
-                )
-                or (
-                    not next_runtime_context_id
-                    and next_task_id
-                    and str(worker.get("task_id") or "").strip()
-                    == next_task_id
-                )
+                (not next_runtime_context_id or str(
+                    worker.get("runtime_context_id") or ""
+                ).strip() == next_runtime_context_id)
+                and (not next_task_id or str(
+                    worker.get("task_id") or ""
+                ).strip() == next_task_id)
             )
         ]
         if len(matching_workers) != 1:
@@ -149643,6 +149667,8 @@ def _observer_runtime_text_contract_runtime_authority(
     project_id: str,
     backlog_id: str,
     contract_execution_id: str,
+    requested_runtime_context_id: str = "",
+    requested_task_id: str = "",
 ) -> dict[str, Any]:
     execution_id = str(contract_execution_id or "").strip()
     if not execution_id:
@@ -149678,6 +149704,8 @@ def _observer_runtime_text_contract_runtime_authority(
     dispatch_authority = _contract_runtime_dispatch_ticket_authority(
         record,
         current_state,
+        requested_runtime_context_id=requested_runtime_context_id,
+        requested_task_id=requested_task_id,
     )
     qa_line_id = str(
         (current_state.get("next_legal_action") or {}).get("line_id")
@@ -149904,6 +149932,10 @@ def handle_cli_agent_desktop_execution_ticket_resolve(ctx: RequestContext):
             project_id=project_id,
             backlog_id=str(body.get("backlog_id") or ""),
             contract_execution_id=str(body.get("contract_execution_id") or ""),
+            requested_runtime_context_id=str(
+                body.get("runtime_context_id") or ""
+            ),
+            requested_task_id=str(body.get("task_id") or ""),
         )
     finally:
         conn.close()
@@ -150019,15 +150051,6 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
     )
     conn = get_connection(project_id)
     try:
-        body, worker_route_identity_evidence = (
-            _observer_runtime_text_prepare_worker_route_identity(
-                conn,
-                project_id,
-                body,
-                resolved_context,
-                owned_files,
-            )
-        )
         contract_runtime_current_state = (
             _observer_runtime_text_contract_runtime_authority(
                 conn,
@@ -150040,6 +150063,54 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
                     or resolved_context.get("contract_execution_id")
                     or ""
                 ),
+                requested_runtime_context_id=str(
+                    resolved_context.get("runtime_context_id")
+                    or body.get("runtime_context_id")
+                    or ""
+                ),
+                requested_task_id=str(
+                    resolved_context.get("task_id")
+                    or body.get("task_id")
+                    or ""
+                ),
+            )
+        )
+        ticket_authority_error = str(
+            contract_runtime_current_state.get("ticket_authority_error") or ""
+        )
+        if (
+            contract_runtime_current_state.get("ticket_authority_status")
+            == "invalid"
+            and (
+                "atomic mf_parallel dispatch cannot resolve" in ticket_authority_error
+                or "requires exact runtime_context_id and task_id" in ticket_authority_error
+            )
+        ):
+            return {
+                "ok": False,
+                "status": "rejected",
+                "runtime_context_id": resolved_runtime_context_id,
+                "contract_runtime_current_state": contract_runtime_current_state,
+                "execution_ticket": {
+                    "schema_version": "cli_agent_execution_ticket.v1",
+                    "status": "rejected",
+                    "issue_allowed": False,
+                    "source_of_authority": "ContractRuntime",
+                    "errors": [ticket_authority_error],
+                    "raw_credentials_persisted": False,
+                    "raw_route_token_persisted": False,
+                    "raw_private_context_persisted": False,
+                },
+                "writes_performed": False,
+                "mutation_performed": False,
+            }
+        body, worker_route_identity_evidence = (
+            _observer_runtime_text_prepare_worker_route_identity(
+                conn,
+                project_id,
+                body,
+                resolved_context,
+                owned_files,
             )
         )
         conn.commit()
