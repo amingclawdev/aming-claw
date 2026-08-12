@@ -41975,6 +41975,56 @@ def _runtime_context_failed_qa_line_matches_context(
     )
 
 
+def _runtime_context_active_failed_qa_line_index_for_context(
+    record: Mapping[str, Any],
+    *,
+    context: Any,
+) -> int:
+    """Return the active failed-QA line for the exact worker lane.
+
+    ``_active_failed_qa_line_index`` intentionally models completion for the
+    whole ContractRuntime.  A failed-QA worker revision is lane-local instead:
+    a canonical failure from a sibling worker must not replace the selected
+    worker's authenticated timeline boundary.  Filter by the persisted exact
+    dispatch/context binding first, then reuse the canonical active/superseded
+    QA state machine on that lane and map its result back to the source record.
+    """
+
+    if not isinstance(record, Mapping):
+        return -1
+    completed_lines = record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return -1
+    dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+    if not dispatch_match:
+        return -1
+
+    lane_indices: list[int] = []
+    lane_qa_lines: list[Mapping[str, Any]] = []
+    for index, line in enumerate(completed_lines):
+        if (
+            not isinstance(line, Mapping)
+            or str(line.get("line_id") or "").strip()
+            != "qa_independent_verification"
+            or not _runtime_context_failed_qa_line_matches_context(
+                line,
+                context=context,
+                server_identity=dispatch_match,
+            )
+        ):
+            continue
+        lane_indices.append(index)
+        lane_qa_lines.append(line)
+
+    lane_failed_qa_index = _active_failed_qa_line_index(
+        lane_qa_lines,
+        source_record=record,
+    )
+    if lane_failed_qa_index < 0:
+        return -1
+    return lane_indices[lane_failed_qa_index]
+
+
 def _runtime_context_failed_qa_accepted_line_binding(
     record: Mapping[str, Any],
     failed_line: Mapping[str, Any],
@@ -53599,9 +53649,9 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         task_id=task_id,
     )
     completed_lines = list(record.get("completed_lines") or [])
-    failed_qa_index = _active_failed_qa_line_index(
-        completed_lines,
-        source_record=record,
+    failed_qa_index = _runtime_context_active_failed_qa_line_index_for_context(
+        record,
+        context=context,
     )
     from . import task_timeline
 

@@ -69695,6 +69695,101 @@ def test_failed_qa_rejoin_derives_missing_identity_only_from_exact_dispatch():
     )
 
 
+def test_failed_qa_rework_selects_active_failure_from_exact_worker_lane():
+    parent_task_id = "cex-mf-parallel-lane-failed-qa"
+    focus = SimpleNamespace(
+        runtime_context_id="mfrctx-focus-lane-failed-qa",
+        task_id="focus-lane-failed-qa",
+        parent_task_id=parent_task_id,
+    )
+    reminder = SimpleNamespace(
+        runtime_context_id="mfrctx-reminder-lane-failed-qa",
+        task_id="reminder-lane-failed-qa",
+        parent_task_id=parent_task_id,
+    )
+
+    def dispatch(context):
+        return {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "actor_role": "observer",
+            "evidence_kind": "dispatch_bounded_worker",
+            "worker_role": "mf_sub",
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+        }
+
+    def qa(context, *, status, commit):
+        return {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "actor_role": "qa",
+            "evidence_kind": "independent_verification",
+            "status": status,
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+            "commit_sha": commit,
+            "payload": {"status": status, "verdict": status.upper()},
+        }
+
+    record = {
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "contract_execution_id": parent_task_id,
+        "backlog_id": "AC-EXACT-LANE-FAILED-QA",
+        "completed_lines": [
+            dispatch(focus),
+            dispatch(reminder),
+            qa(focus, status="failed", commit="a" * 40),
+        ],
+    }
+
+    # The contract-global completion selector sees Focus.  Reminder has no
+    # canonical CR QA line and must therefore retain its authenticated
+    # timeline boundary instead of borrowing the sibling failure.
+    assert server._active_failed_qa_line_index(
+        record["completed_lines"],
+        source_record=record,
+    ) == 2
+    assert server._runtime_context_active_failed_qa_line_index_for_context(
+        record,
+        context=focus,
+    ) == 2
+    assert server._runtime_context_active_failed_qa_line_index_for_context(
+        record,
+        context=reminder,
+    ) == -1
+
+    record["completed_lines"].append(
+        qa(reminder, status="failed", commit="b" * 40)
+    )
+    assert server._runtime_context_active_failed_qa_line_index_for_context(
+        record,
+        context=focus,
+    ) == 2
+    assert server._runtime_context_active_failed_qa_line_index_for_context(
+        record,
+        context=reminder,
+    ) == 3
+
+    record["completed_lines"].append(
+        qa(reminder, status="passed", commit="c" * 40)
+    )
+    assert server._runtime_context_active_failed_qa_line_index_for_context(
+        record,
+        context=reminder,
+    ) == -1
+    assert server._runtime_context_active_failed_qa_line_index_for_context(
+        record,
+        context=SimpleNamespace(
+            runtime_context_id=reminder.runtime_context_id,
+            task_id="wrong-task",
+            parent_task_id=parent_task_id,
+        ),
+    ) == -1
+
+
 def test_failed_qa_rejoin_consumes_exact_cross_runtime_successor_dispatch(
     monkeypatch,
 ):
