@@ -38688,6 +38688,134 @@ def test_parallel_branch_merge_queue_materialize_contract_actor_is_prevalidated_
     ) == []
 
 
+def test_mf_parallel_terminal_lane_observer_merge_prefers_exact_observer_proof(
+    conn,
+    monkeypatch,
+):
+    execution_id = "cex-terminal-lane-observer-merge"
+    backlog_id = "AC-TERMINAL-LANE-OBSERVER-MERGE"
+    ctx = _ctx_with_role(
+        {
+            "project_id": PID,
+            "contract_execution_id": execution_id,
+        },
+        "coordinator",
+        method="POST",
+        body={
+            "stage_id": "observer_lane_merge",
+            "line_id": "observer_merge",
+            "evidence_kind": "merge",
+            "runtime_context_id": "mfrctx-terminal-worker",
+            "task_id": "terminal-worker",
+            "parent_task_id": execution_id,
+            "worker_role": "mf_sub",
+            "observer_session_id": "obs-terminal-worker-merge",
+            "observer_route_token_ref": "rtok-terminal-worker-merge",
+        },
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "contract_execution_id": execution_id,
+        "runtime_guide": {
+            # The global scheduler is intentionally on the sibling worker.
+            "next_legal_action": {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "actor_role": "mf_sub",
+                "runtime_context_id": "mfrctx-unfinished-sibling",
+                "task_id": "unfinished-sibling",
+            }
+        },
+    }
+    observer_calls = []
+
+    def resolve_observer(_ctx, _conn, **kwargs):
+        observer_calls.append(kwargs)
+        return {
+            "role": "observer",
+            "role_source": "observer_session_route_token_ref",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_resolve_contract_runtime_observer_proof",
+        resolve_observer,
+    )
+    monkeypatch.setattr(
+        server,
+        "_resolve_contract_runtime_mf_sub_proof",
+        lambda *_args, **_kwargs: pytest.fail(
+            "exact observer_merge must not enter sibling mf_sub proof"
+        ),
+    )
+
+    assert server._contract_runtime_effective_actor_role(
+        ctx,
+        conn,
+        action="contract_runtime_submit_line",
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        record=record,
+    ) == "observer"
+    assert observer_calls == [
+        {
+            "project_id": PID,
+            "action": "contract_runtime_submit_line",
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("stage_id", "worker_implementation"),
+        ("line_id", "worker_implementation"),
+        ("evidence_kind", "implementation"),
+        ("observer_session_id", ""),
+        ("observer_route_token_ref", ""),
+    ],
+)
+def test_mf_parallel_observer_merge_proof_preference_is_exact(field, value):
+    ctx = _ctx(
+        {"project_id": PID},
+        method="POST",
+        body={
+            "stage_id": "observer_lane_merge",
+            "line_id": "observer_merge",
+            "evidence_kind": "merge",
+            "observer_session_id": "obs-exact-merge",
+            "observer_route_token_ref": "rtok-exact-merge",
+            field: value,
+        },
+    )
+    assert server._contract_runtime_mf_parallel_observer_merge_proof_requested(
+        ctx,
+        {"contract_id": "mf_parallel.v2"},
+    ) is False
+
+
+def test_observer_merge_proof_preference_does_not_widen_other_contracts():
+    ctx = _ctx(
+        {"project_id": PID},
+        method="POST",
+        body={
+            "stage_id": "observer_lane_merge",
+            "line_id": "observer_merge",
+            "evidence_kind": "merge",
+            "observer_session_id": "obs-other-contract",
+            "observer_route_token_ref": "rtok-other-contract",
+        },
+    )
+    assert server._contract_runtime_mf_parallel_observer_merge_proof_requested(
+        ctx,
+        {"contract_id": "direct_fix.v1"},
+    ) is False
+
+
 def test_two_worker_premerge_qa_receipts_persist_at_observer_merge_without_writing_it(
     conn,
     monkeypatch,

@@ -97466,6 +97466,48 @@ def _contract_runtime_mf_sub_proof_requested(ctx: RequestContext) -> bool:
     )
 
 
+def _contract_runtime_mf_parallel_observer_merge_proof_requested(
+    ctx: RequestContext,
+    record: Mapping[str, Any] | None,
+) -> bool:
+    """Prefer exact observer proof for a route-bound atomic-lane merge.
+
+    A completed lane can be waiting at ``observer_merge`` while the shared
+    mf_parallel scheduler points at an unfinished sibling worker line.  The
+    observer merge body necessarily carries that completed lane's worker
+    identity, which otherwise looks like an mf_sub proof request when actor
+    resolution examines the global guide.  This predicate only chooses which
+    existing proof resolver runs; the atomic lane write gate remains the
+    authority that accepts or rejects the requested line.
+    """
+
+    body = getattr(ctx, "body", {})
+    if not isinstance(body, Mapping) or not isinstance(record, Mapping):
+        return False
+    if not _is_mf_parallel_record_contract_id(
+        str(record.get("contract_id") or "")
+    ):
+        return False
+    if (
+        str(body.get("stage_id") or "").strip() != "observer_lane_merge"
+        or str(body.get("line_id") or "").strip() != "observer_merge"
+        or str(body.get("evidence_kind") or "").strip() != "merge"
+    ):
+        return False
+    return bool(
+        _contract_runtime_ref_value(
+            ctx,
+            "observer_session_id",
+            "observer_session_ref",
+        )
+        and _contract_runtime_ref_value(
+            ctx,
+            "observer_route_token_ref",
+            "route_token_ref",
+        )
+    )
+
+
 def _contract_runtime_next_line_allows_mf_sub(
     record: Mapping[str, Any] | None,
 ) -> bool:
@@ -98995,6 +99037,17 @@ def _contract_runtime_effective_actor_role(
         return "qa"
     if role_normalized == "observer":
         return "observer"
+    if _contract_runtime_mf_parallel_observer_merge_proof_requested(ctx, record):
+        observer_proof = _resolve_contract_runtime_observer_proof(
+            ctx,
+            conn,
+            project_id=project_id,
+            action=action,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+        )
+        if observer_proof:
+            return "observer"
     proof_requested = _contract_runtime_mf_sub_proof_requested(ctx)
     mf_sub_allowed = _contract_runtime_next_line_allows_mf_sub(record)
     mf_sub_proof_required = _contract_runtime_next_line_requires_mf_sub_proof(record)
