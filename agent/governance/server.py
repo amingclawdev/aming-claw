@@ -53482,6 +53482,100 @@ def _runtime_context_revise_precommit_implementation_lineage(
     }
 
 
+def _runtime_context_failed_qa_worker_commit_lane_next_action(
+    *,
+    runtime: ContractRuntime,
+    record: Mapping[str, Any],
+    source_record: Mapping[str, Any],
+    context: Any,
+    projection: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the exact selected-lane worker_commit action after QA rework.
+
+    A multi-lane ContractRuntime keeps a deterministic global scheduler view.
+    Failed-QA implementation revision must instead validate and return the
+    authenticated worker's private atomic-lane view; otherwise a sibling lane
+    can become the global first-missing action while the selected lane is
+    correctly waiting at ``worker_commit``.
+    """
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    expected_identity = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "lane_id": worker_slot_id,
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+    }
+    if not all(str(value or "").strip() for value in expected_identity.values()):
+        return {}
+    lane_probe = {
+        **expected_identity,
+        "actor_role": "mf_sub",
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "evidence_kind": "worker_commit",
+        "payload": dict(expected_identity),
+    }
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    try:
+        _lane_state, lane_guide = runtime.mf_parallel_atomic_lane_gate_view(
+            record,
+            guide,
+            lane_probe,
+            source_record=source_record,
+            projection=projection,
+        )
+    except ContractRuntimeError:
+        return {}
+    lane_next = (
+        lane_guide.get("next_legal_action")
+        if isinstance(lane_guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    lane_binding = (
+        lane_guide.get("atomic_lane_gate_binding")
+        if isinstance(lane_guide.get("atomic_lane_gate_binding"), Mapping)
+        else {}
+    )
+    if (
+        lane_next.get("atomic_lane_gate_bound") is not True
+        or lane_binding.get("bound") is not True
+        or str(lane_next.get("stage_id") or "").strip() != "worker_commit"
+        or str(lane_next.get("line_id") or "").strip() != "worker_commit"
+        or str(lane_next.get("evidence_kind") or "").strip()
+        != "worker_commit"
+        or str(lane_next.get("owner_role") or "").strip() != "mf_sub"
+        or "mf_sub"
+        not in {
+            str(role or "").strip()
+            for role in (lane_next.get("allowed_writer_roles") or [])
+        }
+        or any(
+            str(lane_next.get(field) or "").strip() != value
+            or str(lane_binding.get(field) or "").strip() != value
+            for field, value in expected_identity.items()
+        )
+    ):
+        return {}
+    return dict(lane_next)
+
+
 def _runtime_context_revise_failed_qa_implementation_lineage(
     conn,
     *,
@@ -54338,23 +54432,28 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
             "mf_sub",
         )
         revised_lines = [*completed_lines, boundary_line, implementation_line]
+        revision_projection = {
+            "schema_version": (
+                "contract_runtime.authenticated_failed_qa_revision_projection.v1"
+            ),
+            "source": "server_authenticated_qa_timeline_materialization",
+            "failed_qa_source_ref": expected_failed_qa_source_ref,
+            "revision_event_ref": revision_event_ref,
+        }
         projected = runtime.projected_record(
             contract_execution_id,
             actor_role="mf_sub",
             completed_lines=revised_lines,
-            projection={
-                "schema_version": (
-                    "contract_runtime.authenticated_failed_qa_revision_projection.v1"
-                ),
-                "source": "server_authenticated_qa_timeline_materialization",
-                "failed_qa_source_ref": expected_failed_qa_source_ref,
-                "revision_event_ref": revision_event_ref,
-            },
+            projection=revision_projection,
         )
         projected_next = (
-            projected.get("runtime_guide", {}).get("next_legal_action", {})
-            if isinstance(projected.get("runtime_guide"), Mapping)
-            else {}
+            _runtime_context_failed_qa_worker_commit_lane_next_action(
+                runtime=runtime,
+                record=projected,
+                source_record=record,
+                context=context,
+                projection=revision_projection,
+            )
         )
         if str(projected_next.get("line_id") or "").strip() != "worker_commit":
             raise GovernanceError(
@@ -54397,6 +54496,14 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
                 },
             ) from exc
         persisted = runtime.store.get(contract_execution_id)
+        persisted_next = (
+            _runtime_context_failed_qa_worker_commit_lane_next_action(
+                runtime=runtime,
+                record=persisted,
+                source_record=persisted,
+                context=context,
+            )
+        )
         latest = _worker_commit_completed_implementation(
             persisted,
             runtime_context_id=runtime_context_id,
@@ -54429,7 +54536,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
                 "execution_state_revision", 0
             ),
             "execution_state_hash": current_state.get("execution_state_hash", ""),
-            "next_legal_action": current_state.get("next_legal_action") or {},
+            "next_legal_action": persisted_next,
             "failed_qa_source_ref": expected_failed_qa_source_ref,
             "superseded_implementation_commit_authority": dict(
                 prior_implementation_commit_authority
@@ -54529,6 +54636,12 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
     )
     lineage = _worker_implementation_lineage(updated, latest or {})
     current_state = _runtime_current_state_from_record(updated)
+    updated_next = _runtime_context_failed_qa_worker_commit_lane_next_action(
+        runtime=runtime,
+        record=updated,
+        source_record=updated,
+        context=context,
+    )
     return {
         "schema_version": "runtime_context.canonical_contract_line.v1",
         "accepted": True,
@@ -54550,7 +54663,7 @@ def _runtime_context_revise_failed_qa_implementation_lineage(
         or "",
         "execution_state_revision": current_state.get("execution_state_revision", 0),
         "execution_state_hash": current_state.get("execution_state_hash", ""),
-        "next_legal_action": current_state.get("next_legal_action") or {},
+        "next_legal_action": updated_next,
         "append_only_history_preserved": True,
         "timeline_projection_authoritative": False,
     }

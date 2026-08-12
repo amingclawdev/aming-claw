@@ -68376,6 +68376,119 @@ def test_timeline_only_authenticated_failed_qa_revises_stored_observer_merge(
     )
 
 
+def test_failed_qa_rework_uses_exact_atomic_lane_worker_commit_view():
+    execution_id = "cex-failed-qa-two-lane-next"
+    selected = {
+        "runtime_context_id": "mfrctx-failed-qa-focus",
+        "task_id": "failed-qa-focus-worker",
+        "parent_task_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": "slot-failed-qa-focus",
+        "worker_slot_id": "slot-failed-qa-focus",
+        "lane_id": "slot-failed-qa-focus",
+        "line_instance_id": "runtime_context:mfrctx-failed-qa-focus",
+    }
+    sibling = {
+        "runtime_context_id": "mfrctx-failed-qa-reminder",
+        "task_id": "failed-qa-reminder-worker",
+        "parent_task_id": execution_id,
+        "worker_id": "slot-failed-qa-reminder",
+        "worker_slot_id": "slot-failed-qa-reminder",
+    }
+    global_next = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        **sibling,
+    }
+    record = {
+        "contract_execution_id": execution_id,
+        "completed_lines": [{"line_id": "observer_dispatch_bounded_workers"}],
+        "runtime_guide": {"next_legal_action": global_next},
+    }
+    context = SimpleNamespace(**selected)
+
+    class FakeRuntime:
+        lane_override: dict[str, Any] = {}
+        binding_override: dict[str, Any] = {}
+
+        def mf_parallel_atomic_lane_gate_view(
+            self,
+            gate_record,
+            guide,
+            write,
+            *,
+            source_record,
+            projection,
+        ):
+            assert gate_record is record
+            assert source_record is record
+            assert projection == {"source": "authenticated_failed_qa"}
+            assert guide["next_legal_action"] == global_next
+            for field, value in selected.items():
+                assert write[field] == value
+                assert write["payload"][field] == value
+            assert write["stage_id"] == "worker_commit"
+            assert write["line_id"] == "worker_commit"
+            assert write["evidence_kind"] == "worker_commit"
+            return {}, {
+                "next_legal_action": {
+                    "stage_id": "worker_commit",
+                    "line_id": "worker_commit",
+                    "evidence_kind": "worker_commit",
+                    "owner_role": "mf_sub",
+                    "allowed_writer_roles": ["mf_sub"],
+                    "atomic_lane_gate_bound": True,
+                    **selected,
+                    **self.lane_override,
+                },
+                "atomic_lane_gate_binding": {
+                    "bound": True,
+                    **selected,
+                    **self.binding_override,
+                },
+            }
+
+    runtime = FakeRuntime()
+    before = copy.deepcopy(record)
+    selected_next = (
+        server._runtime_context_failed_qa_worker_commit_lane_next_action(
+            runtime=runtime,
+            record=record,
+            source_record=record,
+            context=context,
+            projection={"source": "authenticated_failed_qa"},
+        )
+    )
+
+    assert selected_next["line_id"] == "worker_commit"
+    assert selected_next["runtime_context_id"] == selected["runtime_context_id"]
+    assert selected_next["task_id"] == selected["task_id"]
+    assert sibling["runtime_context_id"] not in json.dumps(selected_next)
+    assert record == before
+
+    invalid_views = (
+        ({"runtime_context_id": sibling["runtime_context_id"]}, {}),
+        ({"line_id": "worker_implementation"}, {}),
+        ({"atomic_lane_gate_bound": False}, {}),
+        ({}, {"task_id": sibling["task_id"]}),
+        ({}, {"bound": False}),
+    )
+    for lane_override, binding_override in invalid_views:
+        runtime.lane_override = lane_override
+        runtime.binding_override = binding_override
+        assert not (
+            server._runtime_context_failed_qa_worker_commit_lane_next_action(
+                runtime=runtime,
+                record=record,
+                source_record=record,
+                context=context,
+                projection={"source": "authenticated_failed_qa"},
+            )
+        )
+        assert record == before
+
+
 def test_runtime_context_session_token_rejoin_keeps_validated_worker_closed_without_failed_qa(
     conn,
     tmp_path,
