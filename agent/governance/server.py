@@ -46714,6 +46714,28 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         body=body,
                     )
                 )
+            pre_lineage_request_binding_errors = [
+                str(error or "").strip()
+                for error in (
+                    pre_lineage_bootstrap_rejoin_authority.get("errors")
+                    or []
+                )
+                if (
+                    str(error or "").strip().endswith(
+                        "_mismatch_or_missing"
+                    )
+                    and not str(error or "").strip().startswith(
+                        "initial_join_audit_"
+                    )
+                )
+                or str(error or "").strip().startswith("request_route_")
+                or str(error or "").strip()
+                in {
+                    "runtime_context_identity_mismatch",
+                    "project_identity_mismatch",
+                    "host_startup_id_conflict",
+                }
+            ]
             post_receipt_next_stage_checkpoint_issuance = bool(
                 effective_read_receipt_ref
                 and not effective_startup_ref
@@ -46732,6 +46754,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 and not pre_lineage_bounded_replacement_authority.get(
                     "identity_mismatches"
                 )
+                and not pre_lineage_request_binding_errors
             )
             if (
                 pre_lineage_bootstrap_rejoin_authority.get("eligible")

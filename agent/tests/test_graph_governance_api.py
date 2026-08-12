@@ -61177,6 +61177,34 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
         replacement["audit_event_ref"],
     ]
 
+    before_ref_only_context = context
+    before_ref_only_events = _pre_lineage_case_events(conn, case)
+    before_ref_only_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        context.runtime_context_id,
+    )
+    with pytest.raises(GovernanceError) as ref_only:
+        _pre_lineage_rejoin(
+            case,
+            body_override={
+                "session_token_ref": runtime_context_session_token_ref(
+                    context
+                ),
+                "reason": "a ref alone cannot issue the startup checkpoint",
+            },
+        )
+    assert ref_only.value.details["mutation_performed"] is False
+    assert ref_only.value.details["credential_rotated"] is False
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        ref_only.value,
+        before_context=before_ref_only_context,
+        before_events=before_ref_only_events,
+        before_revision=before_ref_only_revision,
+    )
+
     next_issuance = _pre_lineage_rejoin(
         case,
         body_updates={
