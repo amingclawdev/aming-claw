@@ -61234,11 +61234,13 @@ def test_legacy_operator_recovery_trigger_accepts_only_exact_dead_end_shapes():
 
 
 @pytest.mark.parametrize("persisted_prelineage_cex", ["exact", "legacy_empty"])
+@pytest.mark.parametrize("renew_route_after_receipt", [False, True])
 def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drift(
     conn,
     monkeypatch,
     tmp_path,
     persisted_prelineage_cex,
+    renew_route_after_receipt,
 ):
     case = _setup_pre_lineage_rejoin_recovery_case(
         conn,
@@ -61342,6 +61344,19 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
         first["audit_event_ref"],
         replacement["audit_event_ref"],
     ]
+    active_route_identity = dict(case["route_identity"])
+    if renew_route_after_receipt:
+        renewed = observer_route_context.renew_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=active_route_identity["route_token_ref"],
+            backlog_id=case["backlog_id"],
+            task_id=case["task_id"],
+            allowed_actions=["task_timeline_append"],
+            ttl_hours=24.0,
+            now=datetime(2099, 8, 2, 1, 30, tzinfo=timezone.utc),
+        )
+        active_route_identity = dict(renewed["route_identity"])
 
     with pytest.raises(GovernanceError) as guide_error:
         server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
@@ -61366,6 +61381,10 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
     ]["copy_safe_body"]
     assert projected_rejoin_body["contract_execution_id"] == (
         case["parent_task_id"]
+    )
+    assert all(
+        projected_rejoin_body[field] == active_route_identity[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     )
 
     before_ref_only_context = context
@@ -61449,7 +61468,7 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
                     (receipt.get("timeline_event") or {}).get("id") or ""
                 ),
                 "startup_source": "codex_desktop_governed_dispatch",
-                **case["route_identity"],
+                **active_route_identity,
             },
         )
     )
@@ -62916,6 +62935,245 @@ def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebi
     )
 
 
+@pytest.mark.parametrize("renewal_hops", [0, 1, 2])
+def test_runtime_context_worker_guide_projects_unique_active_route_ref_without_history_rewrite(
+    conn,
+    monkeypatch,
+    tmp_path,
+    renewal_hops,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"worker-guide-route-renewal-{renewal_hops}",
+        source_backed_contract_runtime=False,
+    )
+    original_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        case["context"].runtime_context_id,
+    )
+    assert original_revision is not None
+    original_identity = dict(case["route_identity"])
+    active_identity = dict(original_identity)
+    for hop in range(renewal_hops):
+        renewed = observer_route_context.renew_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref=active_identity["route_token_ref"],
+            backlog_id=case["backlog_id"],
+            task_id=case["task_id"],
+            allowed_actions=["task_timeline_append"],
+            ttl_hours=24.0,
+            now=datetime(2099, 8, 2, 1, 10 + hop, tzinfo=timezone.utc),
+        )
+        active_identity = dict(renewed["route_identity"])
+
+    before_revision_count = conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contract_revisions "
+        "WHERE project_id=? AND runtime_context_id=?",
+        (PID, case["context"].runtime_context_id),
+    ).fetchone()[0]
+    before_timeline_count = len(_pre_lineage_case_events(conn, case))
+    before_changes = conn.total_changes
+    projected = server._runtime_context_worker_projected_route_identity(
+        conn,
+        case["context"],
+    )
+    assert projected == active_identity
+    assert (projected == original_identity) is (renewal_hops == 0)
+
+    recovery = server._runtime_context_worker_recovery_details(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case["context"].runtime_context_id,
+            },
+            "mf_sub",
+            query={
+                "task_id": case["task_id"],
+                "parent_task_id": case["parent_task_id"],
+                "session_token_ref": runtime_context_session_token_ref(
+                    case["context"]
+                ),
+                "target_project_root": str(case["target_root"]),
+            },
+        ),
+        conn,
+        project_id=PID,
+        runtime_context_id=case["context"].runtime_context_id,
+        task_id=case["task_id"],
+        parent_task_id=case["parent_task_id"],
+        session_token_ref=runtime_context_session_token_ref(case["context"]),
+        target_project_root=str(case["target_root"]),
+        reason="worker_auth_material_missing",
+        context=case["context"],
+    )
+    payloads = recovery["actionable_payloads"]
+    rejoin = payloads["session_token_rejoin_submission"]
+    hint = payloads["session_renewal_hints"]["rejoin"]
+    for projection in (rejoin, hint):
+        assert projection["copy_safe_body"]["route_token_ref"] == (
+            active_identity["route_token_ref"]
+        )
+        assert all(
+            projection["copy_safe_body"][field] == active_identity[field]
+            for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+
+    projection_response = server._runtime_context_projection_response(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case["context"].runtime_context_id,
+            },
+            "observer",
+            query={"view": "all"},
+        ),
+        conn,
+        project_id=PID,
+        context=case["context"],
+        role="observer",
+        session={
+            "session_id": "server-derived-route-projection-test",
+            "principal_id": "runtime_context_service",
+            "project_id": PID,
+            "role": "observer",
+        },
+        record_access_audit=False,
+    )
+    guide = server._runtime_context_worker_guide_response(projection_response)
+    assert guide["child_route_token_ref"] == active_identity[
+        "route_token_ref"
+    ]
+    assert conn.total_changes == before_changes
+    assert len(_pre_lineage_case_events(conn, case)) == before_timeline_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM parallel_branch_runtime_contract_revisions "
+        "WHERE project_id=? AND runtime_context_id=?",
+        (PID, case["context"].runtime_context_id),
+    ).fetchone()[0] == before_revision_count
+    assert get_latest_branch_contract_revision(
+        conn,
+        PID,
+        case["context"].runtime_context_id,
+    ) == original_revision
+
+
+def test_runtime_context_worker_guide_route_projection_fails_closed_on_ambiguous_renewal(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="worker-guide-route-renewal-ambiguous",
+    )
+    original_ref = case["route_identity"]["route_token_ref"]
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=original_ref,
+        backlog_id=case["backlog_id"],
+        task_id=case["task_id"],
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 2, 1, 10, tzinfo=timezone.utc),
+    )
+    descendant = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=renewed["route_token_ref"],
+        now=datetime(2099, 8, 2, 1, 11, tzinfo=timezone.utc),
+    )
+    assert descendant is not None
+    sibling = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        task_id=case["task_id"],
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 2, 1, 12, tzinfo=timezone.utc),
+    )
+    sibling_token = sibling["route_token"]
+    sibling_token["owned_files"] = ["agent/governance/server.py"]
+    sibling_proof = copy.deepcopy(
+        descendant["route_lineage"]["renewal_proof"]
+    )
+    sibling_proof["route_token_ref"] = sibling["route_token_ref"]
+    sibling_token["route_lineage"] = {"renewal_proof": sibling_proof}
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=sibling["route_token_ref"],
+        token=sibling_token,
+    )
+    before_dump = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server._runtime_context_worker_projected_route_identity(
+            conn,
+            case["context"],
+        )
+
+    assert rejected.value.code == (
+        "runtime_context_worker_route_projection_invalid"
+    )
+    assert rejected.value.details["route_token_ref_error_code"] == (
+        "route_token_ref_renewal_descendant_ambiguous"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["historical_contract_revision_rewritten"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+def test_runtime_context_worker_guide_registry_backed_missing_ref_is_not_legacy(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="worker-guide-registry-ref-missing",
+    )
+    conn.execute(
+        "UPDATE parallel_branch_runtime_contract_revisions "
+        "SET route_evidence_type='observer_route_token_ref' "
+        "WHERE project_id=? AND runtime_context_id=?",
+        (PID, case["context"].runtime_context_id),
+    )
+    conn.execute(
+        "DELETE FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (PID, case["route_identity"]["route_token_ref"]),
+    )
+    conn.commit()
+    before_dump = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server._runtime_context_worker_projected_route_identity(
+            conn,
+            case["context"],
+        )
+
+    assert rejected.value.code == (
+        "runtime_context_worker_route_projection_missing"
+    )
+    assert rejected.value.details["actual"] == "registry_row_missing"
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 @pytest.mark.parametrize(
     ("lineage_fault", "expected_error_code"),
     [
@@ -64102,6 +64360,13 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
         "visible_injection_manifest_hash": _fake_sha("visible-runtime-rejoin-current"),
         "route_token_ref": "rtok-runtime-rejoin-current",
     }
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=context.backlog_id,
+        task_id=context.task_id,
+        target_files=["agent/governance/server.py"],
+        **route_identity,
+    )
     append_branch_contract_revision(
         conn,
         context,

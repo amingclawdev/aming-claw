@@ -21164,9 +21164,20 @@ def _runtime_context_projection_response(
     latest_revision_payload = (
         branch_contract_revision_to_dict(latest_revision) if latest_revision else {}
     )
-    route_identity = _parallel_branch_runtime_contract_route_identity(
+    persisted_route_identity = _parallel_branch_runtime_contract_route_identity(
         latest_revision_payload,
-        ctx.query,
+    )
+    route_identity = (
+        _runtime_context_worker_projected_route_identity(
+            conn,
+            context,
+            revision_payload=latest_revision_payload,
+        )
+        if persisted_route_identity
+        else _parallel_branch_runtime_contract_route_identity(
+            latest_revision_payload,
+            ctx.query,
+        )
     )
     timeline_events = _runtime_context_service_timeline_events(
         conn,
@@ -21414,7 +21425,7 @@ def _runtime_context_projection_response(
         parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
         worker_id=worker_summary_id,
         worker_slot_id=worker_summary_slot_id,
-        route_identity=_runtime_context_latest_route_identity(conn, context),
+        route_identity=route_identity,
     )
     if record_access_audit:
         audit = record_runtime_context_access_audit(
@@ -32005,7 +32016,10 @@ def _runtime_context_worker_recovery_details(
         expected_runtime_context_id = runtime_context_id_for_branch_context(context)
         expected_parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
         expected_target_root = _runtime_context_effective_target_project_root(context)
-        expected_route_identity = _runtime_context_latest_route_identity(conn, context)
+        expected_route_identity = _runtime_context_worker_projected_route_identity(
+            conn,
+            context,
+        )
         safe_route_identity = {
             field: str(expected_route_identity.get(field) or "").strip()
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
@@ -33008,6 +33022,130 @@ def _runtime_context_latest_route_identity(conn, context) -> dict[str, Any]:
     revision_payload = _runtime_context_latest_contract_revision_payload(conn, context)
     route_identity = _parallel_branch_runtime_contract_route_identity(revision_payload)
     return dict(route_identity)
+
+
+def _runtime_context_worker_projected_route_identity(
+    conn,
+    context,
+    *,
+    revision_payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project the unique active ref without rewriting immutable route history."""
+
+    from . import observer_route_context
+
+    revision = dict(revision_payload) if isinstance(
+        revision_payload, Mapping
+    ) else _runtime_context_latest_contract_revision_payload(conn, context)
+    persisted = {
+        field: str(value or "").strip()
+        for field, value in _parallel_branch_runtime_contract_route_identity(revision).items()
+        if field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not persisted or not persisted.get("route_token_ref"):
+        return dict(persisted)
+
+    project_id = str(getattr(context, "project_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    route_gate = revision.get("route_gate")
+    route_gate = route_gate if isinstance(route_gate, Mapping) else {}
+    token_gate = route_gate.get("route_token_gate")
+    token_gate = token_gate if isinstance(token_gate, Mapping) else {}
+    registry_backed = bool(
+        str(revision.get("contract_version") or "").strip()
+        == "mf_parallel.v2"
+        or str(revision.get("route_evidence_type") or "").strip()
+        in {
+            "parallel_branch_allocate",
+            "observer_route_token_ref",
+            "renewed_route_token_ref",
+            "resolved_active_route_token_ref_rejoin",
+        }
+        or token_gate.get("registry_verified") is True
+        or token_gate.get("resolved_from_ref") is True
+    )
+
+    def fail(
+        code: str,
+        message: str,
+        *,
+        error_code: str = "",
+        failure: Mapping[str, Any] | None = None,
+        actual: Any = "unresolved",
+    ) -> None:
+        evidence = dict(failure or {})
+        raise GovernanceError(
+            code,
+            message,
+            409,
+            {
+                "runtime_context_id": str(getattr(context, "runtime_context_id", "") or ""),
+                "task_id": str(getattr(context, "task_id", "") or ""),
+                "parent_task_id": parent_task_id,
+                "route_token_ref_error_code": error_code,
+                "field": evidence.get("field") or "route_token_ref",
+                "expected": evidence.get("expected")
+                or "unique_active_exact_same_scope_descendant",
+                "actual": evidence.get("actual") or actual,
+                "fail_closed": True,
+                "writes_performed": False,
+                "historical_contract_revision_rewritten": False,
+            },
+        )
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref_renewal_descendant(
+            conn,
+            project_id=project_id,
+            route_token_ref=persisted["route_token_ref"],
+        )
+    except (observer_route_context.RouteTokenRefError, sqlite3.Error, ValueError) as exc:
+        fail(
+            "runtime_context_worker_route_projection_invalid",
+            "runtime-context worker route projection cannot prove one active same-scope route ref",
+            error_code=str(getattr(exc, "code", "") or ""),
+            failure=getattr(exc, "details", {}) or {},
+        )
+    if not resolved:
+        if not registry_backed:
+            return dict(persisted)
+        fail(
+            "runtime_context_worker_route_projection_missing",
+            "runtime-context worker route projection requires registered route authority",
+            actual="registry_row_missing",
+        )
+
+    resolved_identity = _parallel_branch_runtime_contract_route_identity(resolved)
+    resolved_identity = {
+        field: str(resolved_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    renewal_resolution = (
+        resolved.get("renewal_resolution")
+        if isinstance(resolved.get("renewal_resolution"), Mapping)
+        else {}
+    )
+    exact_resolution = not renewal_resolution or (
+        str(renewal_resolution.get("status") or "")
+        == "resolved_active_descendant"
+        and renewal_resolution.get("exact_scope_verified") is True
+        and renewal_resolution.get("registry_verified") is True
+    )
+    if not (
+        resolved.get("resolved_from_ref") is True
+        and str(resolved.get("status") or "").strip() == "active"
+        and all(resolved_identity.values())
+        and exact_resolution
+    ):
+        fail(
+            "runtime_context_worker_route_projection_mismatch",
+            "runtime-context worker route projection changed canonical identity or scope",
+            actual={
+                "identity_resolution_verified": exact_resolution,
+                "registry_backed": registry_backed,
+            },
+        )
+    return resolved_identity
 
 
 def _runtime_context_verified_allocation_route_successor(
