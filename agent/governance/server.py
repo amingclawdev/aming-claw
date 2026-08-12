@@ -142296,6 +142296,490 @@ def _contract_runtime_parentless_direct_main_projection(
     }
 
 
+def _contract_runtime_completed_onboard_direct_main_git_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    candidate_commit: str,
+    implementation_event: Mapping[str, Any],
+    row_declared_files: Sequence[str],
+) -> dict[str, Any]:
+    """Re-derive the immutable Git half of a completed onboard Direct Main.
+
+    The candidate may be an ancestor of the runtime that contains this verifier.
+    That is the normal repair shape: all close-satisfying candidate evidence was
+    frozen before the first close attempt, then a later governance-only commit
+    repaired the read-only authority projection.  No later timeline evidence is
+    accepted here.
+    """
+
+    schema = "completed_onboard_direct_main.git_authority.v1"
+
+    def failed(reason: str, **details: Any) -> dict[str, Any]:
+        authority = {
+            "schema_version": schema,
+            "passed": False,
+            "status": "failed",
+            "server_derived": True,
+            "read_only_projection": True,
+            "caller_claims_trusted": False,
+            "failure_reason": reason,
+            "persisted_timeline_mutated": False,
+            **details,
+        }
+        authority["authority_hash"] = stable_sha256(authority)
+        return authority
+
+    root = Path(
+        project_service.resolve_project_root(project_id, None, fallback_self=True)
+    ).resolve()
+    candidate = str(candidate_commit or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate):
+        return failed("candidate_commit_invalid")
+    resolved = _qa_post_merge_resolve_commit(root, candidate)
+    head = _git_output(root, ["rev-parse", "--verify", "HEAD^{commit}"]).lower()
+    if resolved != candidate or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        return failed("candidate_or_canonical_head_unavailable")
+    if not _git_clean_worktree_verified(root):
+        return failed("canonical_worktree_dirty")
+    if not _git_commit_is_ancestor(root, candidate, head):
+        return failed("candidate_not_ancestor_of_canonical_head")
+
+    parents = _git_output(root, ["rev-list", "--parents", "-n", "1", candidate]).split()
+    if len(parents) != 2 or parents[0].lower() != candidate:
+        return failed("candidate_not_single_parent", parent_count=max(0, len(parents) - 1))
+    parent = parents[1].lower()
+    body = _git_output(root, ["show", "-s", "--format=%B", candidate])
+
+    def trailers(key: str) -> list[str]:
+        return re.findall(rf"(?m)^{re.escape(key)}:\s*(\S+)\s*$", body)
+
+    expected = {
+        "Chain-Source-Task": task_id,
+        "Chain-Source-Contract-Execution": task_id,
+        "Chain-Source-Stage": "implementation",
+        "Chain-Task": task_id,
+        "Chain-Bug-Id": backlog_id,
+        "Chain-Backlog": backlog_id,
+        "Chain-Route": "operator_supervised_direct_main",
+        "Chain-Parent": parent,
+    }
+    mismatches = {
+        key: {"expected": value, "actual": trailers(key)}
+        for key, value in expected.items()
+        if trailers(key) != [value]
+    }
+    if mismatches:
+        return failed("commit_trailer_identity_mismatch", trailer_mismatches=mismatches)
+
+    git_files = _runtime_context_service_dedupe(
+        line.strip()
+        for line in _git_output(
+            root,
+            ["diff-tree", "--no-commit-id", "--name-only", "-r", candidate],
+        ).splitlines()
+        if line.strip()
+    )
+    payload = (
+        implementation_event.get("payload")
+        if isinstance(implementation_event.get("payload"), Mapping)
+        else {}
+    )
+    event_files = _runtime_context_service_dedupe(
+        _runtime_context_service_query_values(payload, "changed_files")
+    )
+    declared_files = _runtime_context_service_dedupe(row_declared_files)
+    if not declared_files or set(git_files) != set(declared_files):
+        return failed(
+            "immutable_git_diff_not_exact_row_scope",
+            git_changed_files=git_files,
+            row_declared_files=declared_files,
+        )
+    if set(event_files) != set(declared_files):
+        return failed(
+            "implementation_files_not_exact_row_scope",
+            implementation_changed_files=event_files,
+            row_declared_files=declared_files,
+        )
+
+    try:
+        version_row = conn.execute(
+            "SELECT git_head, dirty_files, git_synced_at FROM project_version WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        synced_dirty = json.loads(str(version_row["dirty_files"] or "[]"))
+    except (sqlite3.Error, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        version_row = None
+        synced_dirty = ["invalid_or_missing_project_version"]
+    if not version_row or str(version_row["git_head"] or "").strip().lower() != head or synced_dirty or not str(version_row["git_synced_at"] or "").strip():
+        return failed("project_version_not_clean_and_current", canonical_head=head)
+
+    from . import graph_snapshot_store
+
+    active = graph_snapshot_store.get_active_graph_snapshot(conn, project_id) or {}
+    if (
+        str(active.get("status") or "").strip() != "active"
+        or str(active.get("commit_sha") or "").strip().lower() != head
+    ):
+        return failed("active_graph_not_current", canonical_head=head)
+    try:
+        pending_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM pending_scope_reconcile WHERE project_id = ? AND status IN ('queued', 'running', 'failed')",
+                (project_id,),
+            ).fetchone()[0]
+        )
+    except sqlite3.Error:
+        pending_count = -1
+    if pending_count != 0:
+        return failed("pending_scope_reconcile_not_empty", pending_count=pending_count)
+
+    runtime_version = ""
+    self_root = Path(__file__).resolve().parents[2]
+    if project_id == "aming-claw" or root == self_root:
+        runtime_version = str(get_governance_runtime_version(default="") or "").strip().lower()
+        if not runtime_version or not (
+            head.startswith(runtime_version) or runtime_version.startswith(head)
+        ):
+            return failed("governance_runtime_not_current", canonical_head=head)
+
+    authority = {
+        "schema_version": schema,
+        "passed": True,
+        "status": "passed",
+        "server_derived": True,
+        "read_only_projection": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "candidate_commit_sha": candidate,
+        "candidate_parent_commit_sha": parent,
+        "canonical_head_commit_sha": head,
+        "candidate_is_ancestor_of_canonical_head": True,
+        "changed_files": git_files,
+        "active_snapshot_id": str(active.get("snapshot_id") or ""),
+        "governance_runtime_version": runtime_version,
+        "persisted_timeline_mutated": False,
+        "historical_backfill_performed": False,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _contract_runtime_completed_onboard_direct_main_close_authority_gate(
+    *,
+    conn,
+    project_id: str,
+    bug_id: str,
+    requested_execution_id: str,
+    close_commit: str,
+    timeline_events: list[dict[str, Any]] | None,
+    row_declared_files: Sequence[str],
+) -> dict[str, Any]:
+    """Project one root-only completed onboard Direct Main without backfill."""
+
+    from . import graph_snapshot_store, task_timeline
+    from .parallel_branch_runtime import get_branch_context
+
+    schema = "completed_onboard_direct_main.close_authority_gate.v1"
+    if conn is None or not requested_execution_id.startswith("onboard-service-"):
+        return {}
+    try:
+        record = _contract_runtime(conn).store.get(requested_execution_id)
+    except ContractRuntimeError:
+        return {}
+    current = _runtime_current_state_from_record(record)
+    if not (
+        _onboard_service_record(record)
+        and str(record.get("project_id") or "").strip() == project_id
+        and str(record.get("backlog_id") or "").strip() == bug_id
+        and not str(record.get("parent_contract_execution_id") or "").strip()
+        and str(record.get("root_contract_execution_id") or "").strip()
+        == requested_execution_id
+        and not current.get("next_legal_action")
+    ):
+        return {}
+    projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=bug_id,
+        rebuild_if_missing=False,
+    )
+    active_chain = projection.get("active_chain") or {}
+    execution_ids = _runtime_context_service_dedupe(
+        active_chain.get("execution_ids") or []
+    )
+    root_only = bool(
+        projection.get("root_contract_execution_id") == requested_execution_id
+        and projection.get("current_contract_execution_id") == requested_execution_id
+        and not str(projection.get("active_child_contract_execution_id") or "").strip()
+        and str(projection.get("readiness_state") or "").strip() == "contract_complete"
+        and execution_ids == [requested_execution_id]
+        and get_branch_context(conn, project_id, requested_execution_id) is None
+    )
+    if not root_only:
+        return {}
+
+    all_events = [
+        dict(event)
+        for event in timeline_events or []
+        if isinstance(event, Mapping)
+        and str(event.get("project_id") or "").strip() == project_id
+        and str(event.get("backlog_id") or "").strip() == bug_id
+    ]
+    events = [
+        event
+        for event in all_events
+        if str(event.get("task_id") or "").strip() == requested_execution_id
+    ]
+    forbidden_markers = {
+        "mf_subagent_startup",
+        "worker_commit",
+        "live_merge",
+        "merge_queue_entry",
+        "dispatch_bounded_worker",
+        "mf_parallel",
+        "mf_batch",
+    }
+    if any(
+        any(marker in _contract_runtime_parentless_direct_main_marker(event) for marker in forbidden_markers)
+        for event in events
+    ):
+        return {}
+
+    def order(event: Mapping[str, Any]) -> int:
+        return _contract_runtime_parentless_direct_main_event_order(event, 0)
+
+    close_attempt_ids = sorted(
+        order(event)
+        for event in all_events
+        if str(event.get("event_kind") or "").strip() == "route_action_precheck"
+        and isinstance(event.get("payload"), Mapping)
+        and str(event["payload"].get("source") or "").strip()
+        == "authoritative_backlog_close"
+        and str(event["payload"].get("action") or "").strip() == "backlog_close"
+    )
+    first_close_attempt = close_attempt_ids[0] if close_attempt_ids else 0
+    satisfying_kinds = {
+        "implementation", "independent_verification", "qa_verification", "reconcile", "close_ready"
+    }
+    if first_close_attempt and any(
+        order(event) > first_close_attempt
+        and str(event.get("event_kind") or "").strip().lower().replace("-", "_") in satisfying_kinds
+        for event in all_events
+    ):
+        return {
+            "schema_version": schema,
+            "accepted": False,
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": ["all_close_satisfying_evidence_before_first_close_attempt"],
+            "first_close_attempt_event_id": first_close_attempt,
+        }
+    evidence_events = [
+        event for event in events if not first_close_attempt or order(event) < first_close_attempt
+    ]
+    candidate = str(close_commit or "").strip().lower()
+
+    implementations = []
+    for event in evidence_events:
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        if not (
+            str(event.get("event_kind") or "").strip() == "implementation"
+            and task_timeline._event_passed(event)
+            and str(event.get("commit_sha") or "").strip().lower() == candidate
+            and str(payload.get("implementation_scope") or "").strip()
+            == "operator_supervised_direct_main"
+            and _contract_runtime_close_authority_route_token_backed_event(
+                event,
+                _observer_root_route_identity_from_event(event),
+                require_source_backed_authority=True,
+            )
+        ):
+            continue
+        implementations.append(event)
+    if len(implementations) != 1:
+        return {}
+    implementation = implementations[0]
+
+    qa_events: list[dict[str, Any]] = []
+    for event in evidence_events:
+        kind = str(event.get("event_kind") or "").strip().lower().replace("-", "_")
+        if kind not in _QA_TIMELINE_VERIFICATION_EVENT_KINDS:
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        authority = _contract_runtime_close_authority_first_deep_mapping(
+            payload, "source_backed_contract_gate_authority"
+        )
+        if (
+            str(event.get("commit_sha") or "").strip().lower() == candidate
+            and task_timeline._source_backed_qa_session_authority_valid(authority, conn=conn)
+        ):
+            qa_events.append(event)
+    pre_qa = [
+        event for event in qa_events
+        if order(event) > order(implementation)
+        and str(event.get("phase") or "").strip().lower().replace("-", "_") != "postdeploy_qa"
+        and task_timeline._event_passed(event)
+        and int(event.get("parent_event_id") or 0) == order(implementation)
+    ]
+    reconciles = [
+        event for event in evidence_events
+        if str(event.get("event_kind") or "").strip() == "reconcile"
+        and task_timeline._event_passed(event)
+        and str(event.get("commit_sha") or "").strip().lower() == candidate
+    ]
+    post_qa = [
+        event for event in qa_events
+        if str(event.get("phase") or "").strip().lower().replace("-", "_") == "postdeploy_qa"
+        and task_timeline._event_passed(event)
+    ]
+    close_ready = [
+        event for event in evidence_events
+        if str(event.get("event_kind") or "").strip() == "close_ready"
+        and task_timeline._event_passed(event)
+        and str(event.get("commit_sha") or "").strip().lower() == candidate
+    ]
+    if not (len(pre_qa) == len(reconciles) == len(post_qa) == len(close_ready) == 1):
+        return {}
+    pre_event, reconcile_event, post_event, close_event = (
+        pre_qa[0], reconciles[0], post_qa[0], close_ready[0]
+    )
+    if not (
+        order(implementation) < order(pre_event) < order(reconcile_event) < order(post_event) < order(close_event)
+        and int(post_event.get("parent_event_id") or 0) == order(reconcile_event)
+        and int(close_event.get("parent_event_id") or 0) == order(post_event)
+    ):
+        return {}
+    later_blocking_qa = [
+        event for event in qa_events
+        if order(event) > order(post_event) and not task_timeline._event_passed(event)
+    ]
+    if later_blocking_qa:
+        return {}
+
+    reconcile_payload = reconcile_event.get("payload") if isinstance(reconcile_event.get("payload"), Mapping) else {}
+    snapshot_id = str(
+        reconcile_payload.get("snapshot_id")
+        or reconcile_payload.get("active_snapshot_id")
+        or ""
+    ).strip()
+    snapshot = (
+        conn.execute(
+            "SELECT snapshot_id, commit_sha, status FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+            (project_id, snapshot_id),
+        ).fetchone()
+        if snapshot_id
+        else None
+    )
+    if not (
+        reconcile_payload.get("graph_reconciled") is True
+        and snapshot is not None
+        and str(snapshot["commit_sha"] or "").strip().lower() == candidate
+        and str(reconcile_payload.get("canonical_head_commit") or "").strip().lower() == candidate
+    ):
+        return {}
+
+    close_payload = close_event.get("payload") if isinstance(close_event.get("payload"), Mapping) else {}
+    close_verification = close_event.get("verification") if isinstance(close_event.get("verification"), Mapping) else {}
+    if not (
+        _contract_runtime_close_authority_route_token_backed_event(
+            close_event,
+            _observer_root_route_identity_from_event(close_event),
+            require_source_backed_authority=True,
+        )
+        and str(close_payload.get("implementation_event_ref") or "") == f"timeline:{order(implementation)}"
+        and str(close_payload.get("predeploy_qa_event_ref") or "") == f"timeline:{order(pre_event)}"
+        and str(close_payload.get("reconcile_event_ref") or "") == f"timeline:{order(reconcile_event)}"
+        and str(close_payload.get("postdeploy_qa_event_ref") or "") == f"timeline:{order(post_event)}"
+        and close_verification.get("close_satisfying_bundle") is True
+        and close_verification.get("fresh_postdeploy_qa") is True
+        and close_verification.get("graph_exact_current") is True
+        and close_verification.get("runtime_exact") is True
+        and isinstance(close_payload.get("preflight"), Mapping)
+        and close_payload["preflight"].get("ok") is True
+        and not list(close_payload["preflight"].get("blockers") or [])
+    ):
+        return {}
+
+    git_authority = _contract_runtime_completed_onboard_direct_main_git_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=bug_id,
+        task_id=requested_execution_id,
+        candidate_commit=candidate,
+        implementation_event=implementation,
+        row_declared_files=row_declared_files,
+    )
+    if git_authority.get("passed") is not True:
+        return {
+            "schema_version": schema,
+            "accepted": False,
+            "passed": False,
+            "status": "failed",
+            "missing_requirement_ids": [str(git_authority.get("failure_reason") or "immutable_git_authority")],
+            "git_authority": git_authority,
+        }
+    gate = {
+        "schema_version": schema,
+        "accepted": True,
+        "passed": True,
+        "status": "passed",
+        "source": "server_derived_completed_onboard_operator_supervised_direct_main",
+        "primary_decision_source": True,
+        "meta_contract_gate_decision_source": False,
+        "contract_execution_id": requested_execution_id,
+        "close_commit": candidate,
+        "first_close_attempt_event_id": first_close_attempt,
+        "historical_pre_attempt_evidence_frozen": bool(first_close_attempt),
+        "post_attempt_satisfying_evidence_count": 0,
+        "git_authority": git_authority,
+        "source_refs": [
+            f"contract_runtime:{requested_execution_id}",
+            *[f"timeline:{order(event)}" for event in (implementation, pre_event, reconcile_event, post_event, close_event)],
+            f"graph_snapshot:{snapshot_id}",
+        ],
+        "persisted_timeline_mutated": False,
+        "historical_backfill_performed": False,
+        "missing_requirement_ids": [],
+    }
+    gate["authority_hash"] = stable_sha256(gate)
+    return gate
+
+
+def _contract_runtime_completed_onboard_direct_main_projection(
+    **kwargs: Any,
+) -> dict[str, Any]:
+    gate = _contract_runtime_completed_onboard_direct_main_close_authority_gate(**kwargs)
+    if not gate:
+        return {}
+    accepted = gate.get("passed") is True
+    requested_execution_id = str(kwargs.get("requested_execution_id") or "")
+    return {
+        **_contract_runtime_close_authority_payload_fields(),
+        "schema_version": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SCHEMA_VERSION,
+        "accepted": accepted,
+        "status": "projected_completed_onboard_direct_main" if accepted else "incomplete",
+        "source_of_authority": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_SOURCE,
+        "authority_decision_source": _CONTRACT_RUNTIME_CLOSE_AUTHORITY_DECISION_SOURCE,
+        "close_authority": _legacy_mf_timeline_precheck_close_authority_notice(
+            source="contract_runtime_close_authority_projection",
+            contract_execution_id=requested_execution_id,
+        ),
+        "legacy_advisory": not accepted,
+        "authoritative": accepted,
+        "projection_authoritative": accepted,
+        "contract_execution_id": requested_execution_id,
+        "contract_id": "onboard_route_guide",
+        "completed_onboard_direct_main_close_authority_gate": gate,
+        "source_contract_execution_ids": [requested_execution_id],
+        "projected_events": list(kwargs.get("timeline_events") or []),
+    }
+
+
 _MF_BATCH_PARENT_MERGE_DONE_STATES = {
     "applied",
     "complete",
@@ -142728,6 +143212,41 @@ def _contract_runtime_close_authority_projection(
                         "contract_execution_id": requested_execution_id,
                         "deferred_authority_sources": [
                             "active_child_contract_runtime_close_authority"
+                        ],
+                    },
+                }
+            completed_onboard_projection = (
+                _contract_runtime_completed_onboard_direct_main_projection(
+                    conn=conn,
+                    project_id=project_id,
+                    bug_id=bug_id,
+                    requested_execution_id=requested_execution_id,
+                    close_commit=close_commit,
+                    timeline_events=timeline_events,
+                    row_declared_files=_backlog_declared_direct_file_scope(
+                        conn,
+                        bug_id,
+                    ),
+                )
+            )
+            if completed_onboard_projection:
+                return {
+                    **completed_onboard_projection,
+                    "authority_selection": {
+                        "schema_version": (
+                            "contract_runtime_close_authority_selection.v1"
+                        ),
+                        "selected_authority": (
+                            "completed_onboard_operator_supervised_direct_main"
+                        ),
+                        "selection_reason": (
+                            "explicit_completed_root_only_onboard_contract_with_"
+                            "immutable_pre_attempt_direct_main_evidence"
+                        ),
+                        "contract_execution_id": requested_execution_id,
+                        "deferred_authority_sources": [
+                            "active_child_contract_runtime_close_authority",
+                            "mf_batch_parent",
                         ],
                     },
                 }

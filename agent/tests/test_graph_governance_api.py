@@ -88309,6 +88309,362 @@ def test_backlog_close_missing_contract_runtime_close_authority_for_onboard_serv
     assert row["status"] == "MF_IN_PROGRESS"
 
 
+def test_completed_onboard_direct_main_git_authority_rederives_exact_commit(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-COMPLETED-ONBOARD-DIRECT-MAIN-GIT"
+    task_id = "onboard-service-completed-direct-main-git"
+    project_root = tmp_path / "completed-onboard-direct-main-git"
+    project_root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=project_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=project_root,
+        check=True,
+    )
+    changed_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    for path in changed_files:
+        target = project_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", *changed_files], cwd=project_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "base"], cwd=project_root, check=True
+    )
+    parent = batch_jobs.git_commit(project_root)
+    for path in changed_files:
+        target = project_root / path
+        target.write_text("base\ncandidate\n", encoding="utf-8")
+    subprocess.run(["git", "add", *changed_files], cwd=project_root, check=True)
+    message = "\n".join(
+        [
+            "completed onboard Direct Main",
+            "",
+            f"Chain-Source-Task: {task_id}",
+            f"Chain-Source-Contract-Execution: {task_id}",
+            "Chain-Source-Stage: implementation",
+            f"Chain-Task: {task_id}",
+            f"Chain-Bug-Id: {backlog_id}",
+            f"Chain-Backlog: {backlog_id}",
+            "Chain-Route: operator_supervised_direct_main",
+            f"Chain-Parent: {parent}",
+        ]
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", message], cwd=project_root, check=True
+    )
+    candidate = batch_jobs.git_commit(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO project_version
+            (project_id, chain_version, updated_at, updated_by, git_head,
+             dirty_files, git_synced_at)
+        VALUES (?, ?, '2026-08-12T00:00:00Z', 'test', ?, '[]',
+                '2026-08-12T00:00:00Z')
+        """,
+        (PID, candidate[:8], candidate),
+    )
+    _activate_basic_graph(
+        conn,
+        "full-completed-onboard-direct-main-git",
+        commit_sha=candidate,
+    )
+    implementation = {
+        "payload": {"changed_files": changed_files},
+    }
+
+    authority = server._contract_runtime_completed_onboard_direct_main_git_authority(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        candidate_commit=candidate,
+        implementation_event=implementation,
+        row_declared_files=changed_files,
+    )
+
+    assert authority["passed"] is True
+    assert authority["candidate_parent_commit_sha"] == parent
+    assert authority["changed_files"] == changed_files
+    wrong_task = server._contract_runtime_completed_onboard_direct_main_git_authority(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="onboard-service-forged-task",
+        candidate_commit=candidate,
+        implementation_event=implementation,
+        row_declared_files=changed_files,
+    )
+    assert wrong_task["passed"] is False
+    assert wrong_task["failure_reason"] == "commit_trailer_identity_mismatch"
+    wrong_scope = server._contract_runtime_completed_onboard_direct_main_git_authority(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        candidate_commit=candidate,
+        implementation_event={"payload": {"changed_files": changed_files[:1]}},
+        row_declared_files=changed_files,
+    )
+    assert wrong_scope["passed"] is False
+    assert wrong_scope["failure_reason"] == "implementation_files_not_exact_row_scope"
+
+
+@pytest.mark.parametrize(
+    ("tamper", "expected_selection"),
+    [
+        ("", "completed_onboard_operator_supervised_direct_main"),
+        ("post_attempt_qa", "incomplete"),
+        ("failed_postdeploy", ""),
+        ("wrong_parent", ""),
+        ("parallel_marker", ""),
+        ("git_scope", "incomplete"),
+        ("active_child", "active_child"),
+    ],
+)
+def test_completed_onboard_direct_main_close_authority_is_root_only_and_preattempt(
+    conn,
+    monkeypatch,
+    tamper,
+    expected_selection,
+):
+    backlog_id = "AC-COMPLETED-ONBOARD-DIRECT-MAIN-CLOSE"
+    task_id = "onboard-service-completed-direct-main-close"
+    candidate = "a" * 40
+    changed_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ? WHERE bug_id = ?",
+        (json.dumps(changed_files[:1]), json.dumps(changed_files[1:]), backlog_id),
+    )
+    _activate_basic_graph(
+        conn,
+        "full-completed-onboard-direct-main-close",
+        commit_sha=candidate,
+    )
+    record = {
+        "contract_execution_id": task_id,
+        "contract_id": server.ONBOARD_ROUTE_GUIDE_SERVICE_ID,
+        "version": "service",
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "parent_contract_execution_id": "",
+        "root_contract_execution_id": task_id,
+        "runtime_guide": {},
+    }
+    runtime = SimpleNamespace(store=SimpleNamespace(get=lambda _execution_id: record))
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: runtime)
+    chain_projection = {
+        "root_contract_execution_id": task_id,
+        "current_contract_execution_id": task_id,
+        "active_child_contract_execution_id": (
+            "cex-active-child" if tamper == "active_child" else ""
+        ),
+        "readiness_state": "contract_complete",
+        "active_chain": {
+            "execution_ids": (
+                [task_id, "cex-active-child"]
+                if tamper == "active_child"
+                else [task_id]
+            )
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_chain_current_projection",
+        lambda *_args, **_kwargs: chain_projection,
+    )
+    monkeypatch.setattr(
+        "agent.governance.parallel_branch_runtime.get_branch_context",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_parentless_direct_main_projection",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_batch_parent_projection",
+        lambda **_kwargs: {},
+    )
+    child_projection = (
+        {"accepted": True, "status": "projected_active_child"}
+        if tamper == "active_child"
+        else {}
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_child_lane_close_authority_projection",
+        lambda **_kwargs: child_projection,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_close_authority_route_token_backed_event",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_source_backed_qa_session_authority_valid",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_onboard_direct_main_git_authority",
+        lambda *_args, **_kwargs: {
+            "passed": tamper != "git_scope",
+            "failure_reason": "immutable_git_diff_not_exact_row_scope",
+        },
+    )
+    common = {"project_id": PID, "backlog_id": backlog_id, "task_id": task_id}
+    events = [
+        {
+            **common,
+            "id": 1,
+            "event_kind": "implementation",
+            "status": "passed",
+            "commit_sha": candidate,
+            "payload": {
+                "implementation_scope": "operator_supervised_direct_main",
+                "changed_files": changed_files,
+            },
+        },
+        {
+            **common,
+            "id": 2,
+            "parent_event_id": 1,
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "status": "passed",
+            "commit_sha": candidate,
+            "payload": {"source_backed_contract_gate_authority": {}},
+        },
+        {
+            **common,
+            "id": 3,
+            "event_kind": "reconcile",
+            "status": "passed",
+            "commit_sha": candidate,
+            "payload": {
+                "graph_reconciled": True,
+                "snapshot_id": "full-completed-onboard-direct-main-close",
+                "canonical_head_commit": candidate,
+            },
+        },
+        {
+            **common,
+            "id": 4,
+            "parent_event_id": 3 if tamper != "wrong_parent" else 2,
+            "event_kind": "independent_verification",
+            "phase": "postdeploy_qa",
+            "status": "failed" if tamper == "failed_postdeploy" else "passed",
+            "commit_sha": candidate,
+            "payload": {"source_backed_contract_gate_authority": {}},
+        },
+        {
+            **common,
+            "id": 5,
+            "parent_event_id": 4,
+            "event_kind": "close_ready",
+            "phase": "close",
+            "status": "passed",
+            "commit_sha": candidate,
+            "payload": {
+                "implementation_event_ref": "timeline:1",
+                "predeploy_qa_event_ref": "timeline:2",
+                "reconcile_event_ref": "timeline:3",
+                "postdeploy_qa_event_ref": "timeline:4",
+                "preflight": {"ok": True, "blockers": []},
+            },
+            "verification": {
+                "close_satisfying_bundle": True,
+                "fresh_postdeploy_qa": True,
+                "graph_exact_current": True,
+                "runtime_exact": True,
+            },
+        },
+        {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": backlog_id,
+            "id": 6,
+            "event_kind": "route_action_precheck",
+            "status": "accepted",
+            "payload": {
+                "source": "authoritative_backlog_close",
+                "action": "backlog_close",
+            },
+        },
+    ]
+    if tamper == "post_attempt_qa":
+        events.append(
+            {
+                **common,
+                "id": 7,
+                "event_kind": "independent_verification",
+                "phase": "verification",
+                "status": "passed",
+                "commit_sha": candidate,
+                "payload": {"source_backed_contract_gate_authority": {}},
+            }
+        )
+    if tamper == "parallel_marker":
+        events.insert(
+            1,
+            {
+                **common,
+                "id": 8,
+                "event_kind": "worker_commit",
+                "status": "passed",
+                "payload": {},
+            },
+        )
+
+    projection = server._contract_runtime_close_authority_projection(
+        conn,
+        project_id=PID,
+        bug_id=backlog_id,
+        body={"contract_execution_id": task_id},
+        route_gate=None,
+        close_commit=candidate,
+        timeline_events=events,
+    )
+
+    if expected_selection == "completed_onboard_operator_supervised_direct_main":
+        assert projection["accepted"] is True
+        assert projection["authority_selection"]["selected_authority"] == expected_selection
+        gate = projection["completed_onboard_direct_main_close_authority_gate"]
+        assert gate["first_close_attempt_event_id"] == 6
+        assert gate["historical_pre_attempt_evidence_frozen"] is True
+        assert gate["post_attempt_satisfying_evidence_count"] == 0
+    elif expected_selection == "active_child":
+        assert projection == child_projection
+    elif expected_selection == "incomplete":
+        assert projection["accepted"] is False
+        assert projection["status"] == "incomplete"
+        assert projection["authoritative"] is False
+    else:
+        assert projection == {}
+
+
 def test_backlog_close_accepts_mf_batch_parent_onboard_service_authority(
     conn,
     monkeypatch,
