@@ -142775,6 +142775,8 @@ def _contract_runtime_completed_onboard_direct_main_close_authority_gate(
 def _contract_runtime_completed_onboard_direct_main_projection(
     **kwargs: Any,
 ) -> dict[str, Any]:
+    """Expose only the server-derived gate; never synthesize timeline evidence."""
+
     gate = _contract_runtime_completed_onboard_direct_main_close_authority_gate(**kwargs)
     if not gate:
         return {}

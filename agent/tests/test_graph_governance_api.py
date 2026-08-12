@@ -88445,6 +88445,8 @@ def test_completed_onboard_direct_main_close_authority_is_root_only_and_preattem
     tamper,
     expected_selection,
 ):
+    """Freeze close evidence before the first attempt and reject lane drift."""
+
     backlog_id = "AC-COMPLETED-ONBOARD-DIRECT-MAIN-CLOSE"
     task_id = "onboard-service-completed-direct-main-close"
     candidate = "a" * 40
