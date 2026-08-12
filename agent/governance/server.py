@@ -97508,6 +97508,61 @@ def _contract_runtime_mf_parallel_observer_merge_proof_requested(
     )
 
 
+_CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS = (
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "worker_role",
+    "worker_id",
+    "worker_slot_id",
+    "lane_id",
+    "line_instance_id",
+)
+
+
+def _contract_runtime_observer_merge_lane_identity_mismatches(
+    value: Mapping[str, Any] | None,
+    authority: Mapping[str, Any] | None,
+    *,
+    require_all: bool,
+    field_prefix: str = "",
+) -> list[dict[str, str]]:
+    """Compare one caller lane identity with durable observer authority."""
+
+    supplied = value if isinstance(value, Mapping) else {}
+    expected = authority if isinstance(authority, Mapping) else {}
+    mismatches: list[dict[str, str]] = []
+    for field in _CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS:
+        expected_value = str(expected.get(field) or "").strip()
+        supplied_value = str(supplied.get(field) or "").strip()
+        label = f"{field_prefix}{field}"
+        if not expected_value:
+            mismatches.append(
+                {
+                    "field": label,
+                    "expected": "server-derived durable lane identity",
+                    "actual": "unavailable",
+                }
+            )
+        elif require_all and not supplied_value:
+            mismatches.append(
+                {
+                    "field": label,
+                    "expected": expected_value,
+                    "actual": "missing",
+                }
+            )
+        elif supplied_value and supplied_value != expected_value:
+            mismatches.append(
+                {
+                    "field": label,
+                    "expected": expected_value,
+                    "actual": supplied_value,
+                }
+            )
+    return mismatches
+
+
 def _contract_runtime_next_line_allows_mf_sub(
     record: Mapping[str, Any] | None,
 ) -> bool:
@@ -99046,6 +99101,32 @@ def _contract_runtime_effective_actor_role(
             backlog_id=backlog_id,
             contract_execution_id=contract_execution_id,
         )
+        durable_authority = _contract_runtime_observer_merge_durable_authority(
+            conn,
+            project_id=project_id,
+            record=record or {},
+        )
+        lane_mismatches = (
+            _contract_runtime_observer_merge_lane_identity_mismatches(
+                getattr(ctx, "body", {}),
+                durable_authority,
+                require_all=True,
+            )
+        )
+        if not durable_authority or lane_mismatches:
+            raise PermissionDeniedError(
+                role or "coordinator",
+                action,
+                {
+                    "required_role": "observer",
+                    "proof_error": "observer_merge_lane_identity_mismatch",
+                    "contract_execution_id": contract_execution_id,
+                    "identity_mismatches": lane_mismatches,
+                    "fail_closed": True,
+                    "zero_contract_runtime_write": True,
+                    "zero_timeline_write": True,
+                },
+            )
         if observer_proof:
             return "observer"
     proof_requested = _contract_runtime_mf_sub_proof_requested(ctx)
@@ -108146,6 +108227,23 @@ def _contract_runtime_observer_merge_durable_authority(
                     "runtime_context_id": runtime_context_id,
                     "task_id": task_id,
                     "parent_task_id": parent_task_id,
+                    "worker_role": "mf_sub",
+                    "worker_id": str(
+                        getattr(context, "worker_id", "") or ""
+                    ).strip(),
+                    "worker_slot_id": str(
+                        getattr(context, "worker_slot_id", "")
+                        or getattr(context, "worker_id", "")
+                        or ""
+                    ).strip(),
+                    "lane_id": str(
+                        getattr(context, "worker_slot_id", "")
+                        or getattr(context, "worker_id", "")
+                        or ""
+                    ).strip(),
+                    "line_instance_id": (
+                        f"runtime_context:{runtime_context_id}"
+                    ),
                     "branch_head": branch_head,
                     "merge_commit": merged_commit,
                     "target_head_before_merge": str(
@@ -108252,6 +108350,29 @@ def _contract_runtime_bind_observer_merge_authority(
         "queue_item_status": authority["queue_item_status"],
     }
     mismatches: list[dict[str, str]] = []
+    mismatches.extend(
+        _contract_runtime_observer_merge_lane_identity_mismatches(
+            write,
+            authority,
+            require_all=True,
+        )
+    )
+    mismatches.extend(
+        _contract_runtime_observer_merge_lane_identity_mismatches(
+            payload,
+            authority,
+            require_all=False,
+            field_prefix="payload.",
+        )
+    )
+    mismatches.extend(
+        _contract_runtime_observer_merge_lane_identity_mismatches(
+            supplied_durable,
+            authority,
+            require_all=False,
+            field_prefix="durable_merge_authority.",
+        )
+    )
     supplied_commit = str(write.get("commit_sha") or "").strip().lower()
     if supplied_commit and supplied_commit != authority["merge_commit"]:
         mismatches.append(
@@ -108275,17 +108396,6 @@ def _contract_runtime_bind_observer_merge_authority(
                 "actual": "false",
             }
         )
-    for field in ("runtime_context_id", "task_id", "parent_task_id"):
-        supplied = str(supplied_durable.get(field) or "").strip()
-        expected = str(authority[field]).strip()
-        if supplied and supplied != expected:
-            mismatches.append(
-                {
-                    "field": f"durable_merge_authority.{field}",
-                    "expected": expected,
-                    "actual": supplied,
-                }
-            )
     if mismatches:
         raise GovernanceError(
             "contract_runtime_observer_merge_authority_mismatch",
@@ -108342,7 +108452,7 @@ def _contract_runtime_bind_observer_merge_authority(
     effective = dict(write)
     effective["payload"] = payload
     effective["commit_sha"] = authority["merge_commit"]
-    for field in ("runtime_context_id", "task_id", "parent_task_id"):
+    for field in _CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS:
         payload[field] = authority[field]
     if "worker_task_id" in payload:
         payload["worker_task_id"] = authority["task_id"]
@@ -108350,7 +108460,7 @@ def _contract_runtime_bind_observer_merge_authority(
         payload["root_task_id"] = authority["parent_task_id"]
     for field, value in expected_values.items():
         effective[field] = value
-    for field in ("runtime_context_id", "task_id", "parent_task_id"):
+    for field in _CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS:
         effective[field] = authority[field]
     return effective
 

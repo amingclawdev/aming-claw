@@ -589,6 +589,153 @@ def test_exact_candidate_post_merge_qa_accepts_parentless_direct_main_without_ru
 
 
 @pytest.mark.parametrize(
+    "field",
+    [
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "worker_id",
+        "worker_slot_id",
+        "lane_id",
+        "line_instance_id",
+    ],
+)
+@pytest.mark.parametrize("mutation", ["missing", "wrong"])
+def test_mf_parallel_terminal_lane_observer_merge_rejects_cross_lane_identity(
+    conn,
+    monkeypatch,
+    field,
+    mutation,
+):
+    execution_id = "cex-terminal-lane-observer-merge-mismatch"
+    backlog_id = "AC-TERMINAL-LANE-OBSERVER-MERGE-MISMATCH"
+    lane_identity = {
+        "runtime_context_id": "mfrctx-focus",
+        "task_id": "focus-task",
+        "parent_task_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": "focus-worker",
+        "worker_slot_id": "focus-slot",
+        "lane_id": "focus-slot",
+        "line_instance_id": "runtime_context:mfrctx-focus",
+    }
+    supplied_identity = dict(lane_identity)
+    if mutation == "missing":
+        supplied_identity.pop(field)
+    else:
+        supplied_identity[field] = "reminder-value"
+    ctx = _ctx_with_role(
+        {"project_id": PID, "contract_execution_id": execution_id},
+        "coordinator",
+        method="POST",
+        body={
+            "stage_id": "observer_lane_merge",
+            "line_id": "observer_merge",
+            "evidence_kind": "merge",
+            **supplied_identity,
+            "observer_session_id": "obs-focus-merge",
+            "observer_route_token_ref": "rtok-focus-merge",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_resolve_contract_runtime_observer_proof",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_observer_merge_durable_authority",
+        lambda *_args, **_kwargs: dict(lane_identity),
+    )
+
+    with pytest.raises(PermissionDeniedError) as rejected:
+        server._contract_runtime_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_runtime_submit_line",
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            record={
+                "contract_id": "mf_parallel.v2",
+                "contract_execution_id": execution_id,
+            },
+        )
+    assert rejected.value.details["proof_error"] == (
+        "observer_merge_lane_identity_mismatch"
+    )
+    assert rejected.value.details["identity_mismatches"][0]["field"] == field
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "worker_id",
+        "worker_slot_id",
+        "lane_id",
+        "line_instance_id",
+    ],
+)
+@pytest.mark.parametrize("mutation", ["missing", "wrong"])
+def test_observer_merge_binder_rejects_top_level_cross_lane_identity(
+    monkeypatch,
+    field,
+    mutation,
+):
+    lane_identity = {
+        "runtime_context_id": "mfrctx-focus-binder",
+        "task_id": "focus-task-binder",
+        "parent_task_id": "cex-focus-binder",
+        "worker_role": "mf_sub",
+        "worker_id": "focus-worker-binder",
+        "worker_slot_id": "focus-slot-binder",
+        "lane_id": "focus-slot-binder",
+        "line_instance_id": "runtime_context:mfrctx-focus-binder",
+    }
+    authority = {
+        **lane_identity,
+        "branch_head": "a" * 40,
+        "merge_commit": "b" * 40,
+        "target_head_after_merge": "b" * 40,
+        "merge_queue_id": "mq-focus-binder",
+        "queue_item_id": "mqitem-focus-binder",
+        "queue_item_status": "merged",
+        "timeline_event_refs": ["timeline:1"],
+        "qa_audit_only_no_pass_authority": {},
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_observer_merge_durable_authority",
+        lambda *_args, **_kwargs: dict(authority),
+    )
+    supplied_identity = dict(lane_identity)
+    if mutation == "missing":
+        supplied_identity.pop(field)
+    else:
+        supplied_identity[field] = "reminder-value"
+    write = {
+        **supplied_identity,
+        "line_id": "observer_merge",
+        "payload": {},
+    }
+    with pytest.raises(GovernanceError) as rejected:
+        server._contract_runtime_bind_observer_merge_authority(
+            None,
+            project_id=PID,
+            record={"contract_execution_id": "cex-focus-binder"},
+            write=write,
+        )
+    assert rejected.value.code == (
+        "contract_runtime_observer_merge_authority_mismatch"
+    )
+    assert rejected.value.details["mismatches"][0]["field"] == field
+
+
+@pytest.mark.parametrize(
     ("tamper", "expected_reason"),
     [
         ("none", ""),
@@ -38694,6 +38841,16 @@ def test_mf_parallel_terminal_lane_observer_merge_prefers_exact_observer_proof(
 ):
     execution_id = "cex-terminal-lane-observer-merge"
     backlog_id = "AC-TERMINAL-LANE-OBSERVER-MERGE"
+    lane_identity = {
+        "runtime_context_id": "mfrctx-terminal-worker",
+        "task_id": "terminal-worker",
+        "parent_task_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": "terminal-worker-id",
+        "worker_slot_id": "terminal-worker-slot",
+        "lane_id": "terminal-worker-slot",
+        "line_instance_id": "runtime_context:mfrctx-terminal-worker",
+    }
     ctx = _ctx_with_role(
         {
             "project_id": PID,
@@ -38705,10 +38862,7 @@ def test_mf_parallel_terminal_lane_observer_merge_prefers_exact_observer_proof(
             "stage_id": "observer_lane_merge",
             "line_id": "observer_merge",
             "evidence_kind": "merge",
-            "runtime_context_id": "mfrctx-terminal-worker",
-            "task_id": "terminal-worker",
-            "parent_task_id": execution_id,
-            "worker_role": "mf_sub",
+            **lane_identity,
             "observer_session_id": "obs-terminal-worker-merge",
             "observer_route_token_ref": "rtok-terminal-worker-merge",
         },
@@ -38742,6 +38896,11 @@ def test_mf_parallel_terminal_lane_observer_merge_prefers_exact_observer_proof(
         server,
         "_resolve_contract_runtime_observer_proof",
         resolve_observer,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_observer_merge_durable_authority",
+        lambda *_args, **_kwargs: dict(lane_identity),
     )
     monkeypatch.setattr(
         server,
@@ -129569,6 +129728,8 @@ def test_contract_runtime_recovers_exact_audit_only_qa_bypass_round(
         runtime_context_id=runtime_context_id,
         backlog_id=backlog_id,
         parent_task_id=backlog_id,
+        worker_id=task_id,
+        worker_slot_id=task_id,
         target_project_id="audit-only-target",
         target_project_root=str(target_root.resolve()),
         worktree_path=str(target_root.resolve()),
@@ -129950,6 +130111,14 @@ def test_contract_runtime_recovers_exact_audit_only_qa_bypass_round(
         "actor_role": "observer",
         "evidence_kind": "merge",
         "status": "accepted",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": backlog_id,
+        "worker_role": "mf_sub",
+        "worker_id": task_id,
+        "worker_slot_id": task_id,
+        "lane_id": task_id,
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
         "payload": {},
     }
     bound = server._contract_runtime_bind_observer_merge_authority(
@@ -130246,6 +130415,8 @@ def test_contract_runtime_recovers_graph_context_bypass_then_independent_qa(
         runtime_context_id=runtime_context_id,
         backlog_id=backlog_id,
         parent_task_id=execution_id,
+        worker_id=task_id,
+        worker_slot_id=task_id,
         target_project_id="qa-graph-bypass-target",
         target_project_root=str(tmp_path.resolve()),
         worktree_path=str(tmp_path.resolve()),
@@ -130617,6 +130788,14 @@ def test_contract_runtime_recovers_graph_context_bypass_then_independent_qa(
             "actor_role": "observer",
             "evidence_kind": "merge",
             "status": "accepted",
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": execution_id,
+            "worker_role": "mf_sub",
+            "worker_id": task_id,
+            "worker_slot_id": task_id,
+            "lane_id": task_id,
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
             "payload": {},
         },
     )
