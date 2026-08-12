@@ -61177,6 +61177,66 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
         replacement["audit_event_ref"],
     ]
 
+    next_issuance = _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": runtime_context_session_token_ref(context),
+            "reason": "issue the post-receipt startup checkpoint envelope",
+        },
+    )
+    assert next_issuance["bounded_rejoin_kind"] == "ordinary_initial_rejoin"
+    assert next_issuance["rejoin_stage_checkpoint_id"] != replacement[
+        "rejoin_stage_checkpoint_id"
+    ]
+    assert next_issuance["bounded_replacement_rejoin_authority"]["mode"] == (
+        "next_stage_checkpoint_issuance"
+    )
+
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case["context"].runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": case["context"].runtime_context_id,
+                "contract_execution_id": case["parent_task_id"],
+                "task_id": case["task_id"],
+                "parent_task_id": case["parent_task_id"],
+                "session_token": next_issuance["session_token"],
+                "session_token_ref": next_issuance["session_token_ref"],
+                "fence_token": next_issuance["fence_token"],
+                "target_project_root": str(case["target_root"]),
+                "agent_id": case["worker_id"],
+                "actual_host_worker_id": case["worker_id"],
+                "worker_session_id": case["worker_session_id"],
+                "host_startup_id": case["host_startup_id"],
+                "host_session_id": case["worker_session_id"],
+                "worker_transcript_ref": f"codex:{case['worker_session_id']}",
+                "harness_type": "codex",
+                "filer_principal": case["worker_session_id"],
+                "actual_cwd": str(case["target_root"]),
+                "actual_git_root": str(case["target_root"]),
+                "branch": context.branch_ref,
+                "head_commit": context.head_commit,
+                "base_commit": context.base_commit,
+                "target_head_commit": context.target_head_commit,
+                "merge_queue_id": context.merge_queue_id,
+                "owned_files": list(context.owned_files),
+                "read_receipt_hash": receipt_hash,
+                "read_receipt_event_id": str(
+                    (receipt.get("timeline_event") or {}).get("id") or ""
+                ),
+                "startup_source": "codex_desktop_governed_dispatch",
+                **case["route_identity"],
+            },
+        )
+    )
+    assert startup["ok"] is True, startup
+    assert startup["status"] == "startup_recorded"
+
 
 @pytest.mark.parametrize(
     "batch_id",

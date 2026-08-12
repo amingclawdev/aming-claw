@@ -46714,9 +46714,29 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         body=body,
                     )
                 )
+            post_receipt_next_stage_checkpoint_issuance = bool(
+                effective_read_receipt_ref
+                and not effective_startup_ref
+                and str(
+                    pre_lineage_bounded_replacement_authority.get("mode")
+                    or ""
+                )
+                == "next_stage_checkpoint_issuance"
+                and pre_lineage_bounded_replacement_authority.get(
+                    "next_checkpoint_issuance_allowed"
+                )
+                is True
+                and not pre_lineage_bounded_replacement_authority.get(
+                    "errors"
+                )
+                and not pre_lineage_bounded_replacement_authority.get(
+                    "identity_mismatches"
+                )
+            )
             if (
                 pre_lineage_bootstrap_rejoin_authority.get("eligible")
                 is not True
+                and not post_receipt_next_stage_checkpoint_issuance
                 and (
                     pre_lineage_bounded_replacement_authority.get(
                         "applicable"
