@@ -38788,6 +38788,45 @@ def test_two_worker_premerge_qa_receipts_persist_at_observer_merge_without_writi
             assert actor_role == "qa"
             return copy.deepcopy(record)
 
+        def mf_parallel_atomic_lane_gate_view(
+            self,
+            lane_record,
+            lane_guide,
+            write,
+            *,
+            source_record,
+            projection,
+        ):
+            assert source_record == lane_record
+            assert projection == {}
+            runtime_context_id = write["runtime_context_id"]
+            task_id = write["task_id"]
+            worker = next(
+                item
+                for item in workers
+                if item["runtime_context_id"] == runtime_context_id
+                and item["task_id"] == task_id
+            )
+            identity = {
+                **worker,
+                "worker_role": "mf_sub",
+                "lane_id": worker["worker_slot_id"],
+            }
+            return (
+                {"next_action": None},
+                {
+                    **copy.deepcopy(lane_guide),
+                    "next_legal_action": None,
+                    "atomic_lane_gate_binding": {
+                        "schema_version": (
+                            "mf_parallel.atomic_lane_gate_binding.v1"
+                        ),
+                        "bound": True,
+                        **identity,
+                    },
+                },
+            )
+
         def submit_line_write(self, *_args, **_kwargs):
             raise AssertionError("premerge QA must not write observer_merge")
 
@@ -38811,6 +38850,30 @@ def test_two_worker_premerge_qa_receipts_persist_at_observer_merge_without_writi
 
     event_refs = []
     for index, (task_id, candidate_commit) in enumerate(candidates.items(), 1):
+        if task_id == "worker-a":
+            sibling_next = {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "actor_role": "mf_sub",
+                "owner_role": "mf_sub",
+                "evidence_kind": "implementation",
+                "runtime_context_id": "mfrctx-worker-b",
+                "task_id": "worker-b",
+            }
+            record["runtime_guide"]["next_legal_action"] = sibling_next
+            record["execution_state"]["next_legal_action"] = sibling_next
+        else:
+            observer_merge = {
+                "stage_id": "observer_lane_merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "owner_role": "observer",
+                "evidence_kind": "merge",
+                "runtime_context_id": workers[0]["runtime_context_id"],
+                "task_id": workers[0]["task_id"],
+            }
+            record["runtime_guide"]["next_legal_action"] = observer_merge
+            record["execution_state"]["next_legal_action"] = observer_merge
         qa_principal = f"qa:premerge-{task_id}"
         qa_session_id = f"ses-premerge-{task_id}"
         ctx = _ctx_with_role({"project_id": PID}, "qa", method="POST")
@@ -38882,6 +38945,20 @@ def test_two_worker_premerge_qa_receipts_persist_at_observer_merge_without_writi
         assert result["contract_runtime_close_evidence_gate"][
             "observer_merge_written"
         ] is False
+        receipt_authority = result["payload"][
+            "premerge_candidate_qa_receipt_authority"
+        ]
+        if task_id == "worker-a":
+            assert receipt_authority["global_observer_merge_ready"] is False
+            assert receipt_authority["selected_atomic_lane_authority"][
+                "selected_lane_terminal"
+            ] is True
+            assert receipt_authority["selected_atomic_lane_authority"][
+                "runtime_context_id"
+            ] == "mfrctx-worker-a"
+        else:
+            assert receipt_authority["global_observer_merge_ready"] is True
+            assert "selected_atomic_lane_authority" not in receipt_authority
         event_refs.append(f"timeline:{result['id']}")
 
     assert len(set(event_refs)) == 2
@@ -39107,6 +39184,104 @@ def test_two_worker_premerge_qa_receipts_persist_at_observer_merge_without_writi
             limit=10,
         )
     ) == persisted_count
+
+
+@pytest.mark.parametrize(
+    ("lane_next", "binding_override", "accepted"),
+    [
+        (None, {}, True),
+        (
+            {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "evidence_kind": "implementation",
+            },
+            {},
+            False,
+        ),
+        (None, {"bound": False}, False),
+        (None, {"task_id": "sibling-task"}, False),
+        (None, {"runtime_context_id": "mfrctx-sibling"}, False),
+        (None, {"parent_task_id": "cex-sibling-parent"}, False),
+        (None, {"worker_id": "sibling-worker"}, False),
+        (None, {"worker_slot_id": "sibling-slot"}, False),
+        (None, {"lane_id": "sibling-lane"}, False),
+        (
+            None,
+            {"line_instance_id": "runtime_context:mfrctx-sibling"},
+            False,
+        ),
+    ],
+)
+def test_premerge_candidate_atomic_lane_authority_requires_exact_terminal_binding(
+    lane_next,
+    binding_override,
+    accepted,
+):
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-selected",
+        task_id="selected-task",
+        parent_task_id="cex-selected-parent",
+        root_task_id="cex-selected-parent",
+        worker_id="selected-slot",
+        worker_slot_id="selected-slot",
+    )
+    expected = {
+        "runtime_context_id": "mfrctx-selected",
+        "task_id": "selected-task",
+        "parent_task_id": "cex-selected-parent",
+        "worker_role": "mf_sub",
+        "worker_id": "selected-slot",
+        "worker_slot_id": "selected-slot",
+        "lane_id": "selected-slot",
+        "line_instance_id": "runtime_context:mfrctx-selected",
+    }
+
+    class FakeRuntime:
+        def mf_parallel_atomic_lane_gate_view(
+            self,
+            record,
+            guide,
+            write,
+            *,
+            source_record,
+            projection,
+        ):
+            assert write["runtime_context_id"] == "mfrctx-selected"
+            assert source_record["contract_execution_id"] == (
+                "cex-selected-parent"
+            )
+            assert projection == {"source": "test"}
+            binding = {"bound": True, **expected, **binding_override}
+            return (
+                {"next_action": copy.deepcopy(lane_next)},
+                {
+                    **copy.deepcopy(guide),
+                    "next_legal_action": copy.deepcopy(lane_next),
+                    "atomic_lane_gate_binding": binding,
+                },
+            )
+
+    record = {
+        "contract_execution_id": "cex-selected-parent",
+        "runtime_guide": {"next_legal_action": {"line_id": "sibling"}},
+    }
+    result = server._contract_runtime_premerge_candidate_atomic_lane_authority(
+        runtime=FakeRuntime(),
+        record=record,
+        source_record=record,
+        context=context,
+        projection={"source": "test"},
+    )
+
+    assert bool(result) is accepted
+    if accepted:
+        assert result["server_derived"] is True
+        assert result["selected_lane_terminal"] is True
+        assert result["runtime_context_id"] == "mfrctx-selected"
+        assert result["task_id"] == "selected-task"
+        assert result["observer_merge_written"] is False
+        assert result["contract_runtime_mutated"] is False
 
 
 def test_parallel_branch_merge_queue_materialize_rejects_cross_queue_and_corrects_before_apply(

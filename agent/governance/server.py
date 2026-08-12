@@ -132913,7 +132913,10 @@ def _contract_runtime_close_gate(
         _contract_runtime_premerge_candidate_qa_receipt_gate(
             conn,
             project_id=project_id,
+            runtime=runtime,
             record=authority_record,
+            source_record=stored_record,
+            projection=projection,
             body=body,
             event_kind=event_kind,
             normalized_status=normalized_status,
@@ -133771,11 +133774,107 @@ def _contract_runtime_close_gate(
     }
 
 
+def _contract_runtime_premerge_candidate_atomic_lane_authority(
+    *,
+    runtime: ContractRuntime,
+    record: Mapping[str, Any],
+    source_record: Mapping[str, Any],
+    context: Any,
+    projection: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Prove one selected mf_parallel lane reached its observer barrier.
+
+    The global scheduler can legitimately point at an unfinished sibling after
+    failed-QA rework.  Candidate QA admission must therefore use the same
+    immutable dispatch-bound atomic lane view as worker writes, while keeping
+    the observer-owned merge line global and untouched.
+    """
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    expected_identity = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "lane_id": worker_slot_id,
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+    }
+    if not all(str(value or "").strip() for value in expected_identity.values()):
+        return {}
+    lane_probe = {
+        **expected_identity,
+        "actor_role": "mf_sub",
+        "payload": dict(expected_identity),
+    }
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    try:
+        lane_state, lane_guide = runtime.mf_parallel_atomic_lane_gate_view(
+            record,
+            guide,
+            lane_probe,
+            source_record=source_record,
+            projection=projection,
+        )
+    except ContractRuntimeError:
+        return {}
+    lane_binding = (
+        lane_guide.get("atomic_lane_gate_binding")
+        if isinstance(lane_guide.get("atomic_lane_gate_binding"), Mapping)
+        else {}
+    )
+    lane_next = lane_guide.get("next_legal_action")
+    state_next = lane_state.get("next_action")
+    if (
+        lane_binding.get("bound") is not True
+        or lane_next not in (None, {})
+        or state_next not in (None, {})
+        or any(
+            str(lane_binding.get(field) or "").strip() != value
+            for field, value in expected_identity.items()
+        )
+    ):
+        return {}
+    authority = {
+        "schema_version": (
+            "contract_runtime.premerge_candidate_atomic_lane_authority.v1"
+        ),
+        "server_derived": True,
+        "source": "contract_runtime_mf_parallel_atomic_lane_gate_view",
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        **expected_identity,
+        "atomic_lane_gate_bound": True,
+        "selected_lane_terminal": True,
+        "observer_merge_written": False,
+        "contract_runtime_mutated": False,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _contract_runtime_premerge_candidate_qa_receipt_gate(
     conn,
     *,
     project_id: str,
+    runtime: ContractRuntime,
     record: Mapping[str, Any],
+    source_record: Mapping[str, Any],
+    projection: Mapping[str, Any] | None,
     body: Mapping[str, Any],
     event_kind: str,
     normalized_status: str,
@@ -133800,17 +133899,13 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
         if isinstance(current_state.get("next_legal_action"), Mapping)
         else {}
     )
-    applicable = bool(
+    qa_event_applicable = bool(
         contract_id == "mf_parallel.v2"
-        and str(next_line.get("stage_id") or "").strip()
-        == "observer_lane_merge"
-        and str(next_line.get("line_id") or "").strip()
-        == "observer_merge"
         and actor_role == "qa"
         and _contract_runtime_close_normalized(event_kind)
         in {"independent_verification", "qa_verification", "verification"}
     )
-    if not applicable:
+    if not qa_event_applicable:
         return {}
 
     proof = (
@@ -133833,6 +133928,25 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
     from .parallel_branch_runtime import get_branch_context
 
     context = get_branch_context(conn, project_id, task_id) if task_id else None
+    global_observer_merge_ready = bool(
+        str(next_line.get("stage_id") or "").strip()
+        == "observer_lane_merge"
+        and str(next_line.get("line_id") or "").strip()
+        == "observer_merge"
+    )
+    selected_lane_authority = (
+        _contract_runtime_premerge_candidate_atomic_lane_authority(
+            runtime=runtime,
+            record=record,
+            source_record=source_record,
+            context=context,
+            projection=projection,
+        )
+        if context is not None and not global_observer_merge_ready
+        else {}
+    )
+    if not global_observer_merge_ready and not selected_lane_authority:
+        return {}
     dispatch_workers: list[dict[str, Any]] = []
     for completed in record.get("completed_lines") or []:
         if not isinstance(completed, Mapping):
@@ -134051,7 +134165,12 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
         "observer_merge_bypassed": False,
         "observer_authorship_preserved": True,
         "materialize_receipt_only": True,
+        "global_observer_merge_ready": global_observer_merge_ready,
     }
+    if selected_lane_authority:
+        authority["selected_atomic_lane_authority"] = dict(
+            selected_lane_authority
+        )
     authority["authority_hash"] = stable_sha256(authority)
     return {
         "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
@@ -134082,6 +134201,7 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
         "timeline_append_required": True,
         "timeline_append_authoritative": True,
         "premerge_candidate_qa_receipt_authority": authority,
+        "selected_atomic_lane_authority": dict(selected_lane_authority),
     }
 
 
