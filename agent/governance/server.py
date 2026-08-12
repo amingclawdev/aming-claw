@@ -140533,6 +140533,262 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
     }
 
 
+def _contract_runtime_parentless_direct_main_historical_diff_projection(
+    *,
+    conn,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    close_commit: str,
+    direct_event: Mapping[str, Any],
+    implementation_event: Mapping[str, Any],
+    timeline_events: Sequence[Mapping[str, Any]],
+    row_declared_files: Sequence[str],
+) -> dict[str, Any]:
+    """Project one immutable Git diff into a legacy implementation event."""
+
+    schema = "parentless_direct_main.historical_implementation_git_diff_authority.v1"
+    payload = (
+        implementation_event.get("payload")
+        if isinstance(implementation_event.get("payload"), Mapping)
+        else {}
+    )
+    if isinstance(payload.get("diff_check"), Mapping) or isinstance(
+        payload.get("dirty_scope_check"),
+        Mapping,
+    ):
+        return {"passed": False, "authority": {"schema_version": schema, "applicable": False}}
+
+    def failed(reason: str, **details: Any) -> dict[str, Any]:
+        authority = {
+            "schema_version": schema,
+            "applicable": True,
+            "passed": False,
+            "status": "failed",
+            "server_derived": True,
+            "read_only_projection": True,
+            "caller_claims_trusted": False,
+            "failure_reason": reason,
+            "persisted_timeline_mutated": False,
+            **details,
+        }
+        authority["authority_hash"] = stable_sha256(authority)
+        return {"passed": False, "authority": authority}
+
+    if conn is None or not implementation_event:
+        return failed("database_or_implementation_unavailable")
+    implementation_id = _contract_runtime_parentless_direct_main_event_order(
+        implementation_event,
+        0,
+    )
+    direct_id = _contract_runtime_parentless_direct_main_event_order(direct_event, 0)
+    if implementation_id <= direct_id or str(
+        implementation_event.get("task_id") or ""
+    ).strip() != task_id:
+        return failed("implementation_identity_or_order_mismatch")
+    close_attempt_ids = sorted(
+        _contract_runtime_parentless_direct_main_event_order(event, 0)
+        for event in timeline_events
+        if str(event.get("event_kind") or "").strip().lower()
+        == "route_action_precheck"
+        and isinstance(event.get("payload"), Mapping)
+        and str(event["payload"].get("source") or "").strip()
+        == "authoritative_backlog_close"
+        and str(event["payload"].get("action") or "").strip() == "backlog_close"
+    )
+    if any(event_id and event_id <= implementation_id for event_id in close_attempt_ids):
+        return failed(
+            "implementation_not_before_first_authoritative_close_attempt",
+            first_close_attempt_event_id=close_attempt_ids[0],
+        )
+    from .parallel_branch_runtime import get_branch_context
+
+    try:
+        branch_context = get_branch_context(conn, project_id, task_id)
+    except Exception as exc:
+        return failed("branch_runtime_context_unavailable", detail=type(exc).__name__)
+    if branch_context is not None:
+        return failed("branch_runtime_context_present")
+    implementation_identity = _observer_root_route_identity_from_event(
+        implementation_event
+    )
+    direct_identity = _observer_root_route_identity_from_event(direct_event)
+    if not (
+        implementation_identity.get("route_token_ref")
+        and implementation_identity.get("route_token_ref")
+        == direct_identity.get("route_token_ref")
+        and _contract_runtime_close_authority_route_token_backed_event(
+            implementation_event,
+            implementation_identity,
+            require_source_backed_authority=True,
+        )
+    ):
+        return failed("implementation_source_backed_route_authority_missing")
+
+    def canonical_paths(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError("not_a_list")
+        paths: list[str] = []
+        for raw in value:
+            if not isinstance(raw, str) or raw != raw.strip():
+                raise ValueError("noncanonical_path")
+            path = _qa_overlay_normalize_path(raw)
+            if path != raw or path in paths:
+                raise ValueError("noncanonical_or_duplicate_path")
+            paths.append(path)
+        if not paths:
+            raise ValueError("empty_paths")
+        return paths
+
+    try:
+        event_files = canonical_paths(payload.get("changed_files"))
+        declared_files = canonical_paths(list(row_declared_files))
+    except (ValueError, _QACandidateOverlayError) as exc:
+        return failed("changed_file_identity_invalid", detail=str(exc))
+    if set(event_files) != set(declared_files):
+        return failed(
+            "event_changed_files_not_exact_row_scope",
+            event_changed_files=event_files,
+            row_declared_files=declared_files,
+        )
+    try:
+        project_root = project_service.resolve_project_root(
+            project_id,
+            None,
+            fallback_self=True,
+        )
+    except Exception as exc:
+        return failed("project_root_unavailable", detail=type(exc).__name__)
+    if project_root is None:
+        return failed("project_root_unavailable")
+    root = Path(project_root).resolve()
+    try:
+        candidate = _qa_post_merge_resolve_commit(
+            root,
+            str(implementation_event.get("commit_sha") or ""),
+        )
+        close = _qa_post_merge_resolve_commit(root, close_commit)
+    except _QACandidateOverlayError as exc:
+        return failed("implementation_or_close_commit_unavailable", detail=exc.reason)
+    if not candidate or close != str(close_commit or "").strip().lower():
+        return failed("implementation_or_close_commit_unavailable")
+    try:
+        parents = _qa_git_bytes(
+            root,
+            ["rev-list", "--parents", "--max-count=1", candidate],
+        )
+    except _QACandidateOverlayError as exc:
+        return failed("implementation_commit_not_single_parent", detail=exc.reason)
+    parent_tokens = parents.stdout.decode("ascii", errors="ignore").strip().lower().split()
+    if parents.returncode != 0 or parent_tokens[:1] != [candidate] or len(parent_tokens) != 2:
+        return failed("implementation_commit_not_single_parent")
+    parent = parent_tokens[1]
+    try:
+        ancestry = _qa_git_bytes(
+            root,
+            ["merge-base", "--is-ancestor", candidate, close],
+        )
+        head = _qa_git_bytes(root, ["rev-parse", "--verify", "HEAD^{commit}"])
+        status = _qa_git_bytes(
+            root,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+        )
+    except _QACandidateOverlayError as exc:
+        return failed("implementation_ancestry_or_canonical_head_mismatch", detail=exc.reason)
+    actual_head = head.stdout.decode("ascii", errors="ignore").strip().lower()
+    if ancestry.returncode != 0 or head.returncode != 0 or actual_head != close:
+        return failed("implementation_ancestry_or_canonical_head_mismatch")
+    if status.returncode != 0 or status.stdout:
+        return failed("canonical_worktree_dirty")
+    try:
+        diff_identity = _qa_exact_candidate_diff_identity(
+            root,
+            base_commit_sha=parent,
+            candidate_commit_sha=candidate,
+            comparison_base_commit_source=_QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
+        )
+    except _QACandidateOverlayError as exc:
+        return failed("immutable_git_diff_unavailable", detail=exc.reason)
+    git_files = list(diff_identity.get("changed_files") or [])
+    if set(git_files) != set(event_files) or len(git_files) != len(event_files):
+        return failed(
+            "immutable_git_diff_not_exact_event_scope",
+            git_changed_files=git_files,
+            event_changed_files=event_files,
+        )
+    try:
+        version_row = conn.execute(
+            "SELECT git_head, dirty_files, git_synced_at FROM project_version WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+    except Exception as exc:
+        return failed("project_version_unavailable", detail=type(exc).__name__)
+    try:
+        synced_dirty = json.loads(str(version_row["dirty_files"] or "[]"))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        synced_dirty = ["invalid_dirty_files_json"]
+    if not version_row or str(version_row["git_head"] or "").strip().lower() != close or synced_dirty or not str(version_row["git_synced_at"] or "").strip():
+        return failed("project_version_not_clean_and_current")
+    from . import graph_snapshot_store
+
+    try:
+        snapshot = graph_snapshot_store.get_active_graph_snapshot(conn, project_id) or {}
+    except Exception as exc:
+        return failed("active_graph_unavailable", detail=type(exc).__name__)
+    if not str(snapshot.get("snapshot_id") or "").strip() or str(
+        snapshot.get("commit_sha") or ""
+    ).strip().lower() != close:
+        return failed("active_graph_not_current")
+    self_root = Path(__file__).resolve().parents[2]
+    runtime_version = ""
+    if project_id == "aming-claw" or root == self_root:
+        runtime_version = str(get_governance_runtime_version(default="") or "").strip().lower()
+        if not runtime_version or not (
+            close.startswith(runtime_version) or runtime_version.startswith(close)
+        ):
+            return failed("governance_runtime_not_current")
+    authority = {
+        "schema_version": schema,
+        "applicable": True,
+        "passed": True,
+        "status": "passed",
+        "server_derived": True,
+        "read_only_projection": True,
+        "caller_claims_trusted": False,
+        "source": "immutable_single_parent_git_objects",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "implementation_event_id": implementation_id,
+        "first_close_attempt_event_id": close_attempt_ids[0] if close_attempt_ids else 0,
+        "candidate_commit_sha": candidate,
+        "candidate_parent_commit_sha": parent,
+        "canonical_close_commit_sha": close,
+        "changed_files": git_files,
+        "candidate_diff_hash": diff_identity.get("candidate_diff_hash"),
+        "active_snapshot_id": snapshot.get("snapshot_id"),
+        "governance_runtime_version": runtime_version,
+        "persisted_timeline_mutated": False,
+        "historical_backfill_performed": False,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    projected_event = dict(implementation_event)
+    projected_payload = dict(payload)
+    projected_payload["diff_check"] = {
+        "schema_version": schema,
+        "status": "passed",
+        "passed": True,
+        "exact_match": True,
+        "allowed_files": declared_files,
+        "changed_files": git_files,
+        "unexpected_files": [],
+        "authority_hash": authority["authority_hash"],
+    }
+    projected_payload["historical_implementation_git_diff_authority"] = authority
+    projected_event["payload"] = projected_payload
+    return {"passed": True, "authority": authority, "projected_event": projected_event}
+
+
 def _contract_runtime_parentless_direct_main_close_authority_gate(
     *,
     conn=None,
@@ -140853,6 +141109,19 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             0,
         ),
     )
+    historical_diff_projection = (
+        _contract_runtime_parentless_direct_main_historical_diff_projection(
+            conn=conn,
+            project_id=project_id,
+            backlog_id=bug_id,
+            task_id=requested_execution_id,
+            close_commit=close_commit,
+            direct_event=direct_event,
+            implementation_event=implementation_event,
+            timeline_events=events,
+            row_declared_files=allowed_files,
+        )
+    )
     materialized_by_lineage: dict[str, list[dict[str, Any]]] = {}
     for event in events:
         normalized = (
@@ -140914,6 +141183,22 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         selected_materialized_events.get(int(event.get("id") or 0), event)
         for event in events
     ]
+    projected_implementation = historical_diff_projection.get("projected_event")
+    if historical_diff_projection.get("passed") is True and isinstance(
+        projected_implementation,
+        Mapping,
+    ):
+        implementation_id = _contract_runtime_parentless_direct_main_event_order(
+            implementation_event,
+            0,
+        )
+        normalized_events = [
+            dict(projected_implementation)
+            if _contract_runtime_parentless_direct_main_event_order(event, 0)
+            == implementation_id
+            else event
+            for event in normalized_events
+        ]
     materialized_qa_monotonic_gate = {
         "schema_version": (
             "parentless_direct_main.materialized_qa_monotonic_verdict_gate.v1"
@@ -141054,6 +141339,9 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
                 "materialized_qa_fallback_isolation_gate": (
                     materialized_fallback_gate
                 ),
+                "historical_implementation_git_diff_authority": (
+                    historical_diff_projection.get("authority") or {}
+                ),
             }
     if materialized_blocking_event_ids:
         direct_gate = {
@@ -141154,6 +141442,9 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
                 "materialized_qa_fallback_isolation_gate": (
                     materialized_fallback_gate
                 ),
+                "historical_implementation_git_diff_authority": (
+                    historical_diff_projection.get("authority") or {}
+                ),
                 "root_route_registry_authority_passed": root_registry_passed,
                 "row_declared_file_scope_applied": bool(row_declared_files),
                 **row_scope_diagnostics,
@@ -141208,6 +141499,9 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             ),
             "materialized_qa_fallback_isolation_gate": (
                 materialized_fallback_gate
+            ),
+            "historical_implementation_git_diff_authority": (
+                historical_diff_projection.get("authority") or {}
             ),
             "root_route_registry_authority_passed": root_registry_passed,
             "worker_or_successor_contract_required": False,

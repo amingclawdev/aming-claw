@@ -589,6 +589,208 @@ def test_exact_candidate_post_merge_qa_accepts_parentless_direct_main_without_ru
 
 
 @pytest.mark.parametrize(
+    ("tamper", "expected_reason"),
+    [
+        ("none", ""),
+        ("alias_only", ""),
+        ("event_scope", "event_changed_files_not_exact_row_scope"),
+        (
+            "late_implementation",
+            "implementation_not_before_first_authoritative_close_attempt",
+        ),
+        ("branch_context", "branch_runtime_context_present"),
+        ("source_authority", "implementation_source_backed_route_authority_missing"),
+        ("dirty_worktree", "canonical_worktree_dirty"),
+        ("version_drift", "project_version_not_clean_and_current"),
+        ("graph_drift", "active_graph_not_current"),
+        ("runtime_drift", "governance_runtime_not_current"),
+        ("missing_commit", "implementation_or_close_commit_unavailable"),
+        ("merge_commit", "implementation_commit_not_single_parent"),
+        ("nonancestor", "implementation_ancestry_or_canonical_head_mismatch"),
+    ],
+)
+def test_parentless_direct_main_historical_diff_projection_is_immutable_and_narrow(
+    conn,
+    monkeypatch,
+    tmp_path,
+    tamper,
+    expected_reason,
+):
+    from agent.governance import parallel_branch_runtime
+
+    project_root = tmp_path / f"historical-diff-{tamper}"
+    project_root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=project_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=project_root,
+        check=True,
+    )
+    changed_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    for path in changed_files:
+        target = project_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=project_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "base"],
+        cwd=project_root,
+        check=True,
+    )
+    for path in changed_files:
+        (project_root / path).write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=project_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "candidate"],
+        cwd=project_root,
+        check=True,
+    )
+    candidate_commit = batch_jobs.git_commit(project_root)
+    close_commit = candidate_commit
+    if tamper == "merge_commit":
+        subprocess.run(["git", "checkout", "-q", "-b", "side", "HEAD~1"], cwd=project_root, check=True)
+        (project_root / "side.txt").write_text("side\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=project_root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "side"], cwd=project_root, check=True)
+        subprocess.run(["git", "checkout", "-q", "-"], cwd=project_root, check=True)
+        subprocess.run(["git", "merge", "-q", "--no-ff", "side", "-m", "merge"], cwd=project_root, check=True)
+        candidate_commit = close_commit = batch_jobs.git_commit(project_root)
+    if tamper == "nonancestor":
+        subprocess.run(["git", "checkout", "-q", "-b", "other", "HEAD~1"], cwd=project_root, check=True)
+        (project_root / "other.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=project_root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "other"], cwd=project_root, check=True)
+        close_commit = batch_jobs.git_commit(project_root)
+    project_id = "aming-claw" if tamper == "runtime_drift" else PID
+    task_id = "onboard-service-historical-diff"
+    route_identity = {
+        "route_id": "route-historical-diff",
+        "route_context_hash": _fake_sha("historical-diff-context"),
+        "route_token_ref": "rtok-historical-diff",
+    }
+    direct_event = {"id": 100, "task_id": task_id, "payload": {}}
+    implementation_event = {
+        "id": 102,
+        "task_id": task_id,
+        "event_kind": "implementation",
+        "status": "passed",
+        "commit_sha": candidate_commit,
+        "payload": {"changed_files": list(changed_files)},
+    }
+    if tamper == "alias_only":
+        implementation_event["payload"]["git_diff_check"] = "passed"
+    if tamper == "event_scope":
+        implementation_event["payload"]["changed_files"] = changed_files[:1]
+    if tamper == "missing_commit":
+        implementation_event["commit_sha"] = "f" * 40
+    close_precheck = {
+        "id": 103 if tamper != "late_implementation" else 101,
+        "event_kind": "route_action_precheck",
+        "payload": {
+            "source": "authoritative_backlog_close",
+            "action": "backlog_close",
+        },
+    }
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    monkeypatch.setattr(
+        server,
+        "_observer_root_route_identity_from_event",
+        lambda _event: dict(route_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_close_authority_route_token_backed_event",
+        lambda *_args, **_kwargs: tamper != "source_authority",
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_branch_context",
+        lambda *_args, **_kwargs: (
+            SimpleNamespace(task_id=task_id)
+            if tamper == "branch_context"
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_governance_runtime_version",
+        lambda default="": "d" * 40 if tamper == "runtime_drift" else default,
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO project_version
+            (project_id, chain_version, updated_at, updated_by, git_head,
+             dirty_files, git_synced_at)
+        VALUES (?, ?, '2026-08-12T00:00:00Z', 'test', ?, ?,
+                '2026-08-12T00:00:00Z')
+        """,
+        (
+            project_id,
+            close_commit,
+            close_commit,
+            json.dumps(
+                changed_files if tamper == "version_drift" else []
+            ),
+        ),
+    )
+    _activate_basic_graph(
+        conn,
+        f"full-historical-diff-{tamper}",
+        project_id=project_id,
+        commit_sha=("e" * 40 if tamper == "graph_drift" else close_commit),
+    )
+    conn.commit()
+    if tamper == "dirty_worktree":
+        (project_root / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+    original_event = copy.deepcopy(implementation_event)
+
+    result = (
+        server._contract_runtime_parentless_direct_main_historical_diff_projection(
+            conn=conn,
+            project_id=project_id,
+            backlog_id="AC-HISTORICAL-DIFF",
+            task_id=task_id,
+            close_commit=close_commit,
+            direct_event=direct_event,
+            implementation_event=implementation_event,
+            timeline_events=[direct_event, implementation_event, close_precheck],
+            row_declared_files=changed_files,
+        )
+    )
+
+    assert implementation_event == original_event
+    if expected_reason:
+        assert result["passed"] is False
+        assert result["authority"]["failure_reason"] == expected_reason
+        assert "projected_event" not in result
+        return
+    assert result["passed"] is True
+    authority = result["authority"]
+    assert authority["server_derived"] is True
+    assert authority["read_only_projection"] is True
+    assert authority["persisted_timeline_mutated"] is False
+    assert authority["historical_backfill_performed"] is False
+    assert authority["changed_files"] == changed_files
+    projected = result["projected_event"]
+    assert projected["payload"]["diff_check"]["exact_match"] is True
+    assert projected["payload"]["diff_check"]["unexpected_files"] == []
+    if tamper == "alias_only":
+        assert projected["payload"]["git_diff_check"] == "passed"
+
+
+@pytest.mark.parametrize(
     ("raised", "expected_code"),
     [
         (PermissionError(errno.EPERM, "denied"), "prior_governance_pid_unverifiable"),
