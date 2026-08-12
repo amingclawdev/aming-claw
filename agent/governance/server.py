@@ -10855,17 +10855,14 @@ def _qa_exact_candidate_runtime_comparison_authority(
             candidate_records.append(record)
 
     resolved_authorities: dict[str, dict[str, str]] = {}
-    runtime_context_id = str(
-        getattr(context, "runtime_context_id", "") or ""
-    ).strip()
     for record in candidate_records:
         if str(record.get("backlog_id") or "").strip() != backlog_id:
             continue
-        record_identity = _contract_runtime_server_line_identity(record)
-        if (
-            str(record_identity.get("runtime_context_id") or "").strip()
-            != runtime_context_id
-            or str(record_identity.get("task_id") or "").strip() != task_id
+        dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+        if not _contract_runtime_verified_dispatch_lineage(
+            record,
+            context,
+            dispatch_match,
         ):
             continue
         authority = _contract_runtime_server_comparison_authority(
@@ -10873,6 +10870,7 @@ def _qa_exact_candidate_runtime_comparison_authority(
             project_id=project_id,
             record=record,
             expected_candidate_commit=candidate_commit_sha,
+            expected_context=context,
         )
         if authority:
             resolved_authorities[stable_sha256(authority)] = authority
@@ -32246,7 +32244,30 @@ def _runtime_context_worker_recovery_details(
         )
         session_token_initial_join_submission: dict[str, Any] = {}
         session_token_rejoin_submission: dict[str, Any] = {}
-        rejoin_contract_execution_id = ""
+        rejoin_contract_execution_id = str(
+            contract_runtime_sequence.get("contract_execution_id") or ""
+        ).strip()
+        if not rejoin_contract_execution_id:
+            rejoin_authority = (
+                session_token_rejoin_eligibility.get("authority")
+                if isinstance(
+                    session_token_rejoin_eligibility.get("authority"),
+                    Mapping,
+                )
+                else {}
+            )
+            rejoin_contract_execution_id = str(
+                rejoin_authority.get("contract_execution_id") or ""
+            ).strip()
+        if (
+            not rejoin_contract_execution_id
+            and expected_parent_task_id
+            and _runtime_context_contract_execution_record_exists(
+                conn,
+                expected_parent_task_id,
+            )
+        ):
+            rejoin_contract_execution_id = expected_parent_task_id
         pre_lineage_bootstrap_recovery = bool(
             missing_worker_lineage
             and session_token_rejoin_eligibility.get("eligible") is True
@@ -32350,21 +32371,6 @@ def _runtime_context_worker_recovery_details(
                 expected_host_session_id = str(
                     getattr(context, "host_session_id", "") or ""
                 ).strip()
-                rejoin_contract_execution_id = str(
-                    contract_runtime_sequence.get("contract_execution_id") or ""
-                ).strip()
-                if not rejoin_contract_execution_id:
-                    authority = (
-                        session_token_rejoin_eligibility.get("authority")
-                        if isinstance(
-                            session_token_rejoin_eligibility.get("authority"),
-                            Mapping,
-                        )
-                        else {}
-                    )
-                    rejoin_contract_execution_id = str(
-                        authority.get("contract_execution_id") or ""
-                    ).strip()
                 session_token_rejoin_submission = {
                     "schema_version": "runtime_context.session_token_rejoin_submission.v1",
                     "action": rejoin_action,
@@ -100914,6 +100920,7 @@ def _contract_runtime_server_candidate_base_commit(
     project_id: str,
     record: Mapping[str, Any],
     expected_candidate_commit: str,
+    expected_context: Any | None = None,
 ) -> str:
     """Return the trusted cumulative diff base for the candidate commit."""
 
@@ -100921,9 +100928,26 @@ def _contract_runtime_server_candidate_base_commit(
         project_id or ""
     ).strip():
         return ""
-    identity = _contract_runtime_server_line_identity(record)
-    runtime_context_id = str(identity.get("runtime_context_id") or "").strip()
-    task_id = str(identity.get("task_id") or "").strip()
+    if expected_context is not None:
+        dispatch_match = _contract_runtime_dispatch_line_match(
+            record,
+            expected_context,
+        )
+        if not _contract_runtime_verified_dispatch_lineage(
+            record,
+            expected_context,
+            dispatch_match,
+        ):
+            return ""
+        runtime_context_id, task_id, _ = _contract_runtime_context_identity(
+            expected_context
+        )
+    else:
+        identity = _contract_runtime_server_line_identity(record)
+        runtime_context_id = str(
+            identity.get("runtime_context_id") or ""
+        ).strip()
+        task_id = str(identity.get("task_id") or "").strip()
     if not runtime_context_id or not task_id:
         return ""
     expected_candidate_commit = str(
@@ -101000,36 +101024,50 @@ def _contract_runtime_server_candidate_base_commit(
 
     context_bases: set[str] = set()
     context_retarget_bases: set[str] = set()
-    for dispatch_line in record.get("completed_lines") or []:
-        if not isinstance(dispatch_line, Mapping) or str(
-            dispatch_line.get("line_id") or ""
-        ).strip() != "observer_dispatch_bounded_workers":
-            continue
-        for context in _contract_runtime_contexts_for_dispatch_line(
-            conn,
-            project_id=project_id,
-            record=record,
-            line=dispatch_line,
-        ):
-            context_id, context_task_id, _ = _contract_runtime_context_identity(
-                context
+    if expected_context is not None:
+        context_bases.add(
+            _contract_runtime_full_commit_value(
+                project_id,
+                getattr(expected_context, "base_commit", ""),
             )
-            if (
-                context_id == runtime_context_id
-                and context_task_id == task_id
+        )
+        context_retarget_bases.add(
+            _contract_runtime_full_commit_value(
+                project_id,
+                getattr(expected_context, "target_head_commit", ""),
+            )
+        )
+    else:
+        for dispatch_line in record.get("completed_lines") or []:
+            if not isinstance(dispatch_line, Mapping) or str(
+                dispatch_line.get("line_id") or ""
+            ).strip() != "observer_dispatch_bounded_workers":
+                continue
+            for context in _contract_runtime_contexts_for_dispatch_line(
+                conn,
+                project_id=project_id,
+                record=record,
+                line=dispatch_line,
             ):
-                context_bases.add(
-                    _contract_runtime_full_commit_value(
-                        project_id,
-                        getattr(context, "base_commit", ""),
-                    )
+                context_id, context_task_id, _ = (
+                    _contract_runtime_context_identity(context)
                 )
-                context_retarget_bases.add(
-                    _contract_runtime_full_commit_value(
-                        project_id,
-                        getattr(context, "target_head_commit", ""),
+                if (
+                    context_id == runtime_context_id
+                    and context_task_id == task_id
+                ):
+                    context_bases.add(
+                        _contract_runtime_full_commit_value(
+                            project_id,
+                            getattr(context, "base_commit", ""),
+                        )
                     )
-                )
+                    context_retarget_bases.add(
+                        _contract_runtime_full_commit_value(
+                            project_id,
+                            getattr(context, "target_head_commit", ""),
+                        )
+                    )
     valid_context_bases = {
         value
         for value in {*context_bases, *context_retarget_bases}
@@ -101351,6 +101389,7 @@ def _contract_runtime_server_comparison_authority(
     project_id: str,
     record: Mapping[str, Any],
     expected_candidate_commit: str,
+    expected_context: Any | None = None,
 ) -> dict[str, str]:
     """Resolve worker or combined post-merge comparison authority."""
 
@@ -101368,6 +101407,7 @@ def _contract_runtime_server_comparison_authority(
             project_id=project_id,
             record=record,
             expected_candidate_commit=expected_candidate_commit,
+            expected_context=expected_context,
         )
         source = _QA_WORKER_COMPARISON_BASE_SOURCE
     return (

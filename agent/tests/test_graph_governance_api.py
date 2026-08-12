@@ -51192,6 +51192,140 @@ def test_exact_candidate_runtime_comparison_base_falls_through_missing_parent(
         )
 
 
+def test_exact_candidate_runtime_comparison_base_uses_selected_parallel_lane(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-EXACT-CANDIDATE-SELECTED-PARALLEL-LANE"
+    execution_id = "cex-exact-candidate-selected-parallel-lane"
+    base_commit = "a" * 40
+    focus_commit = "b" * 40
+    reminder_commit = "c" * 40
+    contexts = []
+    for lane, candidate_commit in (
+        ("focus", focus_commit),
+        ("reminder", reminder_commit),
+    ):
+        context = BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=f"selected-{lane}-worker",
+            runtime_context_id=f"mfrctx-selected-{lane}",
+            backlog_id=backlog_id,
+            parent_task_id=execution_id,
+            root_task_id=execution_id,
+            branch_ref=f"refs/heads/codex/selected-{lane}",
+            status=STATE_VALIDATED,
+            base_commit=base_commit,
+            target_head_commit=base_commit,
+            head_commit=candidate_commit,
+        )
+        upsert_branch_context(
+            conn,
+            context,
+            now_iso="2026-08-12T08:30:00Z",
+        )
+        contexts.append(context)
+
+    completed_lines = []
+    for context in contexts:
+        completed_lines.append(
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "actor_role": "observer",
+                "payload": {
+                    "runtime_context_id": context.runtime_context_id,
+                    "task_id": context.task_id,
+                    "parent_task_id": execution_id,
+                    "worker_role": "mf_sub",
+                },
+            }
+        )
+    for context in contexts:
+        completed_lines.append(
+            {
+                "stage_id": "implementation",
+                "line_id": "worker_commit",
+                "evidence_kind": "worker_commit",
+                "commit_sha": context.head_commit,
+                "payload": {
+                    "runtime_context_id": context.runtime_context_id,
+                    "task_id": context.task_id,
+                    "commit_sha": context.head_commit,
+                    "worker_commit_sha": context.head_commit,
+                    "validated_head_commit": context.head_commit,
+                    "diff_base_commit": base_commit,
+                },
+            }
+        )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": completed_lines,
+    }
+
+    class StubRuntimeStore:
+        @staticmethod
+        def get(candidate_execution_id):
+            if candidate_execution_id != execution_id:
+                raise ContractRuntimeError(
+                    f"unknown contract execution: {candidate_execution_id}"
+                )
+            return copy.deepcopy(record)
+
+        @staticmethod
+        def list_by_backlog(**_kwargs):
+            return []
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: StubRuntimeStore(),
+    )
+
+    for context in contexts:
+        assert server._qa_exact_candidate_runtime_comparison_base(
+            conn,
+            project_id=PID,
+            proof={
+                "backlog_id": backlog_id,
+                "task_id": context.task_id,
+                "commit_sha": context.head_commit,
+            },
+        ) == base_commit
+
+    unmatched = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id="selected-unmatched-worker",
+        runtime_context_id="mfrctx-selected-unmatched",
+        backlog_id=backlog_id,
+        parent_task_id=execution_id,
+        root_task_id=execution_id,
+        branch_ref="refs/heads/codex/selected-unmatched",
+        status=STATE_VALIDATED,
+        base_commit=base_commit,
+        target_head_commit=base_commit,
+        head_commit="d" * 40,
+    )
+    upsert_branch_context(
+        conn,
+        unmatched,
+        now_iso="2026-08-12T08:31:00Z",
+    )
+    assert server._qa_exact_candidate_runtime_comparison_base(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": backlog_id,
+            "task_id": unmatched.task_id,
+            "commit_sha": unmatched.head_commit,
+        },
+    ) == ""
+
+
 def test_managed_exact_candidate_requires_comparison_authority(monkeypatch):
     candidate_commit = "c" * 40
     monkeypatch.setattr(
@@ -51254,6 +51388,35 @@ def test_exact_candidate_runtime_comparison_base_resolves_child_cex(
         "project_id": PID,
         "backlog_id": backlog_id,
         "contract_execution_id": child_execution_id,
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "actor_role": "observer",
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": "cex-parent-without-worker-line",
+                    "worker_role": "mf_sub",
+                },
+            },
+            {
+                "stage_id": "implementation",
+                "line_id": "worker_commit",
+                "evidence_kind": "worker_commit",
+                "commit_sha": candidate_commit,
+                "payload": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "commit_sha": candidate_commit,
+                    "worker_commit_sha": candidate_commit,
+                    "validated_head_commit": candidate_commit,
+                    "diff_base_commit": base_commit,
+                },
+            },
+        ],
     }
 
     class StubRuntimeStore:
@@ -51268,26 +51431,6 @@ def test_exact_candidate_runtime_comparison_base_resolves_child_cex(
             return [child_record]
 
     monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: StubRuntimeStore())
-    monkeypatch.setattr(
-        server,
-        "_contract_runtime_server_line_identity",
-        lambda record: (
-            {
-                "runtime_context_id": runtime_context_id,
-                "task_id": task_id,
-            }
-            if record is child_record
-            else {}
-        ),
-    )
-    monkeypatch.setattr(
-        server,
-        "_contract_runtime_server_candidate_base_commit",
-        lambda _conn, **kwargs: (
-            base_commit if kwargs["record"] is child_record else ""
-        ),
-    )
-
     assert server._qa_exact_candidate_runtime_comparison_base(
         conn,
         project_id=PID,
@@ -61177,6 +61320,31 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
         replacement["audit_event_ref"],
     ]
 
+    with pytest.raises(GovernanceError) as guide_error:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": case["parent_task_id"],
+                    "session_token_ref": runtime_context_session_token_ref(
+                        context
+                    ),
+                    "target_project_root": str(case["target_root"]),
+                },
+            )
+        )
+    assert guide_error.value.code == "fence_invalidated_or_unknown"
+    projected_rejoin_body = guide_error.value.details["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]["copy_safe_body"]
+    assert projected_rejoin_body["contract_execution_id"] == (
+        case["parent_task_id"]
+    )
+
     before_ref_only_context = context
     before_ref_only_events = _pre_lineage_case_events(conn, case)
     before_ref_only_revision = get_latest_branch_contract_revision(
@@ -61207,8 +61375,8 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
 
     next_issuance = _pre_lineage_rejoin(
         case,
-        body_updates={
-            "session_token_ref": runtime_context_session_token_ref(context),
+        body_override={
+            **projected_rejoin_body,
             "reason": "issue the post-receipt startup checkpoint envelope",
         },
     )
