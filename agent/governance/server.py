@@ -139313,6 +139313,24 @@ def _contract_runtime_authoritative_close_verification(
     verification: Mapping[str, Any],
     runtime_projection: Mapping[str, Any],
 ) -> dict[str, Any]:
+    completed_onboard_direct_gate = (
+        runtime_projection.get("completed_onboard_direct_main_close_authority_gate")
+        if isinstance(
+            runtime_projection.get(
+                "completed_onboard_direct_main_close_authority_gate"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    completed_onboard_direct_gate_valid = bool(
+        completed_onboard_direct_gate.get("accepted")
+        and completed_onboard_direct_gate.get("passed")
+        and str(completed_onboard_direct_gate.get("schema_version") or "")
+        == "completed_onboard_direct_main.close_authority_gate.v1"
+        and str(completed_onboard_direct_gate.get("source") or "")
+        == "server_derived_completed_onboard_operator_supervised_direct_main"
+    )
     mf_batch_parent_gate = (
         runtime_projection.get("mf_batch_parent_close_authority_gate")
         if isinstance(
@@ -139339,8 +139357,24 @@ def _contract_runtime_authoritative_close_verification(
         if isinstance(runtime_projection.get("mf_parallel_close_authority_gate"), Mapping)
         else {}
     )
+    completed_onboard_direct_gate_ambiguous = bool(
+        completed_onboard_direct_gate_valid
+        and any(
+            bool(gate.get("passed"))
+            for gate in (
+                mf_batch_parent_gate,
+                parentless_direct_gate,
+                direct_fix_gate,
+                mf_parallel_gate,
+            )
+        )
+    )
     authority_gate = (
-        mf_batch_parent_gate
+        {}
+        if completed_onboard_direct_gate_ambiguous
+        else completed_onboard_direct_gate
+        if completed_onboard_direct_gate_valid
+        else mf_batch_parent_gate
         if bool(mf_batch_parent_gate.get("passed"))
         else parentless_direct_gate
         if bool(parentless_direct_gate.get("passed"))
@@ -139351,7 +139385,21 @@ def _contract_runtime_authoritative_close_verification(
     if not bool(authority_gate.get("passed")):
         failed_authority_kind = ""
         failed_authority_gate: Mapping[str, Any] = {}
-        if mf_batch_parent_gate:
+        if completed_onboard_direct_gate_ambiguous:
+            failed_authority_kind = "completed_onboard_direct_main"
+            failed_authority_gate = dict(completed_onboard_direct_gate)
+            failed_authority_gate.update(
+                {
+                    "accepted": False,
+                    "passed": False,
+                    "status": "ambiguous",
+                    "missing_requirement_ids": ["exclusive_close_authority_gate"],
+                }
+            )
+        elif completed_onboard_direct_gate:
+            failed_authority_kind = "completed_onboard_direct_main"
+            failed_authority_gate = completed_onboard_direct_gate
+        elif mf_batch_parent_gate:
             failed_authority_kind = "mf_batch_parent"
             failed_authority_gate = mf_batch_parent_gate
         elif parentless_direct_gate:
@@ -139387,6 +139435,12 @@ def _contract_runtime_authoritative_close_verification(
                     "complete mf_batch parent children, merge queue, and close commit "
                     "evidence before closing the coordination row"
                 )
+            elif failed_authority_kind == "completed_onboard_direct_main":
+                next_action = (
+                    "complete the immutable pre-attempt onboard direct-main "
+                    "implementation, QA, reconcile, postdeploy QA, close-ready, "
+                    "runtime, graph, and canonical Git authority"
+                )
             elif failed_authority_kind == "parentless_direct_main":
                 next_action = (
                     "complete parentless operator-supervised direct-main exception, "
@@ -139407,6 +139461,8 @@ def _contract_runtime_authoritative_close_verification(
                 "label": (
                     "ContractRuntime mf_batch parent close authority"
                     if failed_authority_kind == "mf_batch_parent"
+                    else "ContractRuntime completed onboard direct-main close authority"
+                    if failed_authority_kind == "completed_onboard_direct_main"
                     else "ContractRuntime parentless direct-main close authority"
                     if failed_authority_kind == "parentless_direct_main"
                     else "ContractRuntime direct_fix close authority"
@@ -139428,7 +139484,9 @@ def _contract_runtime_authoritative_close_verification(
             return result
         return dict(verification)
     authority_kind = (
-        "mf_batch_parent"
+        "completed_onboard_direct_main"
+        if authority_gate is completed_onboard_direct_gate
+        else "mf_batch_parent"
         if authority_gate is mf_batch_parent_gate
         else "parentless_direct_main"
         if authority_gate is parentless_direct_gate
@@ -139437,7 +139495,9 @@ def _contract_runtime_authoritative_close_verification(
         else "mf_parallel"
     )
     source = (
-        "contract_runtime_mf_batch_parent_timeline_and_merge_queue"
+        "contract_runtime_completed_onboard_direct_main_immutable_preattempt"
+        if authority_kind == "completed_onboard_direct_main"
+        else "contract_runtime_mf_batch_parent_timeline_and_merge_queue"
         if authority_kind == "mf_batch_parent"
         else "contract_runtime_parentless_direct_main_timeline"
         if authority_kind == "parentless_direct_main"
@@ -139446,7 +139506,10 @@ def _contract_runtime_authoritative_close_verification(
         else "contract_runtime_completed_mf_parallel_chain"
     )
     message = (
-        "backlog_close accepted server-derived mf_batch parent close authority "
+        "backlog_close accepted server-derived completed onboard direct-main "
+        "close authority with immutable pre-attempt evidence."
+        if authority_kind == "completed_onboard_direct_main"
+        else "backlog_close accepted server-derived mf_batch parent close authority "
         "with all child rows fixed and durable merge queue items merged."
         if authority_kind == "mf_batch_parent"
         else "backlog_close accepted server-derived parentless operator-supervised "
@@ -139468,7 +139531,11 @@ def _contract_runtime_authoritative_close_verification(
     result["status"] = "passed"
     result["missing_event_kinds"] = []
     result["ignored_required_events"] = []
-    if authority_kind == "mf_batch_parent":
+    if authority_kind == "completed_onboard_direct_main":
+        result[
+            "contract_runtime_completed_onboard_direct_main_close_authority_gate"
+        ] = dict(authority_gate)
+    elif authority_kind == "mf_batch_parent":
         result["contract_runtime_mf_batch_parent_close_authority_gate"] = dict(
             authority_gate
         )
@@ -139545,6 +139612,9 @@ def _contract_runtime_authoritative_close_verification(
         "has_independent_qa": True,
         "contract_runtime_mf_batch_parent_close_authority": (
             authority_kind == "mf_batch_parent"
+        ),
+        "contract_runtime_completed_onboard_direct_main_close_authority": (
+            authority_kind == "completed_onboard_direct_main"
         ),
         "contract_runtime_parentless_direct_main_close_authority": (
             authority_kind == "parentless_direct_main"
@@ -139664,6 +139734,7 @@ def _contract_runtime_close_authority_failure_details(
         missing_ids.append("contract_runtime_completed_lines")
 
     for gate_key in (
+        "completed_onboard_direct_main_close_authority_gate",
         "mf_batch_parent_close_authority_gate",
         "parentless_direct_main_close_authority_gate",
         "direct_fix_close_authority_gate",

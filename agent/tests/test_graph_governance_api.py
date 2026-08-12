@@ -87945,6 +87945,217 @@ def test_backlog_close_contract_runtime_authority_ignores_legacy_advisory_gaps(
     assert closed["gate_summary"]["failed_gates"] == []
 
 
+def test_backlog_close_completed_onboard_authority_overrides_legacy_advisory_gaps(
+    conn,
+    monkeypatch,
+):
+    """Consume the exact completed-onboard authority at the public close handler."""
+
+    backlog_id = "AC-COMPLETED-ONBOARD-HANDLER-LEGACY-ADVISORY"
+    task_id = "onboard-service-completed-onboard-handler"
+    close_commit = "aa6275118745006c8324dfcbeecea62c39e91936"
+    close_route_token_ref = "rtok-completed-onboard-handler-close"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    _persist_backlog_close_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=close_route_token_ref,
+        evidence_refs=[f"contract_runtime:{task_id}"],
+    )
+
+    def completed_onboard_projection(*_args, **_kwargs):
+        return {
+            "schema_version": "contract_runtime_close_authority_projection.v1",
+            "accepted": True,
+            "authoritative": True,
+            "status": "projected_completed_onboard_direct_main",
+            "contract_execution_id": task_id,
+            "completed_onboard_direct_main_close_authority_gate": {
+                "schema_version": (
+                    "completed_onboard_direct_main.close_authority_gate.v1"
+                ),
+                "accepted": True,
+                "passed": True,
+                "status": "passed",
+                "source": (
+                    "server_derived_completed_onboard_"
+                    "operator_supervised_direct_main"
+                ),
+                "contract_execution_id": task_id,
+                "source_refs": [f"contract_runtime:{task_id}"],
+                "missing_requirement_ids": [],
+            },
+        }
+
+    def legacy_advisory_failure(_events, contract=None, *, conn=None, project_id=""):
+        return {
+            "schema_version": "mf_close_timeline_gate.v1",
+            "passed": False,
+            "can_close": False,
+            "status": "failed",
+            "missing_event_kinds": [],
+            "failed_gates": [
+                {
+                    "gate": "route_context_gate",
+                    "status": "failed",
+                    "missing_requirement_ids": [
+                        "bounded_implementation_worker_dispatch",
+                        "mf_subagent_startup",
+                        "independent_verification_lane",
+                        "route_identity_mismatch",
+                    ],
+                }
+            ],
+            "route_context_gate": {
+                "passed": False,
+                "status": "failed",
+                "missing_requirement_ids": [
+                    "bounded_implementation_worker_dispatch",
+                    "mf_subagent_startup",
+                    "independent_verification_lane",
+                    "route_identity_mismatch",
+                ],
+            },
+            "checks": {},
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_close_authority_projection",
+        completed_onboard_projection,
+    )
+    monkeypatch.setattr(
+        server,
+        "_mf_close_gate_verification",
+        legacy_advisory_failure,
+    )
+    real_subprocess_run = server.subprocess.run
+
+    def fake_commit_verify(args, *run_args, **run_kwargs):
+        if list(args[:3]) == ["git", "rev-parse", "--verify"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_subprocess_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_commit_verify)
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": close_commit,
+                "contract_execution_id": task_id,
+                "route_token_ref": close_route_token_ref,
+            },
+        )
+    )
+
+    assert closed["ok"] is True
+    assert closed["status"] == "FIXED"
+    assert closed["gate_summary"]["can_close"] is True
+    assert closed["gate_summary"]["failed_gates"] == []
+    assert closed["gate_summary"]["close_authority"] == {
+        "schema_version": "contract_runtime_close_authority.v1",
+        "legacy": False,
+        "advisory": False,
+        "authoritative": True,
+        "replacement_authority": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("gate_update"),
+    [
+        {"accepted": False},
+        {"passed": False},
+        {"schema_version": "completed_onboard_direct_main.close_authority_gate.v0"},
+        {"source": "caller_claimed_completed_onboard_direct_main"},
+    ],
+)
+def test_completed_onboard_authoritative_wrapper_rejects_untrusted_gate(
+    gate_update,
+):
+    gate = {
+        "schema_version": "completed_onboard_direct_main.close_authority_gate.v1",
+        "accepted": True,
+        "passed": True,
+        "status": "passed",
+        "source": (
+            "server_derived_completed_onboard_operator_supervised_direct_main"
+        ),
+        "contract_execution_id": "onboard-service-untrusted-gate",
+        "missing_requirement_ids": [],
+    }
+    gate.update(gate_update)
+    legacy = {
+        "schema_version": "mf_close_timeline_gate.v1",
+        "passed": False,
+        "can_close": False,
+        "status": "failed",
+        "missing_event_kinds": [],
+        "failed_gates": [],
+        "checks": {},
+    }
+    result = server._contract_runtime_authoritative_close_verification(
+        legacy,
+        {
+            "accepted": True,
+            "completed_onboard_direct_main_close_authority_gate": gate,
+        },
+    )
+
+    assert result["passed"] is False
+    assert result["can_close"] is False
+    assert result["runtime_projection_authority_failed"] is True
+    assert result[
+        "contract_runtime_completed_onboard_direct_main_close_authority_gate"
+    ] == gate
+
+
+def test_completed_onboard_authoritative_wrapper_rejects_ambiguous_gate():
+    completed_gate = {
+        "schema_version": "completed_onboard_direct_main.close_authority_gate.v1",
+        "accepted": True,
+        "passed": True,
+        "status": "passed",
+        "source": (
+            "server_derived_completed_onboard_operator_supervised_direct_main"
+        ),
+        "contract_execution_id": "onboard-service-ambiguous-gate",
+        "missing_requirement_ids": [],
+    }
+    result = server._contract_runtime_authoritative_close_verification(
+        {
+            "schema_version": "mf_close_timeline_gate.v1",
+            "passed": False,
+            "can_close": False,
+            "status": "failed",
+            "missing_event_kinds": [],
+            "failed_gates": [],
+            "checks": {},
+        },
+        {
+            "accepted": True,
+            "completed_onboard_direct_main_close_authority_gate": completed_gate,
+            "mf_parallel_close_authority_gate": {
+                "passed": True,
+                "status": "passed",
+            },
+        },
+    )
+
+    assert result["passed"] is False
+    assert result["can_close"] is False
+    assert result["runtime_projection_authority_failed"] is True
+    assert result[
+        "contract_runtime_completed_onboard_direct_main_close_authority_gate"
+    ]["status"] == "ambiguous"
+    assert result[
+        "contract_runtime_completed_onboard_direct_main_close_authority_gate"
+    ]["missing_requirement_ids"] == ["exclusive_close_authority_gate"]
+
+
 def test_backlog_close_contract_runtime_incomplete_blocks_before_legacy_advisory(
     conn,
     monkeypatch,
