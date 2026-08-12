@@ -88654,6 +88654,12 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         ),
         (
             "observer_materialized",
+            "root_route_registry_historical_implementation_action",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
             "root_route_registry_historical_preflight_actions",
             True,
             "",
@@ -89361,6 +89367,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "root_route_registry_extra_ref",
             "root_route_registry_minimal_actions",
             "root_route_registry_live_actions",
+            "root_route_registry_historical_implementation_action",
             "root_route_registry_historical_preflight_actions",
             "root_route_registry_required_ref_removed",
             "root_route_registry_scope_tampered",
@@ -89408,6 +89415,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "root_route_registry_extra_ref",
             "root_route_registry_minimal_actions",
             "root_route_registry_live_actions",
+            "root_route_registry_historical_implementation_action",
             "root_route_registry_required_ref_removed",
             "root_route_registry_scope_tampered",
             "root_route_registry_malformed_json",
@@ -89551,6 +89559,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         "root_route_registry_noncanonical_action",
         "root_route_registry_minimal_actions",
         "root_route_registry_live_actions",
+        "root_route_registry_historical_implementation_action",
         "root_route_registry_historical_preflight_actions",
     }:
         action_sets = {
@@ -89584,6 +89593,11 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 "graph_query",
                 "task_timeline_append",
                 "observer_direct_mutation_exception",
+            ],
+            "root_route_registry_historical_implementation_action": [
+                "graph_query",
+                "task_timeline_append",
+                "observer_direct_implementation_exception",
             ],
             "root_route_registry_historical_preflight_actions": [
                 "graph_query",
@@ -89731,6 +89745,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     if tamper in {
         "root_route_registry_minimal_actions",
         "root_route_registry_live_actions",
+        "root_route_registry_historical_implementation_action",
         "root_route_registry_expired_history",
         "root_route_registry_superseded_history",
     }:

@@ -112385,6 +112385,10 @@ _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS = (
 # preserves the action that was legal when the route was issued.
 _OPERATOR_SUPERVISED_DIRECT_MAIN_HISTORICAL_ROOT_ROUTE_ACTIONS = (
     *_OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS,
+    # Older direct-main route issuers used the persisted event-kind spelling
+    # for this action.  Accept it only when revalidating an immutable root
+    # route; newly issued full-round routes keep the canonical mutation name.
+    "observer_direct_implementation_exception",
     "preflight_check",
 )
 _ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES = ("agent/governance/server.py",)
