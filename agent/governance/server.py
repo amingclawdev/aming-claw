@@ -100958,8 +100958,7 @@ def _contract_runtime_server_candidate_base_commit(
     ).strip().lower()
     if not expected_candidate_commit:
         return ""
-    worker_commit_matched = False
-    worker_commit_base = ""
+    matching_worker_commit_bases: list[str] = []
     for line in reversed(
         [
             item
@@ -101013,14 +101012,15 @@ def _contract_runtime_server_candidate_base_commit(
             continue
         if commit_values != {expected_candidate_commit}:
             continue
-        worker_commit_matched = True
-        worker_commit_base = _contract_runtime_full_commit_value(
-            project_id,
-            payload.get("diff_base_commit"),
+        matching_worker_commit_bases.append(
+            _contract_runtime_full_commit_value(
+                project_id,
+                payload.get("diff_base_commit"),
+            )
         )
-        break
-    if not worker_commit_matched:
+    if len(matching_worker_commit_bases) != 1:
         return ""
+    worker_commit_base = matching_worker_commit_bases[0]
 
     context_bases: set[str] = set()
     context_retarget_bases: set[str] = set()

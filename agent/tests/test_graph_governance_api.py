@@ -51298,6 +51298,28 @@ def test_exact_candidate_runtime_comparison_base_uses_selected_parallel_lane(
             },
         ) == base_commit
 
+    focus_context = contexts[0]
+    duplicate_focus_commit = copy.deepcopy(
+        next(
+            line
+            for line in completed_lines
+            if line.get("line_id") == "worker_commit"
+            and (line.get("payload") or {}).get("task_id")
+            == focus_context.task_id
+        )
+    )
+    record["completed_lines"].append(duplicate_focus_commit)
+    assert server._qa_exact_candidate_runtime_comparison_base(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": backlog_id,
+            "task_id": focus_context.task_id,
+            "commit_sha": focus_context.head_commit,
+        },
+    ) == ""
+    record["completed_lines"].pop()
+
     unmatched = BranchTaskRuntimeContext(
         project_id=PID,
         task_id="selected-unmatched-worker",
