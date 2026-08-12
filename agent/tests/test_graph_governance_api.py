@@ -7807,7 +7807,9 @@ def test_failed_qa_route_rotation_uses_one_server_correction_identity(monkeypatc
         "execution_state": {"next_legal_action": {}},
         "runtime_guide": {},
     }
-    runtime = SimpleNamespace(store=SimpleNamespace(get=lambda _execution_id: record))
+    runtime = SimpleNamespace(
+        store=SimpleNamespace(get=lambda _execution_id: record)
+    )
     monkeypatch.setattr(server, "_contract_runtime", lambda _conn: runtime)
     monkeypatch.setattr(
         server,
@@ -88650,7 +88652,10 @@ def test_completed_onboard_direct_main_close_authority_is_root_only_and_preattem
 
     if expected_selection == "completed_onboard_operator_supervised_direct_main":
         assert projection["accepted"] is True
-        assert projection["authority_selection"]["selected_authority"] == expected_selection
+        assert (
+            projection["authority_selection"]["selected_authority"]
+            == expected_selection
+        )
         gate = projection["completed_onboard_direct_main_close_authority_gate"]
         assert gate["first_close_attempt_event_id"] == 6
         assert gate["historical_pre_attempt_evidence_frozen"] is True

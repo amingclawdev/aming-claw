@@ -142564,7 +142564,11 @@ def _contract_runtime_completed_onboard_direct_main_close_authority_gate(
     )
     first_close_attempt = close_attempt_ids[0] if close_attempt_ids else 0
     satisfying_kinds = {
-        "implementation", "independent_verification", "qa_verification", "reconcile", "close_ready"
+        "implementation",
+        "independent_verification",
+        "qa_verification",
+        "reconcile",
+        "close_ready",
     }
     if first_close_attempt and any(
         order(event) > first_close_attempt
@@ -142643,13 +142647,19 @@ def _contract_runtime_completed_onboard_direct_main_close_authority_gate(
         and task_timeline._event_passed(event)
         and str(event.get("commit_sha") or "").strip().lower() == candidate
     ]
-    if not (len(pre_qa) == len(reconciles) == len(post_qa) == len(close_ready) == 1):
+    if not (
+        len(pre_qa) == len(reconciles) == len(post_qa) == len(close_ready) == 1
+    ):
         return {}
     pre_event, reconcile_event, post_event, close_event = (
         pre_qa[0], reconciles[0], post_qa[0], close_ready[0]
     )
     if not (
-        order(implementation) < order(pre_event) < order(reconcile_event) < order(post_event) < order(close_event)
+        order(implementation)
+        < order(pre_event)
+        < order(reconcile_event)
+        < order(post_event)
+        < order(close_event)
         and int(post_event.get("parent_event_id") or 0) == order(reconcile_event)
         and int(close_event.get("parent_event_id") or 0) == order(post_event)
     ):
@@ -142661,7 +142671,11 @@ def _contract_runtime_completed_onboard_direct_main_close_authority_gate(
     if later_blocking_qa:
         return {}
 
-    reconcile_payload = reconcile_event.get("payload") if isinstance(reconcile_event.get("payload"), Mapping) else {}
+    reconcile_payload = (
+        reconcile_event.get("payload")
+        if isinstance(reconcile_event.get("payload"), Mapping)
+        else {}
+    )
     snapshot_id = str(
         reconcile_payload.get("snapshot_id")
         or reconcile_payload.get("active_snapshot_id")
@@ -142683,8 +142697,16 @@ def _contract_runtime_completed_onboard_direct_main_close_authority_gate(
     ):
         return {}
 
-    close_payload = close_event.get("payload") if isinstance(close_event.get("payload"), Mapping) else {}
-    close_verification = close_event.get("verification") if isinstance(close_event.get("verification"), Mapping) else {}
+    close_payload = (
+        close_event.get("payload")
+        if isinstance(close_event.get("payload"), Mapping)
+        else {}
+    )
+    close_verification = (
+        close_event.get("verification")
+        if isinstance(close_event.get("verification"), Mapping)
+        else {}
+    )
     if not (
         _contract_runtime_close_authority_route_token_backed_event(
             close_event,
