@@ -90833,6 +90833,53 @@ def _backlog_close_audited_bypass_next_action(
         raw_audit["close_commit"] = close_commit
     if route_token_ref:
         raw_audit["route_token_ref"] = route_token_ref
+    fresh_generation_recovery = {
+        "schema_version": (
+            "backlog_close.blocked_fresh_generation_recovery.v1"
+        ),
+        "status": "separate_bounded_root_required",
+        "source": "authoritative_backlog_close_blocker",
+        "project_id": project_id,
+        "historical_source_backlog_id": backlog_id,
+        "historical_source_contract_execution_id": parent_execution_id,
+        "historical_blocker_event_ref": blocker_ref,
+        "historical_close_commit": close_commit,
+        "historical_parent_mutated": False,
+        "historical_missing_evidence_backfilled": False,
+        "historical_source_resume_allowed": False,
+        "historical_source_close_retry_allowed": False,
+        "repair_backlog": "separate_bounded_root_row",
+        "required_sequence": [
+            "file_separate_bounded_root_repair",
+            "complete_independent_qa",
+            "deploy_exact_repair_commit",
+            "activate_current_head_full_graph",
+            "complete_fresh_postdeploy_qa",
+            "close_repair_row_normally",
+            "start_fresh_validation_generation_from_scenario_1",
+        ],
+        "canonical_close_ready_requirements": [
+            "runtime_sync or governance_redeploy",
+            "live_regression",
+            "graph_reconciled=true",
+            "preflight_ok=true",
+        ],
+        "non_satisfying_aliases": [
+            "redeploy_runtime_sync",
+            "active_full_reconcile",
+        ],
+        "forbidden_actions": [
+            "resume_original_contract",
+            "return_to_parent",
+            "parent_to_resume",
+            "retry_source_backlog_close_after_repair",
+            "post_hoc_close_ready_backfill",
+        ],
+        "advisory_only": True,
+        "authorizes_write": False,
+        "satisfies_gate": False,
+        "synthesizes_pass": False,
+    }
     return {
         "schema_version": "backlog_close.blocker_audit_projection.v1",
         "id": "backlog_close_blocker_audit",
@@ -90870,6 +90917,7 @@ def _backlog_close_audited_bypass_next_action(
         "source_backlog_mutated": False,
         "repair_requires_separate_backlog_row": True,
         "legacy_raw_audit": raw_audit,
+        "fresh_generation_recovery": fresh_generation_recovery,
         "block_reason": (
             "authoritative backlog_close reported close-gate blockers; retain "
             "the raw blocker audit without projecting a close retry or terminal "
@@ -90977,6 +91025,10 @@ def _contract_chain_current_with_backlog_close_blocker(
         # child, downgrade contract_complete, or create a resumable parent.
         overlay = dict(current)
         overlay["historical_backlog_close_blocker_audit"] = dict(action)
+        if action.get("fresh_generation_recovery"):
+            overlay["close_blocked_fresh_generation_recovery"] = dict(
+                action["fresh_generation_recovery"]
+            )
         overlay["projection_hash"] = contract_chain_projection_hash(overlay)
         return overlay
     overlay = dict(current)
@@ -91046,6 +91098,10 @@ def _contract_chain_current_with_backlog_close_blocker(
             },
         }
     )
+    if action.get("fresh_generation_recovery"):
+        overlay["close_blocked_fresh_generation_recovery"] = dict(
+            action["fresh_generation_recovery"]
+        )
     overlay.pop("parent_to_resume_contract_execution_id", None)
     overlay["projection_hash"] = contract_chain_projection_hash(overlay)
     return overlay
@@ -122165,6 +122221,21 @@ def _onboard_route_guide_compact_service_response(
         )
         else {}
     )
+    close_blocked_fresh_generation_recovery = (
+        runtime_resume.get("close_blocked_fresh_generation_recovery")
+        if isinstance(
+            runtime_resume.get("close_blocked_fresh_generation_recovery"),
+            Mapping,
+        )
+        else current_projection.get(
+            "close_blocked_fresh_generation_recovery"
+        )
+        if isinstance(
+            current_projection.get("close_blocked_fresh_generation_recovery"),
+            Mapping,
+        )
+        else {}
+    )
     failure_domain_disposition = (
         runtime_resume.get("failure_domain_disposition")
         if isinstance(
@@ -122357,7 +122428,12 @@ def _onboard_route_guide_compact_service_response(
                 section_name="runtime_identity",
             ),
             "blockers": _onboard_guide_capsule_bounded_section(
-                {"blocker_ids": blocker_ids},
+                {
+                    "blocker_ids": blocker_ids,
+                    "fresh_generation_recovery": (
+                        close_blocked_fresh_generation_recovery
+                    ),
+                },
                 section_name="blockers",
             ),
         }
@@ -122549,6 +122625,13 @@ def _onboard_route_guide_compact_service_response(
             _onboard_guide_capsule_bounded_section(
                 completed_repair_barrier,
                 section_name="fresh_generation_barrier",
+            )
+        )
+    if close_blocked_fresh_generation_recovery:
+        response["close_blocked_fresh_generation_recovery"] = (
+            _onboard_guide_capsule_bounded_section(
+                close_blocked_fresh_generation_recovery,
+                section_name="blockers",
             )
         )
     if failure_domain_disposition:
@@ -139968,12 +140051,13 @@ def _contract_runtime_parentless_direct_main_selected_scope(
     project_id: str,
     backlog_id: str,
     route_token_ref: str = "",
+    rebuild_if_missing: bool = True,
 ) -> dict[str, Any]:
     projection = _contract_chain_current_projection(
         conn,
         project_id=project_id,
         backlog_id=backlog_id,
-        rebuild_if_missing=True,
+        rebuild_if_missing=rebuild_if_missing,
         route_token_ref=route_token_ref,
     )
     active_chain = (
@@ -140016,6 +140100,197 @@ def _contract_runtime_parentless_direct_main_selected_scope(
         "selection_source": "backlog_contract_chain_current",
         "candidate_execution_ids": candidates,
         "projection_source": str(projection.get("projection_source") or ""),
+    }
+
+
+def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    event_kind: str,
+    normalized_status: str,
+    normalized_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reject incomplete direct-main close evidence before it becomes immutable."""
+
+    from . import task_timeline
+
+    if task_timeline._close_event_key(
+        {"event_kind": event_kind}
+    ) != "close_ready":
+        return {}
+    prospective = {
+        "event_kind": event_kind,
+        "status": normalized_status,
+        "payload": dict(normalized_payload or {}),
+        "verification": dict(body.get("verification") or {}),
+        "artifact_refs": dict(body.get("artifact_refs") or {}),
+    }
+    if not task_timeline._event_passed(prospective):
+        return {}
+
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    if not backlog_id or not task_id:
+        return {}
+    selected_scope = _contract_runtime_parentless_direct_main_selected_scope(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=str(body.get("route_token_ref") or "").strip(),
+        rebuild_if_missing=False,
+    )
+    if (
+        selected_scope.get("resolved") is not True
+        or str(selected_scope.get("contract_execution_id") or "").strip()
+        != task_id
+    ):
+        return {}
+
+    events = task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        limit=1000,
+    )
+    direct_events = []
+    for event in events:
+        if "observer_direct_implementation_exception" not in (
+            _contract_runtime_parentless_direct_main_marker(event)
+        ):
+            continue
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        authority = (
+            payload.get("observer_direct_pre_mutation_authority")
+            if isinstance(
+                payload.get("observer_direct_pre_mutation_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        if (
+            authority.get("accepted") is True
+            and authority.get("server_projected") is True
+            and str(authority.get("projection_source") or "").strip()
+            == "task_timeline_append_pre_persistence_gate"
+        ):
+            direct_events.append(event)
+    if not direct_events:
+        return {}
+    direct_event = max(
+        direct_events,
+        key=lambda event: _contract_runtime_parentless_direct_main_event_order(
+            event,
+            0,
+        ),
+    )
+    implementation = task_timeline._latest_passing_close_event(
+        events,
+        "implementation",
+        after_event_id=_contract_runtime_parentless_direct_main_event_order(
+            direct_event,
+            0,
+        ),
+    )
+    if not implementation:
+        return {}
+
+    structured_requirements = {
+        "runtime_sync_or_governance_redeploy": {
+            "governance_redeploy",
+            "redeploy",
+            "redeployed",
+            "runtime_sync",
+            "runtime_version_sync",
+            "version_sync",
+            "runtime_match",
+        },
+        "live_regression": {
+            "live_regression",
+            "live_regression_evidence",
+            "regression",
+            "smoke_test",
+        },
+    }
+
+    def passed_structured_evidence(keys: set[str]) -> bool:
+        for value in task_timeline._event_field_values(prospective, keys):
+            if isinstance(value, Mapping):
+                if value.get("passed") is True or task_timeline._truthy(
+                    value.get("status")
+                    or value.get("decision")
+                    or value.get("result")
+                ):
+                    return True
+                continue
+            if task_timeline._truthy(value):
+                return True
+        return False
+
+    checks = {
+        requirement_id: passed_structured_evidence(keys)
+        for requirement_id, keys in structured_requirements.items()
+    }
+    checks["graph_reconciled"] = any(
+        task_timeline._truthy(value) and not isinstance(value, Mapping)
+        for value in task_timeline._event_field_values(
+            prospective,
+            {"graph_reconciled", "scope_reconciled"},
+        )
+    )
+    checks["preflight_ok"] = any(
+        task_timeline._truthy(value) and not isinstance(value, Mapping)
+        for value in task_timeline._event_field_values(
+            prospective,
+            {"preflight_ok", "preflight_passed"},
+        )
+    )
+    missing = [key for key, passed in checks.items() if not passed]
+    aliases = {
+        alias: task_timeline._event_has_evidence(prospective, {alias})
+        for alias in ("redeploy_runtime_sync", "active_full_reconcile")
+    }
+    return {
+        "schema_version": (
+            "parentless_direct_main.close_ready_prewrite_gate.v1"
+        ),
+        "applicable": True,
+        "passed": not missing,
+        "status": "passed" if not missing else "failed",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": task_id,
+        "implementation_event_ref": f"timeline:{implementation.get('id')}",
+        "missing_requirement_ids": missing,
+        "canonical_requirements": {
+            "runtime_sync_or_governance_redeploy": sorted(
+                structured_requirements[
+                    "runtime_sync_or_governance_redeploy"
+                ]
+            ),
+            "live_regression": sorted(
+                structured_requirements["live_regression"]
+            ),
+            "graph_reconciled": ["graph_reconciled=true"],
+            "preflight_ok": ["preflight_ok=true"],
+        },
+        "non_satisfying_aliases": [
+            alias for alias, present in aliases.items() if present
+        ],
+        "zero_write_on_failure": True,
+        "required_before": "first backlog_close",
+        "preclose_check": {
+            "mcp_tool": "mf_timeline_precheck",
+            "view": "full",
+            "mutates_backlog_chain": False,
+        },
+        "selected_scope": selected_scope,
     }
 
 
@@ -145033,6 +145308,47 @@ def handle_task_timeline_append(ctx: RequestContext):
                 norm_payload["contract_runtime_canonical_line"] = dict(
                     canonical_contract_line
                 )
+        direct_main_close_ready_prewrite_gate = (
+            _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
+                conn,
+                project_id=project_id,
+                body=ctx.body or {},
+                event_kind=norm_event_kind,
+                normalized_status=norm_status,
+                normalized_payload=norm_payload,
+            )
+        )
+        if (
+            direct_main_close_ready_prewrite_gate.get("applicable") is True
+            and direct_main_close_ready_prewrite_gate.get("passed") is not True
+        ):
+            raise GovernanceError(
+                "parentless_direct_main_close_ready_canonical_evidence_incomplete",
+                (
+                    "parentless direct-main close_ready canonical evidence is "
+                    "incomplete and was not persisted"
+                ),
+                422,
+                {
+                    **direct_main_close_ready_prewrite_gate,
+                    "source": (
+                        "server.handle_task_timeline_append."
+                        "parentless_direct_main_close_ready_prewrite_gate"
+                    ),
+                    "guide": {
+                        "correction": (
+                            "replace descriptive aliases with the canonical "
+                            "close_ready fields, then rerun mf_timeline_precheck "
+                            "before the first backlog_close"
+                        ),
+                        "post_hoc_backfill_after_first_close_failure": False,
+                    },
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "persisted_as_accepted": False,
+                    "historical_backfill_allowed": False,
+                },
+            )
         # The canonical Contract sequence gate is the first write precondition
         # for runtime-context worker evidence.  Persist route-gate audit only
         # after it accepts, otherwise an out-of-order read/startup would perform
