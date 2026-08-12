@@ -88426,6 +88426,49 @@ def test_completed_onboard_direct_main_git_authority_rederives_exact_commit(
     assert wrong_scope["passed"] is False
     assert wrong_scope["failure_reason"] == "implementation_files_not_exact_row_scope"
 
+    for path in changed_files:
+        target = project_root / path
+        target.write_text("base\ncandidate\nnoncanonical\n", encoding="utf-8")
+    subprocess.run(["git", "add", *changed_files], cwd=project_root, check=True)
+    noncanonical_args = ["git", "commit", "-qm", "noncanonical trailers"]
+    for line in (
+        f"Chain-Source-Task: {task_id}",
+        f"Chain-Source-Contract-Execution: {task_id}",
+        "Chain-Source-Stage: implementation",
+        f"Chain-Task: {task_id}",
+        f"Chain-Bug-Id: {backlog_id}",
+        f"Chain-Backlog: {backlog_id}",
+        "Chain-Route: operator_supervised_direct_main",
+        f"Chain-Parent: {candidate}",
+    ):
+        noncanonical_args.extend(["-m", line])
+    subprocess.run(noncanonical_args, cwd=project_root, check=True)
+    noncanonical = batch_jobs.git_commit(project_root)
+    conn.execute(
+        "UPDATE project_version SET chain_version = ?, git_head = ? WHERE project_id = ?",
+        (noncanonical[:8], noncanonical, PID),
+    )
+    _activate_basic_graph(
+        conn,
+        "full-completed-onboard-direct-main-noncanonical",
+        commit_sha=noncanonical,
+    )
+    noncanonical_authority = (
+        server._contract_runtime_completed_onboard_direct_main_git_authority(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            candidate_commit=noncanonical,
+            implementation_event=implementation,
+            row_declared_files=changed_files,
+        )
+    )
+    assert noncanonical_authority["passed"] is False
+    assert noncanonical_authority["failure_reason"] == (
+        "commit_trailer_identity_mismatch"
+    )
+
 
 @pytest.mark.parametrize(
     ("tamper", "expected_selection"),

@@ -142351,10 +142351,26 @@ def _contract_runtime_completed_onboard_direct_main_git_authority(
     if len(parents) != 2 or parents[0].lower() != candidate:
         return failed("candidate_not_single_parent", parent_count=max(0, len(parents) - 1))
     parent = parents[1].lower()
-    body = _git_output(root, ["show", "-s", "--format=%B", candidate])
+    canonical_trailer_block = _git_output(
+        root,
+        [
+            "show",
+            "-s",
+            "--format=%(trailers:only,unfold=true)",
+            candidate,
+        ],
+    )
+    parsed_trailers: dict[str, list[str]] = {}
+    for line in canonical_trailer_block.splitlines():
+        key, separator, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not separator or not key or not value:
+            continue
+        parsed_trailers.setdefault(key, []).append(value)
 
     def trailers(key: str) -> list[str]:
-        return re.findall(rf"(?m)^{re.escape(key)}:\s*(\S+)\s*$", body)
+        return list(parsed_trailers.get(key) or [])
 
     expected = {
         "Chain-Source-Task": task_id,
