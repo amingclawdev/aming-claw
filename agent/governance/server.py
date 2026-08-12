@@ -113725,6 +113725,11 @@ _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS = (
 # preserves the action that was legal when the route was issued.
 _OPERATOR_SUPERVISED_DIRECT_MAIN_HISTORICAL_ROOT_ROUTE_ACTIONS = (
     *_OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS,
+    # Older root-route issuers included the read-only route-context surface in
+    # the durable action set.  It is not part of newly issued full-round
+    # routes, but must remain valid when rechecking that exact immutable root
+    # registry row at close.
+    "route_context",
     # Older direct-main route issuers used the persisted event-kind spelling
     # for this action.  Accept it only when revalidating an immutable root
     # route; newly issued full-round routes keep the canonical mutation name.
