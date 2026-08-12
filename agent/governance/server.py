@@ -101393,7 +101393,16 @@ def _contract_runtime_server_comparison_authority(
 ) -> dict[str, str]:
     """Resolve worker or combined post-merge comparison authority."""
 
-    if _is_mf_parallel_postmerge_revision(record):
+    if expected_context is not None:
+        commit_sha = _contract_runtime_server_candidate_base_commit(
+            conn,
+            project_id=project_id,
+            record=record,
+            expected_candidate_commit=expected_candidate_commit,
+            expected_context=expected_context,
+        )
+        source = _QA_WORKER_COMPARISON_BASE_SOURCE
+    elif _is_mf_parallel_postmerge_revision(record):
         commit_sha = _contract_runtime_server_postmerge_comparison_base_commit(
             conn,
             project_id=project_id,

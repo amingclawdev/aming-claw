@@ -51264,6 +51264,7 @@ def test_exact_candidate_runtime_comparison_base_uses_selected_parallel_lane(
         "backlog_id": backlog_id,
         "contract_execution_id": execution_id,
         "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
         "completed_lines": completed_lines,
     }
 
