@@ -56775,15 +56775,179 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         assert raw_fence not in serialized_context
         assert raw_fence not in serialized_current
 
-    startup_body = {
-        "runtime_context_id": allocated.runtime_context_id,
-        "contract_execution_id": contract_execution_id,
-        "task_id": allocated.task_id,
-        "parent_task_id": contract_execution_id,
+    post_reissue_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": allocated.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": contract_execution_id,
+                    "session_token": reissued["session_token"],
+                    "session_token_ref": reissued["session_token_ref"],
+                    "fence_token": reissued["fence_token"],
+                    "target_project_root": str(target_root),
+                    "view": "all",
+                },
+            )
+        )
+    )
+    startup_skeleton = post_reissue_guide["worker_guide"][
+        "startup_facade_payload_skeleton"
+    ]
+    assert startup_skeleton["actionable"] is True
+    assert startup_skeleton["status"] == (
+        "actionable_unique_durable_read_receipt"
+    )
+    assert startup_skeleton["read_receipt_authority"]["server_derived"] is True
+    assert startup_skeleton["read_receipt_authority"]["candidate_count"] == 1
+    assert startup_skeleton["read_receipt_authority"]["event_id"] == str(
+        (read.get("timeline_event") or {}).get("id") or ""
+    )
+    assert startup_skeleton["copy_safe_body"]["read_receipt_event_id"] == str(
+        (read.get("timeline_event") or {}).get("id") or ""
+    )
+    assert startup_skeleton["copy_safe_body"]["read_receipt_hash"] == receipt_hash
+    durable_authority = startup_skeleton["read_receipt_authority"]
+    for field, forged_value in (
+        ("event_id", "999999"),
+        ("event_ref", "timeline:999999"),
+        ("read_receipt_hash", _fake_sha("forged-receipt")),
+        ("worker_id", "cross-lane-worker"),
+        ("current_session_token_ref", joined["session_token_ref"]),
+        ("authority_hash", _fake_sha("forged-authority")),
+    ):
+        forged_authority = copy.deepcopy(durable_authority)
+        forged_authority[field] = forged_value
+        assert server._runtime_context_post_read_startup_receipt_authority_is_exact(
+            forged_authority,
+            project_id=PID,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=allocated.runtime_context_id,
+            task_id=allocated.task_id,
+            parent_task_id=contract_execution_id,
+            worker_id=allocated.worker_id,
+            worker_slot_id=allocated.worker_slot_id,
+            target_project_root=str(target_root),
+            session_token_ref=reissued["session_token_ref"],
+            route_identity=route_identity,
+        ) is False
+
+    receipt_event_id = int((read.get("timeline_event") or {})["id"])
+    receipt_row = conn.execute(
+        "SELECT * FROM task_timeline_events WHERE id = ?",
+        (receipt_event_id,),
+    ).fetchone()
+    receipt_columns = [column for column in receipt_row.keys() if column != "id"]
+
+    duplicate_conn = sqlite3.connect(":memory:")
+    duplicate_conn.row_factory = sqlite3.Row
+    conn.backup(duplicate_conn)
+    duplicate_conn.execute(
+        (
+            "INSERT INTO task_timeline_events ("
+            + ", ".join(receipt_columns)
+            + ") VALUES ("
+            + ", ".join("?" for _column in receipt_columns)
+            + ")"
+        ),
+        tuple(receipt_row[column] for column in receipt_columns),
+    )
+    duplicate_context = get_branch_context(
+        duplicate_conn,
+        PID,
+        allocated.task_id,
+    )
+    before_duplicate_probe = duplicate_conn.total_changes
+    assert server._runtime_context_post_read_startup_receipt_authority(
+        duplicate_conn,
+        project_id=PID,
+        context=duplicate_context,
+        route_identity=route_identity,
+    ) == {}
+    assert duplicate_conn.total_changes == before_duplicate_probe
+    duplicate_conn.close()
+
+    forged_conn = sqlite3.connect(":memory:")
+    forged_conn.row_factory = sqlite3.Row
+    conn.backup(forged_conn)
+    forged_receipt_payload = json.loads(receipt_row["payload_json"])
+    forged_receipt_payload["read_receipt_hash"] = _fake_sha(
+        "forged-persisted-receipt"
+    )
+    forged_conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+        (
+            json.dumps(forged_receipt_payload, sort_keys=True),
+            receipt_event_id,
+        ),
+    )
+    forged_context = get_branch_context(
+        forged_conn,
+        PID,
+        allocated.task_id,
+    )
+    before_forged_probe = forged_conn.total_changes
+    assert server._runtime_context_post_read_startup_receipt_authority(
+        forged_conn,
+        project_id=PID,
+        context=forged_context,
+        route_identity=route_identity,
+    ) == {}
+    assert forged_conn.total_changes == before_forged_probe
+    forged_conn.close()
+
+    blocked_startup = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=allocated.runtime_context_id,
+        task_id=allocated.task_id,
+        parent_task_id=contract_execution_id,
+        worker_id=allocated.worker_id,
+        worker_slot_id=allocated.worker_slot_id,
+        target_project_root=str(target_root),
+        session_token_ref=reissued["session_token_ref"],
+        route_identity=route_identity,
+        read_receipt_event_ref=f"timeline:{receipt_event_id}",
+        read_receipt_authority={},
+        read_receipt_authority_required=True,
+    )["startup_facade_payload_skeleton"]
+    assert blocked_startup["actionable"] is False
+    assert blocked_startup["status"] == (
+        "blocked_invalid_or_ambiguous_read_receipt_authority"
+    )
+    assert blocked_startup["body"] == {}
+    assert blocked_startup["copy_safe_body"] == {}
+
+    pre_read_template = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=allocated.runtime_context_id,
+        task_id=allocated.task_id,
+        parent_task_id=contract_execution_id,
+        worker_id=allocated.worker_id,
+        worker_slot_id=allocated.worker_slot_id,
+        target_project_root=str(target_root),
+        session_token_ref=reissued["session_token_ref"],
+        route_identity=route_identity,
+    )["startup_facade_payload_skeleton"]
+    assert pre_read_template["actionable"] is False
+    assert pre_read_template["status"] == "template_before_read_receipt"
+    assert pre_read_template["copy_safe_body"]["read_receipt_hash"].startswith(
+        "<"
+    )
+
+    startup_body = copy.deepcopy(startup_skeleton["copy_safe_body"])
+    startup_body.pop("worker_transcript_path", None)
+    startup_body.update({
         "session_token": reissued["session_token"],
         "session_token_ref": reissued["session_token_ref"],
         "fence_token": reissued["fence_token"],
-        "target_project_root": str(target_root),
         "agent_id": allocated.worker_id,
         "actual_host_worker_id": allocated.worker_id,
         "host_startup_id": "codex-thread:safe-ref-prestartup-worker",
@@ -56801,13 +56965,8 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         "target_head_commit": head_commit,
         "merge_queue_id": allocated.merge_queue_id,
         "owned_files": list(allocated.owned_files),
-        "read_receipt_hash": receipt_hash,
-        "read_receipt_event_id": str(
-            (read.get("timeline_event") or {}).get("id") or ""
-        ),
         "startup_source": "codex_desktop_governed_dispatch",
-        **route_identity,
-    }
+    })
     before_hash_as_bearer_context = get_branch_context(
         conn,
         PID,
@@ -56859,6 +57018,14 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     assert startup["ok"] is True, startup
     running_context = get_branch_context(conn, PID, allocated.task_id)
     assert running_context is not None
+    before_started_probe = conn.total_changes
+    assert server._runtime_context_post_read_startup_receipt_authority(
+        conn,
+        project_id=PID,
+        context=running_context,
+        route_identity=route_identity,
+    ) == {}
+    assert conn.total_changes == before_started_probe
     assert running_context.fence_token == ""
     assert running_context.fence_token_verifier == reissued["fence_token_hash"]
     final_record = server._contract_runtime_store(conn).get(contract_execution_id)

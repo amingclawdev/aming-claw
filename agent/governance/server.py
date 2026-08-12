@@ -21132,6 +21132,538 @@ def _runtime_context_service_graph_trace_values_from_event(
     return _runtime_context_service_dedupe(values)
 
 
+def _runtime_context_post_read_startup_receipt_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one durable worker receipt to its exact pre-startup session chain."""
+
+    from .parallel_branch_runtime import (
+        runtime_context_session_token_lease_view,
+        runtime_context_session_token_ref,
+    )
+
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    target_project_root = _runtime_context_effective_target_project_root(context)
+    current_session_token_ref = runtime_context_session_token_ref(context)
+    safe_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not all(
+        (
+            runtime_context_id,
+            task_id,
+            backlog_id,
+            parent_task_id,
+            worker_id,
+            worker_slot_id,
+            target_project_root,
+            current_session_token_ref,
+            *safe_route_identity.values(),
+        )
+    ):
+        return {}
+
+    timeline_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+    timeline_refs, _startup, _finish, _close = (
+        _runtime_context_service_timeline_refs(
+            conn,
+            project_id=project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            timeline_events=timeline_events,
+            runtime_context_id=runtime_context_id,
+            parent_task_id=parent_task_id,
+        )
+    )
+    timeline_authority = (
+        timeline_refs.get("read_receipt_authority")
+        if isinstance(timeline_refs.get("read_receipt_authority"), Mapping)
+        else {}
+    )
+    read_receipt_event_ref = str(
+        timeline_refs.get("read_receipt_event_ref") or ""
+    ).strip()
+    read_receipt_hash = str(timeline_refs.get("read_receipt_hash") or "").strip()
+    if (
+        timeline_refs.get("startup_event_ref")
+        or str(timeline_authority.get("schema_version") or "")
+        != "runtime_context.read_receipt_authority.v1"
+        or str(timeline_authority.get("status") or "") != "unique_passing"
+        or timeline_authority.get("server_derived") is not True
+        or timeline_authority.get("candidate_count") != 1
+        or timeline_authority.get("candidate_event_refs")
+        != [read_receipt_event_ref]
+        or str(timeline_authority.get("event_ref") or "").strip()
+        != read_receipt_event_ref
+        or str(timeline_authority.get("read_receipt_hash") or "").strip()
+        != read_receipt_hash
+        or not re.fullmatch(r"timeline:[1-9][0-9]*", read_receipt_event_ref)
+        or not _runtime_context_non_placeholder_text(read_receipt_hash)
+    ):
+        return {}
+    matching_receipts = [
+        event
+        for event in timeline_events
+        if _runtime_context_event_ref(event) == read_receipt_event_ref
+    ]
+    if len(matching_receipts) != 1:
+        return {}
+    receipt_event = matching_receipts[0]
+    receipt_payload = (
+        receipt_event.get("payload")
+        if isinstance(receipt_event.get("payload"), Mapping)
+        else {}
+    )
+    receipt_provenance = (
+        receipt_payload.get("worker_evidence_provenance")
+        if isinstance(receipt_payload.get("worker_evidence_provenance"), Mapping)
+        else {}
+    )
+    if (
+        str(receipt_event.get("task_id") or "").strip() != task_id
+        or str(receipt_event.get("backlog_id") or "").strip() != backlog_id
+        or str(receipt_event.get("event_type") or "").strip()
+        != "mf_subagent_read_receipt"
+        or str(receipt_event.get("event_kind") or "").strip()
+        not in {"mf_subagent_read_receipt", "contract_context_read_receipt"}
+        or any(
+            str(receipt_payload.get(field) or "").strip() != expected
+            for field, expected in {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "worker_id": worker_id,
+                "worker_slot_id": worker_slot_id,
+                "target_project_root": target_project_root,
+                "read_receipt_hash": read_receipt_hash,
+            }.items()
+        )
+        or str(receipt_provenance.get("schema_version") or "")
+        != "contract_runtime.worker_evidence_provenance.v1"
+        or str(receipt_provenance.get("source") or "")
+        != "runtime_context_copy_safe_worker_proof"
+        or receipt_provenance.get("verified") is not True
+        or receipt_provenance.get("worker_owned") is not True
+        or receipt_provenance.get("observer_impersonation") is not False
+        or receipt_provenance.get("raw_session_token_persisted") is not False
+        or receipt_provenance.get("raw_fence_token_persisted") is not False
+        or receipt_payload.get("observer_impersonation") is not False
+        or receipt_payload.get("raw_session_token_persisted") is not False
+        or receipt_payload.get("raw_fence_token_persisted") is not False
+    ):
+        return {}
+
+    sequence = _runtime_context_contract_runtime_worker_sequence_evidence(
+        conn,
+        project_id=project_id,
+        context=context,
+    )
+    contract_execution_id = str(
+        sequence.get("contract_execution_id") or ""
+    ).strip()
+    if (
+        not contract_execution_id
+        or not sequence.get("read_receipt_ref")
+        or sequence.get("startup_ref")
+    ):
+        return {}
+    try:
+        record = _contract_runtime_store(conn).get(contract_execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+    matching_read_lines: list[tuple[int, Mapping[str, Any]]] = []
+    for line_index, line in _contract_runtime_completed_lines(record):
+        line_payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if (
+            str(line.get("line_id") or "").strip()
+            == "worker_read_runtime_guide"
+            and str(line.get("stage_id") or "").strip() == "worker_read"
+            and str(line.get("evidence_kind") or "").strip() == "read_receipt"
+            and str(line.get("actor_role") or "").strip() == "mf_sub"
+            and _contract_runtime_line_status_passes(line)
+            and (
+                _contract_runtime_mapping_matches_context(
+                    line,
+                    runtime_context_id=runtime_context_id,
+                    task_id=task_id,
+                    parent_task_id=parent_task_id,
+                )
+                or _contract_runtime_mapping_matches_context(
+                    line_payload,
+                    runtime_context_id=runtime_context_id,
+                    task_id=task_id,
+                    parent_task_id=parent_task_id,
+                )
+            )
+        ):
+            matching_read_lines.append((line_index, line))
+    if len(matching_read_lines) != 1:
+        return {}
+    read_line_index, read_line = matching_read_lines[0]
+    read_line_payload = (
+        read_line.get("payload")
+        if isinstance(read_line.get("payload"), Mapping)
+        else {}
+    )
+    worker_provenance = (
+        read_line_payload.get("worker_evidence_provenance")
+        if isinstance(read_line_payload.get("worker_evidence_provenance"), Mapping)
+        else {}
+    )
+    exact_dispatch = _runtime_context_contract_dispatch_matches_worker(
+        conn,
+        record,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    if not exact_dispatch:
+        # Older single-lane fixtures predate the atomic dispatch-ticket
+        # authority. Preserve that bounded compatibility shape, but never use
+        # the deep-text fallback for an aggregate containing multiple workers:
+        # it would silently select the first sibling lane.
+        dispatch_selection = _contract_runtime_current_dispatch_authority_line(
+            record
+        )
+        dispatch_payload = (
+            dispatch_selection.get("payload")
+            if isinstance(dispatch_selection.get("payload"), Mapping)
+            else {}
+        )
+        bounded_workers = _contract_runtime_mf_parallel_bounded_workers(
+            {"payload": dispatch_payload}
+        )
+        legacy_dispatch_matches = [
+            line
+            for _line_index, line in _contract_runtime_completed_lines(record)
+            if str(line.get("line_id") or "").strip()
+            == "observer_dispatch_bounded_workers"
+            and str(line.get("stage_id") or "").strip() == "dispatch"
+            and _contract_runtime_line_status_passes(line)
+            and (
+                _contract_runtime_mapping_matches_context(
+                    line,
+                    runtime_context_id=runtime_context_id,
+                    task_id=task_id,
+                    parent_task_id=parent_task_id,
+                )
+                or _contract_runtime_mapping_matches_context(
+                    line.get("payload")
+                    if isinstance(line.get("payload"), Mapping)
+                    else {},
+                    runtime_context_id=runtime_context_id,
+                    task_id=task_id,
+                    parent_task_id=parent_task_id,
+                )
+            )
+            and {
+                field: _runtime_context_non_placeholder_text(
+                    _timeline_first_deep_text(line, field)
+                )
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            }
+            == safe_route_identity
+        ]
+        exact_dispatch = bool(
+            len(bounded_workers) <= 1
+            and len(legacy_dispatch_matches) == 1
+        )
+    contract_read_ref = (
+        f"contract_runtime:{contract_execution_id}:completed_lines:{read_line_index}"
+    )
+    if (
+        contract_read_ref != str(sequence.get("read_receipt_ref") or "").strip()
+        or not exact_dispatch
+        or str(read_line_payload.get("read_receipt_hash") or "").strip()
+        != read_receipt_hash
+        or any(
+            _runtime_context_non_placeholder_text(
+                _timeline_first_deep_text(read_line, field)
+            )
+            != expected
+            for field, expected in {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "worker_id": worker_id,
+                "worker_slot_id": worker_slot_id,
+                "target_project_root": target_project_root,
+            }.items()
+        )
+        or str(worker_provenance.get("schema_version") or "")
+        != "contract_runtime.worker_evidence_provenance.v1"
+        or str(worker_provenance.get("source") or "")
+        != "runtime_context_copy_safe_worker_proof"
+        or worker_provenance.get("verified") is not True
+        or worker_provenance.get("worker_owned") is not True
+        or worker_provenance.get("observer_impersonation") is not False
+        or worker_provenance.get("raw_session_token_persisted") is not False
+        or worker_provenance.get("raw_fence_token_persisted") is not False
+    ):
+        return {}
+
+    receipt_session_ref = str(
+        receipt_payload.get("session_token_ref") or ""
+    ).strip()
+    route_identity_hash = _stable_public_hash(safe_route_identity)
+    matching_initial_joins: list[Mapping[str, Any]] = []
+    matching_identity_anchors: list[Mapping[str, Any]] = []
+    for event in timeline_events:
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        action = str(payload.get("action") or "").strip()
+        if (
+            str(event.get("status") or "").strip().lower()
+            not in {"accepted", "ok", "pass", "passed", "success", "succeeded"}
+            or str(payload.get("runtime_context_id") or "").strip()
+            != runtime_context_id
+            or str(payload.get("task_id") or event.get("task_id") or "").strip()
+            != task_id
+        ):
+            continue
+        if (
+            action == "runtime_context_session_token_initial_join"
+            and str(payload.get("parent_task_id") or "").strip() == parent_task_id
+            and str(payload.get("contract_execution_id") or "").strip()
+            == contract_execution_id
+            and str(payload.get("worker_id") or "").strip() == worker_id
+            and str(payload.get("worker_slot_id") or "").strip() == worker_slot_id
+            and str(payload.get("session_token_ref") or "").strip()
+            == receipt_session_ref
+            and dict(payload.get("route_identity") or {}) == safe_route_identity
+        ):
+            matching_initial_joins.append(event)
+        elif action == (
+            "runtime_context_session_token_initial_join_identity_binding_anchor"
+        ):
+            matching_identity_anchors.append(event)
+    if len(matching_initial_joins) > 1:
+        return {}
+    initial_join_ref = (
+        _runtime_context_event_ref(matching_initial_joins[0])
+        if matching_initial_joins
+        else ""
+    )
+    if initial_join_ref:
+        matching_identity_anchors = [
+            event
+            for event in matching_identity_anchors
+            if isinstance(event.get("payload"), Mapping)
+            and str(event["payload"].get("initial_join_event_ref") or "").strip()
+            == initial_join_ref
+            and str(event["payload"].get("session_token_ref") or "").strip()
+            == receipt_session_ref
+            and str(event["payload"].get("route_identity_hash") or "").strip()
+            == route_identity_hash
+            and re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(
+                    event["payload"].get("canonical_binding_hash") or ""
+                ).strip(),
+            )
+        ]
+        if len(matching_identity_anchors) != 1:
+            return {}
+        session_authority_ref = initial_join_ref
+        session_authority_kind = "initial_join"
+    else:
+        current_lease = runtime_context_session_token_lease_view(context)
+        if (
+            current_session_token_ref != receipt_session_ref
+            or str(current_lease.get("status") or "") != "active"
+            or current_lease.get("authorization_valid") is not True
+            or current_lease.get("lease_record_valid") is not True
+            or current_lease.get("expired") is not False
+            or str(current_lease.get("session_token_ref") or "")
+            != current_session_token_ref
+        ):
+            return {}
+        matching_identity_anchors = []
+        session_authority_ref = ""
+        session_authority_kind = "active_runtime_session"
+    safe_ref_reissue_ref = ""
+    if current_session_token_ref != receipt_session_ref:
+        if not initial_join_ref:
+            return {}
+        matching_reissues: list[Mapping[str, Any]] = []
+        for event in timeline_events:
+            payload = (
+                event.get("payload")
+                if isinstance(event.get("payload"), Mapping)
+                else {}
+            )
+            safe_ref_authority = (
+                payload.get("safe_ref_reissue_authority")
+                if isinstance(payload.get("safe_ref_reissue_authority"), Mapping)
+                else {}
+            )
+            if (
+                str(event.get("status") or "").strip().lower()
+                in {"accepted", "ok", "pass", "passed", "success", "succeeded"}
+                and str(payload.get("action") or "").strip()
+                == "runtime_context_session_token_reissue"
+                and str(payload.get("runtime_context_id") or "").strip()
+                == runtime_context_id
+                and str(payload.get("task_id") or event.get("task_id") or "").strip()
+                == task_id
+                and str(payload.get("session_token_ref") or "").strip()
+                == current_session_token_ref
+                and dict(payload.get("route_identity") or {}) == safe_route_identity
+                and str(payload.get("authorization_source") or "").strip()
+                == "safe_ref_prestartup_reissue_authority"
+                and payload.get("session_token_persisted") is False
+                and payload.get("raw_session_token_persisted") is False
+                and payload.get("raw_fence_token_persisted") is False
+                and str(safe_ref_authority.get("schema_version") or "")
+                == "runtime_context.safe_ref_prestartup_reissue_authority.v2"
+                and safe_ref_authority.get("server_derived") is True
+                and safe_ref_authority.get("caller_claims_trusted") is False
+                and str(safe_ref_authority.get("read_receipt_ref") or "").strip()
+                == contract_read_ref
+                and str(safe_ref_authority.get("initial_join_event_ref") or "").strip()
+                == initial_join_ref
+                and str(safe_ref_authority.get("session_authority_event_ref") or "").strip()
+                == initial_join_ref
+                and str(safe_ref_authority.get("session_authority_kind") or "").strip()
+                == "initial_join"
+                and str(safe_ref_authority.get("route_identity_hash") or "").strip()
+                == route_identity_hash
+                and re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    str(safe_ref_authority.get("stage_checkpoint_id") or "").strip(),
+                )
+                and safe_ref_authority.get("stage_checkpoint_server_verified") is True
+                and re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    str(safe_ref_authority.get("authority_hash") or "").strip(),
+                )
+            ):
+                matching_reissues.append(event)
+        if len(matching_reissues) != 1:
+            return {}
+        safe_ref_reissue_ref = _runtime_context_event_ref(matching_reissues[0])
+        session_authority_ref = safe_ref_reissue_ref
+        session_authority_kind = "safe_ref_prestartup_reissue"
+
+    authority_core = {
+        "schema_version": (
+            "runtime_context.post_read_startup_receipt_authority.v1"
+        ),
+        "source": (
+            "task_timeline+ContractRuntime.completed_lines+"
+            "runtime_context_session_authority"
+        ),
+        "server_derived": True,
+        "status": "unique_exact_prestartup_receipt",
+        "actionable": True,
+        "candidate_count": 1,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "event_id": read_receipt_event_ref.removeprefix("timeline:"),
+        "event_ref": read_receipt_event_ref,
+        "read_receipt_hash": read_receipt_hash,
+        "contract_runtime_read_receipt_ref": contract_read_ref,
+        "initial_join_event_ref": initial_join_ref,
+        "identity_anchor_event_ref": (
+            _runtime_context_event_ref(matching_identity_anchors[0])
+            if matching_identity_anchors
+            else ""
+        ),
+        "safe_ref_reissue_event_ref": safe_ref_reissue_ref,
+        "session_authority_event_ref": session_authority_ref,
+        "session_authority_kind": session_authority_kind,
+        "receipt_session_token_ref": receipt_session_ref,
+        "current_session_token_ref": current_session_token_ref,
+        "route_identity": dict(safe_route_identity),
+        "startup_absent": True,
+        "timeline_backfill_performed": False,
+        "contract_runtime_backfill_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+        "caller_claims_trusted": False,
+    }
+    return {
+        **authority_core,
+        "authority_hash": _stable_public_hash(authority_core),
+    }
+
+
+def _runtime_context_post_read_startup_receipt_authority_required(
+    timeline_events: Sequence[Mapping[str, Any]],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    session_token_ref: str,
+) -> bool:
+    """Require the stronger receipt chain only after safe-ref recovery."""
+
+    expected = {
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "session_token_ref": str(session_token_ref or "").strip(),
+    }
+    if not all(expected.values()):
+        return False
+    matches = []
+    for event in timeline_events:
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        if (
+            str(event.get("status") or "").strip().lower()
+            in {"accepted", "ok", "pass", "passed", "success", "succeeded"}
+            and str(payload.get("action") or "").strip()
+            == "runtime_context_session_token_reissue"
+            and str(payload.get("authorization_source") or "").strip()
+            == "safe_ref_prestartup_reissue_authority"
+            and all(
+                str(payload.get(field) or "").strip() == value
+                for field, value in expected.items()
+            )
+            and payload.get("session_token_persisted") is False
+            and payload.get("raw_session_token_persisted") is False
+            and payload.get("raw_fence_token_persisted") is False
+        ):
+            matches.append(event)
+    # This is a strictness detector, not the authority validator itself. Any
+    # current safe-ref reissue means startup must fail closed unless the
+    # separate authority projection proves one exact receipt chain. Duplicate
+    # reissue rows therefore must not downgrade to compatibility behavior.
+    return bool(matches)
+
+
 def _runtime_context_projection_response(
     ctx: RequestContext,
     conn,
@@ -21152,6 +21684,7 @@ def _runtime_context_projection_response(
         runtime_context_audit_nodes_for_views,
         runtime_context_filter_content_address,
         runtime_context_id_for_branch_context,
+        runtime_context_session_token_ref,
     )
 
     runtime_context_id = runtime_context_id_for_branch_context(context)
@@ -21194,6 +21727,15 @@ def _runtime_context_projection_response(
             timeline_events=timeline_events,
             runtime_context_id=runtime_context_id,
             parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
+        )
+    )
+    post_read_startup_receipt_authority: dict[str, Any] = {}
+    post_read_startup_receipt_authority_required = (
+        _runtime_context_post_read_startup_receipt_authority_required(
+            timeline_events,
+            runtime_context_id=runtime_context_id,
+            task_id=str(getattr(context, "task_id", "") or ""),
+            session_token_ref=runtime_context_session_token_ref(context),
         )
     )
     contract_runtime_qa_verification = (
@@ -21326,6 +21868,36 @@ def _runtime_context_projection_response(
         if isinstance(exposed_views.get("worker_view"), Mapping)
         else {}
     )
+    receipt_route_identity = next(
+        (
+            dict(candidate)
+            for candidate in (
+                worker_view_for_summary.get("route_identity"),
+                full_worker_view_for_scope.get("route_identity"),
+                route_identity,
+            )
+            if isinstance(candidate, Mapping)
+            and all(
+                _runtime_context_non_placeholder_text(candidate.get(field))
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            )
+        ),
+        {},
+    )
+    post_read_startup_receipt_authority = (
+        _runtime_context_post_read_startup_receipt_authority(
+            conn,
+            project_id=context_project_id,
+            context=context,
+            route_identity=receipt_route_identity,
+        )
+        if receipt_route_identity
+        else {}
+    )
+    if post_read_startup_receipt_authority:
+        route_identity = dict(
+            post_read_startup_receipt_authority.get("route_identity") or {}
+        )
     worker_summary_id = str(
         worker_view_for_summary.get("worker_id")
         or getattr(context, "worker_id", "")
@@ -21458,6 +22030,12 @@ def _runtime_context_projection_response(
         "ok": True,
         "schema_version": "runtime_context.current_state_response.v1",
         "project_id": project_id,
+        "post_read_startup_receipt_authority": dict(
+            post_read_startup_receipt_authority
+        ),
+        "post_read_startup_receipt_authority_required": (
+            post_read_startup_receipt_authority_required
+        ),
         "governance_project_id": context_project_id,
         "target_project_id": getattr(context, "target_project_id", "") or project_id,
         "target_project_root": target_project_root,
@@ -21795,7 +22373,13 @@ def _runtime_context_projection_response(
         session_token_ref=str(worker_view_for_summary.get("session_token_ref") or ""),
         launch_text_hash=str(worker_view_for_summary.get("launch_text_hash") or ""),
         read_receipt_event_ref=str(
-            worker_view_for_summary.get("read_receipt_event_ref") or ""
+            worker_view_for_summary.get("read_receipt_event_ref")
+            or timeline_refs.get("read_receipt_event_ref")
+            or ""
+        ),
+        read_receipt_authority=post_read_startup_receipt_authority,
+        read_receipt_authority_required=(
+            post_read_startup_receipt_authority_required
         ),
         contract_execution_id=contract_identity["contract_execution_id"],
         contract_chain_id=contract_identity["contract_chain_id"],
@@ -28296,7 +28880,26 @@ def _runtime_context_worker_guide_response(
         ),
         session_token_ref=str(worker_view.get("session_token_ref") or ""),
         launch_text_hash=str(worker_view.get("launch_text_hash") or ""),
-        read_receipt_event_ref=str(worker_view.get("read_receipt_event_ref") or ""),
+        read_receipt_event_ref=str(
+            worker_view.get("read_receipt_event_ref")
+            or timeline_refs.get("read_receipt_event_ref")
+            or ""
+        ),
+        read_receipt_authority=(
+            current_state_response.get("post_read_startup_receipt_authority")
+            if isinstance(
+                current_state_response.get(
+                    "post_read_startup_receipt_authority"
+                ),
+                Mapping,
+            )
+            else {}
+        ),
+        read_receipt_authority_required=bool(
+            current_state_response.get(
+                "post_read_startup_receipt_authority_required"
+            )
+        ),
         contract_execution_id=str(
             contract_execution_identity.get("contract_execution_id")
             or contract_runtime_execution_resolution.get(
@@ -29668,6 +30271,127 @@ def _runtime_context_host_safe_filesystem_sequence() -> dict[str, Any]:
     }
 
 
+def _runtime_context_post_read_startup_receipt_authority_is_exact(
+    authority: Mapping[str, Any] | None,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    worker_id: str,
+    worker_slot_id: str,
+    target_project_root: str,
+    session_token_ref: str,
+    route_identity: Mapping[str, Any],
+) -> bool:
+    source = dict(authority) if isinstance(authority, Mapping) else {}
+    authority_hash = str(source.pop("authority_hash", "") or "").strip()
+    expected_identity = {
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "parent_task_id": str(parent_task_id or "").strip(),
+        "worker_id": str(worker_id or "").strip(),
+        "worker_slot_id": str(worker_slot_id or "").strip(),
+        "target_project_root": str(target_project_root or "").strip(),
+        "current_session_token_ref": str(session_token_ref or "").strip(),
+    }
+    expected_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    event_id = str(source.get("event_id") or "").strip()
+    event_ref = str(source.get("event_ref") or "").strip()
+    read_receipt_hash = str(source.get("read_receipt_hash") or "").strip()
+    session_authority_kind = str(
+        source.get("session_authority_kind") or ""
+    ).strip()
+    session_authority_event_ref = str(
+        source.get("session_authority_event_ref") or ""
+    ).strip()
+    initial_join_event_ref = str(
+        source.get("initial_join_event_ref") or ""
+    ).strip()
+    identity_anchor_event_ref = str(
+        source.get("identity_anchor_event_ref") or ""
+    ).strip()
+    safe_ref_reissue_event_ref = str(
+        source.get("safe_ref_reissue_event_ref") or ""
+    ).strip()
+    exact_session_authority = (
+        session_authority_kind == "active_runtime_session"
+        and not session_authority_event_ref
+        and not initial_join_event_ref
+        and not identity_anchor_event_ref
+        and not safe_ref_reissue_event_ref
+    ) or (
+        session_authority_kind in {"initial_join", "safe_ref_prestartup_reissue"}
+        and re.fullmatch(r"timeline:[1-9][0-9]*", initial_join_event_ref)
+        and re.fullmatch(r"timeline:[1-9][0-9]*", identity_anchor_event_ref)
+        and re.fullmatch(
+            r"timeline:[1-9][0-9]*",
+            session_authority_event_ref,
+        )
+        and (
+            session_authority_kind == "initial_join"
+            and not safe_ref_reissue_event_ref
+            or session_authority_kind == "safe_ref_prestartup_reissue"
+            and re.fullmatch(
+                r"timeline:[1-9][0-9]*",
+                safe_ref_reissue_event_ref,
+            )
+        )
+    )
+    return bool(
+        source
+        and str(source.get("schema_version") or "")
+        == "runtime_context.post_read_startup_receipt_authority.v1"
+        and str(source.get("source") or "")
+        == (
+            "task_timeline+ContractRuntime.completed_lines+"
+            "runtime_context_session_authority"
+        )
+        and source.get("server_derived") is True
+        and source.get("actionable") is True
+        and source.get("candidate_count") == 1
+        and str(source.get("status") or "")
+        == "unique_exact_prestartup_receipt"
+        and source.get("startup_absent") is True
+        and source.get("timeline_backfill_performed") is False
+        and source.get("contract_runtime_backfill_performed") is False
+        and source.get("raw_session_token_exposed") is False
+        and source.get("raw_fence_token_exposed") is False
+        and source.get("raw_route_token_exposed") is False
+        and source.get("caller_claims_trusted") is False
+        and all(
+            expected
+            and str(source.get(field) or "").strip() == expected
+            for field, expected in expected_identity.items()
+        )
+        and dict(source.get("route_identity") or {}) == expected_route_identity
+        and event_id.isdigit()
+        and int(event_id) > 0
+        and event_ref == f"timeline:{event_id}"
+        and (
+            session_authority_kind == "active_runtime_session"
+            and _runtime_context_non_placeholder_text(read_receipt_hash)
+            or session_authority_kind != "active_runtime_session"
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", read_receipt_hash)
+        )
+        and re.fullmatch(
+            r"contract_runtime:[^:]+:completed_lines:[0-9]+",
+            str(source.get("contract_runtime_read_receipt_ref") or "").strip(),
+        )
+        and exact_session_authority
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", authority_hash)
+        and authority_hash == _stable_public_hash(source)
+    )
+
+
 def _runtime_context_worker_recovery_payloads(
     *,
     project_id: str,
@@ -29695,6 +30419,8 @@ def _runtime_context_worker_recovery_payloads(
     session_token_ref: str = "",
     launch_text_hash: str = "",
     read_receipt_event_ref: str = "",
+    read_receipt_authority: Mapping[str, Any] | None = None,
+    read_receipt_authority_required: bool = False,
     contract_execution_id: str = "",
     contract_chain_id: str = "",
     parent_contract_execution_id: str = "",
@@ -29713,6 +30439,33 @@ def _runtime_context_worker_recovery_payloads(
         field: str((route_identity or {}).get(field) or "").strip()
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     }
+    trusted_read_receipt_authority = (
+        dict(read_receipt_authority)
+        if _runtime_context_post_read_startup_receipt_authority_is_exact(
+            read_receipt_authority,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_slot_id,
+            target_project_root=target_project_root,
+            session_token_ref=session_token_ref,
+            route_identity=safe_route_identity,
+        )
+        else {}
+    )
+    trusted_read_receipt_event_id = str(
+        trusted_read_receipt_authority.get("event_id") or ""
+    ).strip()
+    trusted_read_receipt_hash = str(
+        trusted_read_receipt_authority.get("read_receipt_hash") or ""
+    ).strip()
+    strict_read_receipt_authority_required = bool(
+        read_receipt_authority_required
+    )
     present_route_identity = {
         field: value for field, value in safe_route_identity.items() if value
     }
@@ -30544,9 +31297,12 @@ def _runtime_context_worker_recovery_payloads(
         "actual_cwd": target_project_root,
         "actual_git_root": target_project_root,
         "head_commit": "<worker worktree HEAD after launch>",
-        "read_receipt_hash": "<accepted-read-receipt-hash>",
+        "read_receipt_hash": (
+            trusted_read_receipt_hash or "<accepted-read-receipt-hash>"
+        ),
         "read_receipt_event_id": (
-            read_receipt_event_ref or "<accepted-read-receipt-event-id>"
+            trusted_read_receipt_event_id
+            or "<accepted-read-receipt-event-id>"
         ),
         "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
         "write_authorization_policy": dict(write_authorization_policy),
@@ -31307,6 +32063,27 @@ def _runtime_context_worker_recovery_payloads(
                 *startup_identity_required_fields,
             ],
             "required_real_worker_identity_fields": startup_identity_required_fields,
+            "actionable": bool(
+                trusted_read_receipt_authority
+                or (
+                    read_receipt_event_ref
+                    and not strict_read_receipt_authority_required
+                )
+            ),
+            "status": (
+                "actionable_unique_durable_read_receipt"
+                if trusted_read_receipt_authority
+                else (
+                    "template_before_read_receipt"
+                    if not read_receipt_event_ref
+                    else (
+                        "blocked_invalid_or_ambiguous_read_receipt_authority"
+                        if strict_read_receipt_authority_required
+                        else "legacy_same_session_read_receipt"
+                    )
+                )
+            ),
+            "read_receipt_authority": dict(trusted_read_receipt_authority),
             "preconditions": [
                 {
                     "source": (
@@ -31358,8 +32135,22 @@ def _runtime_context_worker_recovery_payloads(
                 "fence_token": fence_token_placeholder,
                 "fence_token_env": fence_token_env,
             },
-            "body": startup_body,
-            "copy_safe_body": dict(startup_body),
+            "body": (
+                startup_body
+                if (
+                    trusted_read_receipt_authority
+                    or not strict_read_receipt_authority_required
+                )
+                else {}
+            ),
+            "copy_safe_body": (
+                dict(startup_body)
+                if (
+                    trusted_read_receipt_authority
+                    or not strict_read_receipt_authority_required
+                )
+                else {}
+            ),
             "body_source": "copy_safe_body",
             "payload": startup_payload,
             "worker_session_lifecycle_policy": worker_session_lifecycle_policy,
@@ -32613,6 +33404,24 @@ def _runtime_context_worker_recovery_details(
             fence_token_hash=fence_token_hash,
             session_token_ref=runtime_context_session_token_ref(context),
             read_receipt_event_ref=str(timeline_refs.get("read_receipt_event_ref") or ""),
+            read_receipt_authority=(
+                _runtime_context_post_read_startup_receipt_authority(
+                    conn,
+                    project_id=project_id,
+                    context=context,
+                    route_identity=(
+                        expected_route_identity or supplied_route_identity
+                    ),
+                )
+            ),
+            read_receipt_authority_required=(
+                _runtime_context_post_read_startup_receipt_authority_required(
+                    timeline_events,
+                    runtime_context_id=expected_runtime_context_id,
+                    task_id=str(getattr(context, "task_id", "") or ""),
+                    session_token_ref=runtime_context_session_token_ref(context),
+                )
+            ),
             contract_execution_id=rejoin_contract_execution_id,
             session_token_rejoin_eligibility=(
                 session_token_rejoin_eligibility
@@ -46420,6 +47229,22 @@ def _runtime_context_session_rejoin_guidance_eligibility(
             ).strip(),
             session_token_ref=runtime_context_session_token_ref(context),
             read_receipt_event_ref=effective_read_receipt_ref,
+            read_receipt_authority=(
+                _runtime_context_post_read_startup_receipt_authority(
+                    conn,
+                    project_id=project_id,
+                    context=context,
+                    route_identity=route_identity,
+                )
+            ),
+            read_receipt_authority_required=(
+                _runtime_context_post_read_startup_receipt_authority_required(
+                    timeline_events,
+                    runtime_context_id=runtime_context_id,
+                    task_id=task_id,
+                    session_token_ref=runtime_context_session_token_ref(context),
+                )
+            ),
             contract_execution_id=sequence_execution_id,
         )
         reissue_submission = recovery_payloads.get(
