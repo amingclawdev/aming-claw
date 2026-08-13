@@ -153588,3 +153588,727 @@ def test_current_full_proof_leaf_import_order_has_no_cycle(imports):
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_mf_parallel_postworker_authority_is_exact_lane_and_ignores_nested_sibling(
+    conn,
+    monkeypatch,
+):
+    parent_task_id = "cex-postworker-exact-lane"
+    focus = SimpleNamespace(
+        runtime_context_id="mfrctx-postworker-focus",
+        task_id="postworker-focus",
+        parent_task_id=parent_task_id,
+        worker_id="postworker-focus-worker",
+        worker_slot_id="postworker-focus-worker",
+    )
+    reminder = SimpleNamespace(
+        runtime_context_id="mfrctx-postworker-reminder",
+        task_id="postworker-reminder",
+        parent_task_id=parent_task_id,
+        worker_id="postworker-reminder-worker",
+        worker_slot_id="postworker-reminder-worker",
+    )
+    focus_failed_session = "ses-postworker-focus-failed"
+    reminder_failed_session = "ses-postworker-reminder-failed"
+    focus_commit = "1" * 40
+    reminder_commit = "2" * 40
+
+    def line_identity(context):
+        return {
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+            "line_instance_id": (
+                f"runtime_context:{context.runtime_context_id}"
+            ),
+        }
+
+    def failed_qa_line(context, source_ref, qa_session_id, sibling):
+        identity = line_identity(context)
+        return {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "actor_role": "qa",
+            "evidence_kind": "independent_verification",
+            "status": "failed",
+            "source_ref": source_ref,
+            **identity,
+            "payload": {
+                **identity,
+                "source_ref": source_ref,
+                # Historical payloads may retain the sibling's old guide.
+                # It is audit context, not canonical line ownership.
+                "event_payload": {
+                    "runtime_guide": {
+                        "runtime_context_id": sibling.runtime_context_id,
+                        "task_id": sibling.task_id,
+                        "parent_task_id": sibling.parent_task_id,
+                        "line_instance_id": (
+                            f"runtime_context:{sibling.runtime_context_id}"
+                        ),
+                    }
+                },
+            },
+            "qa_evidence_provenance": {
+                "authenticated_qa_binding": {
+                    "qa_session_id": qa_session_id,
+                }
+            },
+        }
+
+    def worker_commit_line(context, commit_sha):
+        identity = line_identity(context)
+        worker_identity = {
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id,
+            "worker_role": "mf_sub",
+            "lane_id": context.worker_slot_id,
+        }
+        return {
+            "stage_id": "worker_commit",
+            "line_id": "worker_commit",
+            "actor_role": "mf_sub",
+            "evidence_kind": "worker_commit",
+            "commit_sha": commit_sha,
+            **identity,
+            **worker_identity,
+            "payload": {
+                **identity,
+                **worker_identity,
+                "worker_commit_sha": commit_sha,
+            },
+        }
+
+    def observer_merge_line(context, commit_sha):
+        identity = line_identity(context)
+        worker_identity = {
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id,
+            "worker_role": "mf_sub",
+            "lane_id": context.worker_slot_id,
+        }
+        return {
+            "stage_id": "observer_lane_merge",
+            "line_id": "observer_merge",
+            "actor_role": "observer",
+            "evidence_kind": "merge",
+            "commit_sha": commit_sha,
+            **identity,
+            **worker_identity,
+            "payload": {**identity, **worker_identity},
+        }
+
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "completed_lines": [
+            failed_qa_line(
+                focus,
+                "timeline:28",
+                focus_failed_session,
+                reminder,
+            ),
+            worker_commit_line(focus, focus_commit),
+            observer_merge_line(focus, "3" * 40),
+            failed_qa_line(
+                reminder,
+                "timeline:44",
+                reminder_failed_session,
+                focus,
+            ),
+            worker_commit_line(reminder, reminder_commit),
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_line_match",
+        lambda _record, context: {
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_verified_dispatch_lineage",
+        lambda *_args, **_kwargs: {
+            "dispatch_lineage_verified": True,
+            "source": "test_exact_dispatch",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_full_commit_value",
+        lambda _project_id, value: str(value or "").strip().lower(),
+    )
+
+    focus_prior = {
+        "source_ref": "timeline:28",
+        "qa_session_id": focus_failed_session,
+    }
+    reminder_prior = {
+        "source_ref": "timeline:44",
+        "qa_session_id": reminder_failed_session,
+    }
+    assert server._contract_runtime_context_failed_qa_candidate_commit(
+        conn,
+        project_id=PID,
+        record=record,
+        context=focus,
+        prior_failed_qa_verdict=focus_prior,
+    ) == focus_commit
+    assert server._contract_runtime_context_failed_qa_candidate_commit(
+        conn,
+        project_id=PID,
+        record=record,
+        context=reminder,
+        prior_failed_qa_verdict=reminder_prior,
+    ) == reminder_commit
+
+    focus_verdict = {
+        "expected_candidate_commit": focus_commit,
+        "prior_no_pass_source_ref": "timeline:28",
+        "prior_no_pass_qa_session_id": focus_failed_session,
+        "prior_no_pass_created_at": "2026-08-12T18:00:00Z",
+    }
+    reminder_verdict = {
+        "expected_candidate_commit": reminder_commit,
+        "prior_no_pass_source_ref": "timeline:44",
+        "prior_no_pass_qa_session_id": reminder_failed_session,
+        "prior_no_pass_created_at": "2026-08-12T19:00:00Z",
+    }
+    assert server._contract_runtime_authoritative_qa_superseded_line_indices(
+        conn,
+        record,
+        project_id=PID,
+        backlog_id="AC-POSTWORKER-EXACT-LANE",
+        context=focus,
+        authoritative_qa_verdict=focus_verdict,
+    ) == [0, 2]
+    assert server._contract_runtime_authoritative_qa_superseded_line_indices(
+        conn,
+        record,
+        project_id=PID,
+        backlog_id="AC-POSTWORKER-EXACT-LANE",
+        context=reminder,
+        authoritative_qa_verdict=reminder_verdict,
+    ) == [3]
+
+    duplicate = copy.deepcopy(record)
+    duplicate["completed_lines"].append(
+        worker_commit_line(focus, focus_commit)
+    )
+    assert server._contract_runtime_context_failed_qa_candidate_commit(
+        conn,
+        project_id=PID,
+        record=duplicate,
+        context=focus,
+        prior_failed_qa_verdict=focus_prior,
+    ) == ""
+    wrong_top_level = copy.deepcopy(record)
+    wrong_top_level["completed_lines"][0]["task_id"] = reminder.task_id
+    assert server._contract_runtime_context_failed_qa_candidate_commit(
+        conn,
+        project_id=PID,
+        record=wrong_top_level,
+        context=focus,
+        prior_failed_qa_verdict=focus_prior,
+    ) == ""
+    for field, wrong_value in (
+        ("runtime_context_id", reminder.runtime_context_id),
+        ("parent_task_id", "cex-sibling"),
+        ("line_instance_id", f"runtime_context:{reminder.runtime_context_id}"),
+    ):
+        mismatched = copy.deepcopy(record)
+        mismatched["completed_lines"][0][field] = wrong_value
+        assert server._contract_runtime_context_failed_qa_candidate_commit(
+            conn,
+            project_id=PID,
+            record=mismatched,
+            context=focus,
+            prior_failed_qa_verdict=focus_prior,
+        ) == ""
+    for field, wrong_value in (
+        ("worker_id", reminder.worker_id),
+        ("worker_slot_id", reminder.worker_slot_id),
+        ("worker_role", "observer"),
+        ("lane_id", reminder.worker_slot_id),
+    ):
+        mismatched = copy.deepcopy(record)
+        mismatched["completed_lines"][1][field] = wrong_value
+        assert server._contract_runtime_context_failed_qa_candidate_commit(
+            conn,
+            project_id=PID,
+            record=mismatched,
+            context=focus,
+            prior_failed_qa_verdict=focus_prior,
+        ) == ""
+    for field in ("worker_id", "worker_slot_id", "worker_role", "lane_id"):
+        missing = copy.deepcopy(record)
+        missing["completed_lines"][1].pop(field)
+        assert server._contract_runtime_context_failed_qa_candidate_commit(
+            conn,
+            project_id=PID,
+            record=missing,
+            context=focus,
+            prior_failed_qa_verdict=focus_prior,
+        ) == ""
+
+
+def test_mf_parallel_postworker_projection_orders_lane_merges_after_workers():
+    parent_task_id = "cex-postworker-order"
+
+    def lane_line(context_id, task_id, stage_id, line_id):
+        return {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "line_instance_id": f"runtime_context:{context_id}",
+            "runtime_context_id": context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+        }
+
+    completed = [
+        {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+        },
+        lane_line(
+            "mfrctx-postworker-focus",
+            "postworker-focus",
+            "worker_finish",
+            "worker_finish_gate",
+        ),
+        lane_line(
+            "mfrctx-postworker-reminder",
+            "postworker-reminder",
+            "worker_finish",
+            "worker_finish_gate",
+        ),
+    ]
+    projected = [
+        lane_line(
+            "mfrctx-postworker-focus",
+            "postworker-focus",
+            "observer_lane_merge",
+            "observer_merge",
+        ),
+        lane_line(
+            "mfrctx-postworker-reminder",
+            "postworker-reminder",
+            "observer_lane_merge",
+            "observer_merge",
+        ),
+        lane_line(
+            "mfrctx-postworker-reminder",
+            "postworker-reminder",
+            "observer_reconcile",
+            "observer_reconcile",
+        ),
+    ]
+
+    merged = server._contract_runtime_merge_projected_completed_lines(
+        completed,
+        projected,
+    )
+    assert [line["line_id"] for line in merged] == [
+        "observer_dispatch_bounded_workers",
+        "worker_finish_gate",
+        "observer_merge",
+        "worker_finish_gate",
+        "observer_merge",
+        "observer_reconcile",
+    ]
+    assert merged[2]["task_id"] == "postworker-focus"
+    assert merged[4]["task_id"] == "postworker-reminder"
+
+
+def test_exact_candidate_postmerge_provenance_uses_direct_lane_merge_binding(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    task_id = "postworker-provenance-focus"
+    backlog_id = "AC-POSTWORKER-PROVENANCE"
+    parent_task_id = "cex-postworker-provenance"
+    runtime_context_id = "mfrctx-postworker-provenance"
+    root_task_id = "onboard-postworker-provenance"
+    candidate_commit = "4" * 40
+    merged_commit = "5" * 40
+    trace_id = "gqt-postworker-provenance"
+    qa_event_ref = "timeline:38"
+    context = SimpleNamespace(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        root_task_id=root_task_id,
+        runtime_context_id=runtime_context_id,
+    )
+    qa_event = {
+        "id": 38,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_kind": "independent_verification",
+        "event_type": "qa.candidate.independent_verification",
+        "phase": "verification",
+        "actor": "qa:postworker",
+        "actor_role": "qa",
+        "status": "passed",
+        "commit_sha": candidate_commit,
+        "created_at": "2026-08-12T18:00:00Z",
+        "payload": {
+            "runtime_context_id": runtime_context_id,
+            "candidate_commit_sha": candidate_commit,
+            "graph_trace_ids": [trace_id],
+        },
+    }
+    merge_payload = {
+        "backlog_id": backlog_id,
+        "child_task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "merge_commit": merged_commit,
+        "target_head_after_merge": merged_commit,
+        "qa_evidence": {
+            "gate_evidence": [
+                {
+                    "key": "test_evidence",
+                    "passed": True,
+                    "evidence_id": qa_event_ref,
+                }
+            ]
+        },
+        "recorded_merge": {
+            "context": {
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "stage_task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "root_task_id": root_task_id,
+                "runtime_context_id": runtime_context_id,
+                "head_commit": candidate_commit,
+                "target_head_commit": merged_commit,
+            },
+            "queue_item": {
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "branch_head": candidate_commit,
+                "merge_commit": merged_commit,
+                "target_head_after_merge": merged_commit,
+            },
+        },
+    }
+    merge_event = {
+        "id": 43,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_kind": "live_merge",
+        "event_type": "parallel.live_merge",
+        "phase": "live_merge",
+        "actor": "observer",
+        "actor_role": "observer",
+        "status": "passed",
+        "commit_sha": merged_commit,
+        "created_at": "2026-08-12T18:01:00Z",
+        "payload": merge_payload,
+    }
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_branch_context",
+        lambda *_args, **_kwargs: context,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "list_events",
+        lambda *_args, **_kwargs: [qa_event, merge_event],
+    )
+    monkeypatch.setattr(
+        server,
+        "_qa_post_merge_resolve_commit",
+        lambda _root, value: str(value or "").strip().lower(),
+    )
+    monkeypatch.setattr(
+        server,
+        "_qa_git_bytes",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        ),
+    )
+    row = {
+        "trace_id": trace_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+
+    authority, mismatches = (
+        server._qa_exact_candidate_post_merge_provenance(
+            conn,
+            project_id=PID,
+            row=row,
+            canonical_project_root=tmp_path,
+            candidate_commit_sha=candidate_commit,
+            canonical_head_commit=merged_commit,
+        )
+    )
+    assert mismatches == []
+    assert authority["qa_event_ref"] == qa_event_ref
+    assert authority["merge_event_ref"] == "timeline:43"
+    assert authority["candidate_commit_sha"] == candidate_commit
+    assert authority["merged_commit_sha"] == merged_commit
+
+    nested_sibling = copy.deepcopy(merge_event)
+    nested_sibling["payload"]["diagnostics"] = {
+        "runtime_guide": {
+            "runtime_context_id": "mfrctx-sibling",
+            "task_id": "sibling-task",
+        }
+    }
+    monkeypatch.setattr(
+        task_timeline,
+        "list_events",
+        lambda *_args, **_kwargs: [qa_event, nested_sibling],
+    )
+    nested_authority, nested_mismatches = (
+        server._qa_exact_candidate_post_merge_provenance(
+            conn,
+            project_id=PID,
+            row=row,
+            canonical_project_root=tmp_path,
+            candidate_commit_sha=candidate_commit,
+            canonical_head_commit=merged_commit,
+        )
+    )
+    assert nested_mismatches == []
+    assert nested_authority["merge_event_ref"] == "timeline:43"
+
+    wrong_direct = copy.deepcopy(merge_event)
+    wrong_direct["payload"]["runtime_context_id"] = "mfrctx-sibling"
+    monkeypatch.setattr(
+        task_timeline,
+        "list_events",
+        lambda *_args, **_kwargs: [qa_event, wrong_direct],
+    )
+    wrong_authority, wrong_mismatches = (
+        server._qa_exact_candidate_post_merge_provenance(
+            conn,
+            project_id=PID,
+            row=row,
+            canonical_project_root=tmp_path,
+            candidate_commit_sha=candidate_commit,
+            canonical_head_commit=merged_commit,
+        )
+    )
+    assert wrong_authority == {}
+    assert {item["field"] for item in wrong_mismatches} == {
+        "canonical_head_commit"
+    }
+
+
+def test_authenticated_premerge_qa_receipt_remains_materialize_only(
+    conn,
+    monkeypatch,
+):
+    task_id = "premerge-receipt-worker"
+    backlog_id = "AC-PREMERGE-RECEIPT"
+    runtime_context_id = "mfrctx-premerge-receipt"
+    commit_sha = "6" * 40
+    principal = "qa:premerge-receipt"
+    session_id = "ses-premerge-receipt"
+    context = SimpleNamespace(task_id=task_id, backlog_id=backlog_id)
+    qa_proof = {
+        "verified": True,
+        "source": "authenticated_qa_session",
+        "role": "qa",
+        "qa_session_id": session_id,
+        "qa_scope_binding_ref": "qa_scope:sha256:" + "7" * 64,
+        "project_id": PID,
+        "task_id": task_id,
+        "backlog_id": backlog_id,
+        "event_kind": "independent_verification",
+        "evidence_status": "passed",
+        "principal_id": principal,
+        "commit_sha": commit_sha,
+        "observer_impersonation": False,
+    }
+    premerge_authority = {
+        "schema_version": (
+            "contract_runtime.premerge_candidate_qa_receipt_authority.v1"
+        ),
+        "server_derived": True,
+        "qa_verdict_passing": True,
+        "materialize_receipt_only": True,
+        "materialize_satisfying": True,
+        "close_satisfying": False,
+        "observer_merge_written": False,
+        "global_observer_merge_ready": False,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "runtime_context_id": runtime_context_id,
+        "candidate_commit_sha": commit_sha,
+        "qa_session_id": session_id,
+    }
+    premerge_authority["authority_hash"] = server.stable_sha256(
+        premerge_authority
+    )
+    event = {
+        "id": 90,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_kind": "independent_verification",
+        "event_type": "qa.candidate.independent_verification",
+        "actor": principal,
+        "status": "passed",
+        "commit_sha": commit_sha,
+        "created_at": "2026-08-13T01:00:00Z",
+        "payload": {
+            "runtime_context_id": runtime_context_id,
+            "observer_impersonation": False,
+            "contract_gate_decision": {
+                "ok": True,
+                "primary_decision_source": True,
+                "source_of_authority": "qa_session_verification",
+                "required_role": "qa",
+                "missing_proof_fields": [],
+                "execution_state_revision": 0,
+            },
+            "source_backed_contract_gate_authority": {
+                "source": "server_qa_session_verification",
+                "source_of_authority": "qa_session_verification",
+                "authority_hash": "sha256:" + "9" * 64,
+                "qa_session_proof": qa_proof,
+            },
+            "premerge_candidate_qa_receipt_authority": premerge_authority,
+        },
+        "verification": {},
+    }
+    monkeypatch.setattr(
+        task_timeline,
+        "_source_backed_qa_session_authority_valid",
+        lambda *_args, **_kwargs: True,
+    )
+
+    verdict = server._runtime_context_latest_authenticated_qa_timeline_verdict(
+        conn=conn,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        timeline_events=[event],
+    )
+    assert verdict["premerge_candidate_receipt_only"] is True
+    assert verdict["premerge_candidate_receipt_authority_hash"] == (
+        premerge_authority["authority_hash"]
+    )
+
+    forged = copy.deepcopy(event)
+    forged["payload"]["premerge_candidate_qa_receipt_authority"][
+        "close_satisfying"
+    ] = True
+    forged_verdict = (
+        server._runtime_context_latest_authenticated_qa_timeline_verdict(
+            conn=conn,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=[forged],
+        )
+    )
+    assert forged_verdict["premerge_candidate_receipt_only"] is False
+
+
+def test_premerge_qa_projects_lane_merge_without_final_qa_or_close(
+    conn,
+    monkeypatch,
+):
+    task_id = "premerge-projection-worker"
+    backlog_id = "AC-PREMERGE-PROJECTION"
+    parent_task_id = "cex-premerge-projection"
+    runtime_context_id = "mfrctx-premerge-projection"
+    context = SimpleNamespace(
+        backlog_id=backlog_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        runtime_context_id=runtime_context_id,
+        worker_id="premerge-projection-worker",
+        worker_slot_id="premerge-projection-worker",
+        worktree_path="/tmp/premerge-projection-worker",
+    )
+    qa_event = {
+        "id": 100,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_kind": "independent_verification",
+        "phase": "verification",
+        "actor": "qa:premerge-projection",
+        "actor_role": "qa",
+        "status": "passed",
+        "created_at": "2026-08-13T01:00:00Z",
+        "payload": {
+            "runtime_context_id": runtime_context_id,
+            "parent_task_id": parent_task_id,
+            "graph_trace_ids": ["gqt-premerge-projection"],
+        },
+    }
+    merge_event = {
+        "id": 101,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_kind": "live_merge",
+        "phase": "live_merge",
+        "actor": "observer",
+        "actor_role": "observer",
+        "status": "passed",
+        "commit_sha": "a" * 40,
+        "created_at": "2026-08-13T01:01:00Z",
+        "payload": {
+            "child_task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "runtime_context_id": runtime_context_id,
+            "merge_commit": "a" * 40,
+            "target_head_after_merge": "a" * 40,
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_line_evidence_policy",
+        lambda _record, _policy, *, line_id: (
+            {"required": True} if line_id == "qa_graph_context" else {}
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        lambda *_args, **_kwargs: {
+            "db_verified": True,
+            "verified_trace_ids": ["gqt-premerge-projection"],
+        },
+    )
+
+    lines = server._contract_runtime_projection_post_worker_lines(
+        conn=conn,
+        project_id=PID,
+        record={
+            "contract_id": "mf_parallel.v2",
+            "contract_execution_id": parent_task_id,
+            "backlog_id": backlog_id,
+            "completed_lines": [],
+        },
+        context=context,
+        timeline_events=[qa_event, merge_event],
+        authoritative_qa_verdict={
+            "event_id": 100,
+            "effective_status": "passed",
+            "candidate_scope_verified": True,
+            "fresh_session_pass_verified": True,
+            "premerge_candidate_receipt_only": True,
+            "expected_candidate_commit": "b" * 40,
+        },
+    )
+    assert [line["line_id"] for line in lines] == ["observer_merge"]
+    assert lines[0]["stage_id"] == "observer_integration"
+    assert lines[0]["lane_id"] == "premerge-projection-worker"

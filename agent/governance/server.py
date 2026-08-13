@@ -12588,11 +12588,6 @@ def _qa_exact_candidate_post_merge_provenance(
         )
         return {}, mismatches
 
-    parent_task_ids = {
-        str(getattr(runtime_context, "parent_task_id", "") or "").strip(),
-        str(getattr(runtime_context, "root_task_id", "") or "").strip(),
-    }
-    allowed_task_ids = {task_id, *(item for item in parent_task_ids if item)}
     try:
         from . import task_timeline
 
@@ -12642,23 +12637,36 @@ def _qa_exact_candidate_post_merge_provenance(
             _runtime_context_service_graph_trace_values_from_event(event)
         ):
             continue
+        qa_payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        qa_artifact_refs = (
+            event.get("artifact_refs")
+            if isinstance(event.get("artifact_refs"), Mapping)
+            else {}
+        )
         qa_commit_claims = {
-            str(event.get("commit_sha") or "").strip().lower(),
-            *_qa_post_merge_deep_text_values(
-                event,
-                {
-                    "candidate_commit_sha",
-                    "verified_commit",
-                },
-            ),
+            str(value or "").strip().lower()
+            for value in (
+                event.get("commit_sha"),
+                qa_payload.get("candidate_commit_sha"),
+                qa_payload.get("exact_candidate_commit"),
+                qa_artifact_refs.get("candidate_commit_sha"),
+            )
+            if str(value or "").strip()
         }
-        qa_commit_claims = {
-            item.strip().lower() for item in qa_commit_claims if item.strip()
-        }
-        if not qa_commit_claims or not any(
+        resolved_qa_commits = {
             _qa_post_merge_resolve_commit(canonical_project_root, item)
-            == candidate_commit
             for item in qa_commit_claims
+        }
+        if (
+            not qa_commit_claims
+            or "" in resolved_qa_commits
+            or resolved_qa_commits != {candidate_commit}
+            or str(qa_payload.get("runtime_context_id") or "").strip()
+            != runtime_context_id
         ):
             continue
         event_id = _contract_runtime_projection_timeline_event_id(event)
@@ -12679,6 +12687,257 @@ def _qa_exact_candidate_post_merge_provenance(
         )
 
     verified_provenance: dict[str, Any] = {}
+
+    def exact_lane_merge_authority(
+        event: Mapping[str, Any],
+        qa_event: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Bind a durable live merge to one QA event and branch lane.
+
+        Merge rows retain nested route and contract diagnostics whose parent
+        identities may legitimately describe the observer root.  Conversely,
+        old rows may also retain stale guide copies.  Neither is lane
+        authority.  Use only the canonical event tuple plus the direct
+        recorded-merge context, queue item, and QA gate evidence.
+        """
+
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        recorded_merge = (
+            payload.get("recorded_merge")
+            if isinstance(payload.get("recorded_merge"), Mapping)
+            else {}
+        )
+        merge_context = (
+            recorded_merge.get("context")
+            if isinstance(recorded_merge.get("context"), Mapping)
+            else {}
+        )
+        queue_item = (
+            recorded_merge.get("queue_item")
+            if isinstance(recorded_merge.get("queue_item"), Mapping)
+            else {}
+        )
+        if bool(merge_context) != bool(queue_item):
+            return {}
+        legacy_direct_merge = not merge_context and not queue_item
+
+        expected_parent_task_id = str(
+            getattr(runtime_context, "parent_task_id", "") or ""
+        ).strip()
+        expected_root_task_id = str(
+            getattr(runtime_context, "root_task_id", "") or ""
+        ).strip()
+        if legacy_direct_merge:
+            if {
+                "event_task_id": str(event.get("task_id") or "").strip(),
+                "event_backlog_id": str(
+                    event.get("backlog_id") or ""
+                ).strip(),
+                "child_task_id": str(
+                    payload.get("child_task_id") or ""
+                ).strip(),
+                "payload_parent_task_id": str(
+                    payload.get("parent_task_id") or ""
+                ).strip(),
+                "payload_runtime_context_id": str(
+                    payload.get("runtime_context_id") or ""
+                ).strip(),
+            } != {
+                "event_task_id": expected_parent_task_id,
+                "event_backlog_id": backlog_id,
+                "child_task_id": task_id,
+                "payload_parent_task_id": expected_parent_task_id,
+                "payload_runtime_context_id": runtime_context_id,
+            }:
+                return {}
+        else:
+            direct_identity = {
+                "event_task_id": str(event.get("task_id") or "").strip(),
+                "event_backlog_id": str(
+                    event.get("backlog_id") or ""
+                ).strip(),
+                "child_task_id": str(
+                    payload.get("child_task_id") or ""
+                ).strip(),
+                "payload_parent_task_id": str(
+                    payload.get("parent_task_id") or ""
+                ).strip(),
+                "payload_runtime_context_id": str(
+                    payload.get("runtime_context_id") or ""
+                ).strip(),
+                "context_task_id": str(
+                    merge_context.get("task_id") or ""
+                ).strip(),
+                "context_stage_task_id": str(
+                    merge_context.get("stage_task_id") or ""
+                ).strip(),
+                "context_parent_task_id": str(
+                    merge_context.get("parent_task_id") or ""
+                ).strip(),
+                "context_runtime_context_id": str(
+                    merge_context.get("runtime_context_id") or ""
+                ).strip(),
+                "context_backlog_id": str(
+                    merge_context.get("backlog_id") or ""
+                ).strip(),
+                "queue_task_id": str(
+                    queue_item.get("task_id") or ""
+                ).strip(),
+                "queue_backlog_id": str(
+                    queue_item.get("backlog_id") or ""
+                ).strip(),
+            }
+            if direct_identity != {
+                "event_task_id": task_id,
+                "event_backlog_id": backlog_id,
+                "child_task_id": task_id,
+                "payload_parent_task_id": expected_parent_task_id,
+                "payload_runtime_context_id": runtime_context_id,
+                "context_task_id": task_id,
+                "context_stage_task_id": task_id,
+                "context_parent_task_id": expected_parent_task_id,
+                "context_runtime_context_id": runtime_context_id,
+                "context_backlog_id": backlog_id,
+                "queue_task_id": task_id,
+                "queue_backlog_id": backlog_id,
+            }:
+                return {}
+            supplied_root_task_id = str(
+                merge_context.get("root_task_id") or ""
+            ).strip()
+            if (
+                expected_root_task_id
+                and supplied_root_task_id != expected_root_task_id
+            ):
+                return {}
+
+        qa_ref = str(qa_event.get("event_ref") or "").strip()
+        qa_refs: set[str] = set()
+
+        def collect_direct_qa_refs(qa_evidence: Any) -> None:
+            if not isinstance(qa_evidence, Mapping):
+                return
+            gate_evidence = qa_evidence.get("gate_evidence")
+            if isinstance(gate_evidence, list):
+                for gate in gate_evidence:
+                    if not isinstance(gate, Mapping):
+                        continue
+                    if gate.get("passed") is not True:
+                        continue
+                    value = str(gate.get("evidence_id") or "").strip()
+                    if value:
+                        qa_refs.add(value)
+            request_evidence = (
+                qa_evidence.get("request_evidence")
+                if isinstance(qa_evidence.get("request_evidence"), Mapping)
+                else {}
+            )
+            request_qa = (
+                request_evidence.get("qa_evidence")
+                if isinstance(request_evidence.get("qa_evidence"), Mapping)
+                else {}
+            )
+            value = str(request_qa.get("event_ref") or "").strip()
+            if value:
+                qa_refs.add(value)
+
+        collect_direct_qa_refs(payload.get("qa_evidence"))
+        contract_evidence = payload.get("contract_evidence")
+        if isinstance(contract_evidence, list):
+            for item in contract_evidence:
+                if isinstance(item, Mapping):
+                    collect_direct_qa_refs(item.get("qa_evidence"))
+        if legacy_direct_merge:
+            legacy_qa_ref = str(payload.get("qa_event_ref") or "").strip()
+            if legacy_qa_ref:
+                qa_refs.add(legacy_qa_ref)
+        if not qa_ref or qa_refs != {qa_ref}:
+            return {}
+
+        candidate_claims = (
+            {
+                str(payload.get("candidate_commit_sha") or "")
+                .strip()
+                .lower(),
+                str(payload.get("branch_head") or "").strip().lower(),
+            }
+            if legacy_direct_merge
+            else {
+                str(merge_context.get("head_commit") or "")
+                .strip()
+                .lower(),
+                str(queue_item.get("branch_head") or "").strip().lower(),
+            }
+        )
+        direct_qa_evidence = [payload.get("qa_evidence")]
+        if isinstance(contract_evidence, list):
+            direct_qa_evidence.extend(
+                item.get("qa_evidence")
+                for item in contract_evidence
+                if isinstance(item, Mapping)
+            )
+        for qa_evidence in direct_qa_evidence:
+            if not isinstance(qa_evidence, Mapping):
+                continue
+            request_evidence = (
+                qa_evidence.get("request_evidence")
+                if isinstance(qa_evidence.get("request_evidence"), Mapping)
+                else {}
+            )
+            request_qa = (
+                request_evidence.get("qa_evidence")
+                if isinstance(request_evidence.get("qa_evidence"), Mapping)
+                else {}
+            )
+            value = str(request_qa.get("commit_sha") or "").strip().lower()
+            if value:
+                candidate_claims.add(value)
+        if "" in candidate_claims:
+            return {}
+        candidate_commits = {
+            _qa_post_merge_resolve_commit(canonical_project_root, value)
+            for value in candidate_claims
+        }
+        if candidate_commits != {candidate_commit}:
+            return {}
+
+        merge_claims = {
+            str(event.get("commit_sha") or "").strip().lower(),
+            str(payload.get("merge_commit") or "").strip().lower(),
+            str(payload.get("target_head_after_merge") or "").strip().lower(),
+        }
+        if not legacy_direct_merge:
+            merge_claims.update(
+                {
+                    str(merge_context.get("target_head_commit") or "")
+                    .strip()
+                    .lower(),
+                    str(queue_item.get("merge_commit") or "")
+                    .strip()
+                    .lower(),
+                    str(queue_item.get("target_head_after_merge") or "")
+                    .strip()
+                    .lower(),
+                }
+            )
+        if "" in merge_claims:
+            return {}
+        merge_commits = {
+            _qa_post_merge_resolve_commit(canonical_project_root, value)
+            for value in merge_claims
+        }
+        if "" in merge_commits or len(merge_commits) != 1:
+            return {}
+        return {
+            "candidate_commit": candidate_commit,
+            "merged_commit": next(iter(merge_commits)),
+            "qa_event_ref": qa_ref,
+        }
+
     for qa_event in sorted(
         qa_events,
         key=lambda item: (float(item["event_time"]), int(item["event_id"])),
@@ -12723,77 +12982,12 @@ def _qa_exact_candidate_post_merge_provenance(
                 or float(event_time) <= float(qa_event["event_time"])
             ):
                 continue
-            backlog_values = {
-                str(event.get("backlog_id") or "").strip(),
-                *_qa_post_merge_deep_text_values(event, {"backlog_id"}),
-            }
-            backlog_values = {item for item in backlog_values if item}
-            if backlog_values != {backlog_id}:
+            merge_authority = exact_lane_merge_authority(event, qa_event)
+            if not merge_authority:
                 continue
-            task_values = {
-                str(event.get("task_id") or "").strip(),
-                *_qa_post_merge_deep_text_values(
-                    event,
-                    {
-                        "task_id",
-                        "worker_task_id",
-                        "child_task_id",
-                        "stage_task_id",
-                    },
-                ),
-            }
-            task_values = {item for item in task_values if item}
-            if task_id not in task_values or not task_values.issubset(
-                allowed_task_ids
-            ):
-                continue
-            runtime_context_values = _qa_post_merge_deep_text_values(
-                event,
-                {"runtime_context_id"},
-            )
-            if runtime_context_values != {runtime_context_id}:
-                continue
-            qa_event_refs = _qa_post_merge_deep_text_values(
-                event,
-                {"qa_event_ref"},
-            )
-            if qa_event["event_ref"] not in qa_event_refs:
-                continue
-            candidate_claims = _qa_post_merge_deep_text_values(
-                event,
-                {
-                    "candidate_commit_sha",
-                    "branch_head",
-                },
-            )
-            candidate_commits = {
-                _qa_post_merge_resolve_commit(canonical_project_root, item)
-                for item in candidate_claims
-            }
-            if (
-                not candidate_claims
-                or "" in candidate_commits
-                or candidate_commits != {candidate_commit}
-            ):
-                continue
-            merge_claims = {
-                str(event.get("commit_sha") or "").strip().lower(),
-                *_qa_post_merge_deep_text_values(
-                    event,
-                    {
-                        "merge_commit",
-                        "target_head_after_merge",
-                    },
-                ),
-            }
-            merge_claims = {item for item in merge_claims if item}
-            merge_commits = {
-                _qa_post_merge_resolve_commit(canonical_project_root, item)
-                for item in merge_claims
-            }
-            if not merge_claims or "" in merge_commits or len(merge_commits) != 1:
-                continue
-            scoped_merge_commit = next(iter(merge_commits))
+            scoped_merge_commit = str(
+                merge_authority.get("merged_commit") or ""
+            ).strip()
             if scoped_merge_commit == candidate_commit:
                 continue
             candidate_to_scoped_merge = _qa_git_bytes(
@@ -13187,7 +13381,7 @@ def _qa_reverify_candidate_trace_context(
                 )
             )
             mismatches.extend(post_merge_mismatches)
-            if post_merge_provenance and not post_merge_mismatches:
+            if post_merge_provenance and not mismatches:
                 review_context["post_merge_provenance"] = {
                     key: value
                     for key, value in post_merge_provenance.items()
@@ -13218,7 +13412,38 @@ def _qa_reverify_candidate_trace_context(
         or canonical_head_commit
         not in {expected_base_commit, review_context["candidate_commit_sha"]}
     )
-    if not historical_audit_only and active_snapshot_id != expected_snapshot_id:
+    post_merge_provenance: dict[str, Any] = {}
+    post_merge_mismatches: list[dict[str, Any]] = []
+    post_merge_candidate = bool(
+        not historical_audit_only
+        and canonical_head_commit
+        and canonical_head_commit
+        not in {expected_base_commit, review_context["candidate_commit_sha"]}
+    )
+    if post_merge_candidate:
+        post_merge_provenance, post_merge_mismatches = (
+            _qa_exact_candidate_post_merge_provenance(
+                conn,
+                project_id=project_id,
+                row=row,
+                canonical_project_root=Path(canonical_root),
+                candidate_commit_sha=review_context[
+                    "candidate_commit_sha"
+                ],
+                canonical_head_commit=canonical_head_commit,
+            )
+        )
+        if not post_merge_provenance or post_merge_mismatches:
+            mismatches.extend(post_merge_mismatches)
+    post_merge_verified = bool(
+        post_merge_provenance
+        and not post_merge_mismatches
+    )
+    if (
+        not historical_audit_only
+        and not post_merge_verified
+        and active_snapshot_id != expected_snapshot_id
+    ):
         mismatches.append(
             {
                 "trace_id": trace_id,
@@ -13227,7 +13452,11 @@ def _qa_reverify_candidate_trace_context(
                 "actual": active_snapshot_id,
             }
         )
-    if not historical_audit_only and active_commit_sha != expected_base_commit:
+    if (
+        not historical_audit_only
+        and not post_merge_verified
+        and active_commit_sha != expected_base_commit
+    ):
         mismatches.append(
             {
                 "trace_id": trace_id,
@@ -13240,14 +13469,16 @@ def _qa_reverify_candidate_trace_context(
         recomputed = _qa_candidate_diff_context(
             (
                 Path(canonical_root)
-                if historical_audit_only
+                if historical_audit_only or post_merge_verified
                 else Path(query_root_raw)
             ),
             project_id=project_id,
             canonical_project_root=canonical_root,
             base_commit_sha=expected_base_commit,
             candidate_commit_sha=review_context["candidate_commit_sha"],
-            allow_historical_audit_descendant=historical_audit_only,
+            allow_historical_audit_descendant=(
+                historical_audit_only or post_merge_verified
+            ),
         )
     except _QACandidateOverlayError as exc:
         mismatches.append(
@@ -13267,7 +13498,7 @@ def _qa_reverify_candidate_trace_context(
         "candidate_overlay_hash",
         "repository_identity_hash",
     ]
-    if not historical_audit_only:
+    if not historical_audit_only and not post_merge_verified:
         immutable_reverification_fields.extend(
             [
                 "graph_basis_decision_hash",
@@ -13322,6 +13553,12 @@ def _qa_reverify_candidate_trace_context(
             "current_canonical_head_commit_sha": current_head_commit,
             "candidate_is_ancestor_of_current_head": True,
             "historical_close_authority_granted": False,
+        }
+    if post_merge_verified and not mismatches:
+        review_context["post_merge_provenance"] = {
+            key: value
+            for key, value in post_merge_provenance.items()
+            if key != "trace_id"
         }
     return review_context, mismatches
 
@@ -41038,6 +41275,47 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
         )
         if not authenticated or status not in blocking_statuses | passing_statuses:
             continue
+        premerge_receipt = (
+            payload.get("premerge_candidate_qa_receipt_authority")
+            if isinstance(
+                payload.get("premerge_candidate_qa_receipt_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        premerge_receipt_only = bool(
+            str(premerge_receipt.get("schema_version") or "").strip()
+            == "contract_runtime.premerge_candidate_qa_receipt_authority.v1"
+            and premerge_receipt.get("server_derived") is True
+            and premerge_receipt.get("qa_verdict_passing") is True
+            and premerge_receipt.get("materialize_receipt_only") is True
+            and premerge_receipt.get("materialize_satisfying") is True
+            and premerge_receipt.get("close_satisfying") is False
+            and premerge_receipt.get("observer_merge_written") is False
+            and premerge_receipt.get("global_observer_merge_ready") is False
+            and str(premerge_receipt.get("project_id") or "").strip()
+            == str(event.get("project_id") or "").strip()
+            and str(premerge_receipt.get("backlog_id") or "").strip()
+            == backlog_id
+            and str(premerge_receipt.get("task_id") or "").strip()
+            == task_id
+            and str(
+                premerge_receipt.get("runtime_context_id") or ""
+            ).strip()
+            == str(runtime_context_id or "").strip()
+            and str(premerge_receipt.get("candidate_commit_sha") or "").strip()
+            == event_commit
+            and str(premerge_receipt.get("qa_session_id") or "").strip()
+            == str(qa_proof.get("qa_session_id") or "").strip()
+            and str(premerge_receipt.get("authority_hash") or "").strip()
+            == stable_sha256(
+                {
+                    key: value
+                    for key, value in premerge_receipt.items()
+                    if key != "authority_hash"
+                }
+            )
+        )
         explicit_runtime_context_ids = {
             str(value or "").strip()
             for value in (
@@ -41096,6 +41374,12 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
                 "server_derived"
             ],
             "runtime_context_binding": runtime_context_binding,
+            "premerge_candidate_receipt_only": premerge_receipt_only,
+            "premerge_candidate_receipt_authority_hash": str(
+                premerge_receipt.get("authority_hash") or ""
+            ).strip()
+            if premerge_receipt_only
+            else "",
             "task_id": task_id,
             "backlog_id": backlog_id,
         }
@@ -94348,6 +94632,52 @@ def _contract_runtime_merge_projected_completed_lines(
         for context_key in _contract_runtime_line_context_keys(line):
             projected_by_context.setdefault(context_key, []).append(index)
 
+    def direct_lane_key(line: Mapping[str, Any]) -> tuple[str, str] | None:
+        runtime_context_id = str(
+            line.get("runtime_context_id") or ""
+        ).strip()
+        task_id = str(line.get("task_id") or "").strip()
+        line_instance_id = str(
+            line.get("line_instance_id") or ""
+        ).strip()
+        if not runtime_context_id or not task_id:
+            return None
+        if line_instance_id and line_instance_id != (
+            f"runtime_context:{runtime_context_id}"
+        ):
+            return None
+        return runtime_context_id, task_id
+
+    last_completed_lane_index: dict[tuple[str, str], int] = {}
+    for index, line in enumerate(completed):
+        lane_key = direct_lane_key(line)
+        if lane_key is not None:
+            last_completed_lane_index[lane_key] = index
+
+    deferred_by_lane_anchor: dict[int, list[int]] = {}
+    for projected_index, line in enumerate(projected):
+        if str(line.get("line_id") or "").strip() not in {
+            "qa_graph_context",
+            "qa_independent_verification",
+            "observer_merge",
+            "observer_reconcile",
+            "observer_close_ready",
+        }:
+            continue
+        lane_key = direct_lane_key(line)
+        if lane_key is None:
+            continue
+        anchor_index = last_completed_lane_index.get(lane_key)
+        if anchor_index is not None:
+            deferred_by_lane_anchor.setdefault(anchor_index, []).append(
+                projected_index
+            )
+    lane_deferred = {
+        projected_index
+        for projected_indexes in deferred_by_lane_anchor.values()
+        for projected_index in projected_indexes
+    }
+
     deferred_by_merge: dict[int, list[int]] = {}
     merge_anchors = [
         (index, line)
@@ -94355,6 +94685,8 @@ def _contract_runtime_merge_projected_completed_lines(
         if str(line.get("line_id") or "").strip() == "observer_merge"
     ]
     for projected_index, line in enumerate(projected):
+        if projected_index in lane_deferred:
+            continue
         if str(line.get("line_id") or "").strip() not in {
             "observer_reconcile",
             "observer_close_ready",
@@ -94376,7 +94708,10 @@ def _contract_runtime_merge_projected_completed_lines(
                 break
     deferred = {
         projected_index
-        for projected_indexes in deferred_by_merge.values()
+        for projected_indexes in (
+            *deferred_by_lane_anchor.values(),
+            *deferred_by_merge.values(),
+        )
         for projected_index in projected_indexes
     }
 
@@ -94394,6 +94729,14 @@ def _contract_runtime_merge_projected_completed_lines(
                     merged.append(projected[projected_index])
                     inserted.add(projected_index)
         for projected_index in deferred_by_merge.get(completed_index, []):
+            if projected_index in inserted:
+                continue
+            merged.append(projected[projected_index])
+            inserted.add(projected_index)
+        for projected_index in deferred_by_lane_anchor.get(
+            completed_index,
+            [],
+        ):
             if projected_index in inserted:
                 continue
             merged.append(projected[projected_index])
@@ -94493,6 +94836,229 @@ _CONTRACT_RUNTIME_AUTHORITATIVE_QA_SUPERSEDED_LINE_IDS = frozenset(
 )
 
 
+def _contract_runtime_exact_lane_completed_line_binding(
+    record: Mapping[str, Any],
+    context: Any,
+    line: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one completed line to one dispatched lane without deep scanning.
+
+    Historical QA payloads retain a copy of the runtime guide that was current
+    when the evidence was appended.  That guide may describe a sibling lane,
+    so recursively collecting identity values from the whole payload is not a
+    safe ownership test.  The canonical completed-line tuple and its direct
+    payload/artifact copies are the only line-local identities admitted here.
+    """
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    line_instance_id = f"runtime_context:{runtime_context_id}"
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    if not all((runtime_context_id, task_id, parent_task_id)):
+        return {}
+    if (
+        str(line.get("runtime_context_id") or "").strip()
+        != runtime_context_id
+        or str(line.get("task_id") or "").strip() != task_id
+        or str(line.get("parent_task_id") or "").strip()
+        != parent_task_id
+        or str(line.get("line_instance_id") or "").strip()
+        != line_instance_id
+    ):
+        return {}
+
+    line_id = str(line.get("line_id") or "").strip()
+    direct_candidates = [
+        candidate
+        for candidate in (
+            line,
+            line.get("payload"),
+            line.get("artifact_refs"),
+        )
+        if isinstance(candidate, Mapping)
+    ]
+    for direct in direct_candidates:
+        for field, expected in (
+            ("runtime_context_id", runtime_context_id),
+            ("task_id", task_id),
+            ("parent_task_id", parent_task_id),
+            ("line_instance_id", line_instance_id),
+        ):
+            supplied = str(direct.get(field) or "").strip()
+            if supplied and supplied != expected:
+                return {}
+        if worker_slot_id:
+            for field, expected in (
+                ("worker_id", worker_slot_id),
+                ("worker_slot_id", worker_slot_id),
+                ("lane_id", worker_slot_id),
+                ("worker_role", "mf_sub"),
+            ):
+                supplied = str(direct.get(field) or "").strip()
+                if supplied and supplied != expected:
+                    return {}
+    if line_id in {"worker_commit", "observer_merge"} and worker_slot_id:
+        if {
+            field: str(line.get(field) or "").strip()
+            for field in (
+                "worker_id",
+                "worker_slot_id",
+                "worker_role",
+                "lane_id",
+            )
+        } != {
+            "worker_id": worker_slot_id,
+            "worker_slot_id": worker_slot_id,
+            "worker_role": "mf_sub",
+            "lane_id": worker_slot_id,
+        }:
+            return {}
+
+    dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+    dispatch_lineage = _contract_runtime_verified_dispatch_lineage(
+        record,
+        context,
+        dispatch_match,
+    )
+    if dispatch_lineage.get("dispatch_lineage_verified") is not True:
+        return {}
+    return {
+        "schema_version": "contract_runtime.exact_lane_completed_line_binding.v1",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "line_instance_id": line_instance_id,
+        "worker_slot_id": worker_slot_id,
+        **dispatch_lineage,
+    }
+
+
+def _contract_runtime_context_failed_qa_candidate_commit(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    context: Any,
+    prior_failed_qa_verdict: Mapping[str, Any],
+) -> str:
+    """Return the unique post-failure worker commit for one exact lane."""
+
+    failed_source_ref = str(
+        prior_failed_qa_verdict.get("source_ref") or ""
+    ).strip()
+    failed_qa_session_id = str(
+        prior_failed_qa_verdict.get("qa_session_id") or ""
+    ).strip()
+    if not failed_source_ref or not failed_qa_session_id:
+        return ""
+
+    def direct_source_refs(line: Mapping[str, Any]) -> set[str]:
+        refs: set[str] = set()
+        for candidate in (
+            line,
+            line.get("payload"),
+            line.get("artifact_refs"),
+        ):
+            if not isinstance(candidate, Mapping):
+                continue
+            for key in ("source_ref", "timeline_event_ref"):
+                value = str(candidate.get(key) or "").strip()
+                if value:
+                    refs.add(value)
+        return refs
+
+    failed_indices: list[int] = []
+    completed_lines = list(record.get("completed_lines") or [])
+    for index, line in enumerate(completed_lines):
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != (
+            "qa_independent_verification"
+        ):
+            continue
+        if not _contract_runtime_exact_lane_completed_line_binding(
+            record,
+            context,
+            line,
+        ):
+            continue
+        provenance = (
+            line.get("qa_evidence_provenance")
+            if isinstance(line.get("qa_evidence_provenance"), Mapping)
+            else {}
+        )
+        binding = (
+            provenance.get("authenticated_qa_binding")
+            if isinstance(
+                provenance.get("authenticated_qa_binding"), Mapping
+            )
+            else {}
+        )
+        if (
+            direct_source_refs(line) != {failed_source_ref}
+            or str(binding.get("qa_session_id") or "").strip()
+            != failed_qa_session_id
+            or str(line.get("status") or "").strip().lower()
+            not in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_BLOCKING_STATUSES
+        ):
+            continue
+        failed_indices.append(index)
+    if len(failed_indices) != 1:
+        return ""
+
+    candidate_commits: list[str] = []
+    for line in completed_lines[failed_indices[0] + 1 :]:
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != "worker_commit":
+            continue
+        if not _contract_runtime_exact_lane_completed_line_binding(
+            record,
+            context,
+            line,
+        ):
+            continue
+        if str(line.get("evidence_kind") or "").strip() == (
+            "contract_line_bypass"
+        ):
+            return ""
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        raw_values = {
+            str(value or "").strip().lower()
+            for value in (
+                line.get("commit_sha"),
+                payload.get("commit_sha"),
+                payload.get("worker_commit_sha"),
+                payload.get("validated_head_commit"),
+            )
+            if str(value or "").strip()
+        }
+        commit_values = {
+            _contract_runtime_full_commit_value(project_id, value)
+            for value in raw_values
+        }
+        if (
+            len(commit_values) != 1
+            or "" in commit_values
+            or not all(
+                re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value)
+                for value in commit_values
+            )
+        ):
+            return ""
+        candidate_commits.append(next(iter(commit_values)))
+    return candidate_commits[0] if len(candidate_commits) == 1 else ""
+
+
 def _contract_runtime_authoritative_qa_projection_verdict(
     conn,
     *,
@@ -94512,15 +95078,48 @@ def _contract_runtime_authoritative_qa_projection_verdict(
     )
     if not latest:
         return {}
-    expected_candidate_commit = str(
-        _contract_runtime_server_candidate_commit(
-            conn,
-            project_id=project_id,
-            record=record,
+    latest_status = str(latest.get("status") or "").strip().lower()
+    prior: dict[str, Any] = {}
+    if latest_status in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES:
+        prior = _runtime_context_latest_authenticated_qa_timeline_verdict(
+            conn=conn,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=timeline_events,
+            before_event_id=int(latest.get("event_id") or 0),
         )
-        or getattr(context, "head_commit", "")
-        or ""
-    ).strip()
+        if (
+            str(prior.get("status") or "").strip().lower()
+            not in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_BLOCKING_STATUSES
+        ):
+            return {}
+    if (
+        latest_status in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES
+        and _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+    ):
+        expected_candidate_commit = str(
+            _contract_runtime_context_failed_qa_candidate_commit(
+                conn,
+                project_id=project_id,
+                record=record,
+                context=context,
+                prior_failed_qa_verdict=prior,
+            )
+        ).strip()
+        if not expected_candidate_commit:
+            return {}
+    else:
+        expected_candidate_commit = str(
+            _contract_runtime_server_candidate_commit(
+                conn,
+                project_id=project_id,
+                record=record,
+            )
+            or getattr(context, "head_commit", "")
+            or ""
+        ).strip()
     if (
         expected_candidate_commit
         and str(latest.get("commit_sha") or "").strip()
@@ -94532,21 +95131,14 @@ def _contract_runtime_authoritative_qa_projection_verdict(
         **latest,
         "expected_candidate_commit": expected_candidate_commit,
         "candidate_scope_verified": True,
-        "effective_status": str(latest.get("status") or "").strip().lower(),
+        "effective_status": latest_status,
         "fresh_session_pass_verified": True,
     }
     if projected["effective_status"] in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES:
-        prior = _runtime_context_latest_authenticated_qa_timeline_verdict(
-            conn=conn,
-            context=context,
-            runtime_context_id=runtime_context_id,
-            timeline_events=timeline_events,
-            before_event_id=int(projected.get("event_id") or 0),
-        )
-        prior_status = str(prior.get("status") or "").strip().lower()
-        if prior_status not in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_BLOCKING_STATUSES:
-            return {}
         projected["prior_no_pass_event_id"] = int(prior.get("event_id") or 0)
+        projected["prior_no_pass_source_ref"] = str(
+            prior.get("source_ref") or ""
+        ).strip()
         projected["prior_no_pass_qa_session_id"] = str(
             prior.get("qa_session_id") or ""
         ).strip()
@@ -94573,13 +95165,17 @@ def _contract_runtime_authoritative_qa_superseded_line_indices(
     *,
     project_id: str,
     backlog_id: str,
-    runtime_context_id: str,
-    task_id: str,
+    context: Any,
     authoritative_qa_verdict: Mapping[str, Any],
 ) -> list[int]:
     """Invalidate historical QA/integration only in the current read model."""
 
     if not authoritative_qa_verdict:
+        return []
+    runtime_context_id, task_id, _parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    if not runtime_context_id or not task_id:
         return []
     completed_lines = list(record.get("completed_lines") or [])
     expected_commit = str(
@@ -94605,6 +95201,15 @@ def _contract_runtime_authoritative_qa_superseded_line_indices(
         or authoritative_qa_verdict.get("execution_state_revision")
         or 0
     )
+    failed_qa_source_ref = str(
+        authoritative_qa_verdict.get("prior_no_pass_source_ref")
+        or (
+            f"timeline:{int(authoritative_qa_verdict.get('prior_no_pass_event_id') or 0)}"
+            if int(authoritative_qa_verdict.get("prior_no_pass_event_id") or 0)
+            > 0
+            else ""
+        )
+    ).strip()
 
     def qa_session_id(line: Mapping[str, Any]) -> str:
         provenance = (
@@ -94621,6 +95226,40 @@ def _contract_runtime_authoritative_qa_superseded_line_indices(
         )
         return str(binding.get("qa_session_id") or "").strip()
 
+    failed_line_indices: list[int] = []
+    for index, line in enumerate(completed_lines):
+        if not isinstance(line, Mapping):
+            continue
+        if str(line.get("line_id") or "").strip() != (
+            "qa_independent_verification"
+        ):
+            continue
+        if not _contract_runtime_exact_lane_completed_line_binding(
+            record,
+            context,
+            line,
+        ):
+            continue
+        source_refs = {
+            str(candidate.get(key) or "").strip()
+            for candidate in (
+                line,
+                line.get("payload"),
+                line.get("artifact_refs"),
+            )
+            if isinstance(candidate, Mapping)
+            for key in ("source_ref", "timeline_event_ref")
+            if str(candidate.get(key) or "").strip()
+        }
+        if (
+            source_refs == {failed_qa_source_ref}
+            and qa_session_id(line) == failed_qa_session_id
+        ):
+            failed_line_indices.append(index)
+    if len(failed_line_indices) != 1:
+        return []
+    failed_line_index = failed_line_indices[0]
+
     superseded: list[int] = []
     for index, line in enumerate(completed_lines):
         if not isinstance(line, Mapping):
@@ -94628,18 +95267,16 @@ def _contract_runtime_authoritative_qa_superseded_line_indices(
         line_id = str(line.get("line_id") or "").strip()
         if line_id not in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_SUPERSEDED_LINE_IDS:
             continue
-        context_keys = _contract_runtime_line_context_keys(line)
-        runtime_context_ids = {
-            value
-            for kind, value in context_keys
-            if kind == "runtime_context_id"
-        }
-        task_ids = {
-            value for kind, value in context_keys if kind == "task_id"
-        }
-        if (
-            runtime_context_ids != {runtime_context_id}
-            or task_ids != {task_id}
+        if index < failed_line_index:
+            continue
+        if not _contract_runtime_exact_lane_completed_line_binding(
+            record,
+            context,
+            line,
+        ):
+            continue
+        if line_id == "qa_independent_verification" and index != (
+            failed_line_index
         ):
             continue
         if line_id == "qa_graph_context":
@@ -94795,8 +95432,7 @@ def _contract_runtime_projection_for_context(
             record,
             project_id=project_id,
             backlog_id=backlog_id,
-            runtime_context_id=runtime_context_id,
-            task_id=task_id,
+            context=context,
             authoritative_qa_verdict=authoritative_qa_verdict,
         )
     )
@@ -96090,6 +96726,10 @@ def _contract_runtime_projection_post_worker_lines(
         and authoritative_qa_verdict.get("candidate_scope_verified") is True
         and authoritative_qa_verdict.get("fresh_session_pass_verified") is True
     )
+    authoritative_qa_premerge_only = bool(
+        authoritative_qa_verdict.get("premerge_candidate_receipt_only")
+        is True
+    )
     if authoritative_qa_event_id > 0 and authoritative_qa_passed:
         candidate_qa_event = next(
             (
@@ -96365,7 +97005,11 @@ def _contract_runtime_projection_post_worker_lines(
             == qa_graph_line_instance_id
             for line in (record.get("completed_lines") or [])
         )
-    if qa_event and qa_graph_line_present:
+    if (
+        qa_event
+        and qa_graph_line_present
+        and not authoritative_qa_premerge_only
+    ):
         lines.append(
             _contract_runtime_projected_qa_graph_line(
                 record=record,
@@ -96374,7 +97018,11 @@ def _contract_runtime_projection_post_worker_lines(
                 graph_refs=qa_graph_refs,
             )
         )
-    if qa_event and qa_graph_line_present:
+    if (
+        qa_event
+        and qa_graph_line_present
+        and not authoritative_qa_premerge_only
+    ):
         lines.append(
             _contract_runtime_projected_post_worker_line(
                 record=record,
@@ -96414,7 +97062,7 @@ def _contract_runtime_projection_post_worker_lines(
                 server_authority=reconcile_authority,
             )
         )
-    if close_ready_event:
+    if close_ready_event and not authoritative_qa_premerge_only:
         derived_from = []
         if merge_event:
             derived_from.append(_runtime_context_event_ref(merge_event))
@@ -96433,7 +97081,11 @@ def _contract_runtime_projection_post_worker_lines(
                 derived_from=derived_from,
             )
         )
-    elif merge_event and reconcile_event:
+    elif (
+        merge_event
+        and reconcile_event
+        and not authoritative_qa_premerge_only
+    ):
         lines.append(
             _contract_runtime_projected_post_worker_line(
                 record=record,
@@ -96981,6 +97633,32 @@ def _contract_runtime_projected_post_worker_line(
         },
         "_source_ref": source_ref,
     }
+    if line_id == "observer_merge":
+        worker_id = str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip()
+        if worker_id:
+            line.update(
+                {
+                    "worker_id": worker_id,
+                    "worker_slot_id": worker_id,
+                    "worker_role": "mf_sub",
+                    "lane_id": worker_id,
+                }
+            )
+            projected_payload.update(
+                {
+                    "worker_id": worker_id,
+                    "worker_slot_id": worker_id,
+                    "worker_role": "mf_sub",
+                    "lane_id": worker_id,
+                    "line_instance_id": (
+                        f"runtime_context:{runtime_context_id}"
+                    ),
+                }
+            )
     commit_sha = str(
         (server_authority or {}).get("merged_commit_sha")
         or event.get("commit_sha")
