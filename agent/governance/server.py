@@ -101052,10 +101052,15 @@ def _contract_runtime_bind_qa_worker_identity_authority(
     project_id: str,
     record: Mapping[str, Any],
     write: Mapping[str, Any],
+    server_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bind a QA row to the one active worker context selected by dispatch."""
 
-    expected = _contract_runtime_server_line_identity(record)
+    expected = (
+        dict(server_identity)
+        if isinstance(server_identity, Mapping)
+        else _contract_runtime_server_line_identity(record)
+    )
     expected_runtime_context_id = str(
         expected.get("runtime_context_id") or ""
     ).strip()
@@ -101117,6 +101122,7 @@ def _contract_runtime_bind_qa_worker_identity_authority(
     runtime_context_id, task_id, parent_task_id = next(iter(identities.values()))
     claimed_runtime_context_ids: set[str] = set()
     claimed_task_ids: set[str] = set()
+    claimed_parent_task_ids: set[str] = set()
     for candidate in _contract_runtime_mapping_candidates(write):
         claimed_runtime_context_ids.update(
             _contract_runtime_mapping_values(candidate, "runtime_context_id")
@@ -101128,6 +101134,13 @@ def _contract_runtime_bind_qa_worker_identity_authority(
                 "worker_task_id",
             )
         )
+        claimed_parent_task_ids.update(
+            _contract_runtime_mapping_values(
+                candidate,
+                "parent_task_id",
+                "root_task_id",
+            )
+        )
     mismatches = []
     for field, claimed, canonical in (
         (
@@ -101136,6 +101149,7 @@ def _contract_runtime_bind_qa_worker_identity_authority(
             runtime_context_id,
         ),
         ("task_id", claimed_task_ids, task_id),
+        ("parent_task_id", claimed_parent_task_ids, parent_task_id),
     ):
         wrong = sorted(value for value in claimed if value != canonical)
         if wrong:
@@ -101186,6 +101200,201 @@ def _contract_runtime_bind_qa_worker_identity_authority(
     )
     effective["payload"] = payload
     return effective
+
+
+def _contract_runtime_postmerge_qa_worker_identity_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve the final worker lane from one frozen postmerge QA ticket.
+
+    A postmerge ``qa_graph_context`` deliberately carries two scopes: its
+    canonical worker identity remains the final merged lane, while its graph
+    query task is the combined ContractRuntime execution.  Deep-scanning that
+    line therefore produces an ambiguous worker identity.  Consume only the
+    newest accepted, server-derived ticket and rejoin its final-lane identity
+    to exactly one durable dispatch RuntimeContext.
+    """
+
+    def blocked(*codes: str) -> dict[str, Any]:
+        return {
+            "schema_version": (
+                "contract_runtime.postmerge_qa_worker_identity_authority.v1"
+            ),
+            "status": "blocked",
+            "verified": False,
+            "server_derived": True,
+            "fail_closed": True,
+            "blocker_codes": list(codes) or [
+                "persisted_postmerge_qa_worker_identity_unverified"
+            ],
+        }
+
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    if not (
+        _is_mf_parallel_postmerge_revision(record)
+        and project_id
+        and execution_id
+        and backlog_id
+    ):
+        return blocked("postmerge_qa_contract_scope_invalid")
+
+    latest_line: Mapping[str, Any] = {}
+    for line in reversed(record.get("completed_lines") or []):
+        if isinstance(line, Mapping) and str(
+            line.get("line_id") or ""
+        ).strip() == "qa_graph_context":
+            latest_line = line
+            break
+    if not latest_line:
+        return blocked("persisted_postmerge_qa_graph_context_missing")
+
+    payload = (
+        latest_line.get("payload")
+        if isinstance(latest_line.get("payload"), Mapping)
+        else {}
+    )
+    evidence = (
+        payload.get("graph_trace_evidence")
+        if isinstance(payload.get("graph_trace_evidence"), Mapping)
+        else {}
+    )
+    raw_ticket = (
+        evidence.get("postmerge_qa_authority")
+        if isinstance(evidence.get("postmerge_qa_authority"), Mapping)
+        else {}
+    )
+    ticket = _contract_runtime_persisted_postmerge_qa_authority(record)
+    if ticket.get("verified") is not True:
+        return blocked(
+            *(
+                str(code)
+                for code in ticket.get("blocker_codes") or [
+                    "persisted_postmerge_qa_authority_missing"
+                ]
+            )
+        )
+
+    runtime_context_id = str(
+        ticket.get("runtime_context_id") or ""
+    ).strip()
+    task_id = str(ticket.get("task_id") or "").strip()
+    parent_task_id = str(ticket.get("parent_task_id") or "").strip()
+    graph_task_id = str(ticket.get("qa_graph_trace_task_id") or "").strip()
+    candidate_commit = str(
+        ticket.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    ticket_source = str(ticket.get("source") or "").strip()
+    ticket_hash = str(ticket.get("authority_hash") or "").strip()
+    ticket_unsigned = {
+        key: value for key, value in ticket.items() if key != "authority_hash"
+    }
+    line_candidate_commit = str(
+        latest_line.get("commit_sha") or ""
+    ).strip().lower()
+    evidence_candidate_commit = str(
+        evidence.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    identity_checks = bool(
+        str(ticket.get("schema_version") or "")
+        == "contract_runtime.rev8_postmerge_qa_authority.v1"
+        and str(ticket.get("status") or "") == "verified"
+        and ticket.get("server_derived") is True
+        and ticket.get("db_verified") is True
+        and ticket.get("live_verified") is True
+        and ticket.get("graph_reconciled") is True
+        and ticket.get("active_snapshot_verified") is True
+        and str(ticket.get("project_id") or "").strip() == project_id
+        and str(ticket.get("backlog_id") or "").strip() == backlog_id
+        and str(ticket.get("contract_execution_id") or "").strip()
+        == execution_id
+        and parent_task_id == execution_id
+        and graph_task_id == execution_id
+        and str(ticket.get("qa_graph_trace_task_source") or "").strip()
+        == "ContractRuntime.contract_execution_id"
+        and ticket_source.startswith("ContractRuntime.")
+        and ticket_hash == stable_sha256(ticket_unsigned)
+        and stable_sha256(raw_ticket) == stable_sha256(ticket)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit)
+        is not None
+        and line_candidate_commit == candidate_commit
+        and evidence_candidate_commit == candidate_commit
+        and _contract_runtime_mapping_value(
+            latest_line, "runtime_context_id"
+        )
+        == runtime_context_id
+        and _contract_runtime_mapping_value(latest_line, "task_id")
+        == graph_task_id
+        and _contract_runtime_mapping_value(latest_line, "parent_task_id")
+        == parent_task_id
+        and _contract_runtime_mapping_value(evidence, "runtime_context_id")
+        == runtime_context_id
+        and _contract_runtime_mapping_value(evidence, "task_id")
+        == graph_task_id
+        and _contract_runtime_mapping_value(evidence, "parent_task_id")
+        == parent_task_id
+    )
+    if not identity_checks:
+        return blocked("persisted_postmerge_qa_worker_identity_mismatch")
+
+    matching_contexts: list[tuple[str, str, str]] = []
+    for line in record.get("completed_lines") or []:
+        if not isinstance(line, Mapping) or str(
+            line.get("line_id") or ""
+        ).strip() not in {
+            "observer_dispatch_bounded_workers",
+            "direct_fix_dispatch_context",
+        }:
+            continue
+        for context in _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=line,
+        ):
+            identity = _contract_runtime_context_identity(context)
+            if identity == (runtime_context_id, task_id, parent_task_id):
+                matching_contexts.append(identity)
+    if len(matching_contexts) != 1:
+        return blocked("persisted_postmerge_qa_dispatch_identity_ambiguous")
+
+    authority = {
+        "schema_version": (
+            "contract_runtime.postmerge_qa_worker_identity_authority.v1"
+        ),
+        "source": (
+            "ContractRuntime.qa_graph_context.postmerge_qa_authority+"
+            "observer_dispatch_bounded_workers"
+        ),
+        "status": "verified",
+        "verified": True,
+        "server_derived": True,
+        "db_verified": True,
+        "fail_closed": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "qa_graph_trace_task_id": graph_task_id,
+        "qa_graph_trace_task_source": (
+            "ContractRuntime.contract_execution_id"
+        ),
+        "candidate_commit_sha": candidate_commit,
+        "postmerge_qa_authority_hash": ticket_hash,
+        "identity_status": "resolved",
+        "identity_source_line_id": (
+            "qa_graph_context.postmerge_qa_authority"
+        ),
+        "candidate_count": 1,
+        "blocker_codes": [],
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
 
 
 def _contract_runtime_worker_implementation_bypass_continuation_anchor(
@@ -104601,11 +104810,61 @@ def _contract_runtime_bind_qa_independent_verification_authority(
     if _is_mf_parallel_record_contract_id(
         str(record.get("contract_id") or "")
     ):
+        postmerge_independent_verification = bool(
+            _is_mf_parallel_postmerge_revision(record)
+            and str(write.get("line_id") or "").strip()
+            == "qa_independent_verification"
+            and str(
+                _contract_runtime_next_line(record).get("line_id") or ""
+            ).strip()
+            == "qa_independent_verification"
+        )
+        postmerge_identity = (
+            _contract_runtime_postmerge_qa_worker_identity_authority(
+                conn,
+                project_id=project_id,
+                record=record,
+            )
+            if postmerge_independent_verification
+            else {}
+        )
+        if (
+            postmerge_independent_verification
+            and postmerge_identity.get("verified") is not True
+        ):
+            raise GovernanceError(
+                "contract_runtime_qa_worker_identity_unresolved",
+                (
+                    "postmerge independent QA requires one persisted, "
+                    "server-verified final-lane worker identity"
+                ),
+                409,
+                {
+                    "contract_execution_id": str(
+                        record.get("contract_execution_id") or ""
+                    ),
+                    "line_id": str(write.get("line_id") or ""),
+                    "identity_status": "blocked",
+                    "identity_source_line_id": (
+                        "qa_graph_context.postmerge_qa_authority"
+                    ),
+                    "candidate_count": 0,
+                    "blocker_codes": list(
+                        postmerge_identity.get("blocker_codes") or []
+                    ),
+                    "fail_closed": True,
+                },
+            )
         effective = _contract_runtime_bind_qa_worker_identity_authority(
             conn,
             project_id=project_id,
             record=record,
             write=effective,
+            server_identity=(
+                postmerge_identity
+                if postmerge_independent_verification
+                else None
+            ),
         )
     return _contract_runtime_bind_qa_no_pass_ledger_authority(
         conn,

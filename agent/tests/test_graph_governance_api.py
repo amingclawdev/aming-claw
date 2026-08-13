@@ -70392,6 +70392,7 @@ def test_failed_qa_rejoin_marker_composes_authority_and_active_auth_rotation(
     [
         ("runtime_context_id", "mfrctx-wrong"),
         ("task_id", "worker-wrong"),
+        ("parent_task_id", "parent-wrong"),
     ],
 )
 def test_qa_worker_identity_binding_rejects_wrong_runtime_or_task(
@@ -70732,6 +70733,449 @@ def _rev8_postmerge_qa_binding_authority() -> dict[str, Any]:
     }
     authority["authority_hash"] = server.stable_sha256(authority)
     return authority
+
+
+def _rev8_postmerge_independent_qa_record() -> dict[str, Any]:
+    record = _rev8_postmerge_qa_binding_record()
+    authority = _rev8_postmerge_qa_binding_authority()
+    evidence = {
+        "schema_version": "qa_graph_trace_db_evidence.v1",
+        "source": "graph_query_traces",
+        "db_verified": True,
+        "identity_mismatches": [],
+        "trace_ids": ["gqt-rev8-postmerge-independent"],
+        "verified_trace_ids": ["gqt-rev8-postmerge-independent"],
+        "runtime_context_id": authority["runtime_context_id"],
+        "task_id": authority["qa_graph_trace_task_id"],
+        "parent_task_id": authority["parent_task_id"],
+        "candidate_commit_sha": authority["candidate_commit_sha"],
+        "postmerge_qa_authority": authority,
+    }
+    evidence["authority_hash"] = server.stable_sha256(evidence)
+    graph_line = server._contract_runtime_bind_authenticated_qa_provenance(
+        {
+            "principal_id": "qa:rev8-postmerge-independent",
+            "session_id": "ses-rev8-postmerge-independent",
+        },
+        write={
+            "stage_id": "qa_graph_context",
+            "line_id": "qa_graph_context",
+            "actor_role": "qa",
+            "evidence_kind": "graph_trace",
+            "status": "accepted",
+            "commit_sha": authority["candidate_commit_sha"],
+            "runtime_context_id": authority["runtime_context_id"],
+            "task_id": authority["qa_graph_trace_task_id"],
+            "parent_task_id": authority["parent_task_id"],
+            "payload": {"graph_trace_evidence": evidence},
+        },
+        source="test_rev8_postmerge_independent_graph_context",
+        binding_claims={"graph_trace_session_matched": True},
+    )
+    record["completed_lines"].append(graph_line)
+    record["runtime_guide"] = {
+        "next_legal_action": {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "owner_role": "qa",
+            "evidence_kind": "independent_verification",
+        }
+    }
+    return record
+
+
+def _rev8_postmerge_dispatch_contexts(
+    record: Mapping[str, Any],
+) -> list[SimpleNamespace]:
+    workers = record["completed_lines"][0]["payload"]["bounded_workers"]
+    return [
+        SimpleNamespace(
+            runtime_context_id=worker["runtime_context_id"],
+            task_id=worker["task_id"],
+            parent_task_id=worker["parent_task_id"],
+        )
+        for worker in workers
+    ]
+
+
+def _rehash_rev8_postmerge_graph_line(record: dict[str, Any]) -> None:
+    evidence = record["completed_lines"][-1]["payload"][
+        "graph_trace_evidence"
+    ]
+    ticket = evidence.get("postmerge_qa_authority")
+    if isinstance(ticket, dict):
+        ticket["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in ticket.items()
+                if key != "authority_hash"
+            }
+        )
+    evidence["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in evidence.items()
+            if key != "authority_hash"
+        }
+    )
+
+
+def test_postmerge_independent_qa_uses_persisted_final_lane_identity(
+    monkeypatch,
+):
+    record = _rev8_postmerge_independent_qa_record()
+    contexts = _rev8_postmerge_dispatch_contexts(record)
+    before = copy.deepcopy(record)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: list(contexts),
+    )
+
+    authority = server._contract_runtime_postmerge_qa_worker_identity_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+    assert authority["verified"] is True
+    assert authority["runtime_context_id"] == contexts[-1].runtime_context_id
+    assert authority["task_id"] == contexts[-1].task_id
+    assert authority["parent_task_id"] == record["contract_execution_id"]
+    assert authority["qa_graph_trace_task_id"] == record[
+        "contract_execution_id"
+    ]
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:rev8-postmerge-independent",
+                "session_id": "ses-rev8-postmerge-independent",
+            }
+
+    bound = server._contract_runtime_bind_qa_independent_verification_authority(
+        QAContext(),
+        object(),
+        project_id=PID,
+        record=record,
+        write={
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "actor_role": "qa",
+            "evidence_kind": "independent_verification",
+            "status": "accepted",
+        },
+    )
+
+    assert bound["runtime_context_id"] == contexts[-1].runtime_context_id
+    assert bound["task_id"] == contexts[-1].task_id
+    assert bound["parent_task_id"] == record["contract_execution_id"]
+    assert bound["qa_evidence_provenance"]["authenticated_qa_binding"][
+        "qa_session_id"
+    ] == "ses-rev8-postmerge-independent"
+    assert record == before
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value", "blocker"),
+    (
+        (
+            "ticket",
+            "verified",
+            False,
+            "persisted_postmerge_qa_authority_invalid",
+        ),
+        (
+            "ticket",
+            "live_verified",
+            False,
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "ticket",
+            "graph_reconciled",
+            False,
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "ticket",
+            "source",
+            "caller_claim",
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "ticket",
+            "project_id",
+            "project-other",
+            "persisted_postmerge_qa_authority_invalid",
+        ),
+        (
+            "ticket",
+            "backlog_id",
+            "AC-OTHER",
+            "persisted_postmerge_qa_authority_invalid",
+        ),
+        (
+            "ticket",
+            "contract_execution_id",
+            "cex-other",
+            "persisted_postmerge_qa_authority_invalid",
+        ),
+        (
+            "ticket",
+            "parent_task_id",
+            "cex-other",
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "ticket",
+            "runtime_context_id",
+            "mfrctx-rev8-postmerge-server",
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "ticket",
+            "task_id",
+            "rev8-postmerge-server-worker",
+            "persisted_postmerge_qa_dispatch_identity_ambiguous",
+        ),
+        (
+            "ticket",
+            "qa_graph_trace_task_id",
+            "worker-task",
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "ticket",
+            "qa_graph_trace_task_source",
+            "caller_claim",
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "ticket",
+            "candidate_commit_sha",
+            "3" * 40,
+            "persisted_postmerge_qa_authority_invalid",
+        ),
+        (
+            "line",
+            "commit_sha",
+            "3" * 40,
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "line",
+            "task_id",
+            "worker-task",
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "line",
+            "runtime_context_id",
+            "mfrctx-other",
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "evidence",
+            "task_id",
+            "worker-task",
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+        (
+            "evidence",
+            "runtime_context_id",
+            "mfrctx-other",
+            "persisted_postmerge_qa_worker_identity_mismatch",
+        ),
+    ),
+)
+def test_postmerge_independent_qa_ticket_identity_fails_closed(
+    monkeypatch,
+    target,
+    field,
+    value,
+    blocker,
+):
+    record = _rev8_postmerge_independent_qa_record()
+    graph_line = record["completed_lines"][-1]
+    evidence = graph_line["payload"]["graph_trace_evidence"]
+    ticket = evidence["postmerge_qa_authority"]
+    if target == "ticket":
+        ticket[field] = value
+    elif target == "line":
+        graph_line[field] = value
+    else:
+        evidence[field] = value
+    _rehash_rev8_postmerge_graph_line(record)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: _rev8_postmerge_dispatch_contexts(record),
+    )
+
+    authority = server._contract_runtime_postmerge_qa_worker_identity_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+
+    assert authority["verified"] is False
+    assert blocker in authority["blocker_codes"]
+    assert authority["fail_closed"] is True
+
+
+def test_postmerge_independent_qa_rejects_missing_or_ambiguous_dispatch(
+    monkeypatch,
+):
+    record = _rev8_postmerge_independent_qa_record()
+    contexts = _rev8_postmerge_dispatch_contexts(record)
+    for supplied in ([], [*contexts, contexts[-1]]):
+        monkeypatch.setattr(
+            server,
+            "_contract_runtime_contexts_for_dispatch_line",
+            lambda *_args, supplied=supplied, **_kwargs: list(supplied),
+        )
+        authority = (
+            server._contract_runtime_postmerge_qa_worker_identity_authority(
+                object(),
+                project_id=PID,
+                record=record,
+            )
+        )
+        assert authority["verified"] is False
+        assert authority["blocker_codes"] == [
+            "persisted_postmerge_qa_dispatch_identity_ambiguous"
+        ]
+
+
+def test_postmerge_independent_qa_missing_current_ticket_never_reuses_old(
+    monkeypatch,
+):
+    record = _rev8_postmerge_independent_qa_record()
+    newer = server._contract_runtime_bind_authenticated_qa_provenance(
+        {
+            "principal_id": "qa:newer-postmerge-round",
+            "session_id": "ses-newer-postmerge-round",
+        },
+        write={
+            "line_id": "qa_graph_context",
+            "status": "accepted",
+            "payload": {
+                "graph_trace_evidence": {
+                    "db_verified": True,
+                    "identity_mismatches": [],
+                    "candidate_commit_sha": "3" * 40,
+                }
+            },
+        },
+        source="test_newer_postmerge_round",
+        binding_claims={"graph_trace_session_matched": True},
+    )
+    newer_evidence = newer["payload"]["graph_trace_evidence"]
+    newer_evidence["authority_hash"] = server.stable_sha256(newer_evidence)
+    record["completed_lines"].append(newer)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: _rev8_postmerge_dispatch_contexts(record),
+    )
+
+    authority = server._contract_runtime_postmerge_qa_worker_identity_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+
+    assert authority["verified"] is False
+    assert authority["blocker_codes"] == [
+        "persisted_postmerge_qa_authority_missing"
+    ]
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:newer-postmerge-round",
+                "session_id": "ses-newer-postmerge-round",
+            }
+
+    with pytest.raises(GovernanceError) as blocked:
+        server._contract_runtime_bind_qa_independent_verification_authority(
+            QAContext(),
+            object(),
+            project_id=PID,
+            record=record,
+            write={"line_id": "qa_independent_verification"},
+        )
+    assert blocked.value.code == "contract_runtime_qa_worker_identity_unresolved"
+    assert blocked.value.details["blocker_codes"] == [
+        "persisted_postmerge_qa_authority_missing"
+    ]
+    assert blocked.value.details["fail_closed"] is True
+
+
+def test_non_postmerge_independent_qa_keeps_generic_worker_binding(
+    monkeypatch,
+):
+    context = SimpleNamespace(
+        runtime_context_id="mfrctx-generic-independent",
+        task_id="worker-generic-independent",
+        parent_task_id="cex-generic-independent",
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-GENERIC-INDEPENDENT",
+        "contract_execution_id": context.parent_task_id,
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev7",
+        "completed_lines": [
+            {"line_id": "observer_dispatch_bounded_workers"},
+        ],
+        "runtime_guide": {
+            "next_legal_action": {
+                "line_id": "qa_independent_verification",
+            }
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda _record: {
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+            "identity_status": "resolved",
+            "identity_source_line_id": "worker_review_ready_handoff",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [context],
+    )
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:generic-independent",
+                "session_id": "ses-generic-independent",
+            }
+
+    bound = server._contract_runtime_bind_qa_independent_verification_authority(
+        QAContext(),
+        object(),
+        project_id=PID,
+        record=record,
+        write={"line_id": "qa_independent_verification"},
+    )
+
+    assert bound["runtime_context_id"] == context.runtime_context_id
+    assert bound["task_id"] == context.task_id
+    assert bound["parent_task_id"] == context.parent_task_id
 
 
 def test_rev8_postmerge_comparison_base_uses_full_merge_chain(
