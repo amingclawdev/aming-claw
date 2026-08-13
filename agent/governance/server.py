@@ -90,7 +90,7 @@ from .contracts.runtime import (
     upsert_contract_chain_successor_binding,
 )
 from .contracts.hash import stable_sha256
-from .contracts.schema import ContractDefinitionError
+from .contracts.schema import ContractDefinitionError, iter_stage_lines
 from .contracts.write_gate import (
     _public_safe_runtime_guide_hash,
     contract_line_evidence_policy,
@@ -96993,6 +96993,25 @@ def _contract_runtime_projection_post_worker_lines(
     if close_ready_event and not reconcile_event:
         close_ready_event = {}
 
+    projected_stage_ids = _contract_runtime_pinned_projected_line_stage_ids(
+        conn,
+        record=record,
+        line_ids=(
+            "observer_merge",
+            "observer_reconcile",
+            "observer_close_ready",
+        ),
+    )
+    if merge_event and not projected_stage_ids.get("observer_merge"):
+        merge_event = {}
+        reconcile_event = {}
+        close_ready_event = {}
+    if reconcile_event and not projected_stage_ids.get("observer_reconcile"):
+        reconcile_event = {}
+        close_ready_event = {}
+    if close_ready_event and not projected_stage_ids.get("observer_close_ready"):
+        close_ready_event = {}
+
     lines: list[dict[str, Any]] = []
     qa_graph_line_instance_id = f"runtime_context:{runtime_context_id}"
     qa_graph_line_present = bool(qa_graph_refs.get("db_verified"))
@@ -97041,7 +97060,7 @@ def _contract_runtime_projection_post_worker_lines(
                 record=record,
                 context=context,
                 event=merge_event,
-                stage_id="observer_integration",
+                stage_id=projected_stage_ids["observer_merge"],
                 line_id="observer_merge",
                 evidence_kind="merge",
                 actor_role="observer",
@@ -97054,7 +97073,7 @@ def _contract_runtime_projection_post_worker_lines(
                 record=record,
                 context=context,
                 event=reconcile_event,
-                stage_id="observer_integration",
+                stage_id=projected_stage_ids["observer_reconcile"],
                 line_id="observer_reconcile",
                 evidence_kind="reconcile",
                 actor_role="observer",
@@ -97073,7 +97092,7 @@ def _contract_runtime_projection_post_worker_lines(
                 record=record,
                 context=context,
                 event=close_ready_event,
-                stage_id="observer_integration",
+                stage_id=projected_stage_ids["observer_close_ready"],
                 line_id="observer_close_ready",
                 evidence_kind="close_ready",
                 actor_role="observer",
@@ -97085,13 +97104,14 @@ def _contract_runtime_projection_post_worker_lines(
         merge_event
         and reconcile_event
         and not authoritative_qa_premerge_only
+        and projected_stage_ids.get("observer_close_ready")
     ):
         lines.append(
             _contract_runtime_projected_post_worker_line(
                 record=record,
                 context=context,
                 event=reconcile_event,
-                stage_id="observer_integration",
+                stage_id=projected_stage_ids["observer_close_ready"],
                 line_id="observer_close_ready",
                 evidence_kind="close_ready",
                 actor_role="observer",
@@ -97103,6 +97123,48 @@ def _contract_runtime_projection_post_worker_lines(
             )
         )
     return lines
+
+
+def _contract_runtime_definition_projected_line_stage_ids(
+    definition: Mapping[str, Any],
+    *,
+    line_ids: Sequence[str],
+) -> dict[str, str]:
+    requested = {
+        str(line_id or "").strip()
+        for line_id in line_ids
+        if str(line_id or "").strip()
+    }
+    if not requested:
+        return {}
+    matches: dict[str, list[str]] = {line_id: [] for line_id in requested}
+    for stage, line in iter_stage_lines(definition):
+        line_id = str(line.get("line_id") or "").strip()
+        stage_id = str(stage.get("stage_id") or "").strip()
+        if line_id in matches and stage_id:
+            matches[line_id].append(stage_id)
+    if any(len(stage_ids) != 1 for stage_ids in matches.values()):
+        return {}
+    return {
+        line_id: stage_ids[0]
+        for line_id, stage_ids in matches.items()
+    }
+
+
+def _contract_runtime_pinned_projected_line_stage_ids(
+    conn,
+    *,
+    record: Mapping[str, Any],
+    line_ids: Sequence[str],
+) -> dict[str, str]:
+    try:
+        definition = _contract_runtime(conn)._load_pinned_definition(record)
+    except (ContractDefinitionError, ContractRuntimeError):
+        return {}
+    return _contract_runtime_definition_projected_line_stage_ids(
+        definition,
+        line_ids=line_ids,
+    )
 
 
 def _contract_runtime_projected_qa_graph_line(

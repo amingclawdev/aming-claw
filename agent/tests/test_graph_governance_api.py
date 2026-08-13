@@ -133871,6 +133871,12 @@ def test_pinned_mf_parallel_rev1_preserves_legacy_qa_and_reconcile_projection(
     runtime_context_id = "mfrctx-mf-parallel-rev1-legacy"
     trace_id = "gqt-mf-parallel-rev1-legacy"
     snapshot_id = "full-mf-parallel-rev1-legacy"
+    definition = server._contract_runtime(conn).registry.get(
+        "mf_parallel.v2",
+        version="v2",
+        revision="rev1",
+        include_deprecated=True,
+    )
     _activate_basic_graph(conn, snapshot_id, commit_sha="legacy-rev1-head")
     _insert_observer_graph_query_trace(
         conn,
@@ -133887,6 +133893,8 @@ def test_pinned_mf_parallel_rev1_preserves_legacy_qa_and_reconcile_projection(
         "contract_id": "mf_parallel.v2",
         "version": "v2",
         "revision": "rev1",
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition.get("source_sha256") or "",
         "contract_execution_id": "cex-mf-parallel-rev1-legacy",
         "completed_lines": [],
     }
@@ -134029,12 +134037,20 @@ def test_rev2_projection_requires_durable_qa_merge_reconcile_order(
     runtime_context_id = f"mfrctx-mf-parallel-rev2-temporal-{suffix}"
     trace_id = f"gqt-mf-parallel-rev2-temporal-{suffix}"
     candidate_commit = "b" * 40
+    definition = server._contract_runtime(conn).registry.get(
+        "mf_parallel.v2",
+        version="v2",
+        revision="rev2",
+        include_deprecated=True,
+    )
     record = {
         "project_id": PID,
         "backlog_id": backlog_id,
         "contract_id": "mf_parallel.v2",
         "version": "v2",
         "revision": "rev2",
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition.get("source_sha256") or "",
         "contract_execution_id": f"cex-mf-parallel-rev2-temporal-{suffix}",
         "completed_lines": [
             {
@@ -134716,12 +134732,20 @@ def test_post_worker_projection_uses_direct_parent_not_missing_ancestors(conn):
     runtime_context_id = "mfrctx-live-merge-real-child"
     backlog_id = "AC-LIVE-MERGE-REAL-BATCH-WRAPPER"
     merge_commit = "d" * 40
+    definition = server._contract_runtime(conn).registry.get(
+        "mf_parallel.v2",
+        version="v2",
+        revision="rev1",
+        include_deprecated=True,
+    )
     record = {
         "project_id": PID,
         "backlog_id": backlog_id,
         "contract_id": "mf_parallel.v2",
         "version": "v2",
         "revision": "rev1",
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition.get("source_sha256") or "",
         "contract_execution_id": child_contract_id,
         "parent_contract_execution_id": missing_parent_contract_id,
         "root_contract_execution_id": missing_root_contract_id,
@@ -154219,6 +154243,221 @@ def test_authenticated_premerge_qa_receipt_remains_materialize_only(
     assert forged_verdict["premerge_candidate_receipt_only"] is False
 
 
+@pytest.mark.parametrize(
+    ("revision", "expected"),
+    [
+        (
+            "rev7",
+            {
+                "observer_merge": "observer_integration",
+                "observer_reconcile": "observer_integration",
+                "observer_close_ready": "observer_integration",
+            },
+        ),
+        (
+            "rev9",
+            {
+                "observer_merge": "observer_lane_merge",
+                "observer_reconcile": "observer_reconcile",
+                "observer_close_ready": "observer_close",
+            },
+        ),
+    ],
+)
+def test_postworker_projected_line_stages_follow_pinned_definition(
+    conn,
+    revision,
+    expected,
+):
+    runtime = server._contract_runtime(conn)
+    definition = runtime.registry.get(
+        "mf_parallel.v2",
+        version="v2",
+        revision=revision,
+        include_deprecated=True,
+    )
+    record = {
+        "contract_id": definition["contract_id"],
+        "version": definition["version"],
+        "revision": definition["revision"],
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition.get("source_sha256") or "",
+    }
+    line_ids = tuple(expected)
+
+    assert server._contract_runtime_pinned_projected_line_stage_ids(
+        conn,
+        record=record,
+        line_ids=line_ids,
+    ) == expected
+
+    wrong_pin = dict(record)
+    wrong_pin["definition_hash"] = "sha256:" + "0" * 64
+    assert server._contract_runtime_pinned_projected_line_stage_ids(
+        conn,
+        record=wrong_pin,
+        line_ids=line_ids,
+    ) == {}
+
+
+def test_postworker_projected_line_stage_resolution_is_unique_and_complete():
+    line_ids = (
+        "observer_merge",
+        "observer_reconcile",
+        "observer_close_ready",
+    )
+    missing = {
+        "rule_layer": {
+            "stages": [
+                {
+                    "stage_id": "observer_lane_merge",
+                    "lines": [{"line_id": "observer_merge"}],
+                }
+            ]
+        }
+    }
+    ambiguous = copy.deepcopy(missing)
+    ambiguous["rule_layer"]["stages"].append(
+        {
+            "stage_id": "observer_integration",
+            "lines": [{"line_id": "observer_merge"}],
+        }
+    )
+    duplicate_same_stage = copy.deepcopy(missing)
+    duplicate_same_stage["rule_layer"]["stages"][0]["lines"].append(
+        {"line_id": "observer_merge"}
+    )
+
+    assert server._contract_runtime_definition_projected_line_stage_ids(
+        missing,
+        line_ids=line_ids,
+    ) == {}
+    assert server._contract_runtime_definition_projected_line_stage_ids(
+        ambiguous,
+        line_ids=line_ids,
+    ) == {}
+    assert server._contract_runtime_definition_projected_line_stage_ids(
+        duplicate_same_stage,
+        line_ids=line_ids,
+    ) == {}
+
+
+def test_rev9_projected_observer_stages_advance_runtime_past_duplicate_merge(
+    conn,
+):
+    runtime = server._contract_runtime(conn)
+    definition = runtime.registry.get(
+        "mf_parallel.v2",
+        version="v2",
+        revision="rev9",
+        include_deprecated=True,
+    )
+    instruction_bundle = resolve_instruction_bundle(
+        definition,
+        root=runtime.instruction_root,
+        include_content=True,
+    )
+    execution_id = "cex-rev9-projected-observer-stages"
+    identity = {
+        "runtime_context_id": "mfrctx-rev9-projected-observer-stages",
+        "task_id": "rev9-projected-observer-stages",
+        "parent_task_id": execution_id,
+        "line_instance_id": (
+            "runtime_context:mfrctx-rev9-projected-observer-stages"
+        ),
+        "worker_id": "rev9-projected-observer-worker",
+        "worker_slot_id": "rev9-projected-observer-worker",
+        "lane_id": "rev9-projected-observer-worker",
+        "worker_role": "mf_sub",
+    }
+    line_specs = [
+        ("orchestration", "observer_prefill_child_contracts", "observer", "contract_binding"),
+        ("dispatch", "observer_dispatch_bounded_workers", "observer", "dispatch_bounded_worker"),
+        ("worker_read", "worker_read_runtime_guide", "mf_sub", "read_receipt"),
+        ("worker_startup", "worker_startup", "mf_sub", "mf_subagent_startup"),
+        ("worker_context", "worker_graph_context", "mf_sub", "graph_trace"),
+        ("worker_implementation", "worker_implementation", "mf_sub", "implementation"),
+        ("worker_commit", "worker_commit", "mf_sub", "worker_commit"),
+        (
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "mf_sub",
+            "record_finish_time_worker_attestation",
+        ),
+        ("worker_finish", "worker_finish_gate", "mf_sub", "mf_subagent_finish_gate"),
+        ("observer_lane_merge", "observer_merge", "observer", "merge"),
+        ("observer_reconcile", "observer_reconcile", "observer", "reconcile"),
+    ]
+    completed_lines = []
+    for stage_id, line_id, actor_role, evidence_kind in line_specs:
+        line = {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": actor_role,
+            "evidence_kind": evidence_kind,
+            "status": "passed",
+        }
+        if stage_id not in {"orchestration", "dispatch"}:
+            line.update(identity)
+        completed_lines.append(line)
+    record = {
+        "schema_version": "contract_runtime_execution_record.v1",
+        "project_id": PID,
+        "backlog_id": "AC-REV9-PROJECTED-OBSERVER-STAGES",
+        "contract_execution_id": execution_id,
+        "parent_contract_execution_id": "",
+        "root_contract_execution_id": execution_id,
+        "contract_chain_id": "cchain-rev9-projected-observer-stages",
+        "contract_id": definition["contract_id"],
+        "version": definition["version"],
+        "revision": definition["revision"],
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition.get("source_sha256") or "",
+        "instruction_bundle_hash": instruction_bundle[
+            "instruction_bundle_hash"
+        ],
+        "route_token_ref": "",
+        "completed_lines": completed_lines,
+        "execution_state_revision": 26,
+        "execution_state": {"actor_role": "observer"},
+        "runtime_guide": {},
+        "judgment_hints": {},
+        "precheck_decision": {},
+        "role_binding": {},
+        "backlog_lineage": {},
+        "metadata": {},
+        "contract_runtime_features": {},
+    }
+
+    correct = runtime._record_view(
+        record,
+        actor_role="observer",
+        completed_lines=completed_lines,
+    )
+    legacy_stage_lines = [
+        {
+            **line,
+            "stage_id": "observer_integration",
+        }
+        if line["line_id"] in {"observer_merge", "observer_reconcile"}
+        else line
+        for line in completed_lines
+    ]
+    legacy = runtime._record_view(
+        record,
+        actor_role="observer",
+        completed_lines=legacy_stage_lines,
+    )
+
+    assert legacy["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "observer_merge"
+    )
+    assert correct["runtime_guide"]["next_legal_action"]["line_id"] in {
+        "qa_graph_context",
+        "qa_independent_verification",
+    }
+
+
 def test_premerge_qa_projects_lane_merge_without_final_qa_or_close(
     conn,
     monkeypatch,
@@ -154289,15 +154528,26 @@ def test_premerge_qa_projects_lane_merge_without_final_qa_or_close(
         },
     )
 
+    definition = server._contract_runtime(conn).registry.get(
+        "mf_parallel.v2",
+        version="v2",
+        revision="rev9",
+        include_deprecated=True,
+    )
+    record = {
+        "contract_id": definition["contract_id"],
+        "version": definition["version"],
+        "revision": definition["revision"],
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition.get("source_sha256") or "",
+        "contract_execution_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "completed_lines": [],
+    }
     lines = server._contract_runtime_projection_post_worker_lines(
         conn=conn,
         project_id=PID,
-        record={
-            "contract_id": "mf_parallel.v2",
-            "contract_execution_id": parent_task_id,
-            "backlog_id": backlog_id,
-            "completed_lines": [],
-        },
+        record=record,
         context=context,
         timeline_events=[qa_event, merge_event],
         authoritative_qa_verdict={
@@ -154310,5 +154560,5 @@ def test_premerge_qa_projects_lane_merge_without_final_qa_or_close(
         },
     )
     assert [line["line_id"] for line in lines] == ["observer_merge"]
-    assert lines[0]["stage_id"] == "observer_integration"
+    assert lines[0]["stage_id"] == "observer_lane_merge"
     assert lines[0]["lane_id"] == "premerge-projection-worker"
