@@ -2809,16 +2809,28 @@ TOOLS: list[dict] = [
     },
     {
         "name": "runtime_context_session_token_reissue",
-        "description": "Worker-authenticated Runtime Context session-token rotation facade for expired or near-expired mf_sub leases. Requires matching raw session/fence proof and never persists raw tokens.",
+        "description": "Runtime Context session-token rotation facade for expired or lost pre-startup mf_sub auth. Accepts either the server-projected copy-safe session_token_ref recovery proof or matching raw session/fence proof, and never persists raw tokens.",
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),
-            "required": [
-                "project_id",
-                "runtime_context_id",
-                "task_id",
-                "fence_token",
-                "session_token",
+            "required": ["project_id", "runtime_context_id", "task_id"],
+            "anyOf": [
+                {
+                    "required": ["session_token_ref"],
+                    "properties": {
+                        "session_token_ref": {
+                            "type": "string",
+                            "minLength": 1,
+                        },
+                    },
+                },
+                {
+                    "required": ["fence_token", "session_token"],
+                    "properties": {
+                        "fence_token": {"type": "string", "minLength": 1},
+                        "session_token": {"type": "string", "minLength": 1},
+                    },
+                },
             ],
         },
     },

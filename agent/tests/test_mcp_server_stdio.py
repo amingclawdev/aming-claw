@@ -1680,7 +1680,7 @@ def test_mcp_stdio_initial_join_schema_exposes_actual_host_identity_fields():
     }.issubset(properties)
 
 
-def test_mcp_stdio_reissue_schema_requires_worker_auth_proof():
+def test_mcp_stdio_reissue_schema_accepts_safe_ref_or_raw_worker_auth_proof():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
     ])
@@ -1689,12 +1689,41 @@ def test_mcp_stdio_reissue_schema_requires_worker_auth_proof():
     assert stderr == ""
     tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
     schema = tools["runtime_context_session_token_reissue"]["inputSchema"]
+    expected_schema = {
+        "required": [
+            "project_id",
+            "runtime_context_id",
+            "task_id",
+        ],
+        "anyOf": [
+            {
+                "required": ["session_token_ref"],
+                "properties": {
+                    "session_token_ref": {"type": "string", "minLength": 1},
+                },
+            },
+            {
+                "required": ["fence_token", "session_token"],
+                "properties": {
+                    "fence_token": {"type": "string", "minLength": 1},
+                    "session_token": {"type": "string", "minLength": 1},
+                },
+            },
+        ],
+    }
+    assert schema["required"] == expected_schema["required"]
+    assert schema["anyOf"] == expected_schema["anyOf"]
+    standalone_schema = next(
+        tool["inputSchema"]
+        for tool in governance_mcp_server.TOOLS
+        if tool["name"] == "runtime_context_session_token_reissue"
+    )
+    assert standalone_schema["required"] == expected_schema["required"]
+    assert standalone_schema["anyOf"] == expected_schema["anyOf"]
     assert {
         "project_id",
         "runtime_context_id",
         "task_id",
-        "fence_token",
-        "session_token",
     }.issubset(schema["required"])
     assert {
         "parent_task_id",
@@ -2539,6 +2568,58 @@ def test_mcp_dispatcher_runtime_context_reissue_posts_canonical_facade():
                 "session_token": "old-session-token",
                 "fence_token": "fence-reissue",
                 "ttl_seconds": 1200,
+            },
+        )
+    ]
+
+
+def test_mcp_dispatcher_runtime_context_reissue_forwards_safe_ref_recovery_body():
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return {"ok": True, "status": "session_token_reissued"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    safe_ref_body = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-safe-ref-reissue",
+        "contract_execution_id": "cex-safe-ref-reissue",
+        "task_id": "worker-safe-ref-reissue",
+        "parent_task_id": "cex-safe-ref-reissue",
+        "target_project_root": "/repo/safe-ref-fixture",
+        "worker_id": "worker-safe-ref-reissue",
+        "worker_slot_id": "worker-safe-ref-reissue",
+        "agent_id": "worker-safe-ref-reissue",
+        "allocation_owner": "worker-safe-ref-reissue",
+        "actual_host_worker_id": "worker-safe-ref-reissue",
+        "worker_session_id": "session-safe-ref-reissue",
+        "host_session_id": "session-safe-ref-reissue",
+        "session_token_ref": "wstok-safe-ref-reissue",
+        "reason": "recover the joined pre-startup host envelope",
+        "ttl_seconds": 1200,
+    }
+
+    result = dispatcher.dispatch(
+        "runtime_context_session_token_reissue",
+        safe_ref_body,
+    )
+
+    assert result == {"ok": True, "status": "session_token_reissued"}
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            "mfrctx-safe-ref-reissue/session-token/reissue",
+            {
+                key: value
+                for key, value in safe_ref_body.items()
+                if key != "project_id"
             },
         )
     ]
