@@ -117808,6 +117808,144 @@ _DIRECT_MAIN_CONTRACT_TRANSITION_SCHEMA = (
     "operator_supervised_direct_main.contract_transition.v1"
 )
 _DIRECT_MAIN_CONTRACT_TRANSITION_MODES = {"revise_scope", "expand_scope"}
+_PARENTLESS_DIRECT_MAIN_TEST_RESULTS_SCHEMA = (
+    "parentless_direct_main.test_results.v1"
+)
+
+
+def _parentless_direct_main_test_results_template(
+    *,
+    commit_sha: str,
+    command_placeholder: str,
+) -> dict[str, Any]:
+    """Return the only executable test-results shape for Direct Main."""
+
+    return {
+        "schema_version": _PARENTLESS_DIRECT_MAIN_TEST_RESULTS_SCHEMA,
+        "status": "passed",
+        "passed": True,
+        "commit_sha": str(commit_sha or "").strip(),
+        "commands": [
+            {
+                "command": str(command_placeholder or "").strip(),
+                "status": "passed",
+                "exit_code": 0,
+            }
+        ],
+    }
+
+
+def _contract_runtime_parentless_direct_main_test_results_gate(
+    value: Any,
+    *,
+    expected_commit: str,
+    field: str,
+) -> dict[str, Any]:
+    """Validate command-backed, commit-bound Direct Main test evidence."""
+
+    normalized_commit = str(expected_commit or "").strip().lower()
+    supplied = dict(value) if isinstance(value, Mapping) else {}
+    validation = worker_implementation_test_results_validation(supplied)
+    canonical = (
+        dict(validation.get("canonical_test_results"))
+        if isinstance(validation.get("canonical_test_results"), Mapping)
+        else {}
+    )
+    missing: list[str] = []
+    mismatches: list[dict[str, Any]] = []
+    if validation.get("accepted") is not True:
+        missing.append("canonical_test_results")
+        mismatches.append(
+            {
+                "field": str(validation.get("field") or field),
+                "expected": "finish-compatible structured test_results",
+                "actual": str(validation.get("reason") or "invalid"),
+            }
+        )
+    if str(canonical.get("schema_version") or "").strip() != (
+        _PARENTLESS_DIRECT_MAIN_TEST_RESULTS_SCHEMA
+    ):
+        missing.append("canonical_test_results_schema")
+    if str(canonical.get("status") or "").strip().lower() != "passed":
+        missing.append("canonical_test_results_status")
+    if canonical.get("passed") is not True:
+        missing.append("canonical_test_results_boolean_verdict")
+    supplied_commit = str(canonical.get("commit_sha") or "").strip().lower()
+    if not normalized_commit or supplied_commit != normalized_commit:
+        missing.append("canonical_test_results_commit_binding")
+        mismatches.append(
+            {
+                "field": f"{field}.commit_sha",
+                "expected": normalized_commit,
+                "actual": supplied_commit,
+            }
+        )
+    commands = canonical.get("commands")
+    command_values: list[str] = []
+    if not isinstance(commands, list) or not commands:
+        missing.append("canonical_test_results_commands_nonempty")
+    else:
+        for index, raw_command in enumerate(commands):
+            command = dict(raw_command) if isinstance(raw_command, Mapping) else {}
+            command_text = str(command.get("command") or "").strip()
+            command_status = str(command.get("status") or "").strip().lower()
+            exit_code = command.get("exit_code")
+            if (
+                not command_text
+                or (
+                    command_text.startswith("<")
+                    and command_text.endswith(">")
+                )
+                or command_status != "passed"
+                or isinstance(exit_code, bool)
+                or exit_code != 0
+            ):
+                missing.append("canonical_test_results_commands_passing")
+                mismatches.append(
+                    {
+                        "field": f"{field}.commands[{index}]",
+                        "expected": (
+                            "non-placeholder command with status=passed and "
+                            "exit_code=0"
+                        ),
+                        "actual": {
+                            "command_present": bool(command_text),
+                            "status": command_status,
+                            "exit_code": exit_code,
+                        },
+                    }
+                )
+                continue
+            command_values.append(command_text)
+    if len(command_values) != len(set(command_values)):
+        missing.append("canonical_test_results_commands_unique")
+    missing = list(dict.fromkeys(missing))
+    passed = bool(canonical) and not missing
+    authority = {
+        "schema_version": (
+            "parentless_direct_main.test_results_authority.v1"
+        ),
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "field": field,
+        "expected_commit": normalized_commit,
+        "command_count": len(command_values),
+        "missing_requirement_ids": missing,
+        "mismatches": mismatches,
+        "validator": validation,
+        "canonical_test_results": canonical if passed else {},
+        "server_validated": True,
+        "caller_aliases_accepted": False,
+        "historical_backfill_allowed": False,
+    }
+    authority["authority_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in authority.items()
+            if key != "authority_hash"
+        }
+    )
+    return authority
 
 
 def _onboard_parentless_direct_main_event_is_accepted(
@@ -118533,6 +118671,9 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
     full_reconcile_snapshot_placeholder = (
         "<replace with the active current-HEAD full reconcile snapshot id>"
     )
+    test_commands_placeholder = (
+        "<replace with one or more exact commands that passed for this commit>"
+    )
     identity_ready = all(
         [
             str(project_id or "").strip(),
@@ -118554,6 +118695,10 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
         "commit_sha": close_commit_placeholder,
         "payload": {
             "changed_files": changed_files_placeholder,
+            "test_results": _parentless_direct_main_test_results_template(
+                commit_sha=close_commit_placeholder,
+                command_placeholder=test_commands_placeholder,
+            ),
             "dirty_scope_check": {
                 "allowed_files": allowed_files,
                 "changed_files": changed_files_placeholder,
@@ -118591,6 +118736,10 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
                 "status": "passed",
                 "commit_sha": close_commit_placeholder,
             },
+            "test_results": _parentless_direct_main_test_results_template(
+                commit_sha=close_commit_placeholder,
+                command_placeholder=test_commands_placeholder,
+            ),
             "graph_reconciled": True,
             "preflight_ok": True,
             "full_reconcile_snapshot": {
@@ -118631,12 +118780,14 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
             "replace_before_submit": [
                 "commit_sha",
                 "payload.changed_files",
+                "payload.test_results.commands",
                 "payload.dirty_scope_check.changed_files",
                 "payload.diff_check.changed_files",
             ],
             "same_value_replacements": {
                 close_commit_placeholder: [
                     "commit_sha",
+                    "payload.test_results.commit_sha",
                 ],
                 changed_files_placeholder: [
                     "payload.changed_files",
@@ -118646,6 +118797,7 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
             },
             "required_canonical_fields": [
                 "payload.changed_files",
+                "payload.test_results",
                 "payload.dirty_scope_check or payload.diff_check",
             ],
             "ordering": (
@@ -118661,6 +118813,7 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
                 "verification.runtime_sync.commit_sha",
                 "verification.governance_redeploy.commit_sha",
                 "verification.live_regression.commit_sha",
+                "verification.test_results.commands",
                 "verification.full_reconcile_snapshot.snapshot_id",
                 "verification.full_reconcile_snapshot.commit_sha",
                 "payload.close_commit",
@@ -118672,6 +118825,7 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
                     "verification.runtime_sync.commit_sha",
                     "verification.governance_redeploy.commit_sha",
                     "verification.live_regression.commit_sha",
+                    "verification.test_results.commit_sha",
                     "verification.full_reconcile_snapshot.commit_sha",
                     "payload.close_commit",
                 ],
@@ -118686,6 +118840,7 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
                     "verification.governance_redeploy"
                 ),
                 "verification.live_regression",
+                "verification.test_results",
                 "verification.graph_reconciled=true",
                 "verification.preflight_ok=true",
             ],
@@ -118737,6 +118892,7 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
             "implementation": {
                 "required": [
                     "changed_files",
+                    "test_results",
                     "dirty_scope_check or diff_check",
                 ],
                 "non_satisfying_aliases": ["dirty_scope_exact_match"],
@@ -118745,6 +118901,7 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
                 "required": [
                     "runtime_sync or governance_redeploy",
                     "live_regression",
+                    "test_results",
                     "graph_reconciled=true",
                     "preflight_ok=true",
                 ],
@@ -118754,9 +118911,9 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
                 ],
             },
             "warning": (
-                "dirty_scope_exact_match, redeploy_runtime_sync, and "
-                "active_full_reconcile are descriptive aliases only and do "
-                "not satisfy the parentless direct-main close gate."
+                "dirty_scope_exact_match, redeploy_runtime_sync, descriptive "
+                "test summaries, and active_full_reconcile are aliases only "
+                "and do not satisfy the parentless direct-main close gate."
             ),
         },
         "authoritative_close_failure_policy": {
@@ -118810,6 +118967,7 @@ def _onboard_parentless_direct_main_compact_evidence_guidance(
     approval_ref = "<operator approval reference>"
     close_commit_ref = "<exact closing HEAD commit>"
     snapshot_ref = "<active current-HEAD full snapshot id>"
+    test_command_ref = "<exact command that passed for this commit>"
     common = {
         "project_id": str(project_id or "").strip(),
         "backlog_id": str(backlog_id or "").strip(),
@@ -118823,17 +118981,9 @@ def _onboard_parentless_direct_main_compact_evidence_guidance(
         ),
         "immutable_allowed_files": allowed_files,
         "same_value_replacements": {
-            allowed_files_ref: [
-                "pre_mutation.verification.dirty_scope.allowed_files",
-                "pre_mutation.artifact_refs.allowed_files",
-                "implementation.payload.dirty_scope_check.allowed_files",
-            ],
-            changed_files_ref: [
-                "implementation.payload.changed_files",
-                "implementation.payload.dirty_scope_check.changed_files",
-            ],
             close_commit_ref: [
                 "implementation.commit_sha",
+                "implementation.payload.test_results.commit_sha",
                 "close_ready.commit_sha",
                 "close_ready.verification.runtime_sync.commit_sha",
                 "close_ready.verification.live_regression.commit_sha",
@@ -118880,6 +119030,10 @@ def _onboard_parentless_direct_main_compact_evidence_guidance(
             "commit_sha": close_commit_ref,
             "payload": {
                 "changed_files": changed_files_ref,
+                "test_results": _parentless_direct_main_test_results_template(
+                    commit_sha=close_commit_ref,
+                    command_placeholder=test_command_ref,
+                ),
                 "dirty_scope_check": {
                     "allowed_files": allowed_files_ref,
                     "changed_files": changed_files_ref,
@@ -118909,6 +119063,10 @@ def _onboard_parentless_direct_main_compact_evidence_guidance(
                     "status": "passed",
                     "commit_sha": close_commit_ref,
                 },
+                "test_results": (
+                    "<copy implementation.payload.test_results after deployed "
+                    "commands pass>"
+                ),
                 "graph_reconciled": True,
                 "preflight_ok": True,
                 "full_reconcile_snapshot": {
@@ -119708,6 +119866,7 @@ def _onboard_contract_route_guide(
                     "commit_binding": "commit_sha must equal the close commit",
                     "required_payload_fields": [
                         "changed_files",
+                        "test_results",
                         "diff_check or dirty_scope_check",
                     ],
                     "copy_safe_event": (
@@ -119757,6 +119916,7 @@ def _onboard_contract_route_guide(
                     "required_payload_fields": [
                         "one accepted_redeploy_fields value",
                         "one accepted_live_regression_fields value",
+                        "test_results",
                         "graph_reconciled",
                         "preflight_ok",
                     ],
@@ -143191,6 +143351,36 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
             {"preflight_ok", "preflight_passed"},
         )
     )
+    implementation_payload = (
+        implementation.get("payload")
+        if isinstance(implementation.get("payload"), Mapping)
+        else {}
+    )
+    implementation_test_results_gate = (
+        _contract_runtime_parentless_direct_main_test_results_gate(
+            implementation_payload.get("test_results"),
+            expected_commit=str(implementation.get("commit_sha") or ""),
+            field="implementation.payload.test_results",
+        )
+    )
+    close_ready_verification = (
+        body.get("verification")
+        if isinstance(body.get("verification"), Mapping)
+        else {}
+    )
+    close_ready_test_results_gate = (
+        _contract_runtime_parentless_direct_main_test_results_gate(
+            close_ready_verification.get("test_results"),
+            expected_commit=str(body.get("commit_sha") or ""),
+            field="close_ready.verification.test_results",
+        )
+    )
+    checks["implementation_canonical_test_results"] = (
+        implementation_test_results_gate.get("passed") is True
+    )
+    checks["close_ready_canonical_test_results"] = (
+        close_ready_test_results_gate.get("passed") is True
+    )
     missing = [key for key, passed in checks.items() if not passed]
     aliases = {
         alias: task_timeline._event_has_evidence(prospective, {alias})
@@ -143219,7 +143409,15 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
             ),
             "graph_reconciled": ["graph_reconciled=true"],
             "preflight_ok": ["preflight_ok=true"],
+            "implementation_canonical_test_results": [
+                "implementation.payload.test_results"
+            ],
+            "close_ready_canonical_test_results": [
+                "close_ready.verification.test_results"
+            ],
         },
+        "implementation_test_results_gate": implementation_test_results_gate,
+        "close_ready_test_results_gate": close_ready_test_results_gate,
         "non_satisfying_aliases": [
             alias for alias, present in aliases.items() if present
         ],
@@ -143231,6 +143429,127 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
             "mutates_backlog_chain": False,
         },
         "selected_scope": selected_scope,
+    }
+
+
+def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    event_kind: str,
+    normalized_status: str,
+    normalized_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Require canonical test evidence before a Direct Main implementation write."""
+
+    from . import task_timeline
+
+    if task_timeline._close_event_key({"event_kind": event_kind}) != (
+        "implementation"
+    ):
+        return {}
+    prospective = {
+        "event_kind": event_kind,
+        "status": normalized_status,
+        "payload": dict(normalized_payload or {}),
+    }
+    if not task_timeline._event_passed(prospective):
+        return {}
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    if not backlog_id or not task_id:
+        return {}
+    selected_scope = _contract_runtime_parentless_direct_main_selected_scope(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=str(body.get("route_token_ref") or "").strip(),
+        rebuild_if_missing=False,
+    )
+    if (
+        selected_scope.get("resolved") is not True
+        or str(selected_scope.get("contract_execution_id") or "").strip()
+        != task_id
+    ):
+        return {}
+    events = task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        limit=1000,
+    )
+    direct_events = [
+        event
+        for event in events
+        if isinstance(event.get("payload"), Mapping)
+        and isinstance(
+            event["payload"].get("observer_direct_pre_mutation_authority"),
+            Mapping,
+        )
+        and event["payload"]["observer_direct_pre_mutation_authority"].get(
+            "accepted"
+        )
+        is True
+        and event["payload"]["observer_direct_pre_mutation_authority"].get(
+            "server_projected"
+        )
+        is True
+        and str(
+            event["payload"]["observer_direct_pre_mutation_authority"].get(
+                "projection_source"
+            )
+            or ""
+        ).strip()
+        == "task_timeline_append_pre_persistence_gate"
+    ]
+    if not direct_events:
+        return {}
+    alias_fields = []
+    for container_name, container in (
+        ("top_level", body),
+        (
+            "verification",
+            body.get("verification")
+            if isinstance(body.get("verification"), Mapping)
+            else {},
+        ),
+        (
+            "artifact_refs",
+            body.get("artifact_refs")
+            if isinstance(body.get("artifact_refs"), Mapping)
+            else {},
+        ),
+    ):
+        if "test_results" in container:
+            alias_fields.append(f"{container_name}.test_results")
+    test_results_gate = _contract_runtime_parentless_direct_main_test_results_gate(
+        normalized_payload.get("test_results"),
+        expected_commit=str(body.get("commit_sha") or ""),
+        field="implementation.payload.test_results",
+    )
+    missing = list(test_results_gate.get("missing_requirement_ids") or [])
+    if alias_fields:
+        missing.append("canonical_test_results_payload_only")
+    missing = list(dict.fromkeys(missing))
+    passed = test_results_gate.get("passed") is True and not alias_fields
+    return {
+        "schema_version": (
+            "parentless_direct_main.implementation_prewrite_gate.v1"
+        ),
+        "applicable": True,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": task_id,
+        "test_results_gate": test_results_gate,
+        "non_satisfying_alias_fields": alias_fields,
+        "missing_requirement_ids": missing,
+        "selected_scope": selected_scope,
+        "zero_write_on_failure": True,
+        "historical_backfill_allowed": False,
     }
 
 
@@ -143592,6 +143911,24 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
         and (close_satisfying or superseding_failure)
     ):
         return {}
+
+    implementation_payload = (
+        implementation_event.get("payload")
+        if isinstance(implementation_event.get("payload"), Mapping)
+        else {}
+    )
+    implementation_test_results_gate = (
+        _contract_runtime_parentless_direct_main_test_results_gate(
+            implementation_payload.get("test_results"),
+            expected_commit=normalized_commit,
+            field="implementation.payload.test_results",
+        )
+    )
+    if implementation_test_results_gate.get("passed") is not True:
+        return {}
+    canonical_implementation_test_results = dict(
+        implementation_test_results_gate.get("canonical_test_results") or {}
+    )
 
     payload = (
         dict(event.get("payload"))
@@ -143960,19 +144297,34 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
         "verdict_status": verdict_status,
         "close_satisfying": close_satisfying,
         "superseding_failure": superseding_failure,
+        "canonical_implementation_test_results_bound": True,
+        "implementation_test_results_authority_hash": (
+            implementation_test_results_gate.get("authority_hash")
+        ),
     }
     normalized_event["payload"] = normalized_payload
 
-    if close_satisfying and (
-        not task_timeline._event_has_test_evidence(normalized_event)
-        and task_timeline._event_has_test_evidence(dict(implementation_event))
-    ):
+    if close_satisfying:
         normalized_verification = dict(normalized_event.get("verification") or {})
-        normalized_verification["test_results"] = {
-            "schema_version": "parentless_direct_main.implementation_test_projection.v1",
+        normalized_verification["test_results"] = (
+            canonical_implementation_test_results
+        )
+        normalized_verification[
+            "direct_main_implementation_test_results_authority"
+        ] = {
+            "schema_version": (
+                "parentless_direct_main.implementation_test_projection.v2"
+            ),
             "read_only_projection": True,
             "source_event_id": implementation_id,
             "source_commit_sha": normalized_commit,
+            "canonical_test_results_hash": stable_sha256(
+                canonical_implementation_test_results
+            ),
+            "source_authority_hash": implementation_test_results_gate.get(
+                "authority_hash"
+            ),
+            "persisted_timeline_mutated": False,
         }
         normalized_event["verification"] = normalized_verification
 
@@ -148807,6 +149159,47 @@ def handle_task_timeline_append(ctx: RequestContext):
                 norm_payload["contract_runtime_canonical_line"] = dict(
                     canonical_contract_line
                 )
+        direct_main_implementation_prewrite_gate = (
+            _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
+                conn,
+                project_id=project_id,
+                body=ctx.body or {},
+                event_kind=norm_event_kind,
+                normalized_status=norm_status,
+                normalized_payload=norm_payload,
+            )
+        )
+        if (
+            direct_main_implementation_prewrite_gate.get("applicable") is True
+            and direct_main_implementation_prewrite_gate.get("passed") is not True
+        ):
+            raise GovernanceError(
+                "parentless_direct_main_implementation_test_evidence_incomplete",
+                (
+                    "parentless direct-main implementation test evidence is "
+                    "incomplete and was not persisted"
+                ),
+                422,
+                {
+                    **direct_main_implementation_prewrite_gate,
+                    "source": (
+                        "server.handle_task_timeline_append."
+                        "parentless_direct_main_implementation_prewrite_gate"
+                    ),
+                    "guide": {
+                        "correction": (
+                            "refresh onboard_route_guide and submit the exact "
+                            "payload.test_results object after replacing its "
+                            "commit and command placeholders"
+                        ),
+                        "accepted_aliases": [],
+                    },
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "persisted_as_accepted": False,
+                    "historical_backfill_allowed": False,
+                },
+            )
         direct_main_close_ready_prewrite_gate = (
             _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
                 conn,

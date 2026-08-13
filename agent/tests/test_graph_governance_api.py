@@ -464,7 +464,11 @@ def test_exact_candidate_post_merge_qa_accepts_parentless_direct_main_without_ru
                 "route_token_ref": route_token_ref,
                 "payload": {
                     "changed_files": ["agent/governance/server.py"],
-                    "test_results": {"focused": "passed"},
+                    "test_results": (
+                        _canonical_parentless_direct_main_test_results(
+                            candidate_commit
+                        )
+                    ),
                 },
             },
         )
@@ -80630,6 +80634,22 @@ def _canonical_parentless_direct_main_pre_mutation_body(
     }
 
 
+def _canonical_parentless_direct_main_test_results(
+    commit_sha: str,
+    *,
+    command: str = "pytest -q agent/tests/test_graph_governance_api.py",
+) -> dict[str, Any]:
+    return {
+        "schema_version": "parentless_direct_main.test_results.v1",
+        "status": "passed",
+        "passed": True,
+        "commit_sha": commit_sha,
+        "commands": [
+            {"command": command, "status": "passed", "exit_code": 0}
+        ],
+    }
+
+
 def _parentless_direct_main_pre_mutation_graph_scope(
     conn,
     *,
@@ -80742,6 +80762,118 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
             ),
         )
     )
+    commit_sha = "f" * 40
+    canonical_test_results = {
+        "schema_version": "parentless_direct_main.test_results.v1",
+        "status": "passed",
+        "passed": True,
+        "commit_sha": commit_sha,
+        "commands": [
+            {"command": "pytest -q", "status": "passed", "exit_code": 0}
+        ],
+    }
+    events_before_invalid_implementation = len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            limit=1000,
+        )
+    )
+    with pytest.raises(GovernanceError) as missing_implementation_tests:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    **append_base,
+                    "event_type": "observer.implementation",
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "passed",
+                    "actor": "observer",
+                    "commit_sha": commit_sha,
+                    "payload": {
+                        **route_identity,
+                        "changed_files": ["agent/governance/server.py"],
+                        "dirty_scope_check": {
+                            "allowed_files": ["agent/governance/server.py"],
+                            "changed_files": ["agent/governance/server.py"],
+                            "unexpected_files": [],
+                            "exact_match": True,
+                        },
+                    },
+                },
+            )
+        )
+    assert missing_implementation_tests.value.code == (
+        "parentless_direct_main_implementation_test_evidence_incomplete"
+    )
+    assert missing_implementation_tests.value.details["zero_write_rejection"] is True
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            limit=1000,
+        )
+    ) == events_before_invalid_implementation
+    for invalid_test_results in (
+        {**canonical_test_results, "status": "failed", "passed": False},
+        {**canonical_test_results, "passed": 1},
+        {**canonical_test_results, "commands": []},
+        {**canonical_test_results, "commit_sha": "e" * 40},
+    ):
+        with pytest.raises(GovernanceError) as invalid_implementation_tests:
+            server.handle_task_timeline_append(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body={
+                        **append_base,
+                        "event_type": "observer.implementation",
+                        "event_kind": "implementation",
+                        "phase": "implementation",
+                        "status": "passed",
+                        "actor": "observer",
+                        "commit_sha": commit_sha,
+                        "payload": {
+                            **route_identity,
+                            "changed_files": ["agent/governance/server.py"],
+                            "test_results": invalid_test_results,
+                            "dirty_scope_check": {
+                                "allowed_files": [
+                                    "agent/governance/server.py"
+                                ],
+                                "changed_files": [
+                                    "agent/governance/server.py"
+                                ],
+                                "unexpected_files": [],
+                                "exact_match": True,
+                            },
+                        },
+                    },
+                )
+            )
+        assert invalid_implementation_tests.value.code == (
+            "parentless_direct_main_implementation_test_evidence_incomplete"
+        )
+        assert invalid_implementation_tests.value.details[
+            "writes_performed"
+        ] is False
+        assert len(
+            task_timeline.list_events(
+                conn,
+                PID,
+                backlog_id=backlog_id,
+                task_id=parent_execution_id,
+                limit=1000,
+            )
+        ) == events_before_invalid_implementation
     implementation = server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
@@ -80754,10 +80886,11 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
                 "phase": "implementation",
                 "status": "passed",
                 "actor": "observer",
-                "commit_sha": "f" * 40,
+                "commit_sha": commit_sha,
                 "payload": {
                     **route_identity,
                     "changed_files": ["agent/governance/server.py"],
+                    "test_results": canonical_test_results,
                     "dirty_scope_check": {
                         "allowed_files": ["agent/governance/server.py"],
                         "changed_files": ["agent/governance/server.py"],
@@ -80794,14 +80927,48 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
         "phase": "close_ready",
         "status": "passed",
         "actor": "observer",
-        "commit_sha": "f" * 40,
+        "commit_sha": commit_sha,
         "verification": {
             "redeploy_runtime_sync": {"status": "passed"},
             "active_full_reconcile": {"status": "passed"},
             "live_regression": {"status": "passed"},
+            "test_results": canonical_test_results,
         },
-        "payload": {**route_identity, "close_commit": "f" * 40},
+        "payload": {**route_identity, "close_commit": commit_sha},
     }
+    with pytest.raises(GovernanceError) as missing_close_ready_tests:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    **alias_only,
+                    "verification": {
+                        "runtime_sync": {"status": "passed"},
+                        "live_regression": {"status": "passed"},
+                        "graph_reconciled": True,
+                        "preflight_ok": True,
+                    },
+                },
+            )
+        )
+    assert missing_close_ready_tests.value.code == (
+        "parentless_direct_main_close_ready_canonical_evidence_incomplete"
+    )
+    assert missing_close_ready_tests.value.details["missing_requirement_ids"] == [
+        "close_ready_canonical_test_results"
+    ]
+    assert missing_close_ready_tests.value.details["writes_performed"] is False
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            limit=1000,
+        )
+    ) == event_count_before
     with pytest.raises(GovernanceError) as rejected:
         server.handle_task_timeline_append(
             _ctx_with_role(
@@ -80862,6 +81029,7 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
                     "verification": {
                         "runtime_sync": {"status": "failed"},
                         "live_regression": {"status": "failed"},
+                        "test_results": canonical_test_results,
                         "graph_reconciled": False,
                         "preflight_ok": False,
                     },
@@ -80894,6 +81062,7 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
                 "verification": {
                     "runtime_sync": {"status": "passed"},
                     "live_regression": {"status": "passed"},
+                    "test_results": canonical_test_results,
                     "graph_reconciled": True,
                     "preflight_ok": True,
                 },
@@ -80943,6 +81112,112 @@ def test_parentless_direct_main_close_ready_prewrite_gate_preserves_nonapplicabl
         normalized_status="failed",
         normalized_payload=route_identity,
     ) == {}
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_missing"),
+    [
+        (lambda value: {}, "canonical_test_results"),
+        (
+            lambda value: {**value, "status": "failed", "passed": False},
+            "canonical_test_results_status",
+        ),
+        (
+            lambda value: {**value, "passed": 1},
+            "canonical_test_results",
+        ),
+        (
+            lambda value: {**value, "commands": []},
+            "canonical_test_results_commands_nonempty",
+        ),
+        (
+            lambda value: {
+                **value,
+                "commands": [
+                    {
+                        "command": "<placeholder>",
+                        "status": "passed",
+                        "exit_code": 0,
+                    }
+                ],
+            },
+            "canonical_test_results_commands_passing",
+        ),
+        (
+            lambda value: {
+                **value,
+                "commands": [
+                    {
+                        "command": "pytest -q",
+                        "status": "failed",
+                        "exit_code": 1,
+                    }
+                ],
+            },
+            "canonical_test_results_commands_passing",
+        ),
+        (
+            lambda value: {**value, "commit_sha": "e" * 40},
+            "canonical_test_results_commit_binding",
+        ),
+        (
+            lambda value: {
+                **value,
+                "commands": [value["commands"][0], value["commands"][0]],
+            },
+            "canonical_test_results_commands_unique",
+        ),
+    ],
+)
+def test_parentless_direct_main_test_results_gate_rejects_noncanonical_evidence(
+    mutate,
+    expected_missing,
+):
+    commit_sha = "f" * 40
+    canonical = {
+        "schema_version": "parentless_direct_main.test_results.v1",
+        "status": "passed",
+        "passed": True,
+        "commit_sha": commit_sha,
+        "commands": [
+            {"command": "pytest -q", "status": "passed", "exit_code": 0}
+        ],
+    }
+    gate = server._contract_runtime_parentless_direct_main_test_results_gate(
+        mutate(copy.deepcopy(canonical)),
+        expected_commit=commit_sha,
+        field="implementation.payload.test_results",
+    )
+    assert gate["passed"] is False
+    assert expected_missing in gate["missing_requirement_ids"]
+    assert gate["canonical_test_results"] == {}
+    assert gate["historical_backfill_allowed"] is False
+
+
+def test_parentless_direct_main_test_results_gate_accepts_exact_command_results():
+    commit_sha = "f" * 40
+    canonical = {
+        "schema_version": "parentless_direct_main.test_results.v1",
+        "status": "passed",
+        "passed": True,
+        "commit_sha": commit_sha,
+        "commands": [
+            {"command": "pytest -q", "status": "passed", "exit_code": 0},
+            {
+                "command": "git diff --check",
+                "status": "passed",
+                "exit_code": 0,
+            },
+        ],
+    }
+    gate = server._contract_runtime_parentless_direct_main_test_results_gate(
+        canonical,
+        expected_commit=commit_sha,
+        field="implementation.payload.test_results",
+    )
+    assert gate["passed"] is True
+    assert gate["canonical_test_results"] == canonical
+    assert gate["command_count"] == 2
 
 
 def test_task_timeline_append_missing_route_ref_is_complete_zero_write_then_corrects(
@@ -91181,8 +91456,8 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         (
             "observer_materialized_missing_tests",
             "",
-            False,
-            "tests_or_test_results",
+            True,
+            "",
         ),
         (
             "observer_materialized",
@@ -91683,17 +91958,21 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 "commit_sha": close_commit,
                 "payload": {
                     **route_identity,
-                    **(
-                        {
-                            "test_results": {
+                    "test_results": {
+                        "schema_version": (
+                            "parentless_direct_main.test_results.v1"
+                        ),
+                        "status": "passed",
+                        "passed": True,
+                        "commit_sha": close_commit,
+                        "commands": [
+                            {
+                                "command": "python3 -m pytest -q focused",
                                 "status": "passed",
-                                "commands": ["python3 -m pytest -q focused"],
+                                "exit_code": 0,
                             }
-                        }
-                        if qa_append_mode
-                        == "observer_materialized_implementation_tests"
-                        else {}
-                    ),
+                        ],
+                    },
                     "changed_files": [
                         "agent/governance/server.py",
                         "agent/tests/test_graph_governance_api.py",
@@ -92238,6 +92517,21 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                     "graph_reconciled": True,
                     "preflight_ok": True,
                     "live_regression": {"status": "passed"},
+                    "test_results": {
+                        "schema_version": (
+                            "parentless_direct_main.test_results.v1"
+                        ),
+                        "status": "passed",
+                        "passed": True,
+                        "commit_sha": close_commit,
+                        "commands": [
+                            {
+                                "command": "python3 -m pytest -q focused",
+                                "status": "passed",
+                                "exit_code": 0,
+                            }
+                        ],
+                    },
                 },
                 "payload": {**route_identity, "close_commit": close_commit},
             },
@@ -93495,6 +93789,7 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     ]
     assert implementation_shape["required_payload_fields"] == [
         "changed_files",
+        "test_results",
         "diff_check or dirty_scope_check",
     ]
     assert qa_shape["accepted_event_kinds"] == [
@@ -93526,6 +93821,21 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     changed_files_placeholder = post_mutation["implementation"][
         "arguments_template"
     ]["payload"]["changed_files"]
+    implementation_test_results = post_mutation["implementation"][
+        "arguments_template"
+    ]["payload"]["test_results"]
+    close_ready_test_results = post_mutation["close_ready"][
+        "arguments_template"
+    ]["verification"]["test_results"]
+    assert implementation_test_results["schema_version"] == (
+        "parentless_direct_main.test_results.v1"
+    )
+    assert implementation_test_results["status"] == "passed"
+    assert implementation_test_results["passed"] is True
+    assert implementation_test_results["commands"][0]["exit_code"] == 0
+    assert close_ready_test_results["schema_version"] == (
+        "parentless_direct_main.test_results.v1"
+    )
     assert changed_files_placeholder.startswith(
         "<replace with the exact changed-files list"
     )
@@ -93568,6 +93878,7 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "implementation": {
             "required": [
                 "changed_files",
+                "test_results",
                 "dirty_scope_check or diff_check",
             ],
             "non_satisfying_aliases": ["dirty_scope_exact_match"],
@@ -93576,6 +93887,7 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
             "required": [
                 "runtime_sync or governance_redeploy",
                 "live_regression",
+                "test_results",
                 "graph_reconciled=true",
                 "preflight_ok=true",
             ],
@@ -93585,9 +93897,9 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
             ],
         },
         "warning": (
-            "dirty_scope_exact_match, redeploy_runtime_sync, and "
-            "active_full_reconcile are descriptive aliases only and do "
-            "not satisfy the parentless direct-main close gate."
+            "dirty_scope_exact_match, redeploy_runtime_sync, descriptive "
+            "test summaries, and active_full_reconcile are aliases only "
+            "and do not satisfy the parentless direct-main close gate."
         ),
     }
     assert post_mutation["authoritative_close_failure_policy"][
@@ -93745,6 +94057,16 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     implementation_arguments["payload"]["diff_check"][
         "changed_files"
     ] = actual_changed_files
+    implementation_arguments["payload"]["test_results"][
+        "commit_sha"
+    ] = close_commit
+    implementation_arguments["payload"]["test_results"]["commands"] = [
+        {
+            "command": "pytest -q agent/tests/test_graph_governance_api.py",
+            "status": "passed",
+            "exit_code": 0,
+        }
+    ]
     server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
@@ -93777,6 +94099,9 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     close_ready_arguments["verification"]["live_regression"][
         "commit_sha"
     ] = close_commit
+    close_ready_arguments["verification"]["test_results"] = copy.deepcopy(
+        implementation_arguments["payload"]["test_results"]
+    )
     close_ready_arguments["verification"]["full_reconcile_snapshot"][
         "snapshot_id"
     ] = "full-parentless-direct-main-guide-shapes"
@@ -94120,6 +94445,11 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
                         "agent/governance/server.py",
                         "agent/tests/test_graph_governance_api.py",
                     ],
+                    "test_results": (
+                        _canonical_parentless_direct_main_test_results(
+                            close_commit
+                        )
+                    ),
                     "dirty_scope_check": {"unexpected_files": []},
                 },
             },
@@ -94151,6 +94481,11 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
                     "graph_reconciled": True,
                     "preflight_ok": True,
                     "live_regression": {"status": "passed"},
+                    "test_results": (
+                        _canonical_parentless_direct_main_test_results(
+                            close_commit
+                        )
+                    ),
                 },
                 "payload": {**route_identity, "close_commit": close_commit},
             },
@@ -94233,6 +94568,16 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
             graph_trace_id=child_graph_trace_id,
             head_commit=worker_commit,
             implementation_event_ref="contract_runtime:worker_implementation",
+            test_results={
+                "status": "passed",
+                "passed": True,
+                "commands": [
+                    {
+                        "command": "pytest -q active-child-worker",
+                        "status": "passed",
+                    }
+                ],
+            },
         )
     )
     implementation_payload.update(
@@ -95051,6 +95396,11 @@ def test_parentless_direct_main_requires_independent_qa_verification(
                 "payload": {
                     **route_identity,
                     "changed_files": ["agent/governance/server.py"],
+                    "test_results": (
+                        _canonical_parentless_direct_main_test_results(
+                            close_commit
+                        )
+                    ),
                     "dirty_scope_check": {"unexpected_files": []},
                 },
             },
@@ -95097,6 +95447,11 @@ def test_parentless_direct_main_requires_independent_qa_verification(
                     "graph_reconciled": True,
                     "preflight_ok": True,
                     "live_regression": {"status": "passed"},
+                    "test_results": (
+                        _canonical_parentless_direct_main_test_results(
+                            close_commit
+                        )
+                    ),
                 },
                 "payload": {**route_identity, "close_commit": close_commit},
             },
@@ -98806,6 +99161,10 @@ def test_contract_bound_direct_main_capsule_mint_validate_hash_and_refresh_termi
     assert shapes["implementation"]["payload"]["dirty_scope_check"][
         "changed_files"
     ] == changed_files_ref
+    assert shapes["implementation"]["payload"]["test_results"][
+        "schema_version"
+    ] == "parentless_direct_main.test_results.v1"
+    assert shapes["implementation"]["payload"]["test_results"]["passed"] is True
     assert (
         "may be a strict subset of immutable_allowed_files"
         in shapes["changed_files_rule"]
@@ -98815,6 +99174,9 @@ def test_contract_bound_direct_main_capsule_mint_validate_hash_and_refresh_termi
     )
     assert shapes["close_ready"]["verification"]["live_regression"]["status"] == (
         "passed"
+    )
+    assert shapes["close_ready"]["verification"]["test_results"].startswith(
+        "<copy implementation.payload.test_results"
     )
     assert shapes["close_ready"]["verification"]["graph_reconciled"] is True
     assert shapes["close_ready"]["verification"]["preflight_ok"] is True
