@@ -30879,6 +30879,24 @@ def _runtime_context_worker_recovery_payloads(
         and rejoin_eligibility.get("mode")
         == "bounded_post_lineage_replacement_auth_only"
     )
+    post_receipt_startup_rejoin_binding = (
+        _runtime_context_post_receipt_startup_rejoin_binding(
+            runtime_context_id=runtime_context_id,
+            contract_execution_id=contract_execution_id,
+            read_receipt_event_ref=read_receipt_event_ref,
+            startup_event_ref=(
+                ""
+                if rejoin_eligibility.get("post_receipt_pre_startup_recovery")
+                is True
+                else "not_applicable"
+            ),
+            authority=(
+                rejoin_eligibility.get("authority")
+                if isinstance(rejoin_eligibility.get("authority"), Mapping)
+                else {}
+            ),
+        )
+    )
     normalized_branch_ref = str(branch_ref or "").strip()
     normalized_base_commit = str(base_commit or "").strip()
     normalized_target_head_commit = str(target_head_commit or "").strip()
@@ -31113,6 +31131,15 @@ def _runtime_context_worker_recovery_payloads(
             "host_startup_id": normalized_host_startup_id,
             "host_session_id": normalized_host_session_id,
             "session_token_ref": session_token_ref_placeholder,
+            **(
+                {
+                    "server_rejoin_authority_binding": dict(
+                        post_receipt_startup_rejoin_binding
+                    )
+                }
+                if post_receipt_startup_rejoin_binding
+                else {}
+            ),
             **safe_route_identity,
             "reason": "<operator reason: live worker lost raw auth env>",
             "ttl_seconds": 3600,
@@ -31136,6 +31163,15 @@ def _runtime_context_worker_recovery_payloads(
             "host_startup_id": normalized_host_startup_id,
             "host_session_id": normalized_host_session_id,
             "session_token_ref": session_token_ref_placeholder,
+            **(
+                {
+                    "server_rejoin_authority_binding": dict(
+                        post_receipt_startup_rejoin_binding
+                    )
+                }
+                if post_receipt_startup_rejoin_binding
+                else {}
+            ),
             **safe_route_identity,
             "reason": "<operator reason: live worker lost raw auth env>",
             "ttl_seconds": 3600,
@@ -47760,6 +47796,54 @@ def _runtime_context_bounded_replacement_rejoin_authority(
     return projection
 
 
+def _runtime_context_post_receipt_startup_rejoin_binding(
+    *,
+    runtime_context_id: str,
+    contract_execution_id: str,
+    read_receipt_event_ref: str,
+    startup_event_ref: str,
+    authority: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Close the guide-to-endpoint authority gap for startup auth recovery."""
+
+    bounded = dict(authority or {})
+    runtime_id = str(runtime_context_id or "").strip()
+    execution_id = str(contract_execution_id or "").strip()
+    receipt_ref = str(read_receipt_event_ref or "").strip()
+    startup_ref = str(startup_event_ref or "").strip()
+    checkpoint_id = str(
+        bounded.get("current_stage_checkpoint_id") or ""
+    ).strip()
+    if not (
+        runtime_id
+        and execution_id
+        and receipt_ref
+        and not startup_ref
+        and bounded.get("server_derived") is True
+        and bounded.get("caller_claims_trusted") is False
+        and str(bounded.get("mode") or "").strip()
+        == "next_stage_checkpoint_issuance"
+        and bounded.get("next_checkpoint_issuance_allowed") is True
+        and not bounded.get("errors")
+        and not bounded.get("identity_mismatches")
+        and checkpoint_id
+    ):
+        return {}
+    return {
+        "schema_version": (
+            "runtime_context.post_receipt_startup_rejoin_binding.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "mode": "next_stage_checkpoint_issuance",
+        "runtime_context_id": runtime_id,
+        "contract_execution_id": execution_id,
+        "read_receipt_event_ref": receipt_ref,
+        "startup_event_ref": "",
+        "stage_checkpoint_id": checkpoint_id,
+    }
+
+
 def _runtime_context_session_rejoin_guidance_eligibility(
     conn,
     *,
@@ -48643,24 +48727,50 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "host_startup_id_conflict",
                 }
             ]
+            expected_post_receipt_startup_binding = (
+                _runtime_context_post_receipt_startup_rejoin_binding(
+                    runtime_context_id=runtime_context_id,
+                    contract_execution_id=resolved_contract_execution_id,
+                    read_receipt_event_ref=effective_read_receipt_ref,
+                    startup_event_ref=effective_startup_ref,
+                    authority=pre_lineage_bounded_replacement_authority,
+                )
+            )
+            supplied_post_receipt_startup_binding = (
+                dict(body.get("server_rejoin_authority_binding") or {})
+                if isinstance(
+                    body.get("server_rejoin_authority_binding"), Mapping
+                )
+                else {}
+            )
+            post_receipt_startup_binding_valid = bool(
+                expected_post_receipt_startup_binding
+                and supplied_post_receipt_startup_binding
+                == expected_post_receipt_startup_binding
+            )
+            if post_receipt_startup_binding_valid:
+                copy_safe_identity_omissions = {
+                    "worker_session_id_mismatch_or_missing": (
+                        "worker_session_id"
+                    ),
+                    "host_session_id_mismatch_or_missing": "host_session_id",
+                }
+                pre_lineage_request_binding_errors = [
+                    error
+                    for error in pre_lineage_request_binding_errors
+                    if not (
+                        error in copy_safe_identity_omissions
+                        and not str(
+                            body.get(copy_safe_identity_omissions[error])
+                            or ""
+                        ).strip()
+                    )
+                ]
+                post_receipt_startup_binding_valid = not (
+                    pre_lineage_request_binding_errors
+                )
             post_receipt_next_stage_checkpoint_issuance = bool(
-                effective_read_receipt_ref
-                and not effective_startup_ref
-                and str(
-                    pre_lineage_bounded_replacement_authority.get("mode")
-                    or ""
-                )
-                == "next_stage_checkpoint_issuance"
-                and pre_lineage_bounded_replacement_authority.get(
-                    "next_checkpoint_issuance_allowed"
-                )
-                is True
-                and not pre_lineage_bounded_replacement_authority.get(
-                    "errors"
-                )
-                and not pre_lineage_bounded_replacement_authority.get(
-                    "identity_mismatches"
-                )
+                post_receipt_startup_binding_valid
                 and not pre_lineage_request_binding_errors
             )
             if (
@@ -48743,6 +48853,15 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                                 "audit_valid"
                             )
                             is True
+                        ),
+                        "post_receipt_startup_binding_valid": (
+                            post_receipt_startup_binding_valid
+                        ),
+                        "expected_post_receipt_startup_binding": dict(
+                            expected_post_receipt_startup_binding
+                        ),
+                        "supplied_post_receipt_startup_binding": dict(
+                            supplied_post_receipt_startup_binding
                         ),
                         "credential_rotated": False,
                         "mutation_performed": False,

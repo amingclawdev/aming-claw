@@ -62355,12 +62355,14 @@ def test_legacy_operator_recovery_trigger_accepts_only_exact_dead_end_shapes():
 
 @pytest.mark.parametrize("persisted_prelineage_cex", ["exact", "legacy_empty"])
 @pytest.mark.parametrize("renew_route_after_receipt", [False, True])
+@pytest.mark.parametrize("project_copy_safe_host_session_ids", [False, True])
 def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drift(
     conn,
     monkeypatch,
     tmp_path,
     persisted_prelineage_cex,
     renew_route_after_receipt,
+    project_copy_safe_host_session_ids,
 ):
     case = _setup_pre_lineage_rejoin_recovery_case(
         conn,
@@ -62502,10 +62504,36 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
     assert projected_rejoin_body["contract_execution_id"] == (
         case["parent_task_id"]
     )
+    projected_binding = projected_rejoin_body[
+        "server_rejoin_authority_binding"
+    ]
+    assert projected_binding["schema_version"] == (
+        "runtime_context.post_receipt_startup_rejoin_binding.v1"
+    )
+    assert projected_binding["server_derived"] is True
+    assert projected_binding["caller_claims_trusted"] is False
+    assert projected_binding["mode"] == "next_stage_checkpoint_issuance"
+    assert projected_binding["runtime_context_id"] == (
+        case["context"].runtime_context_id
+    )
+    assert projected_binding["contract_execution_id"] == (
+        case["parent_task_id"]
+    )
+    assert projected_binding["read_receipt_event_ref"] == (
+        f"timeline:{receipt['timeline_event']['id']}"
+    )
+    assert projected_binding["startup_event_ref"] == ""
+    assert projected_binding["stage_checkpoint_id"] == (
+        guidance["authority"]["current_stage_checkpoint_id"]
+    )
     assert all(
         projected_rejoin_body[field] == active_route_identity[field]
         for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     )
+    executable_rejoin_body = copy.deepcopy(projected_rejoin_body)
+    if not project_copy_safe_host_session_ids:
+        executable_rejoin_body["worker_session_id"] = ""
+        executable_rejoin_body["host_session_id"] = ""
 
     before_ref_only_context = context
     before_ref_only_events = _pre_lineage_case_events(conn, case)
@@ -62535,10 +62563,70 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
         before_revision=before_ref_only_revision,
     )
 
+    tampered_checkpoint_body = copy.deepcopy(executable_rejoin_body)
+    tampered_checkpoint_body["server_rejoin_authority_binding"][
+        "stage_checkpoint_id"
+    ] = _fake_sha("caller-forged-post-receipt-startup-checkpoint")
+    with pytest.raises(GovernanceError) as tampered_checkpoint:
+        _pre_lineage_rejoin(
+            case,
+            body_override={
+                **tampered_checkpoint_body,
+                "reason": "reject a caller-forged startup checkpoint binding",
+            },
+        )
+    assert tampered_checkpoint.value.code in {
+        "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid",
+        "runtime_context_pre_lineage_rejoin_identity_mismatch",
+    }
+    assert (
+        tampered_checkpoint.value.details[
+            "post_receipt_startup_binding_valid"
+        ]
+        is False
+    )
+    assert tampered_checkpoint.value.details[
+        "expected_post_receipt_startup_binding"
+    ] == projected_binding
+    assert tampered_checkpoint.value.details[
+        "supplied_post_receipt_startup_binding"
+    ] == tampered_checkpoint_body["server_rejoin_authority_binding"]
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        tampered_checkpoint.value,
+        before_context=before_ref_only_context,
+        before_events=before_ref_only_events,
+        before_revision=before_ref_only_revision,
+    )
+
+    mismatched_session_body = copy.deepcopy(executable_rejoin_body)
+    mismatched_session_body["worker_session_id"] = (
+        "codex:caller-forged-post-receipt-worker-session"
+    )
+    with pytest.raises(GovernanceError) as mismatched_session:
+        _pre_lineage_rejoin(
+            case,
+            body_override={
+                **mismatched_session_body,
+                "reason": "reject an explicit worker-session mismatch",
+            },
+        )
+    assert mismatched_session.value.details["credential_rotated"] is False
+    assert mismatched_session.value.details["mutation_performed"] is False
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        mismatched_session.value,
+        before_context=before_ref_only_context,
+        before_events=before_ref_only_events,
+        before_revision=before_ref_only_revision,
+    )
+
     next_issuance = _pre_lineage_rejoin(
         case,
         body_override={
-            **projected_rejoin_body,
+            **executable_rejoin_body,
             "reason": "issue the post-receipt startup checkpoint envelope",
         },
     )
