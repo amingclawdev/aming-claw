@@ -70818,6 +70818,93 @@ def test_rev8_postmerge_comparison_base_uses_full_merge_chain(
     ) == ""
 
 
+def test_rev8_postmerge_comparison_base_consumes_projected_lane_merges(
+    conn,
+    monkeypatch,
+):
+    projected_record = _rev8_postmerge_qa_binding_record()
+    projected_record["_projection_test"] = True
+    for index, (before, after) in enumerate(
+        (("a" * 40, "1" * 40), ("1" * 40, "2" * 40)),
+        start=1,
+    ):
+        durable = projected_record["completed_lines"][index]["payload"][
+            "durable_merge_authority"
+        ]
+        durable["target_head_before_merge"] = before
+        durable["target_head_after_merge"] = after
+        durable["merge_commit"] = after
+        projected_record["completed_lines"][index]["commit_sha"] = after
+        upsert_merge_queue_item(
+            conn,
+            MergeQueueItem(
+                project_id=PID,
+                backlog_id=projected_record["backlog_id"],
+                merge_queue_id=durable["merge_queue_id"],
+                queue_item_id=durable["queue_item_id"],
+                task_id=durable["task_id"],
+                branch_ref=f"refs/heads/rev8-projected-{index}",
+                queue_index=index,
+                status="merged",
+                merge_commit=after,
+                target_head_before_merge=before,
+                target_head_after_merge=after,
+            ),
+            now_iso=f"2026-08-02T11:00:0{index}Z",
+        )
+    pinned_merge = server._contract_runtime_rev8_two_worker_merge_projection(
+        projected_record,
+        required_worker_count=2,
+    )
+    raw_record = {
+        **copy.deepcopy(projected_record),
+        "_projection_test": False,
+        "completed_lines": [
+            copy.deepcopy(projected_record["completed_lines"][0])
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda *_args, **_kwargs: (
+            projected_record,
+            {
+                "status": "projected",
+                "persistence": {
+                    "mutates_contract_runtime_completed_lines": False,
+                    "observer_authored_worker_backfill": False,
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_two_worker_merge_projection",
+        lambda candidate, **_kwargs: (
+            copy.deepcopy(pinned_merge)
+            if candidate.get("_projection_test") is True
+            else {}
+        ),
+    )
+
+    assert server._contract_runtime_server_postmerge_comparison_base_commit(
+        conn,
+        project_id=PID,
+        record=raw_record,
+        expected_candidate_commit="2" * 40,
+    ) == "a" * 40
+
+    projected_record["completed_lines"][2]["payload"][
+        "durable_merge_authority"
+    ]["target_head_before_merge"] = "f" * 40
+    assert server._contract_runtime_server_postmerge_comparison_base_commit(
+        conn,
+        project_id=PID,
+        record=raw_record,
+        expected_candidate_commit="2" * 40,
+    ) == ""
+
+
 def test_rev8_merge_projection_accepts_one_observer_selected_batch_child_lane():
     record = _rev8_postmerge_qa_binding_record()
     dispatch = record["completed_lines"][0]
@@ -71388,6 +71475,218 @@ def test_rev8_postmerge_qa_authority_fails_closed_at_each_live_boundary(
         object(), project_id=PID, record=record
     )
     assert receipt_blocked["blocker_codes"] == [
+        "observer_reconcile_receipt_unverified"
+    ]
+
+
+def test_projected_lane_merge_rederives_closed_durable_authority(
+    monkeypatch,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    worker = record["completed_lines"][0]["payload"]["bounded_workers"][1]
+    context = SimpleNamespace(
+        **worker,
+        backlog_id=record["backlog_id"],
+    )
+    queue_item = MergeQueueItem(
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        merge_queue_id=worker["merge_queue_id"],
+        queue_item_id="mqitem-rev8-postmerge-2",
+        task_id=worker["task_id"],
+        branch_ref="refs/heads/rev8-postmerge-test",
+        queue_index=1,
+        status="merged",
+        target_ref="refs/heads/integration",
+        branch_head="b" * 40,
+        merge_commit="2" * 40,
+        target_head_before_merge="1" * 40,
+        target_head_after_merge="2" * 40,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_line_match",
+        lambda *_args, **_kwargs: {"status": "selected"},
+    )
+    lineage = {"dispatch_lineage_verified": True}
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_verified_dispatch_lineage",
+        lambda *_args, **_kwargs: dict(lineage),
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_merge_queue_item_for_branch_context",
+        lambda *_args, **_kwargs: queue_item,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_observer_merge_completed_round",
+        lambda *_args, **_kwargs: {
+            "worker_commit_completed_line_index": 6,
+            "qa_contract_runtime_verified": False,
+            "pre_qa_merge_authorized": True,
+            "final_qa_required_after_reconcile": True,
+            "qa_audit_only_no_pass_authority": {},
+        },
+    )
+    qa_event = {
+        "id": 901,
+        "created_at": "2026-08-01T15:00:01Z",
+    }
+    merge_event = {
+        "id": 902,
+        "created_at": "2026-08-01T15:00:02Z",
+        "commit_sha": "2" * 40,
+    }
+
+    authority = server._contract_runtime_projected_lane_merge_durable_authority(
+        object(),
+        project_id=PID,
+        record=record,
+        context=context,
+        merge_event=merge_event,
+        qa_event=qa_event,
+    )
+
+    assert authority["schema_version"] == (
+        "contract_runtime.observer_merge_durable_authority.v1"
+    )
+    assert authority["runtime_context_id"] == worker["runtime_context_id"]
+    assert authority["task_id"] == worker["task_id"]
+    assert authority["merge_queue_id"] == worker["merge_queue_id"]
+    assert authority["queue_item_id"] == queue_item.queue_item_id
+    assert authority["merge_commit"] == "2" * 40
+    assert authority["merge_event_ref"] == "timeline:902"
+    assert authority["contract_runtime_dispatch_source_ref"] == (
+        "contract_runtime:cex-rev8-postmerge-qa-authority:completed_lines:0"
+    )
+    assert authority["pre_qa_merge_authorized"] is True
+    assert authority["final_qa_required_after_reconcile"] is True
+    assert authority["close_satisfying"] is False
+
+    forged_event = {**merge_event, "commit_sha": "f" * 40}
+    assert server._contract_runtime_projected_lane_merge_durable_authority(
+        object(),
+        project_id=PID,
+        record=record,
+        context=context,
+        merge_event=forged_event,
+        qa_event=qa_event,
+    ) == {}
+    lineage["dispatch_lineage_verified"] = False
+    assert server._contract_runtime_projected_lane_merge_durable_authority(
+        object(),
+        project_id=PID,
+        record=record,
+        context=context,
+        merge_event=merge_event,
+        qa_event=qa_event,
+    ) == {}
+
+
+def test_rev8_postmerge_qa_authority_consumes_exact_projected_lane_merges(
+    monkeypatch,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    state = _install_rev8_postmerge_qa_helper_boundaries(
+        monkeypatch,
+        record,
+    )
+    pinned_merge = server._contract_runtime_rev8_two_worker_merge_projection(
+        record,
+        required_worker_count=2,
+    )
+    pinned_merge.update(
+        {
+            "reconcile_source_ref": "timeline:903",
+            "reconcile_event_id": 903,
+            "reconcile_event_created_at": "2026-08-01T15:00:03Z",
+        }
+    )
+    final_worker = record["completed_lines"][0]["payload"][
+        "bounded_workers"
+    ][1]
+    projected_record = {
+        **copy.deepcopy(record),
+        "_projection_test": True,
+        "completed_lines": [
+            copy.deepcopy(record["completed_lines"][0]),
+            copy.deepcopy(record["completed_lines"][1]),
+            copy.deepcopy(record["completed_lines"][2]),
+            {
+                "stage_id": "observer_reconcile",
+                "line_id": "observer_reconcile",
+                "actor_role": "observer",
+                "evidence_kind": "reconcile",
+                "status": "passed",
+                "commit_sha": "2" * 40,
+                "runtime_context_id": final_worker["runtime_context_id"],
+                "task_id": final_worker["task_id"],
+                "parent_task_id": record["contract_execution_id"],
+                "payload": {
+                    "schema_version": (
+                        "mf_parallel.runtime_context_post_worker_"
+                        "line_projection.v1"
+                    ),
+                    "source": (
+                        "runtime_context_post_worker_timeline_evidence"
+                    ),
+                    "source_backed": True,
+                    "source_ref": "timeline:903",
+                    "source_event_id": 903,
+                    "projection_persists_completed_line": False,
+                    "observer_authored_worker_backfill": False,
+                    "reconcile_authority": copy.deepcopy(
+                        state["current_full"]
+                    ),
+                },
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda *_args, **_kwargs: (
+            projected_record,
+            {
+                "status": "projected",
+                "persistence": {
+                    "mutates_contract_runtime_completed_lines": False,
+                    "observer_authored_worker_backfill": False,
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_two_worker_merge_projection",
+        lambda candidate, **_kwargs: (
+            copy.deepcopy(pinned_merge)
+            if candidate.get("_projection_test") is True
+            else {}
+        ),
+    )
+
+    authority = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+    assert authority["verified"] is True
+    assert authority["candidate_commit_sha"] == "2" * 40
+    assert authority["reconcile_source_ref"] == "timeline:903"
+
+    projected_record["completed_lines"][-1]["payload"][
+        "source_backed"
+    ] = False
+    blocked = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+    assert blocked["verified"] is False
+    assert blocked["blocker_codes"] == [
         "observer_reconcile_receipt_unverified"
     ]
 
@@ -154525,6 +154824,27 @@ def test_premerge_qa_projects_lane_merge_without_final_qa_or_close(
         lambda *_args, **_kwargs: {
             "db_verified": True,
             "verified_trace_ids": ["gqt-premerge-projection"],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_projected_lane_merge_durable_authority",
+        lambda *_args, **_kwargs: {
+            "schema_version": (
+                "contract_runtime.observer_merge_durable_authority.v1"
+            ),
+            "server_derived": True,
+            "db_verified": True,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "merge_commit": "a" * 40,
+            "merged_commit_sha": "a" * 40,
+            "merge_event_ref": "timeline:101",
+            "merge_event_id": 101,
+            "pre_qa_merge_authorized": True,
+            "final_qa_required_after_reconcile": True,
+            "close_satisfying": False,
         },
     )
 
