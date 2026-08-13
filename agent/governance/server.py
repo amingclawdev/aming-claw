@@ -104615,6 +104615,127 @@ def _contract_runtime_bind_qa_independent_verification_authority(
     )
 
 
+def _contract_runtime_transient_post_worker_lines(
+    record: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    """Return server-shaped, non-persisting post-worker projection lines."""
+
+    lines: list[Mapping[str, Any]] = []
+    for line in record.get("completed_lines") or []:
+        if not isinstance(line, Mapping):
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if (
+            str(payload.get("schema_version") or "")
+            == "mf_parallel.runtime_context_post_worker_line_projection.v1"
+            and str(payload.get("source") or "")
+            == "runtime_context_post_worker_timeline_evidence"
+            and str(line.get("line_id") or "").strip()
+            in {"observer_merge", "observer_reconcile"}
+        ):
+            lines.append(line)
+    return lines
+
+
+def _contract_runtime_canonical_post_worker_projection(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    required_worker_count: int,
+) -> dict[str, Any]:
+    """Re-derive an already-projected read model from canonical raw history.
+
+    Public current/guide is allowed to pass its read-only projected record into
+    the canonical QA precheck.  Those transient lines have no persisted-line
+    acceptance receipt.  Re-read the exact canonical ContractRuntime record,
+    project it once on the server, and accept the projected branch only when
+    the supplied transient lines are byte-identical to that derivation.
+    """
+
+    supplied_lines = _contract_runtime_transient_post_worker_lines(record)
+    if not supplied_lines:
+        return {}
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    if not execution_id:
+        return {}
+    try:
+        canonical = _contract_runtime_store(conn).get(execution_id)
+    except (ContractRuntimeError, sqlite3.Error, AttributeError, TypeError):
+        return {}
+    if not isinstance(canonical, Mapping):
+        return {}
+    identity_fields = (
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "contract_id",
+        "contract_chain_id",
+        "parent_contract_execution_id",
+        "root_contract_execution_id",
+    )
+    if any(
+        str(canonical.get(field) or "").strip()
+        != str(record.get(field) or "").strip()
+        for field in identity_fields
+    ):
+        return {}
+    if (
+        str(canonical.get("project_id") or "").strip() != project_id
+        or _contract_runtime_transient_post_worker_lines(canonical)
+    ):
+        return {}
+    projected_record, runtime_projection = (
+        _contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=project_id,
+            record=canonical,
+            actor_role="qa",
+        )
+    )
+    if not (
+        isinstance(projected_record, Mapping)
+        and isinstance(runtime_projection, Mapping)
+    ):
+        return {}
+    if not (
+        str(runtime_projection.get("status") or "").strip() == "projected"
+        and runtime_projection.get("persistence")
+        == {
+            "mutates_contract_runtime_completed_lines": False,
+            "observer_authored_worker_backfill": False,
+        }
+    ):
+        return {}
+    canonical_lines = _contract_runtime_transient_post_worker_lines(
+        projected_record
+    )
+    if (
+        len(canonical_lines) != len(supplied_lines)
+        or [stable_sha256(line) for line in canonical_lines]
+        != [stable_sha256(line) for line in supplied_lines]
+    ):
+        return {}
+    projected_merge = _contract_runtime_rev8_two_worker_merge_projection(
+        projected_record,
+        required_worker_count=required_worker_count,
+        conn=conn,
+        project_id=project_id,
+    )
+    if not (
+        projected_merge.get("timeline_verified") is True
+        and projected_merge.get("authority_verified") is True
+        and projected_merge.get("dispatch_lineage_verified") is True
+        and projected_merge.get("all_lane_merges_verified") is True
+    ):
+        return {}
+    return {"record": projected_record, "merge": projected_merge}
+
+
 def _contract_runtime_rev8_postmerge_qa_authority(
     conn,
     *,
@@ -104660,12 +104781,26 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         project_id=project_id,
     )
     projected_post_worker_authority = False
-    if not (
+    merge_verified = bool(
         merge.get("timeline_verified") is True
         and merge.get("authority_verified") is True
         and merge.get("dispatch_lineage_verified") is True
         and merge.get("all_lane_merges_verified") is True
-    ):
+    )
+    if merge_verified:
+        canonical_projection = (
+            _contract_runtime_canonical_post_worker_projection(
+                conn,
+                project_id=project_id,
+                record=record,
+                required_worker_count=required_worker_count,
+            )
+        )
+        if canonical_projection:
+            merge_record = canonical_projection["record"]
+            merge = canonical_projection["merge"]
+            projected_post_worker_authority = True
+    else:
         projected_record, runtime_projection = (
             _contract_runtime_apply_mf_parallel_context_projection(
                 conn,
@@ -105209,6 +105344,27 @@ def _contract_runtime_rev8_postmerge_qa_authority(
     ):
         return blocked("current_full_active_snapshot_unverified")
 
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    if not contract_execution_id:
+        return blocked("combined_qa_contract_execution_identity_mismatch")
+    combined_qa_graph_trace_scope = (
+        parent_task_id == contract_execution_id
+    )
+    qa_graph_trace_task_id = (
+        contract_execution_id
+        if combined_qa_graph_trace_scope
+        else task_id
+    )
+    qa_graph_trace_task_source = (
+        "ContractRuntime.contract_execution_id"
+        if combined_qa_graph_trace_scope
+        else "ContractRuntime.final_lane_task_id"
+    )
+    if not qa_graph_trace_task_id:
+        return blocked("postmerge_qa_graph_trace_task_identity_unverified")
+
     authority = {
         "schema_version": "contract_runtime.rev8_postmerge_qa_authority.v1",
         "source": (
@@ -105226,12 +105382,18 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         "fail_closed": True,
         "project_id": project_id,
         "backlog_id": str(record.get("backlog_id") or ""),
-        "contract_execution_id": str(
-            record.get("contract_execution_id") or ""
-        ),
+        "contract_execution_id": contract_execution_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        # The merge/reconcile authority above remains bound to the final
+        # worker lane.  The post-merge QA graph round is a combined review of
+        # the parent ContractRuntime execution, so its persisted graph-query
+        # rows are deliberately scoped to the CEX task instead of that final
+        # lane's task.  Persist both identities explicitly; never infer this
+        # distinction from caller claims.
+        "qa_graph_trace_task_id": qa_graph_trace_task_id,
+        "qa_graph_trace_task_source": qa_graph_trace_task_source,
         "merge_queue_id": merge_queue_id,
         "queue_item_id": queue_item_id,
         "target_ref": target_ref,
@@ -105456,13 +105618,71 @@ def _contract_runtime_bind_qa_graph_authority(
                 "candidate_commit_sha": expected_candidate_commit,
             },
         )
+    expected_graph_trace_task_id = str(identity.get("task_id") or "").strip()
+    if postmerge_authority.get("verified") is True:
+        contract_execution_id = str(
+            record.get("contract_execution_id") or ""
+        ).strip()
+        expected_graph_trace_task_id = str(
+            postmerge_authority.get("qa_graph_trace_task_id") or ""
+        ).strip()
+        trace_task_source = str(
+            postmerge_authority.get("qa_graph_trace_task_source") or ""
+        ).strip()
+        combined_qa_graph_trace_scope = (
+            str(identity.get("parent_task_id") or "").strip()
+            == contract_execution_id
+        )
+        combined_trace_scope_verified = bool(
+            combined_qa_graph_trace_scope
+            and expected_graph_trace_task_id == contract_execution_id
+            and trace_task_source
+            == "ContractRuntime.contract_execution_id"
+        )
+        final_lane_trace_scope_verified = bool(
+            not combined_qa_graph_trace_scope
+            and expected_graph_trace_task_id
+            == str(identity.get("task_id") or "").strip()
+            and expected_graph_trace_task_id
+            == str(postmerge_authority.get("task_id") or "").strip()
+            and trace_task_source == "ContractRuntime.final_lane_task_id"
+        )
+        if not (
+            contract_execution_id
+            and str(
+                postmerge_authority.get("contract_execution_id") or ""
+            ).strip()
+            == contract_execution_id
+            and (
+                combined_trace_scope_verified
+                or final_lane_trace_scope_verified
+            )
+        ):
+            raise GovernanceError(
+                "contract_runtime_rev8_postmerge_qa_authority_required",
+                (
+                    "rev8 final QA requires one server-derived combined "
+                    "ContractRuntime graph-trace task identity"
+                ),
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "line_id": str(write.get("line_id") or ""),
+                    "authority_status": "blocked",
+                    "blocker_codes": [
+                        "postmerge_qa_graph_trace_task_identity_unverified"
+                    ],
+                    "fail_closed": True,
+                },
+            )
+
     evidence = _runtime_context_service_qa_graph_trace_refs(
         conn,
         project_id=project_id,
         explicit_trace_ids=requested_trace_ids,
         target_project_root=canonical_target_project_root,
         expected_backlog_id=str(record.get("backlog_id") or ""),
-        expected_task_id=identity["task_id"],
+        expected_task_id=expected_graph_trace_task_id,
         expected_candidate_commit_sha=expected_candidate_commit,
         expected_qa_principal=str(session.get("principal_id") or ""),
         expected_qa_session_id=str(session.get("session_id") or ""),

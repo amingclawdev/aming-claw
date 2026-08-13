@@ -70706,6 +70706,10 @@ def _rev8_postmerge_qa_binding_authority() -> dict[str, Any]:
         "runtime_context_id": "mfrctx-rev8-postmerge-test",
         "task_id": "rev8-postmerge-test-worker",
         "parent_task_id": "cex-rev8-postmerge-qa-authority",
+        "qa_graph_trace_task_id": "cex-rev8-postmerge-qa-authority",
+        "qa_graph_trace_task_source": (
+            "ContractRuntime.contract_execution_id"
+        ),
         "merge_queue_id": "mq-rev8-postmerge-test",
         "queue_item_id": "mqitem-rev8-postmerge-2",
         "target_ref": "refs/heads/integration",
@@ -71668,6 +71672,18 @@ def test_rev8_postmerge_qa_authority_consumes_exact_projected_lane_merges(
         ),
     )
 
+    class CanonicalStore:
+        @staticmethod
+        def get(execution_id):
+            assert execution_id == record["contract_execution_id"]
+            return copy.deepcopy(record)
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: CanonicalStore(),
+    )
+
     authority = server._contract_runtime_rev8_postmerge_qa_authority(
         object(),
         project_id=PID,
@@ -71676,6 +71692,61 @@ def test_rev8_postmerge_qa_authority_consumes_exact_projected_lane_merges(
     assert authority["verified"] is True
     assert authority["candidate_commit_sha"] == "2" * 40
     assert authority["reconcile_source_ref"] == "timeline:903"
+
+    already_projected = (
+        server._contract_runtime_rev8_postmerge_qa_authority(
+            object(),
+            project_id=PID,
+            record=projected_record,
+        )
+    )
+    assert already_projected["verified"] is True
+    assert already_projected["reconcile_source_ref"] == "timeline:903"
+
+    class WrongScopeStore:
+        @staticmethod
+        def get(_execution_id):
+            canonical = copy.deepcopy(record)
+            canonical["backlog_id"] = "AC-WRONG-CANONICAL-SCOPE"
+            return canonical
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: WrongScopeStore(),
+    )
+    scope_blocked = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(),
+        project_id=PID,
+        record=projected_record,
+    )
+    assert scope_blocked["verified"] is False
+    assert scope_blocked["blocker_codes"] == [
+        "observer_reconcile_receipt_unverified"
+    ]
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(get=lambda _execution_id: None),
+    )
+    missing_canonical = (
+        server._contract_runtime_rev8_postmerge_qa_authority(
+            object(),
+            project_id=PID,
+            record=projected_record,
+        )
+    )
+    assert missing_canonical["verified"] is False
+    assert missing_canonical["blocker_codes"] == [
+        "observer_reconcile_receipt_unverified"
+    ]
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: CanonicalStore(),
+    )
 
     projected_record["completed_lines"][-1]["payload"][
         "source_backed"
@@ -72124,7 +72195,7 @@ def test_rev8_postmerge_qa_graph_binding_uses_final_combined_root_and_commit(
             "missing_trace_ids": [],
             "identity_mismatches": [],
             "runtime_context_id": authority["runtime_context_id"],
-            "task_id": authority["task_id"],
+            "task_id": authority["qa_graph_trace_task_id"],
             "parent_task_id": authority["parent_task_id"],
             "backlog_id": record["backlog_id"],
             "qa_principal": "qa:rev8-final-combined",
@@ -72165,18 +72236,98 @@ def test_rev8_postmerge_qa_graph_binding_uses_final_combined_root_and_commit(
     assert captured["expected_candidate_commit_sha"] == (
         authority["candidate_commit_sha"]
     )
-    assert captured["expected_task_id"] == authority["task_id"]
+    assert captured["expected_task_id"] == (
+        authority["contract_execution_id"]
+    )
+    assert authority["task_id"] != captured["expected_task_id"]
     assert captured["expected_qa_principal"] == "qa:rev8-final-combined"
     assert captured["expected_qa_session_id"] == "ses-rev8-final-combined"
     assert bound["commit_sha"] == authority["candidate_commit_sha"]
-    assert bound["task_id"] == authority["task_id"]
+    assert bound["task_id"] == authority["contract_execution_id"]
     assert bound["runtime_context_id"] == authority["runtime_context_id"]
     assert bound["payload"]["graph_trace_evidence"][
         "postmerge_qa_authority"
     ] == authority
+    assert bound["payload"]["graph_trace_evidence"]["task_id"] == (
+        authority["contract_execution_id"]
+    )
+    assert bound["payload"]["graph_trace_evidence"][
+        "postmerge_qa_authority"
+    ]["task_id"] == authority["task_id"]
     assert bound["qa_evidence_provenance"]["authenticated_qa_binding"][
         "qa_session_id"
     ] == "ses-rev8-final-combined"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("qa_graph_trace_task_id", ""),
+        ("qa_graph_trace_task_id", "rev8-postmerge-test-worker"),
+        ("qa_graph_trace_task_source", "caller_claim"),
+        ("contract_execution_id", "cex-other-postmerge-round"),
+        ("parent_task_id", "cex-other-postmerge-round"),
+    ),
+)
+def test_rev8_postmerge_qa_graph_binding_requires_combined_cex_trace_scope(
+    monkeypatch,
+    field,
+    value,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    authority = _rev8_postmerge_qa_binding_authority()
+    authority[field] = value
+    authority["authority_hash"] = server.stable_sha256(
+        {
+            key: item
+            for key, item in authority.items()
+            if key != "authority_hash"
+        }
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: dict(authority),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid combined QA task authority must stop before trace lookup"
+        ),
+    )
+
+    class QAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:rev8-final-combined",
+                "session_id": "ses-rev8-final-combined",
+            }
+
+    with pytest.raises(GovernanceError) as blocked:
+        server._contract_runtime_bind_qa_graph_authority(
+            QAContext(),
+            object(),
+            project_id=PID,
+            record=record,
+            write={"line_id": "qa_graph_context", "status": "accepted"},
+            body={"graph_trace_ids": ["gqt-rev8-final-combined"]},
+            policy={
+                "lookup_key_fields": ["graph_trace_ids"],
+                "authority_object_path": "payload.graph_trace_evidence",
+            },
+        )
+
+    assert blocked.value.code == (
+        "contract_runtime_rev8_postmerge_qa_authority_required"
+    )
+    assert blocked.value.details["blocker_codes"] == [
+        "postmerge_qa_graph_trace_task_identity_unverified"
+    ]
+    assert blocked.value.details["fail_closed"] is True
 
 
 def test_rev8_postmerge_qa_graph_binding_rejects_missing_final_authority(
@@ -72262,7 +72413,7 @@ def test_rev8_postmerge_qa_graph_binding_rejects_premerge_and_wrong_scope_traces
         {
             "trace_id": "gqt-rev8-stale-worker-world",
             "field": "task_id",
-            "expected": authority["task_id"],
+            "expected": authority["contract_execution_id"],
             "actual": "rev8-postmerge-server-worker",
         },
         {
