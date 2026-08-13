@@ -104721,6 +104721,60 @@ def test_contract_runtime_dispatch_projects_canonical_allocation_payload():
     )
 
 
+@pytest.mark.parametrize(
+    ("profile", "expected"),
+    [
+        (
+            {
+                "host_kind": "codex_desktop",
+                "worker_role": "mf_sub",
+                "isolated_runtime_context": True,
+            },
+            {"profile_id": "codex-mf-sub", "harness": "codex"},
+        ),
+        (
+            {"profile_id": "codex-mf-sub", "harness": "codex"},
+            {"profile_id": "codex-mf-sub", "harness": "codex"},
+        ),
+        (
+            {
+                "host_kind": "codex_desktop",
+                "worker_role": "qa",
+                "isolated_runtime_context": True,
+            },
+            {},
+        ),
+        (
+            {
+                "host_kind": "codex_desktop",
+                "worker_role": "mf_sub",
+                "isolated_runtime_context": False,
+            },
+            {},
+        ),
+        (
+            {
+                "host_kind": "codex_desktop",
+                "worker_role": "mf_sub",
+                "isolated_runtime_context": True,
+                "harness": "claude",
+            },
+            {},
+        ),
+    ],
+)
+def test_cli_agent_ticket_profile_requirements_canonicalize_exact_desktop_alias(
+    profile,
+    expected,
+):
+    assert (
+        contract_state_runtime.canonical_cli_agent_ticket_profile_requirements(
+            profile
+        )
+        == expected
+    )
+
+
 def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_union(
     conn,
     tmp_path,
@@ -104797,9 +104851,13 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
     assert prefill["ok"] is True
 
     profile_requirements = {
+        "host_kind": "codex_desktop",
+        "worker_role": "mf_sub",
+        "isolated_runtime_context": True,
+    }
+    canonical_profile_requirements = {
         "profile_id": "codex-mf-sub",
         "harness": "codex",
-        "provider": "openai",
     }
     retry_policy = {"attempt": 1, "max_attempts": 2}
     lanes = [
@@ -105154,7 +105212,7 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
         and worker["root_task_id"]
         == successor["root_contract_execution_id"]
         and worker["target_project_root"] == str(tmp_path)
-        and worker["profile_requirements"] == profile_requirements
+        and worker["profile_requirements"] == canonical_profile_requirements
         and worker["retry_policy"] == retry_policy
         for worker in bounded_workers
     )
@@ -105292,6 +105350,26 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
     assert accepted["next_legal_action"]["line_id"] == (
         "worker_read_runtime_guide"
     )
+    for worker in copy_body["payload"]["bounded_workers"]:
+        authority = server._observer_runtime_text_contract_runtime_authority(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            requested_runtime_context_id=worker["runtime_context_id"],
+            requested_task_id=worker["task_id"],
+        )
+        launch_identity = server._contract_runtime_desktop_launch_identity(
+            authority
+        )
+        ticket = contract_state_runtime.build_cli_agent_execution_ticket(
+            contract_runtime_current_state=authority,
+            launch_identity=launch_identity,
+        )
+        assert ticket["status"] == "issued"
+        assert ticket["profile_requirements"] == (
+            canonical_profile_requirements
+        )
     persisted = json.dumps(accepted, sort_keys=True)
     assert '"route_token":' not in persisted
     assert '"session_token":' not in persisted

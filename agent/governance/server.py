@@ -15362,11 +15362,12 @@ def _parallel_branch_allocate_require_dispatch_authority(
 
     profile_requirements_present = "profile_requirements" in body
     retry_policy_present = "retry_policy" in body
-    profile_requirements = (
+    supplied_profile_requirements = (
         dict(body.get("profile_requirements") or {})
         if isinstance(body.get("profile_requirements"), Mapping)
         else {}
     )
+    profile_requirements = dict(supplied_profile_requirements)
     retry_policy = (
         dict(body.get("retry_policy") or {})
         if isinstance(body.get("retry_policy"), Mapping)
@@ -15379,6 +15380,16 @@ def _parallel_branch_allocate_require_dispatch_authority(
             )
         if not retry_policy_present:
             retry_policy = dict(_MF_PARALLEL_DEFAULT_RETRY_POLICY)
+    if profile_requirements:
+        from .contract_state_runtime import (
+            canonical_cli_agent_ticket_profile_requirements,
+        )
+
+        profile_requirements = (
+            canonical_cli_agent_ticket_profile_requirements(
+                profile_requirements
+            )
+        )
     actual = {
         "profile_requirements": profile_requirements,
         "retry_policy": retry_policy,
@@ -15404,13 +15415,21 @@ def _parallel_branch_allocate_require_dispatch_authority(
             {
                 "field": field,
                 "expected": expected[field],
-                "actual": actual[field],
+                "actual": (
+                    supplied_profile_requirements
+                    if field == "profile_requirements"
+                    else actual[field]
+                ),
                 "missing_fields": missing_fields,
                 "field_mismatches": [
                     {
                         "field": item,
                         "expected": expected[item],
-                        "actual": actual[item],
+                        "actual": (
+                            supplied_profile_requirements
+                            if item == "profile_requirements"
+                            else actual[item]
+                        ),
                     }
                     for item in missing_fields
                 ],
@@ -18923,9 +18942,16 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 ),
             }
         if rev8_allocation_record:
-            _parallel_branch_allocate_require_dispatch_authority(
-                effective_body
+            canonical_profile, canonical_retry = (
+                _parallel_branch_allocate_require_dispatch_authority(
+                    effective_body
+                )
             )
+            effective_body = {
+                **effective_body,
+                "profile_requirements": canonical_profile,
+                "retry_policy": canonical_retry,
+            }
         worktree_result: dict[str, Any] | None = None
         with sqlite_write_lock():
             if isinstance(

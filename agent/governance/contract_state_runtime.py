@@ -4585,8 +4585,46 @@ def _ticket_string_items(value: Any) -> list[str]:
     )
 
 
-def _ticket_profile_requirements(value: Mapping[str, Any] | None) -> dict[str, Any]:
-    source = value if isinstance(value, Mapping) else {}
+def canonical_cli_agent_ticket_profile_requirements(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the one canonical ticket profile for accepted public aliases.
+
+    The allocation facade historically accepted the public Codex Desktop
+    capability tuple while the execution-ticket contract retained only
+    ``profile_id``/``harness`` selectors. Normalize only the exact supported
+    tuple; partial, contradictory, or cross-role aliases remain empty so the
+    existing missing-authority gate fails closed.
+    """
+
+    source = dict(value) if isinstance(value, Mapping) else {}
+    alias_fields = {
+        "host_kind",
+        "worker_role",
+        "isolated_runtime_context",
+    }
+    if alias_fields.intersection(source):
+        if (
+            str(source.get("host_kind") or "").strip() != "codex_desktop"
+            or str(source.get("worker_role") or "").strip() != "mf_sub"
+            or source.get("isolated_runtime_context") is not True
+        ):
+            return {}
+        canonical_aliases = {
+            "profile_id": "codex-mf-sub",
+            "harness": "codex",
+        }
+        if any(
+            str(source.get(field) or "").strip()
+            and str(source.get(field) or "").strip() != expected
+            for field, expected in canonical_aliases.items()
+        ) or (
+            str(source.get("role") or "").strip()
+            and str(source.get("role") or "").strip() != "mf_sub"
+        ):
+            return {}
+        source.update(canonical_aliases)
+
     result: dict[str, Any] = {}
     for key in _CLI_AGENT_TICKET_PROFILE_FIELDS:
         field_value = source.get(key)
@@ -4606,6 +4644,10 @@ def _ticket_profile_requirements(value: Mapping[str, Any] | None) -> dict[str, A
         if items:
             result[key] = items
     return result
+
+
+def _ticket_profile_requirements(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    return canonical_cli_agent_ticket_profile_requirements(value)
 
 
 def _ticket_retry_policy(value: Mapping[str, Any] | None) -> dict[str, Any]:
