@@ -1545,8 +1545,10 @@ class SafeRefPrestartupReissueAuthority:
 
     The opaque session ref is deliberately not a general write credential.  It
     can authorize this one host-envelope recovery only when the governance
-    server has already bound it to an active lease, one exact source-backed
-    ContractRuntime read line, and the original initial-join audit record.
+    server has already bound it to an active lease, the exact source-backed
+    ContractRuntime lane checkpoint, and the original initial-join audit
+    record.  Before the read line exists, only a validated one-shot special
+    pre-lineage authority may set ``pre_read_special_authority``.
     """
 
     project_id: str
@@ -1578,6 +1580,7 @@ class SafeRefPrestartupReissueAuthority:
     stage_checkpoint_server_verified: bool = False
     lease_status_at_authorization: str = ""
     latest_ref_identifier_only: bool = False
+    pre_read_special_authority: bool = False
     schema_version: str = (
         "runtime_context.safe_ref_prestartup_reissue_authority.v2"
     )
@@ -11465,6 +11468,7 @@ def build_safe_ref_prestartup_reissue_authority(
     session_authority_event_ref: str = "",
     session_authority_kind: str = "initial_join",
     stage_checkpoint_id: str = "",
+    pre_read_special_authority: bool = False,
     now_iso: str = "",
 ) -> SafeRefPrestartupReissueAuthority:
     """Bind server-verified pre-startup lineage to the latest opaque ref.
@@ -11487,6 +11491,7 @@ def build_safe_ref_prestartup_reissue_authority(
     route_hash = str(route_identity_hash or "").strip()
     checkpoint_id = str(stage_checkpoint_id or "").strip()
     checkpoint_server_verified = bool(checkpoint_id)
+    pre_read_special = bool(pre_read_special_authority)
     worker_id = str(context.worker_id or "").strip()
     worker_slot_id = str(context.worker_slot_id or worker_id).strip()
     actual_host_worker_id = str(context.actual_host_worker_id or "").strip()
@@ -11511,7 +11516,6 @@ def build_safe_ref_prestartup_reissue_authority(
                 session_ref,
                 context.lease_id,
                 context.lease_expires_at,
-                read_ref,
                 join_ref,
                 session_authority_ref,
                 session_authority_type,
@@ -11519,8 +11523,21 @@ def build_safe_ref_prestartup_reissue_authority(
                 authorized_at,
             )
         )
-        or not read_ref.startswith(
-            f"contract_runtime:{execution_id}:completed_lines:"
+        or (
+            read_ref
+            and not read_ref.startswith(
+                f"contract_runtime:{execution_id}:completed_lines:"
+            )
+        )
+        or (read_ref and pre_read_special)
+        or (
+            not read_ref
+            and not (
+                pre_read_special
+                and checkpoint_server_verified
+                and session_authority_ref != join_ref
+                and session_authority_type == "ordinary_initial_rejoin"
+            )
         )
         or not join_ref.startswith("timeline:")
         or not session_authority_ref.startswith("timeline:")
@@ -11596,10 +11613,74 @@ def build_safe_ref_prestartup_reissue_authority(
         stage_checkpoint_server_verified=checkpoint_server_verified,
         lease_status_at_authorization=lease_status,
         latest_ref_identifier_only=latest_ref_identifier_only,
+        pre_read_special_authority=pre_read_special,
     )
     payload = asdict(authority)
     payload.pop("authority_hash", None)
     return replace(authority, authority_hash=_stable_authority_hash(payload))
+
+
+def is_nonprogress_mf_subagent_startup_refusal(
+    event: Mapping[str, Any],
+) -> bool:
+    """Return whether a timeline row is a typed blocked-startup audit only.
+
+    A startup refusal is durable diagnostics, but it is not worker progress and
+    must not advance the checkpoint used by the one bounded auth-loss recovery.
+    The classifier is deliberately closed over the canonical/legacy refusal
+    aliases and the startup-gate phase; arbitrary failed worker events are not
+    eligible for this exclusion.
+    """
+
+    payload = (
+        event.get("payload")
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    refusal = (
+        payload.get("mf_subagent_startup_refusal")
+        if isinstance(payload.get("mf_subagent_startup_refusal"), Mapping)
+        else {}
+    )
+    event_type = str(event.get("event_type") or "").strip().lower()
+    event_kind = str(event.get("event_kind") or "").strip().lower()
+    event_status = str(event.get("status") or "").strip().lower()
+    phase = str(event.get("phase") or "").strip().lower()
+    action = str(payload.get("action") or refusal.get("action") or "").strip()
+    refusal_markers = {
+        "mf_subagent_startup_refusal",
+        "mf_subagent.startup_refusal",
+    }
+    startup_markers = {
+        "mf_subagent_startup",
+        "mf_subagent.startup",
+        *refusal_markers,
+    }
+    accepted_statuses = {
+        "accepted",
+        "ok",
+        "pass",
+        "passed",
+        "success",
+        "succeeded",
+    }
+    return bool(
+        phase == "startup_gate"
+        and event_status
+        and event_status not in accepted_statuses
+        and (event_type in startup_markers or event_kind in startup_markers)
+        and (
+            event_type in refusal_markers
+            or event_kind in refusal_markers
+            or bool(refusal)
+        )
+        and action
+        in {
+            "",
+            "record_mf_subagent_startup",
+            "record_mf_subagent_startup_refusal",
+        }
+    )
 
 
 def reissue_mf_subagent_runtime_session_token(
@@ -11709,8 +11790,25 @@ def reissue_mf_subagent_runtime_session_token(
             != "runtime_context.safe_ref_prestartup_reissue_authority.v2"
             or authority.server_derived is not True
             or authority.caller_claims_trusted is not False
-            or not authority.read_receipt_ref.startswith(
-                f"contract_runtime:{authority.contract_execution_id}:completed_lines:"
+            or (
+                authority.read_receipt_ref
+                and not authority.read_receipt_ref.startswith(
+                    f"contract_runtime:{authority.contract_execution_id}:"
+                    "completed_lines:"
+                )
+            )
+            or (
+                not authority.read_receipt_ref
+                and not (
+                    authority.pre_read_special_authority is True
+                    and authority.session_authority_kind
+                    == "ordinary_initial_rejoin"
+                    and authority.stage_checkpoint_server_verified is True
+                )
+            )
+            or (
+                authority.read_receipt_ref
+                and authority.pre_read_special_authority is True
             )
             or not authority.initial_join_event_ref.startswith("timeline:")
             or not authority.session_authority_event_ref.startswith(

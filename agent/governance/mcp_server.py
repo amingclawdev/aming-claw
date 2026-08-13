@@ -2809,7 +2809,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "runtime_context_session_token_reissue",
-        "description": "Runtime Context session-token rotation facade for expired or lost pre-startup mf_sub auth. Accepts either the server-projected copy-safe session_token_ref recovery proof or matching raw session/fence proof, and never persists raw tokens.",
+        "description": "Runtime Context session-token rotation facade for expired or lost pre-startup mf_sub auth. Accepts either the server-projected copy-safe session_token_ref recovery proof (including a server-validated special-authority pre-lineage source normalized to the closed safe-ref capability) or matching raw session/fence proof, and never persists raw tokens.",
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),

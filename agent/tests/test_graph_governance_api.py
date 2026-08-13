@@ -59739,6 +59739,436 @@ def _pre_lineage_case_events(conn, case: Mapping[str, Any]) -> list[dict[str, An
     )
 
 
+def _setup_special_safe_ref_ready_case(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    suffix: str,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=suffix,
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+    special = _pre_lineage_rejoin(case)
+    assert special["bounded_rejoin_kind"] == "special_authority_rejoin"
+    read = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case["context"].runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": case["context"].runtime_context_id,
+                "contract_execution_id": case["parent_task_id"],
+                "task_id": case["task_id"],
+                "parent_task_id": case["parent_task_id"],
+                "worker_id": case["worker_id"],
+                "worker_slot_id": case["worker_id"],
+                "fence_token": special["fence_token"],
+                "session_token": special["session_token"],
+                "session_token_ref": special["session_token_ref"],
+                "target_project_root": str(case["target_root"]),
+                "actor": case["worker_id"],
+                "read_receipt_hash": _fake_sha(f"{suffix}-read"),
+                "launch_text_hash": _fake_sha(f"{suffix}-launch"),
+                **case["route_identity"],
+            },
+        )
+    )
+    assert read["ok"] is True
+    current = get_branch_context(conn, PID, case["task_id"])
+    assert current is not None
+
+    def recovery_body(session_token_ref: str, reason: str) -> dict[str, Any]:
+        projected = server._runtime_context_worker_recovery_payloads(
+            project_id=PID,
+            runtime_context_id=current.runtime_context_id,
+            task_id=case["task_id"],
+            parent_task_id=case["parent_task_id"],
+            worker_id=case["worker_id"],
+            worker_slot_id=case["worker_id"],
+            target_project_root=str(case["target_root"]),
+            backlog_id=case["backlog_id"],
+            agent_id=str(current.agent_id or "").strip(),
+            allocation_owner=str(current.allocation_owner or "").strip(),
+            actual_host_worker_id=case["worker_id"],
+            worker_session_id=case["worker_session_id"],
+            host_startup_id=case["host_startup_id"],
+            host_session_id=case["worker_session_id"],
+            route_identity=case["route_identity"],
+            session_token_ref=session_token_ref,
+            contract_execution_id=case["parent_task_id"],
+        )
+        body = copy.deepcopy(
+            projected["session_token_reissue_submission"]["copy_safe_body"]
+        )
+        body["reason"] = reason
+        return body
+
+    return case, special, current, recovery_body
+
+
+def test_special_safe_ref_reissue_recovers_exact_worker_before_read(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="cl014-special-before-read",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+    special = _pre_lineage_rejoin(case)
+    assert special["bounded_rejoin_kind"] == "special_authority_rejoin"
+    current = get_branch_context(conn, PID, case["task_id"])
+    assert current is not None
+    projected = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id=current.runtime_context_id,
+        task_id=case["task_id"],
+        parent_task_id=case["parent_task_id"],
+        worker_id=case["worker_id"],
+        worker_slot_id=case["worker_id"],
+        target_project_root=str(case["target_root"]),
+        backlog_id=case["backlog_id"],
+        agent_id=str(current.agent_id or "").strip(),
+        allocation_owner=str(current.allocation_owner or "").strip(),
+        actual_host_worker_id=case["worker_id"],
+        worker_session_id=case["worker_session_id"],
+        host_startup_id=case["host_startup_id"],
+        host_session_id=case["worker_session_id"],
+        route_identity=case["route_identity"],
+        session_token_ref=special["session_token_ref"],
+        contract_execution_id=case["parent_task_id"],
+    )
+    body = copy.deepcopy(
+        projected["session_token_reissue_submission"]["copy_safe_body"]
+    )
+    body["reason"] = "recover the exact worker before its read receipt"
+    before_lines = server._runtime_context_contract_runtime_worker_sequence_evidence(
+        conn,
+        project_id=PID,
+        context=current,
+    )
+    assert before_lines == {}
+    timeline_events = _pre_lineage_case_events(conn, case)
+    special_event = next(
+        event
+        for event in timeline_events
+        if event["id"] == int(special["audit_event_id"])
+    )
+    modern_authority_args = {
+        "project_id": PID,
+        "context": current,
+        "timeline_events": timeline_events,
+        "contract_execution_id": case["parent_task_id"],
+        "route_identity": case["route_identity"],
+    }
+    assert server._runtime_context_modern_special_rejoin_authority_valid(
+        event=special_event,
+        **modern_authority_args,
+    ) is True
+    invalid_events = []
+    for nested_path, value in (
+        (("pre_lineage_rejoin_authority", "task_id"), "foreign-task"),
+        (
+            ("pre_lineage_rejoin_authority", "initial_join_event_ref"),
+            "timeline:999999",
+        ),
+        (
+            (
+                "pre_lineage_rejoin_authority",
+                "canonical_identity_binding_valid",
+            ),
+            False,
+        ),
+        (
+            (
+                "pre_lineage_rejoin_authority",
+                "canonical_identity_cutover_valid",
+            ),
+            False,
+        ),
+        (
+            (
+                "pre_lineage_rejoin_authority",
+                "route_identity",
+                "route_token_ref",
+            ),
+            "rtok-foreign",
+        ),
+        (
+            (
+                "bounded_replacement_worker_write_baseline",
+                "stage_checkpoint_id",
+            ),
+            _fake_sha("foreign-stage"),
+        ),
+        (
+            ("rejoin_stage_checkpoint_id",),
+            _fake_sha("foreign-rejoin-stage"),
+        ),
+    ):
+        invalid_event = copy.deepcopy(special_event)
+        target = invalid_event["payload"]
+        for key in nested_path[:-1]:
+            target = target[key]
+        target[nested_path[-1]] = value
+        invalid_events.append(invalid_event)
+    assert all(
+        server._runtime_context_modern_special_rejoin_authority_valid(
+            event=invalid_event,
+            **modern_authority_args,
+        ) is False
+        for invalid_event in invalid_events
+    )
+    recovered = (
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": current.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=body,
+            )
+        )
+    )
+    source = recovered["safe_ref_session_authority_source"]
+    assert source["source_kind"] == "special_authority_rejoin"
+    assert source["normalized_capability_kind"] == (
+        "ordinary_initial_rejoin"
+    )
+    assert recovered["safe_ref_reissue_authority"][
+        "pre_read_special_authority"
+    ] is True
+    after_lines = server._runtime_context_contract_runtime_worker_sequence_evidence(
+        conn,
+        project_id=PID,
+        context=get_branch_context(conn, PID, case["task_id"]),
+    )
+    assert after_lines == {}
+    events = _pre_lineage_case_events(conn, case)
+    assert not any(
+        str((event.get("payload") or {}).get("action") or "").strip()
+        in {"record_read_receipt", "record_mf_subagent_startup"}
+        for event in events
+    )
+
+
+def test_special_safe_ref_reissue_and_blocked_startup_loss_replacement_are_bounded(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case, special, current, recovery_body = (
+        _setup_special_safe_ref_ready_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix="cl014-special-refusal",
+        )
+    )
+    first_body = recovery_body(
+        special["session_token_ref"],
+        "recover the exact special-authority worker",
+    )
+    assert "session_token" not in first_body
+    assert "fence_token" not in first_body
+    first = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": current.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=first_body,
+        )
+    )
+    source = first["safe_ref_session_authority_source"]
+    assert source["event_ref"] == special["audit_event_ref"]
+    assert source["source_kind"] == "special_authority_rejoin"
+    assert source["normalized_capability_kind"] == (
+        "ordinary_initial_rejoin"
+    )
+    assert source["normalization_applied"] is True
+    assert first["safe_ref_reissue_authority"]["session_authority_kind"] == (
+        "ordinary_initial_rejoin"
+    )
+    assert first["safe_ref_reissue_authority"][
+        "pre_read_special_authority"
+    ] is False
+
+    current = get_branch_context(conn, PID, case["task_id"])
+    assert current is not None
+    before_refusal = server._runtime_context_rejoin_worker_write_baseline(
+        conn,
+        project_id=PID,
+        context=current,
+        timeline_events=_pre_lineage_case_events(conn, case),
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=case["task_id"],
+        backlog_id=case["backlog_id"],
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup_refusal",
+        phase="startup_gate",
+        status="blocked",
+        actor=case["worker_session_id"],
+        payload={
+            "runtime_context_id": current.runtime_context_id,
+            "action": "record_mf_subagent_startup",
+            "mf_subagent_startup_refusal": {
+                "schema_version": "mf_subagent_startup_refusal.v1",
+                "status": "blocked",
+                "ok": False,
+                "blocked": True,
+                "blocker_id": "missing_merge_queue_id",
+            },
+        },
+    )
+    conn.commit()
+    after_refusal = server._runtime_context_rejoin_worker_write_baseline(
+        conn,
+        project_id=PID,
+        context=current,
+        timeline_events=_pre_lineage_case_events(conn, case),
+    )
+    assert after_refusal == before_refusal
+
+    replacement_body = recovery_body(
+        first["session_token_ref"],
+        "replace the one envelope lost after blocked startup",
+    )
+    replacement = (
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": current.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=replacement_body,
+            )
+        )
+    )
+    assert replacement["safe_ref_loss_replacement_authority"][
+        "max_loss_replacements"
+    ] == 1
+
+    exhausted_body = recovery_body(
+        replacement["session_token_ref"],
+        "a second loss replacement must fail closed",
+    )
+    before_exhausted = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as exhausted:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": current.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=exhausted_body,
+            )
+        )
+    assert exhausted.value.code == "fence_invalidated_or_unknown"
+    assert "\n".join(conn.iterdump()) == before_exhausted
+
+    serialized = json.dumps(_pre_lineage_case_events(conn, case), sort_keys=True)
+    for raw_secret in (
+        special["session_token"],
+        special["fence_token"],
+        first["session_token"],
+        first["fence_token"],
+        replacement["session_token"],
+        replacement["fence_token"],
+    ):
+        assert raw_secret not in serialized
+
+
+@pytest.mark.parametrize(
+    ("event_type", "event_kind", "action"),
+    (
+        (
+            "mf_subagent.startup",
+            "mf_subagent_startup_refusal",
+            "record_mf_subagent_startup",
+        ),
+        (
+            "mf_subagent_startup_refusal",
+            "mf_subagent.startup_refusal",
+            "record_mf_subagent_startup_refusal",
+        ),
+    ),
+)
+def test_blocked_startup_refusal_aliases_are_nonprogress_only(
+    event_type,
+    event_kind,
+    action,
+):
+    refusal = {
+        "event_type": event_type,
+        "event_kind": event_kind,
+        "phase": "startup_gate",
+        "status": "blocked",
+        "payload": {"action": action},
+    }
+    assert parallel_branch_runtime.is_nonprogress_mf_subagent_startup_refusal(
+        refusal
+    ) is True
+    assert parallel_branch_runtime.is_nonprogress_mf_subagent_startup_refusal(
+        {
+            **refusal,
+            "event_type": "worker_implementation",
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "payload": {"action": "record_worker_implementation"},
+        }
+    ) is False
+
+
+def test_runtime_context_reissue_mcp_schema_names_special_safe_ref_capability():
+    from agent.governance import mcp_server as governance_mcp_server
+
+    tool = next(
+        item
+        for item in governance_mcp_server.TOOLS
+        if item["name"] == "runtime_context_session_token_reissue"
+    )
+    assert "special-authority pre-lineage source" in tool["description"]
+    proof_branches = tool["inputSchema"]["anyOf"]
+    assert [branch["required"] for branch in proof_branches] == [
+        ["session_token_ref"],
+        ["fence_token", "session_token"],
+    ]
+    assert proof_branches[0]["properties"]["session_token_ref"][
+        "minLength"
+    ] == 1
+    assert proof_branches[1]["properties"]["fence_token"][
+        "minLength"
+    ] == 1
+    assert proof_branches[1]["properties"]["session_token"][
+        "minLength"
+    ] == 1
+
+
 def _freeze_rejoin_audit_as_legacy_v1(
     conn,
     *,
