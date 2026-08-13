@@ -92557,6 +92557,12 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
         ),
         (
             "observer_materialized",
+            "root_route_registry_historical_current_full_action",
+            True,
+            "",
+        ),
+        (
+            "observer_materialized",
             "root_route_registry_historical_route_context_action",
             True,
             "",
@@ -93270,6 +93276,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             "root_route_registry_live_actions",
             "root_route_registry_historical_implementation_action",
             "root_route_registry_historical_preflight_actions",
+            "root_route_registry_historical_current_full_action",
             "root_route_registry_historical_route_context_action",
             "root_route_registry_required_ref_removed",
             "root_route_registry_scope_tampered",
@@ -93478,6 +93485,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         "root_route_registry_live_actions",
         "root_route_registry_historical_implementation_action",
         "root_route_registry_historical_preflight_actions",
+        "root_route_registry_historical_current_full_action",
     }:
         action_sets = {
             "root_route_registry_non_direct_action": [
@@ -93522,6 +93530,13 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
                 "backlog_close",
                 "graph_current_full_reconcile",
                 "preflight_check",
+            ],
+            "root_route_registry_historical_current_full_action": [
+                "graph_query",
+                "task_timeline_append",
+                "observer_direct_mutation_exception",
+                "current_full_reconcile",
+                "backlog_close",
             ],
             "root_route_registry_historical_route_context_action": [
                 "route_context",

@@ -116032,6 +116032,11 @@ _OPERATOR_SUPERVISED_DIRECT_MAIN_HISTORICAL_ROOT_ROUTE_ACTIONS = (
     # for this action.  Accept it only when revalidating an immutable root
     # route; newly issued full-round routes keep the canonical mutation name.
     "observer_direct_implementation_exception",
+    # The pre-graph_current_full_reconcile direct-main issuer persisted this
+    # action spelling in otherwise exact root route rows.  Accept it only at
+    # this immutable historical registry boundary; newly issued full-round
+    # routes continue to use graph_current_full_reconcile.
+    "current_full_reconcile",
     "preflight_check",
 )
 _ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES = ("agent/governance/server.py",)
