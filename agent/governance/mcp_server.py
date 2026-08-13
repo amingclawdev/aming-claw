@@ -816,6 +816,20 @@ def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
         "worker_id": {"type": "string"},
         "actor": {"type": "string"},
         "attempt": {"type": "integer"},
+        "profile_requirements": {
+            "type": "object",
+            "description": (
+                "Public worker profile authority copied unchanged from "
+                "parallel_branch_allocate_precheck."
+            ),
+        },
+        "retry_policy": {
+            "type": "object",
+            "description": (
+                "Bounded retry authority copied unchanged from "
+                "parallel_branch_allocate_precheck."
+            ),
+        },
         "branch_prefix": {"type": "string"},
         "worktree_root": {"type": "string"},
         "worktree_path": {

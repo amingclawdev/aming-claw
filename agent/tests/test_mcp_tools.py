@@ -3686,6 +3686,8 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     finish_props = finish_gate["inputSchema"]["properties"]
     initial_join_props = initial_join["inputSchema"]["properties"]
     runtime_text_props = runtime_text["inputSchema"]["properties"]
+    assert allocate_props["profile_requirements"]["type"] == "object"
+    assert allocate_props["retry_policy"]["type"] == "object"
     assert runtime_text["inputSchema"]["required"] == [
         "project_id",
         "backlog_id",
@@ -3964,6 +3966,11 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
             "stage_task_id": "mf-sub-1",
             "agent_id": "codex",
             "worker_id": "worker-1",
+            "profile_requirements": {
+                "profile_id": "codex-mf-sub",
+                "harness": "codex",
+            },
+            "retry_policy": {"attempt": 1, "max_attempts": 2},
             "branch_prefix": "mf",
             "worktree_root": ".worktrees",
             "ref_name": "main",
@@ -4059,6 +4066,11 @@ def test_mcp_parallel_branch_tools_route_to_governance_api():
                 "stage_task_id": "mf-sub-1",
                 "agent_id": "codex",
                 "worker_id": "worker-1",
+                "profile_requirements": {
+                    "profile_id": "codex-mf-sub",
+                    "harness": "codex",
+                },
+                "retry_policy": {"attempt": 1, "max_attempts": 2},
                 "branch_prefix": "mf",
                 "worktree_root": ".worktrees",
                 "ref_name": "main",

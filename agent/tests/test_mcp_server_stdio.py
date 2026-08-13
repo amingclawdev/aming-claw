@@ -1757,6 +1757,8 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields
         "prompt_contract_id",
         "prompt_contract_hash",
         "visible_injection_manifest_hash",
+        "profile_requirements",
+        "retry_policy",
         "owned_files",
         "target_files",
         "route_identity",
@@ -1783,6 +1785,8 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields
     assert properties["owned_files"]["items"]["type"] == "string"
     assert properties["target_files"]["type"] == "array"
     assert properties["target_files"]["items"]["type"] == "string"
+    assert properties["profile_requirements"]["type"] == "object"
+    assert properties["retry_policy"]["type"] == "object"
     assert properties["route_identity"]["type"] == "object"
     assert properties["canonical_route_identity"]["type"] == "object"
     assert properties["parent_route_identity"]["type"] == "object"
@@ -1921,6 +1925,8 @@ def test_governance_mcp_parallel_branch_allocate_schema_and_dispatch(monkeypatch
         "prompt_contract_id",
         "prompt_contract_hash",
         "visible_injection_manifest_hash",
+        "profile_requirements",
+        "retry_policy",
         "owned_files",
         "target_files",
         "route_identity",
@@ -1937,6 +1943,11 @@ def test_governance_mcp_parallel_branch_allocate_schema_and_dispatch(monkeypatch
             "successor_contract_execution_id": "cex-allocate",
             "current_contract_execution_id": "cex-allocate",
             "observer_command_id": "cmd-allocate",
+            "profile_requirements": {
+                "profile_id": "codex-mf-sub",
+                "harness": "codex",
+            },
+            "retry_policy": {"attempt": 1, "max_attempts": 2},
             "route_context_hash": "sha256:route",
             "prompt_contract_id": "rprompt-allocate",
             "owned_files": ["agent/governance/mcp_server.py"],
@@ -1955,6 +1966,11 @@ def test_governance_mcp_parallel_branch_allocate_schema_and_dispatch(monkeypatch
                 "successor_contract_execution_id": "cex-allocate",
                 "current_contract_execution_id": "cex-allocate",
                 "observer_command_id": "cmd-allocate",
+                "profile_requirements": {
+                    "profile_id": "codex-mf-sub",
+                    "harness": "codex",
+                },
+                "retry_policy": {"attempt": 1, "max_attempts": 2},
                 "route_context_hash": "sha256:route",
                 "prompt_contract_id": "rprompt-allocate",
                 "owned_files": ["agent/governance/mcp_server.py"],
