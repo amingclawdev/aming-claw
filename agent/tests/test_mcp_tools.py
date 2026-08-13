@@ -4274,19 +4274,20 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
 
 
 def test_current_mcp_schema_bump_marks_prior_client_stale():
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-02.3"
-    assert "graph_trace_ids" in _tool_properties("contract_runtime_bypass_line")
-    assert "required_worker_count" in _tool_properties("mf_parallel_revise")
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-13.1"
+    allocate_properties = _tool_properties("parallel_branch_allocate")
+    assert allocate_properties["profile_requirements"]["type"] == "object"
+    assert allocate_properties["retry_policy"]["type"] == "object"
 
     compatibility = mcp_tool_schema_compatibility(
-        loaded_schema_version="2026-08-02.2",
+        loaded_schema_version="2026-08-02.3",
         server_schema_version=MCP_TOOL_SCHEMA_VERSION,
         minimum_client_schema_version=MCP_TOOL_SCHEMA_VERSION,
     )
 
-    assert compatibility["loaded_client_tool_schema_version"] == "2026-08-02.2"
-    assert compatibility["server_tool_schema_version"] == "2026-08-02.3"
-    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-02.3"
+    assert compatibility["loaded_client_tool_schema_version"] == "2026-08-02.3"
+    assert compatibility["server_tool_schema_version"] == "2026-08-13.1"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-13.1"
     assert compatibility["client_schema_fresh"] is False
     assert compatibility["stale_client_possible"] is True
 
