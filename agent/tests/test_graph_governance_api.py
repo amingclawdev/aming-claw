@@ -81727,6 +81727,7 @@ def _parentless_direct_main_pre_mutation_graph_scope(
     conn,
     *,
     backlog_id: str,
+    allowed_actions: list[str] | None = None,
 ) -> tuple[str, str, dict[str, str]]:
     _insert_simple_mf_close_backlog(conn, backlog_id)
     conn.execute(
@@ -81786,7 +81787,9 @@ def _parentless_direct_main_pre_mutation_graph_scope(
         token={
             **route_identity,
             "caller_role": "observer",
-            "allowed_actions": ["task_timeline_append"],
+            "allowed_actions": list(
+                allowed_actions or ["task_timeline_append"]
+            ),
             "scope": {
                 "project_id": PID,
                 "backlog_id": backlog_id,
@@ -81797,6 +81800,122 @@ def _parentless_direct_main_pre_mutation_graph_scope(
         },
     )
     return parent_execution_id, route_token_ref, route_identity
+
+
+@pytest.mark.parametrize(
+    "unexpected_action",
+    ["backlog_upsert", "release_operator_head_queue_remove"],
+)
+def test_parentless_direct_main_pre_mutation_rejects_root_route_actions_that_close_would_reject(
+    conn,
+    unexpected_action,
+):
+    backlog_id = (
+        "AC-DIRECT-MAIN-ROOT-ACTION-ENTRY-"
+        + unexpected_action.upper().replace("_", "-")
+    )
+    parent_execution_id, route_token_ref, route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+            allowed_actions=["task_timeline_append", unexpected_action],
+        )
+    )
+    graph_trace_id = "gqt-20260814-" + _fake_sha(backlog_id).split(":", 1)[1][:10]
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_identity=route_identity,
+    )
+    before_events = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=_canonical_parentless_direct_main_pre_mutation_body(
+                    append_base={
+                        "backlog_id": backlog_id,
+                        "task_id": parent_execution_id,
+                        "route_token_ref": route_token_ref,
+                    },
+                    route_identity=route_identity,
+                    allowed_files=["agent/governance/server.py"],
+                    graph_trace_ids=[graph_trace_id],
+                ),
+            )
+        )
+
+    assert rejected.value.code == (
+        "parentless_direct_main_root_route_action_authority_rejected"
+    )
+    assert rejected.value.details["field"] == "allowed_actions"
+    assert rejected.value.details["unexpected_actions"] == [unexpected_action]
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["persisted_as_accepted"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_events
+    assert conn.total_changes == before_changes
+
+
+def test_parentless_direct_main_pre_mutation_accepts_exact_full_round_root_actions(
+    conn,
+):
+    backlog_id = "AC-DIRECT-MAIN-ROOT-ACTION-ENTRY-CONTROL"
+    parent_execution_id, route_token_ref, route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+            allowed_actions=list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+        )
+    )
+    graph_trace_id = (
+        "gqt-20260814-"
+        + _fake_sha(backlog_id).split(":", 1)[1][:10]
+    )
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        backlog_id=backlog_id,
+        task_id=parent_execution_id,
+        route_identity=route_identity,
+    )
+
+    accepted = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_canonical_parentless_direct_main_pre_mutation_body(
+                append_base={
+                    "backlog_id": backlog_id,
+                    "task_id": parent_execution_id,
+                    "route_token_ref": route_token_ref,
+                },
+                route_identity=route_identity,
+                allowed_files=["agent/governance/server.py"],
+                graph_trace_ids=[graph_trace_id],
+            ),
+        )
+    )
+
+    authority = accepted["payload"]["observer_direct_pre_mutation_authority"]
+    assert authority["accepted"] is True
+    assert authority["root_route_action_authority"]["accepted"] is True
+    assert authority["root_route_action_authority"]["allowed_actions"] == list(
+        server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+    )
 
 
 def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(

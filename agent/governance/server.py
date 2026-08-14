@@ -116308,6 +116308,77 @@ _OPERATOR_SUPERVISED_DIRECT_MAIN_HISTORICAL_ROOT_ROUTE_ACTIONS = (
     "current_full_reconcile",
     "preflight_check",
 )
+
+
+def _contract_runtime_parentless_direct_main_root_route_action_authority(
+    conn,
+    *,
+    project_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    """Validate the immutable root route action set shared by entry and close."""
+
+    normalized_project_id = str(project_id or "").strip()
+    normalized_route_token_ref = str(route_token_ref or "").strip()
+    expected_actions = list(
+        _OPERATOR_SUPERVISED_DIRECT_MAIN_HISTORICAL_ROOT_ROUTE_ACTIONS
+    )
+    expected_action_set = set(expected_actions)
+    row = (
+        conn.execute(
+            """
+            SELECT allowed_actions_json
+            FROM observer_route_token_refs
+            WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (normalized_project_id, normalized_route_token_ref),
+        ).fetchone()
+        if conn is not None
+        and normalized_project_id
+        and normalized_route_token_ref
+        else None
+    )
+    raw_actions: Any = None
+    if row is not None:
+        try:
+            raw_actions = json.loads(row["allowed_actions_json"] or "")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raw_actions = None
+    canonical = bool(
+        isinstance(raw_actions, list)
+        and raw_actions
+        and all(
+            isinstance(item, str) and item == item.strip() and item
+            for item in raw_actions
+        )
+        and len(raw_actions) == len(set(raw_actions))
+    )
+    actual_actions = list(raw_actions) if canonical else []
+    unexpected_actions = (
+        sorted(set(actual_actions) - expected_action_set)
+        if canonical
+        else []
+    )
+    accepted = bool(row is not None and canonical and not unexpected_actions)
+    return {
+        "schema_version": (
+            "parentless_direct_main.root_route_action_authority.v1"
+        ),
+        "accepted": accepted,
+        "passed": accepted,
+        "status": "passed" if accepted else "failed",
+        "server_derived": True,
+        "source": "observer_route_token_refs.allowed_actions_json",
+        "project_id": normalized_project_id,
+        "route_token_ref": normalized_route_token_ref,
+        "route_registry_row_found": row is not None,
+        "canonical_allowed_actions": canonical,
+        "allowed_actions": actual_actions,
+        "expected_allowed_actions": expected_actions,
+        "unexpected_actions": unexpected_actions,
+        "field": "allowed_actions",
+        "historical_backfill_allowed": False,
+    }
 _ONBOARD_CONTRACT_ROUTE_TOKEN_DEFAULT_TARGET_FILES = ("agent/governance/server.py",)
 _CONTRACT_RUNTIME_ROUTE_TOKEN_REQUIRED_ACTIONS = (
     "contract_runtime_current",
@@ -145694,6 +145765,15 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         },
     }
     root_ref = str(direct_identity.get("route_token_ref") or "").strip()
+    root_route_action_authority = (
+        _contract_runtime_parentless_direct_main_root_route_action_authority(
+            conn,
+            project_id=project_id,
+            route_token_ref=root_ref,
+        )
+        if conn is not None
+        else {}
+    )
     root_registry_row = (
         conn.execute(
             """
@@ -145719,17 +145799,10 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
     registry_json_valid = False
     if root_registry_row is not None:
         try:
-            raw_actions = json.loads(root_registry_row["allowed_actions_json"] or "")
             raw_refs = json.loads(root_registry_row["evidence_refs_json"] or "")
             raw_scope = json.loads(root_registry_row["scope_json"] or "")
             registry_json_valid = bool(
-                isinstance(raw_actions, list)
-                and raw_actions
-                and all(
-                    isinstance(item, str) and item == item.strip() and item
-                    for item in raw_actions
-                )
-                and len(raw_actions) == len(set(raw_actions))
+                root_route_action_authority.get("accepted") is True
                 and isinstance(raw_refs, list)
                 and all(
                     isinstance(item, str) and item == item.strip() and item
@@ -145739,7 +145812,12 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
                 and isinstance(raw_scope, dict)
             )
             if registry_json_valid:
-                registry_actions = {item.strip() for item in raw_actions}
+                registry_actions = {
+                    str(item).strip()
+                    for item in root_route_action_authority.get(
+                        "allowed_actions", []
+                    )
+                }
                 registry_refs = {item.strip() for item in raw_refs}
                 registry_scope = raw_scope
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -145759,6 +145837,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
     root_registry_passed = conn is None or bool(
         root_registry_row
         and registry_json_valid
+        and root_route_action_authority.get("accepted") is True
         and str(root_registry_row["status"] or "")
         in {"active", "expired", "superseded"}
         and str(root_registry_row["backlog_id"] or "") == bug_id
@@ -145766,11 +145845,6 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         and str(root_registry_row["caller_role"] or "") == "observer"
         and historical_action
         and historical_action in registry_actions
-        and registry_actions.issubset(
-            set(
-                _OPERATOR_SUPERVISED_DIRECT_MAIN_HISTORICAL_ROOT_ROUTE_ACTIONS
-            )
-        )
         and historical_refs.issubset(registry_refs)
         and registry_scope == expected_scope
         and isinstance(historical_scope, Mapping)
@@ -149689,6 +149763,41 @@ def handle_task_timeline_append(ctx: RequestContext):
             direct_identity = _observer_root_route_identity_from_event(
                 provisional_event
             )
+            root_route_action_authority = (
+                _contract_runtime_parentless_direct_main_root_route_action_authority(
+                    conn,
+                    project_id=project_id,
+                    route_token_ref=str(
+                        direct_identity.get("route_token_ref") or ""
+                    ).strip(),
+                )
+            )
+            if not root_route_action_authority.get("accepted"):
+                raise GovernanceError(
+                    "parentless_direct_main_root_route_action_authority_rejected",
+                    (
+                        "observer direct-main root route actions exceed the "
+                        "entry-and-close authority boundary"
+                    ),
+                    422,
+                    {
+                        **root_route_action_authority,
+                        "actual": root_route_action_authority.get(
+                            "allowed_actions", []
+                        ),
+                        "expected": root_route_action_authority.get(
+                            "expected_allowed_actions", []
+                        ),
+                        "source": (
+                            "server.handle_task_timeline_append."
+                            "parentless_direct_main_root_route_action_gate"
+                        ),
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                        "persisted_as_accepted": False,
+                        "historical_backfill_allowed": False,
+                    },
+                )
             pre_mutation_graph_trace_gate = (
                 _contract_runtime_parentless_direct_main_append_graph_trace_gate(
                     conn,
@@ -149822,6 +149931,7 @@ def handle_task_timeline_append(ctx: RequestContext):
                 "graph_trace_db_evidence": (
                     pre_mutation_graph_trace_gate.get("db_evidence") or {}
                 ),
+                "root_route_action_authority": root_route_action_authority,
                 "missing_requirement_ids": [],
                 "historical_backfill_allowed": False,
             }
