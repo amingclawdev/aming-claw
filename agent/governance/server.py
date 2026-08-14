@@ -34021,6 +34021,8 @@ def _runtime_context_worker_recovery_details(
         get_branch_context,
         get_branch_context_by_runtime_context_id,
         mf_subagent_session_token_hash,
+        runtime_context_fence_token_matches,
+        runtime_context_fence_token_verifier,
         runtime_context_id_for_branch_context,
         runtime_context_session_token_lease_view,
         runtime_context_session_token_ref,
@@ -34130,23 +34132,11 @@ def _runtime_context_worker_recovery_details(
                 or supplied_session_ref_matches
             )
         )
-        fence_token_hash = ""
-        try:
-            from .parallel_branch_runtime import runtime_context_secret_hash
-
-            fence_token_hash = runtime_context_secret_hash(
-                str(getattr(context, "fence_token", "") or fence_token or "")
-            )
-            fence_matches = bool(
-                getattr(context, "fence_token", "")
-                and fence_token
-                and hashlib.sha256(str(fence_token).encode("utf-8")).hexdigest()
-                == hashlib.sha256(
-                    str(getattr(context, "fence_token", "")).encode("utf-8")
-                ).hexdigest()
-            )
-        except Exception:
-            fence_matches = False
+        fence_token_hash = runtime_context_fence_token_verifier(context)
+        fence_matches = bool(
+            fence_token
+            and runtime_context_fence_token_matches(context, fence_token)
+        )
         expected_worker_id = str(
             getattr(context, "worker_id", "")
             or getattr(context, "worker_slot_id", "")
@@ -34183,7 +34173,18 @@ def _runtime_context_worker_recovery_details(
             ],
             "route_identity_present": bool(expected_route_identity),
             "session_token_hash_recorded": bool(getattr(context, "session_token_hash", "")),
-            "fence_token_recorded": bool(getattr(context, "fence_token", "")),
+            "fence_token_recorded": bool(fence_token_hash),
+            "raw_fence_token_recorded": bool(
+                getattr(context, "fence_token", "")
+            ),
+            "fence_token_storage_mode": (
+                "verifier_only"
+                if fence_token_hash
+                and not getattr(context, "fence_token", "")
+                else "legacy_raw_with_derived_verifier"
+                if fence_token_hash
+                else "missing"
+            ),
         }
         target_root_projection = _runtime_context_target_root_projection(
             project_id=project_id,
@@ -34725,6 +34726,31 @@ def _runtime_context_worker_recovery_details(
                     dict(projected_prestartup_reissue)
                 )
         if session_token_initial_join_submission:
+            # A copy-safe ref exists as soon as allocation persists a session
+            # verifier, but it is not a recovery authority before the server
+            # has accepted the exact initial-join and worker-read lineage.
+            # Exposing the generic reissue skeleton beside the executable
+            # initial-join action led hosts to call a guaranteed 403 path and
+            # strand the one process-local envelope boundary.  Keep only the
+            # single legal action until the source-backed safe-ref authority
+            # above is present.
+            if not projected_prestartup_reissue:
+                actionable_payloads.pop(
+                    "session_token_reissue_submission",
+                    None,
+                )
+                renewal_hints = actionable_payloads.get(
+                    "session_renewal_hints"
+                )
+                if isinstance(renewal_hints, dict):
+                    renewal_hints.pop("reissue", None)
+                    renewal_hints["preferred_for_live_worker"] = (
+                        "session_token_initial_join_submission"
+                    )
+                    renewal_hints["reissue_available"] = False
+                    renewal_hints["reissue_unavailable_reason"] = (
+                        "accepted_initial_join_and_worker_read_required"
+                    )
             actionable_payloads["session_token_initial_join_submission"] = (
                 session_token_initial_join_submission
             )

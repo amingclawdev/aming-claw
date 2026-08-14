@@ -59496,7 +59496,10 @@ def test_runtime_context_worker_guide_missing_auth_points_to_initial_join_before
             worker_slot_id="slot-auth-missing",
             branch_ref="refs/heads/codex/worker-auth-missing",
             status=STATE_WORKTREE_READY,
-            fence_token="fence-auth-missing",
+            fence_token="",
+            fence_token_verifier=runtime_context_secret_hash(
+                "fence-auth-missing"
+            ),
             session_token_hash=mf_subagent_session_token_hash("auth-missing-token"),
         ),
     )
@@ -59518,6 +59521,11 @@ def test_runtime_context_worker_guide_missing_auth_points_to_initial_join_before
     assert blocked.value.code == "fence_invalidated_or_unknown"
     details = blocked.value.details
     assert details["diagnostics"]["reason"] == "worker_auth_material_missing"
+    assert details["diagnostics"]["expected"]["fence_token_recorded"] is True
+    assert details["diagnostics"]["expected"]["raw_fence_token_recorded"] is False
+    assert details["diagnostics"]["expected"]["fence_token_storage_mode"] == (
+        "verifier_only"
+    )
     assert details["next_legal_action"] == (
         "request_runtime_context_initial_join_host_envelope"
     )
@@ -59546,6 +59554,43 @@ def test_runtime_context_worker_guide_missing_auth_points_to_initial_join_before
         "worker_slot_id": context.worker_slot_id,
     }
     assert submission["security_boundary"]["session_token_ref_alone_authorizes_writes"] is False
+    assert "session_token_reissue_submission" not in details[
+        "actionable_payloads"
+    ]
+    renewal_hints = details["actionable_payloads"]["session_renewal_hints"]
+    assert "reissue" not in renewal_hints
+    assert renewal_hints["preferred_for_live_worker"] == (
+        "session_token_initial_join_submission"
+    )
+    assert renewal_hints["reissue_available"] is False
+    assert renewal_hints["reissue_unavailable_reason"] == (
+        "accepted_initial_join_and_worker_read_required"
+    )
+
+    before_dump = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+    forged_reissue_body = copy.deepcopy(submission["copy_safe_body"])
+    forged_reissue_body.update(
+        {
+            "session_token_ref": runtime_context_session_token_ref(context),
+            "reason": "a copy-safe ref is not pre-lineage reissue authority",
+        }
+    )
+    with pytest.raises(GovernanceError) as rejected_reissue:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=forged_reissue_body,
+            )
+        )
+    assert rejected_reissue.value.code == "fence_invalidated_or_unknown"
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
     capacity_guidance = details["actionable_payloads"]["capacity_fallback_guidance"]
     assert capacity_guidance["official_fallback_options"] == [
         "reuse_existing_idle_subagent_same_runtime_envelope",
