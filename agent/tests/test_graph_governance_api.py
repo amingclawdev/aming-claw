@@ -65537,6 +65537,7 @@ def test_runtime_context_initial_join_accepts_registry_verified_superseded_ref_t
 
 def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_only_write(
     conn,
+    monkeypatch,
     tmp_path,
 ):
     target_root = tmp_path / "runtime-token-rejoin"
@@ -65694,6 +65695,100 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
     assert wrong_task.value.details["credential_rotated"] is False
     assert wrong_task.value.details["mutation_performed"] is False
 
+    from agent.governance import parallel_branch_runtime
+
+    original_rejoin = (
+        parallel_branch_runtime.rejoin_mf_subagent_runtime_session_token
+    )
+    before_ref_only_context = get_branch_context(
+        conn,
+        PID,
+        "worker-runtime-rejoin",
+    )
+    before_ref_only_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-RUNTIME-TOKEN-REJOIN",
+        limit=1000,
+    )
+
+    def _accepted_ref_only_rejoin(*args, **kwargs):
+        incomplete = dict(original_rejoin(*args, **kwargs))
+        incomplete.pop("session_token", None)
+        incomplete.pop("fence_token", None)
+        return incomplete
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "rejoin_mf_subagent_runtime_session_token",
+        _accepted_ref_only_rejoin,
+    )
+    with pytest.raises(GovernanceError) as missing_envelope:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": "worker-runtime-rejoin",
+                    "parent_task_id": "parent-runtime-rejoin",
+                    "target_project_root": str(target_root),
+                    "reason": "reject an accepted ref-only rejoin response",
+                },
+            )
+        )
+    assert missing_envelope.value.code == (
+        "runtime_context_rejoin_host_envelope_unavailable"
+    )
+    assert missing_envelope.value.details["zero_write_rejection"] is True
+    assert missing_envelope.value.details["writes_performed"] is False
+    assert missing_envelope.value.details["next_legal_action"] == (
+        "refresh_same_context_worker_guide_and_use_only_the_"
+        "advertised_bounded_rejoin_recovery"
+    )
+    assert get_branch_context(conn, PID, "worker-runtime-rejoin") == (
+        before_ref_only_context
+    )
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id="AC-RUNTIME-TOKEN-REJOIN",
+        limit=1000,
+    ) == before_ref_only_events
+    with pytest.raises(GovernanceError) as recovery_preserved:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": "parent-runtime-rejoin",
+                    "session_token_ref": runtime_context_session_token_ref(context),
+                    "target_project_root": str(target_root),
+                },
+            )
+        )
+    assert recovery_preserved.value.code == "fence_invalidated_or_unknown"
+    assert recovery_preserved.value.details["next_legal_action"] == (
+        "request_runtime_context_rejoin_host_envelope"
+    )
+    preserved_submission = recovery_preserved.value.details[
+        "actionable_payloads"
+    ]["session_token_rejoin_submission"]
+    assert preserved_submission["bounded_recovery_contract"] == (
+        rejoin_submission["bounded_recovery_contract"]
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "rejoin_mf_subagent_runtime_session_token",
+        original_rejoin,
+    )
+
     result = server.handle_graph_governance_runtime_context_session_token_rejoin(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": context.runtime_context_id},
@@ -65716,6 +65811,22 @@ def test_runtime_context_session_token_rejoin_audits_host_envelope_without_ref_o
     assert result["session_token"]
     assert result["fence_token"] == "fence-runtime-rejoin"
     assert result["route_identity"] == route_identity
+    assert next(iter(result)) == "host_envelope"
+    assert result["host_envelope_delivery"] == {
+        "schema_version": "runtime_context.rejoin_host_envelope_delivery.v1",
+        "delivery": "worker_host_envelope",
+        "server_derived": True,
+        "process_local_only": True,
+        "session_token_ref": result["session_token_ref"],
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "raw_tokens_persisted": False,
+    }
+    serialized_result = json.dumps(result, sort_keys=False)
+    assert serialized_result.index('"host_envelope"') < 64
+    assert serialized_result.index('"host_envelope"') < serialized_result.index(
+        '"session_token_ref"'
+    )
     assert result["host_envelope"]["route_identity"] == route_identity
     assert result["host_envelope"]["runtime_context_id"] == context.runtime_context_id
     assert result["raw_tokens_persisted_to_timeline"] is False

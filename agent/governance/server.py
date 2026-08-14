@@ -48288,6 +48288,117 @@ def _runtime_context_session_rejoin_guidance_eligibility(
     return projection
 
 
+def _runtime_context_prioritized_rejoin_host_envelope_result(
+    result: Mapping[str, Any],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Validate and prioritize the process-local rejoin host envelope.
+
+    Rejoin responses can carry a large amount of copy-safe recovery authority.
+    The raw envelope is the only part that lets the same live worker continue,
+    so it must be present near the start of the serialized response instead of
+    after the advisory projections.  An accepted ref-only response would rotate
+    durable auth without giving the host a usable write credential; reject that
+    shape while the surrounding transaction can still roll back.
+    """
+
+    payload = dict(result or {})
+    host_envelope = (
+        dict(payload.get("host_envelope") or {})
+        if isinstance(payload.get("host_envelope"), Mapping)
+        else {}
+    )
+    env = (
+        dict(host_envelope.get("env") or {})
+        if isinstance(host_envelope.get("env"), Mapping)
+        else {}
+    )
+    session_token = str(payload.get("session_token") or "").strip()
+    fence_token = str(payload.get("fence_token") or "").strip()
+    session_env = str(env.get("AMING_WORKER_SESSION_TOKEN") or "").strip()
+    fence_env = str(env.get("AMING_WORKER_FENCE_TOKEN") or "").strip()
+    missing_fields = [
+        field
+        for field, present in (
+            ("session_token", session_token),
+            ("fence_token", fence_token),
+            ("host_envelope", host_envelope),
+            ("host_envelope.env.AMING_WORKER_SESSION_TOKEN", session_env),
+            ("host_envelope.env.AMING_WORKER_FENCE_TOKEN", fence_env),
+        )
+        if not present
+    ]
+    mismatched_fields = [
+        field
+        for field, matches in (
+            (
+                "host_envelope.env.AMING_WORKER_SESSION_TOKEN",
+                bool(session_token and session_env == session_token),
+            ),
+            (
+                "host_envelope.env.AMING_WORKER_FENCE_TOKEN",
+                bool(fence_token and fence_env == fence_token),
+            ),
+            (
+                "host_envelope.runtime_context_id",
+                str(host_envelope.get("runtime_context_id") or "").strip()
+                == str(runtime_context_id or "").strip(),
+            ),
+            (
+                "host_envelope.task_id",
+                str(host_envelope.get("task_id") or "").strip()
+                == str(task_id or "").strip(),
+            ),
+        )
+        if not matches
+    ]
+    if missing_fields or mismatched_fields:
+        raise GovernanceError(
+            "runtime_context_rejoin_host_envelope_unavailable",
+            (
+                "accepted runtime-context rejoin must return one complete "
+                "process-local worker host envelope"
+            ),
+            409,
+            {
+                "runtime_context_id": str(runtime_context_id or "").strip(),
+                "task_id": str(task_id or "").strip(),
+                "missing_fields": missing_fields,
+                "mismatched_fields": mismatched_fields,
+                "credential_rotated": False,
+                "mutation_performed": False,
+                "writes_performed": False,
+                "zero_write_rejection": True,
+                "fail_closed": True,
+                "next_legal_action": (
+                    "refresh_same_context_worker_guide_and_use_only_the_"
+                    "advertised_bounded_rejoin_recovery"
+                ),
+            },
+        )
+
+    delivery = {
+        "schema_version": "runtime_context.rejoin_host_envelope_delivery.v1",
+        "delivery": "worker_host_envelope",
+        "server_derived": True,
+        "process_local_only": True,
+        "session_token_ref": str(payload.get("session_token_ref") or "").strip(),
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "raw_tokens_persisted": False,
+    }
+    # Re-inserting an existing key preserves its first insertion position in a
+    # Python dict.  This guarantees that text-based MCP transports encounter
+    # the envelope before large copy-safe authority/advisory projections.
+    return {
+        "host_envelope": host_envelope,
+        "host_envelope_delivery": delivery,
+        **payload,
+    }
+
+
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/rejoin")
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/runtime-contexts/{runtime_context_id}/session-token/rejoin")
 def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestContext):
@@ -49572,6 +49683,19 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         "resolved_active_route_token_ref_rejoin"
                     )
             result["host_envelope"] = host_envelope
+        try:
+            result = _runtime_context_prioritized_rejoin_host_envelope_result(
+                result,
+                runtime_context_id=runtime_context_id,
+                task_id=str(result.get("task_id") or context.task_id or ""),
+            )
+        except GovernanceError:
+            # The branch-runtime rotation and any route-revision projection are
+            # still in this transaction.  Never commit an accepted ref-only
+            # rejoin that the real worker cannot consume.
+            conn.rollback()
+            legacy_template_repair_transaction = ""
+            raise
         audit_payload = {
             key: value
             for key, value in result.items()
