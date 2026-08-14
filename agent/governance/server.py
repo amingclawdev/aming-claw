@@ -20418,6 +20418,262 @@ def _runtime_context_expected_graph_commit(
     return "", ""
 
 
+def _runtime_context_bounded_replacement_graph_trace_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    backlog_id: str,
+    current_fence_token: str,
+    trace: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify one immutable pre-rotation trace through one bounded replacement."""
+
+    from .parallel_branch_runtime import runtime_context_secret_hash
+
+    projection: dict[str, Any] = {
+        "schema_version": (
+            "runtime_context.bounded_replacement_graph_trace_authority.v1"
+        ),
+        "accepted": False,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "trace_id": str(trace.get("trace_id") or "").strip(),
+        "errors": [],
+    }
+
+    def reject(reason: str) -> dict[str, Any]:
+        projection["errors"].append(reason)
+        return projection
+
+    if (
+        context is None
+        or str(getattr(context, "runtime_context_id", "") or "").strip()
+        != runtime_context_id
+        or str(getattr(context, "task_id", "") or "").strip() != task_id
+        or _runtime_context_mf_sub_parent_task_id(context) != parent_task_id
+        or str(getattr(context, "backlog_id", "") or "").strip() != backlog_id
+        or str(trace.get("backlog_id") or "").strip() != backlog_id
+        or str(getattr(context, "last_recovery_action", "") or "").strip()
+        != _RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION
+    ):
+        return reject("runtime context is not the exact bounded replacement lane")
+
+    trace_fence_token = str(trace.get("fence_token") or "").strip()
+    trace_created_at = str(trace.get("created_at") or "").strip()
+    trace_fence_hash = runtime_context_secret_hash(trace_fence_token)
+    current_fence_hash = runtime_context_secret_hash(current_fence_token)
+    if (
+        not trace_fence_hash
+        or not current_fence_hash
+        or trace_fence_hash == current_fence_hash
+        or not trace_created_at
+    ):
+        return reject("trace and current fence do not prove one prior rotation")
+
+    route_identity = _runtime_context_latest_route_identity(conn, context)
+    trace_route_identity = {
+        field: str(trace.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if (
+        not route_identity
+        or any(
+            not str(route_identity.get(field) or "").strip()
+            or trace_route_identity[field]
+            != str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+    ):
+        return reject("trace route identity is missing or stale")
+
+    timeline_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+    current_baseline = _runtime_context_rejoin_worker_write_baseline(
+        conn,
+        project_id=project_id,
+        context=context,
+        timeline_events=timeline_events,
+    )
+    current_checkpoint = _runtime_context_rejoin_stage_checkpoint(
+        current_baseline
+    )
+    if not current_checkpoint:
+        return reject("current stage checkpoint is invalid")
+
+    try:
+        record = _contract_runtime_store(conn).get(parent_task_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return reject("ContractRuntime stage is unavailable")
+    next_action = (
+        record.get("runtime_guide", {}).get("next_legal_action", {})
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    if not (
+        str(next_action.get("line_id") or "").strip()
+        == "worker_implementation"
+        and str(next_action.get("runtime_context_id") or runtime_context_id).strip()
+        == runtime_context_id
+        and str(next_action.get("task_id") or task_id).strip() == task_id
+    ):
+        return reject("ContractRuntime advanced beyond worker_implementation")
+
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+
+    def event_payload(event: Mapping[str, Any]) -> Mapping[str, Any]:
+        value = event.get("payload")
+        return value if isinstance(value, Mapping) else {}
+
+    def accepted_event(
+        event: Mapping[str, Any],
+        *,
+        kind: str,
+        fence_hash: str,
+    ) -> bool:
+        payload = event_payload(event)
+        event_route = (
+            payload.get("route_identity")
+            if isinstance(payload.get("route_identity"), Mapping)
+            else {}
+        )
+        return bool(
+            str(event.get("status") or "").strip().lower()
+            in {"accepted", "ok", "pass", "passed", "success", "succeeded"}
+            and str(event.get("task_id") or "").strip() == task_id
+            and str(event.get("backlog_id") or "").strip() == backlog_id
+            and str(payload.get("action") or "").strip()
+            == "runtime_context_session_token_rejoin"
+            and str(payload.get("bounded_rejoin_kind") or "").strip() == kind
+            and str(payload.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            and str(payload.get("task_id") or "").strip() == task_id
+            and str(payload.get("parent_task_id") or "").strip()
+            == parent_task_id
+            and str(payload.get("worker_id") or "").strip() == worker_id
+            and str(payload.get("worker_slot_id") or worker_id).strip()
+            == worker_slot_id
+            and str(payload.get("fence_token_hash") or "").strip()
+            == fence_hash
+            and payload.get("route_identity_verified") is True
+            and all(
+                str(event_route.get(field) or "").strip()
+                == str(route_identity.get(field) or "").strip()
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            )
+            and _runtime_context_rejoin_checkpoint_relation(
+                payload.get("bounded_replacement_worker_write_baseline"),
+                current_baseline,
+            )
+            == "exact"
+            and str(payload.get("rejoin_stage_checkpoint_id") or "").strip()
+            == str(current_checkpoint.get("stage_checkpoint_id") or "").strip()
+        )
+
+    replacements = [
+        event
+        for event in timeline_events
+        if accepted_event(
+            event,
+            kind="bounded_replacement_rejoin",
+            fence_hash=current_fence_hash,
+        )
+    ]
+    if len(replacements) != 1:
+        return reject("bounded replacement audit is missing or ambiguous")
+    replacement = replacements[0]
+    replacement_payload = event_payload(replacement)
+    authority = (
+        replacement_payload.get("bounded_replacement_rejoin_authority")
+        if isinstance(
+            replacement_payload.get("bounded_replacement_rejoin_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    source_event_ref = str(authority.get("source_event_ref") or "").strip()
+    source_event_id = _runtime_context_timeline_event_id(source_event_ref)
+    if not (
+        replacement_payload.get("bounded_replacement_rejoin") is True
+        and str(authority.get("schema_version") or "").strip()
+        == "runtime_context.bounded_replacement_rejoin_authority.v2"
+        and authority.get("server_derived") is True
+        and authority.get("caller_claims_trusted") is False
+        and authority.get("applicable") is True
+        and authority.get("eligible") is True
+        and str(authority.get("mode") or "").strip()
+        == "bounded_post_lineage_replacement_auth_only"
+        and int(authority.get("replacement_generation") or 0) == 1
+        and not authority.get("errors")
+        and not authority.get("identity_mismatches")
+        and _runtime_context_rejoin_checkpoint_relation(
+            authority.get("expected_worker_write_baseline"),
+            current_baseline,
+        )
+        == "exact"
+        and _runtime_context_rejoin_checkpoint_relation(
+            authority.get("actual_worker_write_baseline"),
+            current_baseline,
+        )
+        == "exact"
+        and source_event_id
+    ):
+        return reject("bounded replacement authority is not canonical")
+
+    ordinary = [
+        event
+        for event in timeline_events
+        if str(event.get("id") or "").strip() == source_event_id
+        and accepted_event(
+            event,
+            kind="ordinary_initial_rejoin",
+            fence_hash=trace_fence_hash,
+        )
+    ]
+    if len(ordinary) != 1:
+        return reject("ordinary issuance audit is missing or ambiguous")
+    ordinary_created_at = str(ordinary[0].get("created_at") or "").strip()
+    replacement_created_at = str(replacement.get("created_at") or "").strip()
+    if not (
+        ordinary_created_at
+        and replacement_created_at
+        and ordinary_created_at <= trace_created_at <= replacement_created_at
+    ):
+        return reject("trace was not created between issuance and replacement")
+
+    projection.update(
+        {
+            "accepted": True,
+            "errors": [],
+            "source_event_ref": source_event_ref,
+            "replacement_event_ref": f"timeline:{replacement.get('id', '')}",
+            "stage_checkpoint_id": current_checkpoint["stage_checkpoint_id"],
+            "trace_fence_hash": trace_fence_hash,
+            "current_fence_hash": current_fence_hash,
+            "snapshot_id": str(trace.get("snapshot_id") or "").strip(),
+            "route_identity": dict(route_identity),
+            "worker_identity": {
+                "worker_id": worker_id,
+                "worker_slot_id": worker_slot_id,
+            },
+            "trace_rows_mutated": False,
+            "timeline_backfill_performed": False,
+            "pass_synthesized": False,
+        }
+    )
+    return projection
+
+
 def _runtime_context_service_graph_trace_refs(
     conn,
     *,
@@ -20475,7 +20731,11 @@ def _runtime_context_service_graph_trace_refs(
                            t.status, t.snapshot_id,
                            s.commit_sha AS snapshot_commit_sha,
                            r.snapshot_id AS active_snapshot_id,
-                           r.commit_sha AS active_commit_sha
+                           r.commit_sha AS active_commit_sha,
+                           t.backlog_id, t.route_id, t.route_context_hash,
+                           t.prompt_contract_id, t.prompt_contract_hash,
+                           t.visible_injection_manifest_hash,
+                           t.route_token_ref, t.created_at
                     FROM graph_query_traces t
                     LEFT JOIN graph_snapshots s
                       ON s.project_id = t.project_id
@@ -20503,7 +20763,11 @@ def _runtime_context_service_graph_trace_refs(
                        t.status, t.snapshot_id,
                        s.commit_sha AS snapshot_commit_sha,
                        r.snapshot_id AS active_snapshot_id,
-                       r.commit_sha AS active_commit_sha
+                       r.commit_sha AS active_commit_sha,
+                       t.backlog_id, t.route_id, t.route_context_hash,
+                       t.prompt_contract_id, t.prompt_contract_hash,
+                       t.visible_injection_manifest_hash,
+                       t.route_token_ref, t.created_at
                 FROM graph_query_traces t
                 LEFT JOIN graph_snapshots s
                   ON s.project_id = t.project_id
@@ -20549,6 +20813,7 @@ def _runtime_context_service_graph_trace_refs(
     seen_verified: set[str] = set()
     row_trace_ids: set[str] = set()
     identity_mismatches: list[dict[str, str]] = []
+    bounded_replacement_authorities: dict[str, dict[str, Any]] = {}
     for row in rows:
         trace_id = _row_trace_id(row)
         if not trace_id:
@@ -20579,6 +20844,17 @@ def _runtime_context_service_graph_trace_refs(
                 "active_commit_sha",
                 13,
             ).lower(),
+            "backlog_id": _row_text("backlog_id", 14),
+            "route_id": _row_text("route_id", 15),
+            "route_context_hash": _row_text("route_context_hash", 16),
+            "prompt_contract_id": _row_text("prompt_contract_id", 17),
+            "prompt_contract_hash": _row_text("prompt_contract_hash", 18),
+            "visible_injection_manifest_hash": _row_text(
+                "visible_injection_manifest_hash",
+                19,
+            ),
+            "route_token_ref": _row_text("route_token_ref", 20),
+            "created_at": _row_text("created_at", 21),
         }
         expected = {
             "query_source": "mf_subagent",
@@ -20586,7 +20862,6 @@ def _runtime_context_service_graph_trace_refs(
             "parent_task_id": parent_task_id,
             "task_id": task_id,
             "runtime_context_id": runtime_context_id,
-            "fence_token": fence_token,
         }
         trace_mismatches = [
             {
@@ -20598,6 +20873,35 @@ def _runtime_context_service_graph_trace_refs(
             for field, value in expected.items()
             if value and fields[field] != value
         ]
+        if fence_token and fields["fence_token"] != fence_token:
+            bounded_authority = (
+                _runtime_context_bounded_replacement_graph_trace_authority(
+                    conn,
+                    project_id=project_id,
+                    context=runtime_context,
+                    runtime_context_id=runtime_context_id,
+                    task_id=task_id,
+                    parent_task_id=parent_task_id,
+                    backlog_id=backlog_id,
+                    current_fence_token=fence_token,
+                    trace={"trace_id": trace_id, **fields},
+                )
+                if not trace_mismatches
+                else {}
+            )
+            if bounded_authority.get("accepted") is True:
+                bounded_replacement_authorities[trace_id] = dict(
+                    bounded_authority
+                )
+            else:
+                trace_mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": "fence_token",
+                        "expected": fence_token,
+                        "actual": fields["fence_token"],
+                    }
+                )
         if fields["query_purpose"] not in {
             "subagent_context_build",
             "subagent_gate_validation",
@@ -20665,6 +20969,9 @@ def _runtime_context_service_graph_trace_refs(
         "requested_trace_ids": requested_trace_ids,
         "missing_trace_ids": missing_trace_ids,
         "identity_mismatches": requested_identity_mismatches,
+        "bounded_replacement_trace_authority": (
+            bounded_replacement_authorities
+        ),
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -20683,6 +20990,11 @@ def _runtime_context_service_graph_trace_refs(
             "active_snapshot_required": True,
             "expected_graph_commit": expected_graph_commit,
             "expected_graph_commit_source": expected_graph_commit_source,
+            "bounded_replacement_trace_count": len(
+                bounded_replacement_authorities
+            ),
+            "trace_rows_mutated": False,
+            "timeline_backfill_performed": False,
         },
     }
 

@@ -156801,3 +156801,401 @@ def test_premerge_qa_projects_lane_merge_without_final_qa_or_close(
     assert [line["line_id"] for line in lines] == ["observer_merge"]
     assert lines[0]["stage_id"] == "observer_lane_merge"
     assert lines[0]["lane_id"] == "premerge-projection-worker"
+
+
+def _bounded_replacement_graph_trace_case(conn, monkeypatch):
+    candidate_server, _ = _preload_candidate_server_module()
+    task_id = "bounded-replacement-graph-trace-worker"
+    parent_task_id = "cex-bounded-replacement-graph-trace"
+    backlog_id = "AC-BOUNDED-REPLACEMENT-GRAPH-TRACE"
+    runtime_context_id = "mfrctx-bounded-replacement-graph-trace"
+    trace_id = "gqt-bounded-replacement-pre-rotation"
+    current_trace_id = "gqt-bounded-replacement-current-fence"
+    prior_fence = "fence-bounded-replacement-prior"
+    current_fence = "fence-bounded-replacement-current"
+    target_commit = "a" * 40
+    snapshot_id = "scope-bounded-replacement-graph-trace"
+    route_identity = {
+        "route_id": "route-bounded-replacement-graph-trace",
+        "route_context_hash": _fake_sha("bounded-route-context"),
+        "prompt_contract_id": "rprompt-bounded-replacement-graph-trace",
+        "prompt_contract_hash": _fake_sha("bounded-prompt-contract"),
+        "visible_injection_manifest_hash": _fake_sha("bounded-visible-manifest"),
+        "route_token_ref": "rtok-bounded-replacement-graph-trace",
+    }
+
+    _activate_basic_graph(conn, snapshot_id, commit_sha=target_commit)
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            root_task_id=parent_task_id,
+            backlog_id=backlog_id,
+            runtime_context_id=runtime_context_id,
+            branch_ref="refs/heads/codex/bounded-replacement-graph-trace",
+            status=STATE_WORKTREE_READY,
+            worker_id="worker-bounded-replacement-graph-trace",
+            worker_slot_id="slot-bounded-replacement-graph-trace",
+            actual_host_worker_id="worker-bounded-replacement-graph-trace",
+            target_project_root="/repo/bounded-replacement-graph-trace",
+            worktree_path="/repo/bounded-replacement-graph-trace",
+            base_commit=target_commit,
+            head_commit=target_commit,
+            target_head_commit=target_commit,
+            snapshot_id=snapshot_id,
+            fence_token=current_fence,
+            fence_token_verifier=runtime_context_secret_hash(current_fence),
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-bounded-replacement-current"
+            ),
+            last_recovery_action=(
+                "mf_subagent_session_token_rejoin_replacement_issued"
+            ),
+        ),
+        now_iso="2026-08-14T07:10:00Z",
+    )
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-bounded-replacement-graph-trace",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=route_identity,
+        now_iso="2026-08-14T07:11:00Z",
+    )
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        parent_task_id=parent_task_id,
+        snapshot_id=snapshot_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        worker_role="mf_sub",
+        fence_token=prior_fence,
+        run_id=_mf_sub_run_id(task_id, prior_fence),
+        route_identity=route_identity,
+        created_at="2026-08-14T07:30:00Z",
+    )
+    conn.execute(
+        "UPDATE graph_query_traces SET backlog_id = ? WHERE trace_id = ?",
+        (backlog_id, trace_id),
+    )
+
+    baseline = {
+        "schema_version": "runtime_context.rejoin_worker_write_baseline.v1",
+        "runtime_context_id": runtime_context_id,
+        "contract_execution_id": parent_task_id,
+        "timeline_worker_write_count": 2,
+        "timeline_worker_write_hash": _fake_sha("bounded-timeline-baseline"),
+        "contract_runtime_completed_line_count": 3,
+        "contract_runtime_completed_lines_hash": _fake_sha(
+            "bounded-contract-baseline"
+        ),
+    }
+    checkpoint = candidate_server._runtime_context_rejoin_stage_checkpoint(
+        baseline
+    )
+    baseline["stage_checkpoint_id"] = checkpoint["stage_checkpoint_id"]
+    common_payload = {
+        "action": "runtime_context_session_token_rejoin",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+        "route_identity_verified": True,
+        "route_identity": route_identity,
+        "bounded_replacement_worker_write_baseline": baseline,
+        "rejoin_stage_checkpoint_id": checkpoint["stage_checkpoint_id"],
+    }
+    ordinary = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="observer.runtime_context_session_token_rejoin",
+        event_kind="observer_command",
+        phase="runtime_context_recovery",
+        status="accepted",
+        actor="coordinator",
+        payload={
+            **common_payload,
+            "bounded_rejoin_kind": "ordinary_initial_rejoin",
+            "fence_token_hash": runtime_context_secret_hash(prior_fence),
+        },
+    )
+    replacement_authority = {
+        "schema_version": (
+            "runtime_context.bounded_replacement_rejoin_authority.v2"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "applicable": True,
+        "eligible": True,
+        "mode": "bounded_post_lineage_replacement_auth_only",
+        "replacement_generation": 1,
+        "last_recovery_action": "mf_subagent_session_token_rejoin_issued",
+        "source_event_ref": f"timeline:{ordinary['id']}",
+        "expected_worker_write_baseline": baseline,
+        "actual_worker_write_baseline": baseline,
+        "errors": [],
+        "identity_mismatches": [],
+    }
+    replacement = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        event_type="observer.runtime_context_session_token_rejoin",
+        event_kind="observer_command",
+        phase="runtime_context_recovery",
+        status="accepted",
+        actor="coordinator",
+        payload={
+            **common_payload,
+            "bounded_rejoin_kind": "bounded_replacement_rejoin",
+            "bounded_replacement_rejoin": True,
+            "bounded_replacement_rejoin_authority": replacement_authority,
+            "fence_token_hash": runtime_context_secret_hash(current_fence),
+        },
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+        ("2026-08-14T07:20:00Z", ordinary["id"]),
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+        ("2026-08-14T07:40:00Z", replacement["id"]),
+    )
+    conn.commit()
+
+    monkeypatch.setattr(
+        candidate_server,
+        "_runtime_context_rejoin_worker_write_baseline",
+        lambda *_args, **_kwargs: dict(baseline),
+    )
+    monkeypatch.setattr(
+        candidate_server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(
+            get=lambda _execution_id: {
+                "runtime_guide": {
+                    "next_legal_action": {
+                        "line_id": "worker_implementation",
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": task_id,
+                    }
+                }
+            }
+        ),
+    )
+    return {
+        "server": candidate_server,
+        "context": context,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "trace_id": trace_id,
+        "current_trace_id": current_trace_id,
+        "prior_fence": prior_fence,
+        "current_fence": current_fence,
+        "snapshot_id": snapshot_id,
+        "target_commit": target_commit,
+        "route_identity": route_identity,
+        "ordinary": ordinary,
+        "replacement": replacement,
+    }
+
+
+def _bounded_replacement_graph_trace_evidence(candidate_server, conn, case):
+    return candidate_server._runtime_context_implementation_graph_trace_db_evidence(
+        conn,
+        project_id=PID,
+        runtime_context_id=case["runtime_context_id"],
+        context=case["context"],
+        parent_task_id=case["parent_task_id"],
+        fence_token=case["current_fence"],
+        sources=[{"graph_trace_ids": [case["trace_id"]]}],
+    )
+
+
+def test_bounded_replacement_preserves_exact_pre_rotation_graph_trace(
+    conn,
+    monkeypatch,
+):
+    case = _bounded_replacement_graph_trace_case(conn, monkeypatch)
+    candidate_server = case["server"]
+    before_dump = "\n".join(conn.iterdump())
+    if candidate_server is not server:
+        with pytest.raises(
+            GovernanceError,
+            match="runtime-context implementation evidence graph trace ids",
+        ):
+            _bounded_replacement_graph_trace_evidence(server, conn, case)
+        assert "\n".join(conn.iterdump()) == before_dump
+
+    direct_authority = (
+        candidate_server._runtime_context_bounded_replacement_graph_trace_authority(
+            conn,
+            project_id=PID,
+            context=case["context"],
+            runtime_context_id=case["runtime_context_id"],
+            task_id=case["task_id"],
+            parent_task_id=case["parent_task_id"],
+            backlog_id=case["backlog_id"],
+            current_fence_token=case["current_fence"],
+            trace={
+                "trace_id": case["trace_id"],
+                "fence_token": case["prior_fence"],
+                "created_at": "2026-08-14T07:30:00Z",
+                "backlog_id": case["backlog_id"],
+                "snapshot_id": case["snapshot_id"],
+                **case["route_identity"],
+            },
+        )
+    )
+    assert direct_authority["accepted"] is True, direct_authority["errors"]
+    projected = candidate_server._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PID,
+        runtime_context_id=case["runtime_context_id"],
+        task_id=case["task_id"],
+        parent_task_id=case["parent_task_id"],
+        backlog_id=case["backlog_id"],
+        fence_token=case["current_fence"],
+        explicit_trace_ids=[case["trace_id"]],
+        strict_explicit_trace_ids=True,
+    )
+    assert projected["db_verified"] is True, (
+        projected["identity_mismatches"],
+        projected["bounded_replacement_trace_authority"],
+    )
+    evidence = _bounded_replacement_graph_trace_evidence(
+        candidate_server,
+        conn,
+        case,
+    )
+    assert evidence["db_verified"] is True
+    assert evidence["verified_trace_ids"] == [case["trace_id"]]
+    authority = evidence["bounded_replacement_trace_authority"][
+        case["trace_id"]
+    ]
+    assert authority["accepted"] is True
+    assert authority["source_event_ref"] == (
+        f"timeline:{case['ordinary']['id']}"
+    )
+    assert authority["replacement_event_ref"] == (
+        f"timeline:{case['replacement']['id']}"
+    )
+    assert authority["trace_rows_mutated"] is False
+    assert authority["timeline_backfill_performed"] is False
+    assert authority["pass_synthesized"] is False
+    assert "\n".join(conn.iterdump()) == before_dump
+
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=case["current_trace_id"],
+        parent_task_id=case["parent_task_id"],
+        snapshot_id=case["snapshot_id"],
+        runtime_context_id=case["runtime_context_id"],
+        task_id=case["task_id"],
+        worker_role="mf_sub",
+        fence_token=case["current_fence"],
+        run_id=_mf_sub_run_id(case["task_id"], case["current_fence"]),
+        route_identity=case["route_identity"],
+        created_at="2026-08-14T07:45:00Z",
+    )
+    conn.execute(
+        "UPDATE graph_query_traces SET backlog_id = ? WHERE trace_id = ?",
+        (case["backlog_id"], case["current_trace_id"]),
+    )
+    conn.commit()
+    current = candidate_server._runtime_context_implementation_graph_trace_db_evidence(
+        conn,
+        project_id=PID,
+        runtime_context_id=case["runtime_context_id"],
+        context=case["context"],
+        parent_task_id=case["parent_task_id"],
+        fence_token=case["current_fence"],
+        sources=[{"graph_trace_ids": [case["current_trace_id"]]}],
+    )
+    assert current["db_verified"] is True
+    assert current["bounded_replacement_trace_authority"] == {}
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "duplicate_replacement",
+        "route_drift",
+        "checkpoint_drift",
+        "nonaccepted_replacement",
+        "post_rotation_trace",
+        "snapshot_drift",
+    ),
+)
+def test_bounded_replacement_graph_trace_negatives_fail_closed(
+    conn,
+    monkeypatch,
+    drift,
+):
+    case = _bounded_replacement_graph_trace_case(conn, monkeypatch)
+    if drift == "duplicate_replacement":
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            task_id=case["task_id"],
+            backlog_id=case["backlog_id"],
+            event_type="observer.runtime_context_session_token_rejoin",
+            event_kind="observer_command",
+            phase="runtime_context_recovery",
+            status="accepted",
+            actor="coordinator",
+            payload=copy.deepcopy(case["replacement"]["payload"]),
+        )
+    elif drift == "route_drift":
+        conn.execute(
+            "UPDATE graph_query_traces SET route_id = ? WHERE trace_id = ?",
+            ("route-cross-lane", case["trace_id"]),
+        )
+    elif drift == "checkpoint_drift":
+        payload = copy.deepcopy(case["replacement"]["payload"])
+        payload["rejoin_stage_checkpoint_id"] = _fake_sha(
+            "different-checkpoint"
+        )
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True), case["replacement"]["id"]),
+        )
+    elif drift == "nonaccepted_replacement":
+        conn.execute(
+            "UPDATE task_timeline_events SET status = 'failed' WHERE id = ?",
+            (case["replacement"]["id"],),
+        )
+    elif drift == "post_rotation_trace":
+        conn.execute(
+            "UPDATE graph_query_traces SET created_at = ? WHERE trace_id = ?",
+            ("2026-08-14T07:41:00Z", case["trace_id"]),
+        )
+    elif drift == "snapshot_drift":
+        _activate_basic_graph(
+            conn,
+            "scope-bounded-replacement-stale-successor",
+            commit_sha=case["target_commit"],
+        )
+    conn.commit()
+
+    before_changes = conn.total_changes
+    with pytest.raises(
+        GovernanceError,
+        match="runtime-context implementation evidence graph trace ids",
+    ) as exc_info:
+        _bounded_replacement_graph_trace_evidence(
+            case["server"],
+            conn,
+            case,
+        )
+    assert exc_info.value.code == "runtime_context_graph_trace_evidence_rejected"
+    assert conn.total_changes == before_changes
