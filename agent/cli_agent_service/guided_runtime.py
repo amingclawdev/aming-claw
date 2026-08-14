@@ -28,6 +28,9 @@ RUNTIME_CONTEXT_HOST_ORCHESTRATION_SCHEMA_VERSION = (
 RUNTIME_CONTEXT_GRAPH_CONTINUATION_SCHEMA_VERSION = (
     "cli_agent_service.runtime_context_graph_continuation.v1"
 )
+RUNTIME_CONTEXT_IMPLEMENTATION_CONTINUATION_SCHEMA_VERSION = (
+    "cli_agent_service.runtime_context_implementation_continuation.v1"
+)
 
 _PLACEHOLDER = re.compile(r"<[^<>]+>")
 _INITIAL_JOIN_TOOL_FIELDS = frozenset(
@@ -196,6 +199,114 @@ _GRAPH_HOST_ENVELOPE_PATHS = (
     ("details", "worker_host_envelope"),
     ("data", "host_envelope"),
     ("data", "worker_host_envelope"),
+)
+_IMPLEMENTATION_WRITER_BINDING_FIELDS = (
+    "backlog_id",
+    "definition_hash",
+    "instruction_bundle_hash",
+    "execution_state_revision",
+    "runtime_guide_hash",
+    "stage_id",
+    "line_id",
+    "evidence_kind",
+    "line_instance_id",
+)
+_IMPLEMENTATION_GUIDE_BODY_PATHS = (
+    (
+        "actionable_payloads",
+        "implementation_evidence_facade_payload_skeleton",
+        "copy_safe_body",
+    ),
+    (
+        "details",
+        "actionable_payloads",
+        "implementation_evidence_facade_payload_skeleton",
+        "copy_safe_body",
+    ),
+    (
+        "details",
+        "implementation_evidence_facade_payload_skeleton",
+        "copy_safe_body",
+    ),
+    (
+        "details",
+        "compatibility",
+        "implementation_evidence_facade_payload_skeleton",
+        "copy_safe_body",
+    ),
+)
+_CONTRACT_CURRENT_WRITER_CONTAINER_PATHS = (
+    ("runtime_guide", "writer_role_safe_copy_payload"),
+    ("next_legal_action", "writer_role_safe_copy_payload"),
+    (
+        "contract_runtime_current_state",
+        "next_legal_action",
+        "writer_role_safe_copy_payload",
+    ),
+    ("details", "runtime_guide", "writer_role_safe_copy_payload"),
+    ("details", "next_legal_action", "writer_role_safe_copy_payload"),
+    (
+        "details",
+        "contract_runtime_current_state",
+        "next_legal_action",
+        "writer_role_safe_copy_payload",
+    ),
+    (
+        "details",
+        "compatibility",
+        "runtime_guide",
+        "writer_role_safe_copy_payload",
+    ),
+)
+_IMPLEMENTATION_EVIDENCE_FIELDS = frozenset(
+    {
+        "changed_files",
+        "tests",
+        "test_results",
+        "graph_trace_ids",
+        "commit_sha",
+        "head_commit",
+        "clean_worktree",
+        "dirty_files",
+    }
+)
+_IMPLEMENTATION_TOOL_FIELDS = frozenset(
+    """acknowledged_at actor actor_role actor_session_principal
+    actual_host_worker_id agent_id artifact_refs authorization_source backlog_id
+    blocked_acceptance_ids changed_files checkpoint_id clean_worktree
+    commit_diff_files commit_sha context_hash contract_context_read_receipt
+    contract_execution_id contract_hash db_verified definition_hash dirty_files
+    event_kind event_type evidence_kind evidence_owner_actor evidence_owner_role
+    evidence_owner_session evidence_owner_session_ref execution_state_revision
+    fence_token filer_principal finish_time_worker_self_attestation
+    graph_query_trace_id graph_query_trace_ids graph_refs graph_trace_evidence
+    graph_trace_id graph_trace_ids harness_type head_commit host_session_id
+    host_startup_id host_worker_id immutable_head_commit implementation_event_ref
+    implementation_lineage_ref instruction_bundle_hash join_reason lane_id
+    launch_text_hash line_id line_instance_id materialized_from
+    materialized_from_report missing_files now_iso observer_impersonation
+    owned_changed_files owned_files parent_materialization_authorized
+    parent_task_id payload phase project_id prompt_contract_hash
+    prompt_contract_id qa_evidence_provenance qa_session_token_ref query_purpose
+    query_source read_receipt_event_id read_receipt_hash reason receipt_hash
+    rejoin_reason requested_files route_context_hash route_id route_token
+    route_token_ref route_waiver runtime_context_id runtime_guide_hash
+    session_token session_token_ref stage_id status submitter_principal
+    submitter_session target_project_root task_id test_results tests trace_id
+    trace_ids ttl_seconds validated_head_commit verdict verification view
+    visible_injection_manifest_hash worker_changed_files worker_commit_sha
+    worker_id worker_implementation_lineage worker_session_id worker_slot_id
+    worker_transcript_path worker_transcript_ref""".split()
+)
+_IMPLEMENTATION_GUIDANCE_FIELDS = frozenset(
+    {
+        "session_token_env",
+        "fence_token_env",
+        "implementation_diff_submission_guidance",
+        "worker_session_lifecycle_policy",
+        "write_authorization_policy",
+        "contract_runtime_writer_binding",
+    }
 )
 
 _ADMISSION_FIELDS = frozenset(
@@ -1409,6 +1520,331 @@ def orchestrate_runtime_context_graph_continuation(
             "queries": summaries,
             "guide_derived_body": True,
             "route_identity_preserved": True,
+            **_HOST_PRIVACY_FLAGS,
+        }
+    finally:
+        for value in (*request_bodies, *raw_results, application):
+            if isinstance(value, (dict, list)):
+                scrub_host_secret_values(value, raw_values=raw_values)
+
+
+def _single_mapping_block(
+    value: Mapping[str, Any],
+    *,
+    paths: Sequence[Sequence[str]],
+    label: str,
+) -> dict[str, Any]:
+    blocks = mcp_application_mapping_blocks(value, paths=paths)
+    unique = {
+        json.dumps(block, sort_keys=True, separators=(",", ":")): block
+        for block in blocks
+    }
+    if not unique:
+        raise _implementation_continuation_error(
+            "{} is missing from the authenticated application object".format(label)
+        )
+    if len(unique) != 1:
+        raise _implementation_continuation_error(
+            "{} is ambiguous in the authenticated application object".format(label)
+        )
+    return next(iter(unique.values()))
+
+
+def _implementation_continuation_error(
+    message: str,
+) -> GuidedRuntimeDispatchError:
+    return GuidedRuntimeDispatchError(
+        message,
+        status="invalid_implementation_continuation",
+    )
+
+
+def _implementation_writer_binding(
+    contract_current: Mapping[str, Any],
+    *,
+    expected_scope: Mapping[str, Any],
+) -> dict[str, Any]:
+    containers = mcp_application_mapping_blocks(
+        contract_current,
+        paths=_CONTRACT_CURRENT_WRITER_CONTAINER_PATHS,
+    )
+    bindings: dict[str, dict[str, Any]] = {}
+    alignments: list[dict[str, Any]] = []
+    for container in containers:
+        copy_payload = container.get("copy_payload")
+        if not isinstance(copy_payload, Mapping):
+            continue
+        binding = {
+            field_name: copy_payload.get(field_name)
+            for field_name in _IMPLEMENTATION_WRITER_BINDING_FIELDS
+        }
+        identity = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+        bindings[identity] = binding
+        alignment = container.get("hash_alignment")
+        if isinstance(alignment, Mapping):
+            alignments.append(dict(alignment))
+    if not bindings:
+        raise _implementation_continuation_error(
+            "current ContractRuntime omitted its atomic writer binding"
+        )
+    if len(bindings) != 1:
+        raise _implementation_continuation_error(
+            "current ContractRuntime atomic writer binding is ambiguous"
+        )
+    binding = next(iter(bindings.values()))
+    missing = [
+        field_name
+        for field_name, value in binding.items()
+        if value in (None, "")
+    ]
+    if missing:
+        raise _implementation_continuation_error(
+            "current ContractRuntime atomic writer binding is missing {}".format(
+                ", ".join(missing)
+            )
+        )
+    revision = binding.get("execution_state_revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise _implementation_continuation_error(
+            "current ContractRuntime writer execution_state_revision is invalid"
+        )
+    for field_name in (
+        "definition_hash",
+        "instruction_bundle_hash",
+        "runtime_guide_hash",
+    ):
+        value = _text(binding.get(field_name))
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise _implementation_continuation_error(
+                "current ContractRuntime writer {} is invalid".format(field_name)
+            )
+    runtime_context_id = _text(expected_scope.get("runtime_context_id"))
+    static_expected = {
+        "backlog_id": _text(expected_scope.get("backlog_id")),
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "line_instance_id": "runtime_context:{}".format(runtime_context_id),
+    }
+    for field_name, expected in static_expected.items():
+        if not expected or binding.get(field_name) != expected:
+            raise _implementation_continuation_error(
+                "current ContractRuntime writer binding conflicts at {}".format(
+                    field_name
+                )
+            )
+    aligned_hashes = {
+        _text(item.get("required_writer_runtime_guide_hash"))
+        for item in alignments
+        if _text(item.get("required_writer_runtime_guide_hash"))
+    }
+    if aligned_hashes and aligned_hashes != {binding["runtime_guide_hash"]}:
+        raise _implementation_continuation_error(
+            "current ContractRuntime atomic writer binding is stale"
+        )
+    return _json_round_trip(binding, "ContractRuntime atomic writer binding")
+
+
+def _implementation_body(
+    template: Mapping[str, Any],
+    *,
+    binding: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    expected_scope: Mapping[str, Any],
+    session_token: str,
+    fence_token: str,
+    session_token_ref: str,
+) -> dict[str, Any]:
+    unexpected = set(evidence) - _IMPLEMENTATION_EVIDENCE_FIELDS
+    if unexpected:
+        raise _implementation_continuation_error(
+            "implementation evidence contains caller-owned authority fields"
+        )
+    for required in ("changed_files", "tests", "test_results", "graph_trace_ids"):
+        value = evidence.get(required)
+        if value in (None, "", [], {}):
+            raise _implementation_continuation_error(
+                "implementation evidence is missing {}".format(required)
+            )
+    identity_fields = (
+        "project_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "target_project_root",
+        "route_token_ref",
+    )
+    for field_name in identity_fields:
+        expected = _text(expected_scope.get(field_name))
+        actual = _text(template.get(field_name))
+        if not expected or not actual or expected != actual:
+            raise _implementation_continuation_error(
+                "implementation guide scope conflicts at {}".format(field_name)
+            )
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            result: dict[str, Any] = {}
+            for key, nested in value.items():
+                field_name = str(key)
+                if field_name in _IMPLEMENTATION_GUIDANCE_FIELDS:
+                    continue
+                if field_name in evidence and (
+                    field_name in _IMPLEMENTATION_EVIDENCE_FIELDS
+                ):
+                    result[field_name] = _json_round_trip(
+                        evidence[field_name],
+                        "implementation evidence",
+                    )
+                    continue
+                result[field_name] = clean(nested)
+            return result
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        return value
+
+    body = {
+        str(key): clean(value)
+        for key, value in template.items()
+        if str(key) in _IMPLEMENTATION_TOOL_FIELDS
+        and str(key) not in _IMPLEMENTATION_GUIDANCE_FIELDS
+    }
+    for field_name, value in evidence.items():
+        body[field_name] = _json_round_trip(value, "implementation evidence")
+    body.update(_json_round_trip(binding, "ContractRuntime atomic writer binding"))
+    body["session_token"] = session_token
+    body["fence_token"] = fence_token
+    body["session_token_ref"] = session_token_ref
+    if _PLACEHOLDER.search(json.dumps(body, sort_keys=True)):
+        raise _implementation_continuation_error(
+            "implementation guide body contains unresolved placeholders"
+        )
+    return body
+
+
+def orchestrate_runtime_context_implementation_continuation(
+    *,
+    worker_guide: Mapping[str, Any],
+    host_auth_response: Mapping[str, Any],
+    tool_caller: Callable[[str, Mapping[str, Any]], Any],
+    expected_scope: Mapping[str, Any],
+    implementation_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Read the current atomic writer binding and submit implementation once."""
+
+    try:
+        guide = unwrap_mcp_application_response(worker_guide)
+    except ServiceError as exc:
+        raise _implementation_continuation_error(
+            "authenticated worker guide could not be decoded"
+        ) from exc
+    scope = _mapping(expected_scope, "expected implementation scope")
+    evidence = _mapping(
+        implementation_evidence,
+        "implementation evidence",
+    )
+    if set(evidence) - _IMPLEMENTATION_EVIDENCE_FIELDS:
+        raise _implementation_continuation_error(
+            "implementation evidence contains caller-owned authority fields"
+        )
+    template = _single_mapping_block(
+        guide,
+        paths=_IMPLEMENTATION_GUIDE_BODY_PATHS,
+        label="implementation evidence guide body",
+    )
+    contract_execution_id = _text(scope.get("contract_execution_id"))
+    if not contract_execution_id:
+        raise _implementation_continuation_error(
+            "expected implementation scope is missing contract_execution_id"
+        )
+    for field_name in (
+        "project_id",
+        "backlog_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "target_project_root",
+        "route_token_ref",
+        "contract_execution_id",
+    ):
+        if not _text(scope.get(field_name)):
+            raise _implementation_continuation_error(
+                "expected implementation scope is missing {}".format(field_name)
+            )
+    application: dict[str, Any] = {}
+    raw_results: list[Any] = []
+    request_bodies: list[dict[str, Any]] = []
+    raw_values: tuple[str, ...] = ()
+    try:
+        application, session_token, fence_token, session_token_ref = (
+            _graph_host_auth(host_auth_response)
+        )
+        raw_values = (session_token, fence_token)
+        guide_ref = _text(template.get("session_token_ref"))
+        if guide_ref and guide_ref != session_token_ref:
+            raise _implementation_continuation_error(
+                "authenticated implementation guide safe ref is stale"
+            )
+        current_body = {
+            "project_id": _text(scope.get("project_id")),
+            "contract_execution_id": contract_execution_id,
+            "route_token_ref": _text(scope.get("route_token_ref")),
+        }
+        current, failure, raw_values = _invoke_host_tool(
+            tool_caller,
+            "contract_runtime_current",
+            current_body,
+            response_status="ContractRuntime current",
+            request_bodies=request_bodies,
+            raw_results=raw_results,
+            raw_values=raw_values,
+        )
+        if failure:
+            return failure
+        binding = _implementation_writer_binding(
+            current,
+            expected_scope=scope,
+        )
+        body = _implementation_body(
+            template,
+            binding=binding,
+            evidence=evidence,
+            expected_scope=scope,
+            session_token=session_token,
+            fence_token=fence_token,
+            session_token_ref=session_token_ref,
+        )
+        response, failure, raw_values = _invoke_host_tool(
+            tool_caller,
+            "runtime_context_implementation_evidence",
+            body,
+            response_status="implementation evidence",
+            request_bodies=request_bodies,
+            raw_results=raw_results,
+            raw_values=raw_values,
+        )
+        if failure:
+            return failure
+        implementation_event_ref = _first_deep_text(
+            response,
+            "implementation_event_ref",
+            "implementation_lineage_ref",
+            "event_ref",
+            "timeline_event_id",
+        )
+        return {
+            "schema_version": (
+                RUNTIME_CONTEXT_IMPLEMENTATION_CONTINUATION_SCHEMA_VERSION
+            ),
+            "ok": True,
+            "status": "passed",
+            "session_token_ref": session_token_ref,
+            "implementation_event_ref": implementation_event_ref,
+            "writer_binding_source": (
+                "contract_runtime_current.writer_role_safe_copy_payload."
+                "copy_payload"
+            ),
+            "atomic_writer_binding_used": True,
             **_HOST_PRIVACY_FLAGS,
         }
     finally:

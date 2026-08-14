@@ -10,6 +10,7 @@ from agent.ai_invocation import RoutePromptContract
 from agent.cli_agent_service.guided_runtime import (
     orchestrate_runtime_context_graph_continuation,
     orchestrate_runtime_context_host_startup,
+    orchestrate_runtime_context_implementation_continuation,
 )
 from agent.governance.parallel_branch_runtime import (
     BranchTaskRuntimeContext,
@@ -1746,4 +1747,150 @@ def test_graph_continuation_accepts_live_compatibility_guide_and_rejoin_envelope
         "raw-observer-session" not in json.dumps(request)
         and "raw-observer-fence" not in json.dumps(request)
         for _, request in seen
+    )
+
+
+def test_implementation_continuation_reads_compatibility_writer_binding() -> None:
+    runtime_context_id = "mfrctx-observer-implementation"
+    route_token_ref = "rtok-observer-implementation"
+    session_token_ref = "wstok-observer-implementation"
+    binding = {
+        "backlog_id": "AC-OBSERVER-IMPLEMENTATION",
+        "definition_hash": "sha256:" + "1" * 64,
+        "instruction_bundle_hash": "sha256:" + "2" * 64,
+        "execution_state_revision": 4,
+        "runtime_guide_hash": "sha256:" + "3" * 64,
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "line_instance_id": "runtime_context:{}".format(runtime_context_id),
+    }
+    scope = {
+        "project_id": "aming-claw",
+        "backlog_id": binding["backlog_id"],
+        "contract_execution_id": "cex-observer-implementation",
+        "runtime_context_id": runtime_context_id,
+        "task_id": "observer-implementation-worker",
+        "parent_task_id": "cex-observer-implementation",
+        "target_project_root": "/tmp/observer-implementation",
+        "route_token_ref": route_token_ref,
+    }
+    guide_body = {
+        "project_id": scope["project_id"],
+        "runtime_context_id": runtime_context_id,
+        "task_id": scope["task_id"],
+        "parent_task_id": scope["parent_task_id"],
+        "target_project_root": scope["target_project_root"],
+        "session_token": "<worker session token>",
+        "session_token_ref": session_token_ref,
+        "fence_token": "<worker fence token>",
+        "changed_files": ["<changed file>"],
+        "tests": [{"command": "<test command>", "status": "passed"}],
+        "test_results": {"status": "passed"},
+        "graph_trace_ids": ["<graph trace id>"],
+        "route_token_ref": route_token_ref,
+    }
+    guide = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "details": {
+                            "compatibility": {
+                                "implementation_evidence_facade_payload_skeleton": {
+                                    "copy_safe_body": guide_body
+                                }
+                            }
+                        }
+                    }
+                ),
+            }
+        ]
+    }
+    auth = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "worker_session_token_ref": session_token_ref,
+                        "worker_host_envelope": {
+                            "worker_session_token_ref": session_token_ref,
+                            "env": {
+                                "AMING_WORKER_SESSION_TOKEN": (
+                                    "raw-observer-implementation-session"
+                                ),
+                                "AMING_WORKER_FENCE_TOKEN": (
+                                    "raw-observer-implementation-fence"
+                                ),
+                            },
+                        },
+                    }
+                ),
+            }
+        ]
+    }
+    current = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "details": {
+                            "compatibility": {
+                                "runtime_guide": {
+                                    "writer_role_safe_copy_payload": {
+                                        "copy_payload": binding,
+                                        "hash_alignment": {
+                                            "required_writer_runtime_guide_hash": (
+                                                binding["runtime_guide_hash"]
+                                            )
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ),
+            }
+        ]
+    }
+    calls = []
+
+    def call_tool(name, body):
+        calls.append((name, body))
+        if name == "contract_runtime_current":
+            return current
+        return {
+            "ok": True,
+            "status": "passed",
+            "implementation_event_ref": "timeline:observer-implementation",
+        }
+
+    result = orchestrate_runtime_context_implementation_continuation(
+        worker_guide=guide,
+        host_auth_response=auth,
+        tool_caller=call_tool,
+        expected_scope=scope,
+        implementation_evidence={
+            "changed_files": ["agent/cli_agent_service/guided_runtime.py"],
+            "tests": [{"command": "python -m pytest", "status": "passed"}],
+            "test_results": {"status": "passed"},
+            "graph_trace_ids": ["gqt-observer-implementation"],
+        },
+    )
+
+    assert result["atomic_writer_binding_used"] is True
+    assert [name for name, _body in calls] == [
+        "contract_runtime_current",
+        "runtime_context_implementation_evidence",
+    ]
+    implementation_body = calls[1][1]
+    assert {key: implementation_body[key] for key in binding} == binding
+    assert "raw-observer-implementation-session" not in json.dumps(
+        implementation_body
+    )
+    assert "raw-observer-implementation-fence" not in json.dumps(
+        implementation_body
     )

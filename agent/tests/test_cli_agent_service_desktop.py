@@ -16,6 +16,7 @@ from agent.cli_agent_service.guided_runtime import (
     GuidedRuntimeDispatchError,
     orchestrate_runtime_context_graph_continuation,
     orchestrate_runtime_context_host_startup,
+    orchestrate_runtime_context_implementation_continuation,
 )
 from agent.cli_agent_service.service import (
     CliAgentService,
@@ -1053,6 +1054,238 @@ def test_graph_continuation_ambiguous_guide_is_zero_call() -> None:
             tool_caller=lambda name, body: calls.append((name, body)),
             expected_scope=scope,
             queries=[{"tool": "function_index", "args": {"query": "exact_symbol"}}],
+        )
+
+    assert calls == []
+
+
+def _implementation_continuation_inputs():
+    runtime_context_id = "mfrctx-implementation-continuation"
+    session_token_ref = "wstok-implementation-rotated"
+    route_token_ref = "rtok-implementation-continuation"
+    body = {
+        "project_id": "aming-claw",
+        "runtime_context_id": runtime_context_id,
+        "task_id": "implementation-continuation-worker",
+        "parent_task_id": "cex-implementation-continuation",
+        "lane_id": "implementation-continuation-worker",
+        "worker_role": "mf_sub",
+        "worker_id": "implementation-continuation-worker",
+        "worker_slot_id": "implementation-continuation-worker",
+        "target_project_root": "/tmp/implementation-continuation",
+        "session_token": "<read from worker env>",
+        "session_token_ref": session_token_ref,
+        "fence_token": "<read from worker env>",
+        "session_token_env": "AMING_WORKER_SESSION_TOKEN",
+        "fence_token_env": "AMING_WORKER_FENCE_TOKEN",
+        "changed_files": ["<cumulative changed file>"],
+        "tests": [{"command": "<test command>", "status": "passed"}],
+        "test_results": {
+            "status": "passed",
+            "commands": [{"command": "<test command>", "status": "passed"}],
+        },
+        "graph_trace_ids": ["<worker graph trace>"],
+        "payload": {
+            "graph_trace_ids": ["<worker graph trace>"],
+            "worker_session_lifecycle_policy": {
+                "fence_token": "<must not persist raw auth>"
+            },
+        },
+        "route_token_ref": route_token_ref,
+    }
+    guide = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "details": {
+                            "actionable_payloads": {
+                                "implementation_evidence_facade_payload_skeleton": {
+                                    "copy_safe_body": body
+                                }
+                            }
+                        }
+                    }
+                ),
+            }
+        ]
+    }
+    auth = {
+        "structuredContent": {
+            "worker_session_token_ref": session_token_ref,
+            "worker_host_envelope": {
+                "worker_session_token_ref": session_token_ref,
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": "raw-implementation-session",
+                    "AMING_WORKER_FENCE_TOKEN": "raw-implementation-fence",
+                },
+            },
+        }
+    }
+    binding = {
+        "backlog_id": "AC-IMPLEMENTATION-CONTINUATION",
+        "definition_hash": "sha256:" + "1" * 64,
+        "instruction_bundle_hash": "sha256:" + "2" * 64,
+        "execution_state_revision": 7,
+        "runtime_guide_hash": "sha256:" + "3" * 64,
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "line_instance_id": "runtime_context:{}".format(runtime_context_id),
+    }
+    writer = {
+        "copy_payload": binding,
+        "hash_alignment": {
+            "required_writer_runtime_guide_hash": binding["runtime_guide_hash"]
+        },
+    }
+    current = {
+        "structuredContent": {
+            "ok": True,
+            "runtime_guide": {"writer_role_safe_copy_payload": writer},
+            "next_legal_action": {"writer_role_safe_copy_payload": writer},
+        }
+    }
+    scope = {
+        "project_id": "aming-claw",
+        "backlog_id": binding["backlog_id"],
+        "contract_execution_id": "cex-implementation-continuation",
+        "runtime_context_id": runtime_context_id,
+        "task_id": body["task_id"],
+        "parent_task_id": body["parent_task_id"],
+        "target_project_root": body["target_project_root"],
+        "route_token_ref": route_token_ref,
+    }
+    evidence = {
+        "changed_files": ["agent/cli_agent_service/guided_runtime.py"],
+        "tests": [{"command": "python -m pytest focused.py", "status": "passed"}],
+        "test_results": {"status": "passed", "passed": True},
+        "graph_trace_ids": ["gqt-implementation-continuation"],
+        "commit_sha": "a" * 40,
+        "head_commit": "a" * 40,
+        "clean_worktree": True,
+        "dirty_files": [],
+    }
+    return guide, auth, current, scope, evidence, binding
+
+
+def test_implementation_continuation_uses_current_atomic_writer_binding() -> None:
+    guide, auth, current, scope, evidence, binding = (
+        _implementation_continuation_inputs()
+    )
+    calls = []
+    live_bodies = []
+
+    def call_tool(name, body):
+        calls.append(name)
+        live_bodies.append(body)
+        if name == "contract_runtime_current":
+            assert body == {
+                "project_id": scope["project_id"],
+                "contract_execution_id": scope["contract_execution_id"],
+                "route_token_ref": scope["route_token_ref"],
+            }
+            return current
+        assert name == "runtime_context_implementation_evidence"
+        assert {key: body[key] for key in binding} == binding
+        assert body["session_token_ref"] == "wstok-implementation-rotated"
+        assert body["changed_files"] == evidence["changed_files"]
+        assert body["payload"]["graph_trace_ids"] == evidence["graph_trace_ids"]
+        assert "worker_session_lifecycle_policy" not in body["payload"]
+        return {
+            "ok": True,
+            "status": "passed",
+            "implementation_event_ref": "timeline:implementation-continuation",
+        }
+
+    result = orchestrate_runtime_context_implementation_continuation(
+        worker_guide=guide,
+        host_auth_response=auth,
+        tool_caller=call_tool,
+        expected_scope=scope,
+        implementation_evidence=evidence,
+    )
+
+    assert calls == [
+        "contract_runtime_current",
+        "runtime_context_implementation_evidence",
+    ]
+    assert result["atomic_writer_binding_used"] is True
+    assert result["implementation_event_ref"] == (
+        "timeline:implementation-continuation"
+    )
+    serialized = json.dumps(result, sort_keys=True)
+    assert "raw-implementation-session" not in serialized
+    assert "raw-implementation-fence" not in serialized
+    assert all(
+        "raw-implementation-session" not in json.dumps(body)
+        and "raw-implementation-fence" not in json.dumps(body)
+        for body in live_bodies
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "message"),
+    [
+        ("missing", "missing definition_hash"),
+        ("wrong", "line_instance_id"),
+        ("stale", "stale"),
+    ],
+)
+def test_implementation_continuation_invalid_binding_is_zero_write(
+    failure_kind, message
+) -> None:
+    guide, auth, current, scope, evidence, _binding = (
+        _implementation_continuation_inputs()
+    )
+    writer = current["structuredContent"]["runtime_guide"][
+        "writer_role_safe_copy_payload"
+    ]
+    if failure_kind == "missing":
+        writer["copy_payload"].pop("definition_hash")
+    elif failure_kind == "wrong":
+        writer["copy_payload"]["line_instance_id"] = "runtime_context:wrong"
+    else:
+        writer["hash_alignment"]["required_writer_runtime_guide_hash"] = (
+            "sha256:" + "9" * 64
+        )
+    current["structuredContent"]["next_legal_action"][
+        "writer_role_safe_copy_payload"
+    ] = writer
+    calls = []
+
+    def call_tool(name, body):
+        calls.append((name, body))
+        assert name == "contract_runtime_current"
+        return current
+
+    with pytest.raises(GuidedRuntimeDispatchError, match=message):
+        orchestrate_runtime_context_implementation_continuation(
+            worker_guide=guide,
+            host_auth_response=auth,
+            tool_caller=call_tool,
+            expected_scope=scope,
+            implementation_evidence=evidence,
+        )
+
+    assert [name for name, _body in calls] == ["contract_runtime_current"]
+
+
+def test_implementation_continuation_rejects_caller_binding_override_zero_call() -> None:
+    guide, auth, _current, scope, evidence, binding = (
+        _implementation_continuation_inputs()
+    )
+    evidence["runtime_guide_hash"] = binding["runtime_guide_hash"]
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError, match="caller-owned authority"):
+        orchestrate_runtime_context_implementation_continuation(
+            worker_guide=guide,
+            host_auth_response=auth,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            expected_scope=scope,
+            implementation_evidence=evidence,
         )
 
     assert calls == []
