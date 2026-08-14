@@ -807,6 +807,7 @@ function verifyBacklogEvidenceContract() {
   const playbackTestSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/taskPlayback.test.ts"), "utf8");
   const playbackPanelSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/TaskPlaybackPanel.tsx"), "utf8");
   const playbackViewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/TaskPlaybackView.tsx"), "utf8");
+  const backlogViewTestSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/BacklogView.test.tsx"), "utf8");
   const treeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/TreePanel.tsx"), "utf8");
   const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/BacklogView.tsx"), "utf8");
   const typeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/types.ts"), "utf8");
@@ -844,6 +845,9 @@ function verifyBacklogEvidenceContract() {
   assert(viewSource.includes("BACKLOG_URL_PARAM"), "Backlog detail modal should be URL addressable");
   assert(viewSource.includes("buildTimelineDag"), "Backlog detail should derive a timeline DAG");
   assert(viewSource.includes("buildTimelineLaneContext"), "Backlog timeline should derive readable actor-family lane context");
+  assert(viewSource.includes('projectTaskTimelineEvent(event, index).lane_id') && viewSource.includes('["observer", ...workers, "verification", "gate", "content_sys"]'), "Backlog DAG should preserve the canonical Playback semantic lane families before adding durable worker sublanes");
+  assert(backlogViewTestSource.includes("buildBacklogSemanticLaneParityFixtureDagForTest") && backlogViewTestSource.includes('=== "observer,verification,gate"'), "Backlog DAG fixtures should prove generic actor labels retain Observer, Verification, and Close gate parity");
+  assert(backlogViewTestSource.includes("buildBacklogParallelTimelineFixtureDagForTest") && backlogViewTestSource.includes("parallelWorkerDag.workerLaneCount === 2") && backlogViewTestSource.includes("parallelWorkerLanes.length === 2"), "Backlog DAG fixtures should prove two durable workers remain two distinct worker sublanes");
   assert(viewSource.includes("Subagents / Workers ·"), "Parallel worker DAG sublanes should stay under the Subagents / Workers family");
   assert(viewSource.includes("workers parallel"), "Backlog timeline should make parallel worker execution visible");
   assert(viewSource.includes("rawLaneKeyForEvent"), "Backlog timeline should keep raw lane ids inspectable without using them as labels");

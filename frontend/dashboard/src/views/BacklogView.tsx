@@ -126,7 +126,7 @@ export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
   {
     event_id: "fixture-observer-dispatch",
     event_type: "mf_dispatch",
-    event_kind: "implementation",
+    event_kind: "dispatch",
     actor: "observer",
     phase: "dispatch",
     status: "accepted",
@@ -187,7 +187,8 @@ export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
     event_id: "fixture-worker-frontend",
     event_type: "subagent_result",
     event_kind: "implementation",
-    actor: "mf_sub_frontend",
+    actor: "Aming Claw",
+    task_id: "fixture-worker-frontend-task",
     phase: "implementation",
     status: "passed",
     payload: {
@@ -206,7 +207,8 @@ export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
     event_id: "fixture-worker-backend",
     event_type: "subagent_result",
     event_kind: "implementation",
-    actor: "mf_sub_backend",
+    actor: "Aming Claw",
+    task_id: "fixture-worker-backend-task",
     phase: "implementation",
     status: "passed",
     payload: {
@@ -1043,7 +1045,7 @@ function BacklogDetailModal({
                   <div className="backlog-dag-grid">
                     {dag.lanes.map((lane) => (
                       <div className={`backlog-dag-lane lane-${cssToken(lane.id)}`} key={lane.id}>
-                        <div className="backlog-dag-lane-label" title={lane.family === "worker" ? "Subagents / Workers" : "Observer"}>
+                        <div className="backlog-dag-lane-label" title={lane.label}>
                           {lane.label}
                         </div>
                         <div className="backlog-dag-lane-track" style={{ gridTemplateColumns: `repeat(${dag.phaseLabels.length}, minmax(130px, 1fr))` }}>
@@ -2990,7 +2992,7 @@ interface TimelineDagLane {
   id: string;
   label: string;
   nodes: TimelineDagNode[];
-  family: "observer" | "worker";
+  family: "observer" | "worker" | "verification" | "gate" | "content_sys";
 }
 
 interface TimelineDagNode {
@@ -3041,6 +3043,50 @@ export function buildBacklogParallelTimelineFixtureDagForTest(): TimelineDag {
   );
 }
 
+export function buildBacklogSemanticLaneParityFixtureDagForTest(): TimelineDag {
+  const backlog: BacklogBug = {
+    bug_id: "FIXTURE-BACKLOG-SEMANTIC-LANE-PARITY",
+    title: "Fixture backlog semantic lane parity",
+    status: "FIXED",
+    priority: "P1",
+  };
+  const events: TaskTimelineEvent[] = [
+    {
+      event_id: "fixture-semantic-observer",
+      event_type: "observer_command",
+      event_kind: "observer_command",
+      actor: "Aming Claw",
+      phase: "observer_review",
+      status: "accepted",
+      created_at: "2026-08-14T11:00:00Z",
+    },
+    {
+      event_id: "fixture-semantic-verification",
+      event_type: "qa.independent_verification",
+      event_kind: "independent_verification",
+      actor: "Aming Claw",
+      phase: "verification",
+      status: "passed",
+      created_at: "2026-08-14T11:01:00Z",
+    },
+    {
+      event_id: "fixture-semantic-gate",
+      event_type: "route_token_gate.backlog_close",
+      event_kind: "route_token_gate",
+      actor: "Aming Claw",
+      phase: "close_ready",
+      status: "accepted",
+      created_at: "2026-08-14T11:02:00Z",
+    },
+  ];
+  return buildTimelineDag(
+    backlog,
+    events,
+    undefined,
+    normalizeTaskPlaybackDag({ projectId: "aming-claw", backlog, events }),
+  );
+}
+
 function buildTimelineDag(
   bug: BacklogBug | null,
   events: TaskTimelineEvent[],
@@ -3054,7 +3100,7 @@ function buildTimelineDag(
   orderedEvents.forEach((event, index) => {
     const semantic = projectTaskTimelineEvent(event, index);
     const phase = phaseLabelForEvent(event, index);
-    const lane = timelineLaneIdForEvent(event, laneContext);
+    const lane = timelineLaneIdForEvent(event, laneContext, index);
     // AC-2: use registry headline as L1; truncate for card, keep full for hover.
     const fullHeadline = semantic.headline || timelineNodeLabel(event, index);
     const truncatedLabel = fullHeadline.length > 52 ? `${fullHeadline.slice(0, 49)}…` : fullHeadline;
@@ -3074,7 +3120,7 @@ function buildTimelineDag(
     nodes.push(eventNode);
   });
 
-  const laneOrder = timelineLaneOrder(events);
+  const laneOrder = timelineLaneOrder(laneContext);
   const laneMap = new Map<string, TimelineDagNode[]>();
   for (const node of nodes) {
     laneMap.set(node.lane, [...(laneMap.get(node.lane) ?? []), node]);
@@ -3084,7 +3130,7 @@ function buildTimelineDag(
       id,
       label: timelineLaneDisplayLabel(id, laneContext),
       nodes: laneNodes.sort((a, b) => a.phaseIndex - b.phaseIndex || a.label.localeCompare(b.label)),
-      family: id.startsWith("worker") ? "worker" as const : "observer" as const,
+      family: timelineLaneFamily(id),
     }))
     .sort((a, b) => {
       const ai = laneOrder.indexOf(a.id);
@@ -3207,7 +3253,10 @@ function compareTimelineEvents(a: TaskTimelineEvent, b: TaskTimelineEvent): numb
 }
 
 function buildTimelineLaneContext(events: TaskTimelineEvent[]): TimelineLaneContext {
-  const workerKeys = stableUnique(events.filter(isWorkerTimelineEvent).map(rawWorkerKeyForEvent).filter(Boolean));
+  const workerKeys = stableUnique(events
+    .filter((event, index) => projectTaskTimelineEvent(event, index).lane_id === "worker")
+    .map(rawWorkerKeyForEvent)
+    .filter(Boolean));
   const roleCounts = new Map<string, number>();
   const workerAliases = new Map<string, string>();
   workerKeys.forEach((key, index) => {
@@ -3221,8 +3270,9 @@ function buildTimelineLaneContext(events: TaskTimelineEvent[]): TimelineLaneCont
   return { workerKeys, workerAliases };
 }
 
-function timelineLaneIdForEvent(event: TaskTimelineEvent, context: TimelineLaneContext): string {
-  if (!isWorkerTimelineEvent(event)) return "observer";
+function timelineLaneIdForEvent(event: TaskTimelineEvent, context: TimelineLaneContext, index = 0): string {
+  const semanticLane = projectTaskTimelineEvent(event, index).lane_id;
+  if (semanticLane !== "worker") return semanticLane;
   if (context.workerKeys.length <= 1) return "worker";
   const key = rawWorkerKeyForEvent(event);
   if (!key) return "worker";
@@ -3241,6 +3291,12 @@ function timelineLaneDisplayLabel(id: string, context: TimelineLaneContext): str
   return titleizeLane(id);
 }
 
+function timelineLaneFamily(id: string): TimelineDagLane["family"] {
+  if (id === "verification" || id === "gate" || id === "content_sys") return id;
+  if (id === "worker" || id.startsWith("worker_")) return "worker";
+  return "observer";
+}
+
 function rawWorkerKeyForEvent(event: TaskTimelineEvent): string {
   const payload = asRecord(event.payload);
   const verification = asRecord(event.verification);
@@ -3255,9 +3311,9 @@ function rawWorkerKeyForEvent(event: TaskTimelineEvent): string {
     stringField(payload, "subagent_id") ||
     stringField(verification, "worker_id") ||
     stringField(verification, "agent_id") ||
-    event.actor ||
     event.task_id ||
     event.trace_id ||
+    event.actor ||
     ""
   );
 }
@@ -3290,23 +3346,6 @@ function workerRoleForEvent(event: TaskTimelineEvent): string {
   if (text.includes("test") || text.includes("qa") || text.includes("verify")) return "verification";
   if (text.includes("doc")) return "docs";
   return "";
-}
-
-function isWorkerTimelineEvent(event: TaskTimelineEvent): boolean {
-  const text = eventSearchText(event);
-  const lane = rawLaneKeyForEvent(event).toLowerCase();
-  if (text.includes("observer") && !text.includes("subagent") && !text.includes("worker") && !text.includes("mf_sub")) return false;
-  return (
-    event.event_kind === "implementation" ||
-    lane.includes("subagent") ||
-    lane.includes("worker") ||
-    lane.includes("mf_sub") ||
-    lane.includes("front") ||
-    lane.includes("back") ||
-    text.includes("subagent") ||
-    text.includes("mf_sub") ||
-    text.includes("changed_files")
-  );
 }
 
 function displayActorForEvent(event: TaskTimelineEvent): string {
@@ -3384,27 +3423,11 @@ interface ContractEvidenceMatch {
   artifacts: EventArtifactSummary;
 }
 
-function timelineLaneOrder(events: TaskTimelineEvent[]): string[] {
-  const hasImplementation = events.some(isImplementationEvidenceEvent);
-  if (!hasImplementation) return ["observer", "worker"];
-  return ["observer", "worker"];
-}
-
-function isImplementationEvidenceEvent(event: TaskTimelineEvent): boolean {
-  const lane = laneLabelForEvent(event);
-  const text = eventSearchText(event);
-  if (lane === "observer" && !text.includes("implementation")) return false;
-  return (
-    event.event_kind === "implementation" ||
-    lane === "worker" ||
-    lane === "implementation" ||
-    lane === "frontend" ||
-    lane === "backend" ||
-    text.includes("mf_sub") ||
-    text.includes("subagent") ||
-    text.includes("changed_files") ||
-    text.includes("tests_run")
-  );
+function timelineLaneOrder(context: TimelineLaneContext): string[] {
+  const workers = context.workerKeys.length <= 1
+    ? ["worker"]
+    : context.workerKeys.map((key) => `worker_${cssToken(context.workerAliases.get(key) || key)}`);
+  return ["observer", ...workers, "verification", "gate", "content_sys"];
 }
 
 function isCoarseOrInferredEvent(event: TaskTimelineEvent): boolean {
@@ -3494,28 +3517,6 @@ function eventSearchText(event: TaskTimelineEvent): string {
     JSON.stringify(event.verification ?? {}),
     JSON.stringify(event.artifact_refs ?? {}),
   ].join(" ").toLowerCase();
-}
-
-function laneLabelForEvent(event: TaskTimelineEvent): string {
-  const raw = rawLaneKeyForEvent(event);
-  const normalized = raw.toLowerCase();
-  if (normalized.includes("front")) return "frontend";
-  if (normalized.includes("back")) return "backend";
-  if (normalized.includes("subagent") || normalized.includes("worker") || normalized.includes("mf_sub") || event.event_kind === "implementation") return "worker";
-  if (normalized.includes("observer")) return "observer";
-  if (
-    normalized.includes("gate") ||
-    normalized.includes("close_ready") ||
-    normalized.includes("merge") ||
-    normalized.includes("verify") ||
-    normalized.includes("test") ||
-    normalized.includes("browser") ||
-    normalized.includes("playwright") ||
-    normalized.includes("screenshot")
-  ) {
-    return "observer";
-  }
-  return isWorkerTimelineEvent(event) ? "worker" : "observer";
 }
 
 function stringField(record: Record<string, unknown>, key: string): string {

@@ -4,7 +4,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { ContractRuntimeAuthorityPanel } from "../components/TaskPlaybackPanel";
 import type { ContractRuntimeAuthorityViewModel } from "../lib/taskPlayback";
 import type { BacklogBug } from "../types";
-import { filterBacklogHotWindowRows } from "./BacklogView";
+import {
+  buildBacklogParallelTimelineFixtureDagForTest,
+  buildBacklogSemanticLaneParityFixtureDagForTest,
+  filterBacklogHotWindowRows,
+} from "./BacklogView";
 
 const projectedCommandBug: BacklogBug = {
   bug_id: "AC-OBSERVER-COMMAND-TERMINAL-PROJECTION-FROM-CONTRACT-20260604",
@@ -61,6 +65,30 @@ assertBacklogAuthority(
     && backlogViewSource.includes("visualization: compactTimeline?.contract_runtime_visualization")
     && backlogViewSource.includes("timeline-event:${timelineEventKey(event, index)}"),
   "Backlog detail and Playback must share the canonical typed-DAG normalizer and event identities",
+);
+
+const semanticLaneDag = buildBacklogSemanticLaneParityFixtureDagForTest();
+assertBacklogAuthority(
+  semanticLaneDag.lanes.map((lane) => lane.id).join(",") === "observer,verification,gate",
+  "generic Aming Claw actor labels must retain the same Observer, Verification, and Close gate lanes as Playback",
+);
+assertBacklogAuthority(
+  semanticLaneDag.lanes.map((lane) => lane.label).join(",") === "Observer,Verification,Close gate",
+  "semantic lane ids must render public labels without raw actor or runtime identifiers",
+);
+
+const parallelWorkerDag = buildBacklogParallelTimelineFixtureDagForTest();
+const parallelWorkerLanes = parallelWorkerDag.lanes.filter((lane) => lane.family === "worker");
+assertBacklogAuthority(
+  parallelWorkerDag.workerLaneCount === 2
+    && parallelWorkerLanes.length === 2
+    && new Set(parallelWorkerLanes.flatMap((lane) => lane.nodes.map((node) => node.id))).size === 2,
+  "two durable worker identities must render as two distinct Subagents / Workers lanes",
+);
+assertBacklogAuthority(
+  parallelWorkerLanes.every((lane) => lane.label.startsWith("Subagents / Workers · "))
+    && parallelWorkerLanes.every((lane) => !lane.label.includes("mf_sub_")),
+  "worker lane labels must remain readable aliases rather than raw worker identities",
 );
 assertBacklogAuthority(
   backlogViewSource.includes("Typed edges")
