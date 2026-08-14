@@ -5490,6 +5490,102 @@ def test_worker_commit_bypass_uses_clean_diff_when_historical_lineage_is_stale(m
     ) == {}
 
 
+def test_worker_commit_bypass_accepts_normal_precommit_implementation_without_pass(
+    monkeypatch,
+):
+    candidate_commit, historical_commit, base_commit = (
+        "d" * 40,
+        "a" * 40,
+        "c" * 40,
+    )
+    runtime_context_id = "mfrctx-worker-commit-precommit"
+    task_id = "worker-commit-precommit-task"
+    context = SimpleNamespace(
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id="cex-worker-commit-precommit",
+        worktree_path="/worker",
+        base_commit=base_commit,
+        owned_files=("owned.py",),
+    )
+    implementation = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        # Normal lifecycle truth: implementation is recorded before git commit.
+        "commit_sha": "",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": "cex-worker-commit-precommit",
+        "payload": {"changed_files": ["owned.py"]},
+    }
+    record = {
+        "project_id": PID,
+        "contract_execution_id": "cex-worker-commit-precommit",
+        "completed_lines": [
+            {
+                "line_id": "observer_dispatch_bounded_workers",
+                "payload": {
+                    "worker_role": "mf_sub",
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                },
+            },
+            implementation,
+        ],
+    }
+    request = {
+        "line_id": "worker_commit",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "commit_sha": candidate_commit,
+        "changed_files": ["owned.py"],
+        "evidence_refs": [f"commit:{candidate_commit}"],
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_a, **_k: [context],
+    )
+    monkeypatch.setattr(server, "_runtime_context_git_dirty_files", lambda _path: [])
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_git_head_commit",
+        lambda _path: candidate_commit,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_commit_revision_diff",
+        lambda *_a, **_k: {
+            "parent_commit": base_commit,
+            "base_commit": base_commit,
+            "changed_files": ["owned.py"],
+        },
+    )
+
+    authority = server._contract_runtime_worker_commit_bypass_continuation_authority(
+        None,
+        project_id=PID,
+        record=record,
+        request=request,
+    )
+
+    assert authority["server_derived"] is authority["db_verified"] is True
+    assert authority["no_pass_claim"] is True
+    assert authority["authoritative_pass_synthesized"] is False
+    assert authority["commit_sha"] == candidate_commit
+    assert authority["historical_lineage_stale"] is False
+    assert authority["canonical_historical_commit_sha"] == ""
+
+    implementation["commit_sha"] = historical_commit
+    assert server._contract_runtime_worker_commit_bypass_continuation_authority(
+        None,
+        project_id=PID,
+        record=record,
+        request=request,
+    ) == {}
+
+
 def _worker_commit_after_implementation_bypass_case(
     conn,
     tmp_path,
@@ -134984,6 +135080,31 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
         "required": False,
         "compatibility_alias_only": True,
         "must_project_same_canonical_line": True,
+    }
+
+
+def test_worker_commit_guide_omits_optional_placeholder_lineage_claims():
+    payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id="mfrctx-worker-commit-optional-lineage",
+        task_id="worker-commit-optional-lineage-task",
+        parent_task_id="cex-worker-commit-optional-lineage",
+        worker_id="worker-commit-optional-lineage",
+        worker_slot_id="worker-commit-optional-lineage",
+        target_project_root="/tmp/worker-commit-optional-lineage",
+        backlog_id="AC-WORKER-COMMIT-OPTIONAL-LINEAGE",
+        successor_contract_execution_id="cex-worker-commit-optional-lineage",
+    )
+
+    skeleton = payloads["worker_commit_facade_payload_skeleton"]
+    body = skeleton["copy_safe_body"]
+    assert "implementation_lineage_ref" not in body
+    assert "worker_implementation_lineage" not in body
+    assert "implementation_lineage_ref" not in skeleton["required_fields"]
+    assert skeleton["implementation_lineage_ref"] == {
+        "required": False,
+        "server_derived_when_omitted": True,
+        "supplied_nonempty_value_must_match": True,
     }
 
 

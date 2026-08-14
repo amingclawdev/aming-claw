@@ -28877,7 +28877,6 @@ def _runtime_context_worker_guide_response(
                 "parent_task_id",
                 "worker_session_id",
                 "filer_principal",
-                "implementation_lineage_ref",
                 "worker_commit_sha",
                 "owned_files",
                 "changed_files",
@@ -28887,6 +28886,11 @@ def _runtime_context_worker_guide_response(
             "implementation_lineage_source_of_authority": (
                 "ContractRuntime.completed_lines.worker_implementation"
             ),
+            "implementation_lineage_ref": {
+                "required": False,
+                "server_derived_when_omitted": True,
+                "supplied_nonempty_value_must_match": True,
+            },
             "implementation_event_ref": {
                 "required": False,
                 "compatibility_alias_only": True,
@@ -31784,21 +31788,6 @@ def _runtime_context_worker_recovery_payloads(
         "session_token": session_token_placeholder,
         "session_token_ref": session_token_ref_placeholder,
         "fence_token": fence_token_placeholder,
-        "implementation_lineage_ref": (
-            implementation_lineage_ref
-            or "<ContractRuntime worker_implementation lineage ref>"
-        ),
-        "worker_implementation_lineage": (
-            canonical_implementation_lineage
-            or {
-                "source_of_authority": (
-                    "ContractRuntime.completed_lines.worker_implementation"
-                ),
-                "implementation_lineage_ref": (
-                    "<ContractRuntime worker_implementation lineage ref>"
-                ),
-            }
-        ),
         "worker_commit_sha": "<exact full clean git HEAD after implementation commit>",
         "owned_files": (
             list((authority_revision or {}).get("active_owned_files") or [])
@@ -31815,6 +31804,13 @@ def _runtime_context_worker_recovery_payloads(
         "graph_trace_ids": ["<same DB-verified implementation graph trace id>"],
         **safe_route_identity,
     }
+    if implementation_lineage_ref:
+        worker_commit_body["implementation_lineage_ref"] = (
+            implementation_lineage_ref
+        )
+        worker_commit_body["worker_implementation_lineage"] = dict(
+            canonical_implementation_lineage
+        )
     merge_materialize_body = {
         "project_id": project_id,
         "merge_queue_id": (
@@ -32601,7 +32597,6 @@ def _runtime_context_worker_recovery_payloads(
                 "parent_task_id",
                 "worker_session_id",
                 "filer_principal",
-                "implementation_lineage_ref",
                 "worker_commit_sha",
                 "owned_files",
                 "changed_files",
@@ -32613,6 +32608,11 @@ def _runtime_context_worker_recovery_payloads(
             "implementation_lineage_source_of_authority": (
                 "ContractRuntime.completed_lines.worker_implementation"
             ),
+            "implementation_lineage_ref": {
+                "required": False,
+                "server_derived_when_omitted": True,
+                "supplied_nonempty_value_must_match": True,
+            },
             "implementation_event_ref": {
                 "required": False,
                 "compatibility_alias_only": True,
@@ -104169,9 +104169,24 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
         )
     )
     out_of_scope = sorted(set(changed_files) - set(owned_files))
+    canonical_historical_commit_sha = str(
+        implementation.get("commit_sha")
+        or implementation_payload.get("worker_commit_sha")
+        or implementation_payload.get("validated_head_commit")
+        or implementation_payload.get("commit_sha")
+        or implementation_payload.get("head_commit")
+        or ""
+    ).strip().lower()
+    # Normal workers record implementation before creating the clean git
+    # commit.  An empty implementation commit is therefore not historical
+    # drift: the current HEAD is independently re-derived from the assigned
+    # worktree and its exact base..HEAD diff below.  A real non-empty prior
+    # commit remains strict and may only diverge on the failed-QA path.
     historical_lineage_stale = bool(
-        str(implementation.get("commit_sha") or "").strip().lower()
-        != actual_head
+        (
+            canonical_historical_commit_sha
+            and canonical_historical_commit_sha != actual_head
+        )
         or set(implementation_files) != set(changed_files)
     )
     if actual_head != commit_sha:
@@ -104191,7 +104206,14 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
             if historical_lineage_stale
             else "canonical_worker_implementation+runtime_context_git"
         ),
+        **(
+            {"authorization_scope": "worker_commit_bypass_only"}
+            if not historical_lineage_stale
+            else {}
+        ),
         "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "implementation_pass_claimed": False,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -104205,9 +104227,7 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
         "out_of_scope_files": [],
         "clean_worktree": True,
         "historical_lineage_stale": historical_lineage_stale,
-        "canonical_historical_commit_sha": str(
-            implementation.get("commit_sha") or ""
-        ).strip().lower(),
+        "canonical_historical_commit_sha": canonical_historical_commit_sha,
     }
 
 
