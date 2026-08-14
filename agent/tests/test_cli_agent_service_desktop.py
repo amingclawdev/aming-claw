@@ -1645,11 +1645,16 @@ def test_implementation_continuation_uses_current_atomic_writer_binding() -> Non
     def call_tool(name, body):
         calls.append(name)
         live_bodies.append(body)
-        if name == "contract_runtime_current":
+        if name == "runtime_context_current":
             assert body == {
                 "project_id": scope["project_id"],
-                "contract_execution_id": scope["contract_execution_id"],
-                "route_token_ref": scope["route_token_ref"],
+                "runtime_context_id": scope["runtime_context_id"],
+                "parent_task_id": scope["parent_task_id"],
+                "target_project_root": scope["target_project_root"],
+                "session_token": "raw-implementation-session",
+                "fence_token": "raw-implementation-fence",
+                "session_token_ref": "wstok-implementation-rotated",
+                "view": "all",
             }
             return current
         assert name == "runtime_context_implementation_evidence"
@@ -1673,7 +1678,7 @@ def test_implementation_continuation_uses_current_atomic_writer_binding() -> Non
     )
 
     assert calls == [
-        "contract_runtime_current",
+        "runtime_context_current",
         "runtime_context_implementation_evidence",
     ]
     assert result["atomic_writer_binding_used"] is True
@@ -1722,7 +1727,7 @@ def test_implementation_continuation_invalid_binding_is_zero_write(
 
     def call_tool(name, body):
         calls.append((name, body))
-        assert name == "contract_runtime_current"
+        assert name == "runtime_context_current"
         return current
 
     with pytest.raises(GuidedRuntimeDispatchError, match=message):
@@ -1734,7 +1739,7 @@ def test_implementation_continuation_invalid_binding_is_zero_write(
             implementation_evidence=evidence,
         )
 
-    assert [name for name, _body in calls] == ["contract_runtime_current"]
+    assert [name for name, _body in calls] == ["runtime_context_current"]
 
 
 def test_implementation_continuation_rejects_caller_binding_override_zero_call() -> None:

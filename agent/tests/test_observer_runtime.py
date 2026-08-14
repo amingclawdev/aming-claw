@@ -1900,7 +1900,11 @@ def test_implementation_continuation_reads_compatibility_writer_binding() -> Non
 
     def call_tool(name, body):
         calls.append((name, body))
-        if name == "contract_runtime_current":
+        if name == "runtime_context_current":
+            assert body["session_token"] == (
+                "raw-observer-implementation-session"
+            )
+            assert body["fence_token"] == "raw-observer-implementation-fence"
             return current
         return {
             "ok": True,
@@ -1923,7 +1927,7 @@ def test_implementation_continuation_reads_compatibility_writer_binding() -> Non
 
     assert result["atomic_writer_binding_used"] is True
     assert [name for name, _body in calls] == [
-        "contract_runtime_current",
+        "runtime_context_current",
         "runtime_context_implementation_evidence",
     ]
     implementation_body = calls[1][1]

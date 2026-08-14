@@ -2234,7 +2234,7 @@ def orchestrate_runtime_context_implementation_continuation(
     expected_scope: Mapping[str, Any],
     implementation_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Read the current atomic writer binding and submit implementation once."""
+    """Read the worker-safe current writer binding and submit implementation once."""
 
     try:
         guide = unwrap_mcp_application_response(worker_guide)
@@ -2291,14 +2291,19 @@ def orchestrate_runtime_context_implementation_continuation(
             )
         current_body = {
             "project_id": _text(scope.get("project_id")),
-            "contract_execution_id": contract_execution_id,
-            "route_token_ref": _text(scope.get("route_token_ref")),
+            "runtime_context_id": _text(scope.get("runtime_context_id")),
+            "parent_task_id": _text(scope.get("parent_task_id")),
+            "target_project_root": _text(scope.get("target_project_root")),
+            "session_token": session_token,
+            "fence_token": fence_token,
+            "session_token_ref": session_token_ref,
+            "view": "all",
         }
         current, failure, raw_values = _invoke_host_tool(
             tool_caller,
-            "contract_runtime_current",
+            "runtime_context_current",
             current_body,
-            response_status="ContractRuntime current",
+            response_status="RuntimeContext worker current",
             request_bodies=request_bodies,
             raw_results=raw_results,
             raw_values=raw_values,
@@ -2345,8 +2350,8 @@ def orchestrate_runtime_context_implementation_continuation(
             "session_token_ref": session_token_ref,
             "implementation_event_ref": implementation_event_ref,
             "writer_binding_source": (
-                "contract_runtime_current.writer_role_safe_copy_payload."
-                "copy_payload"
+                "runtime_context_current.contract_runtime_current_state."
+                "next_legal_action.writer_role_safe_copy_payload.copy_payload"
             ),
             "atomic_writer_binding_used": True,
             **_HOST_PRIVACY_FLAGS,
