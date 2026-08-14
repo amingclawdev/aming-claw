@@ -227,31 +227,102 @@ def unwrap_mcp_application_response(value: Any) -> dict[str, Any]:
     return copied
 
 
+def _mcp_application_objects(value: Any) -> list[dict[str, Any]]:
+    """Return every declared application object in one MCP host result.
+
+    Hosts may expose the same application result directly, in
+    ``structuredContent``, or as JSON in one or more text content blocks.  A
+    continuation packet may be present in only one of those declared
+    representations, so packet readers must not discard the other blocks by
+    unwrapping just the first convenient shape.
+    """
+
+    copied = _json_compatible_copy(value)
+    if not isinstance(copied, dict):
+        raise ServiceError("MCP tool response must be a JSON object")
+
+    wrapper_is_error = copied.get("isError") is True
+    candidates: list[dict[str, Any]] = []
+
+    wrapper_fields = {"structuredContent", "content", "isError", "_meta"}
+    if set(copied) - wrapper_fields:
+        candidates.append(copied)
+
+    structured = copied.get("structuredContent")
+    if isinstance(structured, str):
+        try:
+            structured = json.loads(structured)
+        except json.JSONDecodeError as exc:
+            raise ServiceError(
+                "MCP structuredContent must contain a JSON object"
+            ) from exc
+    if isinstance(structured, Mapping):
+        application = _json_compatible_copy(structured)
+        if wrapper_is_error and "isError" not in application:
+            application["isError"] = True
+        candidates.append(application)
+
+    content = copied.get("content")
+    saw_text_block = False
+    parsed_text_block = False
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, Mapping) or block.get("type") != "text":
+                continue
+            saw_text_block = True
+            text = block.get("text")
+            if not isinstance(text, str):
+                continue
+            try:
+                application = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(application, Mapping):
+                continue
+            parsed_text_block = True
+            application = _json_compatible_copy(application)
+            if wrapper_is_error and "isError" not in application:
+                application["isError"] = True
+            candidates.append(application)
+    if saw_text_block and not parsed_text_block and not candidates:
+        raise ServiceError("MCP text content must contain a JSON object")
+
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates or [copied]:
+        identity = json.dumps(candidate, sort_keys=True, separators=(",", ":"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(candidate)
+    return unique
+
+
 def mcp_application_mapping_blocks(
     value: Any,
     *,
     paths: Sequence[Sequence[str]],
 ) -> list[dict[str, Any]]:
-    """Read mapping blocks only from explicit MCP application-object paths."""
+    """Read mappings from fixed paths across all declared MCP applications."""
 
-    application = unwrap_mcp_application_response(value)
     blocks: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for path in paths:
-        current: Any = application
-        for field_name in path:
-            if not isinstance(current, Mapping) or field_name not in current:
-                current = None
-                break
-            current = current[field_name]
-        if not isinstance(current, Mapping):
-            continue
-        block = _json_compatible_copy(current)
-        identity = json.dumps(block, sort_keys=True, separators=(",", ":"))
-        if identity in seen:
-            continue
-        seen.add(identity)
-        blocks.append(block)
+    for application in _mcp_application_objects(value):
+        for path in paths:
+            current: Any = application
+            for field_name in path:
+                if not isinstance(current, Mapping) or field_name not in current:
+                    current = None
+                    break
+                current = current[field_name]
+            if not isinstance(current, Mapping):
+                continue
+            block = _json_compatible_copy(current)
+            identity = json.dumps(block, sort_keys=True, separators=(",", ":"))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            blocks.append(block)
     return blocks
 
 

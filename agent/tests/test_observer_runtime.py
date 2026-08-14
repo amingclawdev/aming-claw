@@ -1624,16 +1624,41 @@ def test_host_orchestration_scrubs_raw_auth_from_post_join_server_error() -> Non
         calls.append(name)
         if len(calls) == 1:
             return {
-                "ok": True,
-                "status": "session_token_initial_join_issued",
-                "worker_session_token_ref": "wstok-after-join",
-                "worker_host_envelope": {
+                # Live managed MCP may put its copy-safe summary in
+                # structuredContent and the invocation-local packet in one
+                # declared JSON text compatibility block.  Neither block may
+                # be discarded merely because the other was decoded first.
+                "structuredContent": {
+                    "ok": True,
+                    "status": "session_token_initial_join_issued",
                     "worker_session_token_ref": "wstok-after-join",
-                    "env": {
-                        "AMING_WORKER_SESSION_TOKEN": session_token,
-                        "AMING_WORKER_FENCE_TOKEN": fence_token,
-                    },
                 },
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "details": {
+                                    "compatibility": {
+                                        "worker_host_envelope": {
+                                            "worker_session_token_ref": (
+                                                "wstok-after-join"
+                                            ),
+                                            "env": {
+                                                "AMING_WORKER_SESSION_TOKEN": (
+                                                    session_token
+                                                ),
+                                                "AMING_WORKER_FENCE_TOKEN": (
+                                                    fence_token
+                                                ),
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        ),
+                    },
+                ],
             }
         return {
             "structuredContent": {

@@ -1034,6 +1034,289 @@ def test_runtime_context_host_orchestration_preserves_server_error_object() -> N
     assert "host_envelope_incomplete" not in serialized
 
 
+def _live_refreshing_host_startup_inputs(
+    precursor_tool="runtime_context_session_token_rejoin",
+):
+    route = {
+        "route_id": "route-live-host-continuation",
+        "route_context_hash": "sha256:" + "7" * 64,
+        "prompt_contract_id": "prompt-live-host-continuation",
+        "prompt_contract_hash": "sha256:" + "8" * 64,
+        "route_token_ref": "rtok-live-host-continuation",
+        "visible_injection_manifest_hash": "sha256:" + "9" * 64,
+    }
+    scope = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-LIVE-HOST-CONTINUATION",
+        "contract_execution_id": "cex-live-host-continuation",
+        "runtime_context_id": "mfrctx-live-host-continuation",
+        "task_id": "live-host-continuation-worker",
+        "parent_task_id": "cex-live-host-continuation",
+        "target_project_root": "/tmp/live-host-continuation",
+        "worker_id": "live-host-continuation-worker",
+        "worker_slot_id": "live-host-continuation-worker",
+        "agent_id": "live-host-continuation-worker",
+        "actual_host_worker_id": "live-host-continuation-worker",
+        **route,
+    }
+    precursor_body = {
+        **scope,
+        "worker_session_id": "<actual worker session id>",
+        "host_session_id": "<actual host session id>",
+        "host_startup_id": "<actual host startup id>",
+        "session_token_ref": "wstok-live-before",
+        "reason": "<operator reason>",
+    }
+    guide = {
+        "project_id": scope["project_id"],
+        "backlog_id": scope["backlog_id"],
+        "contract_execution_id": scope["contract_execution_id"],
+        "selected_role": "mf_sub",
+        "selected_work_type": "parallel_worker",
+        "route_token_ref": route["route_token_ref"],
+        "host_precursor_required": True,
+        "execution_sequence": [
+            "host_precursor_action",
+            "refresh_onboard_route_guide",
+            "canonical_contract_action",
+        ],
+        "host_precursor_action": {
+            "mcp_tool": precursor_tool,
+            "copy_safe_body": precursor_body,
+        },
+    }
+    receipt_body = {
+        **scope,
+        "session_token": "<host-realized session_token>",
+        "fence_token": "<host-realized fence_token>",
+        "session_token_ref": "wstok-live-after",
+        "read_receipt_hash": "<launch text hash>",
+        "launch_text_hash": "<launch text hash>",
+    }
+    startup_body = {
+        **scope,
+        "session_token": "<host-realized session_token>",
+        "fence_token": "<host-realized fence_token>",
+        "session_token_ref": "wstok-live-after",
+        "worker_session_id": "<actual worker session id>",
+        "host_session_id": "<actual host session id>",
+        "host_startup_id": "<actual host startup id>",
+        "filer_principal": "<actual worker principal>",
+        "head_commit": "<worker head commit>",
+        "read_receipt_hash": "<accepted receipt hash>",
+        "read_receipt_event_id": "<accepted receipt event>",
+        "worker_transcript_ref": "<host transcript ref>",
+        "actual_cwd": scope["target_project_root"],
+        "actual_git_root": scope["target_project_root"],
+        "harness_type": "codex",
+    }
+    return guide, receipt_body, startup_body
+
+
+@pytest.mark.parametrize(
+    "precursor_tool",
+    [
+        "runtime_context_session_token_initial_join",
+        "runtime_context_session_token_rejoin",
+    ],
+)
+def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
+    precursor_tool,
+) -> None:
+    guide, receipt_body, startup_body = _live_refreshing_host_startup_inputs(
+        precursor_tool
+    )
+    raw_session = "raw-live-host-session"
+    raw_fence = "raw-live-host-fence"
+    calls = []
+    refresh_count = 0
+
+    def call_tool(name, body):
+        nonlocal refresh_count
+        calls.append((name, body))
+        if name == precursor_tool:
+            return {
+                "structuredContent": {
+                    "ok": True,
+                    "status": "session_token_rejoin_issued",
+                    "worker_session_token_ref": "wstok-live-after",
+                },
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "details": {
+                                    "compatibility": {
+                                        "worker_host_envelope": {
+                                            "worker_session_token_ref": (
+                                                "wstok-live-after"
+                                            ),
+                                            "env": {
+                                                "AMING_WORKER_SESSION_TOKEN": raw_session,
+                                                "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        ),
+                    }
+                ],
+            }
+        if name == "onboard_route_guide":
+            refresh_count += 1
+            if refresh_count == 1:
+                return {
+                    "structuredContent": {
+                        "ok": True,
+                        "status": "compact_response_size_exceeded",
+                        "guide_capsule_ref": "gcap-live-receipt",
+                    }
+                }
+            return {
+                "structuredContent": {
+                    "ok": True,
+                    "details": {
+                        "compatibility": {
+                            "canonical_executable_action": {
+                                "mcp_tool": "parallel_branch_startup",
+                                "copy_safe_body": startup_body,
+                            }
+                        }
+                    },
+                }
+            }
+        if name == "onboard_route_guide_section_fetch":
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "sections": {
+                                    "action_input": {
+                                        "canonical_executable_action": {
+                                            "mcp_tool": (
+                                                "runtime_context_read_receipt"
+                                            ),
+                                            "copy_safe_body": receipt_body,
+                                        }
+                                    }
+                                }
+                            }
+                        ),
+                    }
+                ]
+            }
+        if name == "runtime_context_read_receipt":
+            assert body["session_token"] == raw_session
+            assert body["fence_token"] == raw_fence
+            assert body["session_token_ref"] == "wstok-live-after"
+            return {
+                "ok": True,
+                "status": "accepted",
+                "read_receipt_hash": body["read_receipt_hash"],
+                "read_receipt_event_id": "timeline:live-receipt",
+            }
+        assert name == "parallel_branch_startup"
+        assert body["session_token"] == raw_session
+        assert body["fence_token"] == raw_fence
+        assert body["read_receipt_event_id"] == "timeline:live-receipt"
+        return {"ok": True, "status": "startup_recorded"}
+
+    result = orchestrate_runtime_context_host_startup(
+        worker_guide={
+            "content": [{"type": "text", "text": json.dumps(guide)}]
+        },
+        tool_caller=call_tool,
+        host_identity={
+            "worker_session_id": "live-host-session",
+            "host_startup_id": "live-host-startup",
+            "head_commit": "a" * 40,
+            "launch_text_hash": "sha256:" + "a" * 64,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["guide_refreshed_after_each_transition"] is True
+    assert [name for name, _body in calls] == [
+        precursor_tool,
+        "onboard_route_guide",
+        "onboard_route_guide_section_fetch",
+        "runtime_context_read_receipt",
+        "onboard_route_guide",
+        "parallel_branch_startup",
+    ]
+    assert raw_session not in json.dumps(result, sort_keys=True)
+    assert raw_fence not in json.dumps(result, sort_keys=True)
+    assert all(raw_session not in json.dumps(body) for _name, body in calls)
+    assert all(raw_fence not in json.dumps(body) for _name, body in calls)
+
+
+@pytest.mark.parametrize("failure_mode", ["wrong_scope", "conflicting_alias"])
+def test_host_orchestration_rejects_invalid_refreshed_packet_before_receipt(
+    failure_mode,
+) -> None:
+    guide, receipt_body, _startup_body = _live_refreshing_host_startup_inputs()
+    bad_body = deepcopy(receipt_body)
+    bad_body["task_id"] = "wrong-worker"
+    receipt_action = {
+        "mcp_tool": "runtime_context_read_receipt",
+        "copy_safe_body": bad_body if failure_mode == "wrong_scope" else receipt_body,
+    }
+    calls = []
+
+    def call_tool(name, body):
+        calls.append(name)
+        if name == "runtime_context_session_token_rejoin":
+            return {
+                "ok": True,
+                "worker_session_token_ref": "wstok-live-after",
+                "host_envelope": {
+                    "session_token_ref": "wstok-live-after",
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": "raw-live-session",
+                        "AMING_WORKER_FENCE_TOKEN": "raw-live-fence",
+                    },
+                },
+            }
+        if name == "onboard_route_guide":
+            response = {"structuredContent": {"canonical_executable_action": receipt_action}}
+            if failure_mode == "conflicting_alias":
+                response["content"] = [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "canonical_executable_action": {
+                                    "mcp_tool": "runtime_context_read_receipt",
+                                    "copy_safe_body": bad_body,
+                                }
+                            }
+                        ),
+                    }
+                ]
+            return response
+        pytest.fail("invalid continuation packet reached a downstream write")
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=call_tool,
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+            },
+        )
+
+    assert calls == [
+        "runtime_context_session_token_rejoin",
+        "onboard_route_guide",
+    ]
+
+
 def _graph_continuation_inputs():
     route = {
         "route_id": "route-graph-continuation",

@@ -79,7 +79,8 @@ _HOST_REPLACEMENT_FIELDS_BY_SOURCE = {
         observer_command_id""".split()
     ),
     "worker_guide": frozenset(
-        """contract_execution_id contract_hash context_hash agent_id
+        """backlog_id contract_execution_id contract_hash context_hash
+        runtime_context_id task_id agent_id
         actual_host_worker_id worker_id worker_slot_id parent_task_id
         target_project_root branch branch_ref base_commit target_head_commit
         merge_queue_id observer_command_id route_id route_context_hash
@@ -201,6 +202,40 @@ _GRAPH_HOST_ENVELOPE_PATHS = (
     ("details", "worker_host_envelope"),
     ("data", "host_envelope"),
     ("data", "worker_host_envelope"),
+    ("details", "compatibility", "host_envelope"),
+    ("details", "compatibility", "worker_host_envelope"),
+)
+_MCP_APPLICATION_ROOT_PATHS = ((),)
+_HOST_PRECURSOR_ACTION_PATHS = (
+    ("host_precursor_action",),
+    ("details", "host_precursor_action"),
+    ("details", "compatibility", "host_precursor_action"),
+    ("sections", "action_input", "host_precursor_action"),
+)
+_HOST_CONTINUATION_ACTION_PATHS = (
+    ("canonical_executable_action",),
+    ("action_input", "canonical_executable_action"),
+    ("sections", "action_input", "canonical_executable_action"),
+    ("details", "canonical_executable_action"),
+    ("details", "action_input", "canonical_executable_action"),
+    ("details", "compatibility", "canonical_executable_action"),
+    (
+        "details",
+        "compatibility",
+        "action_input",
+        "canonical_executable_action",
+    ),
+)
+_HOST_AUTH_TOOLS = frozenset(
+    {
+        "runtime_context_session_token_initial_join",
+        "runtime_context_session_token_rejoin",
+        "runtime_context_session_token_reissue",
+    }
+)
+_HOST_AUTH_REQUIRED_FIELDS = tuple(
+    """project_id runtime_context_id task_id worker_session_id
+    session_token_ref reason""".split()
 )
 _IMPLEMENTATION_WRITER_BINDING_FIELDS = (
     "backlog_id",
@@ -747,6 +782,221 @@ def _public_server_failure(
     return result
 
 
+def _host_auth_candidates(
+    value: Any,
+) -> tuple[set[tuple[str, str]], set[str], tuple[str, ...]]:
+    """Collect only declared raw-auth pairs and copy-safe refs from MCP blocks."""
+
+    applications = mcp_application_mapping_blocks(
+        value,
+        paths=_MCP_APPLICATION_ROOT_PATHS,
+    )
+    envelopes = mcp_application_mapping_blocks(
+        value,
+        paths=_GRAPH_HOST_ENVELOPE_PATHS,
+    )
+    pairs: set[tuple[str, str]] = set()
+    refs: set[str] = set()
+    raw_values: list[str] = []
+    for candidate in [*applications, *envelopes]:
+        environment = candidate.get("env")
+        environment = (
+            dict(environment) if isinstance(environment, Mapping) else {}
+        )
+        session_token = _text(
+            environment.get(WORKER_AUTH_ENV_KEYS[0])
+            or candidate.get("session_token")
+        )
+        fence_token = _text(
+            environment.get(WORKER_AUTH_ENV_KEYS[1])
+            or candidate.get("fence_token")
+        )
+        if session_token:
+            raw_values.append(session_token)
+        if fence_token:
+            raw_values.append(fence_token)
+        if session_token and fence_token:
+            pairs.add((session_token, fence_token))
+        for field_name in (
+            "session_token_ref",
+            "worker_session_token_ref",
+            "safe_session_token_ref",
+        ):
+            ref = _text(candidate.get(field_name))
+            if ref:
+                refs.add(ref)
+    return pairs, refs, tuple(dict.fromkeys(raw_values))
+
+
+def _single_host_auth_packet(value: Any) -> tuple[str, str, str]:
+    try:
+        pairs, refs, _raw_values = _host_auth_candidates(value)
+    except ServiceError as exc:
+        raise GuidedRuntimeDispatchError(
+            "worker host continuation packet could not be decoded",
+            status="invalid_host_orchestration",
+        ) from exc
+    if len(pairs) != 1 or len(refs) != 1:
+        raise GuidedRuntimeDispatchError(
+            "worker host continuation packet is missing or ambiguous",
+            status="invalid_host_orchestration",
+        )
+    session_token, fence_token = next(iter(pairs))
+    session_token_ref = next(iter(refs))
+    if any(
+        _PLACEHOLDER.search(value)
+        for value in (session_token, fence_token, session_token_ref)
+    ):
+        raise GuidedRuntimeDispatchError(
+            "worker host continuation packet contains placeholders",
+            status="invalid_host_orchestration",
+        )
+    return session_token, fence_token, session_token_ref
+
+
+def _host_action_packet(
+    value: Any,
+    *,
+    paths: Sequence[Sequence[str]],
+    expected_tools: frozenset[str],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    try:
+        blocks = mcp_application_mapping_blocks(value, paths=paths)
+    except ServiceError as exc:
+        raise GuidedRuntimeDispatchError(
+            "runtime context host continuation action could not be decoded",
+            status="invalid_host_orchestration",
+        ) from exc
+    packets: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for action in blocks:
+        tool_name = _text(
+            action.get("mcp_tool")
+            or action.get("tool")
+            or action.get("legacy_tool")
+            or action.get("facade")
+        )
+        body = action.get("copy_safe_body")
+        if tool_name not in expected_tools or not isinstance(body, Mapping):
+            continue
+        normalized = {
+            "tool": tool_name,
+            "copy_safe_body": _json_round_trip(body, "host action body"),
+        }
+        identity = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+        packets[identity] = (action, normalized["copy_safe_body"])
+    if not packets:
+        return None
+    if len(packets) != 1:
+        raise GuidedRuntimeDispatchError(
+            "runtime context host continuation action is ambiguous",
+            status="invalid_host_orchestration",
+        )
+    return next(iter(packets.values()))
+
+
+def _onboard_refresh_body(guide: Mapping[str, Any]) -> dict[str, Any]:
+    project_id = _first_deep_text(guide, "project_id")
+    backlog_id = _first_deep_text(guide, "backlog_id")
+    selected_role = _first_deep_text(guide, "selected_role") or "mf_sub"
+    selected_work_type = (
+        _first_deep_text(guide, "selected_work_type") or "parallel_worker"
+    )
+    contract_execution_id = _first_deep_text(guide, "contract_execution_id")
+    route_token_ref = _first_deep_text(guide, "route_token_ref")
+    missing = [
+        field_name
+        for field_name, value in {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "route_token_ref": route_token_ref,
+        }.items()
+        if not value or _PLACEHOLDER.search(value)
+    ]
+    if missing:
+        raise GuidedRuntimeDispatchError(
+            "runtime context guide refresh scope is incomplete: {}".format(
+                ", ".join(missing)
+            ),
+            status="invalid_host_orchestration",
+        )
+    return {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "role": selected_role,
+        "work_type": selected_work_type,
+        "task_id": contract_execution_id,
+        "route_token_ref": route_token_ref,
+        "response_view": "compact",
+    }
+
+
+def _refresh_host_action_packet(
+    *,
+    tool_caller: Callable[[str, Mapping[str, Any]], Any],
+    refresh_body: Mapping[str, Any],
+    expected_tools: frozenset[str],
+    request_bodies: list[dict[str, Any]],
+    raw_results: list[Any],
+    raw_values: tuple[str, ...],
+) -> tuple[dict[str, Any], dict[str, Any], tuple[str, ...], dict[str, Any] | None]:
+    response, failure, raw_values = _invoke_host_tool(
+        tool_caller,
+        "onboard_route_guide",
+        _json_round_trip(refresh_body, "onboard refresh body"),
+        response_status="onboard guide refresh",
+        request_bodies=request_bodies,
+        raw_results=raw_results,
+        raw_values=raw_values,
+    )
+    if failure:
+        return {}, {}, raw_values, failure
+    packet = _host_action_packet(
+        raw_results[-1],
+        paths=_HOST_CONTINUATION_ACTION_PATHS,
+        expected_tools=expected_tools,
+    )
+    if packet is None:
+        capsule_ref = _first_deep_text(response, "guide_capsule_ref")
+        if not capsule_ref:
+            raise GuidedRuntimeDispatchError(
+                "authenticated guide omitted its executable continuation packet",
+                status="invalid_host_orchestration",
+            )
+        section_body = {
+            key: refresh_body[key]
+            for key in ("project_id", "backlog_id", "role", "work_type")
+            if key in refresh_body
+        }
+        section_body.update(
+            {"guide_capsule_ref": capsule_ref, "sections": ["action_input"]}
+        )
+        section_response, failure, raw_values = _invoke_host_tool(
+            tool_caller,
+            "onboard_route_guide_section_fetch",
+            section_body,
+            response_status="onboard action-input section",
+            request_bodies=request_bodies,
+            raw_results=raw_results,
+            raw_values=raw_values,
+        )
+        if failure:
+            return {}, {}, raw_values, failure
+        response = section_response
+        packet = _host_action_packet(
+            raw_results[-1],
+            paths=_HOST_CONTINUATION_ACTION_PATHS,
+            expected_tools=expected_tools,
+        )
+    if packet is None:
+        raise GuidedRuntimeDispatchError(
+            "authenticated guide omitted its executable continuation packet",
+            status="invalid_host_orchestration",
+        )
+    action, body = packet
+    return action, body, raw_values, None
+
+
 def _invoke_host_tool(
     tool_caller: Callable[[str, Mapping[str, Any]], Any],
     tool_name: str,
@@ -780,21 +1030,281 @@ def _invoke_host_tool(
             "{} response could not be decoded".format(response_status),
             status="{}_response_invalid".format(response_status.replace(" ", "_")),
         ) from exc
-    envelope = _first_named_mapping(response, "host_envelope") or _first_named_mapping(
-        response, "worker_host_envelope"
-    )
-    environment = envelope.get("env")
-    environment = environment if isinstance(environment, Mapping) else {}
-    discovered = (
-        _text(environment.get("AMING_WORKER_SESSION_TOKEN") or response.get("session_token")),
-        _text(environment.get("AMING_WORKER_FENCE_TOKEN") or response.get("fence_token")),
-    )
-    raw_values = tuple(dict.fromkeys((*raw_values, *(item for item in discovered if item))))
+    try:
+        _pairs, _refs, discovered = _host_auth_candidates(raw)
+    except ServiceError:
+        discovered = ()
+    raw_values = tuple(dict.fromkeys((*raw_values, *discovered)))
     if not _application_succeeded(response):
         return response, _public_server_failure(
             tool_name, response, raw_values=raw_values
         ), raw_values
     return response, None, raw_values
+
+
+def _assert_host_action_scope(
+    body: Mapping[str, Any],
+    values: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    scope_fields = (
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "target_project_root",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+        "session_token_ref",
+    )
+    mismatches: list[str] = []
+    for field_name in scope_fields:
+        expected = _text(values.get(field_name))
+        actual = _text(body.get(field_name))
+        if not expected or not actual:
+            continue
+        if _PLACEHOLDER.search(actual) or actual != expected:
+            mismatches.append(field_name)
+    if mismatches:
+        raise GuidedRuntimeDispatchError(
+            "{} conflicts with authenticated scope at {}".format(
+                label, ", ".join(mismatches)
+            ),
+            status="invalid_host_orchestration",
+        )
+
+
+def _orchestrate_refreshing_host_startup(
+    *,
+    guide: Mapping[str, Any],
+    precursor_action: Mapping[str, Any],
+    precursor_template: Mapping[str, Any],
+    tool_caller: Callable[[str, Mapping[str, Any]], Any],
+    host_identity: Mapping[str, Any],
+    project_id: str,
+    reason: str,
+    now_iso: str,
+    read_receipt_hash: str,
+) -> dict[str, Any]:
+    """Run a declared auth precursor and refresh each executable packet."""
+
+    values = _host_runtime_values(
+        guide,
+        host_identity,
+        project_id=project_id,
+        reason=reason,
+        now_iso=now_iso,
+        read_receipt_hash=read_receipt_hash,
+    )
+    precursor_tool = _text(
+        precursor_action.get("mcp_tool")
+        or precursor_action.get("tool")
+        or precursor_action.get("facade")
+    )
+    if precursor_tool not in _HOST_AUTH_TOOLS:
+        raise GuidedRuntimeDispatchError(
+            "runtime context host precursor tool is not authorized",
+            status="invalid_host_orchestration",
+        )
+    _validate_placeholder_contract(
+        (("host_precursor", precursor_template, _INITIAL_JOIN_TOOL_FIELDS),)
+    )
+    _assert_host_action_scope(
+        precursor_template, values, label="host precursor packet"
+    )
+    precursor_required = (
+        _INITIAL_REQUIRED_FIELDS
+        if precursor_tool == "runtime_context_session_token_initial_join"
+        else _HOST_AUTH_REQUIRED_FIELDS
+    )
+    precursor_body = _validated_tool_body(
+        precursor_template,
+        allowed_fields=_INITIAL_JOIN_TOOL_FIELDS,
+        replacements=values,
+        force_fields=_INITIAL_FORCE_FIELDS,
+        required_fields=precursor_required,
+    )
+    refresh_body = _onboard_refresh_body(guide)
+    raw_results: list[Any] = []
+    request_bodies: list[dict[str, Any]] = []
+    raw_values: tuple[str, ...] = ()
+    try:
+        precursor_response, failure, raw_values = _invoke_host_tool(
+            tool_caller,
+            precursor_tool,
+            precursor_body,
+            response_status="host auth precursor",
+            request_bodies=request_bodies,
+            raw_results=raw_results,
+        )
+        if failure:
+            return failure
+        session_token, fence_token, joined_session_token_ref = (
+            _single_host_auth_packet(raw_results[-1])
+        )
+        raw_values = tuple(
+            dict.fromkeys((*raw_values, session_token, fence_token))
+        )
+        protected_values = {
+            **values,
+            "session_token": session_token,
+            "fence_token": fence_token,
+            "session_token_ref": joined_session_token_ref,
+        }
+
+        receipt_action, receipt_template, raw_values, failure = (
+            _refresh_host_action_packet(
+                tool_caller=tool_caller,
+                refresh_body=refresh_body,
+                expected_tools=frozenset({"runtime_context_read_receipt"}),
+                request_bodies=request_bodies,
+                raw_results=raw_results,
+                raw_values=raw_values,
+            )
+        )
+        if failure:
+            return failure
+        _validate_placeholder_contract(
+            (("read_receipt", receipt_template, _READ_RECEIPT_TOOL_FIELDS),)
+        )
+        _assert_host_action_scope(
+            receipt_template,
+            protected_values,
+            label="read-receipt continuation packet",
+        )
+        receipt_body = _validated_tool_body(
+            receipt_template,
+            allowed_fields=_READ_RECEIPT_TOOL_FIELDS,
+            replacements=protected_values,
+            force_fields=_RECEIPT_FORCE_FIELDS,
+            required_fields=_RECEIPT_REQUIRED_FIELDS,
+        )
+        receipt_tool = _text(
+            receipt_action.get("mcp_tool") or receipt_action.get("tool")
+        )
+        receipt_response, failure, raw_values = _invoke_host_tool(
+            tool_caller,
+            receipt_tool,
+            receipt_body,
+            response_status="read receipt",
+            request_bodies=request_bodies,
+            raw_results=raw_results,
+            raw_values=raw_values,
+        )
+        if failure:
+            return failure
+        accepted_receipt_hash = _first_deep_text(
+            receipt_response, "read_receipt_hash", "receipt_hash"
+        ) or _text(protected_values.get("read_receipt_hash"))
+        accepted_receipt_event_id = _first_deep_text(
+            receipt_response,
+            "read_receipt_event_id",
+            "read_receipt_event_ref",
+            "event_id",
+        )
+        startup_values = {
+            **protected_values,
+            "read_receipt_hash": accepted_receipt_hash,
+            "receipt_hash": accepted_receipt_hash,
+            "read_receipt_event_id": accepted_receipt_event_id,
+        }
+
+        startup_action, startup_template, raw_values, failure = (
+            _refresh_host_action_packet(
+                tool_caller=tool_caller,
+                refresh_body=refresh_body,
+                expected_tools=frozenset(
+                    {"parallel_branch_startup", "runtime_context_startup"}
+                ),
+                request_bodies=request_bodies,
+                raw_results=raw_results,
+                raw_values=raw_values,
+            )
+        )
+        if failure:
+            return failure
+        _validate_placeholder_contract(
+            (("startup", startup_template, _STARTUP_TOOL_FIELDS),)
+        )
+        _assert_host_action_scope(
+            startup_template,
+            startup_values,
+            label="startup continuation packet",
+        )
+        startup_body = _validated_tool_body(
+            startup_template,
+            allowed_fields=_STARTUP_TOOL_FIELDS,
+            replacements=startup_values,
+            force_fields=_STARTUP_FORCE_FIELDS,
+            required_fields=_STARTUP_REQUIRED_FIELDS,
+        )
+        if not (
+            _text(startup_body.get("worker_transcript_ref"))
+            or _text(startup_body.get("worker_transcript_path"))
+        ):
+            raise GuidedRuntimeDispatchError(
+                "runtime context startup requires a transcript ref or path",
+                status="invalid_host_orchestration",
+            )
+        startup_tool = _text(
+            startup_action.get("mcp_tool")
+            or startup_action.get("tool")
+            or startup_action.get("legacy_tool")
+        )
+        startup_response, failure, raw_values = _invoke_host_tool(
+            tool_caller,
+            startup_tool,
+            startup_body,
+            response_status="startup",
+            request_bodies=request_bodies,
+            raw_results=raw_results,
+            raw_values=raw_values,
+        )
+        if failure:
+            return failure
+
+        public_precursor = _json_round_trip(
+            precursor_response, "host precursor response"
+        )
+        public_receipt = _json_round_trip(
+            receipt_response, "read receipt response"
+        )
+        public_startup = _json_round_trip(startup_response, "startup response")
+        for public in (public_precursor, public_receipt, public_startup):
+            scrub_host_secret_values(public, raw_values=raw_values)
+        return {
+            "schema_version": RUNTIME_CONTEXT_HOST_ORCHESTRATION_SCHEMA_VERSION,
+            "ok": True,
+            "status": "started",
+            "sequence": [
+                precursor_tool,
+                "onboard_route_guide",
+                receipt_tool,
+                "onboard_route_guide",
+                startup_tool,
+            ],
+            "session_token_ref": joined_session_token_ref,
+            "host_session_id": _text(values.get("host_session_id")),
+            "host_startup_id": _text(values.get("host_startup_id")),
+            "auth_precursor": public_precursor,
+            "read_receipt": public_receipt,
+            "startup": public_startup,
+            "guide_refreshed_after_each_transition": True,
+            "uninterrupted_same_invocation": True,
+            **_HOST_PRIVACY_FLAGS,
+        }
+    finally:
+        for request_body in request_bodies:
+            scrub_host_secret_values(request_body, raw_values=raw_values)
+        for raw_result in raw_results:
+            scrub_host_secret_values(raw_result, raw_values=raw_values)
 
 
 def orchestrate_runtime_context_host_startup(
@@ -821,6 +1331,24 @@ def orchestrate_runtime_context_host_startup(
             "runtime context worker guide could not be decoded",
             status="invalid_host_orchestration",
         ) from exc
+    precursor_packet = _host_action_packet(
+        worker_guide,
+        paths=_HOST_PRECURSOR_ACTION_PATHS,
+        expected_tools=_HOST_AUTH_TOOLS,
+    )
+    if precursor_packet is not None:
+        precursor_action, precursor_template = precursor_packet
+        return _orchestrate_refreshing_host_startup(
+            guide=guide,
+            precursor_action=precursor_action,
+            precursor_template=precursor_template,
+            tool_caller=tool_caller,
+            host_identity=_mapping(host_identity, "host runtime identity"),
+            project_id=project_id,
+            reason=reason,
+            now_iso=now_iso,
+            read_receipt_hash=read_receipt_hash,
+        )
     initial_submission, initial_template = _submission_body(
         guide, "session_token_initial_join_submission"
     )
@@ -879,45 +1407,12 @@ def orchestrate_runtime_context_host_startup(
         if failure:
             return failure
 
-        host_envelope = _first_named_mapping(
-            initial_response, "host_envelope"
-        ) or _first_named_mapping(initial_response, "worker_host_envelope")
-        environment = host_envelope.get("env")
-        if not isinstance(environment, Mapping):
-            environment = {}
-        session_token = _text(
-            environment.get("AMING_WORKER_SESSION_TOKEN")
-            or initial_response.get("session_token")
+        session_token, fence_token, joined_session_token_ref = (
+            _single_host_auth_packet(raw_results[-1])
         )
-        fence_token = _text(
-            environment.get("AMING_WORKER_FENCE_TOKEN")
-            or initial_response.get("fence_token")
+        raw_values = tuple(
+            dict.fromkeys((*raw_values, session_token, fence_token))
         )
-        raw_values = tuple(value for value in (session_token, fence_token) if value)
-        joined_session_token_ref = _first_deep_text(
-            initial_response,
-            "session_token_ref",
-            "worker_session_token_ref",
-            "safe_session_token_ref",
-        )
-        if not session_token or not fence_token or not joined_session_token_ref:
-            public = _json_round_trip(initial_response, "initial join response")
-            scrub_host_secret_values(public, raw_values=raw_values)
-            return {
-                "schema_version": RUNTIME_CONTEXT_HOST_ORCHESTRATION_SCHEMA_VERSION,
-                "ok": False,
-                "status": "initial_join_response_invalid",
-                "failed_tool": initial_tool,
-                "error": {
-                    "code": "initial_join_worker_auth_or_safe_ref_missing",
-                    "message": (
-                        "successful initial join omitted required host auth or "
-                        "copy-safe session reference"
-                    ),
-                },
-                "server_response": public,
-                **_HOST_PRIVACY_FLAGS,
-            }
 
         protected_values = {
             **values,
@@ -1366,55 +1861,18 @@ def _graph_host_auth(
 ) -> tuple[dict[str, Any], str, str, str]:
     try:
         application = unwrap_mcp_application_response(host_auth_response)
-        envelopes = mcp_application_mapping_blocks(
-            application,
-            paths=_GRAPH_HOST_ENVELOPE_PATHS,
+        session_token, fence_token, session_token_ref = (
+            _single_host_auth_packet(host_auth_response)
         )
     except ServiceError as exc:
         raise _graph_continuation_error(
             "worker host envelope could not be decoded"
         ) from exc
-    candidates: dict[tuple[str, str], dict[str, Any]] = {}
-    refs: set[str] = set()
-    for envelope in envelopes:
-        environment = envelope.get("env")
-        environment = dict(environment) if isinstance(environment, Mapping) else {}
-        session_token = _text(
-            environment.get(WORKER_AUTH_ENV_KEYS[0])
-            or envelope.get("session_token")
-        )
-        fence_token = _text(
-            environment.get(WORKER_AUTH_ENV_KEYS[1])
-            or envelope.get("fence_token")
-        )
-        if session_token and fence_token:
-            candidates[(session_token, fence_token)] = envelope
-        for field_name in (
-            "session_token_ref",
-            "worker_session_token_ref",
-            "safe_session_token_ref",
-        ):
-            value = _text(envelope.get(field_name))
-            if value:
-                refs.add(value)
-    for field_name in (
-        "session_token_ref",
-        "worker_session_token_ref",
-        "safe_session_token_ref",
-    ):
-        value = _text(application.get(field_name))
-        if value:
-            refs.add(value)
-    if len(candidates) != 1 or len(refs) != 1:
+    except GuidedRuntimeDispatchError as exc:
         raise _graph_continuation_error(
             "worker host envelope auth or rotated safe ref is ambiguous"
-        )
-    session_token, fence_token = next(iter(candidates))
-    if _PLACEHOLDER.search(session_token) or _PLACEHOLDER.search(fence_token):
-        raise _graph_continuation_error(
-            "worker host envelope contains placeholder auth"
-        )
-    return application, session_token, fence_token, next(iter(refs))
+        ) from exc
+    return application, session_token, fence_token, session_token_ref
 
 
 def orchestrate_runtime_context_graph_continuation(
