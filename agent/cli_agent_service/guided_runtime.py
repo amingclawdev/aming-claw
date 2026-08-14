@@ -75,7 +75,8 @@ _HOST_REPLACEMENT_FIELDS_BY_SOURCE = {
         """project_id worker_session_id host_session_id host_startup_id now_iso
         read_receipt_hash worker_transcript_ref worker_transcript_path filer_principal
         actor_session_principal launch_text_hash head_commit actual_cwd actual_git_root
-        harness_type agent_id actual_host_worker_id worker_id worker_slot_id""".split()
+        harness_type agent_id actual_host_worker_id worker_id worker_slot_id
+        observer_command_id""".split()
     ),
     "worker_guide": frozenset(
         """contract_execution_id contract_hash context_hash agent_id
@@ -100,7 +101,8 @@ _HOST_REPLACEMENT_FIELDS = frozenset().union(
     *_HOST_REPLACEMENT_FIELDS_BY_SOURCE.values()
 )
 _INITIAL_FORCE_FIELDS = frozenset(
-    "project_id reason worker_session_id host_session_id host_startup_id now_iso".split()
+    """project_id reason agent_id actual_host_worker_id worker_session_id
+    host_session_id host_startup_id now_iso""".split()
 )
 _INITIAL_REQUIRED_FIELDS = tuple(
     """project_id runtime_context_id task_id reason agent_id actual_host_worker_id
@@ -120,7 +122,7 @@ _STARTUP_FORCE_FIELDS = frozenset(
     actual_host_worker_id worker_session_id worker_transcript_ref
     worker_transcript_path filer_principal host_session_id host_startup_id head_commit
     read_receipt_hash read_receipt_event_id now_iso actual_cwd actual_git_root
-    harness_type""".split()
+    harness_type observer_command_id""".split()
 )
 _STARTUP_REQUIRED_FIELDS = tuple(
     """project_id runtime_context_id task_id parent_task_id session_token fence_token
@@ -442,6 +444,17 @@ def _first_deep_text(value: Any, *field_names: str) -> str:
     return _first_deep_value(value, field_names, want_mapping=False)
 
 
+def _contains_named_field(value: Any, field_name: str) -> bool:
+    if isinstance(value, Mapping):
+        return field_name in value or any(
+            _contains_named_field(nested, field_name)
+            for nested in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_named_field(nested, field_name) for nested in value)
+    return False
+
+
 def _submission_body(
     guide: Mapping[str, Any],
     submission_name: str,
@@ -553,8 +566,41 @@ def _host_runtime_values(
         guide_value = _first_deep_text(guide, field_name)
         if field_name in {"agent_id", "actual_host_worker_id", "worker_id", "worker_slot_id"}:
             # Allocation identity is authoritative; host identity belongs in
-            # worker_session_id/host_session_id.
-            values[field_name] = guide_value or values.get(field_name, "")
+            # worker_session_id/host_session_id.  A caller may repeat the
+            # allocation identity, but it cannot supply or override it.
+            supplied_value = _text(supplied.get(field_name))
+            if supplied_value and guide_value and supplied_value != guide_value:
+                raise GuidedRuntimeDispatchError(
+                    "runtime context host identity conflicts at {}".format(
+                        field_name
+                    ),
+                    status="invalid_host_orchestration",
+                )
+            values[field_name] = guide_value
+        elif field_name == "observer_command_id":
+            supplied_value = _text(supplied.get(field_name))
+            if supplied_value and _PLACEHOLDER.search(supplied_value):
+                raise GuidedRuntimeDispatchError(
+                    "runtime context host identity contains placeholder "
+                    "observer_command_id",
+                    status="invalid_host_orchestration",
+                )
+            if supplied_value and guide_value and supplied_value != guide_value:
+                raise GuidedRuntimeDispatchError(
+                    "runtime context host identity conflicts at "
+                    "observer_command_id",
+                    status="invalid_host_orchestration",
+                )
+            values[field_name] = supplied_value or guide_value
+            if (
+                _contains_named_field(guide, field_name)
+                and not values[field_name]
+            ):
+                raise GuidedRuntimeDispatchError(
+                    "runtime context host orchestration requires "
+                    "observer_command_id",
+                    status="invalid_host_orchestration",
+                )
         else:
             values[field_name] = values.get(field_name) or guide_value
     return values

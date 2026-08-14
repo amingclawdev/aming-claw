@@ -558,7 +558,8 @@ def _runtime_context_host_guide() -> dict[str, object]:
             "session_token_initial_join_submission": {
                 "mcp_tool": "runtime_context_session_token_initial_join",
                 "copy_safe_body": {
-                    # The real guide omitted this MCP-adapter-required field.
+                    # The live compatibility guide omits adapter-realized
+                    # project and allocation host identity fields here.
                     "runtime_context_id": "mfrctx-host",
                     "task_id": "host-worker",
                     "parent_task_id": "cex-host",
@@ -566,9 +567,7 @@ def _runtime_context_host_guide() -> dict[str, object]:
                     "target_project_root": "/tmp/host-worker",
                     "worker_id": "governed-worker",
                     "worker_slot_id": "governed-slot",
-                    "agent_id": "governed-worker",
                     "allocation_owner": "observer-allocation",
-                    "actual_host_worker_id": "governed-worker",
                     "worker_session_id": "<actual Desktop/Codex worker session id>",
                     "session_token_ref": "wstok-allocation-old",
                     **route,
@@ -598,6 +597,7 @@ def _runtime_context_host_guide() -> dict[str, object]:
                     "base_commit": "a" * 40,
                     "target_head_commit": "a" * 40,
                     "merge_queue_id": "mq-host",
+                    "observer_command_id": "<claimed execute_backlog_row command id>",
                     "target_project_root": "/tmp/host-worker",
                     "session_token": "<read from worker env>",
                     "session_token_ref": "wstok-allocation-old",
@@ -730,6 +730,7 @@ def test_runtime_context_host_orchestration_is_uninterrupted_and_private() -> No
         assert body["worker_session_id"] == "codex-thread-42"
         assert body["host_session_id"] == "codex-thread-42"
         assert body["host_startup_id"] == "startup-thread-42"
+        assert body["observer_command_id"] == "observer-desktop-1"
         assert body["read_receipt_event_id"] == "timeline:90210"
         assert "worker_transcript_path" not in body
         assert body["worker_transcript_ref"] == "codex:codex-thread-42"
@@ -742,9 +743,8 @@ def test_runtime_context_host_orchestration_is_uninterrupted_and_private() -> No
         tool_caller=call_tool,
         host_identity={
             "worker_session_id": "codex-thread-42",
-            "agent_id": "codex-thread-42",
-            "actual_host_worker_id": "codex-thread-42",
             "host_startup_id": "startup-thread-42",
+            "observer_command_id": "observer-desktop-1",
             "head_commit": "b" * 40,
         },
         reason="same-invocation host startup",
@@ -766,6 +766,131 @@ def test_runtime_context_host_orchestration_is_uninterrupted_and_private() -> No
     assert all(fence_token not in json.dumps(body) for body in live_bodies)
     assert call_summaries[0]["session_token_ref"] == "wstok-joined-authoritative"
     assert call_summaries[1]["session_token_ref"] == "wstok-joined-authoritative"
+
+
+@pytest.mark.parametrize("field_name", ["agent_id", "actual_host_worker_id"])
+def test_runtime_context_host_orchestration_rejects_host_identity_override(
+    field_name,
+) -> None:
+    calls = []
+
+    with pytest.raises(
+        GuidedRuntimeDispatchError,
+        match="host identity conflicts at {}".format(field_name),
+    ):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=_runtime_context_host_guide(),
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "codex-thread-42",
+                "observer_command_id": "observer-desktop-1",
+                field_name: "caller-guessed-worker",
+                "head_commit": "b" * 40,
+            },
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("guide_value", [None, "<unresolved allocation identity>"])
+def test_runtime_context_host_orchestration_requires_guide_host_identity(
+    guide_value,
+) -> None:
+    guide = _runtime_context_host_guide()
+    application = json.loads(guide["content"][0]["text"])
+    startup = application["actionable_payloads"][
+        "startup_facade_payload_skeleton"
+    ]["copy_safe_body"]
+    for field_name in ("agent_id", "actual_host_worker_id"):
+        if guide_value is None:
+            startup.pop(field_name)
+        else:
+            startup[field_name] = guide_value
+    guide["content"][0]["text"] = json.dumps(application)
+    calls = []
+
+    with pytest.raises(
+        GuidedRuntimeDispatchError,
+        match="missing agent_id, actual_host_worker_id",
+    ):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "codex-thread-42",
+                "observer_command_id": "observer-desktop-1",
+                "agent_id": "caller-guessed-worker",
+                "actual_host_worker_id": "caller-guessed-worker",
+                "head_commit": "b" * 40,
+            },
+        )
+
+    assert calls == []
+
+
+def test_runtime_context_host_orchestration_requires_declared_observer_command() -> None:
+    calls = []
+
+    with pytest.raises(
+        GuidedRuntimeDispatchError,
+        match="requires observer_command_id",
+    ):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=_runtime_context_host_guide(),
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "codex-thread-42",
+                "head_commit": "b" * 40,
+            },
+        )
+
+    assert calls == []
+
+
+def test_runtime_context_host_orchestration_rejects_observer_command_placeholder() -> None:
+    calls = []
+
+    with pytest.raises(
+        GuidedRuntimeDispatchError,
+        match="contains placeholder observer_command_id",
+    ):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=_runtime_context_host_guide(),
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "codex-thread-42",
+                "observer_command_id": "<caller observer command>",
+                "head_commit": "b" * 40,
+            },
+        )
+
+    assert calls == []
+
+
+def test_runtime_context_host_orchestration_rejects_observer_command_conflict() -> None:
+    guide = _runtime_context_host_guide()
+    application = json.loads(guide["content"][0]["text"])
+    application["actionable_payloads"]["startup_facade_payload_skeleton"][
+        "copy_safe_body"
+    ]["observer_command_id"] = "observer-guide"
+    guide["content"][0]["text"] = json.dumps(application)
+    calls = []
+
+    with pytest.raises(
+        GuidedRuntimeDispatchError,
+        match="host identity conflicts at observer_command_id",
+    ):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "codex-thread-42",
+                "observer_command_id": "observer-caller",
+                "head_commit": "b" * 40,
+            },
+        )
+
+    assert calls == []
 
 
 def test_runtime_context_host_orchestration_rejects_placeholders_before_call() -> None:
@@ -838,6 +963,7 @@ def test_runtime_context_host_orchestration_preserves_server_error_object() -> N
         },
         host_identity={
             "worker_session_id": "codex-thread-42",
+            "observer_command_id": "observer-desktop-1",
             "head_commit": "b" * 40,
         },
     )
