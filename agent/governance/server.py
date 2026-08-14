@@ -15353,6 +15353,305 @@ _MF_PARALLEL_DEFAULT_RETRY_POLICY = {
 }
 
 
+def _parallel_branch_allocate_retry_rebind_authority(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    body: Mapping[str, Any],
+    planned_context: Any | None = None,
+) -> dict[str, Any]:
+    """Prove one ordinary pre-startup retry without mutating its source lane."""
+
+    raw_attempt = body.get("attempt")
+    if raw_attempt in (None, ""):
+        return {}
+    if isinstance(raw_attempt, bool):
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_attempt_invalid",
+            "retry allocation attempt must be an integer",
+            422,
+            {"actual": raw_attempt, "writes_performed": False},
+        )
+    try:
+        requested_attempt = int(raw_attempt)
+    except (TypeError, ValueError) as exc:
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_attempt_invalid",
+            "retry allocation attempt must be an integer",
+            422,
+            {"actual": raw_attempt, "writes_performed": False},
+        ) from exc
+    if requested_attempt <= 1:
+        return {}
+    if str(body.get("stage_type") or "mf_sub").strip() != "mf_sub":
+        return {}
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    completed_lines = list(record.get("completed_lines") or [])
+    prior_candidates: list[tuple[Any, Mapping[str, Any], int]] = []
+    for line_index, line in enumerate(completed_lines):
+        if not isinstance(line, Mapping):
+            continue
+        if (
+            str(line.get("stage_id") or "").strip() != "dispatch"
+            or str(line.get("line_id") or "").strip()
+            != "observer_dispatch_bounded_workers"
+            or str(line.get("evidence_kind") or "").strip()
+            != "dispatch_bounded_worker"
+        ):
+            continue
+        contexts = _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=line,
+        )
+        for context in contexts:
+            if int(getattr(context, "attempt", 1) or 1) != requested_attempt - 1:
+                continue
+            if str(getattr(context, "backlog_id", "") or "") != str(
+                body.get("backlog_id") or ""
+            ):
+                continue
+            requested_files = _runtime_context_public_file_values(
+                _runtime_context_service_query_values(
+                    body,
+                    "owned_files",
+                    "target_files",
+                )
+            )
+            prior_files = _runtime_context_public_file_values(
+                list(getattr(context, "owned_files", ()) or ())
+                or list(getattr(context, "target_files", ()) or ())
+            )
+            if requested_files != prior_files:
+                continue
+            prior_candidates.append((context, line, line_index))
+
+    requested_prior_rctx = str(
+        body.get("retry_of_runtime_context_id") or ""
+    ).strip()
+    if requested_prior_rctx:
+        prior_candidates = [
+            candidate
+            for candidate in prior_candidates
+            if str(candidate[0].runtime_context_id or "")
+            == requested_prior_rctx
+        ]
+    if len(prior_candidates) != 1:
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_prior_context_ambiguous",
+            "retry allocation requires one exact prior dispatched worker lane",
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "attempt": requested_attempt,
+                "candidate_runtime_context_ids": sorted(
+                    {
+                        str(candidate[0].runtime_context_id or "")
+                        for candidate in prior_candidates
+                    }
+                ),
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+
+    prior_context, prior_dispatch, prior_dispatch_index = prior_candidates[0]
+    prior_runtime_context_id = str(prior_context.runtime_context_id or "").strip()
+    prior_task_id = str(prior_context.task_id or "").strip()
+    prior_worker_id = str(
+        prior_context.worker_slot_id or prior_context.worker_id or ""
+    ).strip()
+    requested_task_id = str(body.get("task_id") or "").strip()
+    requested_worker_id = str(
+        body.get("worker_slot_id") or body.get("worker_id") or ""
+    ).strip()
+    if not requested_task_id or requested_task_id == prior_task_id:
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_task_identity_invalid",
+            "retry allocation requires one fresh task identity",
+            422,
+            {
+                "prior_task_id": prior_task_id,
+                "requested_task_id": requested_task_id,
+                "writes_performed": False,
+            },
+        )
+    if not requested_worker_id or requested_worker_id == prior_worker_id:
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_worker_identity_invalid",
+            "retry allocation requires one fresh worker identity",
+            422,
+            {
+                "prior_worker_id": prior_worker_id,
+                "requested_worker_id": requested_worker_id,
+                "writes_performed": False,
+            },
+        )
+
+    prior_payload = (
+        prior_dispatch.get("payload")
+        if isinstance(prior_dispatch.get("payload"), Mapping)
+        else {}
+    )
+    retry_policy = (
+        dict(prior_payload.get("retry_policy") or {})
+        if isinstance(prior_payload.get("retry_policy"), Mapping)
+        else {}
+    )
+    try:
+        policy_attempt = int(retry_policy.get("attempt") or 1)
+        max_attempts = int(retry_policy.get("max_attempts") or 0)
+    except (TypeError, ValueError):
+        policy_attempt = 0
+        max_attempts = 0
+    if (
+        policy_attempt != int(prior_context.attempt or 1)
+        or requested_attempt != policy_attempt + 1
+        or requested_attempt > max_attempts
+    ):
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_policy_exhausted",
+            "persisted retry policy does not authorize the requested attempt",
+            409,
+            {
+                "persisted_retry_policy": retry_policy,
+                "prior_context_attempt": int(prior_context.attempt or 1),
+                "requested_attempt": requested_attempt,
+                "writes_performed": False,
+            },
+        )
+
+    timeline_refs, _startup, _finish, _close = (
+        _runtime_context_service_timeline_refs(
+            conn,
+            project_id=project_id,
+            task_id=prior_task_id,
+            backlog_id=str(prior_context.backlog_id or ""),
+            runtime_context_id=prior_runtime_context_id,
+            parent_task_id=_runtime_context_mf_sub_parent_task_id(
+                prior_context
+            ),
+        )
+    )
+    graph_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'graph_query_traces'"
+    ).fetchone()
+    graph_count = (
+        int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                  FROM graph_query_traces
+                 WHERE project_id = ? AND runtime_context_id = ?
+                """,
+                (project_id, prior_runtime_context_id),
+            ).fetchone()[0]
+        )
+        if graph_table_exists
+        else 0
+    )
+    progressed_refs = {
+        key: value
+        for key, value in {
+            "startup_event_ref": timeline_refs.get("startup_event_ref"),
+            "implementation_event_refs": timeline_refs.get(
+                "implementation_event_refs"
+            ),
+            "worker_commit_event_ref": timeline_refs.get(
+                "worker_commit_event_ref"
+            ),
+            "finish_event_ref": timeline_refs.get("finish_event_ref"),
+            "finish_attestation_event_ref": timeline_refs.get(
+                "finish_attestation_event_ref"
+            ),
+        }.items()
+        if value
+    }
+    dirty_files = _runtime_context_git_dirty_files(
+        str(prior_context.worktree_path or "")
+    )
+    if progressed_refs or graph_count or dirty_files:
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_boundary_exceeded",
+            "prior worker progressed beyond the authorized pre-startup retry boundary",
+            409,
+            {
+                "prior_runtime_context_id": prior_runtime_context_id,
+                "progressed_refs": progressed_refs,
+                "graph_query_trace_count": graph_count,
+                "dirty_files": dirty_files,
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+
+    if planned_context is not None:
+        mismatches: list[dict[str, Any]] = []
+        expected_parent = _runtime_context_mf_sub_parent_task_id(prior_context)
+        actual_parent = _runtime_context_mf_sub_parent_task_id(planned_context)
+        for field, expected, actual in (
+            ("parent_task_id", expected_parent, actual_parent),
+            ("base_commit", str(prior_context.base_commit or ""), str(planned_context.base_commit or "")),
+            ("target_head_commit", str(prior_context.target_head_commit or ""), str(planned_context.target_head_commit or "")),
+        ):
+            if expected and actual != expected:
+                mismatches.append(
+                    {"field": field, "expected": expected, "actual": actual}
+                )
+        for field in ("branch_ref", "worktree_path", "merge_queue_id"):
+            prior_value = str(getattr(prior_context, field, "") or "")
+            new_value = str(getattr(planned_context, field, "") or "")
+            if not new_value or new_value == prior_value:
+                mismatches.append(
+                    {
+                        "field": field,
+                        "expected": "fresh value distinct from prior lane",
+                        "actual": new_value,
+                    }
+                )
+        if mismatches:
+            raise GovernanceError(
+                "parallel_branch_allocate_retry_identity_mismatch",
+                "retry allocation identity does not preserve the canonical lane contract",
+                422,
+                {
+                    "field_mismatches": mismatches,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                },
+            )
+
+    authority = {
+        "schema_version": "parallel_branch_allocate.retry_rebind_authority.v1",
+        "source": "contract_runtime_dispatch+runtime_context+task_timeline+graph_query_traces",
+        "server_derived": True,
+        "contract_execution_id": contract_execution_id,
+        "prior_runtime_context_id": prior_runtime_context_id,
+        "prior_task_id": prior_task_id,
+        "prior_worker_id": prior_worker_id,
+        "prior_dispatch_completed_line_index": prior_dispatch_index,
+        "prior_attempt": policy_attempt,
+        "requested_attempt": requested_attempt,
+        "max_attempts": max_attempts,
+        "prior_read_receipt_event_ref": str(
+            timeline_refs.get("read_receipt_event_ref") or ""
+        ),
+        "prior_startup_absent": True,
+        "prior_graph_absent": True,
+        "prior_implementation_absent": True,
+        "prior_worktree_clean": True,
+        "append_only_contract_runtime_rebind_required": True,
+        "old_context_history_immutable": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _parallel_branch_allocate_require_dispatch_authority(
     body: Mapping[str, Any],
     *,
@@ -15963,6 +16262,29 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             and allocation_precheck_policy.get("declared_batch_child") is False
             and allocation_precheck_policy.get("verified_batch_child") is False
         )
+        retry_rebind_authorities: dict[str, dict[str, Any]] = {}
+        for body in copy_safe_bodies:
+            retry_authority = _parallel_branch_allocate_retry_rebind_authority(
+                conn,
+                project_id=project_id,
+                record=contract_record,
+                body=body,
+            )
+            if not retry_authority:
+                continue
+            lane_task_id = str(body.get("task_id") or "").strip()
+            retry_rebind_authorities[lane_task_id] = retry_authority
+            body["retry_of_runtime_context_id"] = str(
+                retry_authority["prior_runtime_context_id"]
+            )
+            body["retry_of_task_id"] = str(retry_authority["prior_task_id"])
+            body["retry_policy"] = {
+                "attempt": int(retry_authority["requested_attempt"]),
+                "max_attempts": int(retry_authority["max_attempts"]),
+            }
+            body["retry_allocation_rebind_authority"] = dict(
+                retry_authority
+            )
         batch_target_authority: dict[str, Any] = {}
         if declared_batch_child:
             batch_target_authority = (
@@ -16287,6 +16609,20 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                 "scope": allocation_scope,
                 "cardinality_source": cardinality_source,
             }
+            retry_authority = retry_rebind_authorities.get(
+                str(body.get("task_id") or "").strip()
+            )
+            if retry_authority:
+                body["allocation_precheck"]["retry_rebind"] = {
+                    "status": "ready",
+                    "authority_hash": retry_authority["authority_hash"],
+                    "prior_runtime_context_id": retry_authority[
+                        "prior_runtime_context_id"
+                    ],
+                    "requested_attempt": retry_authority[
+                        "requested_attempt"
+                    ],
+                }
         copy_safe_bodies.sort(key=lambda body: str(body.get("task_id") or ""))
         lane_projections.sort(
             key=lambda lane: str(lane.get("task_id") or "")
@@ -18142,6 +18478,249 @@ def _parallel_branch_allocate_failed_qa_dispatch_revision(
     }
 
 
+def _parallel_branch_allocate_retry_contract_rebind(
+    conn,
+    *,
+    project_id: str,
+    context,
+    body: Mapping[str, Any],
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append the attempt-2 dispatch and supersede attempt-1 atomically."""
+
+    if not authority:
+        return {}
+    submitted = (
+        dict(body.get("retry_allocation_rebind_authority") or {})
+        if isinstance(
+            body.get("retry_allocation_rebind_authority"), Mapping
+        )
+        else {}
+    )
+    if submitted != dict(authority):
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_authority_mismatch",
+            "retry allocation must submit the unchanged server precheck authority",
+            409,
+            {
+                "expected_authority_hash": str(
+                    authority.get("authority_hash") or ""
+                ),
+                "actual_authority_hash": str(
+                    submitted.get("authority_hash") or ""
+                ),
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+
+    from .parallel_branch_runtime import (
+        get_branch_context_by_runtime_context_id,
+        upsert_branch_context,
+    )
+
+    prior_context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        str(authority.get("prior_runtime_context_id") or ""),
+    )
+    if prior_context is None:
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_prior_context_missing",
+            "retry allocation prior RuntimeContext disappeared before rebind",
+            409,
+            {
+                "prior_runtime_context_id": str(
+                    authority.get("prior_runtime_context_id") or ""
+                ),
+                "writes_performed": False,
+            },
+        )
+
+    contract_execution_id = str(
+        authority.get("contract_execution_id") or ""
+    ).strip()
+    runtime = _contract_runtime(conn)
+    record = runtime.store.get(contract_execution_id)
+    fresh_authority = _parallel_branch_allocate_retry_rebind_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        body=body,
+        planned_context=context,
+    )
+    if fresh_authority != dict(authority):
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_authority_changed",
+            "retry allocation authority changed before the atomic write",
+            409,
+            {
+                "expected_authority_hash": str(
+                    authority.get("authority_hash") or ""
+                ),
+                "actual_authority_hash": str(
+                    fresh_authority.get("authority_hash") or ""
+                ),
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+
+    route_identity = _parallel_branch_runtime_contract_route_identity(body)
+    owned_files = _runtime_context_public_file_values(
+        list(getattr(context, "owned_files", ()) or ())
+        or list(getattr(context, "target_files", ()) or ())
+    )
+    worker_id = str(
+        getattr(context, "worker_id", "")
+        or getattr(context, "worker_slot_id", "")
+        or ""
+    ).strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "")
+        or getattr(context, "worker_id", "")
+        or ""
+    ).strip()
+    canonical = {
+        "runtime_context_id": str(context.runtime_context_id or ""),
+        "task_id": str(context.task_id or ""),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "line_instance_id": f"runtime_context:{context.runtime_context_id}",
+        "lane_id": worker_slot_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "observer_command_id": contract_execution_id,
+        "target_project_root": str(context.target_project_root or ""),
+        "worktree_path": str(context.worktree_path or ""),
+        "branch_ref": str(context.branch_ref or ""),
+        "base_commit": str(context.base_commit or ""),
+        "target_head_commit": str(context.target_head_commit or ""),
+        "merge_queue_id": str(context.merge_queue_id or ""),
+        "owned_files": owned_files,
+    }
+    retry_policy = {
+        "attempt": int(authority["requested_attempt"]),
+        "max_attempts": int(authority["max_attempts"]),
+    }
+    profile_requirements = (
+        dict(body.get("profile_requirements") or {})
+        if isinstance(body.get("profile_requirements"), Mapping)
+        else {}
+    )
+    bounded_worker = {
+        **canonical,
+        "profile_requirements": profile_requirements,
+        "retry_policy": retry_policy,
+        "route_identity": dict(route_identity),
+        **dict(route_identity),
+    }
+    payload = {
+        "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
+        **canonical,
+        "bounded_workers": [bounded_worker],
+        "worker_count": 1,
+        "required_worker_count": 1,
+        "atomic_dispatch": False,
+        "all_or_nothing": False,
+        "profile_requirements": profile_requirements,
+        "retry_policy": retry_policy,
+        "route_identity": dict(route_identity),
+        **dict(route_identity),
+        "retry_allocation_contract_rebind": {
+            **dict(authority),
+            "new_runtime_context_id": canonical["runtime_context_id"],
+            "new_task_id": canonical["task_id"],
+            "new_worker_id": worker_slot_id,
+            "append_only_history_preserved": True,
+            "logical_worker_cardinality_before": 1,
+            "logical_worker_cardinality_after": 1,
+        },
+    }
+    write = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "actor_role": "observer",
+        "evidence_kind": "dispatch_bounded_worker",
+        **canonical,
+        **dict(route_identity),
+        "payload": payload,
+    }
+    write, dispatch_errors = _contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        write=write,
+        _required_worker_count_override=1,
+    )
+    if dispatch_errors:
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_dispatch_invalid",
+            "retry allocation could not bind the canonical replacement dispatch",
+            422,
+            {
+                "errors": dispatch_errors,
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+    completed_lines = list(record.get("completed_lines") or [])
+    written_line = _line_evidence_from_write(write, "observer")
+    expected_revision = int(record.get("execution_state_revision") or 1)
+    candidate = dict(record)
+    candidate["completed_lines"] = [*completed_lines, written_line]
+    candidate["execution_state_revision"] = expected_revision + 1
+    prepared = runtime._record_view(
+        candidate,
+        actor_role="observer",
+        completed_lines=candidate["completed_lines"],
+    )
+    runtime.store.update(
+        contract_execution_id,
+        prepared,
+        expected_revision=expected_revision,
+    )
+
+    superseded = replace(
+        prior_context,
+        status="superseded",
+        last_recovery_action=(
+            "superseded_by_retry_allocation:"
+            + str(context.runtime_context_id or "")
+        ),
+    )
+    upsert_branch_context(conn, superseded)
+    stored = runtime.store.get(contract_execution_id)
+    dispatch_match = _contract_runtime_dispatch_line_match(stored, context)
+    if not dispatch_match:
+        raise GovernanceError(
+            "parallel_branch_allocate_retry_dispatch_unbound",
+            "persisted retry dispatch did not become the canonical worker lane",
+            409,
+            {
+                "runtime_context_id": str(context.runtime_context_id or ""),
+                "task_id": str(context.task_id or ""),
+            },
+        )
+    return {
+        "schema_version": "parallel_branch_allocate.retry_contract_rebind.v1",
+        "status": "rebound",
+        "contract_execution_id": contract_execution_id,
+        "prior_runtime_context_id": str(prior_context.runtime_context_id or ""),
+        "runtime_context_id": str(context.runtime_context_id or ""),
+        "task_id": str(context.task_id or ""),
+        "attempt": int(authority["requested_attempt"]),
+        "authority_hash": str(authority["authority_hash"]),
+        "source_ref": str(dispatch_match.get("source_ref") or ""),
+        "execution_state_revision": int(
+            stored.get("execution_state_revision") or 0
+        ),
+        "append_only_history_preserved": True,
+        "old_context_status": "superseded",
+        "logical_worker_cardinality": 1,
+    }
+
+
 def _parallel_branch_allocate_reject_merged_same_task_failed_qa_rework(
     conn,
     *,
@@ -18774,6 +19353,74 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         ctx.body,
         worktree_root=worktree_root,
     )
+    if int(context.attempt or 1) > 1:
+        existing_retry = conn.execute(
+            """
+            SELECT runtime_context_id, attempt
+              FROM parallel_branch_runtime_contexts
+             WHERE project_id = ? AND task_id = ?
+            """,
+            (project_id, task_id),
+        ).fetchone()
+        if (
+            existing_retry is not None
+            and int(_row_get(existing_retry, "attempt", 1) or 1)
+            == int(context.attempt or 1)
+        ):
+            raise GovernanceError(
+                "parallel_branch_allocate_retry_duplicate",
+                "the requested retry attempt already has a RuntimeContext",
+                409,
+                {
+                    "runtime_context_id": str(
+                        _row_get(
+                            existing_retry,
+                            "runtime_context_id",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "task_id": task_id,
+                    "attempt": int(context.attempt or 1),
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                },
+            )
+    retry_rebind_authority: dict[str, Any] = {}
+    if int(context.attempt or 1) > 1 and rev8_allocation_record:
+        retry_rebind_authority = (
+            _parallel_branch_allocate_retry_rebind_authority(
+                conn,
+                project_id=project_id,
+                record=rev8_allocation_record,
+                body=effective_body,
+                planned_context=context,
+            )
+        )
+        submitted_retry_authority = (
+            dict(effective_body.get("retry_allocation_rebind_authority") or {})
+            if isinstance(
+                effective_body.get("retry_allocation_rebind_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        if submitted_retry_authority != retry_rebind_authority:
+            raise GovernanceError(
+                "parallel_branch_allocate_retry_authority_mismatch",
+                "retry allocation must submit the unchanged server precheck authority",
+                409,
+                {
+                    "expected_authority_hash": str(
+                        retry_rebind_authority.get("authority_hash") or ""
+                    ),
+                    "actual_authority_hash": str(
+                        submitted_retry_authority.get("authority_hash") or ""
+                    ),
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                },
+            )
     create_worktree = _query_bool(ctx.body, "create_worktree", False)
     branch_mismatch = _parallel_branch_allocate_worktree_branch_mismatch(
         context=context,
@@ -18798,6 +19445,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     authority_revision: dict[str, Any] = {}
     runtime_contract_revision: dict[str, Any] = {}
     contract_runtime_dispatch_revision: dict[str, Any] = {}
+    contract_runtime_retry_rebind: dict[str, Any] = {}
     route_identity_for_revision: dict[str, Any] = {}
     owned_files_for_revision: list[str] = []
     acceptance_scope_criteria: list[Any] = []
@@ -19170,6 +19818,17 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     body=effective_body,
                 )
             )
+            contract_runtime_retry_rebind = (
+                _parallel_branch_allocate_retry_contract_rebind(
+                    conn,
+                    project_id=project_id,
+                    context=saved,
+                    body=effective_body,
+                    authority=retry_rebind_authority,
+                )
+                if retry_rebind_authority
+                else {}
+            )
 
             if should_issue_same_owner_session_token:
                 same_owner_worker_session = issue_mf_subagent_session_token(
@@ -19264,6 +19923,10 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         if contract_runtime_dispatch_revision:
             response["contract_runtime_dispatch_revision"] = (
                 contract_runtime_dispatch_revision
+            )
+        if contract_runtime_retry_rebind:
+            response["contract_runtime_retry_rebind"] = (
+                contract_runtime_retry_rebind
             )
         if authority_revision:
             response["authority_revision"] = authority_revision
@@ -95271,9 +95934,72 @@ def _contract_runtime_mf_parallel_context_projection(
         for line in (record.get("completed_lines") or [])
         if isinstance(line, Mapping)
     ]
+    retry_rebind_superseded_indices: set[int] = set()
+    retry_rebind_markers: list[dict[str, Any]] = []
+    for line_index, line in enumerate(completed_lines):
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        marker = (
+            payload.get("retry_allocation_contract_rebind")
+            if isinstance(
+                payload.get("retry_allocation_contract_rebind"), Mapping
+            )
+            else {}
+        )
+        if not marker:
+            continue
+        prior_index = marker.get("prior_dispatch_completed_line_index")
+        prior_runtime_context_id = str(
+            marker.get("prior_runtime_context_id") or ""
+        ).strip()
+        prior_task_id = str(marker.get("prior_task_id") or "").strip()
+        if (
+            marker.get("server_derived") is not True
+            or not isinstance(prior_index, int)
+            or isinstance(prior_index, bool)
+            or prior_index < 0
+            or prior_index >= line_index
+            or not prior_runtime_context_id
+            or not prior_task_id
+            or str(line.get("runtime_context_id") or "").strip()
+            != str(marker.get("new_runtime_context_id") or "").strip()
+            or str(line.get("task_id") or "").strip()
+            != str(marker.get("new_task_id") or "").strip()
+        ):
+            continue
+        retry_rebind_superseded_indices.add(prior_index)
+        for candidate_index, candidate in enumerate(completed_lines):
+            if candidate_index >= line_index:
+                break
+            if str(candidate.get("actor_role") or "").strip() != "mf_sub":
+                continue
+            if (
+                str(candidate.get("runtime_context_id") or "").strip()
+                == prior_runtime_context_id
+                and str(candidate.get("task_id") or "").strip()
+                == prior_task_id
+            ):
+                retry_rebind_superseded_indices.add(candidate_index)
+        retry_rebind_markers.append(
+            {
+                "prior_runtime_context_id": prior_runtime_context_id,
+                "prior_task_id": prior_task_id,
+                "runtime_context_id": str(
+                    marker.get("new_runtime_context_id") or ""
+                ),
+                "task_id": str(marker.get("new_task_id") or ""),
+                "prior_dispatch_completed_line_index": prior_index,
+                "replacement_dispatch_completed_line_index": line_index,
+                "authority_hash": str(marker.get("authority_hash") or ""),
+            }
+        )
     dispatch_lines = [
         line
-        for line in completed_lines
+        for index, line in enumerate(completed_lines)
+        if index not in retry_rebind_superseded_indices
         if str(line.get("stage_id") or "").strip() == "dispatch"
         and str(line.get("line_id") or "").strip()
         == "observer_dispatch_bounded_workers"
@@ -95454,6 +96180,7 @@ def _contract_runtime_mf_parallel_context_projection(
         and not persisted_revision_resets
         and not authoritative_qa_superseded_indices
         and not terminal_audit_only_contexts
+        and not retry_rebind_markers
     ):
         return {}
     superseded_line_indices = {
@@ -95462,6 +96189,7 @@ def _contract_runtime_mf_parallel_context_projection(
         if item.get("status") == "eligible"
         and isinstance(item.get("superseded_completed_line_index"), int)
     }
+    superseded_line_indices.update(retry_rebind_superseded_indices)
     for item in same_lane_recoveries:
         if item.get("status") != "eligible":
             continue
@@ -95546,6 +96274,11 @@ def _contract_runtime_mf_parallel_context_projection(
             sorted(authoritative_qa_superseded_indices)
         )
         projection["authoritative_qa_append_only_history_preserved"] = True
+    if retry_rebind_markers:
+        projection["retry_allocation_contract_rebinds"] = retry_rebind_markers
+        projection["retry_allocation_append_only_history_preserved"] = True
+        if not projected_lines and not identity_mismatch:
+            projection["status"] = "retry_allocation_contract_rebind"
     return projection
 
 

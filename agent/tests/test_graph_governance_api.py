@@ -23472,6 +23472,521 @@ def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_si
     assert Path(allocated["context"]["worktree_path"]).exists()
 
 
+def _setup_parallel_retry_allocation_rebind_case(
+    conn,
+    tmp_path,
+    monkeypatch,
+    *,
+    suffix: str,
+) -> dict[str, Any]:
+    backlog_id = f"AC-ALLOCATE-RETRY-REBIND-{suffix.upper()}"
+    repository_root = tmp_path / f"retry-rebind-{suffix}"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    row_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?, acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps([row_files[0]]),
+            json.dumps([row_files[1]]),
+            json.dumps(
+                [
+                    {
+                        "id": f"AC-RETRY-REBIND-{suffix}",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": row_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    contract_execution_id = _enter_standalone_mf_parallel_for_allocation_precheck(
+        conn,
+        backlog_id=backlog_id,
+        task_id=f"retry-rebind-parent-{suffix}",
+        owned_files=row_files,
+        suffix=f"retry-rebind-{suffix}",
+        required_worker_count=1,
+    )
+    prior_task_id = f"retry-rebind-prior-{suffix}"
+    prior_worker_id = f"retry-rebind-prior-slot-{suffix}"
+    prior_route_token_ref = f"rtok-retry-rebind-prior-{suffix}"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=prior_route_token_ref,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        target_files=row_files,
+    )
+    prior_precheck = (
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "base_commit": candidate_commit,
+                    "target_head_commit": candidate_commit,
+                    "expected_lane_count": 1,
+                    "expected_worker_count": 1,
+                    "lanes": [
+                        {
+                            "task_id": prior_task_id,
+                            "backlog_id": backlog_id,
+                            "contract_execution_id": contract_execution_id,
+                            "worker_id": prior_worker_id,
+                            "worker_slot_id": prior_worker_id,
+                            "route_token_ref": prior_route_token_ref,
+                            "owned_files": row_files,
+                        }
+                    ],
+                },
+            )
+        )
+    )
+    status, prior_allocation = (
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=prior_precheck["copy_safe_allocation_bodies"][0],
+            )
+        )
+    )
+    assert status == 201
+    prior_context = get_branch_context(conn, PID, prior_task_id)
+    assert prior_context is not None
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            "observer",
+            method="GET",
+        )
+    )
+    if current["next_legal_action"]["line_id"] == (
+        "observer_prefill_child_contracts"
+    ):
+        prefill_body = current["next_legal_action"][
+            "writer_role_safe_copy_payload"
+        ]["copy_payload"]
+        prefilled = server.handle_project_contract_runtime_line_write(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": contract_execution_id,
+                },
+                "observer",
+                method="POST",
+                body=prefill_body,
+            )
+        )
+        assert prefilled["ok"] is True
+        current = server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": contract_execution_id,
+                },
+                "observer",
+                method="GET",
+            )
+        )
+    assert current["next_legal_action"]["line_id"] == (
+        "observer_dispatch_bounded_workers"
+    )
+    dispatch_body = current["next_legal_action"][
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]
+    dispatched = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            "observer",
+            method="POST",
+            body=dispatch_body,
+        )
+    )
+    assert dispatched["ok"] is True
+    assert prior_allocation["context"]["runtime_context_id"] == (
+        prior_context.runtime_context_id
+    )
+    dispatch_record = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    assert server._contract_runtime_dispatch_line_match(
+        dispatch_record,
+        prior_context,
+    )
+    route_token_ref = f"rtok-retry-rebind-{suffix}"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        target_files=row_files,
+    )
+    conn.commit()
+    return {
+        "backlog_id": backlog_id,
+        "candidate_commit": candidate_commit,
+        "contract_execution_id": contract_execution_id,
+        "prior_context": prior_context,
+        "repository_root": repository_root,
+        "route_token_ref": route_token_ref,
+        "row_files": row_files,
+        "task_id": f"retry-rebind-worker-{suffix}",
+        "worker_id": f"retry-rebind-slot-{suffix}",
+    }
+
+
+def _parallel_retry_allocation_precheck(case: Mapping[str, Any]) -> dict[str, Any]:
+    return server.handle_graph_governance_parallel_branch_allocate_precheck(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "base_commit": case["candidate_commit"],
+                "target_head_commit": case["candidate_commit"],
+                "expected_lane_count": 1,
+                "expected_worker_count": 1,
+                "lanes": [
+                    {
+                        "task_id": case["task_id"],
+                        "backlog_id": case["backlog_id"],
+                        "contract_execution_id": case[
+                            "contract_execution_id"
+                        ],
+                        "worker_id": case["worker_id"],
+                        "worker_slot_id": case["worker_id"],
+                        "route_token_ref": case["route_token_ref"],
+                        "owned_files": case["row_files"],
+                        "attempt": 2,
+                        "retry_of_runtime_context_id": case[
+                            "prior_context"
+                        ].runtime_context_id,
+                    }
+                ],
+            },
+        )
+    )
+
+
+def test_parallel_branch_allocate_retry_rebinds_contract_runtime_atomically(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    case = _setup_parallel_retry_allocation_rebind_case(
+        conn,
+        tmp_path,
+        monkeypatch,
+        suffix="positive",
+    )
+    prior_context = case["prior_context"]
+    prior_snapshot = {
+        field: getattr(prior_context, field)
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "worker_id",
+            "worker_slot_id",
+            "branch_ref",
+            "worktree_path",
+            "merge_queue_id",
+            "base_commit",
+            "target_head_commit",
+            "owned_files",
+        )
+    }
+    before_precheck = "\n".join(conn.iterdump())
+    before_precheck_changes = conn.total_changes
+
+    prechecked = _parallel_retry_allocation_precheck(case)
+
+    assert prechecked["status"] == "ready"
+    assert conn.total_changes == before_precheck_changes
+    assert "\n".join(conn.iterdump()) == before_precheck
+    copy_body = prechecked["copy_safe_allocation_bodies"][0]
+    authority = copy_body["retry_allocation_rebind_authority"]
+    assert authority["server_derived"] is True
+    assert authority["prior_runtime_context_id"] == (
+        prior_context.runtime_context_id
+    )
+    assert authority["prior_attempt"] == 1
+    assert authority["requested_attempt"] == 2
+    assert authority["max_attempts"] == 2
+    assert authority["prior_startup_absent"] is True
+    assert authority["prior_graph_absent"] is True
+    assert copy_body["retry_policy"] == {"attempt": 2, "max_attempts": 2}
+    assert copy_body["allocation_precheck"]["retry_rebind"]["status"] == (
+        "ready"
+    )
+
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=copy_body,
+        )
+    )
+
+    assert status == 201
+    assert allocated["contract_runtime_retry_rebind"]["status"] == "rebound"
+    assert allocated["contract_runtime_retry_rebind"][
+        "prior_runtime_context_id"
+    ] == prior_context.runtime_context_id
+    assert allocated["contract_runtime_retry_rebind"][
+        "logical_worker_cardinality"
+    ] == 1
+    new_context = get_branch_context(conn, PID, case["task_id"])
+    assert new_context is not None
+    assert new_context.attempt == 2
+    assert new_context.runtime_context_id != prior_context.runtime_context_id
+    stored_prior = get_branch_context(
+        conn,
+        PID,
+        prior_context.task_id,
+    )
+    assert stored_prior is not None
+    assert stored_prior.status == "superseded"
+    assert stored_prior.last_recovery_action == (
+        f"superseded_by_retry_allocation:{new_context.runtime_context_id}"
+    )
+    assert {
+        field: getattr(stored_prior, field) for field in prior_snapshot
+    } == prior_snapshot
+
+    record = server._contract_runtime_store(conn).get(
+        case["contract_execution_id"]
+    )
+    dispatches = [
+        line
+        for line in record["completed_lines"]
+        if line["line_id"] == "observer_dispatch_bounded_workers"
+    ]
+    assert len(dispatches) == 2
+    marker = dispatches[-1]["payload"][
+        "retry_allocation_contract_rebind"
+    ]
+    assert marker["prior_runtime_context_id"] == (
+        prior_context.runtime_context_id
+    )
+    assert marker["new_runtime_context_id"] == new_context.runtime_context_id
+    assert marker["logical_worker_cardinality_before"] == 1
+    assert marker["logical_worker_cardinality_after"] == 1
+
+    projected, projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=record,
+            actor_role="mf_sub",
+        )
+    )
+    projected_dispatches = [
+        line
+        for line in projected["completed_lines"]
+        if line["line_id"] == "observer_dispatch_bounded_workers"
+    ]
+    assert len(projected_dispatches) == 1
+    assert projected_dispatches[0]["runtime_context_id"] == (
+        new_context.runtime_context_id
+    )
+    assert projection["retry_allocation_append_only_history_preserved"] is True
+    assert projected["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+
+
+def test_parallel_branch_allocate_retry_rejects_identical_attempt_two_replay(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    case = _setup_parallel_retry_allocation_rebind_case(
+        conn,
+        tmp_path,
+        monkeypatch,
+        suffix="duplicate-replay",
+    )
+    copy_body = _parallel_retry_allocation_precheck(case)[
+        "copy_safe_allocation_bodies"
+    ][0]
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=copy_body,
+        )
+    )
+    assert status == 201
+    assert allocated["contract_runtime_retry_rebind"]["status"] == "rebound"
+    before = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+    worktrees_root = case["repository_root"] / ".worktrees"
+    before_worktrees = sorted(path.name for path in worktrees_root.iterdir())
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=copy_body,
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_retry_duplicate"
+    )
+    assert rejected.value.details["runtime_context_id"] == (
+        allocated["context"]["runtime_context_id"]
+    )
+    assert rejected.value.details["attempt"] == 2
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["mutation_performed"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before
+    assert sorted(path.name for path in worktrees_root.iterdir()) == (
+        before_worktrees
+    )
+
+
+@pytest.mark.parametrize("progress_kind", ["startup", "graph"])
+def test_parallel_branch_allocate_retry_rejects_progressed_prior_lane_zero_write(
+    conn,
+    tmp_path,
+    monkeypatch,
+    progress_kind,
+):
+    case = _setup_parallel_retry_allocation_rebind_case(
+        conn,
+        tmp_path,
+        monkeypatch,
+        suffix=f"progressed-{progress_kind}",
+    )
+    prior_context = case["prior_context"]
+    if progress_kind == "startup":
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            task_id=prior_context.task_id,
+            backlog_id=case["backlog_id"],
+            event_type="mf_subagent.startup",
+            event_kind="mf_subagent_startup",
+            phase="startup_gate",
+            status="passed",
+            actor="mf_sub",
+            payload={
+                "runtime_context_id": prior_context.runtime_context_id,
+                "task_id": prior_context.task_id,
+                "parent_task_id": case["contract_execution_id"],
+            },
+        )
+    else:
+        _insert_mf_sub_graph_query_trace(
+            conn,
+            trace_id=f"gqt-retry-rebind-{progress_kind}",
+            parent_task_id=case["contract_execution_id"],
+            runtime_context_id=prior_context.runtime_context_id,
+            task_id=prior_context.task_id,
+            worker_role="mf_sub",
+            fence_token=prior_context.fence_token,
+            run_id=_mf_sub_run_id(
+                prior_context.task_id,
+                prior_context.fence_token,
+            ),
+        )
+        conn.commit()
+    before = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+    worktrees_root = case["repository_root"] / ".worktrees"
+    before_worktrees = sorted(path.name for path in worktrees_root.iterdir())
+
+    with pytest.raises(GovernanceError) as rejected:
+        _parallel_retry_allocation_precheck(case)
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_retry_boundary_exceeded"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["mutation_performed"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before
+    assert sorted(path.name for path in worktrees_root.iterdir()) == (
+        before_worktrees
+    )
+
+
+def test_parallel_branch_allocate_retry_rejects_tampered_authority_before_write(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    case = _setup_parallel_retry_allocation_rebind_case(
+        conn,
+        tmp_path,
+        monkeypatch,
+        suffix="tampered-authority",
+    )
+    copy_body = _parallel_retry_allocation_precheck(case)[
+        "copy_safe_allocation_bodies"
+    ][0]
+    copy_body["retry_allocation_rebind_authority"]["authority_hash"] = (
+        _fake_sha("caller-tampered-retry-authority")
+    )
+    before = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+    worktrees_root = case["repository_root"] / ".worktrees"
+    before_worktrees = sorted(path.name for path in worktrees_root.iterdir())
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=copy_body,
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_retry_authority_mismatch"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["mutation_performed"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before
+    assert sorted(path.name for path in worktrees_root.iterdir()) == (
+        before_worktrees
+    )
+
+
 def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
     conn,
     tmp_path,
