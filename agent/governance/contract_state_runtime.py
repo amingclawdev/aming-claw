@@ -4814,6 +4814,18 @@ def _ticket_launch_identity(value: Mapping[str, Any] | None) -> dict[str, Any]:
             source.get("owned_files") or source.get("target_files")
         ),
     }
+    contract_runtime_observer_command_id = _ticket_public_text(
+        source.get("contract_runtime_observer_command_id")
+    )
+    if contract_runtime_observer_command_id:
+        identity["contract_runtime_observer_command_id"] = (
+            contract_runtime_observer_command_id
+        )
+    claimed_observer_command_id = _ticket_public_text(
+        source.get("claimed_observer_command_id")
+    )
+    if claimed_observer_command_id:
+        identity["claimed_observer_command_id"] = claimed_observer_command_id
     for field in _CLI_AGENT_TICKET_ROUTE_FIELDS:
         identity[field] = _ticket_public_text(source.get(field))
     return identity
@@ -4858,6 +4870,10 @@ def _ticket_authority_mismatches(
         "merge_queue_id": action.get("merge_queue_id"),
         **{field: action.get(field) for field in _CLI_AGENT_TICKET_ROUTE_FIELDS},
     }
+    if launch.get("contract_runtime_observer_command_id"):
+        comparisons["contract_runtime_observer_command_id"] = action.get(
+            "observer_command_id"
+        )
     for field, expected in comparisons.items():
         expected_text = _ticket_public_text(expected)
         actual_text = _ticket_public_text(launch.get(field))
@@ -5008,6 +5024,18 @@ def build_cli_agent_execution_ticket(
         errors.append("stale dispatch_identity_hash")
     if mismatches:
         errors.append("launch identity does not match current ContractRuntime action")
+    if launch.get("claimed_observer_command_id") and not launch.get(
+        "contract_runtime_observer_command_id"
+    ):
+        errors.append(
+            "claimed observer command requires explicit ContractRuntime dispatch identity"
+        )
+    if launch.get("claimed_observer_command_id") and not action.get(
+        "observer_command_id"
+    ):
+        errors.append(
+            "current ContractRuntime action is missing observer dispatch identity"
+        )
     if profile_requirements and requested_profile != profile:
         errors.append("profile requirements do not match current ContractRuntime action")
     if retry_policy and requested_retry != retry:

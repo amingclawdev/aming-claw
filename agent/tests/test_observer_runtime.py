@@ -344,7 +344,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
                     "task_id": "task-a1",
                     "worker_id": "worker-a1",
                     "worker_slot_id": "worker-a1",
-                    "observer_command_id": "cmd-a1",
+                    "observer_command_id": "cex-runtime-text-a1",
                     "parent_task_id": "AC-RUNTIME-TEXT-A1",
                     "worker_role": "mf_sub",
                     "target_project_root": str(main),
@@ -382,6 +382,15 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     assert prepared["status"] == "prepared"
     assert prepared["runtime_context_id"] == "mfrctx-runtime-text-a1"
     assert prepared["observer_command_id"] == "cmd-a1"
+    assert prepared["observer_command_identity"] == {
+        "schema_version": "observer_runtime_text.command_identity.v1",
+        "claimed_observer_command_id": "cmd-a1",
+        "claimed_identity_role": "observer_command_queue_claim",
+        "contract_runtime_observer_command_id": "cex-runtime-text-a1",
+        "contract_runtime_identity_role": "contract_runtime_dispatch",
+        "identity_equality_required": False,
+        "both_present": True,
+    }
     assert prepared["route_identity"] == {
         "route_id": "route-a1",
         "route_context_hash": "sha256:route-a1",
@@ -403,7 +412,13 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     assert ticket["dispatch_identity"]["worktree_path"] == str(worktree)
     assert ticket["dispatch_identity"]["worker_id"] == "worker-a1"
     assert ticket["dispatch_identity"]["worker_slot_id"] == "worker-a1"
-    assert ticket["dispatch_identity"]["observer_command_id"] == "cmd-a1"
+    assert ticket["dispatch_identity"]["observer_command_id"] == (
+        "cex-runtime-text-a1"
+    )
+    assert ticket["dispatch_identity"][
+        "contract_runtime_observer_command_id"
+    ] == "cex-runtime-text-a1"
+    assert ticket["dispatch_identity"]["claimed_observer_command_id"] == "cmd-a1"
     assert ticket["profile_requirements"]["profile_id"] == "inherited-current"
     assert prepared["worker_launch_pack"]["execution_ticket"] == ticket
     assert prepared["worker_launch_pack"]["target_project_root"] == str(main)
@@ -413,7 +428,7 @@ def test_runtime_text_prepare_accepts_supplied_registered_allocation_evidence(tm
     ]
     assert admission_request["worker_id"] == "worker-a1"
     assert admission_request["worker_slot_id"] == "worker-a1"
-    assert admission_request["observer_command_id"] == "cmd-a1"
+    assert admission_request["observer_command_id"] == "cex-runtime-text-a1"
     assert admission_request["expected_dispatch_identity_hash"] == ticket[
         "dispatch_identity_hash"
     ]

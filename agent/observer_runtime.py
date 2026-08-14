@@ -2695,6 +2695,51 @@ def _runtime_text_observer_command_id(
     ).strip()
 
 
+def _runtime_text_contract_runtime_observer_command_id(
+    request: ObserverRuntimeTextPrepareRequest,
+) -> str:
+    """Resolve the canonical dispatch identity separately from the queue claim."""
+
+    source = (
+        request.contract_runtime_current_state
+        if isinstance(request.contract_runtime_current_state, Mapping)
+        else {}
+    )
+    nested = source.get("contract_runtime_current_state")
+    if isinstance(nested, Mapping):
+        source = nested
+    action = (
+        source.get("next_legal_action")
+        if isinstance(source.get("next_legal_action"), Mapping)
+        else {}
+    )
+    return str(action.get("observer_command_id") or "").strip()
+
+
+def _runtime_text_observer_command_identity(
+    request: ObserverRuntimeTextPrepareRequest,
+    *,
+    claimed_observer_command_id: str,
+) -> dict[str, Any]:
+    contract_runtime_observer_command_id = (
+        _runtime_text_contract_runtime_observer_command_id(request)
+    )
+    return {
+        "schema_version": "observer_runtime_text.command_identity.v1",
+        "claimed_observer_command_id": claimed_observer_command_id,
+        "claimed_identity_role": "observer_command_queue_claim",
+        "contract_runtime_observer_command_id": (
+            contract_runtime_observer_command_id
+        ),
+        "contract_runtime_identity_role": "contract_runtime_dispatch",
+        "identity_equality_required": False,
+        "both_present": bool(
+            claimed_observer_command_id
+            and contract_runtime_observer_command_id
+        ),
+    }
+
+
 def _runtime_text_observer_command_requirement(
     *,
     observer_command_id: str,
@@ -5077,6 +5122,10 @@ def _runtime_text_worker_launch_pack(
     launch_text_hash: str,
     runtime_context_worker_envelope_claim: Mapping[str, Any],
 ) -> dict[str, Any]:
+    observer_command_identity = _runtime_text_observer_command_identity(
+        request,
+        claimed_observer_command_id=observer_command_id,
+    )
     target_project_root = str(
         request.target_project_root
         or getattr(context, "target_project_root", "")
@@ -5558,7 +5607,19 @@ def _runtime_text_worker_launch_pack(
                 "task_id": context.task_id,
                 "worker_id": dispatch_worker_id,
                 "worker_slot_id": dispatch_worker_slot_id,
-                "observer_command_id": observer_command_id,
+                "observer_command_id": str(
+                    observer_command_identity.get(
+                        "contract_runtime_observer_command_id"
+                    )
+                    or observer_command_id
+                ),
+                "contract_runtime_observer_command_id": str(
+                    observer_command_identity.get(
+                        "contract_runtime_observer_command_id"
+                    )
+                    or ""
+                ),
+                "claimed_observer_command_id": observer_command_id,
                 "parent_task_id": parent_task_id,
                 "runtime_context_id": runtime_context_id,
                 "worker_role": "mf_sub",
@@ -5616,6 +5677,7 @@ def _runtime_text_worker_launch_pack(
         "task_id": context.task_id,
         "runtime_context_id": runtime_context_id,
         "observer_command_id": observer_command_id,
+        "observer_command_identity": observer_command_identity,
         "parent_task_id": parent_task_id,
         "route_id": request.route_id,
         "route_context_hash": request.route.route_context_hash,
@@ -7123,6 +7185,10 @@ def build_observer_runtime_text_context(
         request,
         branch_runtime_evidence=hydrated_branch_runtime_evidence,
     )
+    observer_command_identity = _runtime_text_observer_command_identity(
+        request,
+        claimed_observer_command_id=observer_command_id,
+    )
     observer_command_requirement = _runtime_text_observer_command_requirement(
         observer_command_id=observer_command_id,
         backlog_id=request.backlog_id,
@@ -7228,6 +7294,7 @@ def build_observer_runtime_text_context(
         "target_project_root": request.target_project_root,
         "backlog_id": request.backlog_id,
         "observer_command_id": observer_command_id,
+        "observer_command_identity": observer_command_identity,
         "observer_command_requirement": observer_command_requirement,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
@@ -7398,6 +7465,7 @@ def build_observer_runtime_text_context(
         "schema_version": OBSERVER_RUNTIME_TEXT_SCHEMA_VERSION,
         "runtime_context_id": runtime_context_id,
         "observer_command_id": observer_command_id,
+        "observer_command_identity": observer_command_identity,
         "observer_command_requirement": observer_command_requirement,
         "runtime_context_projection": runtime_context_projection,
         "runtime_context_projection_diagnostics": runtime_context_projection_diagnostics,
@@ -7781,6 +7849,7 @@ def build_observer_runtime_text_context(
         "backlog_id": request.backlog_id,
         "runtime_context_id": runtime_context_id,
         "observer_command_id": observer_command_id,
+        "observer_command_identity": observer_command_identity,
         "observer_command_requirement": observer_command_requirement,
         "launch_text": launch_text,
         "launch_text_hash": launch_text_hash,
@@ -7788,6 +7857,7 @@ def build_observer_runtime_text_context(
         "persistent_evidence": {
             "runtime_context_id": runtime_context_id,
             "observer_command_id": observer_command_id,
+            "observer_command_identity": observer_command_identity,
             "observer_command_requirement": observer_command_requirement,
             "launch_text_hash": launch_text_hash,
             "raw_launch_text_persisted": False,

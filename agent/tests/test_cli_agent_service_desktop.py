@@ -425,6 +425,62 @@ def test_ticket_hash_binds_complete_dispatch_identity(field, replacement) -> Non
     assert field in {item["field"] for item in rejected["mismatches"]}
 
 
+def test_ticket_binds_distinct_queue_claim_and_contract_runtime_dispatch_identity() -> None:
+    inputs = _ticket_inputs()
+    authority = deepcopy(inputs["contract_runtime_current_state"])
+    launch = deepcopy(inputs["launch_identity"])
+    authority["next_legal_action"]["observer_command_id"] = "cex-desktop"
+    launch.update(
+        {
+            "observer_command_id": "cex-desktop",
+            "contract_runtime_observer_command_id": "cex-desktop",
+            "claimed_observer_command_id": "cmd-desktop-claimed",
+        }
+    )
+
+    ticket = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=authority,
+        launch_identity=launch,
+        profile_requirements=inputs["profile_requirements"],
+        retry_policy=inputs["retry_policy"],
+    )
+
+    assert ticket["status"] == "issued"
+    assert ticket["dispatch_identity"]["observer_command_id"] == "cex-desktop"
+    assert ticket["dispatch_identity"][
+        "contract_runtime_observer_command_id"
+    ] == "cex-desktop"
+    assert ticket["dispatch_identity"][
+        "claimed_observer_command_id"
+    ] == "cmd-desktop-claimed"
+
+    rejected = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=authority,
+        launch_identity={
+            **launch,
+            "contract_runtime_observer_command_id": "cex-other",
+        },
+    )
+    assert rejected["status"] == "rejected"
+    assert "contract_runtime_observer_command_id" in {
+        item["field"] for item in rejected["mismatches"]
+    }
+
+    missing_contract_identity = build_cli_agent_execution_ticket(
+        contract_runtime_current_state=authority,
+        launch_identity={
+            key: value
+            for key, value in launch.items()
+            if key != "contract_runtime_observer_command_id"
+        },
+    )
+    assert missing_contract_identity["status"] == "rejected"
+    assert (
+        "claimed observer command requires explicit ContractRuntime dispatch identity"
+        in missing_contract_identity["errors"]
+    )
+
+
 def test_ack_and_join_races_remain_atomic_and_idempotent() -> None:
     adapter = CodexDesktopAdapter()
     for host_id in ("desktop-host-1", "desktop-host-2"):
