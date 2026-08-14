@@ -14,7 +14,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from governance.contract_state_runtime import (
     cli_agent_managed_profile_tooling_binding,
@@ -225,6 +225,34 @@ def unwrap_mcp_application_response(value: Any) -> dict[str, Any]:
 
     # Preserve direct server error objects and alias fields verbatim.
     return copied
+
+
+def mcp_application_mapping_blocks(
+    value: Any,
+    *,
+    paths: Sequence[Sequence[str]],
+) -> list[dict[str, Any]]:
+    """Read mapping blocks only from explicit MCP application-object paths."""
+
+    application = unwrap_mcp_application_response(value)
+    blocks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for path in paths:
+        current: Any = application
+        for field_name in path:
+            if not isinstance(current, Mapping) or field_name not in current:
+                current = None
+                break
+            current = current[field_name]
+        if not isinstance(current, Mapping):
+            continue
+        block = _json_compatible_copy(current)
+        identity = json.dumps(block, sort_keys=True, separators=(",", ":"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        blocks.append(block)
+    return blocks
 
 
 def scrub_host_secret_values(

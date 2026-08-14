@@ -14,6 +14,7 @@ from agent.cli_agent_service.adapters.codex_desktop import (
 )
 from agent.cli_agent_service.guided_runtime import (
     GuidedRuntimeDispatchError,
+    orchestrate_runtime_context_graph_continuation,
     orchestrate_runtime_context_host_startup,
 )
 from agent.cli_agent_service.service import (
@@ -21,6 +22,7 @@ from agent.cli_agent_service.service import (
     ServiceError,
     ServicePaths,
     ServiceUnavailableError,
+    mcp_application_mapping_blocks,
     unwrap_mcp_application_response,
 )
 from agent.governance.contract_state_runtime import build_cli_agent_execution_ticket
@@ -847,3 +849,210 @@ def test_runtime_context_host_orchestration_preserves_server_error_object() -> N
     serialized = json.dumps(result, sort_keys=True)
     assert "tool_error" not in serialized
     assert "host_envelope_incomplete" not in serialized
+
+
+def _graph_continuation_inputs():
+    route = {
+        "route_id": "route-graph-continuation",
+        "route_context_hash": "sha256:" + "1" * 64,
+        "prompt_contract_id": "prompt-graph-continuation",
+        "prompt_contract_hash": "sha256:" + "2" * 64,
+        "route_token_ref": "rtok-graph-continuation",
+        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+    }
+    body = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-GRAPH-CONTINUATION",
+        "runtime_context_id": "mfrctx-graph-continuation",
+        "task_id": "graph-continuation-worker",
+        "parent_task_id": "cex-graph-continuation",
+        "target_project_root": "/tmp/graph-continuation",
+        "project_root": "/tmp/graph-continuation",
+        "repo_root": "/tmp/graph-continuation",
+        "worker_role": "mf_sub",
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "tool": "function_index",
+        "args": {"query": "<exact source symbol name>"},
+        "session_token_ref": "wstok-graph-rotated",
+        "route_identity": route,
+    }
+    guide = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {"corrected_request_shapes": {"graph_query_body": body}}
+                ),
+            }
+        ]
+    }
+    auth = {
+        "structuredContent": {
+            "worker_session_token_ref": "wstok-graph-rotated",
+            "worker_host_envelope": {
+                "worker_session_token_ref": "wstok-graph-rotated",
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": "raw-session-graph",
+                    "AMING_WORKER_FENCE_TOKEN": "raw-fence-graph",
+                },
+            },
+        }
+    }
+    scope = {
+        key: value
+        for key, value in body.items()
+        if key
+        in {
+            "project_id",
+            "backlog_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "target_project_root",
+            "project_root",
+            "repo_root",
+            "query_source",
+            "query_purpose",
+        }
+    }
+    scope["route_identity"] = route
+    return guide, auth, scope
+
+
+def test_mcp_application_mapping_blocks_reads_only_declared_compatibility_path() -> None:
+    response = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "details": {
+                            "compatibility": {
+                                "corrected_request_shapes": {
+                                    "graph_query_body": {"project_id": "aming-claw"}
+                                }
+                            }
+                        },
+                        "unrelated": {
+                            "graph_query_body": {"project_id": "wrong-project"}
+                        },
+                    }
+                ),
+            }
+        ]
+    }
+
+    blocks = mcp_application_mapping_blocks(
+        response,
+        paths=(
+            (
+                "details",
+                "compatibility",
+                "corrected_request_shapes",
+                "graph_query_body",
+            ),
+        ),
+    )
+
+    assert blocks == [{"project_id": "aming-claw"}]
+
+
+def test_graph_continuation_preserves_scope_route_and_scrubs_auth() -> None:
+    guide, auth, scope = _graph_continuation_inputs()
+    live_bodies = []
+
+    def call_tool(name, body):
+        assert name == "graph_query"
+        live_bodies.append(body)
+        assert body["route_identity"] == scope["route_identity"]
+        assert body["backlog_id"] == scope["backlog_id"]
+        return {
+            "structuredContent": {
+                "ok": True,
+                "status": "passed",
+                "trace_id": "gtrace-{}".format(len(live_bodies)),
+            }
+        }
+
+    queries = [
+        {"tool": tool, "args": {"query": "orchestrate_runtime_context_host_startup"}}
+        for tool in ("function_index", "function_callers", "function_callees")
+    ]
+    result = orchestrate_runtime_context_graph_continuation(
+        worker_guide=guide,
+        host_auth_response=auth,
+        tool_caller=call_tool,
+        expected_scope=scope,
+        queries=queries,
+    )
+
+    assert result["graph_trace_ids"] == ["gtrace-1", "gtrace-2", "gtrace-3"]
+    assert [item["tool"] for item in result["queries"]] == [
+        "function_index",
+        "function_callers",
+        "function_callees",
+    ]
+    assert result["session_token_ref"] == "wstok-graph-rotated"
+    serialized = json.dumps(result, sort_keys=True)
+    assert "raw-session-graph" not in serialized
+    assert "raw-fence-graph" not in serialized
+    assert all("raw-session-graph" not in json.dumps(body) for body in live_bodies)
+    assert all("raw-fence-graph" not in json.dumps(body) for body in live_bodies)
+
+
+def test_graph_continuation_conflicting_scope_is_zero_call() -> None:
+    guide, auth, scope = _graph_continuation_inputs()
+    scope["task_id"] = "conflicting-task"
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError, match="task_id"):
+        orchestrate_runtime_context_graph_continuation(
+            worker_guide=guide,
+            host_auth_response=auth,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            expected_scope=scope,
+            queries=[{"tool": "function_index", "args": {"query": "exact_symbol"}}],
+        )
+
+    assert calls == []
+
+
+def test_graph_continuation_missing_expected_route_is_zero_call() -> None:
+    guide, auth, scope = _graph_continuation_inputs()
+    scope["route_identity"].pop("route_token_ref")
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError, match="route_token_ref"):
+        orchestrate_runtime_context_graph_continuation(
+            worker_guide=guide,
+            host_auth_response=auth,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            expected_scope=scope,
+            queries=[{"tool": "function_index", "args": {"query": "exact_symbol"}}],
+        )
+
+    assert calls == []
+
+
+def test_graph_continuation_ambiguous_guide_is_zero_call() -> None:
+    guide, auth, scope = _graph_continuation_inputs()
+    application = json.loads(guide["content"][0]["text"])
+    conflicting = deepcopy(application["corrected_request_shapes"]["graph_query_body"])
+    conflicting["task_id"] = "other-task"
+    application["details"] = {
+        "corrected_request_shapes": {"graph_query_body": conflicting}
+    }
+    guide["content"][0]["text"] = json.dumps(application)
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError, match="ambiguous"):
+        orchestrate_runtime_context_graph_continuation(
+            worker_guide=guide,
+            host_auth_response=auth,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            expected_scope=scope,
+            queries=[{"tool": "function_index", "args": {"query": "exact_symbol"}}],
+        )
+
+    assert calls == []

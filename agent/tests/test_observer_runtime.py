@@ -8,6 +8,7 @@ import pytest
 
 from agent.ai_invocation import RoutePromptContract
 from agent.cli_agent_service.guided_runtime import (
+    orchestrate_runtime_context_graph_continuation,
     orchestrate_runtime_context_host_startup,
 )
 from agent.governance.parallel_branch_runtime import (
@@ -1654,3 +1655,95 @@ def test_host_orchestration_scrubs_raw_auth_from_post_join_server_error() -> Non
     assert "<redacted-worker-auth>" in serialized
     assert "tool_error" not in serialized
     assert "host_envelope_incomplete" not in serialized
+
+
+def test_graph_continuation_accepts_live_compatibility_guide_and_rejoin_envelope() -> None:
+    route = {
+        "route_id": "route-observer-graph",
+        "route_context_hash": "sha256:" + "4" * 64,
+        "prompt_contract_id": "prompt-observer-graph",
+        "prompt_contract_hash": "sha256:" + "5" * 64,
+        "route_token_ref": "rtok-observer-graph",
+        "visible_injection_manifest_hash": "sha256:" + "6" * 64,
+    }
+    scope = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-OBSERVER-GRAPH",
+        "runtime_context_id": "mfrctx-observer-graph",
+        "task_id": "observer-graph-worker",
+        "parent_task_id": "cex-observer-graph",
+        "target_project_root": "/tmp/observer-graph",
+        "project_root": "/tmp/observer-graph",
+        "repo_root": "/tmp/observer-graph",
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "route_identity": route,
+    }
+    body = {
+        **{key: value for key, value in scope.items() if key != "route_identity"},
+        "worker_role": "mf_sub",
+        "tool": "function_index",
+        "args": {"query": "<exact source symbol name>"},
+        "session_token_ref": "wstok-observer-rotated",
+        "route_identity": route,
+    }
+    guide = {
+        "structuredContent": {
+            "details": {
+                "compatibility": {
+                    "corrected_request_shapes": {"graph_query_body": body}
+                }
+            }
+        }
+    }
+    auth = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "worker_session_token_ref": "wstok-observer-rotated",
+                        "worker_host_envelope": {
+                            "worker_session_token_ref": "wstok-observer-rotated",
+                            "env": {
+                                "AMING_WORKER_SESSION_TOKEN": "raw-observer-session",
+                                "AMING_WORKER_FENCE_TOKEN": "raw-observer-fence",
+                            },
+                        },
+                    }
+                ),
+            }
+        ]
+    }
+    seen = []
+
+    def call_tool(name, request):
+        seen.append((name, request))
+        return {
+            "ok": True,
+            "status": "passed",
+            "graph_query_trace_id": "observer-trace-{}".format(len(seen)),
+        }
+
+    result = orchestrate_runtime_context_graph_continuation(
+        worker_guide=guide,
+        host_auth_response=auth,
+        tool_caller=call_tool,
+        expected_scope=scope,
+        queries=[
+            {"tool": tool, "args": {"query": "exact_observer_symbol"}}
+            for tool in ("function_index", "function_callers", "function_callees")
+        ],
+    )
+
+    assert result["graph_trace_ids"] == [
+        "observer-trace-1",
+        "observer-trace-2",
+        "observer-trace-3",
+    ]
+    assert all(request["route_identity"] == route for _, request in seen)
+    assert all(
+        "raw-observer-session" not in json.dumps(request)
+        and "raw-observer-fence" not in json.dumps(request)
+        for _, request in seen
+    )

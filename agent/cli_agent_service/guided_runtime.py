@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .launchers import WORKER_AUTH_ENV_KEYS, scrub_host_envelope_payload
 from .service import (
@@ -14,6 +14,7 @@ from .service import (
     ServiceError,
     ServicePaths,
     ServiceUnavailableError,
+    mcp_application_mapping_blocks,
     request_service,
     scrub_host_secret_values,
     unwrap_mcp_application_response,
@@ -23,6 +24,9 @@ from .service import (
 GUIDED_RUNTIME_DISPATCH_SCHEMA_VERSION = "cli_agent_service.guided_runtime_dispatch.v1"
 RUNTIME_CONTEXT_HOST_ORCHESTRATION_SCHEMA_VERSION = (
     "cli_agent_service.runtime_context_host_orchestration.v1"
+)
+RUNTIME_CONTEXT_GRAPH_CONTINUATION_SCHEMA_VERSION = (
+    "cli_agent_service.runtime_context_graph_continuation.v1"
 )
 
 _PLACEHOLDER = re.compile(r"<[^<>]+>")
@@ -120,6 +124,78 @@ _STARTUP_REQUIRED_FIELDS = tuple(
     session_token_ref agent_id actual_host_worker_id worker_session_id filer_principal
     host_session_id host_startup_id head_commit read_receipt_hash
     read_receipt_event_id""".split()
+)
+_GRAPH_CONTINUATION_TOOLS = frozenset(
+    {"function_index", "function_callers", "function_callees"}
+)
+_GRAPH_ROUTE_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+_GRAPH_SCOPE_FIELDS = (
+    "project_id",
+    "backlog_id",
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "target_project_root",
+    "project_root",
+    "repo_root",
+    "query_source",
+    "query_purpose",
+)
+_GRAPH_QUERY_TOOL_FIELDS = frozenset(
+    """actor args backlog_id commit_sha fence_token parent_task_id project_id
+    project_root prompt_contract_hash prompt_contract_id query_purpose query_source
+    repo_root route_context_hash route_id route_identity route_token_ref
+    runtime_context_id session_token session_token_ref snapshot_id
+    target_project_root task_id tool visible_injection_manifest_hash
+    worker_role""".split()
+)
+_GRAPH_QUERY_BODY_PATHS = (
+    ("actionable_payloads", "graph_query_submission", "copy_safe_body"),
+    ("actionable_payloads", "graph_query_facade_payload_skeleton", "copy_safe_body"),
+    ("corrected_request_shapes", "graph_query_body"),
+    ("target_project_root_projection", "corrected_request_shapes", "graph_query_body"),
+    ("details", "actionable_payloads", "graph_query_submission", "copy_safe_body"),
+    (
+        "details",
+        "actionable_payloads",
+        "graph_query_facade_payload_skeleton",
+        "copy_safe_body",
+    ),
+    ("details", "corrected_request_shapes", "graph_query_body"),
+    (
+        "details",
+        "target_project_root_projection",
+        "corrected_request_shapes",
+        "graph_query_body",
+    ),
+    (
+        "details",
+        "diagnostics",
+        "target_project_root_projection",
+        "corrected_request_shapes",
+        "graph_query_body",
+    ),
+    (
+        "details",
+        "compatibility",
+        "corrected_request_shapes",
+        "graph_query_body",
+    ),
+)
+_GRAPH_HOST_ENVELOPE_PATHS = (
+    ("host_envelope",),
+    ("worker_host_envelope",),
+    ("details", "host_envelope"),
+    ("details", "worker_host_envelope"),
+    ("data", "host_envelope"),
+    ("data", "worker_host_envelope"),
 )
 
 _ADMISSION_FIELDS = frozenset(
@@ -1098,3 +1174,244 @@ def request_contract_runtime_observer(
         state_dir=state_dir,
         timeout_seconds=timeout_seconds,
     )
+
+
+def _graph_continuation_error(message: str) -> GuidedRuntimeDispatchError:
+    return GuidedRuntimeDispatchError(
+        message,
+        status="invalid_graph_continuation",
+    )
+
+
+def _graph_route_identity(body: Mapping[str, Any]) -> dict[str, str]:
+    nested = body.get("route_identity")
+    nested = dict(nested) if isinstance(nested, Mapping) else {}
+    route: dict[str, str] = {}
+    for field_name in _GRAPH_ROUTE_FIELDS:
+        top_level = _text(body.get(field_name))
+        nested_value = _text(nested.get(field_name))
+        values = {value for value in (top_level, nested_value) if value}
+        if len(values) > 1:
+            raise _graph_continuation_error(
+                "authenticated guide contains conflicting {}".format(field_name)
+            )
+        value = next(iter(values), "")
+        if not value or _PLACEHOLDER.search(value):
+            raise _graph_continuation_error(
+                "authenticated guide is missing exact {}".format(field_name)
+            )
+        route[field_name] = value
+    return route
+
+
+def _graph_host_auth(
+    host_auth_response: Mapping[str, Any],
+) -> tuple[dict[str, Any], str, str, str]:
+    try:
+        application = unwrap_mcp_application_response(host_auth_response)
+        envelopes = mcp_application_mapping_blocks(
+            application,
+            paths=_GRAPH_HOST_ENVELOPE_PATHS,
+        )
+    except ServiceError as exc:
+        raise _graph_continuation_error(
+            "worker host envelope could not be decoded"
+        ) from exc
+    candidates: dict[tuple[str, str], dict[str, Any]] = {}
+    refs: set[str] = set()
+    for envelope in envelopes:
+        environment = envelope.get("env")
+        environment = dict(environment) if isinstance(environment, Mapping) else {}
+        session_token = _text(
+            environment.get(WORKER_AUTH_ENV_KEYS[0])
+            or envelope.get("session_token")
+        )
+        fence_token = _text(
+            environment.get(WORKER_AUTH_ENV_KEYS[1])
+            or envelope.get("fence_token")
+        )
+        if session_token and fence_token:
+            candidates[(session_token, fence_token)] = envelope
+        for field_name in (
+            "session_token_ref",
+            "worker_session_token_ref",
+            "safe_session_token_ref",
+        ):
+            value = _text(envelope.get(field_name))
+            if value:
+                refs.add(value)
+    for field_name in (
+        "session_token_ref",
+        "worker_session_token_ref",
+        "safe_session_token_ref",
+    ):
+        value = _text(application.get(field_name))
+        if value:
+            refs.add(value)
+    if len(candidates) != 1 or len(refs) != 1:
+        raise _graph_continuation_error(
+            "worker host envelope auth or rotated safe ref is ambiguous"
+        )
+    session_token, fence_token = next(iter(candidates))
+    if _PLACEHOLDER.search(session_token) or _PLACEHOLDER.search(fence_token):
+        raise _graph_continuation_error(
+            "worker host envelope contains placeholder auth"
+        )
+    return application, session_token, fence_token, next(iter(refs))
+
+
+def orchestrate_runtime_context_graph_continuation(
+    *,
+    worker_guide: Mapping[str, Any],
+    host_auth_response: Mapping[str, Any],
+    tool_caller: Callable[[str, Mapping[str, Any]], Any],
+    expected_scope: Mapping[str, Any],
+    queries: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Continue exact-symbol graph work from authenticated guide authority."""
+
+    try:
+        guide = unwrap_mcp_application_response(worker_guide)
+    except ServiceError as exc:
+        raise _graph_continuation_error(
+            "authenticated worker guide could not be decoded"
+        ) from exc
+    scope = _mapping(expected_scope, "expected graph scope")
+    candidates = mcp_application_mapping_blocks(
+        guide,
+        paths=_GRAPH_QUERY_BODY_PATHS,
+    )
+    if not candidates:
+        raise _graph_continuation_error(
+            "authenticated guide has no canonical graph query body"
+        )
+    unique = {
+        json.dumps(candidate, sort_keys=True, separators=(",", ":")): candidate
+        for candidate in candidates
+    }
+    if len(unique) != 1:
+        raise _graph_continuation_error(
+            "authenticated guide graph query body is ambiguous"
+        )
+    template = next(iter(unique.values()))
+    for field_name in _GRAPH_SCOPE_FIELDS:
+        expected = _text(scope.get(field_name))
+        actual = _text(template.get(field_name))
+        if (
+            not expected
+            or not actual
+            or _PLACEHOLDER.search(actual)
+            or actual != expected
+        ):
+            raise _graph_continuation_error(
+                "authenticated guide graph scope conflicts at {}".format(field_name)
+            )
+    route = _graph_route_identity(template)
+    expected_route = scope.get("route_identity")
+    expected_route = (
+        dict(expected_route) if isinstance(expected_route, Mapping) else scope
+    )
+    for field_name, actual in route.items():
+        expected = _text(expected_route.get(field_name))
+        if not expected or expected != actual:
+            raise _graph_continuation_error(
+                "authenticated guide route conflicts at {}".format(field_name)
+            )
+    requested: list[dict[str, Any]] = []
+    for query in queries:
+        item = _mapping(query, "graph query")
+        tool_name = _text(item.get("tool"))
+        args = item.get("args")
+        symbol = _text(args.get("query")) if isinstance(args, Mapping) else ""
+        if (
+            tool_name not in _GRAPH_CONTINUATION_TOOLS
+            or set(item) != {"tool", "args"}
+            or not isinstance(args, Mapping)
+            or set(args) != {"query"}
+            or not symbol
+            or _PLACEHOLDER.search(symbol)
+        ):
+            raise _graph_continuation_error(
+                "graph continuation accepts exact-symbol function queries only"
+            )
+        requested.append({"tool": tool_name, "args": {"query": symbol}})
+    if not requested:
+        raise _graph_continuation_error(
+            "graph continuation requires at least one exact-symbol query"
+        )
+
+    application: dict[str, Any] = {}
+    raw_results: list[Any] = []
+    request_bodies: list[dict[str, Any]] = []
+    raw_values: tuple[str, ...] = ()
+    try:
+        application, session_token, fence_token, session_token_ref = (
+            _graph_host_auth(host_auth_response)
+        )
+        raw_values = (session_token, fence_token)
+        guide_ref = _text(template.get("session_token_ref"))
+        if guide_ref and guide_ref != session_token_ref:
+            raise _graph_continuation_error(
+                "authenticated guide safe ref is stale"
+            )
+        traces: list[str] = []
+        summaries: list[dict[str, str]] = []
+        for query in requested:
+            body = {
+                str(key): _json_round_trip(value, "graph query body")
+                for key, value in template.items()
+                if str(key) in _GRAPH_QUERY_TOOL_FIELDS
+            }
+            body.update(query)
+            body["session_token"] = session_token
+            body["fence_token"] = fence_token
+            body["session_token_ref"] = session_token_ref
+            serialized = json.dumps(body, sort_keys=True)
+            if _PLACEHOLDER.search(serialized):
+                raise _graph_continuation_error(
+                    "authenticated graph query body contains placeholders"
+                )
+            response, failure, raw_values = _invoke_host_tool(
+                tool_caller,
+                "graph_query",
+                body,
+                response_status=query["tool"],
+                request_bodies=request_bodies,
+                raw_results=raw_results,
+                raw_values=raw_values,
+            )
+            if failure:
+                return failure
+            trace_id = _first_deep_text(
+                response,
+                "trace_id",
+                "graph_trace_id",
+                "graph_query_trace_id",
+            )
+            if not trace_id:
+                raise _graph_continuation_error(
+                    "graph query response omitted canonical trace id"
+                )
+            traces.append(trace_id)
+            summaries.append(
+                {
+                    "tool": query["tool"],
+                    "query": query["args"]["query"],
+                    "trace_id": trace_id,
+                }
+            )
+        return {
+            "schema_version": RUNTIME_CONTEXT_GRAPH_CONTINUATION_SCHEMA_VERSION,
+            "ok": True,
+            "status": "passed",
+            "session_token_ref": session_token_ref,
+            "graph_trace_ids": traces,
+            "queries": summaries,
+            "guide_derived_body": True,
+            "route_identity_preserved": True,
+            **_HOST_PRIVACY_FLAGS,
+        }
+    finally:
+        for value in (*request_bodies, *raw_results, application):
+            if isinstance(value, (dict, list)):
+                scrub_host_secret_values(value, raw_values=raw_values)
