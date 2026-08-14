@@ -146637,6 +146637,377 @@ def _contract_runtime_parentless_direct_main_historical_diff_projection(
     return {"passed": True, "authority": authority, "projected_event": projected_event}
 
 
+def _contract_runtime_parentless_direct_main_same_tree_anchor_authority(
+    *,
+    conn,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    close_commit: str,
+    direct_event: Mapping[str, Any],
+    implementation_event: Mapping[str, Any],
+    timeline_events: Sequence[Mapping[str, Any]],
+    row_declared_files: Sequence[str],
+) -> dict[str, Any]:
+    """Prove that an empty implementation diff is a release-only anchor.
+
+    A same-tree anchor must not manufacture ``changed_files`` merely to satisfy
+    the legacy observer-direct gate.  Instead, re-derive the immutable Git
+    identity and prove that earlier, route-bound implementation events for the
+    same backlog cover the complete declared scope.  Every ordinary empty or
+    omitted ``changed_files`` shape remains rejected.
+    """
+
+    schema = "parentless_direct_main.same_tree_anchor_authority.v1"
+
+    def failed(reason: str, **details: Any) -> dict[str, Any]:
+        authority = {
+            "schema_version": schema,
+            "passed": False,
+            "status": "failed",
+            "server_derived": True,
+            "read_only_projection": True,
+            "caller_claims_trusted": False,
+            "failure_reason": reason,
+            "persisted_timeline_mutated": False,
+            "historical_backfill_performed": False,
+            **details,
+        }
+        authority["authority_hash"] = stable_sha256(authority)
+        return authority
+
+    if conn is None or not implementation_event:
+        return failed("database_or_implementation_unavailable")
+    payload = (
+        implementation_event.get("payload")
+        if isinstance(implementation_event.get("payload"), Mapping)
+        else {}
+    )
+    if "changed_files" not in payload or payload.get("changed_files") != []:
+        return failed("explicit_empty_changed_files_required")
+    if payload.get("same_tree_as_parent") is not True:
+        return failed("same_tree_declaration_required")
+
+    def canonical_paths(value: Any, *, allow_empty: bool = False) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError("not_a_list")
+        paths: list[str] = []
+        for raw in value:
+            if not isinstance(raw, str) or raw != raw.strip():
+                raise ValueError("noncanonical_path")
+            path = _qa_overlay_normalize_path(raw)
+            if path != raw or path in paths:
+                raise ValueError("noncanonical_or_duplicate_path")
+            paths.append(path)
+        if not paths and not allow_empty:
+            raise ValueError("empty_paths")
+        return paths
+
+    try:
+        declared_files = canonical_paths(list(row_declared_files))
+        event_allowed_files = canonical_paths(payload.get("allowed_files"))
+    except (ValueError, _QACandidateOverlayError) as exc:
+        return failed("declared_or_event_scope_invalid", detail=str(exc))
+    if set(event_allowed_files) != set(declared_files):
+        return failed(
+            "event_allowed_files_not_exact_row_scope",
+            event_allowed_files=event_allowed_files,
+            row_declared_files=declared_files,
+        )
+
+    implementation_id = _contract_runtime_parentless_direct_main_event_order(
+        implementation_event, 0
+    )
+    direct_id = _contract_runtime_parentless_direct_main_event_order(
+        direct_event, 0
+    )
+    if (
+        implementation_id <= direct_id
+        or str(implementation_event.get("task_id") or "").strip() != task_id
+        or str(implementation_event.get("backlog_id") or "").strip()
+        != backlog_id
+    ):
+        return failed("implementation_identity_or_order_mismatch")
+    implementation_identity = _observer_root_route_identity_from_event(
+        implementation_event
+    )
+    direct_identity = _observer_root_route_identity_from_event(direct_event)
+    if not (
+        implementation_identity.get("route_token_ref")
+        and implementation_identity.get("route_token_ref")
+        == direct_identity.get("route_token_ref")
+        and _contract_runtime_close_authority_route_token_backed_event(
+            implementation_event,
+            implementation_identity,
+            require_source_backed_authority=True,
+        )
+    ):
+        return failed("implementation_source_backed_route_authority_missing")
+
+    try:
+        project_root = project_service.resolve_project_root(
+            project_id, None, fallback_self=True
+        )
+    except Exception as exc:
+        return failed("project_root_unavailable", detail=type(exc).__name__)
+    if project_root is None:
+        return failed("project_root_unavailable")
+    root = Path(project_root).resolve()
+    try:
+        candidate = _qa_post_merge_resolve_commit(
+            root, str(implementation_event.get("commit_sha") or "")
+        )
+        close = _qa_post_merge_resolve_commit(root, close_commit)
+        parents = _qa_git_bytes(
+            root, ["rev-list", "--parents", "--max-count=1", candidate]
+        )
+    except _QACandidateOverlayError as exc:
+        return failed("anchor_commit_unavailable", detail=exc.reason)
+    parent_tokens = (
+        parents.stdout.decode("ascii", errors="ignore").strip().lower().split()
+    )
+    if (
+        candidate != close
+        or parents.returncode != 0
+        or parent_tokens[:1] != [candidate]
+        or len(parent_tokens) != 2
+    ):
+        return failed("anchor_not_exact_single_parent_close_commit")
+    parent = parent_tokens[1]
+    if str(payload.get("parent_commit_sha") or "").strip().lower() != parent:
+        return failed("declared_parent_commit_mismatch", actual_parent=parent)
+    try:
+        candidate_tree = _qa_git_bytes(root, ["rev-parse", f"{candidate}^{{tree}}"])
+        parent_tree = _qa_git_bytes(root, ["rev-parse", f"{parent}^{{tree}}"])
+        head = _qa_git_bytes(root, ["rev-parse", "--verify", "HEAD^{commit}"])
+        status = _qa_git_bytes(
+            root, ["status", "--porcelain=v1", "--untracked-files=all"]
+        )
+    except _QACandidateOverlayError as exc:
+        return failed("anchor_tree_or_head_unavailable", detail=exc.reason)
+    normalized_candidate_tree = (
+        candidate_tree.stdout.decode("ascii", errors="ignore").strip().lower()
+    )
+    normalized_parent_tree = (
+        parent_tree.stdout.decode("ascii", errors="ignore").strip().lower()
+    )
+    actual_head = head.stdout.decode("ascii", errors="ignore").strip().lower()
+    if (
+        candidate_tree.returncode != 0
+        or parent_tree.returncode != 0
+        or not normalized_candidate_tree
+        or normalized_candidate_tree != normalized_parent_tree
+    ):
+        return failed(
+            "anchor_tree_not_identical_to_parent",
+            candidate_tree=normalized_candidate_tree,
+            parent_tree=normalized_parent_tree,
+        )
+    if (
+        head.returncode != 0
+        or actual_head != close
+        or status.returncode != 0
+        or status.stdout
+    ):
+        return failed("canonical_head_or_worktree_not_exact_clean")
+
+    def scope_matches(path: str, scope: str) -> bool:
+        return path.startswith(scope) if scope.endswith("/") else path == scope
+
+    prior_implementations: list[dict[str, Any]] = []
+    covered_scope: set[str] = set()
+    prior_changed_files: list[str] = []
+    for event in timeline_events:
+        if not isinstance(event, Mapping):
+            continue
+        event_order = _contract_runtime_parentless_direct_main_event_order(event, 0)
+        if not event_order or event_order >= direct_id:
+            continue
+        if (
+            str(event.get("project_id") or "").strip() != project_id
+            or str(event.get("backlog_id") or "").strip() != backlog_id
+            or str(event.get("task_id") or "").strip() != task_id
+            or str(event.get("event_kind") or "").strip().lower()
+            != "implementation"
+            or str(event.get("status") or "").strip().lower()
+            not in _QA_TIMELINE_CLOSE_STATUSES
+        ):
+            continue
+        event_payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        try:
+            event_files = canonical_paths(event_payload.get("changed_files"))
+            event_commit = _qa_post_merge_resolve_commit(
+                root, str(event.get("commit_sha") or "")
+            )
+            event_parent_result = _qa_git_bytes(
+                root,
+                ["rev-list", "--parents", "--max-count=1", event_commit],
+            )
+        except (ValueError, _QACandidateOverlayError):
+            continue
+        event_parent_tokens = (
+            event_parent_result.stdout.decode("ascii", errors="ignore")
+            .strip()
+            .lower()
+            .split()
+        )
+        if (
+            event_parent_result.returncode != 0
+            or event_parent_tokens[:1] != [event_commit]
+            or len(event_parent_tokens) != 2
+        ):
+            continue
+        event_parent = event_parent_tokens[1]
+        try:
+            event_diff_result = _qa_git_bytes(
+                root,
+                [
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    event_parent,
+                    event_commit,
+                ],
+            )
+            event_diff_files = canonical_paths(
+                [
+                    line.strip()
+                    for line in event_diff_result.stdout.decode(
+                        "utf-8", errors="replace"
+                    ).splitlines()
+                    if line.strip()
+                ]
+            )
+        except (ValueError, _QACandidateOverlayError):
+            continue
+        if event_diff_result.returncode != 0 or set(event_diff_files) != set(
+            event_files
+        ):
+            continue
+        event_identity = _observer_root_route_identity_from_event(event)
+        ancestry = _qa_git_bytes(
+            root, ["merge-base", "--is-ancestor", event_commit, parent]
+        )
+        if not (
+            event_identity.get("route_token_ref")
+            == direct_identity.get("route_token_ref")
+            and _contract_runtime_close_authority_route_token_backed_event(
+                event,
+                event_identity,
+                require_source_backed_authority=True,
+            )
+            and ancestry.returncode == 0
+        ):
+            continue
+        event_covered: set[str] = set()
+        unexpected: list[str] = []
+        for changed_file in event_files:
+            matches = [
+                scope for scope in declared_files if scope_matches(changed_file, scope)
+            ]
+            if not matches:
+                unexpected.append(changed_file)
+            else:
+                event_covered.update(matches)
+        if unexpected:
+            return failed(
+                "prior_implementation_outside_declared_scope",
+                unexpected_changed_files=sorted(unexpected),
+            )
+        covered_scope.update(event_covered)
+        prior_changed_files.extend(event_files)
+        prior_implementations.append(
+            {
+                "event_id": event_order,
+                "commit_sha": event_commit,
+                "parent_commit_sha": event_parent,
+                "changed_files": event_files,
+                "git_diff_exact": True,
+                "covered_scope": sorted(event_covered),
+            }
+        )
+    if not prior_implementations or covered_scope != set(declared_files):
+        return failed(
+            "prior_implementation_scope_incomplete",
+            covered_scope=sorted(covered_scope),
+            row_declared_files=declared_files,
+            prior_implementation_event_ids=[
+                item["event_id"] for item in prior_implementations
+            ],
+        )
+
+    try:
+        version_row = conn.execute(
+            "SELECT git_head, dirty_files, git_synced_at FROM project_version WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        synced_dirty = json.loads(str(version_row["dirty_files"] or "[]"))
+    except (sqlite3.Error, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        version_row = None
+        synced_dirty = ["invalid_or_missing_project_version"]
+    if (
+        not version_row
+        or str(version_row["git_head"] or "").strip().lower() != close
+        or synced_dirty
+        or not str(version_row["git_synced_at"] or "").strip()
+    ):
+        return failed("project_version_not_clean_and_current")
+    from . import graph_snapshot_store
+
+    active = graph_snapshot_store.get_active_graph_snapshot(conn, project_id) or {}
+    if (
+        str(active.get("status") or "").strip() != "active"
+        or str(active.get("commit_sha") or "").strip().lower() != close
+    ):
+        return failed("active_graph_not_current")
+    runtime_version = ""
+    self_root = Path(__file__).resolve().parents[2]
+    if project_id == "aming-claw" or root == self_root:
+        runtime_version = str(
+            get_governance_runtime_version(default="") or ""
+        ).strip().lower()
+        if not runtime_version or not (
+            close.startswith(runtime_version) or runtime_version.startswith(close)
+        ):
+            return failed("governance_runtime_not_current")
+
+    authority = {
+        "schema_version": schema,
+        "passed": True,
+        "status": "passed",
+        "server_derived": True,
+        "read_only_projection": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "anchor_commit_sha": candidate,
+        "anchor_parent_commit_sha": parent,
+        "anchor_tree_sha": normalized_candidate_tree,
+        "changed_files": [],
+        "row_declared_files": declared_files,
+        "prior_implementation_event_ids": [
+            item["event_id"] for item in prior_implementations
+        ],
+        "prior_implementation_changed_files": _runtime_context_service_dedupe(
+            prior_changed_files
+        ),
+        "covered_scope": sorted(covered_scope),
+        "active_snapshot_id": str(active.get("snapshot_id") or ""),
+        "governance_runtime_version": runtime_version,
+        "persisted_timeline_mutated": False,
+        "historical_backfill_performed": False,
+        "empty_changed_files_preserved": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _contract_runtime_parentless_direct_main_close_authority_gate(
     *,
     conn=None,
@@ -146973,6 +147344,19 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             row_declared_files=allowed_files,
         )
     )
+    same_tree_anchor_authority = (
+        _contract_runtime_parentless_direct_main_same_tree_anchor_authority(
+            conn=conn,
+            project_id=project_id,
+            backlog_id=bug_id,
+            task_id=requested_execution_id,
+            close_commit=close_commit,
+            direct_event=direct_event,
+            implementation_event=implementation_event,
+            timeline_events=events,
+            row_declared_files=allowed_files,
+        )
+    )
     materialized_by_lineage: dict[str, list[dict[str, Any]]] = {}
     for event in events:
         normalized = (
@@ -147082,6 +147466,57 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         if isinstance(verification.get("observer_direct_close_exception_gate"), Mapping)
         else {}
     )
+    direct_missing_requirement_ids = [
+        str(item) for item in direct_gate.get("missing_requirement_ids") or []
+    ]
+    if (
+        same_tree_anchor_authority.get("passed") is True
+        and "changed_files" in direct_missing_requirement_ids
+    ):
+        remaining_missing = [
+            str(item)
+            for item in direct_missing_requirement_ids
+            if str(item) != "changed_files"
+        ]
+        direct_gate = {
+            **direct_gate,
+            "accepted": not remaining_missing,
+            "passed": not remaining_missing,
+            "status": "passed" if not remaining_missing else "failed",
+            "missing_requirement_ids": remaining_missing,
+            "changed_file_scope": {
+                "changed_files": [],
+                "allowed_files": list(allowed_files),
+                "unexpected_changed_files": [],
+                "passed": True,
+                "enforced": bool(allowed_files),
+                "same_tree_anchor": True,
+                "empty_changed_files_preserved": True,
+                "scope_satisfied_by_prior_implementation_lineage": True,
+                "authority_hash": same_tree_anchor_authority.get(
+                    "authority_hash"
+                ),
+            },
+            "same_tree_anchor_authority": same_tree_anchor_authority,
+            "replaced_gate_ids": (
+                [
+                    "route_context_gate",
+                    "finish_gate_projection",
+                    "worker_graph_trace_gate",
+                    "independent_qa_gate",
+                    "cross_ref_gate",
+                    "contract_projection_gate",
+                    "close_timeline_startup_gate",
+                ]
+                if not remaining_missing
+                else []
+            ),
+            "next_action": (
+                "retry_close_with_observer_direct_exception_evidence"
+                if not remaining_missing
+                else "record complete operator-supervised observer direct close evidence"
+            ),
+        }
     graph_trace_gate = _contract_runtime_parentless_direct_main_graph_trace_gate(
         conn,
         project_id=project_id,
@@ -147193,6 +147628,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
                 "historical_implementation_git_diff_authority": (
                     historical_diff_projection.get("authority") or {}
                 ),
+                "same_tree_anchor_authority": same_tree_anchor_authority,
             }
     if materialized_blocking_event_ids:
         direct_gate = {
@@ -147354,6 +147790,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             "historical_implementation_git_diff_authority": (
                 historical_diff_projection.get("authority") or {}
             ),
+            "same_tree_anchor_authority": same_tree_anchor_authority,
             "root_route_registry_authority_passed": root_registry_passed,
             "worker_or_successor_contract_required": False,
             "row_declared_file_scope_applied": bool(row_declared_files),

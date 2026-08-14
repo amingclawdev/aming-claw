@@ -942,6 +942,198 @@ def test_parentless_direct_main_historical_diff_projection_is_immutable_and_narr
 
 
 @pytest.mark.parametrize(
+    ("tamper", "expected_reason"),
+    [
+        ("none", ""),
+        ("omitted_changed_files", "explicit_empty_changed_files_required"),
+        ("same_tree_false", "same_tree_declaration_required"),
+        ("event_scope", "event_allowed_files_not_exact_row_scope"),
+        ("anchor_tree_changed", "anchor_tree_not_identical_to_parent"),
+        ("prior_diff_claim", "prior_implementation_scope_incomplete"),
+        ("prior_route", "prior_implementation_scope_incomplete"),
+        ("dirty_worktree", "canonical_head_or_worktree_not_exact_clean"),
+        ("version_drift", "project_version_not_clean_and_current"),
+        ("graph_drift", "active_graph_not_current"),
+    ],
+)
+def test_parentless_direct_main_same_tree_anchor_authority_is_exact_and_fail_closed(
+    conn,
+    monkeypatch,
+    tmp_path,
+    tamper,
+    expected_reason,
+):
+    project_root = tmp_path / f"same-tree-anchor-{tamper}"
+    project_root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=project_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=project_root,
+        check=True,
+    )
+    declared_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    for path in declared_files:
+        target = project_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=project_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "base"],
+        cwd=project_root,
+        check=True,
+    )
+    for path in declared_files:
+        (project_root / path).write_text("implementation\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=project_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "implementation"],
+        cwd=project_root,
+        check=True,
+    )
+    prior_commit = batch_jobs.git_commit(project_root)
+    if tamper == "anchor_tree_changed":
+        (project_root / "anchor.txt").write_text("changed\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=project_root, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "release anchor"],
+            cwd=project_root,
+            check=True,
+        )
+    else:
+        subprocess.run(
+            ["git", "commit", "-q", "--allow-empty", "-m", "release anchor"],
+            cwd=project_root,
+            check=True,
+        )
+    anchor_commit = batch_jobs.git_commit(project_root)
+    task_id = "onboard-service-same-tree-anchor"
+    backlog_id = "AC-SAME-TREE-ANCHOR"
+    route_ref = "rtok-same-tree-anchor"
+    prior_route_ref = "rtok-other" if tamper == "prior_route" else route_ref
+    prior_files = (
+        declared_files[:1] if tamper == "prior_diff_claim" else declared_files
+    )
+    prior_event = {
+        "id": 10,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_kind": "implementation",
+        "status": "passed",
+        "commit_sha": prior_commit,
+        "payload": {
+            "changed_files": list(prior_files),
+            "route_token_ref": prior_route_ref,
+        },
+    }
+    direct_event = {
+        "id": 20,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_kind": "observer_direct_implementation_exception",
+        "status": "accepted",
+        "payload": {"route_token_ref": route_ref},
+    }
+    anchor_payload = {
+        "changed_files": [],
+        "allowed_files": list(
+            declared_files[:1] if tamper == "event_scope" else declared_files
+        ),
+        "same_tree_as_parent": tamper != "same_tree_false",
+        "parent_commit_sha": prior_commit,
+        "route_token_ref": route_ref,
+    }
+    if tamper == "omitted_changed_files":
+        anchor_payload.pop("changed_files")
+    anchor_event = {
+        "id": 30,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_kind": "implementation",
+        "status": "passed",
+        "commit_sha": anchor_commit,
+        "payload": anchor_payload,
+    }
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    monkeypatch.setattr(
+        server,
+        "_observer_root_route_identity_from_event",
+        lambda event: {
+            "route_token_ref": str((event.get("payload") or {}).get("route_token_ref") or ""),
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_close_authority_route_token_backed_event",
+        lambda *_args, **_kwargs: True,
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO project_version
+            (project_id, chain_version, updated_at, updated_by, git_head,
+             dirty_files, git_synced_at)
+        VALUES (?, ?, '2026-08-14T00:00:00Z', 'test', ?, ?,
+                '2026-08-14T00:00:00Z')
+        """,
+        (
+            PID,
+            anchor_commit,
+            prior_commit if tamper == "version_drift" else anchor_commit,
+            "[]",
+        ),
+    )
+    _activate_basic_graph(
+        conn,
+        f"full-same-tree-{tamper}",
+        project_id=PID,
+        commit_sha=("f" * 40 if tamper == "graph_drift" else anchor_commit),
+    )
+    conn.commit()
+    if tamper == "dirty_worktree":
+        (project_root / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+    original_events = copy.deepcopy([prior_event, direct_event, anchor_event])
+
+    authority = server._contract_runtime_parentless_direct_main_same_tree_anchor_authority(
+        conn=conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        close_commit=anchor_commit,
+        direct_event=direct_event,
+        implementation_event=anchor_event,
+        timeline_events=[prior_event, direct_event, anchor_event],
+        row_declared_files=declared_files,
+    )
+
+    assert [prior_event, direct_event, anchor_event] == original_events
+    if expected_reason:
+        assert authority["passed"] is False
+        assert authority["failure_reason"] == expected_reason
+        assert authority["persisted_timeline_mutated"] is False
+        return
+    assert authority["passed"] is True
+    assert authority["changed_files"] == []
+    assert authority["empty_changed_files_preserved"] is True
+    assert authority["covered_scope"] == sorted(declared_files)
+    assert authority["prior_implementation_event_ids"] == [10]
+    assert authority["historical_backfill_performed"] is False
+
+
+@pytest.mark.parametrize(
     ("raised", "expected_code"),
     [
         (PermissionError(errno.EPERM, "denied"), "prior_governance_pid_unverifiable"),
@@ -101049,6 +101241,150 @@ def test_contract_bound_direct_main_capsule_mint_validate_hash_and_refresh_termi
     assert shapes["preclose_check"]["required_before"] == "first backlog_close"
     assert "build_assets_synced" in shapes["forbidden_aliases"]
     assert len(json.dumps(role_guidance).encode("utf-8")) <= 6 * 1024
+
+
+@pytest.mark.parametrize(
+    ("authority_passed", "extra_missing", "expected_passed"),
+    [
+        (True, [], True),
+        (True, ["tests_or_test_results"], False),
+        (False, [], False),
+    ],
+)
+def test_parentless_direct_main_close_gate_only_replaces_empty_changed_files_requirement(
+    monkeypatch,
+    authority_passed,
+    extra_missing,
+    expected_passed,
+):
+    backlog_id = "AC-PARENTLESS-SAME-TREE-CLOSE-WIRING"
+    execution_id = "onboard-service-same-tree-close-wiring"
+    close_commit = "a" * 40
+    route_identity = {
+        "route_id": "route-same-tree-close-wiring",
+        "route_context_hash": _fake_sha("same-tree-close-wiring"),
+        "route_token_ref": "rtok-same-tree-close-wiring",
+    }
+    direct_event = {
+        "id": 99201,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "event_kind": "observer_direct_implementation_exception",
+        "status": "accepted",
+        "payload": {},
+    }
+    implementation_event = {
+        "id": 99202,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "event_kind": "implementation",
+        "status": "passed",
+        "commit_sha": close_commit,
+        "payload": {"changed_files": []},
+    }
+    original_direct_gate = {
+        "accepted": False,
+        "passed": False,
+        "status": "failed",
+        "missing_requirement_ids": ["changed_files", *extra_missing],
+        "changed_file_scope": {
+            "changed_files": [],
+            "allowed_files": ["agent/governance/server.py"],
+            "unexpected_changed_files": [],
+            "passed": False,
+        },
+        "implementation_event": {"id": implementation_event["id"]},
+        "verification_event": {"id": 99203},
+        "close_ready_event": {"id": 99204},
+    }
+    monkeypatch.setattr(
+        server,
+        "_observer_root_route_identity_from_event",
+        lambda _event: dict(route_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_close_authority_route_token_backed_event",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_observer_direct_exception_event",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "missing_fields": [],
+            "event": {"id": direct_event["id"]},
+        },
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "mf_close_gate_verification",
+        lambda *_args, **_kwargs: {
+            "observer_direct_close_exception_gate": copy.deepcopy(
+                original_direct_gate
+            ),
+            "missing_event_kinds": [],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_parentless_direct_main_historical_diff_projection",
+        lambda **_kwargs: {"passed": False, "authority": {}},
+    )
+    same_tree_authority = {
+        "schema_version": "parentless_direct_main.same_tree_anchor_authority.v1",
+        "passed": authority_passed,
+        "status": "passed" if authority_passed else "failed",
+        "authority_hash": _fake_sha("same-tree-authority"),
+        "changed_files": [],
+        "empty_changed_files_preserved": authority_passed,
+    }
+    if not authority_passed:
+        same_tree_authority["failure_reason"] = "same_tree_declaration_required"
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_parentless_direct_main_same_tree_anchor_authority",
+        lambda **_kwargs: dict(same_tree_authority),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_parentless_direct_main_materialized_qa_event",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_parentless_direct_main_graph_trace_gate",
+        lambda *_args, **_kwargs: {
+            "passed": True,
+            "missing_requirement_ids": [],
+            "verified_trace_ids": ["gqt-same-tree-close-wiring"],
+        },
+    )
+
+    gate = server._contract_runtime_parentless_direct_main_close_authority_gate(
+        project_id=PID,
+        bug_id=backlog_id,
+        requested_execution_id=execution_id,
+        close_commit=close_commit,
+        timeline_events=[direct_event, implementation_event],
+        row_declared_files=["agent/governance/server.py"],
+    )
+
+    assert gate["passed"] is expected_passed
+    if expected_passed:
+        assert gate["missing_requirement_ids"] == []
+        assert gate["checks"]["same_tree_anchor_authority"] == same_tree_authority
+        return
+    if authority_passed:
+        assert gate["missing_requirement_ids"] == extra_missing
+        assert gate["changed_file_scope"]["same_tree_anchor"] is True
+        return
+    assert gate["missing_requirement_ids"] == ["changed_files", *extra_missing]
+    assert gate["changed_file_scope"] == original_direct_gate[
+        "changed_file_scope"
+    ]
 
 
 def test_parentless_direct_main_preclose_failure_projects_exact_file_diagnostics(
