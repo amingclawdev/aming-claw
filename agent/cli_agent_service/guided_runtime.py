@@ -2441,9 +2441,38 @@ def orchestrate_runtime_context_graph_continuation(
         raise _graph_continuation_error(
             "authenticated guide has no canonical graph query body"
         )
+
+    # The compact worker Guide may keep the current backlog identity in its
+    # route-token scope while omitting the duplicate field from the graph
+    # facade skeleton.  Normalize only from those fixed current-Guide roots;
+    # never search arbitrary descendants where sibling worker packets live.
+    try:
+        current_backlog_id = _unique_current_guide_text(guide, "backlog_id")
+    except GuidedRuntimeDispatchError as exc:
+        raise _graph_continuation_error(
+            "authenticated guide current backlog authority is ambiguous"
+        ) from exc
+    normalized_candidates: list[dict[str, Any]] = []
+    for candidate in candidates:
+        normalized = dict(candidate)
+        candidate_backlog_id = _text(normalized.get("backlog_id"))
+        if candidate_backlog_id and _PLACEHOLDER.search(candidate_backlog_id):
+            raise _graph_continuation_error(
+                "authenticated guide graph scope conflicts at backlog_id"
+            )
+        if current_backlog_id:
+            if (
+                candidate_backlog_id
+                and candidate_backlog_id != current_backlog_id
+            ):
+                raise _graph_continuation_error(
+                    "authenticated guide graph scope conflicts at backlog_id"
+                )
+            normalized["backlog_id"] = current_backlog_id
+        normalized_candidates.append(normalized)
     unique = {
         json.dumps(candidate, sort_keys=True, separators=(",", ":")): candidate
-        for candidate in candidates
+        for candidate in normalized_candidates
     }
     if len(unique) != 1:
         raise _graph_continuation_error(
@@ -2569,6 +2598,196 @@ def orchestrate_runtime_context_graph_continuation(
         }
     finally:
         for value in (*request_bodies, *raw_results, application):
+            if isinstance(value, (dict, list)):
+                scrub_host_secret_values(value, raw_values=raw_values)
+
+
+def orchestrate_runtime_context_authenticated_graph_continuation(
+    *,
+    worker_guide: Mapping[str, Any],
+    tool_caller: Callable[[str, Mapping[str, Any]], Any],
+    host_identity: Mapping[str, Any],
+    expected_scope: Mapping[str, Any],
+    queries: Sequence[Mapping[str, Any]],
+    project_id: str = "",
+    reason: str = "",
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Renew post-startup auth and run graph queries in one private frame.
+
+    This helper is deliberately distinct from host startup: it accepts only a
+    Contract-declared rejoin/reissue for an already-started worker, refreshes
+    that worker's authenticated RuntimeContext Guide directly, and never
+    replays read receipt or startup.  Raw auth never crosses this boundary.
+    """
+
+    try:
+        guide = unwrap_mcp_application_response(worker_guide)
+    except ServiceError as exc:
+        raise _graph_continuation_error(
+            "worker recovery guide could not be decoded"
+        ) from exc
+    scope = _mapping(expected_scope, "expected graph scope")
+    expected_route = scope.get("route_identity")
+    expected_route = (
+        dict(expected_route) if isinstance(expected_route, Mapping) else scope
+    )
+    for field_name in (
+        "project_id",
+        "backlog_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "target_project_root",
+    ):
+        expected = _text(scope.get(field_name))
+        try:
+            actual = _unique_current_guide_text(worker_guide, field_name)
+        except GuidedRuntimeDispatchError as exc:
+            raise _graph_continuation_error(
+                "worker recovery guide has ambiguous {}".format(field_name)
+            ) from exc
+        if (
+            not expected
+            or not actual
+            or _PLACEHOLDER.search(actual)
+            or actual != expected
+        ):
+            raise _graph_continuation_error(
+                "worker recovery guide conflicts at {}".format(field_name)
+            )
+    for field_name in _GRAPH_ROUTE_FIELDS:
+        expected = _text(expected_route.get(field_name))
+        try:
+            actual = _unique_current_guide_text(worker_guide, field_name)
+        except GuidedRuntimeDispatchError as exc:
+            raise _graph_continuation_error(
+                "worker recovery guide has ambiguous {}".format(field_name)
+            ) from exc
+        if (
+            not expected
+            or not actual
+            or _PLACEHOLDER.search(actual)
+            or actual != expected
+        ):
+            raise _graph_continuation_error(
+                "worker recovery guide route conflicts at {}".format(field_name)
+            )
+
+    precursor_packet = _host_action_packet(
+        worker_guide,
+        paths=_HOST_PRECURSOR_ACTION_PATHS,
+        expected_tools=_HOST_AUTH_TOOLS,
+    )
+    if precursor_packet is None:
+        precursor_packet = _server_declared_recovery_packet(worker_guide)
+    if precursor_packet is None:
+        raise _graph_continuation_error(
+            "worker recovery guide omitted its auth continuation"
+        )
+    precursor_action, precursor_template = precursor_packet
+    precursor_tool = _text(
+        precursor_action.get("mcp_tool")
+        or precursor_action.get("tool")
+        or precursor_action.get("facade")
+    )
+    if precursor_tool not in {
+        "runtime_context_session_token_rejoin",
+        "runtime_context_session_token_reissue",
+    }:
+        raise _graph_continuation_error(
+            "authenticated graph continuation requires post-startup auth recovery"
+        )
+    values = _host_runtime_values(
+        guide,
+        _mapping(host_identity, "host runtime identity"),
+        project_id=project_id,
+        reason=reason,
+        now_iso=now_iso,
+        read_receipt_hash="",
+    )
+    _assert_host_action_scope(
+        precursor_template, values, label="graph auth recovery packet"
+    )
+    precursor_allowed_fields = (
+        _HOST_REISSUE_TOOL_FIELDS
+        if precursor_tool == "runtime_context_session_token_reissue"
+        else _INITIAL_JOIN_TOOL_FIELDS
+    )
+    _validate_placeholder_contract(
+        (("graph_auth_recovery", precursor_template, precursor_allowed_fields),)
+    )
+    precursor_body = _validated_tool_body(
+        precursor_template,
+        allowed_fields=precursor_allowed_fields,
+        replacements=values,
+        force_fields=(
+            frozenset()
+            if precursor_tool == "runtime_context_session_token_reissue"
+            else _INITIAL_FORCE_FIELDS
+        ),
+        required_fields=(
+            ("project_id", "runtime_context_id", "task_id", "session_token_ref")
+            if precursor_tool == "runtime_context_session_token_reissue"
+            else _HOST_AUTH_REQUIRED_FIELDS
+        ),
+    )
+
+    request_bodies: list[dict[str, Any]] = []
+    raw_results: list[Any] = []
+    raw_values: tuple[str, ...] = ()
+    try:
+        _auth_response, failure, raw_values = _invoke_host_tool(
+            tool_caller,
+            precursor_tool,
+            precursor_body,
+            response_status="graph auth recovery",
+            request_bodies=request_bodies,
+            raw_results=raw_results,
+        )
+        if failure:
+            return failure
+        session_token, fence_token, session_token_ref = (
+            _single_host_auth_packet(raw_results[0])
+        )
+        raw_values = tuple(
+            dict.fromkeys((*raw_values, session_token, fence_token))
+        )
+        refreshed_guide_body = {
+            "project_id": _text(scope.get("project_id")),
+            "runtime_context_id": _text(scope.get("runtime_context_id")),
+            "parent_task_id": _text(scope.get("parent_task_id")),
+            "target_project_root": _text(scope.get("target_project_root")),
+            "session_token": session_token,
+            "fence_token": fence_token,
+            "session_token_ref": session_token_ref,
+            "view": "all",
+        }
+        _refreshed_guide, failure, raw_values = _invoke_host_tool(
+            tool_caller,
+            "runtime_context_worker_guide",
+            refreshed_guide_body,
+            response_status="authenticated worker guide",
+            request_bodies=request_bodies,
+            raw_results=raw_results,
+            raw_values=raw_values,
+        )
+        if failure:
+            return failure
+        result = orchestrate_runtime_context_graph_continuation(
+            worker_guide=raw_results[-1],
+            host_auth_response=raw_results[0],
+            tool_caller=tool_caller,
+            expected_scope=scope,
+            queries=queries,
+        )
+        result["auth_tool"] = precursor_tool
+        result["authenticated_worker_guide_refreshed"] = True
+        result["read_receipt_replayed"] = False
+        result["startup_replayed"] = False
+        return result
+    finally:
+        for value in (*request_bodies, *raw_results):
             if isinstance(value, (dict, list)):
                 scrub_host_secret_values(value, raw_values=raw_values)
 

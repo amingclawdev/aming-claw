@@ -15,6 +15,7 @@ from agent.cli_agent_service.adapters.codex_desktop import (
 from agent.cli_agent_service.guided_runtime import (
     GuidedRuntimeDispatchError,
     _onboard_refresh_body,
+    orchestrate_runtime_context_authenticated_graph_continuation,
     orchestrate_runtime_context_graph_continuation,
     orchestrate_runtime_context_host_startup,
     orchestrate_runtime_context_implementation_continuation,
@@ -1967,6 +1968,84 @@ def test_graph_continuation_preserves_scope_route_and_scrubs_auth() -> None:
     assert all("raw-fence-graph" not in json.dumps(body) for body in live_bodies)
 
 
+def test_graph_continuation_binds_missing_backlog_from_current_guide_scope() -> None:
+    guide, auth, scope = _graph_continuation_inputs()
+    application = json.loads(guide["content"][0]["text"])
+    graph_body = application["corrected_request_shapes"]["graph_query_body"]
+    graph_body.pop("backlog_id")
+    application["details"] = {
+        "actionable_payloads": {
+            "copy_safe_route_token_scope": {
+                "scope": {"backlog_id": scope["backlog_id"]}
+            }
+        },
+        "unrelated_sibling_packet": {"backlog_id": "AC-FOREIGN-SIBLING"},
+    }
+    guide["content"][0]["text"] = json.dumps(application)
+    calls = []
+
+    result = orchestrate_runtime_context_graph_continuation(
+        worker_guide=guide,
+        host_auth_response=auth,
+        tool_caller=lambda name, body: (
+            calls.append((name, deepcopy(body)))
+            or {
+                "structuredContent": {
+                    "ok": True,
+                    "status": "passed",
+                    "trace_id": "gtrace-current-backlog",
+                }
+            }
+        ),
+        expected_scope=scope,
+        queries=[{"tool": "function_index", "args": {"query": "exact_symbol"}}],
+    )
+
+    assert result["graph_trace_ids"] == ["gtrace-current-backlog"]
+    assert len(calls) == 1
+    assert calls[0][1]["backlog_id"] == scope["backlog_id"]
+
+
+@pytest.mark.parametrize("mode", ["missing", "conflicting", "placeholder"])
+def test_graph_continuation_invalid_current_backlog_is_zero_call(mode) -> None:
+    guide, auth, scope = _graph_continuation_inputs()
+    application = json.loads(guide["content"][0]["text"])
+    graph_body = application["corrected_request_shapes"]["graph_query_body"]
+    calls = []
+
+    if mode == "missing":
+        graph_body.pop("backlog_id")
+    elif mode == "conflicting":
+        application["details"] = {
+            "actionable_payloads": {
+                "copy_safe_route_token_scope": {
+                    "scope": {"backlog_id": "AC-CONFLICTING-BACKLOG"}
+                }
+            }
+        }
+    else:
+        graph_body["backlog_id"] = "<current backlog id>"
+        application["details"] = {
+            "actionable_payloads": {
+                "copy_safe_route_token_scope": {
+                    "scope": {"backlog_id": scope["backlog_id"]}
+                }
+            }
+        }
+    guide["content"][0]["text"] = json.dumps(application)
+
+    with pytest.raises(GuidedRuntimeDispatchError, match="backlog_id"):
+        orchestrate_runtime_context_graph_continuation(
+            worker_guide=guide,
+            host_auth_response=auth,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            expected_scope=scope,
+            queries=[{"tool": "function_index", "args": {"query": "exact_symbol"}}],
+        )
+
+    assert calls == []
+
+
 def test_graph_continuation_conflicting_scope_is_zero_call() -> None:
     guide, auth, scope = _graph_continuation_inputs()
     scope["task_id"] = "conflicting-task"
@@ -2017,6 +2096,201 @@ def test_graph_continuation_ambiguous_guide_is_zero_call() -> None:
             worker_guide=guide,
             host_auth_response=auth,
             tool_caller=lambda name, body: calls.append((name, body)),
+            expected_scope=scope,
+            queries=[{"tool": "function_index", "args": {"query": "exact_symbol"}}],
+        )
+
+    assert calls == []
+
+
+def _authenticated_graph_recovery_inputs():
+    guide, expected_auth_tool = _server_recovery_selected_host_guide(
+        "bounded_post_lineage_replacement_auth_only"
+    )
+    recovery_body = guide["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]["copy_safe_body"]
+    current_scope = {
+        field_name: recovery_body[field_name]
+        for field_name in (
+            "project_id",
+            "backlog_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "target_project_root",
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "route_token_ref",
+            "visible_injection_manifest_hash",
+        )
+    }
+    guide["actionable_payloads"]["copy_safe_route_token_scope"] = {
+        "scope": deepcopy(current_scope)
+    }
+    route = {
+        field_name: current_scope[field_name]
+        for field_name in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "route_token_ref",
+            "visible_injection_manifest_hash",
+        )
+    }
+    graph_body = {
+        "project_id": current_scope["project_id"],
+        "runtime_context_id": current_scope["runtime_context_id"],
+        "task_id": current_scope["task_id"],
+        "parent_task_id": current_scope["parent_task_id"],
+        "target_project_root": current_scope["target_project_root"],
+        "project_root": current_scope["target_project_root"],
+        "repo_root": current_scope["target_project_root"],
+        "worker_role": "mf_sub",
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "tool": "function_index",
+        "args": {"query": "<exact source symbol name>"},
+        "session_token_ref": "wstok-live-after",
+        "route_identity": route,
+    }
+    refreshed_guide = {
+        "ok": True,
+        "corrected_request_shapes": {"graph_query_body": graph_body},
+        "details": {
+            "actionable_payloads": {
+                "copy_safe_route_token_scope": {
+                    "scope": deepcopy(current_scope)
+                }
+            },
+            "unrelated_sibling_packet": {
+                "backlog_id": "AC-FOREIGN-SIBLING",
+                "task_id": "foreign-sibling-task",
+            },
+        },
+    }
+    expected_scope = {
+        "project_id": current_scope["project_id"],
+        "backlog_id": current_scope["backlog_id"],
+        "runtime_context_id": current_scope["runtime_context_id"],
+        "task_id": current_scope["task_id"],
+        "parent_task_id": current_scope["parent_task_id"],
+        "target_project_root": current_scope["target_project_root"],
+        "project_root": current_scope["target_project_root"],
+        "repo_root": current_scope["target_project_root"],
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "route_identity": route,
+    }
+    return guide, refreshed_guide, expected_scope, expected_auth_tool
+
+
+def test_authenticated_graph_continuation_renews_without_replaying_startup() -> None:
+    guide, refreshed_guide, scope, expected_auth_tool = (
+        _authenticated_graph_recovery_inputs()
+    )
+    raw_session = "raw-authenticated-graph-session"
+    raw_fence = "raw-authenticated-graph-fence"
+    auth_response = {
+        "ok": True,
+        "worker_session_token_ref": "wstok-live-after",
+        "worker_host_envelope": {
+            "worker_session_token_ref": "wstok-live-after",
+            "env": {
+                "AMING_WORKER_SESSION_TOKEN": raw_session,
+                "AMING_WORKER_FENCE_TOKEN": raw_fence,
+            },
+        },
+    }
+    calls = []
+
+    def call_tool(name, body):
+        calls.append((name, body))
+        if name == expected_auth_tool:
+            return auth_response
+        if name == "runtime_context_worker_guide":
+            assert body["runtime_context_id"] == scope["runtime_context_id"]
+            assert body["session_token"] == raw_session
+            assert body["fence_token"] == raw_fence
+            assert body["view"] == "all"
+            return {"structuredContent": refreshed_guide}
+        assert name == "graph_query"
+        assert body["backlog_id"] == scope["backlog_id"]
+        assert body["session_token"] == raw_session
+        assert body["fence_token"] == raw_fence
+        return {
+            "ok": True,
+            "status": "passed",
+            "trace_id": "gtrace-authenticated-{}".format(
+                sum(call_name == "graph_query" for call_name, _body in calls)
+            ),
+        }
+
+    result = orchestrate_runtime_context_authenticated_graph_continuation(
+        worker_guide=guide,
+        tool_caller=call_tool,
+        host_identity={
+            "worker_session_id": "live-host-session",
+            "host_session_id": "live-host-session",
+            "host_startup_id": "live-host-startup",
+            "head_commit": "a" * 40,
+        },
+        expected_scope=scope,
+        queries=[
+            {"tool": tool, "args": {"query": "exact_symbol"}}
+            for tool in (
+                "function_index",
+                "function_callers",
+                "function_callees",
+            )
+        ],
+    )
+
+    assert [name for name, _body in calls] == [
+        expected_auth_tool,
+        "runtime_context_worker_guide",
+        "graph_query",
+        "graph_query",
+        "graph_query",
+    ]
+    assert result["graph_trace_ids"] == [
+        "gtrace-authenticated-1",
+        "gtrace-authenticated-2",
+        "gtrace-authenticated-3",
+    ]
+    assert result["auth_tool"] == expected_auth_tool
+    assert result["read_receipt_replayed"] is False
+    assert result["startup_replayed"] is False
+    assert raw_session not in json.dumps(result, sort_keys=True)
+    assert raw_fence not in json.dumps(result, sort_keys=True)
+    assert raw_session not in json.dumps(auth_response, sort_keys=True)
+    assert raw_fence not in json.dumps(auth_response, sort_keys=True)
+    assert all(
+        raw_session not in json.dumps(body, sort_keys=True)
+        and raw_fence not in json.dumps(body, sort_keys=True)
+        for _name, body in calls
+    )
+
+
+def test_authenticated_graph_continuation_scope_conflict_is_zero_call() -> None:
+    guide, _refreshed_guide, scope, _expected_auth_tool = (
+        _authenticated_graph_recovery_inputs()
+    )
+    scope["backlog_id"] = "AC-CONFLICTING-BACKLOG"
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError, match="backlog_id"):
+        orchestrate_runtime_context_authenticated_graph_continuation(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+            },
             expected_scope=scope,
             queries=[{"tool": "function_index", "args": {"query": "exact_symbol"}}],
         )
