@@ -28526,6 +28526,43 @@ def _runtime_context_guide_executable_actions(
     }
 
 
+def _runtime_context_graph_copy_safe_body(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    target_project_root: str,
+    session_token_ref: str,
+    route_identity: Mapping[str, Any],
+    graph_payload_shape: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the one canonical worker graph body shared by all guides."""
+
+    body = dict(graph_payload_shape or {})
+    body.update(
+        {
+            "project_id": project_id,
+            "tool": "function_index",
+            "args": {"query": "<exact source symbol name>"},
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "target_project_root": target_project_root,
+            "worker_role": "mf_sub",
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+            "session_token_ref": session_token_ref,
+            "fence_token": (
+                "<read from env:AMING_WORKER_FENCE_TOKEN at submission time>"
+            ),
+            "route_identity": dict(route_identity),
+            "raw_session_token_exposed": False,
+        }
+    )
+    return body
+
+
 def _runtime_context_worker_guide_response(
     current_state_response: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -30583,22 +30620,16 @@ def _runtime_context_worker_guide_response(
                 "worker_mutations_allowed": False,
             },
         }
-    graph_copy_safe_body = {
-        "project_id": project_id,
-        "tool": "function_index",
-        "args": {"query": "<exact source symbol name>"},
-        **graph_payload_shape,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "target_project_root": target_project_root,
-        "worker_role": "mf_sub",
-        "query_source": "mf_subagent",
-        "query_purpose": "subagent_context_build",
-        "session_token_ref": str(worker_view.get("session_token_ref") or ""),
-        "fence_token": fence_token_placeholder,
-        "route_identity": dict(route_identity),
-    }
+    graph_copy_safe_body = _runtime_context_graph_copy_safe_body(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        target_project_root=target_project_root,
+        session_token_ref=str(worker_view.get("session_token_ref") or ""),
+        route_identity=route_identity,
+        graph_payload_shape=graph_payload_shape,
+    )
     guide_to_facade_coverage = _runtime_context_guide_executable_actions(
         project_id=project_id,
         backlog_id=str(
@@ -126223,36 +126254,50 @@ def _onboard_worker_read_runtime_facade_projection(
     requested_task_id: str = "",
     requested_route_token_ref: str = "",
 ) -> dict[str, Any]:
-    """Join worker read/startup lines to one current RuntimeContext facade."""
+    """Join worker read/startup/graph lines to one RuntimeContext facade."""
 
     projected = dict(next_action)
     selected_line = str(projected.get("line_id") or "").strip()
     if selected_line not in {
         "worker_read_runtime_guide",
         "worker_startup",
+        "worker_graph_context",
     }:
         return projected
 
     startup_selected = selected_line == "worker_startup"
+    graph_selected = selected_line == "worker_graph_context"
     projection_key = (
         "worker_startup_runtime_facade_projection"
         if startup_selected
-        else "worker_read_runtime_facade_projection"
+        else (
+            "worker_graph_runtime_facade_projection"
+            if graph_selected
+            else "worker_read_runtime_facade_projection"
+        )
     )
     projection_schema = (
         "onboard_route_guide.worker_startup_runtime_facade_projection.v1"
         if startup_selected
-        else "onboard_route_guide.worker_read_runtime_facade_projection.v1"
+        else (
+            "onboard_route_guide.worker_graph_runtime_facade_projection.v1"
+            if graph_selected
+            else "onboard_route_guide.worker_read_runtime_facade_projection.v1"
+        )
     )
     blocker_id = (
         "worker_startup_runtime_facade_projection_incomplete"
         if startup_selected
-        else "worker_read_runtime_guide_projection_incomplete"
+        else (
+            "worker_graph_runtime_facade_projection_incomplete"
+            if graph_selected
+            else "worker_read_runtime_guide_projection_incomplete"
+        )
     )
     required_facade = (
         "parallel_branch_startup"
         if startup_selected
-        else "runtime_context_read_receipt"
+        else ("graph_query" if graph_selected else "runtime_context_read_receipt")
     )
 
     def blocked(reason: str, fields: Sequence[str] = ()) -> dict[str, Any]:
@@ -126376,12 +126421,12 @@ def _onboard_worker_read_runtime_facade_projection(
             )
     startup_runtime_context_id = (
         str(projected.get("runtime_context_id") or "").strip()
-        if startup_selected
+        if startup_selected or graph_selected
         else ""
     )
     startup_task_id = (
         str(projected.get("task_id") or "").strip()
-        if startup_selected
+        if startup_selected or graph_selected
         else ""
     )
     if explicit_task_id and startup_selected and (
@@ -126402,6 +126447,7 @@ def _onboard_worker_read_runtime_facade_projection(
             explicit_task_id or startup_task_id
         ),
         allow_post_read_startup=startup_selected,
+        allow_post_startup_graph=graph_selected,
     )
     if dispatch.get("status") != "projected":
         return blocked(
@@ -126596,6 +126642,204 @@ def _onboard_worker_read_runtime_facade_projection(
                 "server_derived": True,
                 "caller_claims_trusted": False,
             },
+        }
+
+    if graph_selected:
+        from .parallel_branch_runtime import runtime_context_has_fence_authority
+
+        completed_worker_lines: set[str] = set()
+        for _index, completed_line in _contract_runtime_completed_lines(record):
+            completed_payload = (
+                completed_line.get("payload")
+                if isinstance(completed_line.get("payload"), Mapping)
+                else {}
+            )
+            completed_identity = {
+                "runtime_context_id": str(
+                    completed_line.get("runtime_context_id")
+                    or completed_payload.get("runtime_context_id")
+                    or ""
+                ).strip(),
+                "task_id": str(
+                    completed_line.get("task_id")
+                    or completed_payload.get("task_id")
+                    or completed_payload.get("worker_task_id")
+                    or ""
+                ).strip(),
+                "parent_task_id": str(
+                    completed_line.get("parent_task_id")
+                    or completed_payload.get("parent_task_id")
+                    or ""
+                ).strip(),
+            }
+            if completed_identity == {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+            }:
+                completed_worker_lines.add(
+                    str(completed_line.get("line_id") or "").strip()
+                )
+        missing_graph_lineage = sorted(
+            {"worker_read_runtime_guide", "worker_startup"}
+            - completed_worker_lines
+        )
+        if missing_graph_lineage:
+            return blocked(
+                "runtime_context_graph_authority_incomplete",
+                missing_graph_lineage,
+            )
+        if (
+            str(getattr(context, "status", "") or "").strip() != "running"
+            or not runtime_context_has_fence_authority(context)
+        ):
+            return blocked(
+                "runtime_context_graph_authority_incomplete",
+                ["runtime_context_status", "fence_token"],
+            )
+
+        worktree_path = str(
+            getattr(context, "worktree_path", "") or target_project_root
+        ).strip()
+        graph_body = _runtime_context_graph_copy_safe_body(
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            target_project_root=target_project_root,
+            session_token_ref=session_token_ref,
+            route_identity=route_identity,
+            graph_payload_shape={
+                "project_id": project_id,
+                "target_project_root": target_project_root,
+                "project_root": target_project_root,
+                "repo_root": target_project_root,
+                "worktree_path": worktree_path,
+                "route_identity": dict(route_identity),
+                "raw_session_token_exposed": False,
+            },
+        )
+        graph_coverage = _runtime_context_guide_executable_actions(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            parent_contract_execution_id=str(
+                record.get("parent_contract_execution_id") or ""
+            ),
+            actionable_payloads={},
+            graph_copy_safe_body=graph_body,
+            qa_verification_guide={},
+            contract_runtime_next_action=(
+                _runtime_next_action_from_guide(record.get("runtime_guide") or {})
+            ),
+        )
+        graph_action = (
+            (graph_coverage.get("actions") or {}).get("graph")
+            if isinstance(graph_coverage.get("actions"), Mapping)
+            else {}
+        )
+        graph_action = (
+            dict(graph_action) if isinstance(graph_action, Mapping) else {}
+        )
+        canonical_graph_body = (
+            dict(graph_action.get("copy_safe_body"))
+            if isinstance(graph_action.get("copy_safe_body"), Mapping)
+            else {}
+        )
+        required_graph_body = {
+            "project_id": project_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "target_project_root": target_project_root,
+            "project_root": target_project_root,
+            "repo_root": target_project_root,
+            "worktree_path": worktree_path,
+            "worker_role": "mf_sub",
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+            "session_token_ref": session_token_ref,
+        }
+        graph_mismatches = [
+            field
+            for field, expected in required_graph_body.items()
+            if str(canonical_graph_body.get(field) or "").strip() != expected
+        ]
+        if canonical_graph_body.get("route_identity") != route_identity:
+            graph_mismatches.append("route_identity")
+        if str(graph_action.get("mcp_tool") or "") != "graph_query":
+            graph_mismatches.append("mcp_tool")
+        graph_lineage = (
+            graph_action.get("canonical_lineage")
+            if isinstance(graph_action.get("canonical_lineage"), Mapping)
+            else {}
+        )
+        for field, expected in {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+        }.items():
+            if str(graph_lineage.get(field) or "").strip() != expected:
+                graph_mismatches.append(
+                    f"canonical_executable_actions.graph.canonical_lineage.{field}"
+                )
+        if graph_mismatches:
+            return blocked(
+                "runtime_context_graph_authority_incomplete",
+                list(dict.fromkeys(graph_mismatches)),
+            )
+
+        worker_scope = [
+            str(path)
+            for path in list(getattr(context, "owned_files", ()) or ())
+            if isinstance(path, str) and path.strip()
+        ]
+        facade_projection = {
+            "schema_version": projection_schema,
+            "status": "ready",
+            "source": (
+                "RuntimeContext.current+ContractRuntime.completed_lines+"
+                "canonical_executable_actions.graph"
+            ),
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "session_token_ref": session_token_ref,
+            "route_authority_source": route_authority_source,
+            "owned_files": worker_scope,
+            "completed_worker_lines": sorted(completed_worker_lines),
+            "zero_write_projection": True,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        }
+        return {
+            **projected,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "action": str(graph_action.get("action") or "run_graph_query"),
+            "interface": str(graph_action.get("facade") or "graph_query"),
+            "facade": str(graph_action.get("facade") or "graph_query"),
+            "mcp_tool": "graph_query",
+            "method": str(graph_action.get("method") or "POST"),
+            "path": str(graph_action.get("path") or ""),
+            "body_source": "copy_safe_body",
+            "action_input": dict(canonical_graph_body),
+            "copy_safe_body": dict(canonical_graph_body),
+            "canonical_executable_action": graph_action,
+            "actionable": True,
+            "host_realization": dict(
+                graph_action.get("host_realization") or {}
+            ),
+            projection_key: facade_projection,
         }
 
     if startup_selected:
@@ -127709,15 +127953,28 @@ def _onboard_route_guide_compact_service_response(
         )
         else {}
     )
+    worker_graph_projection = (
+        next_action.get("worker_graph_runtime_facade_projection")
+        if isinstance(
+            next_action.get("worker_graph_runtime_facade_projection"),
+            Mapping,
+        )
+        else {}
+    )
     selected_contract_line = str(next_action.get("line_id") or "").strip()
     worker_runtime_selected = selected_contract_line in {
         "worker_read_runtime_guide",
         "worker_startup",
+        "worker_graph_context",
     }
     worker_runtime_projection = (
         worker_startup_projection
         if selected_contract_line == "worker_startup"
-        else worker_read_projection
+        else (
+            worker_graph_projection
+            if selected_contract_line == "worker_graph_context"
+            else worker_read_projection
+        )
     )
     worker_runtime_ready = (
         worker_runtime_selected
@@ -127990,6 +128247,9 @@ def _onboard_route_guide_compact_service_response(
             ),
             "worker_startup_runtime_facade_projection": dict(
                 worker_startup_projection
+            ),
+            "worker_graph_runtime_facade_projection": dict(
+                worker_graph_projection
             ),
             "runtime_context_recovery_authority": dict(
                 runtime_context_recovery_authority
@@ -128390,6 +128650,9 @@ def _onboard_route_guide_compact_service_response(
         ),
         "worker_startup_runtime_facade_projection": dict(
             worker_startup_projection
+        ),
+        "worker_graph_runtime_facade_projection": dict(
+            worker_graph_projection
         ),
         "runtime_context_recovery_authority": dict(
             runtime_context_recovery_authority
@@ -157104,6 +157367,7 @@ def _contract_runtime_dispatch_ticket_authority(
     requested_runtime_context_id: str = "",
     requested_task_id: str = "",
     allow_post_read_startup: bool = False,
+    allow_post_startup_graph: bool = False,
 ) -> dict[str, Any]:
     """Project the accepted dispatch in the read or exact post-read window."""
 
@@ -157136,6 +157400,8 @@ def _contract_runtime_dispatch_ticket_authority(
     allowed_next_lines = {"worker_read_runtime_guide"}
     if allow_post_read_startup:
         allowed_next_lines.add("worker_startup")
+    if allow_post_startup_graph:
+        allowed_next_lines.add("worker_graph_context")
     if actual_next_line not in allowed_next_lines:
         return {
             "status": "invalid",
@@ -157259,6 +157525,13 @@ def _contract_runtime_dispatch_ticket_authority(
                 allow_post_read_startup
                 and actual_next_line == "worker_startup"
                 and candidate_line_id == "worker_read_runtime_guide"
+            ):
+                continue
+            if (
+                allow_post_startup_graph
+                and actual_next_line == "worker_graph_context"
+                and candidate_line_id
+                in {"worker_read_runtime_guide", "worker_startup"}
             ):
                 continue
             return {

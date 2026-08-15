@@ -148008,6 +148008,312 @@ def test_compact_worker_read_explicit_task_pin_selects_exact_sibling_zero_write(
     assert "\n".join(conn.iterdump()) == cross_cex_before_db
 
 
+def test_compact_worker_graph_context_projects_exact_sibling_action_zero_write(
+    conn,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
+    )
+    record, write = _rev8_atomic_dispatch_binding_fixture(
+        conn,
+        suffix="compact-worker-graph-context",
+        lane_files=(
+            ("agent/governance/server.py",),
+            ("agent/tests/test_graph_governance_api.py",),
+        ),
+    )
+    dispatch, errors = server._contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        write=write,
+    )
+    assert errors == []
+    dispatch["actor_role"] = "observer"
+    global_worker, pinned_worker = dispatch["payload"]["bounded_workers"]
+
+    completed_worker_lines = []
+    for worker in (global_worker, pinned_worker):
+        for stage_id, line_id, evidence_kind in (
+            (
+                "worker_read",
+                "worker_read_runtime_guide",
+                "read_receipt",
+            ),
+            (
+                "worker_startup",
+                "worker_startup",
+                "mf_subagent_startup",
+            ),
+        ):
+            completed_worker_lines.append(
+                {
+                    "stage_id": stage_id,
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                    "owner_role": "mf_sub",
+                    "actor_role": "mf_sub",
+                    "status": "accepted",
+                    "runtime_context_id": worker["runtime_context_id"],
+                    "task_id": worker["task_id"],
+                    "parent_task_id": worker["parent_task_id"],
+                    "worker_id": worker["worker_id"],
+                    "worker_slot_id": worker["worker_slot_id"],
+                }
+            )
+    next_line = {
+        "stage_id": "worker_graph",
+        "line_id": "worker_graph_context",
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "evidence_kind": "graph_context",
+        "runtime_context_id": global_worker["runtime_context_id"],
+        "task_id": global_worker["task_id"],
+        "parent_task_id": global_worker["parent_task_id"],
+        "worker_id": global_worker["worker_id"],
+        "worker_slot_id": global_worker["worker_slot_id"],
+    }
+    record.update(
+        {
+            "completed_lines": [dispatch, *completed_worker_lines],
+            "contract_chain_id": "cchain-compact-worker-graph-context",
+            "execution_state_revision": 5,
+            "runtime_guide": {
+                "execution": {
+                    "contract_execution_id": record["contract_execution_id"],
+                    "execution_state_revision": 5,
+                },
+                "next_legal_action": next_line,
+            },
+        }
+    )
+    conn.executemany(
+        """
+        UPDATE parallel_branch_runtime_contexts
+           SET status = 'running'
+         WHERE project_id = ? AND runtime_context_id = ?
+        """,
+        [
+            (PID, global_worker["runtime_context_id"]),
+            (PID, pinned_worker["runtime_context_id"]),
+        ],
+    )
+    conn.commit()
+
+    class StaticStore:
+        current = record
+
+        def get(self, execution_id):
+            assert execution_id == record["contract_execution_id"]
+            return self.current
+
+    store = StaticStore()
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: store)
+    current_projection = {
+        "current_contract_execution_id": record["contract_execution_id"],
+        "next_legal_action": next_line,
+    }
+    runtime_resume = {
+        "current_contract_execution_id": record["contract_execution_id"],
+        "next_legal_action": next_line,
+    }
+    before_changes = conn.total_changes
+
+    pinned = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        next_action=next_line,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+        requested_task_id=pinned_worker["task_id"],
+        requested_route_token_ref=pinned_worker["route_token_ref"],
+    )
+
+    assert pinned["actionable"] is True
+    assert pinned["line_id"] == "worker_graph_context"
+    assert pinned["runtime_context_id"] == pinned_worker["runtime_context_id"]
+    assert pinned["task_id"] == pinned_worker["task_id"]
+    assert pinned["mcp_tool"] == "graph_query"
+    assert pinned["canonical_executable_action"]["copy_safe_body"] == pinned[
+        "copy_safe_body"
+    ]
+    pinned_body = pinned["copy_safe_body"]
+    assert pinned_body["runtime_context_id"] == pinned_worker[
+        "runtime_context_id"
+    ]
+    assert pinned_body["task_id"] == pinned_worker["task_id"]
+    pinned_context = parallel_branch_runtime.get_branch_context(
+        conn,
+        PID,
+        pinned_worker["task_id"],
+    )
+    assert pinned_context is not None
+    assert pinned_body["session_token_ref"] == (
+        parallel_branch_runtime.runtime_context_session_token_ref(
+            pinned_context
+        )
+    )
+    assert pinned_body["route_identity"]["route_token_ref"] == pinned_worker[
+        "route_token_ref"
+    ]
+    assert pinned_body["tool"] == "function_index"
+    assert pinned_body["args"] == {"query": "<exact source symbol name>"}
+    assert pinned["worker_graph_runtime_facade_projection"]["status"] == (
+        "ready"
+    )
+    assert global_worker["runtime_context_id"] not in json.dumps(
+        pinned,
+        sort_keys=True,
+    )
+
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        role="mf_sub",
+        work_type="parallel_worker",
+        record=record,
+        next_action=pinned,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+        target_files=list(pinned_worker["owned_files"]),
+        projection_degraded=False,
+    )
+    assert compact["actionable"] is True
+    assert compact["mcp_tool"] == "graph_query"
+    assert compact["copy_safe_body"] == pinned_body
+    assert compact["canonical_executable_action"]["copy_safe_body"] == (
+        pinned_body
+    )
+    capsule = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": compact["guide_capsule_ref"],
+                "sections": ["action_input"],
+                "backlog_id": record["backlog_id"],
+                "role": "mf_sub",
+                "work_type": "parallel_worker",
+            },
+        )
+    )
+    capsule_action = capsule["sections"]["action_input"][
+        "canonical_executable_action"
+    ]
+    assert capsule_action["mcp_tool"] == "graph_query"
+    assert capsule_action["copy_safe_body"] == pinned_body
+
+    from cli_agent_service import guided_runtime
+
+    helper_calls = []
+
+    def helper_tool_caller(tool_name, tool_body):
+        helper_calls.append((tool_name, copy.deepcopy(tool_body)))
+        assert tool_name == "onboard_route_guide"
+        return copy.deepcopy(compact)
+
+    helper_action, helper_body, helper_raw, helper_failure = (
+        guided_runtime._refresh_host_action_packet(
+            tool_caller=helper_tool_caller,
+            refresh_body={
+                "project_id": PID,
+                "backlog_id": record["backlog_id"],
+                "role": "mf_sub",
+                "work_type": "parallel_worker",
+                "task_id": pinned_worker["task_id"],
+                "route_token_ref": pinned_worker["route_token_ref"],
+                "response_view": "compact",
+            },
+            expected_tools=frozenset({"graph_query"}),
+            request_bodies=[],
+            raw_results=[],
+            raw_values=(),
+        )
+    )
+    assert helper_failure is None
+    assert helper_raw == ()
+    assert helper_action["mcp_tool"] == "graph_query"
+    assert helper_body == pinned_body
+    assert [name for name, _body in helper_calls] == [
+        "onboard_route_guide"
+    ]
+
+    unpinned = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        next_action=next_line,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
+    assert unpinned["runtime_context_id"] == global_worker[
+        "runtime_context_id"
+    ]
+
+    before_wrong_route_changes = conn.total_changes
+    before_wrong_route_db = "\n".join(conn.iterdump())
+    wrong_route = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        next_action=next_line,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+        requested_task_id=pinned_worker["task_id"],
+        requested_route_token_ref=global_worker["route_token_ref"],
+    )
+    assert wrong_route["actionable"] is False
+    wrong_route_blocker = wrong_route[
+        "worker_graph_runtime_facade_projection"
+    ]
+    assert wrong_route_blocker["reason"] == (
+        "runtime_context_explicit_task_route_identity_mismatch"
+    )
+    assert wrong_route_blocker["zero_write_rejection"] is True
+    assert conn.total_changes == before_wrong_route_changes
+    assert "\n".join(conn.iterdump()) == before_wrong_route_db
+
+    before_blocker_changes = conn.total_changes
+    before_blocker_db = "\n".join(conn.iterdump())
+    missing_startup = copy.deepcopy(record)
+    missing_startup["completed_lines"] = [
+        line
+        for line in missing_startup["completed_lines"]
+        if not (
+            line.get("line_id") == "worker_startup"
+            and line.get("task_id") == pinned_worker["task_id"]
+        )
+    ]
+    store.current = missing_startup
+    blocked = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        next_action=next_line,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+        requested_task_id=pinned_worker["task_id"],
+        requested_route_token_ref=pinned_worker["route_token_ref"],
+    )
+    assert blocked["actionable"] is False
+    blocker = blocked["worker_graph_runtime_facade_projection"]
+    assert blocker["reason"] == "runtime_context_graph_authority_incomplete"
+    assert blocker["missing_or_mismatched_fields"] == ["worker_startup"]
+    assert blocker["zero_write_rejection"] is True
+    assert conn.total_changes == before_blocker_changes
+    assert "\n".join(conn.iterdump()) == before_blocker_db
+    assert conn.total_changes == before_changes
+
+
 def test_rev8_atomic_dispatch_rejects_overlapping_lane_fences_before_dispatch(conn):
     shared_file = "agent/governance/server.py"
     record, write = _rev8_atomic_dispatch_binding_fixture(
