@@ -22327,6 +22327,10 @@ def _runtime_context_patch_actionable_payload_worker_scope(
         value = actionables.get(key)
         if not isinstance(value, dict):
             continue
+        # A blocked payload deliberately carries no executable body. Do not
+        # turn that fail-closed sentinel into a scope-only MCP submission.
+        if value.get("actionable") is False:
+            continue
         _runtime_context_patch_scope_record(value, files)
         for child_key in (
             "copy_safe_body",
@@ -28021,8 +28025,15 @@ def _runtime_context_guide_executable_actions(
         default_facade: str = "",
         optional_omission_fields: Sequence[str] = (),
     ) -> None:
+        if source.get("actionable") is False:
+            return
         body = source.get("copy_safe_body")
         if not isinstance(body, Mapping) or not body:
+            return
+        if default_tool == "runtime_context_finish_time_worker_attestation" and any(
+            not _runtime_context_non_placeholder_text(body.get(field))
+            for field in ("runtime_context_id", "harness_type")
+        ):
             return
         contract = _guide_canonical_executable_action(
             project_id=project_id,

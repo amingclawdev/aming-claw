@@ -826,7 +826,11 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
     )["ok"] is True
     assert governance_mcp_server._dispatch_tool(
         "runtime_context_finish_time_worker_attestation",
-        {**common, "graph_trace_ids": ["gqt-demo"]},
+        {
+            **common,
+            "harness_type": "codex",
+            "graph_trace_ids": ["gqt-demo"],
+        },
     )["ok"] is True
     assert governance_mcp_server._dispatch_tool(
         "runtime_context_finish_gate",
@@ -878,6 +882,7 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
                 "runtime_context_id": "mfrctx-demo",
                 "session_token": "worker-session",
                 "fence_token": "fence-demo",
+                "harness_type": "codex",
                 "graph_trace_ids": ["gqt-demo"],
             },
         ),
@@ -4237,3 +4242,28 @@ def test_mcp_current_context_online_missing_graph_opens_projects(tmp_path: Path)
     assert "Initialize Project" in actions[0]
     assert "Check Current Project Status" in actions[1]
     assert "Explain Graph Concepts" in actions[2]
+
+
+def test_finish_attestation_missing_runtime_context_id_is_structured_zero_http(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    result = governance_mcp_server._dispatch_tool(
+        "runtime_context_finish_time_worker_attestation",
+        {"project_id": "demo", "harness_type": "codex"},
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_request"
+    assert result["code"] == "mcp_tool_required_arguments_missing"
+    assert result["field"] == "runtime_context_id"
+    assert result["missing_fields"] == ["runtime_context_id"]
+    assert result["zero_write_rejection"] is True
+    assert result["http_request_performed"] is False
+    assert calls == []

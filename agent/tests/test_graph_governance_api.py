@@ -156585,7 +156585,10 @@ def test_guide_literal_stage_facades_have_one_executable_copy_safe_body():
             }
         },
         "finish_time_worker_attestation_submission": {
-            "copy_safe_body": {"runtime_context_id": "mfrctx-guide-stages"}
+            "copy_safe_body": {
+                "runtime_context_id": "mfrctx-guide-stages",
+                "harness_type": "codex",
+            }
         },
         "finish_gate_facade_payload_skeleton": {
             "server_derived": True,
@@ -158276,3 +158279,67 @@ def test_bounded_replacement_graph_trace_negatives_fail_closed(
         )
     assert exc_info.value.code == "runtime_context_graph_trace_evidence_rejected"
     assert conn.total_changes == before_changes
+
+
+def test_blocked_finish_attestation_stays_empty_and_non_executable_after_scope_patch():
+    blocked = {
+        "schema_version": "runtime_context.finish_time_worker_attestation_submission.v1",
+        "status": "blocked_source_evidence_conflict",
+        "actionable": False,
+        "copy_safe_body": {},
+        "body": {},
+    }
+    actionables = {
+        "finish_time_worker_attestation_submission": copy.deepcopy(blocked),
+        "finish_time_worker_attestation_body": copy.deepcopy(blocked),
+    }
+
+    server._runtime_context_patch_actionable_payload_worker_scope(
+        actionables,
+        ["src/app.js"],
+    )
+    coverage = server._runtime_context_guide_executable_actions(
+        project_id=PID,
+        backlog_id="AC-BLOCKED-FINISH-ATTESTATION",
+        contract_execution_id="cex-blocked-finish-attestation",
+        parent_contract_execution_id="cex-parent",
+        actionable_payloads=actionables,
+        graph_copy_safe_body={},
+        qa_verification_guide={},
+        contract_runtime_next_action={},
+    )
+
+    assert actionables["finish_time_worker_attestation_submission"] == blocked
+    assert actionables["finish_time_worker_attestation_body"] == blocked
+    assert "attestation" not in coverage["actions"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"harness_type": "codex"},
+        {"runtime_context_id": "mfrctx-finish"},
+        {
+            "runtime_context_id": "<runtime-context-id>",
+            "harness_type": "codex",
+        },
+    ],
+)
+def test_finish_attestation_executable_action_requires_concrete_identity(body):
+    coverage = server._runtime_context_guide_executable_actions(
+        project_id=PID,
+        backlog_id="AC-FINISH-IDENTITY",
+        contract_execution_id="cex-finish-identity",
+        parent_contract_execution_id="cex-parent",
+        actionable_payloads={
+            "finish_time_worker_attestation_submission": {
+                "actionable": True,
+                "copy_safe_body": body,
+            }
+        },
+        graph_copy_safe_body={},
+        qa_verification_guide={},
+        contract_runtime_next_action={},
+    )
+
+    assert "attestation" not in coverage["actions"]

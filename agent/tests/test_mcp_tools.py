@@ -4560,3 +4560,46 @@ def test_mcp_manager_start_uses_posix_script_on_macos(monkeypatch):
         ("GET", "/api/manager/health", None),
         ("GET", "/api/manager/health", None),
     ]
+
+
+def test_finish_attestation_schema_and_missing_identity_are_zero_http():
+    for registry in (governance_mcp_server.TOOLS, mcp_tools.TOOLS):
+        schema = next(
+            item["inputSchema"]
+            for item in registry
+            if item["name"] == "runtime_context_finish_time_worker_attestation"
+        )
+        assert {
+            "project_id",
+            "runtime_context_id",
+            "harness_type",
+        }.issubset(schema["required"])
+
+    cases = [
+        (
+            {"project_id": "aming-claw", "harness_type": "codex"},
+            ["runtime_context_id"],
+        ),
+        (
+            {"runtime_context_id": "mfrctx-demo", "harness_type": "codex"},
+            ["project_id"],
+        ),
+        (
+            {"project_id": "aming-claw", "runtime_context_id": "mfrctx-demo"},
+            ["harness_type"],
+        ),
+    ]
+    for args, missing_fields in cases:
+        recorder = _Recorder()
+        result = _dispatcher(recorder).dispatch(
+            "runtime_context_finish_time_worker_attestation",
+            args,
+        )
+        assert result["ok"] is False
+        assert result["error"] == "invalid_request"
+        assert result["code"] == "mcp_tool_required_arguments_missing"
+        assert result["field"] == missing_fields[0]
+        assert result["missing_fields"] == missing_fields
+        assert result["zero_write_rejection"] is True
+        assert result["http_request_performed"] is False
+        assert recorder.calls == []

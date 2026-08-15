@@ -3703,11 +3703,11 @@ TOOLS: list[dict] = [
     },
     {
         "name": "runtime_context_finish_time_worker_attestation",
-        "description": "Worker-authored canonical Runtime Context finish-time self-attestation facade. Consumes the exact source-backed ContractRuntime worker_commit and rejects later HEAD or worktree drift.",
+        "description": "Worker-authored canonical Runtime Context finish-time self-attestation facade. Consumes the exact source-backed ContractRuntime worker_commit and rejects later HEAD or worktree drift. Requires harness_type; Codex workers must send harness_type='codex' from the worker-guide copy_safe_body.",
         "inputSchema": {
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),
-            "required": ["project_id", "runtime_context_id"],
+            "required": ["project_id", "runtime_context_id", "harness_type"],
         },
     },
     {
@@ -4656,6 +4656,55 @@ def _mf_parallel_enter_project_id_rejection() -> dict[str, Any]:
     }
 
 
+_RUNTIME_CONTEXT_IDENTITY_REQUIRED_TOOLS = frozenset(
+    {
+        "runtime_context_current",
+        "runtime_context_worker_guide",
+        "runtime_context_read_receipt",
+        "runtime_context_implementation_evidence",
+        "runtime_context_scope_insufficiency_request",
+        "runtime_context_worker_commit",
+        "runtime_context_finish_time_worker_attestation",
+        "runtime_context_finish_gate",
+        "runtime_context_session_token_initial_join",
+        "runtime_context_session_token_reissue",
+        "runtime_context_session_token_rejoin",
+    }
+)
+
+
+def _runtime_context_required_argument_rejection(
+    name: str,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    if name not in _RUNTIME_CONTEXT_IDENTITY_REQUIRED_TOOLS:
+        return {}
+    required = ["project_id", "runtime_context_id"]
+    if name == "runtime_context_finish_time_worker_attestation":
+        required.append("harness_type")
+    missing = [
+        field
+        for field in required
+        if not str(args.get(field) or "").strip()
+    ]
+    if not missing:
+        return {}
+    return {
+        "ok": False,
+        "error": "invalid_request",
+        "code": "mcp_tool_required_arguments_missing",
+        "tool": name,
+        "field": missing[0],
+        "missing_fields": missing,
+        "expected": "non_empty_required_arguments",
+        "actual": "missing_or_empty",
+        "source": "runtime_mcp.ToolDispatcher.dispatch.pre_http_argument_gate",
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "http_request_performed": False,
+    }
+
+
 class ToolDispatcher:
     """Routes MCP tool calls to governance API or in-process worker pool."""
 
@@ -4991,6 +5040,12 @@ class ToolDispatcher:
         args = dict(args or {})
         if worker_host_envelope_present() and name in WORKER_MCP_HOST_ONLY_TOOLS:
             raise ValueError("host-only authentication tool is unavailable in worker MCP")
+        required_argument_rejection = _runtime_context_required_argument_rejection(
+            name,
+            args,
+        )
+        if required_argument_rejection:
+            return required_argument_rejection
         # --- Task tools ---
         if name == "task_create":
             pid = args["project_id"]
