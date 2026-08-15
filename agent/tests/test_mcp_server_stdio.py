@@ -488,7 +488,7 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert stderr == ""
     tools = responses[0]["result"]["tools"]
     schema_meta = responses[0]["result"]["_meta"]["aming_claw_tool_schema"]
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-13.1"
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-15.1"
     assert schema_meta["loaded_client_tool_schema_version"] == (
         MCP_TOOL_SCHEMA_VERSION
     )
@@ -1764,8 +1764,12 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields
         "visible_injection_manifest_hash",
         "profile_requirements",
         "retry_policy",
+        "worker_slot_id",
+        "branch_ref",
         "owned_files",
         "target_files",
+        "acceptance_criteria",
+        "allocation_precheck",
         "route_identity",
         "canonical_route_identity",
         "parent_route_identity",
@@ -1792,6 +1796,10 @@ def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields
     assert properties["target_files"]["items"]["type"] == "string"
     assert properties["profile_requirements"]["type"] == "object"
     assert properties["retry_policy"]["type"] == "object"
+    assert properties["worker_slot_id"]["type"] == "string"
+    assert properties["branch_ref"]["type"] == "string"
+    assert properties["acceptance_criteria"]["type"] == "array"
+    assert properties["allocation_precheck"]["type"] == "object"
     assert properties["route_identity"]["type"] == "object"
     assert properties["canonical_route_identity"]["type"] == "object"
     assert properties["parent_route_identity"]["type"] == "object"
@@ -1932,8 +1940,12 @@ def test_governance_mcp_parallel_branch_allocate_schema_and_dispatch(monkeypatch
         "visible_injection_manifest_hash",
         "profile_requirements",
         "retry_policy",
+        "worker_slot_id",
+        "branch_ref",
         "owned_files",
         "target_files",
+        "acceptance_criteria",
+        "allocation_precheck",
         "route_identity",
         "canonical_route_identity",
         "parent_route_identity",
@@ -2000,8 +2012,28 @@ def test_governance_mcp_parallel_branch_allocate_precheck_dispatch(monkeypatch):
                         "backlog_id": "AC-PRECHECK",
                         "contract_execution_id": "cex-precheck",
                         "worker_id": "slot-a",
+                        "worker_slot_id": "slot-a",
                         "route_token_ref": "rtok-precheck-a",
+                        "branch_ref": "refs/heads/codex/precheck-a",
                         "owned_files": ["src/a.py"],
+                        "target_files": ["src/a.py"],
+                        "acceptance_criteria": [
+                            {
+                                "id": "AC-PRECHECK",
+                                "required_scope": {
+                                    "kind": "files",
+                                    "files": ["src/a.py"],
+                                },
+                            }
+                        ],
+                        "allocation_precheck": {
+                            "schema_version": (
+                                "parallel_branch_allocate_precheck.receipt.v2"
+                            ),
+                            "status": "ready",
+                            "submit_unchanged": True,
+                            "authority_hash": "sha256:signed-precheck",
+                        },
                     }
                 ],
             }
@@ -2064,11 +2096,7 @@ def test_governance_mcp_parallel_branch_allocate_precheck_dispatch(monkeypatch):
     assert calls[-1] == (
         "POST",
         "/api/graph-governance/aming-claw/parallel-branches/allocate",
-        {
-            key: value
-            for key, value in allocation_body.items()
-            if key != "project_id"
-        },
+        allocation_body,
     )
 
 

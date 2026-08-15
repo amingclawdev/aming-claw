@@ -814,6 +814,13 @@ def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
         "stage_type": {"type": "string"},
         "agent_id": {"type": "string"},
         "worker_id": {"type": "string"},
+        "worker_slot_id": {
+            "type": "string",
+            "description": (
+                "Canonical worker slot identity copied unchanged from "
+                "parallel_branch_allocate_precheck."
+            ),
+        },
         "actor": {"type": "string"},
         "attempt": {"type": "integer"},
         "profile_requirements": {
@@ -849,6 +856,13 @@ def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
         },
         "ref_name": {"type": "string"},
         "target_branch": {"type": "string"},
+        "branch_ref": {
+            "type": "string",
+            "description": (
+                "Canonical worker branch ref copied unchanged from "
+                "parallel_branch_allocate_precheck."
+            ),
+        },
         "base_commit": {"type": "string"},
         "target_head_commit": {"type": "string"},
         "merge_queue_id": {
@@ -881,6 +895,26 @@ def _parallel_branch_allocate_schema_properties() -> dict[str, Any]:
             "type": "array",
             "items": {"type": "string"},
             "description": "Alias for dispatch-visible owned_files scope.",
+        },
+        "acceptance_criteria": {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "object"},
+                ]
+            },
+            "description": (
+                "Server-normalized acceptance scope copied unchanged from "
+                "parallel_branch_allocate_precheck."
+            ),
+        },
+        "allocation_precheck": {
+            "type": "object",
+            "description": (
+                "Server-signed allocation precheck receipt. The complete object "
+                "must be forwarded unchanged to parallel_branch_allocate."
+            ),
         },
         "route_identity": {
             "type": "object",
@@ -3885,10 +3919,14 @@ def _dispatch_tool(name: str, args: dict) -> Any:
 
     if name == "parallel_branch_allocate":
         pid = args["project_id"]
+        preserve_signed_project_id = isinstance(
+            args.get("allocation_precheck"), dict
+        )
         body = {
             key: value
             for key, value in args.items()
-            if key != "project_id" and value is not None
+            if value is not None
+            and (key != "project_id" or preserve_signed_project_id)
         }
         return _http(
             "POST",

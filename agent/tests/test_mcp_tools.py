@@ -3688,6 +3688,10 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     runtime_text_props = runtime_text["inputSchema"]["properties"]
     assert allocate_props["profile_requirements"]["type"] == "object"
     assert allocate_props["retry_policy"]["type"] == "object"
+    assert allocate_props["worker_slot_id"]["type"] == "string"
+    assert allocate_props["branch_ref"]["type"] == "string"
+    assert allocate_props["acceptance_criteria"]["type"] == "array"
+    assert allocate_props["allocation_precheck"]["type"] == "object"
     assert runtime_text["inputSchema"]["required"] == [
         "project_id",
         "backlog_id",
@@ -3876,8 +3880,28 @@ def test_mcp_parallel_branch_allocate_precheck_routes_atomic_body_unchanged():
                             "backlog_id": "AC-PRECHECK",
                             "contract_execution_id": "cex-precheck",
                             "worker_id": "slot-a",
+                            "worker_slot_id": "slot-a",
                             "route_token_ref": "rtok-precheck-a",
+                            "branch_ref": "refs/heads/codex/precheck-a",
                             "owned_files": ["src/a.py"],
+                            "target_files": ["src/a.py"],
+                            "acceptance_criteria": [
+                                {
+                                    "id": "AC-PRECHECK",
+                                    "required_scope": {
+                                        "kind": "files",
+                                        "files": ["src/a.py"],
+                                    },
+                                }
+                            ],
+                            "allocation_precheck": {
+                                "schema_version": (
+                                    "parallel_branch_allocate_precheck.receipt.v2"
+                                ),
+                                "status": "ready",
+                                "submit_unchanged": True,
+                                "authority_hash": "sha256:signed-precheck",
+                            },
                         }
                     ],
                 }
@@ -3934,11 +3958,7 @@ def test_mcp_parallel_branch_allocate_precheck_routes_atomic_body_unchanged():
     assert recorder.calls[-1] == (
         "POST",
         "/api/graph-governance/aming-claw/parallel-branches/allocate",
-        {
-            key: value
-            for key, value in allocation_body.items()
-            if key != "project_id"
-        },
+        allocation_body,
     )
 
 
@@ -4274,7 +4294,7 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
 
 
 def test_current_mcp_schema_bump_marks_prior_client_stale():
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-13.1"
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-15.1"
     allocate_properties = _tool_properties("parallel_branch_allocate")
     assert allocate_properties["profile_requirements"]["type"] == "object"
     assert allocate_properties["retry_policy"]["type"] == "object"
@@ -4286,8 +4306,8 @@ def test_current_mcp_schema_bump_marks_prior_client_stale():
     )
 
     assert compatibility["loaded_client_tool_schema_version"] == "2026-08-02.3"
-    assert compatibility["server_tool_schema_version"] == "2026-08-13.1"
-    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-13.1"
+    assert compatibility["server_tool_schema_version"] == "2026-08-15.1"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-15.1"
     assert compatibility["client_schema_fresh"] is False
     assert compatibility["stale_client_possible"] is True
 
