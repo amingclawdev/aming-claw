@@ -100488,6 +100488,78 @@ def _resolve_contract_runtime_observer_proof(
     }
 
 
+def _contract_runtime_bind_observer_dispatch_transport_proof(
+    record: Mapping[str, Any],
+    observer_proof: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind copy-safe observer transport proof to an atomic dispatch body.
+
+    The dispatch writer body is copied from the current/guide response into a
+    later MCP call.  The MCP transport authenticates as the coordinator by
+    default, so an observer-owned body must carry the already-validated opaque
+    observer session id and route-token ref.  These fields are transport proof
+    only: ``_contract_runtime_line_write_body`` does not persist them as line
+    evidence.
+    """
+
+    if not isinstance(observer_proof, Mapping):
+        return dict(record)
+    observer_session_id = str(
+        observer_proof.get("observer_session_id") or ""
+    ).strip()
+    route_token_ref = str(observer_proof.get("route_token_ref") or "").strip()
+    if (
+        str(observer_proof.get("role") or "").strip() != "observer"
+        or not observer_session_id
+        or not route_token_ref
+    ):
+        return dict(record)
+
+    projected = dict(record)
+    guide = (
+        dict(projected.get("runtime_guide") or {})
+        if isinstance(projected.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_action = (
+        dict(guide.get("next_legal_action") or {})
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if (
+        str(next_action.get("line_id") or "").strip()
+        != "observer_dispatch_bounded_workers"
+        or str(next_action.get("owner_role") or "").strip() != "observer"
+    ):
+        return projected
+
+    safe_copy = (
+        dict(guide.get("writer_role_safe_copy_payload") or {})
+        if isinstance(guide.get("writer_role_safe_copy_payload"), Mapping)
+        else {}
+    )
+    copy_payload = (
+        dict(safe_copy.get("copy_payload") or {})
+        if isinstance(safe_copy.get("copy_payload"), Mapping)
+        else {}
+    )
+    if (
+        str(copy_payload.get("line_id") or "").strip()
+        != "observer_dispatch_bounded_workers"
+        or str(copy_payload.get("actor_role") or "").strip() != "observer"
+    ):
+        return projected
+
+    copy_payload["observer_session_id"] = observer_session_id
+    copy_payload["observer_route_token_ref"] = route_token_ref
+    safe_copy["copy_payload"] = copy_payload
+    guide["writer_role_safe_copy_payload"] = safe_copy
+    next_action["writer_role_safe_copy_payload"] = dict(safe_copy)
+    guide["next_legal_action"] = next_action
+    projected["runtime_guide"] = guide
+    return projected
+
+
 def _contract_runtime_next_line(record: Mapping[str, Any]) -> Mapping[str, Any]:
     guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
     next_line = guide.get("next_legal_action") if isinstance(guide, Mapping) else {}
@@ -101912,6 +101984,7 @@ def _contract_runtime_effective_actor_role(
         contract_execution_id=contract_execution_id,
     )
     if proof:
+        ctx._contract_runtime_observer_proof = dict(proof)
         return "observer"
     return role
 
@@ -168231,6 +168304,10 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
                 conn,
                 contract_execution_id=contract_execution_id,
                 actor_role=actor_role,
+            )
+            record = _contract_runtime_bind_observer_dispatch_transport_proof(
+                record,
+                getattr(ctx, "_contract_runtime_observer_proof", None),
             )
         except StalePinnedContractExecutionError as exc:
             return _contract_runtime_stale_recovery_projection(

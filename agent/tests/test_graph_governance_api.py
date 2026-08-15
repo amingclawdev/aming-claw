@@ -106157,6 +106157,47 @@ def test_cli_agent_ticket_profile_requirements_canonicalize_exact_desktop_alias(
     )
 
 
+@pytest.mark.parametrize(
+    ("line_id", "owner_role"),
+    [
+        ("worker_implementation", "mf_sub"),
+        ("qa_independent_verification", "qa"),
+    ],
+)
+def test_observer_dispatch_transport_proof_does_not_widen_other_roles(
+    line_id,
+    owner_role,
+):
+    copy_payload = {
+        "line_id": line_id,
+        "actor_role": owner_role,
+    }
+    record = {
+        "runtime_guide": {
+            "next_legal_action": {
+                "line_id": line_id,
+                "owner_role": owner_role,
+            },
+            "writer_role_safe_copy_payload": {
+                "copy_payload": copy_payload,
+            },
+        }
+    }
+
+    projected = server._contract_runtime_bind_observer_dispatch_transport_proof(
+        record,
+        {
+            "role": "observer",
+            "observer_session_id": "obs-must-not-leak",
+            "route_token_ref": "rtok-must-not-leak",
+        },
+    )
+
+    assert projected == record
+    assert "observer_session_id" not in copy_payload
+    assert "observer_route_token_ref" not in copy_payload
+
+
 def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_union(
     conn,
     tmp_path,
@@ -106534,17 +106575,81 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
     )
     conn.commit()
 
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-dispatch-copy-safe-submit",
+    )
+    observer_submit_route_ref = "rtok-dispatch-copy-safe-submit"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=observer_submit_route_ref,
+        allowed_actions=[
+            "contract_runtime_current",
+            "contract_runtime_submit_line",
+        ],
+        target_files=row_files,
+    )
+    conn.commit()
+
+    changes_before_wrong_proof = conn.total_changes
+    with pytest.raises(PermissionDeniedError) as wrong_proof:
+        server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {"project_id": PID, "contract_execution_id": execution_id},
+                "coordinator",
+                method="GET",
+                query={
+                    "observer_session_id": observer_session_id,
+                    "observer_route_token_ref": "rtok-wrong-dispatch-copy-safe",
+                },
+            )
+        )
+    assert wrong_proof.value.code == "permission_denied"
+    assert conn.total_changes == changes_before_wrong_proof
+
     current = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": execution_id},
-            "observer",
+            "coordinator",
             method="GET",
+            query={
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": observer_submit_route_ref,
+            },
         )
     )
+    assert current["actor_role"] == "observer"
     next_action = current["next_legal_action"]
     assert next_action["line_id"] == "observer_dispatch_bounded_workers"
     assert next_action["copy_safe_dispatch_ready"] is True
     copy_body = next_action["writer_role_safe_copy_payload"]["copy_payload"]
+    assert copy_body["observer_session_id"] == observer_session_id
+    assert copy_body["observer_route_token_ref"] == (
+        observer_submit_route_ref
+    )
+    missing_proof_body = dict(copy_body)
+    missing_proof_body.pop("observer_session_id")
+    missing_proof_body.pop("observer_route_token_ref")
+    revision_before_missing_proof = server._contract_runtime_store(conn).get(
+        execution_id
+    )["execution_state_revision"]
+    changes_before_missing_proof = conn.total_changes
+    missing_proof = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "coordinator",
+            method="POST",
+            body=missing_proof_body,
+        )
+    )
+    assert missing_proof["ok"] is False
+    assert missing_proof["actor_role"] == "coordinator"
+    assert conn.total_changes == changes_before_missing_proof
+    assert server._contract_runtime_store(conn).get(execution_id)[
+        "execution_state_revision"
+    ] == revision_before_missing_proof
     dispatch_body = copy_body["payload"]
     assert dispatch_body["schema_version"] == (
         "mf_parallel.atomic_two_worker_dispatch.v1"
@@ -106650,8 +106755,12 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
     renewed_current = server.handle_project_contract_runtime_current_state(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": execution_id},
-            "observer",
+            "coordinator",
             method="GET",
+            query={
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": observer_submit_route_ref,
+            },
         )
     )
     assert conn.total_changes == before_projection_changes
@@ -106723,7 +106832,7 @@ def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_unio
     accepted = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": execution_id},
-            "observer",
+            "coordinator",
             method="POST",
             body=copy_body,
         )
