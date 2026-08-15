@@ -212,6 +212,103 @@ _HOST_PRECURSOR_ACTION_PATHS = (
     ("details", "compatibility", "host_precursor_action"),
     ("sections", "action_input", "host_precursor_action"),
 )
+_HOST_RECOVERY_ELIGIBILITY_PATHS = (
+    ("session_token_rejoin_eligibility",),
+    ("actionable_payloads", "session_token_rejoin_eligibility"),
+    ("details", "session_token_rejoin_eligibility"),
+    ("details", "diagnostics", "session_token_rejoin_eligibility"),
+    ("details", "actionable_payloads", "session_token_rejoin_eligibility"),
+    ("details", "compatibility", "session_token_rejoin_eligibility"),
+    (
+        "details",
+        "compatibility",
+        "actionable_payloads",
+        "session_token_rejoin_eligibility",
+    ),
+)
+_HOST_REJOIN_ACTION_PATHS = (
+    ("session_token_rejoin_submission",),
+    ("session_renewal_hints", "rejoin"),
+    ("canonical_executable_actions", "rejoin"),
+    ("guide_to_facade_coverage", "actions", "rejoin"),
+    ("actionable_payloads", "session_token_rejoin_submission"),
+    ("actionable_payloads", "session_renewal_hints", "rejoin"),
+    ("actionable_payloads", "canonical_executable_actions", "rejoin"),
+    (
+        "actionable_payloads",
+        "guide_to_facade_coverage",
+        "actions",
+        "rejoin",
+    ),
+    ("details", "session_token_rejoin_submission"),
+    ("details", "session_renewal_hints", "rejoin"),
+    ("details", "canonical_executable_actions", "rejoin"),
+    ("details", "guide_to_facade_coverage", "actions", "rejoin"),
+    ("details", "actionable_payloads", "session_token_rejoin_submission"),
+    ("details", "actionable_payloads", "session_renewal_hints", "rejoin"),
+    ("details", "actionable_payloads", "canonical_executable_actions", "rejoin"),
+    (
+        "details",
+        "actionable_payloads",
+        "guide_to_facade_coverage",
+        "actions",
+        "rejoin",
+    ),
+    ("details", "compatibility", "session_token_rejoin_submission"),
+    ("details", "compatibility", "session_renewal_hints", "rejoin"),
+    (
+        "details",
+        "compatibility",
+        "canonical_executable_actions",
+        "rejoin",
+    ),
+    (
+        "details",
+        "compatibility",
+        "actionable_payloads",
+        "session_token_rejoin_submission",
+    ),
+    (
+        "details",
+        "compatibility",
+        "actionable_payloads",
+        "session_renewal_hints",
+        "rejoin",
+    ),
+)
+_HOST_REISSUE_ACTION_PATHS = (
+    ("session_token_reissue_submission",),
+    ("session_renewal_hints", "reissue"),
+    ("actionable_payloads", "session_token_reissue_submission"),
+    ("actionable_payloads", "session_renewal_hints", "reissue"),
+    (
+        "session_token_rejoin_eligibility",
+        "session_token_reissue_submission",
+    ),
+    ("details", "session_token_reissue_submission"),
+    ("details", "session_renewal_hints", "reissue"),
+    ("details", "actionable_payloads", "session_token_reissue_submission"),
+    ("details", "actionable_payloads", "session_renewal_hints", "reissue"),
+    (
+        "details",
+        "session_token_rejoin_eligibility",
+        "session_token_reissue_submission",
+    ),
+    (
+        "details",
+        "diagnostics",
+        "session_token_rejoin_eligibility",
+        "session_token_reissue_submission",
+    ),
+    ("details", "compatibility", "session_token_reissue_submission"),
+    ("details", "compatibility", "session_renewal_hints", "reissue"),
+    (
+        "details",
+        "compatibility",
+        "actionable_payloads",
+        "session_token_reissue_submission",
+    ),
+)
 _HOST_CONTINUATION_ACTION_PATHS = (
     ("canonical_executable_action",),
     ("action_input", "canonical_executable_action"),
@@ -236,6 +333,9 @@ _HOST_AUTH_TOOLS = frozenset(
 _HOST_AUTH_REQUIRED_FIELDS = tuple(
     """project_id runtime_context_id task_id worker_session_id
     session_token_ref reason""".split()
+)
+_HOST_REISSUE_TOOL_FIELDS = _INITIAL_JOIN_TOOL_FIELDS | frozenset(
+    {"session_token", "fence_token"}
 )
 _IMPLEMENTATION_WRITER_BINDING_FIELDS = (
     "backlog_id",
@@ -915,6 +1015,132 @@ def _host_action_packet(
     return next(iter(packets.values()))
 
 
+def _declared_host_auth_packet(
+    value: Any,
+    *,
+    paths: Sequence[Sequence[str]],
+    expected_tool: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Resolve one fixed-path auth packet, including tool-less server submissions."""
+
+    try:
+        blocks = mcp_application_mapping_blocks(value, paths=paths)
+    except ServiceError as exc:
+        raise GuidedRuntimeDispatchError(
+            "runtime context recovery action could not be decoded",
+            status="invalid_host_orchestration",
+        ) from exc
+    packets: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for block in blocks:
+        declared_tool = _text(
+            block.get("mcp_tool")
+            or block.get("tool")
+            or block.get("legacy_tool")
+            or block.get("facade")
+        )
+        if declared_tool and declared_tool != expected_tool:
+            raise GuidedRuntimeDispatchError(
+                "runtime context recovery action tool conflicts with its mode",
+                status="invalid_host_orchestration",
+            )
+        body = block.get("copy_safe_body")
+        if not isinstance(body, Mapping):
+            body = block.get("body")
+        if not isinstance(body, Mapping):
+            continue
+        action = _json_round_trip(block, "host recovery action")
+        action["mcp_tool"] = expected_tool
+        normalized_body = _json_round_trip(body, "host recovery action body")
+        identity = json.dumps(
+            {"tool": expected_tool, "copy_safe_body": normalized_body},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        packets[identity] = (action, normalized_body)
+    if not packets:
+        return None
+    if len(packets) != 1:
+        raise GuidedRuntimeDispatchError(
+            "runtime context recovery action is ambiguous",
+            status="invalid_host_orchestration",
+        )
+    return next(iter(packets.values()))
+
+
+def _server_declared_recovery_packet(
+    value: Any,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Select the server-authorized auth recovery before legacy initial join."""
+
+    try:
+        eligibility_blocks = mcp_application_mapping_blocks(
+            value, paths=_HOST_RECOVERY_ELIGIBILITY_PATHS
+        )
+    except ServiceError as exc:
+        raise GuidedRuntimeDispatchError(
+            "runtime context recovery eligibility could not be decoded",
+            status="invalid_host_orchestration",
+        ) from exc
+    if not eligibility_blocks:
+        return None
+
+    eligibility_values = {
+        block.get("eligible")
+        for block in eligibility_blocks
+        if "eligible" in block
+    }
+    modes = {
+        _text(block.get("mode"))
+        for block in eligibility_blocks
+        if _text(block.get("mode"))
+    }
+    if len(eligibility_values) != 1 or len(modes) != 1:
+        raise GuidedRuntimeDispatchError(
+            "runtime context recovery eligibility is missing or ambiguous",
+            status="invalid_host_orchestration",
+        )
+    eligible = next(iter(eligibility_values)) is True
+    mode = next(iter(modes))
+    blockers = []
+    for block in eligibility_blocks:
+        for field_name in ("blockers", "errors"):
+            value_blockers = block.get(field_name)
+            if isinstance(value_blockers, (list, tuple)):
+                blockers.extend(item for item in value_blockers if _text(item))
+            elif _text(value_blockers):
+                blockers.append(value_blockers)
+    if not eligible or mode == "blocked" or blockers:
+        raise GuidedRuntimeDispatchError(
+            "runtime context server-declared auth recovery is blocked",
+            status="invalid_host_orchestration",
+        )
+
+    if mode == "safe_ref_prestartup_reissue":
+        expected_tool = "runtime_context_session_token_reissue"
+        paths = _HOST_REISSUE_ACTION_PATHS
+    elif mode in {
+        "pre_lineage_bootstrap_auth_only",
+        "active_context_auth_only",
+        "bounded_post_lineage_replacement_auth_only",
+    }:
+        expected_tool = "runtime_context_session_token_rejoin"
+        paths = _HOST_REJOIN_ACTION_PATHS
+    else:
+        raise GuidedRuntimeDispatchError(
+            "runtime context server-declared auth recovery mode is unsupported",
+            status="invalid_host_orchestration",
+        )
+    packet = _declared_host_auth_packet(
+        value, paths=paths, expected_tool=expected_tool
+    )
+    if packet is None:
+        raise GuidedRuntimeDispatchError(
+            "runtime context server-declared auth recovery packet is missing",
+            status="invalid_host_orchestration",
+        )
+    return packet
+
+
 def _onboard_refresh_body(guide: Mapping[str, Any]) -> dict[str, Any]:
     project_id = _first_deep_text(guide, "project_id")
     backlog_id = _first_deep_text(guide, "backlog_id")
@@ -1134,22 +1360,36 @@ def _orchestrate_refreshing_host_startup(
             "runtime context host precursor tool is not authorized",
             status="invalid_host_orchestration",
         )
+    precursor_allowed_fields = (
+        _HOST_REISSUE_TOOL_FIELDS
+        if precursor_tool == "runtime_context_session_token_reissue"
+        else _INITIAL_JOIN_TOOL_FIELDS
+    )
     _validate_placeholder_contract(
-        (("host_precursor", precursor_template, _INITIAL_JOIN_TOOL_FIELDS),)
+        (("host_precursor", precursor_template, precursor_allowed_fields),)
     )
     _assert_host_action_scope(
         precursor_template, values, label="host precursor packet"
     )
-    precursor_required = (
-        _INITIAL_REQUIRED_FIELDS
-        if precursor_tool == "runtime_context_session_token_initial_join"
-        else _HOST_AUTH_REQUIRED_FIELDS
-    )
+    if precursor_tool == "runtime_context_session_token_initial_join":
+        precursor_required = _INITIAL_REQUIRED_FIELDS
+        precursor_force_fields = _INITIAL_FORCE_FIELDS
+    elif precursor_tool == "runtime_context_session_token_reissue":
+        precursor_required = (
+            "project_id",
+            "runtime_context_id",
+            "task_id",
+            "session_token_ref",
+        )
+        precursor_force_fields = frozenset()
+    else:
+        precursor_required = _HOST_AUTH_REQUIRED_FIELDS
+        precursor_force_fields = _INITIAL_FORCE_FIELDS
     precursor_body = _validated_tool_body(
         precursor_template,
-        allowed_fields=_INITIAL_JOIN_TOOL_FIELDS,
+        allowed_fields=precursor_allowed_fields,
         replacements=values,
-        force_fields=_INITIAL_FORCE_FIELDS,
+        force_fields=precursor_force_fields,
         required_fields=precursor_required,
     )
     refresh_body = _onboard_refresh_body(guide)
@@ -1358,6 +1598,8 @@ def orchestrate_runtime_context_host_startup(
         paths=_HOST_PRECURSOR_ACTION_PATHS,
         expected_tools=_HOST_AUTH_TOOLS,
     )
+    if precursor_packet is None:
+        precursor_packet = _server_declared_recovery_packet(worker_guide)
     if precursor_packet is not None:
         precursor_action, precursor_template = precursor_packet
         return _orchestrate_refreshing_host_startup(

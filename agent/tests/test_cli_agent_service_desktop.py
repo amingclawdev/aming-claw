@@ -1122,6 +1122,199 @@ def _live_refreshing_host_startup_inputs(
     return guide, receipt_body, startup_body
 
 
+def _server_recovery_selected_host_guide(mode):
+    guide, _receipt_body, _startup_body = _live_refreshing_host_startup_inputs()
+    precursor = guide.pop("host_precursor_action")
+    guide.pop("host_precursor_required", None)
+    guide.pop("execution_sequence", None)
+    body = deepcopy(precursor["copy_safe_body"])
+    initial_body = deepcopy(body)
+    initial_body["session_token_ref"] = "wstok-allocation-initial"
+    recovery = {
+        "eligible": True,
+        "mode": mode,
+        "context_status": "running",
+        "blockers": [],
+    }
+    actionable_payloads = {
+        "session_token_initial_join_submission": {
+            "mcp_tool": "runtime_context_session_token_initial_join",
+            "copy_safe_body": initial_body,
+        },
+        "session_token_rejoin_eligibility": deepcopy(recovery),
+    }
+    if mode == "safe_ref_prestartup_reissue":
+        expected_tool = "runtime_context_session_token_reissue"
+        submission_name = "session_token_reissue_submission"
+        renewal_name = "reissue"
+    else:
+        expected_tool = "runtime_context_session_token_rejoin"
+        submission_name = "session_token_rejoin_submission"
+        renewal_name = "rejoin"
+    submission = {
+        "mcp_tool": expected_tool,
+        "copy_safe_body": body,
+    }
+    actionable_payloads[submission_name] = deepcopy(submission)
+    actionable_payloads["session_renewal_hints"] = {
+        renewal_name: deepcopy(submission)
+    }
+    guide["session_token_rejoin_eligibility"] = deepcopy(recovery)
+    guide["actionable_payloads"] = actionable_payloads
+    return guide, expected_tool
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_tool"),
+    [
+        (
+            "pre_lineage_bootstrap_auth_only",
+            "runtime_context_session_token_rejoin",
+        ),
+        ("active_context_auth_only", "runtime_context_session_token_rejoin"),
+        (
+            "bounded_post_lineage_replacement_auth_only",
+            "runtime_context_session_token_rejoin",
+        ),
+        (
+            "safe_ref_prestartup_reissue",
+            "runtime_context_session_token_reissue",
+        ),
+    ],
+)
+def test_host_orchestration_selects_server_declared_auth_recovery(
+    mode, expected_tool
+) -> None:
+    guide, projected_tool = _server_recovery_selected_host_guide(mode)
+    assert projected_tool == expected_tool
+    calls = []
+
+    def call_tool(name, body):
+        calls.append((name, deepcopy(body)))
+        return {
+            "ok": False,
+            "status": "rejected",
+            "message": "bounded test stop after selector",
+        }
+
+    result = orchestrate_runtime_context_host_startup(
+        worker_guide=guide,
+        tool_caller=call_tool,
+        host_identity={
+            "worker_session_id": "live-host-session",
+            "host_startup_id": "live-host-startup",
+            "head_commit": "a" * 40,
+        },
+        reason="select the server-declared recovery",
+    )
+
+    assert result["ok"] is False
+    assert [name for name, _body in calls] == [expected_tool]
+    if expected_tool == "runtime_context_session_token_reissue":
+        assert calls[0][1]["project_id"] == "aming-claw"
+        assert calls[0][1]["runtime_context_id"] == "mfrctx-live-host-continuation"
+        assert calls[0][1]["task_id"] == "live-host-continuation-worker"
+        assert calls[0][1]["session_token_ref"] == "wstok-live-before"
+    else:
+        assert calls[0][1]["project_id"] == "aming-claw"
+        assert calls[0][1]["session_token_ref"] == "wstok-live-before"
+        assert calls[0][1]["reason"] == "select the server-declared recovery"
+
+
+def test_host_orchestration_explicit_precursor_precedes_recovery_catalog() -> None:
+    guide, _receipt_body, _startup_body = _live_refreshing_host_startup_inputs()
+    guide["session_token_rejoin_eligibility"] = {
+        "eligible": True,
+        "mode": "safe_ref_prestartup_reissue",
+        "blockers": [],
+    }
+    guide["actionable_payloads"] = {
+        "session_token_reissue_submission": {
+            "mcp_tool": "runtime_context_session_token_reissue",
+            "copy_safe_body": {"session_token_ref": "wstok-live-before"},
+        }
+    }
+    calls = []
+
+    result = orchestrate_runtime_context_host_startup(
+        worker_guide=guide,
+        tool_caller=lambda name, body: (
+            calls.append((name, deepcopy(body)))
+            or {"ok": False, "status": "rejected", "message": "test stop"}
+        ),
+        host_identity={
+            "worker_session_id": "live-host-session",
+            "host_startup_id": "live-host-startup",
+            "head_commit": "a" * 40,
+        },
+    )
+
+    assert result["ok"] is False
+    assert [name for name, _body in calls] == [
+        "runtime_context_session_token_rejoin"
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "blocked",
+        "missing_packet",
+        "conflicting_eligibility",
+        "conflicting_packet_scope",
+    ],
+)
+def test_host_orchestration_rejects_invalid_recovery_before_auth_call(
+    failure_mode,
+) -> None:
+    guide, _expected_tool = _server_recovery_selected_host_guide(
+        "pre_lineage_bootstrap_auth_only"
+    )
+    if failure_mode == "blocked":
+        blocked = {"eligible": False, "mode": "blocked", "blockers": ["lease"]}
+        guide["session_token_rejoin_eligibility"] = deepcopy(blocked)
+        guide["actionable_payloads"]["session_token_rejoin_eligibility"] = (
+            deepcopy(blocked)
+        )
+    elif failure_mode == "missing_packet":
+        guide["actionable_payloads"].pop("session_token_rejoin_submission")
+        guide["actionable_payloads"]["session_renewal_hints"].pop("rejoin")
+    elif failure_mode == "conflicting_eligibility":
+        guide["details"] = {
+            "diagnostics": {
+                "session_token_rejoin_eligibility": {
+                    "eligible": True,
+                    "mode": "safe_ref_prestartup_reissue",
+                    "blockers": [],
+                }
+            }
+        }
+    else:
+        conflicting = deepcopy(
+            guide["actionable_payloads"]["session_token_rejoin_submission"]
+        )
+        conflicting["copy_safe_body"]["session_token_ref"] = "wstok-stale"
+        guide["details"] = {
+            "actionable_payloads": {
+                "session_token_rejoin_submission": conflicting
+            }
+        }
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+            },
+        )
+
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     "precursor_tool",
     [
