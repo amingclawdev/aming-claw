@@ -653,6 +653,10 @@ def _runtime_context_host_guide() -> dict[str, object]:
                     "base_commit": "a" * 40,
                     "target_head_commit": "a" * 40,
                     "merge_queue_id": "mq-host",
+                    "owned_files": [
+                        "src/reminders.js",
+                        "tests/reminders.test.mjs",
+                    ],
                     "observer_command_id": "<claimed execute_backlog_row command id>",
                     "target_project_root": "/tmp/host-worker",
                     "session_token": "<read from worker env>",
@@ -787,6 +791,10 @@ def test_runtime_context_host_orchestration_is_uninterrupted_and_private() -> No
         assert body["host_session_id"] == "codex-thread-42"
         assert body["host_startup_id"] == "startup-thread-42"
         assert body["observer_command_id"] == "observer-desktop-1"
+        assert body["owned_files"] == [
+            "src/reminders.js",
+            "tests/reminders.test.mjs",
+        ]
         assert body["read_receipt_event_id"] == "timeline:90210"
         assert "worker_transcript_path" not in body
         assert body["worker_transcript_ref"] == "codex:codex-thread-42"
@@ -1095,6 +1103,7 @@ def _live_refreshing_host_startup_inputs(
     }
     startup_body = {
         **scope,
+        "owned_files": ["src/reminders.js", "tests/reminders.test.mjs"],
         "session_token": "<host-realized session_token>",
         "fence_token": "<host-realized fence_token>",
         "session_token_ref": "wstok-live-after",
@@ -1223,6 +1232,10 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
         assert body["session_token"] == raw_session
         assert body["fence_token"] == raw_fence
         assert body["read_receipt_event_id"] == "timeline:live-receipt"
+        assert body["owned_files"] == [
+            "src/reminders.js",
+            "tests/reminders.test.mjs",
+        ]
         return {"ok": True, "status": "startup_recorded"}
 
     result = orchestrate_runtime_context_host_startup(
@@ -1252,6 +1265,78 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
     assert raw_fence not in json.dumps(result, sort_keys=True)
     assert all(raw_session not in json.dumps(body) for _name, body in calls)
     assert all(raw_fence not in json.dumps(body) for _name, body in calls)
+
+
+@pytest.mark.parametrize(
+    "invalid_owned_files",
+    [None, [], "src/reminders.js", ["<owned file>"], ["same.js", "same.js"]],
+)
+def test_host_orchestration_rejects_invalid_refreshed_owned_files_before_startup(
+    invalid_owned_files,
+) -> None:
+    guide, receipt_body, startup_body = _live_refreshing_host_startup_inputs()
+    if invalid_owned_files is None:
+        startup_body.pop("owned_files")
+    else:
+        startup_body["owned_files"] = invalid_owned_files
+    calls = []
+    refresh_count = 0
+
+    def call_tool(name, body):
+        nonlocal refresh_count
+        calls.append(name)
+        if name == "runtime_context_session_token_rejoin":
+            return {
+                "ok": True,
+                "worker_session_token_ref": "wstok-live-after",
+                "host_envelope": {
+                    "session_token_ref": "wstok-live-after",
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": "raw-live-session",
+                        "AMING_WORKER_FENCE_TOKEN": "raw-live-fence",
+                    },
+                },
+            }
+        if name == "onboard_route_guide":
+            refresh_count += 1
+            action = (
+                {
+                    "mcp_tool": "runtime_context_read_receipt",
+                    "copy_safe_body": receipt_body,
+                }
+                if refresh_count == 1
+                else {
+                    "mcp_tool": "parallel_branch_startup",
+                    "copy_safe_body": startup_body,
+                }
+            )
+            return {"structuredContent": {"canonical_executable_action": action}}
+        if name == "runtime_context_read_receipt":
+            return {
+                "ok": True,
+                "read_receipt_hash": body["read_receipt_hash"],
+                "read_receipt_event_id": "timeline:invalid-owned-files",
+            }
+        pytest.fail("invalid owned_files reached the startup tool")
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=call_tool,
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+                "launch_text_hash": "sha256:" + "a" * 64,
+            },
+        )
+
+    assert calls == [
+        "runtime_context_session_token_rejoin",
+        "onboard_route_guide",
+        "runtime_context_read_receipt",
+        "onboard_route_guide",
+    ]
 
 
 @pytest.mark.parametrize("failure_mode", ["wrong_scope", "conflicting_alias"])

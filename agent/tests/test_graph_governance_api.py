@@ -58079,7 +58079,71 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         (read.get("timeline_event") or {}).get("id") or ""
     )
     assert startup_skeleton["copy_safe_body"]["read_receipt_hash"] == receipt_hash
+    assert startup_skeleton["copy_safe_body"]["owned_files"] == list(
+        allocated.owned_files
+    )
+    assert startup_skeleton["payload"]["mf_subagent_startup_gate"][
+        "owned_files"
+    ] == list(allocated.owned_files)
+    assert "owned_files" in startup_skeleton["required_fields"]
     durable_authority = startup_skeleton["read_receipt_authority"]
+    compact_startup = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=allocated.runtime_context_id,
+        task_id=allocated.task_id,
+        parent_task_id=contract_execution_id,
+        worker_id=allocated.worker_id,
+        worker_slot_id=allocated.worker_slot_id,
+        target_project_root=str(target_root),
+        session_token_ref=reissued["session_token_ref"],
+        route_identity=route_identity,
+        read_receipt_event_ref=durable_authority["event_ref"],
+        read_receipt_authority=durable_authority,
+        read_receipt_authority_required=True,
+        authority_revision={
+            "active_owned_files": list(allocated.owned_files),
+        },
+    )["startup_facade_payload_skeleton"]
+    assert compact_startup["actionable"] is True
+    assert compact_startup["copy_safe_body"]["owned_files"] == list(
+        allocated.owned_files
+    )
+    assert compact_startup["payload"]["mf_subagent_startup_gate"][
+        "owned_files"
+    ] == list(allocated.owned_files)
+    assert "owned_files" in compact_startup["required_fields"]
+
+    for invalid_authority_revision in (
+        {},
+        {"active_owned_files": []},
+        {"active_owned_files": "agent/governance/server.py"},
+        {"active_owned_files": ["<owned file>"]},
+        {"active_owned_files": ["same.py", "same.py"]},
+    ):
+        missing_scope_startup = server._runtime_context_worker_recovery_payloads(
+            project_id=PID,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=allocated.runtime_context_id,
+            task_id=allocated.task_id,
+            parent_task_id=contract_execution_id,
+            worker_id=allocated.worker_id,
+            worker_slot_id=allocated.worker_slot_id,
+            target_project_root=str(target_root),
+            session_token_ref=reissued["session_token_ref"],
+            route_identity=route_identity,
+            read_receipt_event_ref=durable_authority["event_ref"],
+            read_receipt_authority=durable_authority,
+            read_receipt_authority_required=True,
+            authority_revision=invalid_authority_revision,
+        )["startup_facade_payload_skeleton"]
+        assert missing_scope_startup["actionable"] is False
+        assert missing_scope_startup["status"] == (
+            "blocked_missing_or_invalid_active_owned_files"
+        )
+        assert missing_scope_startup["copy_safe_body"] == {}
     for field, forged_value in (
         ("event_id", "999999"),
         ("event_ref", "timeline:999999"),

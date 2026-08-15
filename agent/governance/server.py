@@ -23572,6 +23572,21 @@ def _runtime_context_projection_response(
     response["session_token_rejoin_eligibility"] = dict(
         session_token_rejoin_eligibility
     )
+    current_authority_revision = (
+        (latest_revision_payload.get("payload") or {}).get(
+            "authority_revision"
+        )
+        if isinstance(latest_revision_payload.get("payload"), Mapping)
+        else {}
+    )
+    current_authority_revision = dict(
+        current_authority_revision
+        if isinstance(current_authority_revision, Mapping)
+        else {}
+    )
+    current_authority_revision["active_owned_files"] = list(
+        worker_scope_files
+    )
     current_actionable_payloads = _runtime_context_worker_recovery_payloads(
         project_id=project_id,
         runtime_context_id=runtime_context_id,
@@ -23642,13 +23657,7 @@ def _runtime_context_projection_response(
             if isinstance(contract_runtime_projection, Mapping)
             else {}
         ),
-        authority_revision=(
-            (latest_revision_payload.get("payload") or {}).get(
-                "authority_revision"
-            )
-            if isinstance(latest_revision_payload.get("payload"), Mapping)
-            else {}
-        ),
+        authority_revision=current_authority_revision,
         session_token_rejoin_eligibility=session_token_rejoin_eligibility,
         writer_role_safe_copy_payload=(
             (
@@ -30033,6 +30042,21 @@ def _runtime_context_worker_guide_response(
         )
         else {}
     )
+    worker_authority_revision = (
+        worker_view.get("authority_revision")
+        if isinstance(worker_view.get("authority_revision"), Mapping)
+        else (
+            (worker_view.get("work") or {}).get("authority_revision")
+            if isinstance(worker_view.get("work"), Mapping)
+            else {}
+        )
+    )
+    worker_authority_revision = dict(
+        worker_authority_revision
+        if isinstance(worker_authority_revision, Mapping)
+        else {}
+    )
+    worker_authority_revision["active_owned_files"] = list(worker_scope_files)
     actionable_payloads = _runtime_context_worker_recovery_payloads(
         project_id=project_id,
         runtime_context_id=runtime_context_id,
@@ -30179,15 +30203,7 @@ def _runtime_context_worker_guide_response(
             else {}
         ),
         contract_runtime_dispatch_identity=contract_runtime_dispatch_identity,
-        authority_revision=(
-            worker_view.get("authority_revision")
-            if isinstance(worker_view.get("authority_revision"), Mapping)
-            else (
-                (worker_view.get("work") or {}).get("authority_revision")
-                if isinstance(worker_view.get("work"), Mapping)
-                else {}
-            )
-        ),
+        authority_revision=worker_authority_revision,
         session_token_rejoin_eligibility=(
             current_state_response.get("session_token_rejoin_eligibility")
             if isinstance(
@@ -31757,6 +31773,38 @@ def _runtime_context_worker_recovery_payloads(
             "never retry owned_files permutations after implementation."
         ),
     }
+    raw_active_owned_files = (authority_revision or {}).get(
+        "active_owned_files"
+    )
+    active_owned_files = (
+        list(raw_active_owned_files)
+        if isinstance(raw_active_owned_files, list)
+        else []
+    )
+    active_owned_files_ready = (
+        bool(active_owned_files)
+        and all(
+            isinstance(path, str)
+            and path == path.strip()
+            and bool(_runtime_context_non_placeholder_text(path))
+            for path in active_owned_files
+        )
+        and len(set(active_owned_files)) == len(active_owned_files)
+    )
+    startup_receipt_ready = bool(
+        trusted_read_receipt_authority
+        or (
+            read_receipt_event_ref
+            and not strict_read_receipt_authority_required
+        )
+    )
+    startup_body_projection_allowed = bool(
+        (
+            trusted_read_receipt_authority
+            or not strict_read_receipt_authority_required
+        )
+        and (active_owned_files_ready or not startup_receipt_ready)
+    )
     writer_copy_container = (
         writer_role_safe_copy_payload
         if isinstance(writer_role_safe_copy_payload, Mapping)
@@ -32554,6 +32602,7 @@ def _runtime_context_worker_recovery_payloads(
             normalized_target_head_commit or "<assigned target HEAD commit>"
         ),
         "merge_queue_id": normalized_merge_queue_id or "<assigned merge_queue_id>",
+        "owned_files": list(active_owned_files),
         "observer_command_id": (
             canonical_observer_command_id
             or "<claimed execute_backlog_row command id>"
@@ -32619,6 +32668,7 @@ def _runtime_context_worker_recovery_payloads(
             "base_commit": normalized_base_commit,
             "target_head_commit": normalized_target_head_commit,
             "merge_queue_id": normalized_merge_queue_id,
+            "owned_files": list(active_owned_files),
             **(
                 {
                     "observer_command_id": canonical_observer_command_id,
@@ -33341,18 +33391,17 @@ def _runtime_context_worker_recovery_payloads(
                 "session_token or session_token_ref",
                 "fence_token",
                 "target_project_root",
+                "owned_files",
                 *startup_identity_required_fields,
             ],
             "required_real_worker_identity_fields": startup_identity_required_fields,
             "actionable": bool(
-                trusted_read_receipt_authority
-                or (
-                    read_receipt_event_ref
-                    and not strict_read_receipt_authority_required
-                )
+                active_owned_files_ready and startup_receipt_ready
             ),
             "status": (
-                "actionable_unique_durable_read_receipt"
+                "blocked_missing_or_invalid_active_owned_files"
+                if not active_owned_files_ready and startup_receipt_ready
+                else "actionable_unique_durable_read_receipt"
                 if trusted_read_receipt_authority
                 else (
                     "template_before_read_receipt"
@@ -33418,18 +33467,12 @@ def _runtime_context_worker_recovery_payloads(
             },
             "body": (
                 startup_body
-                if (
-                    trusted_read_receipt_authority
-                    or not strict_read_receipt_authority_required
-                )
+                if startup_body_projection_allowed
                 else {}
             ),
             "copy_safe_body": (
                 dict(startup_body)
-                if (
-                    trusted_read_receipt_authority
-                    or not strict_read_receipt_authority_required
-                )
+                if startup_body_projection_allowed
                 else {}
             ),
             "body_source": "copy_safe_body",

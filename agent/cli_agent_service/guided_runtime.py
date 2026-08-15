@@ -129,7 +129,7 @@ _STARTUP_REQUIRED_FIELDS = tuple(
     """project_id runtime_context_id task_id parent_task_id session_token fence_token
     session_token_ref agent_id actual_host_worker_id worker_session_id filer_principal
     host_session_id host_startup_id head_commit read_receipt_hash
-    read_receipt_event_id""".split()
+    read_receipt_event_id owned_files""".split()
 )
 _GRAPH_CONTINUATION_TOOLS = frozenset(
     {"function_index", "function_callers", "function_callees"}
@@ -739,6 +739,27 @@ def _validated_tool_body(
     return realized
 
 
+def _validate_startup_owned_files(body: Mapping[str, Any]) -> None:
+    owned_files = body.get("owned_files")
+    valid_items = (
+        isinstance(owned_files, list)
+        and bool(owned_files)
+        and all(
+            isinstance(item, str)
+            and item == item.strip()
+            and bool(item)
+            and not _PLACEHOLDER.search(item)
+            for item in owned_files
+        )
+    )
+    if not valid_items or len(set(owned_files)) != len(owned_files):
+        raise GuidedRuntimeDispatchError(
+            "runtime context startup requires exact non-empty guide-owned "
+            "owned_files",
+            status="invalid_host_orchestration",
+        )
+
+
 def _application_succeeded(value: Mapping[str, Any]) -> bool:
     if value.get("isError") is True or value.get("ok") is False:
         return False
@@ -1245,6 +1266,7 @@ def _orchestrate_refreshing_host_startup(
             force_fields=_STARTUP_FORCE_FIELDS,
             required_fields=_STARTUP_REQUIRED_FIELDS,
         )
+        _validate_startup_owned_files(startup_body)
         if not (
             _text(startup_body.get("worker_transcript_ref"))
             or _text(startup_body.get("worker_transcript_path"))
@@ -1462,6 +1484,7 @@ def orchestrate_runtime_context_host_startup(
             force_fields=_STARTUP_FORCE_FIELDS,
             required_fields=_STARTUP_REQUIRED_FIELDS,
         )
+        _validate_startup_owned_files(startup_body)
         if not (
             _text(startup_body.get("worker_transcript_ref"))
             or _text(startup_body.get("worker_transcript_path"))
