@@ -34494,6 +34494,7 @@ def _runtime_context_worker_recovery_details(
                         "{runtime_context_id}/session-token/rejoin"
                     ),
                     "copy_safe_body": {
+                        "project_id": project_id,
                         "runtime_context_id": expected_runtime_context_id,
                         "task_id": str(getattr(context, "task_id", "") or ""),
                         "parent_task_id": expected_parent_task_id,
@@ -49413,6 +49414,24 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
     if not runtime_context_id:
         raise ValidationError("runtime_context_id is required")
     body = dict(ctx.body or {})
+    supplied_project_id = str(body.get("project_id") or "").strip()
+    if supplied_project_id and supplied_project_id != project_id:
+        raise GovernanceError(
+            "runtime_context_rejoin_project_identity_mismatch",
+            (
+                "runtime-context session rejoin project_id conflicts with "
+                "the routed governance project"
+            ),
+            403,
+            {
+                "runtime_context_id": runtime_context_id,
+                "supplied_project_id": supplied_project_id,
+                "expected_project_id": project_id,
+                "credential_rotated": False,
+                "mutation_performed": False,
+                "fail_closed": True,
+            },
+        )
     reason = str(body.get("reason") or body.get("rejoin_reason") or "").strip()
     if not reason:
         raise ValidationError("reason is required for runtime-context session rejoin")

@@ -61724,6 +61724,53 @@ def _assert_pre_lineage_rejoin_zero_write(
     assert _pre_lineage_case_events(conn, case) == before_events
 
 
+def test_pre_lineage_rejoin_rejects_conflicting_project_without_writes(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="conflicting-project-zero-write",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    assert before_context is not None
+    before_events = _pre_lineage_case_events(conn, case)
+    before_revision = get_latest_branch_contract_revision(
+        conn,
+        PID,
+        before_context.runtime_context_id,
+    )
+    before_dump = "\n".join(conn.iterdump())
+
+    with pytest.raises(GovernanceError) as conflicting_project:
+        _pre_lineage_rejoin(
+            case,
+            body_updates={"project_id": "foreign-governance-project"},
+        )
+
+    assert conflicting_project.value.code == (
+        "runtime_context_rejoin_project_identity_mismatch"
+    )
+    assert conflicting_project.value.details["supplied_project_id"] == (
+        "foreign-governance-project"
+    )
+    assert conflicting_project.value.details["expected_project_id"] == PID
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        conflicting_project.value,
+        before_context=before_context,
+        before_events=before_events,
+        before_revision=before_revision,
+    )
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 def _convert_pre_lineage_case_to_legacy_initial_join_audit(
     conn,
     case: Mapping[str, Any],
@@ -63346,9 +63393,14 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
             )
         )
     assert guide_error.value.code == "fence_invalidated_or_unknown"
-    projected_rejoin_body = guide_error.value.details["actionable_payloads"][
+    recovery_payloads = guide_error.value.details["actionable_payloads"]
+    rejoin_submission = recovery_payloads[
         "session_token_rejoin_submission"
-    ]["copy_safe_body"]
+    ]
+    rejoin_hint = recovery_payloads["session_renewal_hints"]["rejoin"]
+    projected_rejoin_body = rejoin_submission["copy_safe_body"]
+    assert projected_rejoin_body["project_id"] == PID
+    assert rejoin_hint["copy_safe_body"] == projected_rejoin_body
     assert projected_rejoin_body["contract_execution_id"] == (
         case["parent_task_id"]
     )
@@ -65069,7 +65121,9 @@ def test_runtime_context_worker_guide_projects_unique_active_route_ref_without_h
     payloads = recovery["actionable_payloads"]
     rejoin = payloads["session_token_rejoin_submission"]
     hint = payloads["session_renewal_hints"]["rejoin"]
+    assert rejoin == hint
     for projection in (rejoin, hint):
+        assert projection["copy_safe_body"]["project_id"] == PID
         assert projection["copy_safe_body"]["route_token_ref"] == (
             active_identity["route_token_ref"]
         )
@@ -65103,6 +65157,14 @@ def test_runtime_context_worker_guide_projects_unique_active_route_ref_without_h
     assert guide["child_route_token_ref"] == active_identity[
         "route_token_ref"
     ]
+    guide_payloads = guide["actionable_payloads"]
+    guide_rejoin = guide_payloads["session_token_rejoin_submission"]
+    guide_rejoin_hint = guide_payloads["session_renewal_hints"]["rejoin"]
+    canonical_rejoin = guide_payloads["canonical_executable_actions"]["rejoin"]
+    assert guide_rejoin == guide_rejoin_hint
+    assert guide_rejoin["canonical_executable_action"] == canonical_rejoin
+    assert guide_rejoin["copy_safe_body"] == canonical_rejoin["copy_safe_body"]
+    assert canonical_rejoin["copy_safe_body"]["project_id"] == PID
     assert conn.total_changes == before_changes
     assert len(_pre_lineage_case_events(conn, case)) == before_timeline_count
     assert conn.execute(
@@ -65115,6 +65177,16 @@ def test_runtime_context_worker_guide_projects_unique_active_route_ref_without_h
         PID,
         case["context"].runtime_context_id,
     ) == original_revision
+
+    callable_rejoin = _pre_lineage_rejoin(
+        case,
+        body_override={
+            **copy.deepcopy(rejoin["copy_safe_body"]),
+            "reason": "invoke the server-advertised recovery body directly",
+        },
+    )
+    assert callable_rejoin["status"] == "session_token_rejoin_issued"
+    assert callable_rejoin["pre_lineage_auth_only_rejoin"] is True
 
 
 def test_runtime_context_worker_guide_route_projection_fails_closed_on_ambiguous_renewal(
