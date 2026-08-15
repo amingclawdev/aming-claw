@@ -1213,6 +1213,174 @@ def _server_recovery_selected_host_guide(mode):
     return guide, expected_tool
 
 
+def _fresh_initial_with_blocked_rejoin_guide():
+    guide, _expected_tool = _server_recovery_selected_host_guide(
+        "pre_lineage_bootstrap_auth_only"
+    )
+    blocked = {
+        "eligible": False,
+        "mode": "blocked",
+        "blockers": [
+            "runtime_context_rejoin_requires_existing_worker_lineage",
+            "mf_subagent_read_receipt",
+            "mf_subagent_startup",
+        ],
+    }
+    guide["next_legal_action"] = (
+        "request_runtime_context_initial_join_host_envelope"
+    )
+    guide["session_token_rejoin_eligibility"] = deepcopy(blocked)
+    guide["actionable_payloads"]["session_token_rejoin_eligibility"] = (
+        deepcopy(blocked)
+    )
+    guide["actionable_payloads"].pop("session_token_rejoin_submission")
+    guide["actionable_payloads"].pop("session_renewal_hints")
+    realized_initial = deepcopy(
+        guide["actionable_payloads"][
+            "session_token_initial_join_submission"
+        ]
+    )
+    realized_initial["copy_safe_body"].pop("session_token_ref")
+    compact_initial = deepcopy(realized_initial)
+    for field_name in (
+        "project_id",
+        "agent_id",
+        "actual_host_worker_id",
+        "worker_session_id",
+    ):
+        compact_initial["copy_safe_body"].pop(field_name, None)
+    guide["actionable_payloads"][
+        "session_token_initial_join_submission"
+    ] = compact_initial
+    guide["actionable_payloads"]["session_renewal_hints"] = {
+        "initial_join": deepcopy(realized_initial)
+    }
+    backlog_id = guide.pop("backlog_id")
+    guide["actionable_payloads"]["copy_safe_route_token_scope"] = {
+        "scope": {
+            "project_id": guide["project_id"],
+            "backlog_id": backlog_id,
+            "runtime_context_id": realized_initial["copy_safe_body"][
+                "runtime_context_id"
+            ],
+            "task_id": realized_initial["copy_safe_body"]["task_id"],
+        }
+    }
+    guide["session_renewal_hints"] = {
+        "initial_join": deepcopy(realized_initial)
+    }
+    guide["contract_runtime_current_state"] = {
+        "backlog_id": "AC-SIBLING-WORKER",
+        "runtime_context_id": "mfrctx-sibling-worker",
+        "task_id": "sibling-worker-task",
+        "session_token_ref": "wstok-sibling-worker",
+        "mf_sub_host_bridge_guidance": {
+            "session_renewal_hints": {
+                "initial_join": {
+                    "mcp_tool": "runtime_context_session_token_initial_join",
+                    "copy_safe_body": {
+                        **deepcopy(realized_initial["copy_safe_body"]),
+                        "runtime_context_id": "mfrctx-sibling-worker",
+                        "task_id": "sibling-worker-task",
+                    },
+                }
+            }
+        },
+    }
+    return guide
+
+
+@pytest.mark.parametrize("response_shape", ["direct", "structured", "content_text"])
+def test_host_orchestration_selects_fresh_initial_join_over_blocked_rejoin(
+    response_shape,
+) -> None:
+    guide = _fresh_initial_with_blocked_rejoin_guide()
+    if response_shape == "structured":
+        shaped = {"structuredContent": guide}
+    elif response_shape == "content_text":
+        shaped = {"content": [{"type": "text", "text": json.dumps(guide)}]}
+    else:
+        shaped = guide
+    calls = []
+
+    result = orchestrate_runtime_context_host_startup(
+        worker_guide=shaped,
+        tool_caller=lambda name, body: (
+            calls.append((name, deepcopy(body)))
+            or {"ok": False, "status": "rejected", "message": "test stop"}
+        ),
+        host_identity={
+            "worker_session_id": "live-host-session",
+            "host_startup_id": "live-host-startup",
+            "head_commit": "a" * 40,
+        },
+        reason="claim the fresh initial host envelope",
+    )
+
+    assert result["ok"] is False
+    assert [name for name, _body in calls] == [
+        "runtime_context_session_token_initial_join"
+    ]
+    assert "session_token_ref" not in calls[0][1]
+    assert calls[0][1]["runtime_context_id"] != "mfrctx-sibling-worker"
+    assert calls[0][1]["task_id"] == "live-host-continuation-worker"
+    assert calls[0][1]["reason"] == "claim the fresh initial host envelope"
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "recovery_is_current",
+        "missing_initial",
+        "conflicting_initial",
+        "conflicting_task",
+    ],
+)
+def test_host_orchestration_fresh_initial_selector_remains_fail_closed(
+    failure_mode,
+) -> None:
+    guide = _fresh_initial_with_blocked_rejoin_guide()
+    if failure_mode == "recovery_is_current":
+        guide["next_legal_action"] = (
+            "request_runtime_context_pre_lineage_rejoin_host_envelope"
+        )
+    elif failure_mode == "missing_initial":
+        guide["actionable_payloads"].pop(
+            "session_token_initial_join_submission"
+        )
+        guide["actionable_payloads"].pop("session_renewal_hints")
+        guide.pop("session_renewal_hints")
+    else:
+        conflicting = deepcopy(
+            guide["actionable_payloads"][
+                "session_token_initial_join_submission"
+            ]
+        )
+        if failure_mode == "conflicting_initial":
+            conflicting["copy_safe_body"]["session_token_ref"] = "wstok-stale"
+        else:
+            conflicting["copy_safe_body"]["task_id"] = "foreign-worker-task"
+        guide["details"] = {
+            "actionable_payloads": {
+                "session_token_initial_join_submission": conflicting
+            }
+        }
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+            },
+        )
+
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_tool"),
     [

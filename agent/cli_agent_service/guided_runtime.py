@@ -226,6 +226,124 @@ _HOST_RECOVERY_ELIGIBILITY_PATHS = (
         "session_token_rejoin_eligibility",
     ),
 )
+_HOST_INITIAL_JOIN_ACTION_PATHS = (
+    ("session_token_initial_join_submission",),
+    ("session_renewal_hints", "initial_join"),
+    ("canonical_executable_actions", "join"),
+    ("guide_to_facade_coverage", "actions", "join"),
+    ("actionable_payloads", "session_token_initial_join_submission"),
+    ("actionable_payloads", "session_renewal_hints", "initial_join"),
+    ("actionable_payloads", "canonical_executable_actions", "join"),
+    (
+        "actionable_payloads",
+        "guide_to_facade_coverage",
+        "actions",
+        "join",
+    ),
+    ("details", "session_token_initial_join_submission"),
+    ("details", "session_renewal_hints", "initial_join"),
+    ("details", "canonical_executable_actions", "join"),
+    ("details", "guide_to_facade_coverage", "actions", "join"),
+    ("details", "actionable_payloads", "session_token_initial_join_submission"),
+    ("details", "actionable_payloads", "session_renewal_hints", "initial_join"),
+    ("details", "actionable_payloads", "canonical_executable_actions", "join"),
+    (
+        "details",
+        "actionable_payloads",
+        "guide_to_facade_coverage",
+        "actions",
+        "join",
+    ),
+    ("details", "compatibility", "session_token_initial_join_submission"),
+    ("details", "compatibility", "session_renewal_hints", "initial_join"),
+    (
+        "details",
+        "compatibility",
+        "canonical_executable_actions",
+        "join",
+    ),
+    (
+        "details",
+        "compatibility",
+        "actionable_payloads",
+        "session_token_initial_join_submission",
+    ),
+    (
+        "details",
+        "compatibility",
+        "actionable_payloads",
+        "session_renewal_hints",
+        "initial_join",
+    ),
+)
+_HOST_CURRENT_GUIDE_ROOT_PATHS = (
+    (),
+    ("worker_guide",),
+    ("details",),
+    ("details", "worker_guide"),
+    ("details", "diagnostics"),
+    ("copy_safe_route_token_scope", "scope"),
+    ("actionable_payloads", "copy_safe_route_token_scope", "scope"),
+    (
+        "details",
+        "actionable_payloads",
+        "copy_safe_route_token_scope",
+        "scope",
+    ),
+    (
+        "worker_guide",
+        "actionable_payloads",
+        "copy_safe_route_token_scope",
+        "scope",
+    ),
+    ("host_precursor_action", "copy_safe_body"),
+    ("details", "host_precursor_action", "copy_safe_body"),
+    (
+        "actionable_payloads",
+        "session_token_initial_join_submission",
+        "copy_safe_body",
+    ),
+    (
+        "actionable_payloads",
+        "session_renewal_hints",
+        "initial_join",
+        "copy_safe_body",
+    ),
+    (
+        "details",
+        "actionable_payloads",
+        "session_token_initial_join_submission",
+        "copy_safe_body",
+    ),
+    (
+        "details",
+        "actionable_payloads",
+        "session_renewal_hints",
+        "initial_join",
+        "copy_safe_body",
+    ),
+    (
+        "worker_guide",
+        "actionable_payloads",
+        "session_token_initial_join_submission",
+        "copy_safe_body",
+    ),
+    (
+        "worker_guide",
+        "actionable_payloads",
+        "session_renewal_hints",
+        "initial_join",
+        "copy_safe_body",
+    ),
+)
+_HOST_INITIAL_JOIN_COMPATIBLE_OMISSIONS = frozenset(
+    {
+        "project_id",
+        "agent_id",
+        "actual_host_worker_id",
+        "worker_session_id",
+    }
+)
 _HOST_REJOIN_ACTION_PATHS = (
     ("session_token_rejoin_submission",),
     ("session_renewal_hints", "rejoin"),
@@ -612,6 +730,34 @@ def _unique_application_text(value: Any, field_name: str) -> str:
     if len(values) > 1:
         raise GuidedRuntimeDispatchError(
             "runtime context guide {} is ambiguous".format(field_name),
+            status="invalid_host_orchestration",
+        )
+    return next(iter(values), "")
+
+
+def _unique_current_guide_text(value: Any, field_name: str) -> str:
+    """Read current worker identity without descending into sibling packets."""
+
+    try:
+        roots = mcp_application_mapping_blocks(
+            value,
+            paths=_HOST_CURRENT_GUIDE_ROOT_PATHS,
+        )
+    except ServiceError as exc:
+        raise GuidedRuntimeDispatchError(
+            "runtime context current guide identity could not be decoded",
+            status="invalid_host_orchestration",
+        ) from exc
+    values = {
+        text
+        for root in roots
+        if field_name in root
+        for text in (_text(root.get(field_name)),)
+        if text and not _PLACEHOLDER.search(text)
+    }
+    if len(values) > 1:
+        raise GuidedRuntimeDispatchError(
+            "runtime context current guide {} is ambiguous".format(field_name),
             status="invalid_host_orchestration",
         )
     return next(iter(values), "")
@@ -1058,6 +1204,7 @@ def _declared_host_auth_packet(
     *,
     paths: Sequence[Sequence[str]],
     expected_tool: str,
+    compatible_omission_fields: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """Resolve one fixed-path auth packet, including tool-less server submissions."""
 
@@ -1098,10 +1245,40 @@ def _declared_host_auth_packet(
     if not packets:
         return None
     if len(packets) != 1:
-        raise GuidedRuntimeDispatchError(
-            "runtime context recovery action is ambiguous",
-            status="invalid_host_orchestration",
-        )
+        packet_values = list(packets.values())
+        richest_size = max(len(body) for _action, body in packet_values)
+        richest = [
+            packet
+            for packet in packet_values
+            if len(packet[1]) == richest_size
+        ]
+        if len(richest) != 1 or not compatible_omission_fields:
+            raise GuidedRuntimeDispatchError(
+                "runtime context recovery action is ambiguous",
+                status="invalid_host_orchestration",
+            )
+        selected_action, selected_body = richest[0]
+        selected_keys = set(selected_body)
+        compatible = True
+        for _action, candidate_body in packet_values:
+            candidate_keys = set(candidate_body)
+            omitted = selected_keys - candidate_keys
+            if (
+                not candidate_keys.issubset(selected_keys)
+                or not omitted.issubset(compatible_omission_fields)
+                or any(
+                    candidate_body[field_name] != selected_body[field_name]
+                    for field_name in candidate_keys
+                )
+            ):
+                compatible = False
+                break
+        if not compatible:
+            raise GuidedRuntimeDispatchError(
+                "runtime context recovery action is ambiguous",
+                status="invalid_host_orchestration",
+            )
+        return selected_action, selected_body
     return next(iter(packets.values()))
 
 
@@ -1148,6 +1325,61 @@ def _server_declared_recovery_packet(
             elif _text(value_blockers):
                 blockers.append(value_blockers)
     if not eligible or mode == "blocked" or blockers:
+        next_legal_action = _unique_current_guide_text(
+            value, "next_legal_action"
+        )
+        if (
+            not eligible
+            and mode == "blocked"
+            and next_legal_action
+            == "request_runtime_context_initial_join_host_envelope"
+        ):
+            initial_packet = _declared_host_auth_packet(
+                value,
+                paths=_HOST_INITIAL_JOIN_ACTION_PATHS,
+                expected_tool="runtime_context_session_token_initial_join",
+                compatible_omission_fields=(
+                    _HOST_INITIAL_JOIN_COMPATIBLE_OMISSIONS
+                ),
+            )
+            if initial_packet is None:
+                raise GuidedRuntimeDispatchError(
+                    "runtime context server-declared initial join packet is missing",
+                    status="invalid_host_orchestration",
+                )
+            _initial_action, initial_body = initial_packet
+            for field_name in (
+                "project_id",
+                "runtime_context_id",
+                "task_id",
+            ):
+                expected_value = _unique_current_guide_text(value, field_name)
+                actual_value = _text(initial_body.get(field_name))
+                if expected_value and actual_value != expected_value:
+                    raise GuidedRuntimeDispatchError(
+                        "runtime context initial join packet conflicts with current {}".format(
+                            field_name
+                        ),
+                        status="invalid_host_orchestration",
+                    )
+            actual_session_token_ref = _text(
+                initial_body.get("session_token_ref")
+            )
+            if actual_session_token_ref:
+                expected_session_token_ref = _unique_current_guide_text(
+                    value, "session_token_ref"
+                )
+                if (
+                    expected_session_token_ref
+                    and actual_session_token_ref
+                    != expected_session_token_ref
+                ):
+                    raise GuidedRuntimeDispatchError(
+                        "runtime context initial join packet conflicts with current "
+                        "session_token_ref",
+                        status="invalid_host_orchestration",
+                    )
+            return initial_packet
         raise GuidedRuntimeDispatchError(
             "runtime context server-declared auth recovery is blocked",
             status="invalid_host_orchestration",
@@ -1180,17 +1412,19 @@ def _server_declared_recovery_packet(
 
 
 def _onboard_refresh_body(guide: Mapping[str, Any]) -> dict[str, Any]:
-    project_id = _unique_application_text(guide, "project_id")
-    backlog_id = _unique_application_text(guide, "backlog_id")
+    project_id = _unique_current_guide_text(guide, "project_id")
+    backlog_id = _unique_current_guide_text(guide, "backlog_id")
     selected_role = _first_deep_text(guide, "selected_role") or "mf_sub"
     selected_work_type = (
         _first_deep_text(guide, "selected_work_type") or "parallel_worker"
     )
-    contract_execution_id = _unique_application_text(
+    contract_execution_id = _unique_current_guide_text(
         guide, "contract_execution_id"
     )
-    worker_task_id = _unique_application_text(guide, "task_id")
-    route_token_ref = _unique_application_text(guide, "route_token_ref")
+    worker_task_id = _unique_current_guide_text(guide, "task_id")
+    route_token_ref = _unique_current_guide_text(
+        guide, "child_route_token_ref"
+    ) or _unique_current_guide_text(guide, "route_token_ref")
     missing = [
         field_name
         for field_name, value in {
