@@ -125965,6 +125965,21 @@ def _contract_runtime_dead_initial_join_recovery_projection(
     }
 
 
+_ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS = frozenset(
+    """project_id actual_cwd actual_git_root actual_host_worker_id agent_id
+    base_commit branch branch_head branch_ref fence_token filer_principal
+    harness_type head_commit host_session_id host_startup_id launch_text_hash
+    merge_queue_id now_iso observer_command_id owned_files parent_task_id
+    prompt_contract_hash prompt_contract_id read_receipt_event_id
+    read_receipt_hash role route_context_hash route_id route_token_ref
+    runtime_context_id session_token session_token_ref session_token_surrogate
+    startup_source target_head_commit target_project_root task_id
+    visible_injection_manifest_hash
+    worker_id worker_role worker_session_id worker_transcript_path
+    worker_transcript_ref""".split()
+)
+
+
 def _onboard_worker_read_runtime_facade_projection(
     conn,
     *,
@@ -125974,25 +125989,47 @@ def _onboard_worker_read_runtime_facade_projection(
     current_projection: Mapping[str, Any],
     runtime_resume: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Join worker_read to one current RuntimeContext receipt facade."""
+    """Join worker read/startup lines to one current RuntimeContext facade."""
 
     projected = dict(next_action)
-    if str(projected.get("line_id") or "").strip() != (
-        "worker_read_runtime_guide"
-    ):
+    selected_line = str(projected.get("line_id") or "").strip()
+    if selected_line not in {
+        "worker_read_runtime_guide",
+        "worker_startup",
+    }:
         return projected
+
+    startup_selected = selected_line == "worker_startup"
+    projection_key = (
+        "worker_startup_runtime_facade_projection"
+        if startup_selected
+        else "worker_read_runtime_facade_projection"
+    )
+    projection_schema = (
+        "onboard_route_guide.worker_startup_runtime_facade_projection.v1"
+        if startup_selected
+        else "onboard_route_guide.worker_read_runtime_facade_projection.v1"
+    )
+    blocker_id = (
+        "worker_startup_runtime_facade_projection_incomplete"
+        if startup_selected
+        else "worker_read_runtime_guide_projection_incomplete"
+    )
+    required_facade = (
+        "parallel_branch_startup"
+        if startup_selected
+        else "runtime_context_read_receipt"
+    )
 
     def blocked(reason: str, fields: Sequence[str] = ()) -> dict[str, Any]:
         projection = {
-            "schema_version": (
-                "onboard_route_guide.worker_read_runtime_facade_projection.v1"
-            ),
+            "schema_version": projection_schema,
             "status": "blocked",
-            "blocker_id": "worker_read_runtime_guide_projection_incomplete",
+            "blocker_id": blocker_id,
             "reason": reason,
             "missing_or_mismatched_fields": list(fields),
-            "selected_contract_line": "worker_read_runtime_guide",
-            "required_facade": "runtime_context_read_receipt",
+            "selected_contract_line": selected_line,
+            "required_facade": required_facade,
             "fail_closed": True,
             "zero_write_rejection": True,
             "writes_performed": False,
@@ -126004,7 +126041,7 @@ def _onboard_worker_read_runtime_facade_projection(
         return {
             **projected,
             "actionable": False,
-            "worker_read_runtime_facade_projection": projection,
+            projection_key: projection,
         }
 
     if conn is None:
@@ -126039,6 +126076,11 @@ def _onboard_worker_read_runtime_facade_projection(
         recovery_authority
     )
     if recovery:
+        if startup_selected:
+            return blocked(
+                "runtime_context_initial_join_authority_invalid",
+                ["initial_join_authority"],
+            )
         return {
             **projected,
             **recovery,
@@ -126046,6 +126088,17 @@ def _onboard_worker_read_runtime_facade_projection(
     dispatch = _contract_runtime_dispatch_ticket_authority(
         record,
         _runtime_current_state_from_record(record),
+        requested_runtime_context_id=(
+            str(projected.get("runtime_context_id") or "").strip()
+            if startup_selected
+            else ""
+        ),
+        requested_task_id=(
+            str(projected.get("task_id") or "").strip()
+            if startup_selected
+            else ""
+        ),
+        allow_post_read_startup=startup_selected,
     )
     if dispatch.get("status") != "projected":
         return blocked(
@@ -126167,9 +126220,7 @@ def _onboard_worker_read_runtime_facade_projection(
             liveness=worktree_liveness,
         )
         projection = {
-            "schema_version": (
-                "onboard_route_guide.worker_read_runtime_facade_projection.v1"
-            ),
+            "schema_version": projection_schema,
             "status": (
                 "recovery_required" if recovery else "blocked"
             ),
@@ -126184,7 +126235,7 @@ def _onboard_worker_read_runtime_facade_projection(
             ),
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
-            "selected_contract_line": "worker_read_runtime_guide",
+            "selected_contract_line": selected_line,
             "worker_actionable": False,
             "observer_recovery_actionable": bool(recovery),
             "fail_closed": True,
@@ -126211,15 +126262,23 @@ def _onboard_worker_read_runtime_facade_projection(
             return {
                 **projected,
                 "actionable": False,
-                "worker_read_runtime_facade_projection": projection,
+                projection_key: projection,
             }
+        if startup_selected:
+            return blocked(
+                str(
+                    worktree_liveness.get("reason_code")
+                    or "runtime_context_worktree_unverified"
+                ),
+                ["runtime_context_worktree"],
+            )
         return {
             **projected,
             "id": "observer_rematerialize_worker_worktree",
             "line_id": "",
             "stage_id": "",
             **recovery,
-            "worker_read_runtime_facade_projection": projection,
+            projection_key: projection,
             "runtime_context_recovery_authority": {
                 "runtime_context_id": runtime_context_id,
                 "task_id": task_id,
@@ -126227,6 +126286,348 @@ def _onboard_worker_read_runtime_facade_projection(
                 "server_derived": True,
                 "caller_claims_trusted": False,
             },
+        }
+
+    if startup_selected:
+        worker_scope = [
+            str(path)
+            for path in list(getattr(context, "owned_files", ()) or ())
+            if isinstance(path, str) and path.strip()
+        ]
+        timeline_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+        timeline_refs, _startup_gate, _finish_gate, _close_evidence = (
+            _runtime_context_service_timeline_refs(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+                timeline_events=timeline_events,
+                runtime_context_id=runtime_context_id,
+                parent_task_id=parent_task_id,
+            )
+        )
+        receipt_authority = _runtime_context_post_read_startup_receipt_authority(
+            conn,
+            project_id=project_id,
+            context=context,
+            route_identity=route_identity,
+        )
+        receipt_authority_required = (
+            _runtime_context_post_read_startup_receipt_authority_required(
+                timeline_events,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                session_token_ref=session_token_ref,
+            )
+        )
+        read_receipt_event_ref = str(
+            receipt_authority.get("event_ref")
+            or timeline_refs.get("read_receipt_event_ref")
+            or ""
+        ).strip()
+        startup_payloads = _runtime_context_worker_recovery_payloads(
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_slot_id,
+            target_project_root=target_project_root,
+            backlog_id=backlog_id,
+            agent_id=str(getattr(context, "agent_id", "") or ""),
+            allocation_owner=str(
+                getattr(context, "allocation_owner", "") or ""
+            ),
+            actual_host_worker_id=str(
+                getattr(context, "actual_host_worker_id", "") or ""
+            ),
+            worker_session_id=str(
+                getattr(context, "host_session_id", "") or ""
+            ),
+            host_startup_id=str(
+                getattr(context, "host_startup_id", "") or ""
+            ),
+            host_session_id=str(
+                getattr(context, "host_session_id", "") or ""
+            ),
+            branch_ref=str(getattr(context, "branch_ref", "") or ""),
+            base_commit=str(getattr(context, "base_commit", "") or ""),
+            target_head_commit=str(
+                getattr(context, "target_head_commit", "") or ""
+            ),
+            merge_queue_id=str(
+                getattr(context, "merge_queue_id", "") or ""
+            ),
+            route_identity=route_identity,
+            fence_token_hash=runtime_context_secret_hash(
+                str(getattr(context, "fence_token", "") or "")
+            ),
+            session_token_ref=session_token_ref,
+            read_receipt_event_ref=read_receipt_event_ref,
+            read_receipt_authority=receipt_authority,
+            read_receipt_authority_required=receipt_authority_required,
+            contract_execution_id=execution_id,
+            contract_chain_id=str(record.get("contract_chain_id") or ""),
+            parent_contract_execution_id=str(
+                record.get("parent_contract_execution_id") or ""
+            ),
+            successor_contract_execution_id=execution_id,
+            contract_runtime_dispatch_identity=(
+                _contract_runtime_dispatch_identity_resolution(
+                    record,
+                    context,
+                )
+            ),
+            authority_revision={"active_owned_files": list(worker_scope)},
+        )
+        startup_skeleton = (
+            startup_payloads.get("startup_facade_payload_skeleton")
+            if isinstance(
+                startup_payloads.get("startup_facade_payload_skeleton"),
+                Mapping,
+            )
+            else {}
+        )
+        skeleton_body = (
+            dict(startup_skeleton.get("copy_safe_body"))
+            if isinstance(startup_skeleton.get("copy_safe_body"), Mapping)
+            else {}
+        )
+        bounded_startup_body = {
+            field: deepcopy(skeleton_body[field])
+            for field in _ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS
+            if field in skeleton_body
+        }
+        startup_action = (
+            _guide_canonical_executable_action(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=execution_id,
+                parent_contract_execution_id=str(
+                    record.get("parent_contract_execution_id") or ""
+                ),
+                action="record_mf_subagent_startup",
+                facade="runtime_context.startup",
+                mcp_tool="parallel_branch_startup",
+                method=str(startup_skeleton.get("method") or "POST"),
+                path=str(startup_skeleton.get("path") or ""),
+                stage_id="startup",
+                line_id="worker_startup",
+                body=bounded_startup_body,
+                host_realization=(
+                    startup_skeleton.get("host_realization")
+                    if isinstance(
+                        startup_skeleton.get("host_realization"), Mapping
+                    )
+                    else None
+                ),
+            )
+            if bounded_startup_body
+            else {}
+        )
+        startup_body = (
+            dict(startup_action.get("copy_safe_body"))
+            if isinstance(startup_action.get("copy_safe_body"), Mapping)
+            else {}
+        )
+        expected_body = {
+            "project_id": project_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "target_project_root": target_project_root,
+            "session_token_ref": session_token_ref,
+            "merge_queue_id": str(
+                getattr(context, "merge_queue_id", "") or ""
+            ).strip(),
+            **route_identity,
+        }
+        mismatch_fields = [
+            field
+            for field, expected in expected_body.items()
+            if not _runtime_context_non_placeholder_text(expected)
+            or str(startup_body.get(field) or "").strip() != expected
+        ]
+        if startup_skeleton.get("actionable") is not True:
+            mismatch_fields.append("startup_facade_payload_skeleton.actionable")
+        startup_status = str(startup_skeleton.get("status") or "")
+        if startup_status not in {
+            "actionable_unique_durable_read_receipt",
+            "legacy_same_session_read_receipt",
+        }:
+            mismatch_fields.append("startup_facade_payload_skeleton.status")
+        if str(startup_action.get("mcp_tool") or "") != (
+            "parallel_branch_startup"
+        ):
+            mismatch_fields.append("canonical_executable_actions.startup.mcp_tool")
+        startup_lineage = (
+            startup_action.get("canonical_lineage")
+            if isinstance(startup_action.get("canonical_lineage"), Mapping)
+            else {}
+        )
+        for field, expected in {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+        }.items():
+            if str(startup_lineage.get(field) or "").strip() != expected:
+                mismatch_fields.append(
+                    f"canonical_executable_actions.startup.canonical_lineage.{field}"
+                )
+        expected_safe_body, _expected_replacement_paths = (
+            _guide_executable_action_safe_body(bounded_startup_body)
+        )
+        expected_safe_body.setdefault("project_id", project_id)
+        if not startup_body or startup_body != expected_safe_body:
+            mismatch_fields.append("canonical_executable_actions.startup.copy_safe_body")
+        if (
+            not worker_scope
+            or startup_body.get("owned_files") != worker_scope
+        ):
+            mismatch_fields.append("owned_files")
+        startup_receipt_event_id = str(
+            startup_body.get("read_receipt_event_id") or ""
+        ).strip()
+        startup_receipt_hash = str(
+            startup_body.get("read_receipt_hash") or ""
+        ).strip()
+        receipt_identity_present = bool(
+            startup_receipt_event_id.isdigit()
+            and int(startup_receipt_event_id) > 0
+            and _runtime_context_non_placeholder_text(startup_receipt_hash)
+        )
+        exact_receipt_authority = bool(
+            receipt_authority.get("server_derived") is True
+            and receipt_authority.get("candidate_count") == 1
+            and str(receipt_authority.get("event_id") or "").strip()
+            == startup_receipt_event_id
+            and str(
+                receipt_authority.get("read_receipt_hash") or ""
+            ).strip()
+            == startup_receipt_hash
+        )
+        startup_replacement_paths = list(
+            (startup_action.get("host_realization") or {}).get(
+                "required_replacement_paths"
+            )
+            or []
+        )
+        legacy_receipt_template = bool(
+            startup_status == "legacy_same_session_read_receipt"
+            and startup_receipt_event_id.startswith("<")
+            and startup_receipt_hash.startswith("<")
+            and "copy_safe_body.read_receipt_event_id"
+            in startup_replacement_paths
+            and "copy_safe_body.read_receipt_hash"
+            in startup_replacement_paths
+            and re.fullmatch(
+                r"timeline:[1-9][0-9]*",
+                read_receipt_event_ref,
+            )
+            and _runtime_context_non_placeholder_text(
+                timeline_refs.get("read_receipt_hash")
+            )
+        )
+        if (
+            (
+                startup_status == "actionable_unique_durable_read_receipt"
+                and (
+                    not receipt_identity_present
+                    or not exact_receipt_authority
+                )
+            )
+            or (
+                startup_status == "legacy_same_session_read_receipt"
+                and not legacy_receipt_template
+            )
+        ):
+            mismatch_fields.append("read_receipt_authority")
+        if mismatch_fields:
+            rejected = blocked(
+                "runtime_context_startup_authority_incomplete",
+                list(dict.fromkeys(mismatch_fields)),
+            )
+            rejected[projection_key]["startup_projection_diagnostics"] = {
+                "startup_status": str(startup_skeleton.get("status") or ""),
+                "startup_action_present": bool(startup_action),
+                "startup_action_lineage": dict(startup_lineage),
+                "read_receipt_authority_status": str(
+                    receipt_authority.get("status") or ""
+                ),
+                "read_receipt_authority_candidate_count": (
+                    receipt_authority.get("candidate_count")
+                ),
+                "startup_receipt_event_id": startup_receipt_event_id,
+                "startup_receipt_hash_present": bool(
+                    _runtime_context_non_placeholder_text(
+                        startup_receipt_hash
+                    )
+                ),
+                "server_derived": (
+                    receipt_authority.get("server_derived") is True
+                ),
+            }
+            return rejected
+
+        facade_projection = {
+            "schema_version": projection_schema,
+            "status": "ready",
+            "source": (
+                "RuntimeContext.current+ContractRuntime.completed_lines+"
+                "task_timeline"
+            ),
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "session_token_ref": session_token_ref,
+            "route_authority_source": route_authority_source,
+            "read_receipt_event_id": str(
+                receipt_authority.get("event_id")
+                or read_receipt_event_ref.removeprefix("timeline:")
+            ),
+            "read_receipt_hash": str(
+                receipt_authority.get("read_receipt_hash")
+                or timeline_refs.get("read_receipt_hash")
+                or ""
+            ),
+            "owned_files": list(worker_scope),
+            "zero_write_projection": True,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        }
+        return {
+            **projected,
+            "action": str(
+                startup_action.get("action")
+                or "record_mf_subagent_startup"
+            ),
+            "interface": str(
+                startup_action.get("facade")
+                or "runtime_context.startup"
+            ),
+            "mcp_tool": "parallel_branch_startup",
+            "method": str(startup_action.get("method") or "POST"),
+            "path": str(startup_action.get("path") or ""),
+            "body_source": "copy_safe_body",
+            "action_input": dict(startup_body),
+            "copy_safe_body": dict(startup_body),
+            "actionable": True,
+            "host_realization": dict(
+                startup_action.get("host_realization") or {}
+            ),
+            projection_key: facade_projection,
         }
 
     actionable = _runtime_context_worker_recovery_payloads(
@@ -126980,17 +127381,32 @@ def _onboard_route_guide_compact_service_response(
         )
         else {}
     )
-    worker_read_selected = str(next_action.get("line_id") or "").strip() == (
-        "worker_read_runtime_guide"
+    worker_startup_projection = (
+        next_action.get("worker_startup_runtime_facade_projection")
+        if isinstance(
+            next_action.get("worker_startup_runtime_facade_projection"),
+            Mapping,
+        )
+        else {}
     )
-    worker_read_ready = (
-        worker_read_selected
+    selected_contract_line = str(next_action.get("line_id") or "").strip()
+    worker_runtime_selected = selected_contract_line in {
+        "worker_read_runtime_guide",
+        "worker_startup",
+    }
+    worker_runtime_projection = (
+        worker_startup_projection
+        if selected_contract_line == "worker_startup"
+        else worker_read_projection
+    )
+    worker_runtime_ready = (
+        worker_runtime_selected
         and (
-            str(worker_read_projection.get("status") or "") == "ready"
+            str(worker_runtime_projection.get("status") or "") == "ready"
             or (
-                str(worker_read_projection.get("status") or "")
+                str(worker_runtime_projection.get("status") or "")
                 == "recovery_required"
-                and worker_read_projection.get(
+                and worker_runtime_projection.get(
                     "observer_recovery_actionable"
                 )
                 is True
@@ -126999,12 +127415,12 @@ def _onboard_route_guide_compact_service_response(
     )
     canonical_body = (
         dict(next_action.get("copy_safe_body") or {})
-        if worker_read_ready
+        if worker_runtime_ready
         else {}
-        if worker_read_selected
+        if worker_runtime_selected
         else dict(writer_copy_body or action_input)
     )
-    if worker_read_ready:
+    if worker_runtime_ready:
         action_input = dict(canonical_body)
         action_input_path = "canonical_executable_action.copy_safe_body"
     canonical_mcp_tool = str(
@@ -127013,7 +127429,7 @@ def _onboard_route_guide_compact_service_response(
         or next_action.get("interface")
         or action
     ).strip()
-    if not worker_read_ready and (writer_copy_body or (
+    if not worker_runtime_ready and (writer_copy_body or (
         next_action.get("stage_id") and next_action.get("line_id")
     )):
         canonical_mcp_tool = "contract_runtime_submit_line"
@@ -127251,6 +127667,9 @@ def _onboard_route_guide_compact_service_response(
             )[:16],
             "worker_read_runtime_facade_projection": dict(
                 worker_read_projection
+            ),
+            "worker_startup_runtime_facade_projection": dict(
+                worker_startup_projection
             ),
             "runtime_context_recovery_authority": dict(
                 runtime_context_recovery_authority
@@ -127648,6 +128067,9 @@ def _onboard_route_guide_compact_service_response(
         ),
         "worker_read_runtime_facade_projection": dict(
             worker_read_projection
+        ),
+        "worker_startup_runtime_facade_projection": dict(
+            worker_startup_projection
         ),
         "runtime_context_recovery_authority": dict(
             runtime_context_recovery_authority
@@ -156357,8 +156779,9 @@ def _contract_runtime_dispatch_ticket_authority(
     *,
     requested_runtime_context_id: str = "",
     requested_task_id: str = "",
+    allow_post_read_startup: bool = False,
 ) -> dict[str, Any]:
-    """Project the accepted mf_parallel dispatch during the pre-worker window."""
+    """Project the accepted dispatch in the read or exact post-read window."""
 
     if not _is_mf_parallel_record_contract_id(
         str(record.get("contract_id") or "").strip()
@@ -156386,7 +156809,10 @@ def _contract_runtime_dispatch_ticket_authority(
     actual_next_line = str(
         actual_next.get("line_id") or actual_next.get("id") or ""
     ).strip()
-    if actual_next_line != "worker_read_runtime_guide":
+    allowed_next_lines = {"worker_read_runtime_guide"}
+    if allow_post_read_startup:
+        allowed_next_lines.add("worker_startup")
+    if actual_next_line not in allowed_next_lines:
         return {
             "status": "invalid",
             "error": (
@@ -156495,6 +156921,12 @@ def _contract_runtime_dispatch_ticket_authority(
             dispatch_parent_task_id,
         )
         if all(dispatch_identity) and candidate_identity == dispatch_identity:
+            if (
+                allow_post_read_startup
+                and actual_next_line == "worker_startup"
+                and candidate_line_id == "worker_read_runtime_guide"
+            ):
+                continue
             return {
                 "status": "invalid",
                 "error": "execution ticket authority window closed after worker read/startup",

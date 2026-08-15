@@ -118418,6 +118418,185 @@ def test_compact_worker_read_projects_registry_verified_route_cutover(
         "runtime_context_read_receipt"
     )
 
+    receipt = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": runtime_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=realized_read_body,
+        )
+    )
+    assert receipt["ok"] is True
+    assert receipt["read_receipt_hash"] == realized_read_body[
+        "read_receipt_hash"
+    ]
+    startup_current = server._contract_chain_current_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        rebuild_if_missing=True,
+    )
+    startup_current = (
+        server._contract_chain_current_with_runtime_authority_overlay(
+            startup_current
+        )
+    )
+    startup_resume = server._onboard_runtime_resume_from_current_projection(
+        startup_current
+    )
+    before_startup_projection_changes = conn.total_changes
+    startup_projected_action = (
+        server._onboard_worker_read_runtime_facade_projection(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            next_action=startup_current["next_legal_action"],
+            current_projection=startup_current,
+            runtime_resume=startup_resume,
+        )
+    )
+    assert conn.total_changes == before_startup_projection_changes
+    assert startup_projected_action["line_id"] == "worker_startup"
+    startup_projection = startup_projected_action[
+        "worker_startup_runtime_facade_projection"
+    ]
+    assert startup_projection["status"] == "ready", json.dumps(
+        startup_projection,
+        sort_keys=True,
+    )
+    assert startup_projection["runtime_context_id"] == (
+        runtime_context.runtime_context_id
+    )
+    assert startup_projection["task_id"] == runtime_context.task_id
+    assert startup_projection["owned_files"] == list(
+        runtime_context.owned_files
+    )
+    assert startup_projection["read_receipt_event_id"] == str(
+        receipt["read_receipt_event_id"]
+    )
+    assert startup_projection["read_receipt_hash"] == realized_read_body[
+        "read_receipt_hash"
+    ]
+    startup_guide = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=backlog_id,
+        role="mf_sub",
+        work_type="parallel_worker",
+        record=server._contract_runtime_store(conn).get(
+            successor["contract_execution_id"]
+        ),
+        next_action=startup_projected_action,
+        current_projection=startup_current,
+        runtime_resume=startup_resume,
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+    assert startup_guide["ok"] is True, startup_guide
+    assert startup_guide["status"] == (
+        "compact_action_input_continuation_required"
+    )
+    assert startup_guide["required_sections"] == ["action_input"]
+
+    startup_helper_calls = []
+
+    def startup_helper_tool_caller(tool_name, tool_body):
+        startup_helper_calls.append((tool_name, copy.deepcopy(tool_body)))
+        if tool_name == "onboard_route_guide":
+            return copy.deepcopy(startup_guide)
+        assert tool_name == "onboard_route_guide_section_fetch"
+        return server.handle_project_onboard_route_guide_capsule(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=tool_body,
+            )
+        )
+
+    startup_action, startup_body, startup_raw, startup_failure = (
+        guided_runtime._refresh_host_action_packet(
+            tool_caller=startup_helper_tool_caller,
+            refresh_body={
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "role": "mf_sub",
+                "work_type": "parallel_worker",
+                "task_id": successor["contract_execution_id"],
+                "response_view": "compact",
+            },
+            expected_tools=frozenset({"parallel_branch_startup"}),
+            request_bodies=[],
+            raw_results=[],
+            raw_values=(),
+        )
+    )
+    assert startup_failure is None
+    assert startup_raw == ()
+    assert [name for name, _body in startup_helper_calls] == [
+        "onboard_route_guide",
+        "onboard_route_guide_section_fetch",
+    ]
+    assert startup_action["action"] == "record_mf_subagent_startup"
+    assert startup_action["facade"] == "runtime_context.startup"
+    assert startup_action["mcp_tool"] == "parallel_branch_startup"
+    assert startup_body == startup_action["copy_safe_body"]
+    assert startup_body["project_id"] == PID
+    assert startup_body["runtime_context_id"] == (
+        runtime_context.runtime_context_id
+    )
+    assert startup_body["task_id"] == runtime_context.task_id
+    assert startup_body["parent_task_id"] == runtime_context.parent_task_id
+    assert startup_body["session_token_ref"] == joined["session_token_ref"]
+    assert startup_body["merge_queue_id"] == runtime_context.merge_queue_id
+    assert startup_body["owned_files"] == list(runtime_context.owned_files)
+    assert startup_body["read_receipt_event_id"].startswith("<")
+    assert startup_body["read_receipt_hash"].startswith("<")
+    startup_replacements = startup_action["host_realization"][
+        "required_replacement_paths"
+    ]
+    assert "copy_safe_body.read_receipt_event_id" in startup_replacements
+    assert "copy_safe_body.read_receipt_hash" in startup_replacements
+
+    real_recovery_payloads = server._runtime_context_worker_recovery_payloads
+
+    def drifted_startup_payloads(**kwargs):
+        payloads = real_recovery_payloads(**kwargs)
+        payloads = copy.deepcopy(payloads)
+        payloads["startup_facade_payload_skeleton"]["copy_safe_body"][
+            "owned_files"
+        ] = ["cross-lane.py"]
+        return payloads
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_payloads",
+        drifted_startup_payloads,
+    )
+    before_drift_probe = conn.total_changes
+    blocked_startup = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        next_action=startup_current["next_legal_action"],
+        current_projection=startup_current,
+        runtime_resume=startup_resume,
+    )
+    assert conn.total_changes == before_drift_probe
+    blocked_projection = blocked_startup[
+        "worker_startup_runtime_facade_projection"
+    ]
+    assert blocked_projection["status"] == "blocked"
+    assert blocked_projection["reason"] == (
+        "runtime_context_startup_authority_incomplete"
+    )
+    assert "owned_files" in blocked_projection[
+        "missing_or_mismatched_fields"
+    ]
+    assert blocked_startup.get("copy_safe_body") in (None, {})
+    assert blocked_startup["actionable"] is False
+
 
 def test_compact_worker_read_projects_current_runtime_context_receipt_facade(
     conn,
