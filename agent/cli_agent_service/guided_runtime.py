@@ -579,6 +579,44 @@ def _first_deep_text(value: Any, *field_names: str) -> str:
     return _first_deep_value(value, field_names, want_mapping=False)
 
 
+def _unique_application_text(value: Any, field_name: str) -> str:
+    """Read one unambiguous copy-safe identity from all MCP representations."""
+
+    try:
+        applications = mcp_application_mapping_blocks(
+            value,
+            paths=_MCP_APPLICATION_ROOT_PATHS,
+        )
+    except ServiceError as exc:
+        raise GuidedRuntimeDispatchError(
+            "runtime context guide identity could not be decoded",
+            status="invalid_host_orchestration",
+        ) from exc
+
+    values: set[str] = set()
+
+    def collect(candidate: Any) -> None:
+        if isinstance(candidate, Mapping):
+            if field_name in candidate:
+                text = _text(candidate.get(field_name))
+                if text and not _PLACEHOLDER.search(text):
+                    values.add(text)
+            for nested in candidate.values():
+                collect(nested)
+        elif isinstance(candidate, (list, tuple)):
+            for nested in candidate:
+                collect(nested)
+
+    for application in applications:
+        collect(application)
+    if len(values) > 1:
+        raise GuidedRuntimeDispatchError(
+            "runtime context guide {} is ambiguous".format(field_name),
+            status="invalid_host_orchestration",
+        )
+    return next(iter(values), "")
+
+
 def _contains_named_field(value: Any, field_name: str) -> bool:
     if isinstance(value, Mapping):
         return field_name in value or any(
@@ -1142,20 +1180,24 @@ def _server_declared_recovery_packet(
 
 
 def _onboard_refresh_body(guide: Mapping[str, Any]) -> dict[str, Any]:
-    project_id = _first_deep_text(guide, "project_id")
-    backlog_id = _first_deep_text(guide, "backlog_id")
+    project_id = _unique_application_text(guide, "project_id")
+    backlog_id = _unique_application_text(guide, "backlog_id")
     selected_role = _first_deep_text(guide, "selected_role") or "mf_sub"
     selected_work_type = (
         _first_deep_text(guide, "selected_work_type") or "parallel_worker"
     )
-    contract_execution_id = _first_deep_text(guide, "contract_execution_id")
-    route_token_ref = _first_deep_text(guide, "route_token_ref")
+    contract_execution_id = _unique_application_text(
+        guide, "contract_execution_id"
+    )
+    worker_task_id = _unique_application_text(guide, "task_id")
+    route_token_ref = _unique_application_text(guide, "route_token_ref")
     missing = [
         field_name
         for field_name, value in {
             "project_id": project_id,
             "backlog_id": backlog_id,
             "contract_execution_id": contract_execution_id,
+            "task_id": worker_task_id,
             "route_token_ref": route_token_ref,
         }.items()
         if not value or _PLACEHOLDER.search(value)
@@ -1172,7 +1214,7 @@ def _onboard_refresh_body(guide: Mapping[str, Any]) -> dict[str, Any]:
         "backlog_id": backlog_id,
         "role": selected_role,
         "work_type": selected_work_type,
-        "task_id": contract_execution_id,
+        "task_id": worker_task_id,
         "route_token_ref": route_token_ref,
         "response_view": "compact",
     }

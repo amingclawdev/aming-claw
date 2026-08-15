@@ -14,6 +14,7 @@ from agent.cli_agent_service.adapters.codex_desktop import (
 )
 from agent.cli_agent_service.guided_runtime import (
     GuidedRuntimeDispatchError,
+    _onboard_refresh_body,
     orchestrate_runtime_context_graph_continuation,
     orchestrate_runtime_context_host_startup,
     orchestrate_runtime_context_implementation_continuation,
@@ -1122,6 +1123,54 @@ def _live_refreshing_host_startup_inputs(
     return guide, receipt_body, startup_body
 
 
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        lambda guide: guide,
+        lambda guide: {"structuredContent": guide},
+        lambda guide: {
+            "content": [{"type": "text", "text": json.dumps(guide)}]
+        },
+    ],
+)
+def test_onboard_refresh_body_pins_exact_worker_task_across_mcp_shapes(
+    wrap,
+) -> None:
+    guide, _receipt_body, _startup_body = (
+        _live_refreshing_host_startup_inputs()
+    )
+
+    refresh = _onboard_refresh_body(wrap(deepcopy(guide)))
+
+    assert refresh["task_id"] == "live-host-continuation-worker"
+    assert refresh["task_id"] != guide["contract_execution_id"]
+    assert refresh["route_token_ref"] == "rtok-live-host-continuation"
+
+
+@pytest.mark.parametrize("failure_mode", ["missing", "conflicting"])
+def test_onboard_refresh_body_rejects_missing_or_conflicting_worker_task(
+    failure_mode,
+) -> None:
+    guide, _receipt_body, _startup_body = (
+        _live_refreshing_host_startup_inputs()
+    )
+    if failure_mode == "missing":
+        guide["host_precursor_action"]["copy_safe_body"].pop("task_id")
+        shaped = guide
+    else:
+        conflict = deepcopy(guide)
+        conflict["task_id"] = "foreign-worker-task"
+        shaped = {
+            "structuredContent": guide,
+            "content": [
+                {"type": "text", "text": json.dumps(conflict)}
+            ],
+        }
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        _onboard_refresh_body(shaped)
+
+
 def _server_recovery_selected_host_guide(mode):
     guide, _receipt_body, _startup_body = _live_refreshing_host_startup_inputs()
     precursor = guide.pop("host_precursor_action")
@@ -1454,6 +1503,11 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
         "onboard_route_guide",
         "parallel_branch_startup",
     ]
+    assert all(
+        body["task_id"] == "live-host-continuation-worker"
+        for name, body in calls
+        if name == "onboard_route_guide"
+    )
     assert raw_session not in json.dumps(result, sort_keys=True)
     assert raw_fence not in json.dumps(result, sort_keys=True)
     assert all(raw_session not in json.dumps(body) for _name, body in calls)
