@@ -465,7 +465,7 @@ def test_qa_and_reconcile_policy_revision_boundary_is_pinnable_and_policy_driven
     parallel_rev8 = registry.get("mf_parallel.v2", version="v2", revision="rev8")
     parallel_rev9 = registry.get("mf_parallel.v2", version="v2", revision="rev9")
 
-    assert registry.get("direct_fix", version="v1")["revision"] == "rev3"
+    assert registry.get("direct_fix", version="v1")["revision"] == "rev4"
     parallel_latest = registry.get("mf_parallel.v2", version="v2")
     assert parallel_latest["revision"] == "rev9"
     assert parallel_latest["definition_hash"] == parallel_rev9["definition_hash"]
@@ -714,6 +714,38 @@ def test_qa_and_reconcile_policy_revision_boundary_is_pinnable_and_policy_driven
         rev2_reconcile,
         require_next_action=False,
     ).ok is False
+
+
+def test_direct_fix_terminal_retirement_separates_new_selection_from_history():
+    registry = ContractDefinitionRegistry()
+    exact = {
+        revision: registry.get("direct_fix", version="v1", revision=revision)
+        for revision in ("rev1", "rev2", "rev3", "rev4")
+    }
+
+    for contract_id in ("direct_fix", "direct_fix.v1", "observer_direct_fix.v1"):
+        assert registry.get(contract_id, version="v1")["revision"] == "rev4"
+        for revision in ("rev1", "rev2", "rev3", "rev4"):
+            resolved = registry.resolve_for_new_execution(
+                contract_id,
+                version="v1",
+                requested_revision=revision,
+            )
+            assert resolved["revision"] == "rev4"
+
+    assert exact["rev4"]["status"] == "deprecated"
+    assert exact["rev4"]["metadata"]["lifecycle"]["terminal_retirement"] is True
+    assert [
+        definition
+        for definition in registry.list_definitions(include_deprecated=False)
+        if definition["contract_id"] == "direct_fix"
+    ] == []
+    for revision in ("rev1", "rev2", "rev3"):
+        assert registry.get(
+            "direct_fix",
+            version="v1",
+            revision=revision,
+        )["definition_hash"] == exact[revision]["definition_hash"]
 
 
 def test_registry_rejects_non_object_system_layer(tmp_path):

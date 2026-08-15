@@ -7,6 +7,7 @@ import os
 import pytest
 
 from agent.governance import contract_state_runtime
+from agent.governance.contracts import ContractDefinitionRegistry
 from agent.governance.contract_state_runtime import (
     _bounded_qa_graph_context_satisfies_requirement,
     _current_full_reconcile_satisfies_requirement,
@@ -14,6 +15,55 @@ from agent.governance.contract_state_runtime import (
     build_contract_state_projection,
     resolve_cli_agent_observer_admission,
 )
+
+
+def test_direct_fix_rev4_is_terminal_contract_authority():
+    definition = ContractDefinitionRegistry().get(
+        "direct_fix",
+        version="v1",
+        revision="rev4",
+    )
+    lifecycle = definition["metadata"]["lifecycle"]
+
+    assert definition["status"] == "deprecated"
+    assert lifecycle["state"] == "terminal_retired"
+    assert lifecycle["supersedes_revisions"] == ["rev1", "rev2", "rev3"]
+    assert lifecycle["historical_pinned_read_allowed"] is True
+    for field in (
+        "new_execution_allowed",
+        "entry_allowed",
+        "resume_allowed",
+        "retry_allowed",
+        "reentry_allowed",
+        "successor_allowed",
+    ):
+        assert lifecycle[field] is False
+    assert lifecycle["result"] == {
+        "schema_version": "direct_fix_retired.v1",
+        "code": "direct_fix_retired",
+        "status": "rejected",
+        "classification": "contract_retirement",
+        "retryable": False,
+        "message": (
+            "direct_fix is terminally retired; file a fresh independently "
+            "bounded current-world backlog instead"
+        ),
+    }
+    assert definition["successors"] == []
+    assert definition["system_layer"]["successor_policy"][
+        "allow_successor_start"
+    ] is False
+    assert definition["system_layer"]["lifecycle_policy"] == {
+        "state": "terminal_retired",
+        "entry_allowed": False,
+        "resume_allowed": False,
+        "retry_allowed": False,
+        "reentry_allowed": False,
+        "successor_allowed": False,
+    }
+    terminal_line = definition["rule_layer"]["stages"][0]["lines"][0]
+    assert terminal_line["owner_role"] == "system"
+    assert terminal_line["required"] is False
 
 
 def test_resolve_cli_agent_observer_admission_uses_current_contract_authority():

@@ -195,11 +195,6 @@ def test_qa_template_policies_are_non_authoritative_definition_mirrors():
     v2 = parallel
     qa_policy = parallel["qa_graph_context_policy"]
     direct_fix = get_contract_template("direct_fix.v1")
-    qa_checkpoint = next(
-        item
-        for item in direct_fix["runtime_contract_hints"]["graph_query_checkpoints"]
-        if item["id"] == "qa_graph_context"
-    )
 
     assert qa_policy["non_authoritative_template_mirror"] is True
     assert qa_policy["caller_authority_fields_trusted"] is False
@@ -215,26 +210,12 @@ def test_qa_template_policies_are_non_authoritative_definition_mirrors():
     )
     assert qa_policy["graph_basis_decision_required"] is True
     assert qa_policy["overlay_failure_policy"] == "fail_closed"
-    graph_basis_policy = qa_checkpoint["packet"]["graph_basis_policy"]
-    assert graph_basis_policy["non_authoritative_template_mirror"] is True
-    assert graph_basis_policy["authority"].endswith("bounded_qa_review_policy")
     assert direct_fix["runtime_contract_hints"]["contract_definition_revision"] == (
-        "rev3"
+        "rev4"
     )
-    assert graph_basis_policy["default_graph_basis"] == (
-        "canonical_base_plus_candidate_diff"
-    )
-    assert graph_basis_policy["graph_basis_decision_required"] is True
-    assert graph_basis_policy["one_hop_dependency_failure_policy"] == "fail_closed"
-    assert graph_basis_policy["exact_candidate_escalation_stage"] == qa_policy[
-        "exact_candidate_escalation_stage"
-    ]
-    assert graph_basis_policy["exact_candidate_acceptance_stage"] == qa_policy[
-        "exact_candidate_acceptance_stage"
-    ]
-    assert graph_basis_policy["exact_candidate_upgrade_triggers"] == qa_policy[
-        "exact_candidate_upgrade_triggers"
-    ]
+    assert direct_fix["gate_policy"]["non_authoritative_template_mirror"] is True
+    assert direct_fix["gate_policy"]["terminal_retirement"] is True
+    assert direct_fix["runtime_contract_hints"]["graph_query_checkpoints"] == []
     qa_graph = {
         item["id"]: item for item in v2["evidence_requirements"]
     }["qa_graph_trace_evidence"]
@@ -377,26 +358,23 @@ def test_direct_fix_source_definition_is_registered_as_template_candidate():
     assert template["version"] == "v1"
     assert template["source"]["type"] == "source_controlled"
     assert template["runtime_contract_hints"]["contract_definition_id"] == "direct_fix"
-    assert template["gate_policy"]["parent_blocked_handoff_required"] is True
-    qa_checkpoint = next(
-        item
-        for item in template["runtime_contract_hints"]["graph_query_checkpoints"]
-        if item["id"] == "qa_graph_context"
+    assert template["source"]["template_is_authoritative"] is False
+    assert template["runtime_contract_hints"]["contract_definition_revision"] == "rev4"
+    assert template["runtime_contract_hints"]["entrypoint"] == "retired"
+    assert template["runtime_contract_hints"]["terminal_result"]["code"] == (
+        "direct_fix_retired"
     )
-    assert qa_checkpoint["packet"]["graph_basis_policy"][
-        "exact_candidate_query_root_clean_required"
-    ] is True
-    assert qa_checkpoint["packet"]["graph_basis_policy"][
-        "assigned_target_project_root_required"
-    ] is True
+    assert template["gate_policy"]["terminal_retirement"] is True
+    assert template["stages"] == []
     assert "bypass_parent_close_gate" in template["forbidden_capabilities"]
     assert resolve_contract_template(template_id="direct_fix")["template_id"] == (
         "direct_fix.v1"
     )
-    assert resolve_contract_template(
-        task_type="direct_fix",
-        stage="return_to_parent",
-    )["template_id"] == "direct_fix.v1"
+    with pytest.raises(UnknownContractTemplateError):
+        resolve_contract_template(
+            task_type="direct_fix",
+            stage="return_to_parent",
+        )
 
 
 def test_resolution_by_task_type_and_stage():

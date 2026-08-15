@@ -65,6 +65,47 @@ class ContractRuntimeError(ValueError):
     """Raised when a contract execution cannot be started or advanced."""
 
 
+class ContractRetirementError(ContractRuntimeError):
+    """Typed, source-backed denial for a terminally retired contract."""
+
+    def __init__(self, definition: Mapping[str, Any]) -> None:
+        metadata = definition.get("metadata")
+        lifecycle = metadata.get("lifecycle") if isinstance(metadata, Mapping) else {}
+        result = lifecycle.get("result") if isinstance(lifecycle, Mapping) else {}
+        if not isinstance(result, Mapping):
+            result = {}
+        self.result = deepcopy(dict(result))
+        self.code = str(result.get("code") or "contract_terminally_retired")
+        self.status = str(result.get("status") or "rejected")
+        self.classification = str(
+            result.get("classification") or "contract_retirement"
+        )
+        self.retryable = bool(result.get("retryable", False))
+        self.definition = deepcopy(dict(definition))
+        message = str(result.get("message") or "Contract is terminally retired")
+        super().__init__(f"{self.code}: {message}")
+
+    def to_dict(self) -> dict[str, Any]:
+        lifecycle = (self.definition.get("metadata") or {}).get("lifecycle") or {}
+        return {
+            "schema_version": str(
+                self.result.get("schema_version")
+                or "contract_runtime_terminal_retirement_error.v1"
+            ),
+            "code": self.code,
+            "status": self.status,
+            "classification": self.classification,
+            "retryable": self.retryable,
+            "contract_id": str(self.definition.get("contract_id") or ""),
+            "version": str(self.definition.get("version") or ""),
+            "revision": str(self.definition.get("revision") or ""),
+            "terminal_retirement": True,
+            "supersedes_revisions": list(
+                lifecycle.get("supersedes_revisions") or []
+            ),
+        }
+
+
 class StalePinnedContractExecutionError(ContractRuntimeError):
     """Raised when a persisted execution pins a stale source definition."""
 
@@ -8253,13 +8294,18 @@ class ContractRuntime:
                 "cannot start primary ContractRuntime executions; start with "
                 "onboard_contract and keep legacy routes audit-only"
             )
-        definition = self.registry.get(
+        definition = self.registry.resolve_for_new_execution(
             contract_id,
             version=version,
-            revision=revision,
-            include_deprecated=True,
+            requested_revision=revision,
         )
         if not is_new_execution_allowed(definition):
+            lifecycle = (definition.get("metadata") or {}).get("lifecycle") or {}
+            if (
+                isinstance(lifecycle, Mapping)
+                and lifecycle.get("terminal_retirement") is True
+            ):
+                raise ContractRetirementError(definition)
             raise ContractRuntimeError(
                 f"contract {definition['contract_id']}@{definition['version']}#{definition['revision']} "
                 f"is {definition['status']} and cannot start new executions"

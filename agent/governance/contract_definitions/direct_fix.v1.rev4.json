@@ -1,0 +1,142 @@
+{
+  "schema_version": "contract_definition.v1",
+  "contract_id": "direct_fix",
+  "version": "v1",
+  "revision": "rev4",
+  "role": "observer",
+  "contract_type": "direct_fix",
+  "status": "deprecated",
+  "compat_aliases": [
+    "direct_fix.v1",
+    "observer_direct_fix.v1"
+  ],
+  "successors": [],
+  "metadata": {
+    "previous_revision": "direct_fix.v1.rev3",
+    "revision_reason": "Terminally retire direct_fix because its parent backedge can create contradictory old-world and current-world authority.",
+    "backlog_id": "AC-DIRECT-FIX-CONTRACT-RETIREMENT-P0-20260815",
+    "runtime_cutover": true,
+    "template_id": "direct_fix.v1",
+    "lifecycle": {
+      "state": "terminal_retired",
+      "terminal_retirement": true,
+      "supersedes_revision": "rev3",
+      "supersedes_revisions": [
+        "rev1",
+        "rev2",
+        "rev3"
+      ],
+      "new_execution_allowed": false,
+      "entry_allowed": false,
+      "resume_allowed": false,
+      "retry_allowed": false,
+      "reentry_allowed": false,
+      "successor_allowed": false,
+      "historical_pinned_read_allowed": true,
+      "result": {
+        "schema_version": "direct_fix_retired.v1",
+        "code": "direct_fix_retired",
+        "status": "rejected",
+        "classification": "contract_retirement",
+        "retryable": false,
+        "message": "direct_fix is terminally retired; file a fresh independently bounded current-world backlog instead"
+      }
+    }
+  },
+  "governance_hints": {
+    "schema_version": "governance_hints.v1",
+    "asset_binding_events": [
+      {
+        "schema_version": "asset_binding_event.v1",
+        "operation": "bind",
+        "path": ".",
+        "role": "config",
+        "target_module": "agent.governance.contracts.registry"
+      }
+    ]
+  },
+  "instruction_layer": {
+    "inline": [
+      "direct_fix is terminally retired and must not be entered, resumed, retried, re-entered, or selected as a successor.",
+      "Historical rev1 through rev3 executions remain immutable audit evidence only.",
+      "A current-world repair requires a fresh independently bounded backlog with its own execution, QA, integration, reconcile, and acceptance evidence."
+    ],
+    "refs": []
+  },
+  "rule_layer": {
+    "stages": [
+      {
+        "stage_id": "terminal_retirement",
+        "description": "Source-backed terminal retirement declaration; not an executable repair workflow.",
+        "lines": [
+          {
+            "line_id": "direct_fix_terminal_retirement",
+            "owner_role": "system",
+            "allowed_writer_roles": [
+              "system"
+            ],
+            "evidence_kind": "contract_terminal_retirement",
+            "required": false,
+            "description": "Immutable declaration that direct_fix cannot enter, resume, retry, re-enter, or start a successor."
+          }
+        ]
+      }
+    ],
+    "transitions": []
+  },
+  "system_layer": {
+    "entrypoint_policy": {
+      "allow_root_start": false,
+      "allow_entry": false,
+      "denied_reason": "direct_fix_terminally_retired",
+      "root_start_default": "deny"
+    },
+    "successor_policy": {
+      "allow_successor_start": false,
+      "allowed_parent_contracts": [],
+      "allowed_successors": [],
+      "successor_start_default": "deny"
+    },
+    "write_authority_policy": {
+      "agent_facing_generic_crud_allowed": false,
+      "allowed_writer_roles_source": "terminal_retirement",
+      "body_supplied_role_claims_trusted": false,
+      "unlisted_role_default": "deny"
+    },
+    "next_action_policy": {
+      "decision_source": "terminal_retirement",
+      "entry_default": "deny",
+      "resume_default": "deny",
+      "retry_default": "deny",
+      "reentry_default": "deny"
+    },
+    "projection_policy": {
+      "mutable_completed_lines_trust_root": false,
+      "read_model_source": "source_json_normalized_definition",
+      "runtime_projection_source": "terminal_retirement"
+    },
+    "route_policy": {
+      "route_identity_required": false,
+      "route_token_ref_required": false,
+      "visible_injection_manifest_required": false
+    },
+    "authority_policy": {
+      "historical_pinned_read_allowed": true,
+      "new_execution_authority": "terminal_retirement",
+      "same_revision_semantic_change_allowed": false,
+      "semantic_change_requires_new_revision": true
+    },
+    "graph_binding_policy": {
+      "new_graph_context_allowed": false,
+      "historical_graph_evidence_immutable": true
+    },
+    "lifecycle_policy": {
+      "state": "terminal_retired",
+      "entry_allowed": false,
+      "resume_allowed": false,
+      "retry_allowed": false,
+      "reentry_allowed": false,
+      "successor_allowed": false
+    }
+  }
+}

@@ -112,10 +112,22 @@ class ContractDefinitionRegistry:
 
             definitions = deepcopy(self._snapshot_definitions)
         if not include_deprecated:
+            terminally_retired = {
+                (
+                    str(definition.get("contract_id") or ""),
+                    str(definition.get("version") or ""),
+                )
+                for definition in definitions
+                if _terminal_retirement_lifecycle(definition)
+            }
             definitions = [
                 definition
                 for definition in definitions
                 if definition["status"] != "deprecated"
+                and (
+                    str(definition.get("contract_id") or ""),
+                    str(definition.get("version") or ""),
+                ) not in terminally_retired
             ]
         return definitions
 
@@ -135,6 +147,13 @@ class ContractDefinitionRegistry:
         if not matches:
             raise UnknownContractDefinitionError(f"unknown contract definition: {contract_id}")
         if len(matches) > 1 and revision is None:
+            terminal_retirements = [
+                definition
+                for definition in matches
+                if _terminal_retirement_lifecycle(definition)
+            ]
+            if terminal_retirements and _same_contract_version(terminal_retirements):
+                return max(terminal_retirements, key=_revision_sort_key)
             active = [
                 definition
                 for definition in matches
@@ -151,6 +170,47 @@ class ContractDefinitionRegistry:
                 )
             )
         return matches[0]
+
+    def resolve_for_new_execution(
+        self,
+        contract_id: str,
+        *,
+        version: str | None = None,
+        requested_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve current authority without changing exact historical lookups."""
+
+        selected = self.get(
+            contract_id,
+            version=version,
+            revision=requested_revision,
+            include_deprecated=True,
+        )
+        canonical_contract_id = str(selected.get("contract_id") or "")
+        canonical_version = str(selected.get("version") or "")
+        retirements = [
+            definition
+            for definition in self.list_definitions(include_deprecated=True)
+            if str(definition.get("contract_id") or "") == canonical_contract_id
+            and str(definition.get("version") or "") == canonical_version
+            and _terminal_retirement_lifecycle(definition)
+        ]
+        if not retirements:
+            return selected
+        retirement = max(retirements, key=_revision_sort_key)
+        if requested_revision is None:
+            return retirement
+        lifecycle = _terminal_retirement_lifecycle(retirement)
+        superseded = {
+            str(item)
+            for item in lifecycle.get("supersedes_revisions") or []
+            if str(item)
+        }
+        if requested_revision == str(retirement.get("revision") or ""):
+            return retirement
+        if requested_revision in superseded:
+            return retirement
+        return selected
 
     def validate_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         return normalize_definition(payload)
@@ -324,6 +384,22 @@ def _revision_sort_key(definition: Mapping[str, Any]) -> tuple[int, int, str]:
     if match:
         return (1, int(match.group(1)), revision)
     return (0, 0, revision)
+
+
+def _terminal_retirement_lifecycle(
+    definition: Mapping[str, Any],
+) -> dict[str, Any]:
+    if definition.get("status") != "deprecated":
+        return {}
+    metadata = definition.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return {}
+    lifecycle = metadata.get("lifecycle")
+    if not isinstance(lifecycle, Mapping):
+        return {}
+    if lifecycle.get("terminal_retirement") is not True:
+        return {}
+    return dict(lifecycle)
 
 
 def _matches(

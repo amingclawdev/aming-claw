@@ -6,6 +6,8 @@ from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
 
+import pytest
+
 from agent.governance import (
     graph_snapshot_store,
     parallel_branch_runtime,
@@ -14,6 +16,7 @@ from agent.governance import (
 )
 from agent.governance.contracts import ContractDefinitionRegistry
 from agent.governance.contracts.runtime import (
+    ContractRetirementError,
     ContractRuntime,
     SQLiteContractExecutionStore,
     WriteGateDecision,
@@ -25,6 +28,156 @@ from agent.governance.contracts.runtime import (
     _worker_commit_completed_implementation,
 )
 from agent.governance.contracts.execution_state import build_execution_state
+
+
+@pytest.mark.parametrize(
+    ("contract_id", "revision"),
+    [
+        ("direct_fix", None),
+        ("direct_fix.v1", None),
+        ("observer_direct_fix.v1", None),
+        ("direct_fix", "rev1"),
+        ("direct_fix", "rev2"),
+        ("direct_fix", "rev3"),
+        ("direct_fix", "rev4"),
+    ],
+)
+def test_direct_fix_new_execution_is_typed_terminal_retirement(
+    contract_id,
+    revision,
+):
+    runtime = ContractRuntime(ContractDefinitionRegistry())
+
+    with pytest.raises(ContractRetirementError) as raised:
+        runtime.start_execution(
+            contract_id,
+            version="v1",
+            revision=revision,
+            project_id="aming-claw",
+            backlog_id="AC-DIRECT-FIX-RETIRED",
+            actor_role="observer",
+        )
+
+    error = raised.value.to_dict()
+    assert error == {
+        "schema_version": "direct_fix_retired.v1",
+        "code": "direct_fix_retired",
+        "status": "rejected",
+        "classification": "contract_retirement",
+        "retryable": False,
+        "contract_id": "direct_fix",
+        "version": "v1",
+        "revision": "rev4",
+        "terminal_retirement": True,
+        "supersedes_revisions": ["rev1", "rev2", "rev3"],
+    }
+
+
+def test_direct_fix_frozen_entry_gate_matches_contract_retirement_result():
+    definition = ContractDefinitionRegistry().get(
+        "direct_fix",
+        version="v1",
+        revision="rev4",
+    )
+    contract_result = definition["metadata"]["lifecycle"]["result"]
+    status_code, gate_result = server.handle_project_direct_fix_enter(
+        SimpleNamespace(
+            get_project_id=lambda: "aming-claw",
+            body={"backlog_id": "AC-DIRECT-FIX-RETIRED"},
+        )
+    )
+
+    assert status_code == 409
+    assert gate_result["schema_version"] == contract_result["schema_version"]
+    assert gate_result["error"] == contract_result["code"]
+    assert gate_result["status"] == contract_result["status"]
+    assert gate_result["historical_evidence_readable"] is True
+    assert gate_result["historical_execution_scheduler_eligible"] is False
+
+
+def test_terminal_retirement_does_not_rewrite_pinned_execution(tmp_path):
+    active = {
+        "schema_version": "contract_definition.v1",
+        "contract_id": "pinned_retirement_test",
+        "version": "v1",
+        "revision": "rev1",
+        "role": "observer",
+        "contract_type": "implementation",
+        "status": "active",
+        "rule_layer": {
+            "stages": [
+                {
+                    "stage_id": "work",
+                    "lines": [
+                        {
+                            "line_id": "implementation",
+                            "owner_role": "observer",
+                            "allowed_writer_roles": ["observer"],
+                            "evidence_kind": "implementation",
+                        }
+                    ],
+                }
+            ]
+        },
+        "instruction_layer": {"inline": ["Implement bounded work."], "refs": []},
+    }
+    (tmp_path / "pinned_retirement_test.v1.rev1.json").write_text(
+        json.dumps(active),
+        encoding="utf-8",
+    )
+    original_runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path))
+    created = original_runtime.start_execution(
+        "pinned_retirement_test",
+        project_id="aming-claw",
+        backlog_id="AC-PINNED-HISTORY",
+        actor_role="observer",
+    )
+    original_hash = created["definition_hash"]
+
+    retired = {
+        **active,
+        "revision": "rev2",
+        "status": "deprecated",
+        "metadata": {
+            "lifecycle": {
+                "terminal_retirement": True,
+                "supersedes_revisions": ["rev1"],
+                "result": {
+                    "code": "pinned_test_retired",
+                    "classification": "contract_retirement",
+                    "retryable": False,
+                },
+            }
+        },
+    }
+    (tmp_path / "pinned_retirement_test.v1.rev2.json").write_text(
+        json.dumps(retired),
+        encoding="utf-8",
+    )
+    current_runtime = ContractRuntime(
+        ContractDefinitionRegistry(tmp_path),
+        store=original_runtime.store,
+    )
+    pinned = current_runtime.current_record(
+        created["contract_execution_id"],
+        actor_role="observer",
+    )
+    assert pinned["revision"] == "rev1"
+    assert pinned["definition_hash"] == original_hash
+
+    for revision in (None, "rev1"):
+        with pytest.raises(ContractRetirementError) as raised:
+            current_runtime.start_execution(
+                "pinned_retirement_test",
+                version="v1",
+                revision=revision,
+                project_id="aming-claw",
+                backlog_id="AC-PINNED-HISTORY-NEW",
+                actor_role="observer",
+            )
+        assert raised.value.code == "pinned_test_retired"
+        assert raised.value.status == "rejected"
+        assert raised.value.retryable is False
 
 
 def test_current_record_guide_projection_does_not_compete_with_finish_writer_lock(
