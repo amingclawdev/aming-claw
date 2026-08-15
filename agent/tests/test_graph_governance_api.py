@@ -147952,6 +147952,47 @@ def test_compact_worker_read_explicit_task_pin_selects_exact_sibling_zero_write(
         "current_contract_execution_id": record["contract_execution_id"],
         "next_legal_action": next_line,
     }
+    strict_partial_selector = (
+        server._contract_runtime_dispatch_ticket_authority(
+            record,
+            server._runtime_current_state_from_record(record),
+            requested_task_id=pinned_worker["task_id"],
+        )
+    )
+    assert strict_partial_selector == {
+        "status": "invalid",
+        "error": (
+            "atomic mf_parallel dispatch requires exact runtime_context_id "
+            "and task_id selectors"
+        ),
+    }
+    task_selected_dispatch = (
+        server._contract_runtime_dispatch_ticket_authority(
+            record,
+            server._runtime_current_state_from_record(record),
+            requested_task_id=pinned_worker["task_id"],
+            allow_unique_task_selector=True,
+        )
+    )
+    assert task_selected_dispatch["status"] == "projected"
+    assert task_selected_dispatch["next_legal_action"][
+        "runtime_context_id"
+    ] == pinned_worker["runtime_context_id"]
+    assert task_selected_dispatch["next_legal_action"]["task_id"] == (
+        pinned_worker["task_id"]
+    )
+
+    def reject_task_table_lookup(*_args, **_kwargs):
+        raise AssertionError(
+            "explicit task pin must derive RuntimeContext identity from the "
+            "accepted atomic dispatch before persisted-context validation"
+        )
+
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_branch_context",
+        reject_task_table_lookup,
+    )
     before_changes = conn.total_changes
     before_db = "\n".join(conn.iterdump())
 

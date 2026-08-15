@@ -126380,57 +126380,6 @@ def _onboard_worker_read_runtime_facade_projection(
     explicit_route_token_ref = str(
         requested_route_token_ref or ""
     ).strip()
-    explicit_runtime_context_id = ""
-    if explicit_task_id:
-        from .parallel_branch_runtime import get_branch_context
-
-        explicit_context = get_branch_context(
-            conn,
-            project_id,
-            explicit_task_id,
-        )
-        if explicit_context is None:
-            return blocked(
-                "runtime_context_explicit_task_not_allocated",
-                ["task_id"],
-            )
-        explicit_runtime_context_id = str(
-            getattr(explicit_context, "runtime_context_id", "") or ""
-        ).strip()
-        explicit_parent_task_id = _runtime_context_mf_sub_parent_task_id(
-            explicit_context
-        )
-        explicit_scope_mismatches = [
-            field
-            for field, expected, actual in (
-                (
-                    "project_id",
-                    project_id,
-                    str(getattr(explicit_context, "project_id", "") or ""),
-                ),
-                (
-                    "backlog_id",
-                    backlog_id,
-                    str(getattr(explicit_context, "backlog_id", "") or ""),
-                ),
-                ("parent_task_id", execution_id, explicit_parent_task_id),
-                (
-                    "task_id",
-                    explicit_task_id,
-                    str(getattr(explicit_context, "task_id", "") or ""),
-                ),
-            )
-            if not expected or expected != actual
-        ]
-        if not explicit_runtime_context_id:
-            explicit_scope_mismatches.append("runtime_context_id")
-        if not explicit_route_token_ref:
-            explicit_scope_mismatches.append("route_token_ref")
-        if explicit_scope_mismatches:
-            return blocked(
-                "runtime_context_explicit_task_scope_mismatch",
-                list(dict.fromkeys(explicit_scope_mismatches)),
-            )
     startup_runtime_context_id = (
         str(projected.get("runtime_context_id") or "").strip()
         if startup_selected or graph_selected
@@ -126441,29 +126390,32 @@ def _onboard_worker_read_runtime_facade_projection(
         if startup_selected or graph_selected
         else ""
     )
-    if explicit_task_id and startup_selected and (
-        startup_task_id != explicit_task_id
-        or startup_runtime_context_id != explicit_runtime_context_id
-    ):
-        return blocked(
-            "runtime_context_explicit_task_next_action_mismatch",
-            ["runtime_context_id", "task_id"],
-        )
     dispatch = _contract_runtime_dispatch_ticket_authority(
         record,
         _runtime_current_state_from_record(record),
         requested_runtime_context_id=(
-            explicit_runtime_context_id or startup_runtime_context_id
+            "" if explicit_task_id else startup_runtime_context_id
         ),
         requested_task_id=(
             explicit_task_id or startup_task_id
         ),
         allow_post_read_startup=startup_selected,
         allow_post_startup_graph=graph_selected,
+        allow_unique_task_selector=bool(explicit_task_id),
     )
     if dispatch.get("status") != "projected":
+        dispatch_error = str(
+            dispatch.get("error") or "dispatch_authority_unavailable"
+        )
+        if explicit_task_id and dispatch_error == (
+            "atomic mf_parallel dispatch cannot resolve the active worker line instance"
+        ):
+            return blocked(
+                "runtime_context_explicit_task_not_allocated",
+                ["task_id"],
+            )
         return blocked(
-            str(dispatch.get("error") or "dispatch_authority_unavailable"),
+            dispatch_error,
             ["accepted_dispatch_authority"],
         )
     dispatch_action = (
@@ -126492,6 +126444,39 @@ def _onboard_worker_read_runtime_facade_projection(
         return blocked("runtime_context_not_found", ["runtime_context_id"])
     task_id = str(getattr(context, "task_id", "") or "").strip()
     parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    if explicit_task_id:
+        explicit_scope_mismatches = [
+            field
+            for field, expected, actual in (
+                (
+                    "project_id",
+                    project_id,
+                    str(getattr(context, "project_id", "") or ""),
+                ),
+                (
+                    "backlog_id",
+                    backlog_id,
+                    str(getattr(context, "backlog_id", "") or ""),
+                ),
+                ("parent_task_id", execution_id, parent_task_id),
+                ("task_id", explicit_task_id, task_id),
+                (
+                    "runtime_context_id",
+                    runtime_context_id,
+                    str(
+                        getattr(context, "runtime_context_id", "") or ""
+                    ).strip(),
+                ),
+            )
+            if not expected or expected != actual
+        ]
+        if not explicit_route_token_ref:
+            explicit_scope_mismatches.append("route_token_ref")
+        if explicit_scope_mismatches:
+            return blocked(
+                "runtime_context_explicit_task_scope_mismatch",
+                list(dict.fromkeys(explicit_scope_mismatches)),
+            )
     worker_id = str(getattr(context, "worker_id", "") or "").strip()
     worker_slot_id = str(
         getattr(context, "worker_slot_id", "") or worker_id
@@ -157381,6 +157366,7 @@ def _contract_runtime_dispatch_ticket_authority(
     requested_task_id: str = "",
     allow_post_read_startup: bool = False,
     allow_post_startup_graph: bool = False,
+    allow_unique_task_selector: bool = False,
 ) -> dict[str, Any]:
     """Project the accepted dispatch in the read or exact post-read window."""
 
@@ -157436,8 +157422,14 @@ def _contract_runtime_dispatch_ticket_authority(
         selector_supplied = bool(
             requested_runtime_context_id or requested_task_id
         )
+        task_only_selector = bool(
+            allow_unique_task_selector
+            and requested_task_id
+            and not requested_runtime_context_id
+        )
         if selector_supplied and not (
-            requested_runtime_context_id and requested_task_id
+            (requested_runtime_context_id and requested_task_id)
+            or task_only_selector
         ):
             return {
                 "status": "invalid",
