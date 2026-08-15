@@ -12,6 +12,7 @@ from agent.governance.contract_template_registry import (
     resolve_contract_template,
 )
 from agent.governance.mf_subagent_contract import load_meta_contract_template
+from agent.governance.contracts import ContractDefinitionRegistry
 from agent.mcp.tools import TOOLS, ToolDispatcher
 
 
@@ -364,12 +365,35 @@ def test_direct_fix_source_definition_is_registered_as_template_candidate():
     assert template["runtime_contract_hints"]["terminal_result"]["code"] == (
         "direct_fix_retired"
     )
+    assert template["runtime_contract_hints"]["terminal_result"] == (
+        ContractDefinitionRegistry()
+        .get("direct_fix", version="v1", revision="rev4")["metadata"][
+            "lifecycle"
+        ]["result"]
+    )
     assert template["gate_policy"]["terminal_retirement"] is True
+    assert template["task_types"] == ["direct_fix", "observer_direct_fix"]
     assert template["stages"] == []
     assert "bypass_parent_close_gate" in template["forbidden_capabilities"]
     assert resolve_contract_template(template_id="direct_fix")["template_id"] == (
         "direct_fix.v1"
     )
+    for task_type in (
+        "direct",
+        "direct_fix",
+        "observer_direct_fix",
+        "manual_fix",
+        "chain_rescue",
+    ):
+        if task_type in {"manual_fix", "chain_rescue"}:
+            assert all(
+                item["template_id"] != "direct_fix.v1"
+                for item in list_contract_templates(task_type=task_type)
+            )
+            continue
+        assert list_contract_templates(task_type=task_type) == []
+        with pytest.raises(UnknownContractTemplateError):
+            resolve_contract_template(task_type=task_type)
     with pytest.raises(UnknownContractTemplateError):
         resolve_contract_template(
             task_type="direct_fix",

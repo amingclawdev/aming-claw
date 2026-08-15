@@ -33,13 +33,13 @@ from agent.governance.contracts.execution_state import build_execution_state
 @pytest.mark.parametrize(
     ("contract_id", "revision"),
     [
-        ("direct_fix", None),
-        ("direct_fix.v1", None),
-        ("observer_direct_fix.v1", None),
-        ("direct_fix", "rev1"),
-        ("direct_fix", "rev2"),
-        ("direct_fix", "rev3"),
-        ("direct_fix", "rev4"),
+        (contract_id, revision)
+        for contract_id in (
+            "direct_fix",
+            "direct_fix.v1",
+            "observer_direct_fix.v1",
+        )
+        for revision in (None, "rev1", "rev2", "rev3", "rev4")
     ],
 )
 def test_direct_fix_new_execution_is_typed_terminal_retirement(
@@ -62,9 +62,33 @@ def test_direct_fix_new_execution_is_typed_terminal_retirement(
     assert error == {
         "schema_version": "direct_fix_retired.v1",
         "code": "direct_fix_retired",
+        "error": "direct_fix_retired",
         "status": "rejected",
         "classification": "contract_retirement",
         "retryable": False,
+        "message": (
+            "direct_fix is terminally retired; file a fresh independently "
+            "bounded current-world backlog instead"
+        ),
+        "historical_evidence_readable": True,
+        "historical_execution_scheduler_eligible": False,
+        "authorizes_write": False,
+        "next_legal_action": {
+            "id": "file_fresh_bounded_row",
+            "action": "select_or_create_backlog",
+            "next_step": (
+                "File or select a fresh independently bounded row in the "
+                "current world. Never resume, return to, or retry the "
+                "historical source execution."
+            ),
+        },
+        "forbidden_backedges": [
+            "direct_fix_enter",
+            "parent_to_resume",
+            "return_to_parent",
+            "resume_original_contract",
+            "retry_source_backlog_close_after_repair",
+        ],
         "contract_id": "direct_fix",
         "version": "v1",
         "revision": "rev4",
@@ -88,11 +112,18 @@ def test_direct_fix_frozen_entry_gate_matches_contract_retirement_result():
     )
 
     assert status_code == 409
-    assert gate_result["schema_version"] == contract_result["schema_version"]
-    assert gate_result["error"] == contract_result["code"]
-    assert gate_result["status"] == contract_result["status"]
-    assert gate_result["historical_evidence_readable"] is True
-    assert gate_result["historical_execution_scheduler_eligible"] is False
+    for field in (
+        "schema_version",
+        "error",
+        "status",
+        "historical_evidence_readable",
+        "historical_execution_scheduler_eligible",
+        "authorizes_write",
+        "next_legal_action",
+        "forbidden_backedges",
+    ):
+        assert gate_result[field] == contract_result[field]
+    assert contract_result["code"] == gate_result["error"]
 
 
 def test_terminal_retirement_does_not_rewrite_pinned_execution(tmp_path):
@@ -138,14 +169,75 @@ def test_terminal_retirement_does_not_rewrite_pinned_execution(tmp_path):
         **active,
         "revision": "rev2",
         "status": "deprecated",
+        "successors": [],
+        "system_layer": {
+            "entrypoint_policy": {
+                "allow_root_start": False,
+                "allow_entry": False,
+            },
+            "successor_policy": {"allow_successor_start": False},
+            "write_authority_policy": {
+                "agent_facing_generic_crud_allowed": False,
+            },
+            "graph_binding_policy": {"new_graph_context_allowed": False},
+            "route_policy": {
+                "start_allowed": False,
+                "new_route_allowed": False,
+            },
+            "lifecycle_policy": {
+                "entry_allowed": False,
+                "resume_allowed": False,
+                "retry_allowed": False,
+                "reentry_allowed": False,
+                "successor_allowed": False,
+            },
+        },
+        "rule_layer": {
+            "stages": [
+                {
+                    "stage_id": "terminal_retirement",
+                    "lines": [
+                        {
+                            "line_id": "terminal_retirement",
+                            "owner_role": "system",
+                            "allowed_writer_roles": ["system"],
+                            "evidence_kind": "contract_terminal_retirement",
+                            "required": False,
+                        }
+                    ],
+                }
+            ],
+            "transitions": [],
+        },
         "metadata": {
             "lifecycle": {
+                "state": "terminal_retired",
                 "terminal_retirement": True,
                 "supersedes_revisions": ["rev1"],
+                "new_execution_allowed": False,
+                "entry_allowed": False,
+                "resume_allowed": False,
+                "retry_allowed": False,
+                "reentry_allowed": False,
+                "successor_allowed": False,
+                "historical_pinned_read_allowed": True,
                 "result": {
+                    "schema_version": "pinned_test_retired.v1",
                     "code": "pinned_test_retired",
+                    "error": "pinned_test_retired",
+                    "status": "rejected",
                     "classification": "contract_retirement",
                     "retryable": False,
+                    "message": "pinned test contract is terminally retired",
+                    "historical_evidence_readable": True,
+                    "historical_execution_scheduler_eligible": False,
+                    "authorizes_write": False,
+                    "next_legal_action": {
+                        "id": "file_fresh_bounded_row",
+                        "action": "select_or_create_backlog",
+                        "next_step": "file a fresh bounded row",
+                    },
+                    "forbidden_backedges": ["resume_original_contract"],
                 },
             }
         },
@@ -158,12 +250,61 @@ def test_terminal_retirement_does_not_rewrite_pinned_execution(tmp_path):
         ContractDefinitionRegistry(tmp_path),
         store=original_runtime.store,
     )
+    before = original_runtime.store.get(created["contract_execution_id"])
     pinned = current_runtime.current_record(
         created["contract_execution_id"],
         actor_role="observer",
     )
     assert pinned["revision"] == "rev1"
     assert pinned["definition_hash"] == original_hash
+    assert pinned["runtime_guide"]["contract"]["revision"] == "rev1"
+    assert pinned["runtime_guide"]["next_legal_action"] is None
+    assert pinned["runtime_guide"]["readiness_state"] == "terminal_retired"
+    assert pinned["runtime_guide"]["terminal_retirement"]["code"] == (
+        "pinned_test_retired"
+    )
+    assert pinned["execution_state"]["terminal"] is True
+    assert pinned["execution_state"]["scheduler_eligible"] is False
+    assert pinned["execution_state"]["resume_eligible"] is False
+    assert pinned["execution_state"]["write_eligible"] is False
+    assert pinned["precheck_decision"]["decision"] == "block"
+    assert pinned["precheck_decision"]["gate_id"] == (
+        "contract_terminal_retirement"
+    )
+    assert pinned["precheck_decision"]["errors"] == [
+        "pinned_test_retired"
+    ]
+    assert pinned["precheck_decision"]["contract_definition_hash"] == (
+        current_runtime.registry.get(
+            "pinned_retirement_test",
+            version="v1",
+            revision="rev2",
+        )["definition_hash"]
+    )
+    assert original_runtime.store.get(created["contract_execution_id"]) == before
+
+    current_runtime.current_guide(
+        created["contract_execution_id"],
+        actor_role="observer",
+    )
+    assert original_runtime.store.get(created["contract_execution_id"]) == before
+
+    for method_name, request in (
+        ("precheck_line_write", {}),
+        ("submit_line_write", {}),
+        ("revise_failed_qa_worker_implementation", {}),
+        ("revise_failed_qa_observer_dispatch", {}),
+        ("revise_precommit_worker_implementation", {}),
+        ("bypass_current_line", {}),
+    ):
+        with pytest.raises(ContractRetirementError) as raised:
+            getattr(current_runtime, method_name)(
+                created["contract_execution_id"],
+                request,
+                actor_role="observer",
+            )
+        assert raised.value.to_dict()["authorizes_write"] is False
+        assert original_runtime.store.get(created["contract_execution_id"]) == before
 
     for revision in (None, "rev1"):
         with pytest.raises(ContractRetirementError) as raised:

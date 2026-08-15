@@ -87,12 +87,14 @@ class ContractRetirementError(ContractRuntimeError):
 
     def to_dict(self) -> dict[str, Any]:
         lifecycle = (self.definition.get("metadata") or {}).get("lifecycle") or {}
-        return {
+        payload = deepcopy(self.result)
+        payload.update({
             "schema_version": str(
                 self.result.get("schema_version")
                 or "contract_runtime_terminal_retirement_error.v1"
             ),
             "code": self.code,
+            "error": str(self.result.get("error") or self.code),
             "status": self.status,
             "classification": self.classification,
             "retryable": self.retryable,
@@ -103,7 +105,8 @@ class ContractRetirementError(ContractRuntimeError):
             "supersedes_revisions": list(
                 lifecycle.get("supersedes_revisions") or []
             ),
-        }
+        })
+        return payload
 
 
 class StalePinnedContractExecutionError(ContractRuntimeError):
@@ -968,6 +971,7 @@ CREATE INDEX IF NOT EXISTS idx_backlog_contract_chain_current_chain
 
 DIRECT_FIX_CONTRACT_IDS = frozenset({"direct_fix", "direct_fix.v1"})
 MF_PARALLEL_CONTRACT_IDS = frozenset({"mf_parallel", "mf_parallel.v2", "mf_parallel.v1"})
+_SOURCE_CONTRACT_DEFINITION_REGISTRY = ContractDefinitionRegistry()
 DIRECT_FIX_QA_EVIDENCE_KINDS = frozenset(
     {"independent_verification", "direct_fix_independent_qa"}
 )
@@ -1152,6 +1156,17 @@ def rebuild_backlog_contract_chain_projection(
             completed_repair_barrier
         )
     if current.get("terminal") is True:
+        terminal_retirement = current.get("terminal_retirement")
+        if isinstance(terminal_retirement, Mapping) and terminal_retirement:
+            active_chain["terminal_retirement"] = dict(terminal_retirement)
+        historical_pinned_identity = current.get("historical_pinned_identity")
+        if (
+            isinstance(historical_pinned_identity, Mapping)
+            and historical_pinned_identity
+        ):
+            active_chain["historical_pinned_identity"] = dict(
+                historical_pinned_identity
+            )
         terminal_disposition = current.get("terminal_disposition")
         if isinstance(terminal_disposition, Mapping):
             active_chain["terminal_disposition"] = dict(terminal_disposition)
@@ -2360,6 +2375,9 @@ def _recovery_superseded_execution_ids(
 
 
 def _project_record_state(record: Mapping[str, Any]) -> dict[str, Any]:
+    terminal_retirement = _terminal_retirement_record_projection(record)
+    if terminal_retirement is not None:
+        return terminal_retirement
     current_id = str(record.get("contract_execution_id") or "")
     current_contract_id = _record_contract_id(record)
     terminal = _audited_bypass_terminal_disposition(record)
@@ -2408,6 +2426,9 @@ def _project_direct_fix_state(
     *,
     root_record: Mapping[str, Any],
 ) -> dict[str, Any]:
+    terminal_retirement = _terminal_retirement_record_projection(child)
+    if terminal_retirement is not None:
+        return terminal_retirement
     child_id = str(child.get("contract_execution_id") or "")
     parent_id = str(child.get("parent_contract_execution_id") or "")
     generation = int(child.get("execution_state_revision") or 0)
@@ -2540,6 +2561,62 @@ def _record_order_key(
 
 def _record_contract_id(record: Mapping[str, Any]) -> str:
     return str(record.get("contract_id") or "").strip()
+
+
+def _source_terminal_retirement_for_record(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    contract_id = _record_contract_id(record)
+    version = str(record.get("version") or "").strip()
+    if not contract_id or not version:
+        return None
+    return _SOURCE_CONTRACT_DEFINITION_REGISTRY.terminal_retirement_for(
+        contract_id,
+        version=version,
+    )
+
+
+def _terminal_retirement_record_projection(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    retirement = _source_terminal_retirement_for_record(record)
+    if retirement is None:
+        return None
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    version = str(record.get("version") or "").strip()
+    retirement_result = ContractRetirementError(retirement).to_dict()
+    return {
+        "current_contract_execution_id": execution_id,
+        "current_contract_id": _record_contract_id(record),
+        "parent_to_resume_contract_execution_id": "",
+        "active_child_contract_execution_id": "",
+        "readiness_state": "terminal_retired",
+        "disposition": "terminal_retired",
+        "terminal": True,
+        "historical_pinned_read_only": True,
+        "scheduler_eligible": False,
+        "schedulable": False,
+        "current_eligible": False,
+        "close_eligible": False,
+        "closeable": False,
+        "resume_eligible": False,
+        "resumable": False,
+        "retry_eligible": False,
+        "write_eligible": False,
+        "generation": int(record.get("execution_state_revision") or 0),
+        "next_legal_action": {},
+        "terminal_retirement": retirement_result,
+        "historical_pinned_identity": {
+            "contract_execution_id": execution_id,
+            "contract_id": _record_contract_id(record),
+            "version": version,
+            "revision": str(record.get("revision") or ""),
+            "definition_hash": str(record.get("definition_hash") or ""),
+            "definition_source_sha256": str(
+                record.get("definition_source_sha256") or ""
+            ),
+        },
+    }
 
 
 _DIRECT_FIX_GRAPH_GATE_LINE_IDS = frozenset(
@@ -8001,6 +8078,41 @@ def _current_projection_from_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str
             }
         )
         projection.pop("parent_to_resume_contract_execution_id", None)
+    if projection["readiness_state"] == "terminal_retired":
+        terminal_retirement = (
+            active_chain.get("terminal_retirement")
+            if isinstance(active_chain.get("terminal_retirement"), Mapping)
+            else {}
+        )
+        historical_pinned_identity = (
+            active_chain.get("historical_pinned_identity")
+            if isinstance(
+                active_chain.get("historical_pinned_identity"), Mapping
+            )
+            else {}
+        )
+        projection.update(
+            {
+                "disposition": "terminal_retired",
+                "terminal": True,
+                "historical_pinned_read_only": True,
+                "scheduler_eligible": False,
+                "schedulable": False,
+                "current_eligible": False,
+                "close_eligible": False,
+                "closeable": False,
+                "resume_eligible": False,
+                "resumable": False,
+                "retry_eligible": False,
+                "write_eligible": False,
+                "next_legal_action": {},
+                "terminal_retirement": dict(terminal_retirement),
+                "historical_pinned_identity": dict(
+                    historical_pinned_identity
+                ),
+            }
+        )
+        projection.pop("parent_to_resume_contract_execution_id", None)
     if projection["readiness_state"] == "completed_with_exception":
         stored_terminal = (
             active_chain.get("terminal_disposition")
@@ -8423,7 +8535,8 @@ class ContractRuntime:
             contract_execution_id,
             actor_role=actor_role,
         )
-        self.store.update(contract_execution_id, view)
+        if self._terminal_retirement_for_record(view) is None:
+            self.store.update(contract_execution_id, view)
         return dict(view["runtime_guide"])
 
     def current_record(
@@ -8616,22 +8729,75 @@ class ContractRuntime:
             record=record,
             reader_role=effective_actor_role,
         )
-        current_precheck = self.gate_kernel.precheck(
-            definition,
-            action="current_state",
-            actor_role=effective_actor_role,
-            execution_state=state,
-            runtime_guide=guide,
-            subject={
-                "project_id": record.get("project_id"),
-                "backlog_id": record.get("backlog_id"),
-                "contract_execution_id": record.get("contract_execution_id"),
-                "parent_contract_execution_id": record.get("parent_contract_execution_id"),
-                "root_contract_execution_id": record.get("root_contract_execution_id"),
-                "contract_chain_id": record.get("contract_chain_id"),
-                "route_token_ref": record.get("route_token_ref"),
-            },
-        )
+        retirement = self._terminal_retirement_for_record(record)
+        if retirement is not None:
+            retirement_result = ContractRetirementError(retirement).to_dict()
+            guide["next_legal_action"] = None
+            guide.pop("writer_role_safe_copy_payload", None)
+            guide.pop("line_bypass_guidance", None)
+            guide.pop("failed_qa_rework", None)
+            guide.pop("post_projection_submit_line_guidance", None)
+            guide["readiness_state"] = "terminal_retired"
+            guide["disposition"] = "terminal_retired"
+            guide["terminal_retirement"] = retirement_result
+            guide["historical_pinned_read_only"] = True
+            guide["scheduler_eligible"] = False
+            guide["resume_eligible"] = False
+            guide["retry_eligible"] = False
+            guide["write_eligible"] = False
+            state["readiness_state"] = "terminal_retired"
+            state["disposition"] = "terminal_retired"
+            state["terminal"] = True
+            state["scheduler_eligible"] = False
+            state["current_eligible"] = False
+            state["close_eligible"] = False
+            state["resume_eligible"] = False
+            state["retry_eligible"] = False
+            state["write_eligible"] = False
+            guide["runtime_guide_hash"] = stable_sha256(
+                {
+                    key: value
+                    for key, value in guide.items()
+                    if key != "runtime_guide_hash"
+                }
+            )
+        if retirement is not None:
+            retirement_result = ContractRetirementError(retirement).to_dict()
+            current_precheck = make_gate_decision(
+                action="current_state",
+                gate_id="contract_terminal_retirement",
+                gate_type="contract_lifecycle",
+                actor_role=effective_actor_role,
+                errors=[str(retirement_result.get("code") or "contract_retired")],
+                next_move=retirement_result.get("next_legal_action") or {},
+                policy_hash=stable_sha256(
+                    ((retirement.get("metadata") or {}).get("lifecycle") or {})
+                ),
+                contract_definition_hash=str(
+                    retirement.get("definition_hash") or ""
+                ),
+                execution_state_revision=int(
+                    record.get("execution_state_revision") or 0
+                ),
+                runtime_guide_hash=str(guide.get("runtime_guide_hash") or ""),
+            )
+        else:
+            current_precheck = self.gate_kernel.precheck(
+                definition,
+                action="current_state",
+                actor_role=effective_actor_role,
+                execution_state=state,
+                runtime_guide=guide,
+                subject={
+                    "project_id": record.get("project_id"),
+                    "backlog_id": record.get("backlog_id"),
+                    "contract_execution_id": record.get("contract_execution_id"),
+                    "parent_contract_execution_id": record.get("parent_contract_execution_id"),
+                    "root_contract_execution_id": record.get("root_contract_execution_id"),
+                    "contract_chain_id": record.get("contract_chain_id"),
+                    "route_token_ref": record.get("route_token_ref"),
+                },
+            )
         _attach_precheck_decision(guide, current_precheck.to_dict())
         view = deepcopy(dict(record))
         view["completed_lines"] = deepcopy(line_items)
@@ -8653,6 +8819,7 @@ class ContractRuntime:
         projection: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         record = self.store.get(contract_execution_id)
+        self._raise_if_terminally_retired(record)
         definition = self._load_pinned_definition(record)
         effective_write = dict(write)
         body_actor_role = str(effective_write.get("actor_role") or "")
@@ -8806,6 +8973,7 @@ class ContractRuntime:
         _enrich_line_instance_fields(effective_write)
 
         record = self.store.get(contract_execution_id)
+        self._raise_if_terminally_retired(record)
         lines = list(record.get("completed_lines") or [])
         failed_qa_index = _active_failed_qa_line_index(
             lines,
@@ -9244,6 +9412,7 @@ class ContractRuntime:
         _enrich_line_instance_fields(effective_write)
 
         record = self.store.get(contract_execution_id)
+        self._raise_if_terminally_retired(record)
         lines = list(record.get("completed_lines") or [])
         failed_qa_index = _active_failed_qa_line_index(
             lines,
@@ -9571,6 +9740,7 @@ class ContractRuntime:
         _enrich_line_instance_fields(effective_write)
 
         record = self.store.get(contract_execution_id)
+        self._raise_if_terminally_retired(record)
         lines = list(record.get("completed_lines") or [])
         payload = (
             dict(effective_write.get("payload"))
@@ -10048,6 +10218,7 @@ class ContractRuntime:
         """Waive the current line without PASS or downstream diagnostic fanout."""
 
         record = self.store.get(contract_execution_id)
+        self._raise_if_terminally_retired(record)
         active_no_pass_generation = _contract_runtime_no_pass_generation(record)
         request = dict(bypass)
         effective_actor_role = _effective_actor_role(request, actor_role=actor_role)
@@ -10361,6 +10532,7 @@ class ContractRuntime:
         """Validate a proposed line write without appending completed evidence."""
 
         record = self.store.get(contract_execution_id)
+        self._raise_if_terminally_retired(record)
         definition = self._load_pinned_definition(record)
         effective_write = dict(write)
         body_actor_role = str(effective_write.get("actor_role") or "")
@@ -10469,6 +10641,23 @@ class ContractRuntime:
                 definition=definition,
             )
         return definition
+
+    def _terminal_retirement_for_record(
+        self,
+        record: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        registry = getattr(self, "registry", None)
+        if registry is None:
+            return None
+        return registry.terminal_retirement_for(
+            str(record.get("contract_id") or ""),
+            version=str(record.get("version") or ""),
+        )
+
+    def _raise_if_terminally_retired(self, record: Mapping[str, Any]) -> None:
+        retirement = self._terminal_retirement_for_record(record)
+        if retirement is not None:
+            raise ContractRetirementError(retirement)
 
 
 def _is_non_runtime_source_mismatch(

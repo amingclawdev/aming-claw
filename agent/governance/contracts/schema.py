@@ -70,7 +70,9 @@ def normalize_definition(
         "instruction_layer": _normalize_instruction_layer(payload.get("instruction_layer")),
     }
     if isinstance(payload.get("metadata"), Mapping):
-        normalized["metadata"] = dict(payload["metadata"])
+        metadata = dict(payload["metadata"])
+        _validate_terminal_retirement_metadata(metadata, definition=normalized)
+        normalized["metadata"] = metadata
     if GOVERNANCE_HINTS_ROOT_KEY in payload:
         try:
             normalized[GOVERNANCE_HINTS_ROOT_KEY] = normalize_governance_hints_envelope(
@@ -114,6 +116,160 @@ def is_new_execution_allowed(definition: Mapping[str, Any]) -> bool:
     """Return whether a definition can start new contract executions."""
 
     return definition.get("status") == "active"
+
+
+def _validate_terminal_retirement_metadata(
+    metadata: Mapping[str, Any],
+    *,
+    definition: Mapping[str, Any],
+) -> None:
+    lifecycle = metadata.get("lifecycle")
+    if not isinstance(lifecycle, Mapping) or lifecycle.get("terminal_retirement") is not True:
+        return
+    if definition.get("status") != "deprecated":
+        raise ContractDefinitionError(
+            "terminal retirement requires status='deprecated'"
+        )
+    if lifecycle.get("state") != "terminal_retired":
+        raise ContractDefinitionError(
+            "terminal retirement lifecycle.state must be 'terminal_retired'"
+        )
+    superseded = _string_list(
+        lifecycle.get("supersedes_revisions"),
+        "metadata.lifecycle.supersedes_revisions",
+    )
+    if not superseded:
+        raise ContractDefinitionError(
+            "terminal retirement requires supersedes_revisions"
+        )
+    for field in (
+        "new_execution_allowed",
+        "entry_allowed",
+        "resume_allowed",
+        "retry_allowed",
+        "reentry_allowed",
+        "successor_allowed",
+    ):
+        if lifecycle.get(field) is not False:
+            raise ContractDefinitionError(
+                f"terminal retirement metadata.lifecycle.{field} must be false"
+            )
+    if lifecycle.get("historical_pinned_read_allowed") is not True:
+        raise ContractDefinitionError(
+            "terminal retirement must preserve historical pinned reads"
+        )
+    if definition.get("successors"):
+        raise ContractDefinitionError(
+            "terminal retirement cannot declare successors"
+        )
+    result = lifecycle.get("result")
+    if not isinstance(result, Mapping):
+        raise ContractDefinitionError(
+            "terminal retirement requires a typed result object"
+        )
+    for field in ("schema_version", "code", "error", "message"):
+        if not isinstance(result.get(field), str) or not str(result.get(field)).strip():
+            raise ContractDefinitionError(
+                f"terminal retirement result.{field} must be a non-empty string"
+            )
+    if result.get("error") != result.get("code"):
+        raise ContractDefinitionError(
+            "terminal retirement result.error must equal result.code"
+        )
+    if result.get("status") != "rejected":
+        raise ContractDefinitionError(
+            "terminal retirement result.status must be 'rejected'"
+        )
+    if result.get("classification") != "contract_retirement":
+        raise ContractDefinitionError(
+            "terminal retirement result.classification must be 'contract_retirement'"
+        )
+    for field, expected in (
+        ("retryable", False),
+        ("historical_evidence_readable", True),
+        ("historical_execution_scheduler_eligible", False),
+        ("authorizes_write", False),
+    ):
+        if result.get(field) is not expected:
+            raise ContractDefinitionError(
+                f"terminal retirement result.{field} must be {str(expected).lower()}"
+            )
+    next_action = result.get("next_legal_action")
+    if not isinstance(next_action, Mapping):
+        raise ContractDefinitionError(
+            "terminal retirement result.next_legal_action must be an object"
+        )
+    for field in ("id", "action", "next_step"):
+        if not isinstance(next_action.get(field), str) or not str(next_action.get(field)).strip():
+            raise ContractDefinitionError(
+                f"terminal retirement result.next_legal_action.{field} must be a non-empty string"
+            )
+    forbidden = _string_list(
+        result.get("forbidden_backedges"),
+        "metadata.lifecycle.result.forbidden_backedges",
+    )
+    if not forbidden:
+        raise ContractDefinitionError(
+            "terminal retirement result.forbidden_backedges must be non-empty"
+        )
+    stages = definition.get("rule_layer", {}).get("stages", [])
+    if len(stages) != 1 or len(stages[0].get("lines") or []) != 1:
+        raise ContractDefinitionError(
+            "terminal retirement requires exactly one non-executable declaration line"
+        )
+    declaration_line = stages[0]["lines"][0]
+    if declaration_line.get("required") is not False:
+        raise ContractDefinitionError(
+            "terminal retirement cannot declare required rule lines"
+        )
+    if declaration_line.get("owner_role") != "system":
+        raise ContractDefinitionError(
+            "terminal retirement declaration line owner_role must be system"
+        )
+    if declaration_line.get("allowed_writer_roles") != ["system"]:
+        raise ContractDefinitionError(
+            "terminal retirement declaration line must allow only system"
+        )
+    if declaration_line.get("evidence_kind") != "contract_terminal_retirement":
+        raise ContractDefinitionError(
+            "terminal retirement declaration line evidence_kind must be contract_terminal_retirement"
+        )
+    if definition.get("rule_layer", {}).get("transitions"):
+        raise ContractDefinitionError(
+            "terminal retirement cannot declare executable transitions"
+        )
+    system_layer = definition.get("system_layer") or {}
+    terminal_false_fields = (
+        ("entrypoint_policy", "allow_root_start"),
+        ("entrypoint_policy", "allow_entry"),
+        ("successor_policy", "allow_successor_start"),
+        ("write_authority_policy", "agent_facing_generic_crud_allowed"),
+        ("graph_binding_policy", "new_graph_context_allowed"),
+        ("route_policy", "start_allowed"),
+        ("route_policy", "new_route_allowed"),
+    )
+    for policy_name, field in terminal_false_fields:
+        policy = system_layer.get(policy_name)
+        if not isinstance(policy, Mapping) or policy.get(field) is not False:
+            raise ContractDefinitionError(
+                f"terminal retirement system_layer.{policy_name}.{field} must be false"
+            )
+    lifecycle_policy = system_layer.get("lifecycle_policy")
+    if not isinstance(lifecycle_policy, Mapping):
+        raise ContractDefinitionError(
+            "terminal retirement requires system_layer.lifecycle_policy"
+        )
+    for field in (
+        "entry_allowed",
+        "resume_allowed",
+        "retry_allowed",
+        "reentry_allowed",
+        "successor_allowed",
+    ):
+        if lifecycle_policy.get(field) is not False:
+            raise ContractDefinitionError(
+                f"terminal retirement system_layer.lifecycle_policy.{field} must be false"
+            )
 
 
 def _required_str(payload: Mapping[str, Any], field: str) -> str:

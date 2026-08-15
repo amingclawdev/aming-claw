@@ -19,6 +19,7 @@ from agent.governance.contracts import (
     run_contract_runtime_precheck,
 )
 from agent.governance.contracts.runtime import (
+    ContractRetirementError,
     ContractRuntimeError,
     SQLiteContractExecutionStore,
     StalePinnedContractExecutionError,
@@ -1715,7 +1716,7 @@ def test_mf_parallel_failed_qa_retry_ignores_malformed_worker_implementation_pay
     assert next_action["owner_role"] == "mf_sub"
 
 
-def test_direct_fix_failed_qa_blocks_return_and_passed_qa_allows_progression():
+def test_direct_fix_historical_qa_reentry_is_terminally_retired():
     service = ContractCrudService()
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -1725,143 +1726,42 @@ def test_direct_fix_failed_qa_blocks_return_and_passed_qa_allows_progression():
     )
     backlog_id = "AC-DIRECT-FIX-QA-FAILED-BLOCKS-PROGRESSION-20260629"
     child_id = "cex-direct-fix-qa-failed-blocks-progression-test"
-    _start_direct_fix_successor(
-        runtime,
-        project_id="aming-claw",
-        backlog_id=backlog_id,
-        contract_execution_id=child_id,
-        route_token_ref="rtok-test",
-    )
-
-    for _stage in range(3):
-        accepted = _submit_next_runtime_line(
+    with pytest.raises(ContractRetirementError) as raised:
+        _start_direct_fix_successor(
             runtime,
-            child_id,
-            actor_role="observer",
+            project_id="aming-claw",
+            backlog_id=backlog_id,
+            contract_execution_id=child_id,
+            route_token_ref="rtok-test",
         )
-        assert accepted["ok"] is True
-
-    repair = _submit_next_runtime_line(runtime, child_id, actor_role="mf_sub")
-    assert repair["ok"] is True
-
-    failed_qa = _submit_next_runtime_line(
-        runtime,
-        child_id,
-        actor_role="qa",
-        qa_evidence_provenance={
-            "status": "failed",
-            "verdict": "failed",
-            "reviewer_role": "qa",
-        },
-    )
-    assert failed_qa["ok"] is True
-
-    projection = read_backlog_contract_chain_current(
-        conn,
-        project_id="aming-claw",
-        backlog_id=backlog_id,
-    )
-    assert projection["readiness_state"] == "direct_fix_child_active"
-    assert projection["next_legal_action"]["line_id"] == "direct_fix_worker_graph_context"
-
-    runtime.current_guide(child_id, actor_role="observer")
-    record = runtime.store.get(child_id)
-    rejected_return = runtime.submit_line_write(
-        child_id,
-        {
-            **_runtime_write_from(
-                record,
-                actor_role="observer",
-                stage_id="return_to_parent",
-                line_id="direct_fix_return_to_parent",
-            ),
-            "evidence_kind": "direct_fix_return_to_parent",
-        },
-    )
-    assert rejected_return["ok"] is False
-    assert any(
-        "write does not match next legal action" in error
-        or "cannot write line" in error
-        for error in rejected_return["decision"]["errors"]
-    )
-
-    retry_repair = _submit_next_runtime_line(runtime, child_id, actor_role="mf_sub")
-    assert retry_repair["ok"] is True
-
-    passed_qa = _submit_next_runtime_line(
-        runtime,
-        child_id,
-        actor_role="qa",
-        qa_evidence_provenance={
-            "status": "passed",
-            "verdict": "passed",
-            "reviewer_role": "qa",
-        },
-    )
-    assert passed_qa["ok"] is True
-
-    projection = read_backlog_contract_chain_current(
-        conn,
-        project_id="aming-claw",
-        backlog_id=backlog_id,
-    )
-    assert projection["readiness_state"] == "return_to_parent_after_direct_fix_qa"
-    assert projection["next_legal_action"]["line_id"] == "direct_fix_return_to_parent"
-
-    returned = _submit_next_runtime_line(runtime, child_id, actor_role="observer")
-    assert returned["ok"] is True
-
-    projection = read_backlog_contract_chain_current(
-        conn,
-        project_id="aming-claw",
-        backlog_id=backlog_id,
-    )
-    assert projection["readiness_state"] == "parent_resume_required_after_direct_fix_qa"
-    assert (
-        projection["next_legal_action"]["line_id"]
-        == "resume_parent_after_successor_return"
-    )
+    result = raised.value.to_dict()
+    assert result["code"] == "direct_fix_retired"
+    assert result["authorizes_write"] is False
+    assert result["historical_evidence_readable"] is True
+    assert result["forbidden_backedges"] == [
+        "direct_fix_enter",
+        "parent_to_resume",
+        "return_to_parent",
+        "resume_original_contract",
+        "retry_source_backlog_close_after_repair",
+    ]
 
 
-def test_direct_fix_repair_diagnostic_blocked_status_still_advances_to_qa():
+def test_direct_fix_repair_diagnostic_cannot_reenter_retired_contract():
     service = ContractCrudService()
     runtime = ContractRuntime(service.registry)
     child_id = "cex-direct-fix-repair-diagnostic-blocked-status-test"
-    _start_direct_fix_successor(
-        runtime,
-        project_id="aming-claw",
-        backlog_id="AC-DIRECT-FIX-DIAGNOSTIC-BLOCKED-STATUS-20260630",
-        contract_execution_id=child_id,
-        route_token_ref="rtok-test",
-    )
-
-    for _stage in range(3):
-        accepted = _submit_next_runtime_line(
+    with pytest.raises(ContractRetirementError) as raised:
+        _start_direct_fix_successor(
             runtime,
-            child_id,
-            actor_role="observer",
+            project_id="aming-claw",
+            backlog_id="AC-DIRECT-FIX-DIAGNOSTIC-BLOCKED-STATUS-20260630",
+            contract_execution_id=child_id,
+            route_token_ref="rtok-test",
         )
-        assert accepted["ok"] is True
-
-    repair = _submit_next_runtime_line(
-        runtime,
-        child_id,
-        actor_role="mf_sub",
-        payload={
-            "schema_version": "direct_fix_repair_evidence.worker_audit.v1",
-            "graph_evidence": {
-                "graph_query": {
-                    "status": "blocked",
-                    "reason": "runtime_context_sequence_incomplete",
-                }
-            },
-        },
+    assert raised.value.to_dict()["next_legal_action"]["id"] == (
+        "file_fresh_bounded_row"
     )
-
-    assert repair["ok"] is True
-    next_action = repair["record"]["runtime_guide"]["next_legal_action"]
-    assert next_action["line_id"] == "direct_fix_qa_graph_context"
-    assert next_action["owner_role"] == "qa"
 
 
 def test_direct_fix_close_authority_gate_rejects_failed_qa_provenance():

@@ -152,7 +152,7 @@ class ContractDefinitionRegistry:
                 for definition in matches
                 if _terminal_retirement_lifecycle(definition)
             ]
-            if terminal_retirements and _same_contract_version(terminal_retirements):
+            if terminal_retirements and _same_contract_version(matches):
                 return max(terminal_retirements, key=_revision_sort_key)
             active = [
                 definition
@@ -171,6 +171,33 @@ class ContractDefinitionRegistry:
             )
         return matches[0]
 
+    def terminal_retirement_for(
+        self,
+        contract_id: str,
+        *,
+        version: str,
+    ) -> dict[str, Any] | None:
+        """Return the terminal tombstone for one exact contract/version chain."""
+
+        retirements = [
+            definition
+            for definition in self.list_definitions(include_deprecated=True)
+            if _matches(
+                definition,
+                contract_id=contract_id,
+                version=version,
+                revision=None,
+            )
+            and _terminal_retirement_lifecycle(definition)
+        ]
+        if not retirements:
+            return None
+        if not _same_contract_version(retirements):
+            raise ContractDefinitionError(
+                f"ambiguous terminal retirement: {contract_id}@{version}"
+            )
+        return max(retirements, key=_revision_sort_key)
+
     def resolve_for_new_execution(
         self,
         contract_id: str,
@@ -188,29 +215,16 @@ class ContractDefinitionRegistry:
         )
         canonical_contract_id = str(selected.get("contract_id") or "")
         canonical_version = str(selected.get("version") or "")
-        retirements = [
-            definition
-            for definition in self.list_definitions(include_deprecated=True)
-            if str(definition.get("contract_id") or "") == canonical_contract_id
-            and str(definition.get("version") or "") == canonical_version
-            and _terminal_retirement_lifecycle(definition)
-        ]
-        if not retirements:
+        retirement = self.terminal_retirement_for(
+            canonical_contract_id,
+            version=canonical_version,
+        )
+        if retirement is None:
             return selected
-        retirement = max(retirements, key=_revision_sort_key)
-        if requested_revision is None:
-            return retirement
-        lifecycle = _terminal_retirement_lifecycle(retirement)
-        superseded = {
-            str(item)
-            for item in lifecycle.get("supersedes_revisions") or []
-            if str(item)
-        }
-        if requested_revision == str(retirement.get("revision") or ""):
-            return retirement
-        if requested_revision in superseded:
-            return retirement
-        return selected
+        # A terminal retirement dominates every new attempt in the same
+        # contract/version chain. Reintroduction requires a distinct version
+        # or contract id; a later same-version revision cannot bypass it.
+        return retirement
 
     def validate_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         return normalize_definition(payload)

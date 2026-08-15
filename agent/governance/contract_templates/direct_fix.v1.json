@@ -5,9 +5,7 @@
   "description": "Non-authoritative mirror of the source-backed direct_fix rev4 terminal retirement.",
   "task_types": [
     "direct_fix",
-    "observer_direct_fix",
-    "chain_rescue",
-    "manual_fix"
+    "observer_direct_fix"
   ],
   "stages": [],
   "required_instance_fields": [],
@@ -36,9 +34,26 @@
     "terminal_result": {
       "schema_version": "direct_fix_retired.v1",
       "code": "direct_fix_retired",
+      "error": "direct_fix_retired",
       "status": "rejected",
       "classification": "contract_retirement",
-      "retryable": false
+      "retryable": false,
+      "message": "direct_fix is terminally retired; file a fresh independently bounded current-world backlog instead",
+      "historical_evidence_readable": true,
+      "historical_execution_scheduler_eligible": false,
+      "authorizes_write": false,
+      "next_legal_action": {
+        "id": "file_fresh_bounded_row",
+        "action": "select_or_create_backlog",
+        "next_step": "File or select a fresh independently bounded row in the current world. Never resume, return to, or retry the historical source execution."
+      },
+      "forbidden_backedges": [
+        "direct_fix_enter",
+        "parent_to_resume",
+        "return_to_parent",
+        "resume_original_contract",
+        "retry_source_backlog_close_after_repair"
+      ]
     }
   },
   "forbidden_capabilities": [

@@ -61,6 +61,7 @@ from .impact_analyzer import ImpactAnalyzer
 from .models import ImpactAnalysisRequest, FileHitPolicy
 from .contracts.registry import ContractDefinitionRegistry
 from .contracts.runtime import (
+    ContractRetirementError,
     ContractRuntime,
     ContractRuntimeError,
     LINE_EVIDENCE_OPTIONAL_FIELDS,
@@ -93499,12 +93500,43 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
     readiness_state = _runtime_readiness_state_from_guide(guide)
     if readiness_state:
         current_state["readiness_state"] = readiness_state
+    terminal_retirement = (
+        guide.get("terminal_retirement")
+        if isinstance(guide.get("terminal_retirement"), Mapping)
+        else {}
+    )
+    if terminal_retirement:
+        precheck_decision = (
+            guide.get("precheck_decision")
+            if isinstance(guide.get("precheck_decision"), Mapping)
+            else {}
+        )
+        current_state.update(
+            {
+                "readiness_state": "terminal_retired",
+                "disposition": "terminal_retired",
+                "terminal": True,
+                "historical_pinned_read_only": True,
+                "scheduler_eligible": False,
+                "schedulable": False,
+                "current_eligible": False,
+                "close_eligible": False,
+                "closeable": False,
+                "resume_eligible": False,
+                "resumable": False,
+                "retry_eligible": False,
+                "write_eligible": False,
+                "terminal_retirement": dict(terminal_retirement),
+                "precheck_decision": dict(precheck_decision),
+                "decision": dict(precheck_decision),
+            }
+        )
     terminal = (
         guide.get("terminal_disposition")
         if isinstance(guide.get("terminal_disposition"), Mapping)
         else {}
     )
-    if terminal:
+    if terminal and not terminal_retirement:
         recovery_fallback = (
             guide.get("bypass_recovery_fallback")
             if isinstance(guide.get("bypass_recovery_fallback"), Mapping)
@@ -94848,7 +94880,39 @@ def _onboard_runtime_resume_from_current_projection(
             }
         )
         resume.pop("parent_to_resume_contract_execution_id", None)
-    if current_projection.get("terminal") is True:
+    terminal_retirement = (
+        current_projection.get("terminal_retirement")
+        if isinstance(current_projection.get("terminal_retirement"), Mapping)
+        else {}
+    )
+    if terminal_retirement:
+        next_legal_action = (
+            terminal_retirement.get("next_legal_action")
+            if isinstance(terminal_retirement.get("next_legal_action"), Mapping)
+            else {}
+        )
+        resume.update(
+            {
+                "status": "terminal_retired",
+                "readiness_state": "terminal_retired",
+                "disposition": "terminal_retired",
+                "terminal": True,
+                "historical_pinned_read_only": True,
+                "scheduler_eligible": False,
+                "schedulable": False,
+                "current_eligible": False,
+                "close_eligible": False,
+                "closeable": False,
+                "resume_eligible": False,
+                "resumable": False,
+                "retry_eligible": False,
+                "write_eligible": False,
+                "next_legal_action": dict(next_legal_action),
+                "terminal_retirement": dict(terminal_retirement),
+            }
+        )
+        resume.pop("parent_to_resume_contract_execution_id", None)
+    elif current_projection.get("terminal") is True:
         resume.update(
             {
                 "status": "WAIVED",
@@ -94979,6 +95043,46 @@ def _contract_runtime_recovery_start_endpoint(contract_id: str) -> str:
     if contract_id == CONTRACT_UPDATE_CONTRACT_ID:
         return "contract-update/start"
     return "contract-runtime/recover"
+
+
+def _contract_runtime_retirement_projection(
+    retired: ContractRetirementError,
+    *,
+    action: str,
+    project_id: str = "",
+    contract_execution_id: str = "",
+    actor_role: str = "",
+) -> dict[str, Any]:
+    result = retired.to_dict()
+    code = str(result.get("code") or "contract_terminally_retired")
+    next_move = (
+        result.get("next_legal_action")
+        if isinstance(result.get("next_legal_action"), Mapping)
+        else {}
+    )
+    return {
+        "ok": False,
+        "project_id": str(project_id or ""),
+        "contract_execution_id": str(contract_execution_id or ""),
+        "actor_role": str(actor_role or ""),
+        "action": str(action or ""),
+        "authority_source": (
+            f"Contract:{result.get('contract_id', '')}@"
+            f"{result.get('version', '')}#{result.get('revision', '')}"
+        ),
+        "zero_write": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        **result,
+        "decision": {
+            "schema_version": "contract_write_gate_decision.v1",
+            "ok": False,
+            "decision": "block",
+            "gate_id": "contract_terminal_retirement",
+            "errors": [code],
+            "next_move": dict(next_move),
+        },
+    }
 
 
 def _contract_runtime_stale_recovery_projection(
@@ -95628,6 +95732,44 @@ def _contract_runtime_response(
         "route_token_ref": str(record.get("route_token_ref") or ""),
         "agent_facing_decision_source": "contract_runtime_first_missing_line",
     }
+    terminal_retirement = (
+        current_state.get("terminal_retirement")
+        if isinstance(current_state.get("terminal_retirement"), Mapping)
+        else {}
+    )
+    if terminal_retirement:
+        decision = (
+            current_state.get("decision")
+            if isinstance(current_state.get("decision"), Mapping)
+            else {}
+        )
+        response.update(
+            {
+                "ok": False,
+                "error": str(
+                    terminal_retirement.get("error")
+                    or terminal_retirement.get("code")
+                    or "contract_terminally_retired"
+                ),
+                "code": str(
+                    terminal_retirement.get("code")
+                    or "contract_terminally_retired"
+                ),
+                "status": str(
+                    terminal_retirement.get("status") or "rejected"
+                ),
+                "authority_source": (
+                    f"Contract:{terminal_retirement.get('contract_id', '')}@"
+                    f"{terminal_retirement.get('version', '')}#"
+                    f"{terminal_retirement.get('revision', '')}"
+                ),
+                "zero_write": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "decision": dict(decision),
+                "terminal_retirement": dict(terminal_retirement),
+            }
+        )
     if current_state.get("terminal") is True:
         response.update(
             {
@@ -95645,6 +95787,12 @@ def _contract_runtime_response(
                     "closeable",
                     "resume_eligible",
                     "resumable",
+                    "retry_eligible",
+                    "write_eligible",
+                    "historical_pinned_read_only",
+                    "terminal_retirement",
+                    "precheck_decision",
+                    "decision",
                     "terminal_disposition",
                     "bypass_recovery_fallback",
                 )
@@ -121594,10 +121742,10 @@ def _onboard_contract_route_guide(
     contract_execution_id = str(record.get("contract_execution_id") or "")
     route_token_ref = str(record.get("route_token_ref") or "")
     metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
-    # direct_fix is a retired repair-on-block/back-to-parent control-flow path.
-    # Historical ContractRuntime evidence remains readable, but ordinary
-    # onboarding never advertises or authorizes a new successor.
-    no_direct_fix = True
+    direct_fix_authority = _direct_fix_terminal_retirement_authority()
+    # Contract is the sole authority for whether the retired control-flow path
+    # is selectable. Guide only projects that decision.
+    no_direct_fix = not bool(direct_fix_authority["entry_allowed"])
     legacy_onboard_contract_waived = bool(metadata.get("legacy_onboard_contract_waived"))
     service_source = str(metadata.get("service_source") or "").strip()
     if not service_source:
@@ -122863,17 +123011,22 @@ def _onboard_contract_route_guide(
         "raw_route_token_exposed": False,
     }
     if no_direct_fix:
+        retirement = dict(direct_fix_authority["result"])
+        next_legal_action = (
+            retirement.get("next_legal_action")
+            if isinstance(retirement.get("next_legal_action"), Mapping)
+            else {}
+        )
         direct_fix_policy = {
             "schema_version": "onboard_route_guide.direct_fix_policy.v1",
-            "allowed": False,
-            "source": "system_direct_fix_retirement_policy",
-            "reason": "direct_fix_retired",
-            "historical_source_resume": False,
-            "next_action": (
-                "file or select a fresh independently bounded row in the "
-                "current world; never resume, return to, or retry the "
-                "historical source execution"
+            "allowed": bool(direct_fix_authority["entry_allowed"]),
+            "source": str(direct_fix_authority["authority_source"]),
+            "reason": str(retirement.get("code") or "direct_fix_retired"),
+            "historical_source_resume": bool(
+                direct_fix_authority["resume_allowed"]
             ),
+            "next_action": str(next_legal_action.get("next_step") or ""),
+            "contract_authority": retirement,
         }
         post_reconcile_action = str(
             metadata.get("post_reconcile_action") or ""
@@ -122957,7 +123110,8 @@ def _onboard_contract_agent_guidance(
         if isinstance(record.get("metadata"), Mapping)
         else {}
     )
-    no_direct_fix = True
+    direct_fix_authority = _direct_fix_terminal_retirement_authority()
+    no_direct_fix = not bool(direct_fix_authority["entry_allowed"])
     requested_role = str(
         selected_role or next_legal_action.get("role") or "observer"
     ).strip()
@@ -129285,8 +129439,9 @@ def _onboard_route_guide_service_response(
     chain_trigger = backlog_runtime.parse_json_object(
         _row_get(backlog_policy_row, "chain_trigger_json", "{}")
     )
-    no_direct_fix = True
-    historical_source_resume = False
+    direct_fix_authority = _direct_fix_terminal_retirement_authority()
+    no_direct_fix = not bool(direct_fix_authority["entry_allowed"])
+    historical_source_resume = bool(direct_fix_authority["resume_allowed"])
     materialize_route_token_ref = route_token_ref
     if (
         str(role or "").strip() == "observer"
@@ -129449,7 +129604,9 @@ def _onboard_route_guide_service_response(
             _row_get(backlog_policy_row, "mf_type", "") or ""
         ).strip(),
         "no_direct_fix": no_direct_fix,
-        "direct_fix_policy_source": "system_direct_fix_retirement_policy",
+        "direct_fix_policy_source": str(
+            direct_fix_authority["authority_source"]
+        ),
         "historical_source_resume": historical_source_resume,
         "post_reconcile_action": str(
             chain_trigger.get("after_merge") or ""
@@ -165144,6 +165301,43 @@ def handle_project_hotfix_enter(ctx: RequestContext):
     return response
 
 
+def _direct_fix_terminal_retirement_authority() -> dict[str, Any]:
+    definition = _CONTRACT_DEFINITION_REGISTRY.resolve_for_new_execution(
+        "direct_fix",
+        version="v1",
+    )
+    metadata = (
+        definition.get("metadata")
+        if isinstance(definition.get("metadata"), Mapping)
+        else {}
+    )
+    lifecycle = (
+        metadata.get("lifecycle")
+        if isinstance(metadata.get("lifecycle"), Mapping)
+        else {}
+    )
+    result = ContractRetirementError(definition).to_dict()
+    authority_source = (
+        f"Contract:{definition.get('contract_id', '')}@"
+        f"{definition.get('version', '')}#{definition.get('revision', '')}"
+    )
+    return {
+        "authority_source": authority_source,
+        "definition": definition,
+        "result": result,
+        "terminal_retirement": lifecycle.get("terminal_retirement") is True,
+        "entry_allowed": lifecycle.get("entry_allowed") is True,
+        "resume_allowed": lifecycle.get("resume_allowed") is True,
+        "retry_allowed": lifecycle.get("retry_allowed") is True,
+        "successor_allowed": lifecycle.get("successor_allowed") is True,
+        "authorizes_write": result.get("authorizes_write") is True,
+    }
+
+
+def _direct_fix_terminal_retirement_result() -> dict[str, Any]:
+    return dict(_direct_fix_terminal_retirement_authority()["result"])
+
+
 @route("POST", "/api/projects/{project_id}/direct-fix/enter")
 @route("POST", "/api/projects/{project_id}/direct-fix/start")
 def handle_project_direct_fix_enter(ctx: RequestContext):
@@ -165152,198 +165346,26 @@ def handle_project_direct_fix_enter(ctx: RequestContext):
     project_id = ctx.get_project_id()
     body = ctx.body or {}
     backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
+    authority = _direct_fix_terminal_retirement_authority()
+    retirement = dict(authority["result"])
     return 409, {
         "ok": False,
-        "error": "direct_fix_retired",
-        "status": "rejected",
-        "schema_version": "direct_fix_retired.v1",
         "project_id": project_id,
         "backlog_id": backlog_id,
-        "historical_evidence_readable": True,
-        "historical_execution_scheduler_eligible": False,
-        "authorizes_write": False,
-        "next_legal_action": {
-            "id": "file_fresh_bounded_row",
-            "action": "select_or_create_backlog",
-            "next_step": (
-                "File or select a fresh independently bounded row in the "
-                "current world. Never resume, return to, or retry the "
-                "historical source execution."
-            ),
-        },
-        "forbidden_backedges": [
-            "direct_fix_enter",
-            "parent_to_resume",
-            "return_to_parent",
-            "resume_original_contract",
-            "retry_source_backlog_close_after_repair",
-        ],
+        "authority_source": str(authority["authority_source"]),
+        **retirement,
     }
 
 
 def _handle_project_direct_fix_enter_legacy(ctx: RequestContext):
-    """Exercise retained historical direct_fix semantics in compatibility tests."""
+    """Retained symbol for historical readers; execution is terminally denied."""
 
-    project_id = ctx.get_project_id()
-    body = ctx.body or {}
-    backlog_id = str(body.get("backlog_id") or body.get("bug_id") or "").strip()
-    if not backlog_id:
-        raise ValidationError("direct_fix entry requires backlog_id or bug_id")
-    reason = str(body.get("reason") or body.get("human_reason") or "").strip()
-    if not reason:
-        raise ValidationError("direct_fix entry requires a human reason")
-    parent_execution_id = str(body.get("parent_contract_execution_id") or "").strip()
-    if not parent_execution_id:
-        raise ValidationError("direct_fix entry requires parent_contract_execution_id")
-    route_token_ref = _contract_runtime_ref_value(
-        ctx, "route_token_ref", "observer_route_token_ref"
+    raise ContractRetirementError(
+        _CONTRACT_DEFINITION_REGISTRY.resolve_for_new_execution(
+            "direct_fix",
+            version="v1",
+        )
     )
-    if not route_token_ref:
-        raise ValidationError("direct_fix entry requires route_token_ref")
-    task_id = str(body.get("task_id") or "").strip()
-    actor = str(body.get("actor") or "api").strip()
-    body_role_claim = str(body.get("actor_role") or body.get("role") or "").strip()
-    contract_execution_id = str(body.get("contract_execution_id") or "").strip()
-    from . import task_timeline
-
-    with DBContext(project_id) as conn:
-        actor_role = _contract_runtime_effective_actor_role(
-            ctx,
-            conn,
-            action="direct_fix_enter",
-            backlog_id=backlog_id,
-            contract_execution_id=contract_execution_id,
-        )
-        if actor_role != "observer":
-            raise PermissionDeniedError(
-                actor_role,
-                "direct_fix_enter",
-                {
-                    "body_role_claim": body_role_claim,
-                    "role_source": "contract_runtime_effective_actor_role",
-                },
-            )
-        try:
-            if parent_execution_id == _onboard_service_execution_id(
-                project_id, backlog_id
-            ):
-                parent_record = _direct_fix_onboard_service_parent_for_successor(
-                    conn,
-                    project_id=project_id,
-                    backlog_id=backlog_id,
-                    parent_contract_execution_id=parent_execution_id,
-                    route_token_ref=route_token_ref,
-                    body=body,
-                    reason=reason,
-                )
-            else:
-                parent_record = _contract_runtime_parent_for_successor(
-                    conn,
-                    project_id=project_id,
-                    backlog_id=backlog_id,
-                    parent_contract_execution_id=parent_execution_id,
-                    successor_contract_id=DIRECT_FIX_CONTRACT_ID,
-                    actor_role=actor_role,
-                )
-        except StalePinnedContractExecutionError as exc:
-            _raise_stale_contract_runtime_validation(
-                exc,
-                action="direct_fix_enter",
-                route_token_ref=route_token_ref,
-                actor_role=actor_role,
-                message=(
-                    "parent contract execution is stale; recover it before "
-                    "direct_fix successor"
-                ),
-            )
-        successor_runtime = _direct_fix_successor_runtime_enter(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
-            parent_record=parent_record,
-            actor_role=actor_role,
-            route_token_ref=route_token_ref,
-            reason=reason,
-            contract_execution_id=contract_execution_id,
-        )
-        payload = {
-            "schema_version": "direct_fix_entered.v1",
-            "contract_id": DIRECT_FIX_CONTRACT_ID,
-            "contract_template_id": DIRECT_FIX_TEMPLATE_ID,
-            "reason": reason,
-            "actor": actor,
-            "derived_actor_role": actor_role,
-            "body_role_claim_ignored": body_role_claim,
-            "backlog_id": backlog_id,
-            "task_id": task_id,
-            "parent_contract_execution_id": parent_execution_id,
-            "successor_contract": successor_runtime.get("successor_contract") or {},
-            "return_to_parent": successor_runtime.get("return_to_parent") or {},
-            "parent_close_gate": successor_runtime.get("parent_close_gate") or {},
-            "agent_facing_decision_source": "contract_runtime_first_missing_line",
-            "meta_contract_gate_decision_source": False,
-            "raw_route_token_exposed": False,
-        }
-        event = task_timeline.record_event(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
-            event_type="direct_fix.entered",
-            phase="direct_fix",
-            event_kind="contract_binding",
-            actor=actor_role,
-            status="accepted",
-            payload=payload,
-            artifact_refs={
-                "backlog_id": backlog_id,
-                "task_id": task_id,
-                "parent_contract_execution_id": parent_execution_id,
-                "successor_contract_execution_id": successor_runtime.get(
-                    "successor_contract_execution_id", ""
-                ),
-                "contract_template_id": DIRECT_FIX_TEMPLATE_ID,
-            },
-        )
-        conn.commit()
-    return {
-        "ok": True,
-        "schema_version": "direct_fix_enter.runtime_contract_response.v1",
-        "project_id": project_id,
-        "backlog_id": backlog_id,
-        "event": event,
-        "contract_id": DIRECT_FIX_CONTRACT_ID,
-        "contract_template_id": DIRECT_FIX_TEMPLATE_ID,
-        "contract_execution_id": successor_runtime.get("contract_execution_id", ""),
-        "successor_contract_execution_id": successor_runtime.get(
-            "successor_contract_execution_id", ""
-        ),
-        "parent_contract_execution_id": successor_runtime.get(
-            "parent_contract_execution_id", ""
-        ),
-        "root_contract_execution_id": successor_runtime.get(
-            "root_contract_execution_id", ""
-        ),
-        "contract_chain_id": successor_runtime.get("contract_chain_id", ""),
-        "runtime_guide": successor_runtime.get("runtime_guide") or {},
-        "contract_runtime_current_state": successor_runtime.get("current_state") or {},
-        "next_legal_action": successor_runtime.get("next_legal_action") or {},
-        "execution_state_revision": successor_runtime.get("execution_state_revision", 0),
-        "execution_state_hash": successor_runtime.get("execution_state_hash", ""),
-        "contract_chain_current": successor_runtime.get("contract_chain_current") or {},
-        "route_token_ref": successor_runtime.get("route_token_ref", ""),
-        "route_token_ref_guidance": successor_runtime.get("route_token_ref_guidance")
-        or {},
-        "return_to_parent": successor_runtime.get("return_to_parent") or {},
-        "parent_close_gate": successor_runtime.get("parent_close_gate") or {},
-        "qa_independent_verification": successor_runtime.get(
-            "qa_independent_verification"
-        )
-        or {},
-        "agent_facing_decision_source": "contract_runtime_first_missing_line",
-        "raw_route_token_exposed": False,
-    }
 
 
 @route("POST", "/api/projects/{project_id}/mf-parallel/enter")
@@ -170362,6 +170384,14 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                             request_id=str(ctx.request_id),
                         )
                     )
+        except ContractRetirementError as exc:
+            return _contract_runtime_retirement_projection(
+                exc,
+                action="contract_runtime_submit_line",
+                project_id=project_id,
+                contract_execution_id=contract_execution_id,
+                actor_role=actor_role,
+            )
         except StalePinnedContractExecutionError as exc:
             stale_actor_role = actor_role or (
                 "mf_sub"
@@ -170549,6 +170579,14 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                     _contract_runtime_projection_completed_lines(projection)
                 ),
                 projection=projection,
+            )
+        except ContractRetirementError as exc:
+            return _contract_runtime_retirement_projection(
+                exc,
+                action="contract_runtime_bypass_line",
+                project_id=project_id,
+                contract_execution_id=execution_id,
+                actor_role=actor_role,
             )
         except StalePinnedContractExecutionError as exc:
             return _contract_runtime_stale_recovery_projection(
@@ -170996,6 +171034,14 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                                 ),
                                 projection=projection,
                             )
+        except ContractRetirementError as exc:
+            return _contract_runtime_retirement_projection(
+                exc,
+                action="contract_runtime_precheck_line",
+                project_id=project_id,
+                contract_execution_id=contract_execution_id,
+                actor_role=actor_role,
+            )
         except StalePinnedContractExecutionError as exc:
             stale_actor_role = actor_role or (
                 "mf_sub"

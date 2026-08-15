@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .contracts.registry import ContractDefinitionRegistry
 from .contracts.write_gate import bounded_qa_graph_decision_errors
 
 try:
@@ -25,6 +26,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct agent/ PYTHONPATH
 
 
 CONTRACT_STATE_PROJECTION_SCHEMA_VERSION = "contract_state_projection.v1"
+_SOURCE_CONTRACT_DEFINITION_REGISTRY = ContractDefinitionRegistry()
 INTEGRATION_EPOCH_RESUME_SCHEMA_VERSION = (
     "contract_state.integration_epoch_resume_projection.v1"
 )
@@ -7905,6 +7907,96 @@ def build_contract_state_projection(
     active_lane_contract = (
         lane_contract_executions[-1] if lane_contract_executions else {}
     )
+    terminal_retirement: dict[str, Any] = {}
+    if isinstance(pinned_source_definition, Mapping):
+        retirement_definition: Mapping[str, Any] | None = None
+        metadata = pinned_source_definition.get("metadata")
+        lifecycle = metadata.get("lifecycle") if isinstance(metadata, Mapping) else None
+        if (
+            isinstance(lifecycle, Mapping)
+            and lifecycle.get("terminal_retirement") is True
+        ):
+            retirement_definition = pinned_source_definition
+        else:
+            pinned_contract_id = str(
+                pinned_source_definition.get("contract_id") or ""
+            ).strip()
+            pinned_version = str(
+                pinned_source_definition.get("version") or ""
+            ).strip()
+            if pinned_contract_id and pinned_version:
+                retirement_definition = (
+                    _SOURCE_CONTRACT_DEFINITION_REGISTRY.terminal_retirement_for(
+                        pinned_contract_id,
+                        version=pinned_version,
+                    )
+                )
+        if isinstance(retirement_definition, Mapping):
+            retirement_metadata = retirement_definition.get("metadata")
+            retirement_lifecycle = (
+                retirement_metadata.get("lifecycle")
+                if isinstance(retirement_metadata, Mapping)
+                else None
+            )
+            if not (
+                isinstance(retirement_lifecycle, Mapping)
+                and retirement_lifecycle.get("terminal_retirement") is True
+            ):
+                retirement_lifecycle = None
+        else:
+            retirement_lifecycle = None
+        if isinstance(retirement_lifecycle, Mapping):
+            result = retirement_lifecycle.get("result")
+            terminal_retirement = dict(result) if isinstance(result, Mapping) else {}
+            terminal_retirement.update(
+                {
+                    "contract_id": str(
+                        retirement_definition.get("contract_id") or ""
+                    ),
+                    "version": str(retirement_definition.get("version") or ""),
+                    "revision": str(retirement_definition.get("revision") or ""),
+                    "terminal_retirement": True,
+                }
+            )
+            state = "terminal_retired"
+            next_legal_action = None
+            successor_next_legal_action = None
+            ordered_next_steps = []
+            blocked_steps = []
+            contract_complete = False
+            if active_execution:
+                active_execution.update(
+                    {
+                        "state": "terminal_retired",
+                        "status": "terminal_retired",
+                        "terminal": True,
+                        "historical_pinned_read_only": True,
+                        "scheduler_eligible": False,
+                        "resume_eligible": False,
+                        "retry_eligible": False,
+                        "write_eligible": False,
+                    }
+                )
+            for lane in lane_contract_executions:
+                lane["state"] = "terminal_retired"
+                lane["next_legal_action"] = None
+                lane["scheduler_eligible"] = False
+                lane["resume_eligible"] = False
+                lane["retry_eligible"] = False
+                lane["write_eligible"] = False
+            for execution in contract_chain:
+                if str(execution.get("contract_execution_id") or "") != str(
+                    active_execution.get("contract_execution_id") or ""
+                ):
+                    continue
+                execution["state"] = "terminal_retired"
+                execution["status"] = "terminal_retired"
+                execution["terminal"] = True
+                execution["historical_pinned_read_only"] = True
+                execution["scheduler_eligible"] = False
+                execution["resume_eligible"] = False
+                execution["retry_eligible"] = False
+                execution["write_eligible"] = False
     runtime_contract_hints = _runtime_contract_hints(
         root=root,
         active_execution=active_execution,
@@ -7919,9 +8011,27 @@ def build_contract_state_projection(
         next_legal_action=next_legal_action,
         runtime_hints=runtime_contract_hints,
     )
+    if terminal_retirement:
+        runtime_contract_hints.update(
+            {
+                "terminal_retirement": terminal_retirement,
+                "scheduler_eligible": False,
+                "resume_eligible": False,
+                "retry_eligible": False,
+                "write_eligible": False,
+            }
+        )
+        executable_contract.update(
+            {
+                "actionable": False,
+                "terminal_retirement": terminal_retirement,
+                "next_legal_operation": {},
+                "next_legal_action": "",
+            }
+        )
     cli_agent_run_state = _cli_agent_run_state_projection(rows)
 
-    return {
+    result_projection = {
         "schema_version": schema_version,
         "source_of_truth": "Contract/Revision/Event",
         "contract_id": contract_id,
@@ -7930,6 +8040,8 @@ def build_contract_state_projection(
         "current_revision_id": current_revision_id,
         "state": state,
         "status": state,
+        "terminal_retirement": terminal_retirement,
+        "historical_pinned_read_only": bool(terminal_retirement),
         "legacy_no_contract": legacy_no_contract,
         "contract_binding": binding,
         "route_binding": route_binding,
@@ -7971,3 +8083,13 @@ def build_contract_state_projection(
             "timeline_event_is_authoritative": False,
         },
     }
+    if terminal_retirement:
+        result_projection.update(
+            {
+                "scheduler_eligible": False,
+                "resume_eligible": False,
+                "retry_eligible": False,
+                "write_eligible": False,
+            }
+        )
+    return result_projection

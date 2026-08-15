@@ -41,6 +41,7 @@ def test_direct_fix_rev4_is_terminal_contract_authority():
     assert lifecycle["result"] == {
         "schema_version": "direct_fix_retired.v1",
         "code": "direct_fix_retired",
+        "error": "direct_fix_retired",
         "status": "rejected",
         "classification": "contract_retirement",
         "retryable": False,
@@ -48,6 +49,25 @@ def test_direct_fix_rev4_is_terminal_contract_authority():
             "direct_fix is terminally retired; file a fresh independently "
             "bounded current-world backlog instead"
         ),
+        "historical_evidence_readable": True,
+        "historical_execution_scheduler_eligible": False,
+        "authorizes_write": False,
+        "next_legal_action": {
+            "id": "file_fresh_bounded_row",
+            "action": "select_or_create_backlog",
+            "next_step": (
+                "File or select a fresh independently bounded row in the "
+                "current world. Never resume, return to, or retry the "
+                "historical source execution."
+            ),
+        },
+        "forbidden_backedges": [
+            "direct_fix_enter",
+            "parent_to_resume",
+            "return_to_parent",
+            "resume_original_contract",
+            "retry_source_backlog_close_after_repair",
+        ],
     }
     assert definition["successors"] == []
     assert definition["system_layer"]["successor_policy"][
@@ -64,6 +84,113 @@ def test_direct_fix_rev4_is_terminal_contract_authority():
     terminal_line = definition["rule_layer"]["stages"][0]["lines"][0]
     assert terminal_line["owner_role"] == "system"
     assert terminal_line["required"] is False
+
+
+def test_direct_fix_rev4_state_projection_is_terminal_audit_only():
+    definition = ContractDefinitionRegistry().get(
+        "direct_fix",
+        version="v1",
+        revision="rev4",
+    )
+    projection = build_contract_state_projection(
+        [],
+        contract={
+            "contract_id": "direct_fix",
+            "contract_template_id": "direct_fix.v1",
+            "contract_revision_id": "rev4",
+            "state": "bound",
+        },
+        backlog_row={
+            "project_id": "aming-claw",
+            "bug_id": "AC-DIRECT-FIX-RETIRED",
+        },
+        pinned_source_definition=definition,
+    )
+
+    assert projection["state"] == "terminal_retired"
+    assert projection["status"] == "terminal_retired"
+    assert projection["next_legal_action"] is None
+    assert projection["successor_next_legal_action"] is None
+    assert projection["ordered_next_steps"] == []
+    assert projection["missing_evidence"] == []
+    assert projection["contract_complete"] is False
+    assert projection["historical_pinned_read_only"] is True
+    for field in (
+        "scheduler_eligible",
+        "resume_eligible",
+        "retry_eligible",
+        "write_eligible",
+    ):
+        assert projection[field] is False
+    assert projection["terminal_retirement"]["code"] == "direct_fix_retired"
+    assert projection["active_contract_execution"]["state"] == "terminal_retired"
+    assert projection["contract_chain"][0]["state"] == "terminal_retired"
+    assert projection["contract_chain"][0]["scheduler_eligible"] is False
+    assert projection["executable_contract"]["actionable"] is False
+    assert projection["executable_contract"]["next_legal_operation"] == {}
+    assert projection["executable_contract"]["next_legal_action"] == ""
+
+
+@pytest.mark.parametrize("revision", ["rev1", "rev2", "rev3"])
+def test_historical_direct_fix_state_projection_uses_current_retirement_authority(
+    revision,
+):
+    definition = ContractDefinitionRegistry().get(
+        "direct_fix",
+        version="v1",
+        revision=revision,
+    )
+    projection = build_contract_state_projection(
+        [],
+        contract={
+            "contract_id": "direct_fix",
+            "contract_template_id": "direct_fix.v1",
+            "contract_revision_id": revision,
+            "state": "bound",
+        },
+        backlog_row={
+            "project_id": "aming-claw",
+            "bug_id": f"AC-DIRECT-FIX-HISTORY-{revision}",
+        },
+        pinned_source_definition=definition,
+    )
+
+    assert projection["current_revision_id"] == revision
+    assert projection["active_contract_execution"]["contract_revision_id"] == revision
+    assert projection["state"] == "terminal_retired"
+    assert projection["terminal_retirement"]["revision"] == "rev4"
+    assert projection["historical_pinned_read_only"] is True
+    assert projection["next_legal_action"] is None
+    assert projection["contract_chain"][0]["state"] == "terminal_retired"
+    assert projection["executable_contract"]["actionable"] is False
+    for field in (
+        "scheduler_eligible",
+        "resume_eligible",
+        "retry_eligible",
+        "write_eligible",
+    ):
+        assert projection[field] is False
+
+
+@pytest.mark.parametrize("state", ["no_contract", "closed", "blocked", "complete"])
+def test_projection_never_infers_permission_from_absence_of_retirement(state):
+    contract = {} if state == "no_contract" else {
+        "contract_id": "unrelated_contract",
+        "state": state,
+    }
+    projection = build_contract_state_projection(
+        [],
+        contract=contract,
+        backlog_row={"project_id": "aming-claw", "bug_id": f"AC-{state}"},
+    )
+
+    for field in (
+        "scheduler_eligible",
+        "resume_eligible",
+        "retry_eligible",
+        "write_eligible",
+    ):
+        assert projection.get(field, False) is False
 
 
 def test_resolve_cli_agent_observer_admission_uses_current_contract_authority():

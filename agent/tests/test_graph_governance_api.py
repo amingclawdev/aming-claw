@@ -98194,6 +98194,7 @@ def test_backlog_close_accepts_later_route_context_timeline_evidence_when_projec
     assert closed["gate_summary"]["failed_gates"] == []
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current(
     conn,
     monkeypatch,
@@ -98452,6 +98453,7 @@ def test_backlog_close_projects_direct_fix_chain_when_onboard_service_is_current
     assert closed["gate_summary"]["failed_gates"] == []
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_backlog_close_incomplete_direct_fix_authority_reports_direct_fix_gate(
     conn,
     monkeypatch,
@@ -102671,7 +102673,10 @@ def test_onboard_route_guide_suppresses_direct_fix_for_no_direct_fix_backlog(con
     policy = guide["direct_fix_policy"]
     assert policy["allowed"] is False
     assert policy["reason"] == "direct_fix_retired"
-    assert policy["source"] == "system_direct_fix_retirement_policy"
+    assert policy["source"] == "Contract:direct_fix@v1#rev4"
+    assert policy["contract_authority"] == (
+        server._direct_fix_terminal_retirement_result()
+    )
     assert policy["historical_source_resume"] is False
     assert policy["post_reconcile_action"] == (
         "full_reconcile_then_resume_frozen_nonhistorical_candidate"
@@ -102703,7 +102708,22 @@ def test_onboard_route_guide_suppresses_direct_fix_for_no_direct_fix_backlog(con
     assert "direct_fix_enter" not in agent_guidance["route_token_issue"][
         "allowed_actions"
     ]
-    serialized = json.dumps(result, sort_keys=True)
+
+
+def test_retained_legacy_direct_fix_symbol_is_terminally_denied():
+    with pytest.raises(server.ContractRetirementError) as raised:
+        server._handle_project_direct_fix_enter_legacy(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={"backlog_id": "AC-DIRECT-FIX-RETIRED"},
+            )
+        )
+
+    assert raised.value.to_dict()["error"] == "direct_fix_retired"
+    assert raised.value.to_dict()["authorizes_write"] is False
+    serialized = json.dumps(raised.value.to_dict(), sort_keys=True)
     assert "blocked_parent_successor_return_to_parent" not in serialized
     assert '"return_to_parent_required"' not in serialized
 
@@ -102740,6 +102760,56 @@ def test_direct_fix_public_entrypoint_is_retired_without_mutation(conn):
         "SELECT COUNT(*) FROM task_timeline_events"
     ).fetchone()[0]
     assert after_events == before_events
+
+
+def test_direct_fix_guide_and_facade_follow_resolved_contract_revision(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-DIRECT-FIX-RESOLVED-AUTHORITY-REVISION"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    authority = copy.deepcopy(
+        server._direct_fix_terminal_retirement_authority()
+    )
+    authority["authority_source"] = "Contract:direct_fix@v1#rev99"
+    authority["result"]["revision"] = "rev99"
+    monkeypatch.setattr(
+        server,
+        "_direct_fix_terminal_retirement_authority",
+        lambda: copy.deepcopy(authority),
+    )
+
+    guide_response = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": "rtok-direct-fix-authority-revision",
+            },
+        )
+    )
+    policy = guide_response["onboard_route_guide"]["direct_fix_policy"]
+    assert policy["source"] == "Contract:direct_fix@v1#rev99"
+    assert policy["contract_authority"]["revision"] == "rev99"
+    assert policy["allowed"] is False
+    assert "direct_fix_enter" not in guide_response[
+        "agent_onboard_guidance"
+    ]["entrypoints"]
+
+    status, facade = server.handle_project_direct_fix_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={"backlog_id": backlog_id},
+        )
+    )
+    assert status == 409
+    assert facade["authority_source"] == "Contract:direct_fix@v1#rev99"
+    assert facade["revision"] == "rev99"
 
 
 def test_direct_fix_topology_guidance_terminalizes_bypass_without_source_backedge():
@@ -104727,18 +104797,17 @@ def test_onboard_route_guide_keeps_blocked_candidate_audit_only_without_direct_f
     assert "direct_fix" not in route_guide["backlog_chain_binding"][
         "create_successor"
     ]
-    assert route_guide["direct_fix_policy"] == {
-        "schema_version": "onboard_route_guide.direct_fix_policy.v1",
-        "allowed": False,
-        "source": "system_direct_fix_retirement_policy",
-        "reason": "direct_fix_retired",
-        "historical_source_resume": False,
-        "next_action": (
-            "file or select a fresh independently bounded row in the current "
-            "world; never resume, return to, or retry the historical source "
-            "execution"
-        ),
-    }
+    policy = route_guide["direct_fix_policy"]
+    authority = server._direct_fix_terminal_retirement_result()
+    assert policy["schema_version"] == (
+        "onboard_route_guide.direct_fix_policy.v1"
+    )
+    assert policy["allowed"] is False
+    assert policy["source"] == "Contract:direct_fix@v1#rev4"
+    assert policy["reason"] == authority["code"]
+    assert policy["historical_source_resume"] is False
+    assert policy["next_action"] == authority["next_legal_action"]["next_step"]
+    assert policy["contract_authority"] == authority
 
 
 def test_contract_update_start_accepts_onboard_service_waiver_parent(conn):
@@ -107561,6 +107630,7 @@ def test_contract_update_blocked_precheck_continues_with_audited_bypass(conn):
     )
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_enter_accepts_mf_parallel_failed_qa_parent(conn):
     backlog_id = "AC-MF-PARALLEL-FAILED-QA-DIRECT-FIX"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)
@@ -107713,6 +107783,7 @@ def test_direct_fix_enter_accepts_mf_parallel_failed_qa_parent(conn):
     assert entered["return_to_parent"]["blocked_gate"] == "independent_verification"
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_enter_rejects_mf_parallel_when_latest_qa_passed(conn):
     backlog_id = "AC-MF-PARALLEL-LATEST-QA-PASS-DIRECT-FIX"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)
@@ -109231,6 +109302,7 @@ def test_latest_failed_qa_keeps_noncanonical_or_candidate_failure_fail_closed(
     assert revision["failed_qa_source_ref"].endswith("completed_lines:2")
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_legacy_direct_fix_record_does_not_restore_onboard_parent_backedge(conn):
     backlog_id = "AC-DIRECT-FIX-BLOCKED-ONBOARD-SERVICE-PARENT"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -109290,6 +109362,7 @@ def test_legacy_direct_fix_record_does_not_restore_onboard_parent_backedge(conn)
     assert agent_guidance["direct_fix_policy"]["reason"] == "direct_fix_retired"
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_enter_mints_child_route_ref_for_runtime_writes(conn):
     backlog_id = "AC-DIRECT-FIX-CHILD-ROUTE-REF"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -109490,6 +109563,7 @@ def test_direct_main_bypass_route_actions_are_observer_copy_safe():
     )
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_enter_binds_legacy_existing_successor_once(conn):
     backlog_id = "AC-DIRECT-FIX-LEGACY-EXISTING-CHILD-ROUTE"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -109690,6 +109764,7 @@ def test_contract_chain_current_rebuild_materializes_onboard_service_projection(
     assert parent["route_token_ref"] == "rtok-contract-chain-current-rebuild"
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_dispatch_materializes_missing_worker_identity_and_commits(
     conn,
     tmp_path,
@@ -109846,6 +109921,7 @@ def test_direct_fix_dispatch_materializes_missing_worker_identity_and_commits(
     assert worker_guide_result["raw_session_token_exposed"] is False
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_requires_dispatch_context_before_worker_repair(
     conn,
     tmp_path,
@@ -110432,6 +110508,7 @@ def test_direct_fix_requires_dispatch_context_before_worker_repair(
     assert resumed_current["next_legal_action"] == {}
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_worker_repair_accepts_source_backed_runtime_timeline(
     conn,
     tmp_path,
@@ -110786,6 +110863,7 @@ def test_direct_fix_timeline_bridge_rejects_modern_dispatch_context_mismatch(con
     )
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_generic_qa_can_resume_parent_from_child_contract_source(
     conn,
     tmp_path,
@@ -110964,10 +111042,7 @@ def test_direct_fix_enter_rejects_onboard_service_parent_without_blocker(conn):
     _insert_simple_mf_close_backlog(conn, backlog_id)
     parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
 
-    with pytest.raises(
-        ValidationError,
-        match="requires blocked successor evidence",
-    ):
+    with pytest.raises(server.ContractRetirementError) as raised:
         server._handle_project_direct_fix_enter_legacy(
             _ctx_with_role(
                 {"project_id": PID},
@@ -110984,6 +111059,8 @@ def test_direct_fix_enter_rejects_onboard_service_parent_without_blocker(conn):
                 },
             )
         )
+
+    assert raised.value.to_dict() == server._direct_fix_terminal_retirement_result()
 
 
 def test_hotfix_enter_rejects_explicit_parent_without_allowed_successor(conn):
@@ -113391,6 +113468,137 @@ def test_contract_runtime_line_write_precheck_route_does_not_append(conn):
     record = runtime.store.get(hotfix["contract_execution_id"])
     assert record["completed_lines"] == []
     assert record["execution_state_revision"] == 1
+
+
+@pytest.mark.parametrize(
+    ("handler", "action"),
+    [
+        (
+            server.handle_project_contract_runtime_line_write_precheck,
+            "contract_runtime_precheck_line",
+        ),
+        (
+            server.handle_project_contract_runtime_line_write,
+            "contract_runtime_submit_line",
+        ),
+        (
+            server.handle_project_contract_runtime_line_bypass,
+            "contract_runtime_bypass_line",
+        ),
+    ],
+)
+def test_historical_direct_fix_generic_facades_return_contract_retirement(
+    conn,
+    handler,
+    action,
+):
+    from agent.governance.contracts.execution_state import build_execution_state
+    from agent.governance.contracts.guide_compiler import compile_runtime_guide
+    from agent.governance.contracts.registry import ContractDefinitionRegistry
+
+    registry = ContractDefinitionRegistry()
+    definition = registry.get("direct_fix", version="v1", revision="rev3")
+    instruction_bundle = resolve_instruction_bundle(
+        definition,
+        root=registry.root,
+        include_content=True,
+    )
+    execution_id = f"cex-direct-fix-retired-facade-{action}"
+    backlog_id = f"AC-DIRECT-FIX-RETIRED-FACADE-{action}"
+    state = build_execution_state(
+        definition,
+        project_id=PID,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        actor_role="observer",
+        instruction_bundle_hash=instruction_bundle["instruction_bundle_hash"],
+    )
+    guide = compile_runtime_guide(
+        definition,
+        state,
+        instruction_bundle=instruction_bundle,
+    )
+    record = {
+        "schema_version": "contract_runtime_execution_record.v1",
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "parent_contract_execution_id": "",
+        "root_contract_execution_id": execution_id,
+        "contract_chain_id": f"cchain-{execution_id}",
+        "contract_id": "direct_fix",
+        "version": "v1",
+        "revision": "rev3",
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition["source_sha256"],
+        "instruction_bundle_hash": instruction_bundle["instruction_bundle_hash"],
+        "completed_lines": [],
+        "execution_state_revision": state["execution_state_revision"],
+        "execution_state": state,
+        "runtime_guide": guide,
+        "metadata": {},
+        "backlog_lineage": {},
+    }
+    runtime = server._contract_runtime(conn)
+    runtime.store.create(record)
+    before = runtime.store.get(execution_id)
+    body = {
+        "stage_id": "observer_graph_scope",
+        "line_id": "direct_fix_observer_graph_scope",
+        "evidence_kind": "graph_trace",
+        "bypass_identity": f"bypass:{execution_id}:1",
+        "execution_state_revision": state["execution_state_revision"],
+        "runtime_guide_hash": guide["runtime_guide_hash"],
+        "classification": "retired_contract_probe",
+        "reason": "prove terminal retirement is zero-write",
+        "decision": "blocked",
+    }
+
+    response = handler(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body=body,
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["action"] == action
+    assert response["error"] == "direct_fix_retired"
+    assert response["authority_source"] == "Contract:direct_fix@v1#rev4"
+    assert response["decision"]["gate_id"] == "contract_terminal_retirement"
+    assert response["decision"]["errors"] == ["direct_fix_retired"]
+    assert response["zero_write"] is True
+    assert response["writes_performed"] is False
+    assert response["mutation_performed"] is False
+    assert runtime.store.get(execution_id) == before
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="GET",
+        )
+    )
+    assert current["ok"] is False
+    assert current["error"] == "direct_fix_retired"
+    assert current["authority_source"] == "Contract:direct_fix@v1#rev4"
+    assert current["contract_revision_id"] == "rev3"
+    assert current["terminal_retirement"]["revision"] == "rev4"
+    assert current["decision"]["gate_id"] == "contract_terminal_retirement"
+    assert current["contract_runtime_current_state"]["terminal"] is True
+    for field in (
+        "scheduler_eligible",
+        "current_eligible",
+        "close_eligible",
+        "resume_eligible",
+        "retry_eligible",
+        "write_eligible",
+    ):
+        assert current[field] is False
+        assert current["contract_runtime_current_state"][field] is False
+    assert runtime.store.get(execution_id) == before
 
 
 def test_observer_root_route_context_contract_first_for_no_contract_row(conn):

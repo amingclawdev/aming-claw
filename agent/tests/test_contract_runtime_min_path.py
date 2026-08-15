@@ -28,6 +28,82 @@ from agent.governance.contracts.runtime import (
 from agent.governance.contracts.write_gate import validate_contract_write
 
 
+@pytest.mark.parametrize("revision", ["rev1", "rev2", "rev3"])
+def test_historical_direct_fix_durable_chain_is_terminal_audit_only(revision):
+    registry = ContractDefinitionRegistry()
+    definition = registry.get("direct_fix", version="v1", revision=revision)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    store = SQLiteContractExecutionStore(conn)
+    execution_id = f"cex-direct-fix-history-{revision}"
+    record = {
+        "schema_version": "contract_runtime_execution_record.v1",
+        "project_id": "aming-claw",
+        "backlog_id": f"AC-DIRECT-FIX-HISTORY-{revision}",
+        "contract_execution_id": execution_id,
+        "parent_contract_execution_id": "",
+        "root_contract_execution_id": execution_id,
+        "contract_chain_id": f"cchain-direct-fix-history-{revision}",
+        "contract_id": "direct_fix",
+        "version": "v1",
+        "revision": revision,
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition["source_sha256"],
+        "execution_state_revision": 3,
+        "completed_lines": [],
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "observer_graph_scope",
+                "line_id": "direct_fix_observer_graph_scope",
+            }
+        },
+        "metadata": {},
+        "backlog_lineage": {},
+    }
+
+    store.create(record)
+    projection = read_backlog_contract_chain_current(
+        conn,
+        project_id="aming-claw",
+        backlog_id=record["backlog_id"],
+    )
+    persisted = store.get(execution_id)
+
+    assert persisted["revision"] == revision
+    assert persisted["definition_hash"] == definition["definition_hash"]
+    assert projection["current_contract_execution_id"] == execution_id
+    assert projection["readiness_state"] == "terminal_retired"
+    assert projection["next_legal_action"] == {}
+    assert projection["historical_pinned_read_only"] is True
+    assert projection["terminal_retirement"]["revision"] == "rev4"
+    assert projection["historical_pinned_identity"] == {
+        "contract_execution_id": execution_id,
+        "contract_id": "direct_fix",
+        "version": "v1",
+        "revision": revision,
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition["source_sha256"],
+    }
+    for field in (
+        "scheduler_eligible",
+        "current_eligible",
+        "close_eligible",
+        "resume_eligible",
+        "retry_eligible",
+        "write_eligible",
+    ):
+        assert projection[field] is False
+
+    from agent.governance import server
+
+    resume = server._onboard_runtime_resume_from_current_projection(projection)
+    assert resume["status"] == "terminal_retired"
+    assert resume["readiness_state"] == "terminal_retired"
+    assert resume["terminal_retirement"]["revision"] == "rev4"
+    assert resume["next_legal_action"]["id"] == "file_fresh_bounded_row"
+    assert resume.get("row_status") != "WAIVED"
+
+
 def test_acceptance_file_fence_closure_requires_stable_structured_authority():
     gate = contract_state_runtime.acceptance_file_fence_closure_gate(
         [
@@ -666,43 +742,14 @@ def test_builtin_contract_templates_bind_bounded_qa_base_diff_context():
         ],
     }
 
-    qa_checkpoint = next(
-        checkpoint
-        for checkpoint in direct_fix["runtime_contract_hints"][
-            "graph_query_checkpoints"
-        ]
-        if checkpoint["id"] == "qa_graph_context"
-    )
-    required_fields = qa_checkpoint["packet"]["required_fields"]
-    for field in (
-        "graph_trace_evidence.graph_basis",
-        "graph_trace_evidence.graph_basis_decision",
-        "graph_trace_evidence.graph_basis_decision_hash",
-        "graph_trace_evidence.canonical_base_snapshot_id",
-        "graph_trace_evidence.base_commit_sha",
-        "graph_trace_evidence.candidate_commit_sha",
-        "graph_trace_evidence.changed_files",
-        "graph_trace_evidence.candidate_diff_hash",
-        "graph_trace_evidence.changed_files_source",
-        "graph_trace_evidence.candidate_overlay_hash",
-        "graph_trace_evidence.root_identity_hash",
-        "graph_trace_evidence.query_root_identity_hash",
-        "graph_trace_evidence.canonical_project_identity_hash",
-        "graph_trace_evidence.repository_identity_hash",
-    ):
-        assert field in required_fields
-    assert qa_checkpoint["packet"]["graph_basis_policy"][
-        "candidate_diff_derivation"
-    ] == "server_only"
-    assert qa_checkpoint["packet"]["graph_basis_policy"][
-        "default_graph_basis"
-    ] == "canonical_base_plus_candidate_diff"
-    assert qa_checkpoint["packet"]["graph_basis_policy"][
-        "graph_basis_decision_required"
-    ] is True
-    assert qa_checkpoint["packet"]["graph_basis_policy"][
-        "exact_candidate_query_root_clean_required"
-    ] is True
+    assert direct_fix["runtime_contract_hints"]["graph_query_checkpoints"] == []
+    assert direct_fix["runtime_contract_hints"]["entrypoint"] == "retired"
+    terminal = direct_fix["runtime_contract_hints"]["terminal_result"]
+    assert terminal["code"] == "direct_fix_retired"
+    assert terminal["authorizes_write"] is False
+    assert terminal["historical_evidence_readable"] is True
+    assert terminal["historical_execution_scheduler_eligible"] is False
+    assert direct_fix["gate_policy"]["terminal_retirement"] is True
 
 
 def test_mf_parallel_rev7_adds_scope_sideband_without_linear_line():
@@ -1717,6 +1764,7 @@ def _return_direct_fix_to_parent(runtime, record, *, generation: int, repair_ref
     return returned["record"]
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_graph_context_gates_repair_and_qa(tmp_path):
     _write_chain_projection_contracts(tmp_path)
     conn = sqlite3.connect(":memory:")
@@ -4676,6 +4724,7 @@ def test_incomplete_recovery_remains_current_and_fail_closed(tmp_path):
     }
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_qa_without_explicit_binding_counts_after_repair(tmp_path):
     _write_chain_projection_contracts(tmp_path)
     conn = sqlite3.connect(":memory:")
@@ -4719,6 +4768,7 @@ def test_direct_fix_qa_without_explicit_binding_counts_after_repair(tmp_path):
     assert current["next_legal_action"]["id"] == "return_to_parent_after_direct_fix_qa"
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_qa_with_child_generation_and_source_refs_is_counted(tmp_path):
     _write_chain_projection_contracts(tmp_path)
     conn = sqlite3.connect(":memory:")
@@ -4757,6 +4807,7 @@ def test_direct_fix_qa_with_child_generation_and_source_refs_is_counted(tmp_path
     )
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_direct_fix_projection_does_not_resume_parent_when_return_precedes_qa(tmp_path):
     _write_chain_projection_contracts(tmp_path)
     conn = sqlite3.connect(":memory:")
@@ -4802,6 +4853,7 @@ def test_direct_fix_projection_does_not_resume_parent_when_return_precedes_qa(tm
     assert current["next_legal_action"]["id"] == "return_to_parent_after_direct_fix_qa"
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_later_mf_parallel_successor_becomes_current_after_direct_fix_return(tmp_path):
     _write_chain_projection_contracts(tmp_path)
     conn = sqlite3.connect(":memory:")
@@ -4881,6 +4933,7 @@ def test_later_mf_parallel_successor_becomes_current_after_direct_fix_return(tmp
     assert current["readiness_state"] == "contract_active"
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_parent_resume_cursor_advances_across_returned_direct_fix_children(tmp_path):
     _write_chain_projection_contracts(tmp_path)
     conn = sqlite3.connect(":memory:")
@@ -4959,6 +5012,7 @@ def test_parent_resume_cursor_advances_across_returned_direct_fix_children(tmp_p
     assert current["next_legal_action"]["line_id"] == "read_context"
 
 
+@pytest.mark.skip(reason="direct_fix rev1-rev3 execution is terminal audit history")
 def test_server_chain_current_refreshes_stale_next_action_after_finish(tmp_path):
     from agent.governance import server
 

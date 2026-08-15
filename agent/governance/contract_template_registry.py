@@ -26,7 +26,6 @@ CONTRACT_TEMPLATE_ALIASES = {
     "observer_hotfix.v1": "observer_hotfix_direct_mutation.v1",
 }
 CONTRACT_TASK_TYPE_ALIASES = {
-    "direct": "direct_fix",
     "hotfix": "observer_hotfix",
 }
 
@@ -391,6 +390,10 @@ def list_contract_templates(
     return [
         template
         for template in templates
+        if not (
+            (task_type is not None or stage is not None)
+            and _is_terminal_retirement_mirror(template)
+        )
         if _matches(template, task_type=task_type, stage=stage)
     ]
 
@@ -469,6 +472,17 @@ def _canonical_task_type(task_type: str | None) -> str | None:
     if task_type is None:
         return None
     return CONTRACT_TASK_TYPE_ALIASES.get(task_type, task_type)
+
+
+def _is_terminal_retirement_mirror(template: Mapping[str, Any]) -> bool:
+    source = template.get("source")
+    gate_policy = template.get("gate_policy")
+    return bool(
+        isinstance(source, Mapping)
+        and source.get("template_is_authoritative") is False
+        and isinstance(gate_policy, Mapping)
+        and gate_policy.get("terminal_retirement") is True
+    )
 
 
 def _matches(template: Mapping[str, Any], *, task_type: str | None, stage: str | None) -> bool:

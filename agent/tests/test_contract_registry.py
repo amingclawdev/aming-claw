@@ -746,6 +746,246 @@ def test_direct_fix_terminal_retirement_separates_new_selection_from_history():
             version="v1",
             revision=revision,
         )["definition_hash"] == exact[revision]["definition_hash"]
+    for contract_id in ("direct_fix", "direct_fix.v1", "observer_direct_fix.v1"):
+        with pytest.raises(UnknownContractDefinitionError):
+            registry.get(
+                contract_id,
+                version="v1",
+                include_deprecated=False,
+            )
+        for revision in ("rev1", "rev2", "rev3", "rev4"):
+            with pytest.raises(UnknownContractDefinitionError):
+                registry.get(
+                    contract_id,
+                    version="v1",
+                    revision=revision,
+                    include_deprecated=False,
+                )
+
+
+def _terminal_retirement_definition(
+    *,
+    contract_id: str,
+    version: str,
+    revision: str,
+    supersedes: list[str],
+) -> dict:
+    return _definition(
+        contract_id=contract_id,
+        version=version,
+        revision=revision,
+        status="deprecated",
+        compat_aliases=[],
+        successors=[],
+        system_layer={
+            "entrypoint_policy": {
+                "allow_root_start": False,
+                "allow_entry": False,
+            },
+            "successor_policy": {"allow_successor_start": False},
+            "write_authority_policy": {
+                "agent_facing_generic_crud_allowed": False,
+            },
+            "graph_binding_policy": {"new_graph_context_allowed": False},
+            "route_policy": {
+                "start_allowed": False,
+                "new_route_allowed": False,
+            },
+            "lifecycle_policy": {
+                "entry_allowed": False,
+                "resume_allowed": False,
+                "retry_allowed": False,
+                "reentry_allowed": False,
+                "successor_allowed": False,
+            },
+        },
+        rule_layer={
+            "stages": [
+                {
+                    "stage_id": "terminal_retirement",
+                    "lines": [
+                        {
+                            "line_id": "terminal_retirement",
+                            "owner_role": "system",
+                            "allowed_writer_roles": ["system"],
+                            "evidence_kind": "contract_terminal_retirement",
+                            "required": False,
+                        }
+                    ],
+                }
+            ],
+            "transitions": [],
+        },
+        metadata={
+            "lifecycle": {
+                "state": "terminal_retired",
+                "terminal_retirement": True,
+                "supersedes_revisions": supersedes,
+                "new_execution_allowed": False,
+                "entry_allowed": False,
+                "resume_allowed": False,
+                "retry_allowed": False,
+                "reentry_allowed": False,
+                "successor_allowed": False,
+                "historical_pinned_read_allowed": True,
+                "result": {
+                    "schema_version": "test_contract_retired.v1",
+                    "code": "test_contract_retired",
+                    "error": "test_contract_retired",
+                    "status": "rejected",
+                    "classification": "contract_retirement",
+                    "retryable": False,
+                    "message": "test contract is terminally retired",
+                    "historical_evidence_readable": True,
+                    "historical_execution_scheduler_eligible": False,
+                    "authorizes_write": False,
+                    "next_legal_action": {
+                        "id": "file_fresh_bounded_row",
+                        "action": "select_or_create_backlog",
+                        "next_step": "file a fresh bounded row",
+                    },
+                    "forbidden_backedges": ["resume_original_contract"],
+                },
+            }
+        },
+    )
+
+
+def test_terminal_retirement_dominates_later_same_version_revision(tmp_path):
+    for revision in ("rev1", "rev3"):
+        payload = _definition(
+            contract_id="terminal_dominance",
+            version="v1",
+            revision=revision,
+            status="active",
+            compat_aliases=[],
+        )
+        (tmp_path / f"terminal_dominance.v1.{revision}.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+    retirement = _terminal_retirement_definition(
+        contract_id="terminal_dominance",
+        version="v1",
+        revision="rev2",
+        supersedes=["rev1"],
+    )
+    (tmp_path / "terminal_dominance.v1.rev2.json").write_text(
+        json.dumps(retirement),
+        encoding="utf-8",
+    )
+
+    registry = ContractDefinitionRegistry(tmp_path)
+    assert registry.get(
+        "terminal_dominance",
+        version="v1",
+        revision="rev3",
+    )["revision"] == "rev3"
+    assert registry.resolve_for_new_execution(
+        "terminal_dominance",
+        version="v1",
+        requested_revision="rev3",
+    )["revision"] == "rev2"
+
+
+def test_terminal_retirement_masks_only_its_exact_version_chain(tmp_path):
+    for version in ("v1", "v2"):
+        payload = _definition(
+            contract_id="version_scoped_retirement",
+            version=version,
+            revision="rev1",
+            status="active",
+            compat_aliases=[],
+        )
+        (tmp_path / f"version_scoped_retirement.{version}.rev1.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+    retirement = _terminal_retirement_definition(
+        contract_id="version_scoped_retirement",
+        version="v1",
+        revision="rev2",
+        supersedes=["rev1"],
+    )
+    (tmp_path / "version_scoped_retirement.v1.rev2.json").write_text(
+        json.dumps(retirement),
+        encoding="utf-8",
+    )
+
+    registry = ContractDefinitionRegistry(tmp_path)
+    assert registry.get(
+        "version_scoped_retirement",
+        version="v1",
+    )["revision"] == "rev2"
+    assert registry.get(
+        "version_scoped_retirement",
+        version="v2",
+    )["revision"] == "rev1"
+    with pytest.raises(ContractDefinitionError, match="ambiguous"):
+        registry.get("version_scoped_retirement")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (("state", ""), "lifecycle.state"),
+        (("supersedes_revisions", []), "supersedes_revisions"),
+        (("resume_allowed", True), "resume_allowed"),
+        (("historical_pinned_read_allowed", False), "historical pinned reads"),
+        (("result.authorizes_write", True), "result.authorizes_write"),
+        (("result.error", "different_error"), "result.error"),
+        (("result.forbidden_backedges", []), "forbidden_backedges"),
+        (("required_line", True), "required rule lines"),
+        (("line_owner", "observer"), "owner_role must be system"),
+        (("line_writers", ["observer"]), "allow only system"),
+        (("extra_line", True), "exactly one non-executable declaration line"),
+        (("system_entry", True), "entrypoint_policy.allow_entry"),
+        (("system_entry_missing", None), "entrypoint_policy.allow_entry"),
+        (("route_start_missing", None), "route_policy.start_allowed"),
+        (("route_start", True), "route_policy.start_allowed"),
+        (("lifecycle_policy_missing", None), "requires system_layer.lifecycle_policy"),
+    ],
+)
+def test_terminal_retirement_requires_complete_coherent_schema(mutation, error):
+    payload = json.loads(
+        (registry_module.DEFAULT_DEFINITION_DIR / "direct_fix.v1.rev4.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    field, value = mutation
+    if field.startswith("result."):
+        payload["metadata"]["lifecycle"]["result"][field.split(".", 1)[1]] = value
+    elif field == "required_line":
+        payload["rule_layer"]["stages"][0]["lines"][0]["required"] = value
+    elif field == "line_owner":
+        payload["rule_layer"]["stages"][0]["lines"][0]["owner_role"] = value
+    elif field == "line_writers":
+        payload["rule_layer"]["stages"][0]["lines"][0]["allowed_writer_roles"] = value
+    elif field == "extra_line":
+        payload["rule_layer"]["stages"][0]["lines"].append(
+            {
+                "line_id": "resume_old_world",
+                "owner_role": "observer",
+                "allowed_writer_roles": ["observer"],
+                "evidence_kind": "resume",
+                "required": False,
+            }
+        )
+    elif field == "system_entry":
+        payload["system_layer"]["entrypoint_policy"]["allow_entry"] = value
+    elif field == "system_entry_missing":
+        payload["system_layer"]["entrypoint_policy"].pop("allow_entry")
+    elif field == "lifecycle_policy_missing":
+        payload["system_layer"].pop("lifecycle_policy")
+    elif field == "route_start_missing":
+        payload["system_layer"]["route_policy"].pop("start_allowed")
+    elif field == "route_start":
+        payload["system_layer"]["route_policy"]["start_allowed"] = value
+    else:
+        payload["metadata"]["lifecycle"][field] = value
+
+    with pytest.raises(ContractDefinitionError, match=error):
+        ContractDefinitionRegistry().validate_payload(payload)
 
 
 def test_registry_rejects_non_object_system_layer(tmp_path):
