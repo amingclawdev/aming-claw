@@ -126220,6 +126220,8 @@ def _onboard_worker_read_runtime_facade_projection(
     next_action: Mapping[str, Any],
     current_projection: Mapping[str, Any],
     runtime_resume: Mapping[str, Any],
+    requested_task_id: str = "",
+    requested_route_token_ref: str = "",
 ) -> dict[str, Any]:
     """Join worker read/startup lines to one current RuntimeContext facade."""
 
@@ -126317,18 +126319,87 @@ def _onboard_worker_read_runtime_facade_projection(
             **projected,
             **recovery,
         }
+    explicit_task_id = str(requested_task_id or "").strip()
+    explicit_route_token_ref = str(
+        requested_route_token_ref or ""
+    ).strip()
+    explicit_runtime_context_id = ""
+    if explicit_task_id:
+        from .parallel_branch_runtime import get_branch_context
+
+        explicit_context = get_branch_context(
+            conn,
+            project_id,
+            explicit_task_id,
+        )
+        if explicit_context is None:
+            return blocked(
+                "runtime_context_explicit_task_not_allocated",
+                ["task_id"],
+            )
+        explicit_runtime_context_id = str(
+            getattr(explicit_context, "runtime_context_id", "") or ""
+        ).strip()
+        explicit_parent_task_id = _runtime_context_mf_sub_parent_task_id(
+            explicit_context
+        )
+        explicit_scope_mismatches = [
+            field
+            for field, expected, actual in (
+                (
+                    "project_id",
+                    project_id,
+                    str(getattr(explicit_context, "project_id", "") or ""),
+                ),
+                (
+                    "backlog_id",
+                    backlog_id,
+                    str(getattr(explicit_context, "backlog_id", "") or ""),
+                ),
+                ("parent_task_id", execution_id, explicit_parent_task_id),
+                (
+                    "task_id",
+                    explicit_task_id,
+                    str(getattr(explicit_context, "task_id", "") or ""),
+                ),
+            )
+            if not expected or expected != actual
+        ]
+        if not explicit_runtime_context_id:
+            explicit_scope_mismatches.append("runtime_context_id")
+        if not explicit_route_token_ref:
+            explicit_scope_mismatches.append("route_token_ref")
+        if explicit_scope_mismatches:
+            return blocked(
+                "runtime_context_explicit_task_scope_mismatch",
+                list(dict.fromkeys(explicit_scope_mismatches)),
+            )
+    startup_runtime_context_id = (
+        str(projected.get("runtime_context_id") or "").strip()
+        if startup_selected
+        else ""
+    )
+    startup_task_id = (
+        str(projected.get("task_id") or "").strip()
+        if startup_selected
+        else ""
+    )
+    if explicit_task_id and startup_selected and (
+        startup_task_id != explicit_task_id
+        or startup_runtime_context_id != explicit_runtime_context_id
+    ):
+        return blocked(
+            "runtime_context_explicit_task_next_action_mismatch",
+            ["runtime_context_id", "task_id"],
+        )
     dispatch = _contract_runtime_dispatch_ticket_authority(
         record,
         _runtime_current_state_from_record(record),
         requested_runtime_context_id=(
-            str(projected.get("runtime_context_id") or "").strip()
-            if startup_selected
-            else ""
+            explicit_runtime_context_id or startup_runtime_context_id
         ),
         requested_task_id=(
-            str(projected.get("task_id") or "").strip()
-            if startup_selected
-            else ""
+            explicit_task_id or startup_task_id
         ),
         allow_post_read_startup=startup_selected,
     )
@@ -126402,6 +126473,13 @@ def _onboard_worker_read_runtime_facade_projection(
         )
     except GovernanceError as exc:
         return blocked(exc.code, ["route_identity"])
+    if explicit_task_id and str(
+        route_identity.get("route_token_ref") or ""
+    ).strip() != explicit_route_token_ref:
+        return blocked(
+            "runtime_context_explicit_task_route_identity_mismatch",
+            ["route_token_ref"],
+        )
     identity_mismatches = [
         field
         for field, expected, actual in (
@@ -126841,6 +126919,11 @@ def _onboard_worker_read_runtime_facade_projection(
         }
         return {
             **projected,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
             "action": str(
                 startup_action.get("action")
                 or "record_mf_subagent_startup"
@@ -127063,6 +127146,11 @@ def _onboard_worker_read_runtime_facade_projection(
     }
     return {
         **projected,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
         "action": "record_runtime_context_read_receipt",
         "interface": "runtime_context.read_receipts",
         "mcp_tool": "runtime_context_read_receipt",
@@ -129353,6 +129441,10 @@ def _onboard_route_guide_service_response(
             next_action=next_action,
             current_projection=current_projection,
             runtime_resume=runtime_resume,
+            requested_task_id=str(
+                (request_body or {}).get("task_id") or ""
+            ).strip(),
+            requested_route_token_ref=requested_route_token_ref,
         )
         return _onboard_route_guide_compact_service_response(
             project_id=project_id,
@@ -157056,6 +157148,7 @@ def _contract_runtime_dispatch_ticket_authority(
     bounded_workers = _contract_runtime_mf_parallel_bounded_workers(
         {"payload": payload}
     )
+    selected_bounded_worker = False
     if bounded_workers:
         requested_runtime_context_id = str(
             requested_runtime_context_id or ""
@@ -157105,18 +157198,27 @@ def _contract_runtime_dispatch_ticket_authority(
                 ),
             }
         payload = dict(matching_workers[0])
+        selected_bounded_worker = True
 
     dispatch_runtime_context_id = str(
-        line.get("runtime_context_id") or payload.get("runtime_context_id") or ""
+        (
+            ""
+            if selected_bounded_worker
+            else line.get("runtime_context_id")
+        )
+        or payload.get("runtime_context_id")
+        or ""
     ).strip()
     dispatch_task_id = str(
-        line.get("task_id")
+        ("" if selected_bounded_worker else line.get("task_id"))
         or payload.get("task_id")
         or payload.get("worker_task_id")
         or ""
     ).strip()
     dispatch_parent_task_id = str(
-        line.get("parent_task_id") or payload.get("parent_task_id") or ""
+        ("" if selected_bounded_worker else line.get("parent_task_id"))
+        or payload.get("parent_task_id")
+        or ""
     ).strip()
     for index, candidate in _contract_runtime_completed_lines(record):
         if index <= dispatch_index:
@@ -157172,7 +157274,11 @@ def _contract_runtime_dispatch_ticket_authority(
 
     def canonical_text(field: str, *aliases: str) -> tuple[str, str]:
         keys = (field, *aliases)
-        sources = (line, payload, route_identity)
+        sources = (
+            (payload, route_identity)
+            if selected_bounded_worker
+            else (line, payload, route_identity)
+        )
         values = {
             str(source.get(key) or "").strip()
             for source in sources
@@ -157235,7 +157341,7 @@ def _contract_runtime_dispatch_ticket_authority(
     )
 
     owned_sources = []
-    for source in (line, payload):
+    for source in ((payload,) if selected_bounded_worker else (line, payload)):
         values = _runtime_context_service_query_values(
             source,
             "owned_files",

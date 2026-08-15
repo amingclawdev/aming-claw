@@ -147838,6 +147838,176 @@ def test_compact_worker_read_bridges_outer_atomic_ticket_to_exact_lane_zero_writ
         assert "\n".join(conn.iterdump()) == before_db
 
 
+def test_compact_worker_read_explicit_task_pin_selects_exact_sibling_zero_write(
+    conn,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
+    )
+    record, write = _rev8_atomic_dispatch_binding_fixture(
+        conn,
+        suffix="explicit-sibling-task-pin",
+        lane_files=(("agent/governance/server.py",), ("agent/tests/test_graph_governance_api.py",)),
+    )
+    effective, errors = server._contract_runtime_bind_mf_parallel_dispatch_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        write=write,
+    )
+    assert errors == []
+    effective["actor_role"] = "observer"
+    global_worker, pinned_worker = effective["payload"]["bounded_workers"]
+    next_line = {
+        "stage_id": "worker_read",
+        "line_id": "worker_read_runtime_guide",
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "evidence_kind": "read_receipt",
+        "runtime_context_id": global_worker["runtime_context_id"],
+        "task_id": global_worker["task_id"],
+        "parent_task_id": global_worker["parent_task_id"],
+        "worker_id": global_worker["worker_id"],
+        "worker_slot_id": global_worker["worker_slot_id"],
+    }
+    record.update(
+        {
+            "completed_lines": [effective],
+            "contract_chain_id": "cchain-explicit-sibling-task-pin",
+            "execution_state_revision": 3,
+            "runtime_guide": {
+                "execution": {
+                    "contract_execution_id": record["contract_execution_id"],
+                    "execution_state_revision": 3,
+                },
+                "next_legal_action": next_line,
+            },
+        }
+    )
+
+    class StaticStore:
+        current = record
+
+        def get(self, execution_id):
+            assert execution_id == record["contract_execution_id"]
+            return self.current
+
+    store = StaticStore()
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: store)
+    current_projection = {
+        "current_contract_execution_id": record["contract_execution_id"],
+        "next_legal_action": next_line,
+    }
+    runtime_resume = {
+        "current_contract_execution_id": record["contract_execution_id"],
+        "next_legal_action": next_line,
+    }
+    before_changes = conn.total_changes
+    before_db = "\n".join(conn.iterdump())
+
+    pinned = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        next_action=next_line,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+        requested_task_id=pinned_worker["task_id"],
+        requested_route_token_ref=pinned_worker["route_token_ref"],
+    )
+
+    assert pinned["actionable"] is True
+    assert pinned["runtime_context_id"] == pinned_worker["runtime_context_id"]
+    assert pinned["task_id"] == pinned_worker["task_id"]
+    assert pinned["copy_safe_body"]["route_token_ref"] == pinned_worker[
+        "route_token_ref"
+    ]
+    assert global_worker["runtime_context_id"] not in json.dumps(
+        pinned,
+        sort_keys=True,
+    )
+
+    unpinned = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        next_action=next_line,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
+    assert unpinned["runtime_context_id"] == global_worker["runtime_context_id"]
+
+    for requested_task_id, route_token_ref, expected_reason in (
+        (
+            pinned_worker["task_id"],
+            global_worker["route_token_ref"],
+            "runtime_context_explicit_task_route_identity_mismatch",
+        ),
+        (
+            "unallocated-explicit-sibling",
+            pinned_worker["route_token_ref"],
+            "runtime_context_explicit_task_not_allocated",
+        ),
+    ):
+        rejected = server._onboard_worker_read_runtime_facade_projection(
+            conn,
+            project_id=PID,
+            backlog_id=record["backlog_id"],
+            next_action=next_line,
+            current_projection=current_projection,
+            runtime_resume=runtime_resume,
+            requested_task_id=requested_task_id,
+            requested_route_token_ref=route_token_ref,
+        )
+        assert rejected["actionable"] is False
+        blocker = rejected["worker_read_runtime_facade_projection"]
+        assert blocker["reason"] == expected_reason
+        assert blocker["zero_write_rejection"] is True
+        assert blocker["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_db
+
+    conn.execute(
+        """
+        UPDATE parallel_branch_runtime_contexts
+           SET parent_task_id = ?
+         WHERE project_id = ? AND task_id = ?
+        """,
+        ("cex-other-sibling", PID, pinned_worker["task_id"]),
+    )
+    conn.commit()
+    cross_cex_before_changes = conn.total_changes
+    cross_cex_before_db = "\n".join(conn.iterdump())
+    cross_cex = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        next_action=next_line,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+        requested_task_id=pinned_worker["task_id"],
+        requested_route_token_ref=pinned_worker["route_token_ref"],
+    )
+    assert cross_cex["actionable"] is False
+    cross_cex_blocker = cross_cex["worker_read_runtime_facade_projection"]
+    assert cross_cex_blocker["reason"] == (
+        "runtime_context_explicit_task_scope_mismatch"
+    )
+    assert "parent_task_id" in cross_cex_blocker[
+        "missing_or_mismatched_fields"
+    ]
+    assert conn.total_changes == cross_cex_before_changes
+    assert "\n".join(conn.iterdump()) == cross_cex_before_db
+
+
 def test_rev8_atomic_dispatch_rejects_overlapping_lane_fences_before_dispatch(conn):
     shared_file = "agent/governance/server.py"
     record, write = _rev8_atomic_dispatch_binding_fixture(
