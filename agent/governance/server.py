@@ -31369,9 +31369,13 @@ def _runtime_context_git_head_commit(*paths: str) -> str:
 def _runtime_context_worker_worktree_liveness(
     project_id: str,
     context: Any,
+    *,
+    expected_status: str = "worktree_ready",
 ) -> dict[str, Any]:
     """Prove the assigned worker root is the exact clean linked worktree."""
 
+    expected_status = str(expected_status or "").strip()
+    actual_status = str(getattr(context, "status", "") or "").strip()
     projection: dict[str, Any] = {
         "schema_version": "runtime_context.worker_worktree_liveness.v1",
         "status": "blocked",
@@ -31381,6 +31385,8 @@ def _runtime_context_worker_worktree_liveness(
             getattr(context, "runtime_context_id", "") or ""
         ).strip(),
         "task_id": str(getattr(context, "task_id", "") or "").strip(),
+        "expected_runtime_context_status": expected_status,
+        "actual_runtime_context_status": actual_status,
         "zero_write_projection": True,
         "writes_performed": False,
         "mutation_performed": False,
@@ -31400,8 +31406,14 @@ def _runtime_context_worker_worktree_liveness(
     target = Path(target_text).expanduser().resolve()
     if worktree != target:
         return blocked("target_worktree_identity_mismatch")
-    if str(getattr(context, "status", "") or "").strip() != "worktree_ready":
-        return blocked("runtime_context_not_worktree_ready")
+    if actual_status != expected_status:
+        return blocked(
+            (
+                "runtime_context_not_worktree_ready"
+                if expected_status == "worktree_ready"
+                else "runtime_context_not_running"
+            )
+        )
 
     try:
         repository_root = _parallel_branch_allocate_precheck_registered_repository(
@@ -126564,6 +126576,7 @@ def _onboard_worker_read_runtime_facade_projection(
     worktree_liveness = _runtime_context_worker_worktree_liveness(
         project_id,
         context,
+        expected_status=("running" if graph_selected else "worktree_ready"),
     )
     if worktree_liveness.get("valid") is not True:
         recovery = _runtime_context_worker_worktree_rematerialization_action(

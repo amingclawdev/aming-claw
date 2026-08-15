@@ -119033,6 +119033,33 @@ def test_runtime_context_worker_worktree_liveness_rejects_physical_drift(
     assert ready["valid"] is True
     assert ready["status"] == "ready"
 
+    running_context = replace(context, status="running")
+    running_ready = server._runtime_context_worker_worktree_liveness(
+        PID,
+        running_context,
+        expected_status="running",
+    )
+    assert running_ready["valid"] is True
+    assert running_ready["status"] == "ready"
+    assert running_ready["expected_runtime_context_status"] == "running"
+    assert running_ready["actual_runtime_context_status"] == "running"
+
+    running_with_default = server._runtime_context_worker_worktree_liveness(
+        PID,
+        running_context,
+    )
+    assert running_with_default["valid"] is False
+    assert running_with_default["reason_code"] == (
+        "runtime_context_not_worktree_ready"
+    )
+    prestartup_for_graph = server._runtime_context_worker_worktree_liveness(
+        PID,
+        context,
+        expected_status="running",
+    )
+    assert prestartup_for_graph["valid"] is False
+    assert prestartup_for_graph["reason_code"] == "runtime_context_not_running"
+
     cases = [
         (
             replace(context, target_project_root=str(repo)),
@@ -119055,11 +119082,26 @@ def test_runtime_context_worker_worktree_liveness_rejects_physical_drift(
         result = server._runtime_context_worker_worktree_liveness(PID, candidate)
         assert result["valid"] is False
         assert result["reason_code"] == reason
+        if reason != "runtime_context_not_worktree_ready":
+            running_result = server._runtime_context_worker_worktree_liveness(
+                PID,
+                replace(candidate, status="running"),
+                expected_status="running",
+            )
+            assert running_result["valid"] is False
+            assert running_result["reason_code"] == reason
 
     (worktree / "candidate.txt").write_text("dirty\n", encoding="utf-8")
     dirty = server._runtime_context_worker_worktree_liveness(PID, context)
     assert dirty["valid"] is False
     assert dirty["reason_code"] == "worktree_dirty"
+    running_dirty = server._runtime_context_worker_worktree_liveness(
+        PID,
+        running_context,
+        expected_status="running",
+    )
+    assert running_dirty["valid"] is False
+    assert running_dirty["reason_code"] == "worktree_dirty"
     subprocess.run(
         ["git", "checkout", "--", "candidate.txt"],
         cwd=worktree,
@@ -148012,15 +148054,23 @@ def test_compact_worker_graph_context_projects_exact_sibling_action_zero_write(
     conn,
     monkeypatch,
 ):
+    def graph_stage_liveness(*_args, expected_status="worktree_ready", **_kwargs):
+        return {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready" if expected_status == "running" else "blocked",
+            "valid": expected_status == "running",
+            "reason_code": (
+                "worktree_ready"
+                if expected_status == "running"
+                else "runtime_context_not_worktree_ready"
+            ),
+            "expected_runtime_context_status": expected_status,
+        }
+
     monkeypatch.setattr(
         server,
         "_runtime_context_worker_worktree_liveness",
-        lambda *_args, **_kwargs: {
-            "schema_version": "runtime_context.worker_worktree_liveness.v1",
-            "status": "ready",
-            "valid": True,
-            "reason_code": "worktree_ready",
-        },
+        graph_stage_liveness,
     )
     record, write = _rev8_atomic_dispatch_binding_fixture(
         conn,
