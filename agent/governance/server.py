@@ -125165,6 +125165,7 @@ def _onboard_guide_capsule_scope_identity(
     next_action: Mapping[str, Any],
     current_projection: Mapping[str, Any],
     runtime_resume: Mapping[str, Any],
+    requested_task_id: str = "",
 ) -> dict[str, Any]:
     current_identity = _onboard_guide_capsule_projection_identity(
         current_projection
@@ -125212,11 +125213,15 @@ def _onboard_guide_capsule_scope_identity(
         or runtime_resume.get("terminal") is True
         or next_action.get("terminal") is True
     )
+    selected_task_id = str(
+        requested_task_id or next_action.get("task_id") or ""
+    ).strip()
     return {
         "project_id": project_id,
         "backlog_id": backlog_id,
         "selected_role": str(role or "").strip() or "observer",
         "selected_work_type": str(work_type or "").strip(),
+        "selected_task_id": selected_task_id,
         "contract_execution_id": contract_execution_id,
         "execution_state_revision": revision,
         "projection_hash": projection_hash,
@@ -125283,6 +125288,7 @@ def _onboard_guide_capsule_cache_key(
         str(identity.get("execution_state_revision") or 0),
         str(identity.get("projection_hash") or ""),
         str(identity.get("runtime_context_auth_generation") or 0),
+        str(identity.get("selected_task_id") or ""),
     )
 
 
@@ -125302,11 +125308,13 @@ def _onboard_guide_capsule_invalidate_scope_locked(
     identity: Mapping[str, Any],
     current_key: tuple[str, ...],
 ) -> None:
-    scope = current_key[:4]
+    task_scope = str(identity.get("selected_task_id") or "")
+    scope = (*current_key[:4], task_scope)
     invalidated = [
         key
         for key in _ONBOARD_GUIDE_CAPSULE_CACHE
-        if key[:4] == scope and key != current_key
+        if (*key[:4], key[8] if len(key) > 8 else "") == scope
+        and key != current_key
     ]
     if identity.get("terminal") is True:
         invalidated.extend(
@@ -125598,10 +125606,12 @@ def _onboard_guide_capsule_refresh_response(
             "backlog_id": str(identity.get("backlog_id") or ""),
             "role": str(identity.get("selected_role") or ""),
             "work_type": str(identity.get("selected_work_type") or ""),
+            "task_id": str(identity.get("selected_task_id") or ""),
         },
         "safe_next_step": (
             "call compact onboard_route_guide for the same project, backlog, "
-            "role, and work_type; do not grep guide text or read implementation "
+            "role, work_type, and task_id when projected; do not grep guide "
+            "text or read implementation "
             "source to reconstruct the action"
         ),
         "capsule_cache": {
@@ -125624,6 +125634,7 @@ def _onboard_guide_capsule_fetch(
     backlog_id: str = "",
     role: str = "",
     work_type: str = "",
+    task_id: str = "",
 ) -> dict[str, Any]:
     now = time.monotonic()
     with _ONBOARD_GUIDE_CAPSULE_LOCK:
@@ -125654,6 +125665,7 @@ def _onboard_guide_capsule_fetch(
             "backlog_id": backlog_id,
             "selected_role": role,
             "selected_work_type": work_type,
+            "selected_task_id": task_id,
         }
         for field, value in expected.items():
             if value and str(identity.get(field) or "") != str(value):
@@ -125746,6 +125758,9 @@ def _onboard_guide_capsule_fetch(
             "selected_role": str(identity.get("selected_role") or ""),
             "selected_work_type": str(
                 identity.get("selected_work_type") or ""
+            ),
+            "selected_task_id": str(
+                identity.get("selected_task_id") or ""
             ),
             "guide_capsule_ref": guide_capsule_ref,
             "sections": {
@@ -128025,6 +128040,7 @@ def _onboard_route_guide_compact_service_response(
     target_files: Sequence[str],
     projection_degraded: bool,
     qa_runtime_record: Mapping[str, Any] | None = None,
+    requested_task_id: str = "",
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
@@ -128060,6 +128076,7 @@ def _onboard_route_guide_compact_service_response(
         next_action=next_action,
         current_projection=current_projection,
         runtime_resume=runtime_resume,
+        requested_task_id=requested_task_id,
     )
     action_input, action_input_path = (
         _onboard_guide_capsule_find_action_input(next_action)
@@ -128754,6 +128771,7 @@ def _onboard_route_guide_compact_service_response(
         "backlog_id": backlog_id,
         "selected_role": selected_role,
         "selected_work_type": selected_work_type,
+        "selected_task_id": str(identity.get("selected_task_id") or ""),
         "work_type_storage_projection": work_type_storage_projection,
         "selected_guidance_json_path": selected_guidance_path,
         "next_legal_action": next_action_projection,
@@ -128851,6 +128869,7 @@ def _onboard_route_guide_compact_service_response(
                 "backlog_id",
                 "selected_role",
                 "selected_work_type",
+                "selected_task_id",
                 "contract_execution_id",
                 "execution_state_revision",
                 "projection_hash",
@@ -128951,6 +128970,7 @@ def _onboard_route_guide_compact_service_response(
             "backlog_id": backlog_id,
             "selected_role": selected_role,
             "selected_work_type": selected_work_type,
+            "selected_task_id": str(identity.get("selected_task_id") or ""),
             "guide_capsule_ref": entry["guide_capsule_ref"],
             "status": "compact_action_input_continuation_required",
             "reason": "compact_response_size_limit",
@@ -128984,6 +129004,7 @@ def _onboard_route_guide_compact_service_response(
         "backlog_id": backlog_id,
         "selected_role": selected_role,
         "selected_work_type": selected_work_type,
+        "selected_task_id": str(identity.get("selected_task_id") or ""),
         "guide_capsule_ref": entry["guide_capsule_ref"],
         "status": "compact_response_size_exceeded",
         "reason": (
@@ -129876,6 +129897,9 @@ def _onboard_route_guide_service_response(
             target_files=target_files,
             projection_degraded=projection_degraded,
             qa_runtime_record=qa_runtime_record,
+            requested_task_id=str(
+                (request_body or {}).get("task_id") or ""
+            ).strip(),
         )
     guidance = _onboard_contract_agent_guidance(
         record,
@@ -168779,6 +168803,11 @@ def handle_project_onboard_route_guide_capsule(ctx: RequestContext):
             or body.get("requested_work_type")
             or _first_query_value(ctx.query, "work_type")
             or _first_query_value(ctx.query, "requested_work_type")
+            or ""
+        ).strip(),
+        task_id=str(
+            body.get("task_id")
+            or _first_query_value(ctx.query, "task_id")
             or ""
         ).strip(),
     )

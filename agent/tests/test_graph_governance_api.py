@@ -148485,8 +148485,10 @@ def test_compact_worker_graph_context_projects_exact_sibling_action_zero_write(
         runtime_resume=runtime_resume,
         target_files=list(pinned_worker["owned_files"]),
         projection_degraded=False,
+        requested_task_id=pinned_worker["task_id"],
     )
     assert compact["actionable"] is True
+    assert compact["selected_task_id"] == pinned_worker["task_id"]
     assert compact["mcp_tool"] == "graph_query"
     assert compact["copy_safe_body"] == pinned_body
     assert compact["canonical_executable_action"]["copy_safe_body"] == (
@@ -148502,6 +148504,7 @@ def test_compact_worker_graph_context_projects_exact_sibling_action_zero_write(
                 "backlog_id": record["backlog_id"],
                 "role": "mf_sub",
                 "work_type": "parallel_worker",
+                "task_id": pinned_worker["task_id"],
             },
         )
     )
@@ -148557,6 +148560,61 @@ def test_compact_worker_graph_context_projects_exact_sibling_action_zero_write(
     assert unpinned["runtime_context_id"] == global_worker[
         "runtime_context_id"
     ]
+    unpinned_compact = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=record["backlog_id"],
+        role="mf_sub",
+        work_type="parallel_worker",
+        record=record,
+        next_action=unpinned,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+        target_files=list(global_worker["owned_files"]),
+        projection_degraded=False,
+    )
+    assert unpinned_compact["selected_task_id"] == global_worker["task_id"]
+    assert unpinned_compact["guide_capsule_ref"] != compact[
+        "guide_capsule_ref"
+    ]
+
+    pinned_capsule_after_sibling = (
+        server.handle_project_onboard_route_guide_capsule(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "guide_capsule_ref": compact["guide_capsule_ref"],
+                    "sections": ["action_input"],
+                    "backlog_id": record["backlog_id"],
+                    "role": "mf_sub",
+                    "work_type": "parallel_worker",
+                    "task_id": pinned_worker["task_id"],
+                },
+            )
+        )
+    )
+    assert pinned_capsule_after_sibling["ok"] is True
+    assert pinned_capsule_after_sibling["selected_task_id"] == pinned_worker[
+        "task_id"
+    ]
+    wrong_task_capsule = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": compact["guide_capsule_ref"],
+                "sections": ["action_input"],
+                "backlog_id": record["backlog_id"],
+                "role": "mf_sub",
+                "work_type": "parallel_worker",
+                "task_id": global_worker["task_id"],
+            },
+        )
+    )
+    assert wrong_task_capsule["ok"] is False
+    assert wrong_task_capsule["reason"] == "guide_capsule_wrong_scope"
+    assert wrong_task_capsule["mismatched_fields"] == ["selected_task_id"]
+    assert wrong_task_capsule["authorizes_write"] is False
 
     before_wrong_route_changes = conn.total_changes
     before_wrong_route_db = "\n".join(conn.iterdump())
