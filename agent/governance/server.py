@@ -127747,6 +127747,78 @@ def _onboard_route_guide_compact_service_response(
         <= _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
     ):
         return response
+    action_input_section = (
+        entry.get("sections", {}).get("action_input")
+        if isinstance(entry.get("sections"), Mapping)
+        else {}
+    )
+    continuation_action = (
+        action_input_section.get("canonical_executable_action")
+        if isinstance(action_input_section, Mapping)
+        and isinstance(
+            action_input_section.get("canonical_executable_action"),
+            Mapping,
+        )
+        else {}
+    )
+    continuation_source_binding = (
+        action_input_section.get("source_binding")
+        if isinstance(action_input_section, Mapping)
+        and isinstance(action_input_section.get("source_binding"), Mapping)
+        else {}
+    )
+    continuation_ready = bool(
+        selected_role_key == "worker"
+        and not host_precursor_required
+        and isinstance(action_input_section, Mapping)
+        and action_input_section.get("continuation_complete") is True
+        and str(continuation_action.get("mcp_tool") or "").strip()
+        and continuation_source_binding
+        == {
+            "contract_execution_id": identity["contract_execution_id"],
+            "execution_state_revision": identity["execution_state_revision"],
+            "projection_hash": identity["projection_hash"],
+        }
+    )
+    if continuation_ready:
+        # The public host orchestrator already knows how to fetch this exact
+        # bounded section.  Keep the compact read successful so it can reach
+        # that fallback after an auth transition instead of treating response
+        # size as a terminal worker failure.  The opaque capsule ref remains
+        # scope-, revision-, projection-, and auth-generation-fenced by fetch.
+        return {
+            "schema_version": _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION,
+            "ok": True,
+            "response_view": "compact",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "selected_role": selected_role,
+            "selected_work_type": selected_work_type,
+            "guide_capsule_ref": entry["guide_capsule_ref"],
+            "status": "compact_action_input_continuation_required",
+            "reason": "compact_response_size_limit",
+            "required_sections": ["action_input"],
+            "action_input_continuation": {
+                "schema_version": (
+                    "onboard_route_guide."
+                    "action_input_capsule_continuation.v1"
+                ),
+                "mcp_tool": "onboard_route_guide_section_fetch",
+                "guide_capsule_ref": entry["guide_capsule_ref"],
+                "sections": ["action_input"],
+                "source_binding": dict(continuation_source_binding),
+            },
+            "max_serialized_bytes": (
+                _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+            ),
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+            "advisory_only": True,
+            "authorizes_write": False,
+            "satisfies_gate": False,
+            "synthesizes_pass": False,
+        }
     return {
         "schema_version": _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION,
         "ok": False,

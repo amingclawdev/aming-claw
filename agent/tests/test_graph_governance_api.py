@@ -118073,6 +118073,7 @@ def test_compact_worker_read_projects_registry_verified_route_cutover(
         projection_degraded=False,
     )
     assert overflow["status"] == "compact_response_size_exceeded"
+    assert overflow["ok"] is False
     assert overflow["guide_capsule_ref"] == guide["guide_capsule_ref"]
     monkeypatch.setattr(
         server,
@@ -118256,6 +118257,83 @@ def test_compact_worker_read_projects_registry_verified_route_cutover(
         max_capsule_bytes,
     )
     assert refreshed_overflow["guide_capsule_ref"] == refreshed["guide_capsule_ref"]
+    assert refreshed_overflow["ok"] is True
+    assert refreshed_overflow["status"] == (
+        "compact_action_input_continuation_required"
+    )
+    assert refreshed_overflow["required_sections"] == ["action_input"]
+    assert refreshed_overflow["action_input_continuation"] == {
+        "schema_version": (
+            "onboard_route_guide.action_input_capsule_continuation.v1"
+        ),
+        "mcp_tool": "onboard_route_guide_section_fetch",
+        "guide_capsule_ref": refreshed["guide_capsule_ref"],
+        "sections": ["action_input"],
+        "source_binding": {
+            "contract_execution_id": successor["contract_execution_id"],
+            "execution_state_revision": refreshed["execution_state_revision"],
+            "projection_hash": refreshed["projection_hash"],
+        },
+    }
+    assert (
+        len(json.dumps(refreshed_overflow, sort_keys=True).encode("utf-8"))
+        <= max_capsule_bytes
+    )
+    overflow_serialized = json.dumps(refreshed_overflow, sort_keys=True)
+    assert joined["session_token"] not in overflow_serialized
+    assert joined["fence_token"] not in overflow_serialized
+    from cli_agent_service import guided_runtime
+
+    helper_calls = []
+
+    def helper_tool_caller(tool_name, tool_body):
+        helper_calls.append((tool_name, copy.deepcopy(tool_body)))
+        if tool_name == "onboard_route_guide":
+            return copy.deepcopy(refreshed_overflow)
+        assert tool_name == "onboard_route_guide_section_fetch"
+        return server.handle_project_onboard_route_guide_capsule(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=tool_body,
+            )
+        )
+
+    helper_action, helper_body, helper_raw, helper_failure = (
+        guided_runtime._refresh_host_action_packet(
+            tool_caller=helper_tool_caller,
+            refresh_body={
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "role": "mf_sub",
+                "work_type": "parallel_worker",
+                "task_id": successor["contract_execution_id"],
+                "response_view": "compact",
+            },
+            expected_tools=frozenset({"runtime_context_read_receipt"}),
+            request_bodies=[],
+            raw_results=[],
+            raw_values=(),
+        )
+    )
+    assert helper_failure is None
+    assert helper_raw == ()
+    assert helper_action["mcp_tool"] == "runtime_context_read_receipt"
+    assert helper_body == refreshed["canonical_executable_action"][
+        "copy_safe_body"
+    ]
+    assert [name for name, _body in helper_calls] == [
+        "onboard_route_guide",
+        "onboard_route_guide_section_fetch",
+    ]
+    assert helper_calls[1][1] == {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "role": "mf_sub",
+        "work_type": "parallel_worker",
+        "guide_capsule_ref": refreshed["guide_capsule_ref"],
+        "sections": ["action_input"],
+    }
     refreshed_section = server.handle_project_onboard_route_guide_capsule(
         _ctx(
             {"project_id": PID},
