@@ -453,7 +453,14 @@ _HOST_AUTH_REQUIRED_FIELDS = tuple(
     session_token_ref reason""".split()
 )
 _HOST_REISSUE_TOOL_FIELDS = _INITIAL_JOIN_TOOL_FIELDS | frozenset(
-    {"session_token", "fence_token"}
+    {"allocation_owner", "session_token", "fence_token"}
+)
+_HOST_REISSUE_REQUIRED_FIELDS = (
+    "project_id",
+    "runtime_context_id",
+    "task_id",
+    "session_token_ref",
+    "allocation_owner",
 )
 _IMPLEMENTATION_WRITER_BINDING_FIELDS = (
     "backlog_id",
@@ -1411,6 +1418,43 @@ def _server_declared_recovery_packet(
     return packet
 
 
+def _post_receipt_pre_startup_recovery(value: Any) -> bool:
+    """Return the one server-declared recovery sequence that skips receipt."""
+
+    try:
+        eligibility_blocks = mcp_application_mapping_blocks(
+            value, paths=_HOST_RECOVERY_ELIGIBILITY_PATHS
+        )
+    except ServiceError as exc:
+        raise GuidedRuntimeDispatchError(
+            "runtime context recovery eligibility could not be decoded",
+            status="invalid_host_orchestration",
+        ) from exc
+    flags = {
+        block.get("post_receipt_pre_startup_recovery")
+        for block in eligibility_blocks
+        if "post_receipt_pre_startup_recovery" in block
+    }
+    if not flags:
+        return False
+    if flags != {True}:
+        raise GuidedRuntimeDispatchError(
+            "runtime context post-receipt recovery declaration is ambiguous",
+            status="invalid_host_orchestration",
+        )
+    modes = {
+        _text(block.get("mode"))
+        for block in eligibility_blocks
+        if _text(block.get("mode"))
+    }
+    if modes != {"safe_ref_prestartup_reissue"}:
+        raise GuidedRuntimeDispatchError(
+            "runtime context post-receipt recovery mode is invalid",
+            status="invalid_host_orchestration",
+        )
+    return True
+
+
 def _onboard_refresh_body(guide: Mapping[str, Any]) -> dict[str, Any]:
     project_id = _unique_current_guide_text(guide, "project_id")
     backlog_id = _unique_current_guide_text(guide, "backlog_id")
@@ -1618,6 +1662,7 @@ def _orchestrate_refreshing_host_startup(
 ) -> dict[str, Any]:
     """Run a declared auth precursor and refresh each executable packet."""
 
+    post_receipt_pre_startup = _post_receipt_pre_startup_recovery(guide)
     values = _host_runtime_values(
         guide,
         host_identity,
@@ -1651,12 +1696,7 @@ def _orchestrate_refreshing_host_startup(
         precursor_required = _INITIAL_REQUIRED_FIELDS
         precursor_force_fields = _INITIAL_FORCE_FIELDS
     elif precursor_tool == "runtime_context_session_token_reissue":
-        precursor_required = (
-            "project_id",
-            "runtime_context_id",
-            "task_id",
-            "session_token_ref",
-        )
+        precursor_required = _HOST_REISSUE_REQUIRED_FIELDS
         precursor_force_fields = frozenset()
     else:
         precursor_required = _HOST_AUTH_REQUIRED_FIELDS
@@ -1696,62 +1736,67 @@ def _orchestrate_refreshing_host_startup(
             "session_token_ref": joined_session_token_ref,
         }
 
-        receipt_action, receipt_template, raw_values, failure = (
-            _refresh_host_action_packet(
-                tool_caller=tool_caller,
-                refresh_body=refresh_body,
-                expected_tools=frozenset({"runtime_context_read_receipt"}),
+        receipt_tool = ""
+        receipt_response: dict[str, Any] = {}
+        if post_receipt_pre_startup:
+            startup_values = dict(protected_values)
+        else:
+            receipt_action, receipt_template, raw_values, failure = (
+                _refresh_host_action_packet(
+                    tool_caller=tool_caller,
+                    refresh_body=refresh_body,
+                    expected_tools=frozenset({"runtime_context_read_receipt"}),
+                    request_bodies=request_bodies,
+                    raw_results=raw_results,
+                    raw_values=raw_values,
+                )
+            )
+            if failure:
+                return failure
+            _validate_placeholder_contract(
+                (("read_receipt", receipt_template, _READ_RECEIPT_TOOL_FIELDS),)
+            )
+            _assert_host_action_scope(
+                receipt_template,
+                protected_values,
+                label="read-receipt continuation packet",
+            )
+            receipt_body = _validated_tool_body(
+                receipt_template,
+                allowed_fields=_READ_RECEIPT_TOOL_FIELDS,
+                replacements=protected_values,
+                force_fields=_RECEIPT_FORCE_FIELDS,
+                required_fields=_RECEIPT_REQUIRED_FIELDS,
+            )
+            receipt_tool = _text(
+                receipt_action.get("mcp_tool") or receipt_action.get("tool")
+            )
+            receipt_response, failure, raw_values = _invoke_host_tool(
+                tool_caller,
+                receipt_tool,
+                receipt_body,
+                response_status="read receipt",
                 request_bodies=request_bodies,
                 raw_results=raw_results,
                 raw_values=raw_values,
             )
-        )
-        if failure:
-            return failure
-        _validate_placeholder_contract(
-            (("read_receipt", receipt_template, _READ_RECEIPT_TOOL_FIELDS),)
-        )
-        _assert_host_action_scope(
-            receipt_template,
-            protected_values,
-            label="read-receipt continuation packet",
-        )
-        receipt_body = _validated_tool_body(
-            receipt_template,
-            allowed_fields=_READ_RECEIPT_TOOL_FIELDS,
-            replacements=protected_values,
-            force_fields=_RECEIPT_FORCE_FIELDS,
-            required_fields=_RECEIPT_REQUIRED_FIELDS,
-        )
-        receipt_tool = _text(
-            receipt_action.get("mcp_tool") or receipt_action.get("tool")
-        )
-        receipt_response, failure, raw_values = _invoke_host_tool(
-            tool_caller,
-            receipt_tool,
-            receipt_body,
-            response_status="read receipt",
-            request_bodies=request_bodies,
-            raw_results=raw_results,
-            raw_values=raw_values,
-        )
-        if failure:
-            return failure
-        accepted_receipt_hash = _first_deep_text(
-            receipt_response, "read_receipt_hash", "receipt_hash"
-        ) or _text(protected_values.get("read_receipt_hash"))
-        accepted_receipt_event_id = _first_deep_text(
-            receipt_response,
-            "read_receipt_event_id",
-            "read_receipt_event_ref",
-            "event_id",
-        )
-        startup_values = {
-            **protected_values,
-            "read_receipt_hash": accepted_receipt_hash,
-            "receipt_hash": accepted_receipt_hash,
-            "read_receipt_event_id": accepted_receipt_event_id,
-        }
+            if failure:
+                return failure
+            accepted_receipt_hash = _first_deep_text(
+                receipt_response, "read_receipt_hash", "receipt_hash"
+            ) or _text(protected_values.get("read_receipt_hash"))
+            accepted_receipt_event_id = _first_deep_text(
+                receipt_response,
+                "read_receipt_event_id",
+                "read_receipt_event_ref",
+                "event_id",
+            )
+            startup_values = {
+                **protected_values,
+                "read_receipt_hash": accepted_receipt_hash,
+                "receipt_hash": accepted_receipt_hash,
+                "read_receipt_event_id": accepted_receipt_event_id,
+            }
 
         startup_action, startup_template, raw_values, failure = (
             _refresh_host_action_packet(
@@ -1779,7 +1824,12 @@ def _orchestrate_refreshing_host_startup(
             startup_template,
             allowed_fields=_STARTUP_TOOL_FIELDS,
             replacements=startup_values,
-            force_fields=_STARTUP_FORCE_FIELDS,
+            force_fields=(
+                _STARTUP_FORCE_FIELDS
+                - {"read_receipt_hash", "read_receipt_event_id"}
+                if post_receipt_pre_startup
+                else _STARTUP_FORCE_FIELDS
+            ),
             required_fields=_STARTUP_REQUIRED_FIELDS,
         )
         _validate_startup_owned_files(startup_body)
@@ -1811,29 +1861,38 @@ def _orchestrate_refreshing_host_startup(
         public_precursor = _json_round_trip(
             precursor_response, "host precursor response"
         )
-        public_receipt = _json_round_trip(
-            receipt_response, "read receipt response"
-        )
         public_startup = _json_round_trip(startup_response, "startup response")
+        public_receipt = (
+            {}
+            if post_receipt_pre_startup
+            else _json_round_trip(receipt_response, "read receipt response")
+        )
         for public in (public_precursor, public_receipt, public_startup):
             scrub_host_secret_values(public, raw_values=raw_values)
-        return {
-            "schema_version": RUNTIME_CONTEXT_HOST_ORCHESTRATION_SCHEMA_VERSION,
-            "ok": True,
-            "status": "started",
-            "sequence": [
+        sequence = [precursor_tool, "onboard_route_guide", startup_tool]
+        if not post_receipt_pre_startup:
+            sequence = [
                 precursor_tool,
                 "onboard_route_guide",
                 receipt_tool,
                 "onboard_route_guide",
                 startup_tool,
-            ],
+            ]
+        return {
+            "schema_version": RUNTIME_CONTEXT_HOST_ORCHESTRATION_SCHEMA_VERSION,
+            "ok": True,
+            "status": "started",
+            "sequence": sequence,
             "session_token_ref": joined_session_token_ref,
             "host_session_id": _text(values.get("host_session_id")),
             "host_startup_id": _text(values.get("host_startup_id")),
             "auth_precursor": public_precursor,
             "read_receipt": public_receipt,
             "startup": public_startup,
+            "read_receipt_replayed": False,
+            "post_receipt_pre_startup_recovery": (
+                post_receipt_pre_startup
+            ),
             "guide_refreshed_after_each_transition": True,
             "uninterrupted_same_invocation": True,
             **_HOST_PRIVACY_FLAGS,
@@ -2727,7 +2786,7 @@ def orchestrate_runtime_context_authenticated_graph_continuation(
             else _INITIAL_FORCE_FIELDS
         ),
         required_fields=(
-            ("project_id", "runtime_context_id", "task_id", "session_token_ref")
+            _HOST_REISSUE_REQUIRED_FIELDS
             if precursor_tool == "runtime_context_session_token_reissue"
             else _HOST_AUTH_REQUIRED_FIELDS
         ),

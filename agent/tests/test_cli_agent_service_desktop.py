@@ -1197,6 +1197,7 @@ def _server_recovery_selected_host_guide(mode):
         expected_tool = "runtime_context_session_token_reissue"
         submission_name = "session_token_reissue_submission"
         renewal_name = "reissue"
+        body["allocation_owner"] = "/root/live-host-worker"
     else:
         expected_tool = "runtime_context_session_token_rejoin"
         submission_name = "session_token_rejoin_submission"
@@ -1681,6 +1682,174 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
     assert raw_fence not in json.dumps(result, sort_keys=True)
     assert all(raw_session not in json.dumps(body) for _name, body in calls)
     assert all(raw_fence not in json.dumps(body) for _name, body in calls)
+
+
+def test_host_orchestration_post_receipt_reissue_continues_directly_to_startup(
+) -> None:
+    guide, expected_tool = _server_recovery_selected_host_guide(
+        "safe_ref_prestartup_reissue"
+    )
+    assert expected_tool == "runtime_context_session_token_reissue"
+    for eligibility in (
+        guide["session_token_rejoin_eligibility"],
+        guide["actionable_payloads"]["session_token_rejoin_eligibility"],
+    ):
+        eligibility["post_receipt_pre_startup_recovery"] = True
+    _unused_guide, _receipt_body, startup_body = (
+        _live_refreshing_host_startup_inputs()
+    )
+    startup_body["read_receipt_hash"] = "sha256:" + "c" * 64
+    startup_body["read_receipt_event_id"] = "24074"
+    raw_session = "raw-post-receipt-session"
+    raw_fence = "raw-post-receipt-fence"
+    calls = []
+
+    def call_tool(name, body):
+        calls.append((name, body))
+        if name == "runtime_context_session_token_reissue":
+            return {
+                "ok": True,
+                "worker_session_token_ref": "wstok-live-after",
+                "host_envelope": {
+                    "session_token_ref": "wstok-live-after",
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": raw_session,
+                        "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                    },
+                },
+            }
+        if name == "onboard_route_guide":
+            return {
+                "structuredContent": {
+                    "ok": True,
+                    "canonical_executable_action": {
+                        "mcp_tool": "parallel_branch_startup",
+                        "copy_safe_body": startup_body,
+                    },
+                }
+            }
+        assert name == "parallel_branch_startup"
+        assert body["session_token"] == raw_session
+        assert body["fence_token"] == raw_fence
+        assert body["read_receipt_hash"] == "sha256:" + "c" * 64
+        assert body["read_receipt_event_id"] == "24074"
+        return {"ok": True, "status": "startup_recorded"}
+
+    result = orchestrate_runtime_context_host_startup(
+        worker_guide=guide,
+        tool_caller=call_tool,
+        host_identity={
+            "worker_session_id": "live-host-session",
+            "host_startup_id": "live-host-startup",
+            "head_commit": "a" * 40,
+            "launch_text_hash": "sha256:" + "a" * 64,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["post_receipt_pre_startup_recovery"] is True
+    assert result["read_receipt_replayed"] is False
+    assert result["read_receipt"] == {}
+    assert [name for name, _body in calls] == [
+        "runtime_context_session_token_reissue",
+        "onboard_route_guide",
+        "parallel_branch_startup",
+    ]
+    assert calls[0][1]["allocation_owner"] == "/root/live-host-worker"
+    assert raw_session not in json.dumps(result, sort_keys=True)
+    assert raw_fence not in json.dumps(result, sort_keys=True)
+
+
+@pytest.mark.parametrize("invalid_owner", [None, "", "<allocation owner>"])
+def test_host_orchestration_rejects_invalid_reissue_allocation_owner_before_auth(
+    invalid_owner,
+) -> None:
+    guide, _expected_tool = _server_recovery_selected_host_guide(
+        "safe_ref_prestartup_reissue"
+    )
+    for eligibility in (
+        guide["session_token_rejoin_eligibility"],
+        guide["actionable_payloads"]["session_token_rejoin_eligibility"],
+    ):
+        eligibility["post_receipt_pre_startup_recovery"] = True
+    for packet in (
+        guide["actionable_payloads"]["session_token_reissue_submission"],
+        guide["actionable_payloads"]["session_renewal_hints"]["reissue"],
+    ):
+        if invalid_owner is None:
+            packet["copy_safe_body"].pop("allocation_owner")
+        else:
+            packet["copy_safe_body"]["allocation_owner"] = invalid_owner
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+            },
+        )
+
+    assert calls == []
+
+
+def test_host_orchestration_rejects_conflicting_reissue_allocation_owner_before_auth(
+) -> None:
+    guide, _expected_tool = _server_recovery_selected_host_guide(
+        "safe_ref_prestartup_reissue"
+    )
+    guide["actionable_payloads"]["session_renewal_hints"]["reissue"][
+        "copy_safe_body"
+    ]["allocation_owner"] = "/root/foreign-worker"
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+            },
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("flag", "mode"),
+    [(False, "safe_ref_prestartup_reissue"), (True, "active_context_auth_only")],
+)
+def test_host_orchestration_rejects_invalid_post_receipt_recovery_before_auth(
+    flag, mode
+) -> None:
+    guide, _expected_tool = _server_recovery_selected_host_guide(
+        "safe_ref_prestartup_reissue"
+    )
+    for eligibility in (
+        guide["session_token_rejoin_eligibility"],
+        guide["actionable_payloads"]["session_token_rejoin_eligibility"],
+    ):
+        eligibility["post_receipt_pre_startup_recovery"] = flag
+        eligibility["mode"] = mode
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+            },
+        )
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(
