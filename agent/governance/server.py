@@ -15750,6 +15750,218 @@ def _parallel_branch_allocate_require_dispatch_authority(
     return profile_requirements, retry_policy
 
 
+_PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS = (
+    "project_id",
+    "backlog_id",
+    "contract_execution_id",
+    "task_id",
+    "worker_id",
+    "worker_slot_id",
+    "workspace_root",
+    "target_project_root",
+    "worktree_root",
+    "worktree_path",
+    "branch_ref",
+    "base_commit",
+    "target_head_commit",
+    "merge_queue_id",
+    "route_identity",
+    "owned_files",
+    "target_files",
+    "acceptance_criteria",
+    "allocation_precheck",
+)
+
+
+def _parallel_branch_allocate_precheck_receipt_signing_key(
+    conn,
+    *,
+    project_id: str,
+    route_token_ref: str,
+) -> bytes:
+    """Derive a private receipt key from the active route-ref registry row."""
+
+    normalized_ref = str(route_token_ref or "").strip()
+    row = (
+        conn.execute(
+            """
+            SELECT token_digest, salt, status
+              FROM observer_route_token_refs
+             WHERE project_id = ? AND route_token_ref = ?
+             LIMIT 1
+            """,
+            (str(project_id or "").strip(), normalized_ref),
+        ).fetchone()
+        if normalized_ref
+        else None
+    )
+    token_digest = str(_row_get(row, "token_digest", "") or "").strip()
+    salt = str(_row_get(row, "salt", "") or "").strip()
+    status = str(_row_get(row, "status", "") or "").strip()
+    if row is None or not token_digest or not salt or status != "active":
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_receipt_route_authority_invalid",
+            "allocation precheck receipt requires the active server route-ref authority",
+            409,
+            {
+                "field": "route_token_ref",
+                "expected": "active_server_registered_precheck_route_ref",
+                "actual": "missing_inactive_or_incomplete",
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "public_safe": True,
+            },
+        )
+    return hashlib.sha256(f"{salt}:{token_digest}".encode("utf-8")).digest()
+
+
+def _parallel_branch_allocate_precheck_receipt_message(
+    body: Mapping[str, Any],
+) -> bytes:
+    """Canonicalize the exact submitted allocation body without its signature."""
+
+    receipt = (
+        dict(body.get("allocation_precheck") or {})
+        if isinstance(body.get("allocation_precheck"), Mapping)
+        else {}
+    )
+    receipt.pop("authority_hash", None)
+    canonical = {**dict(body), "allocation_precheck": receipt}
+    return json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+
+
+def _parallel_branch_allocate_precheck_receipt_authority_hash(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> str:
+    key = _parallel_branch_allocate_precheck_receipt_signing_key(
+        conn,
+        project_id=project_id,
+        route_token_ref=str(body.get("route_token_ref") or ""),
+    )
+    digest = hmac.new(
+        key,
+        _parallel_branch_allocate_precheck_receipt_message(body),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _parallel_branch_allocate_precheck_receipt_verification(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify a carried precheck receipt before any allocation-side mutation."""
+
+    if "allocation_precheck" not in body:
+        return {
+            "schema_version": "parallel_branch_allocate.precheck_verification.v1",
+            "status": "legacy_no_receipt",
+            "verified": False,
+            "accepted": True,
+            "legacy_compatibility": True,
+            "policy": "allow_legacy_request_without_precheck_receipt",
+            "writes_performed": False,
+        }
+    receipt = (
+        dict(body.get("allocation_precheck") or {})
+        if isinstance(body.get("allocation_precheck"), Mapping)
+        else {}
+    )
+    required_receipt = {
+        "schema_version": "parallel_branch_allocate_precheck.receipt.v2",
+        "status": "ready",
+        "submit_unchanged": True,
+        "zero_write": True,
+        "authority_source": "observer_route_token_refs.private_digest",
+        "bound_fields": list(
+            _PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS
+        ),
+    }
+    mismatches = [
+        {
+            "field": f"allocation_precheck.{field}",
+            "expected": expected,
+            "actual": receipt.get(field, "missing"),
+        }
+        for field, expected in required_receipt.items()
+        if receipt.get(field) != expected
+    ]
+    actual_hash = str(receipt.get("authority_hash") or "").strip()
+    if not actual_hash:
+        mismatches.append(
+            {
+                "field": "allocation_precheck.authority_hash",
+                "expected": "server_issued_receipt_authority_hash",
+                "actual": "missing",
+            }
+        )
+    expected_hash = ""
+    if not mismatches:
+        expected_hash = _parallel_branch_allocate_precheck_receipt_authority_hash(
+            conn,
+            project_id=project_id,
+            body=body,
+        )
+        if not hmac.compare_digest(expected_hash, actual_hash):
+            mismatches.append(
+                {
+                    "field": "allocation_precheck.authority_hash",
+                    "expected": "exact_current_precheck_body_authority",
+                    "actual": "body_or_receipt_drift",
+                }
+            )
+    if mismatches:
+        first = mismatches[0]
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_receipt_mismatch",
+            "allocation must submit the exact server-prechecked body unchanged",
+            409,
+            {
+                "field": first["field"],
+                "expected": first["expected"],
+                "actual": first["actual"],
+                "field_mismatches": mismatches,
+                "bound_fields": list(
+                    _PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS
+                ),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "retry_same_world_allowed": True,
+                "next_legal_action": (
+                    "rerun_parallel_branch_allocate_precheck_and_submit_"
+                    "copy_safe_body_unchanged"
+                ),
+                "public_safe": True,
+                "raw_paths_exposed": False,
+            },
+        )
+    return {
+        "schema_version": "parallel_branch_allocate.precheck_verification.v1",
+        "status": "verified",
+        "verified": True,
+        "accepted": True,
+        "legacy_compatibility": False,
+        "authority_source": "observer_route_token_refs.private_digest",
+        "bound_fields": list(
+            _PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS
+        ),
+        "writes_performed": False,
+    }
+
+
 def _parallel_branch_allocate_precheck_copy_safe_body(
     conn,
     *,
@@ -16600,7 +16812,7 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
         for body in copy_safe_bodies:
             body["acceptance_criteria"] = list(acceptance_scope_criteria or criteria)
             body["allocation_precheck"] = {
-                "schema_version": "parallel_branch_allocate_precheck.receipt.v1",
+                "schema_version": "parallel_branch_allocate_precheck.receipt.v2",
                 "status": "ready",
                 "submit_unchanged": True,
                 "zero_write": True,
@@ -16608,6 +16820,10 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                 "atomic": atomic,
                 "scope": allocation_scope,
                 "cardinality_source": cardinality_source,
+                "authority_source": "observer_route_token_refs.private_digest",
+                "bound_fields": list(
+                    _PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS
+                ),
             }
             retry_authority = retry_rebind_authorities.get(
                 str(body.get("task_id") or "").strip()
@@ -16623,6 +16839,13 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                         "requested_attempt"
                     ],
                 }
+            body["allocation_precheck"]["authority_hash"] = (
+                _parallel_branch_allocate_precheck_receipt_authority_hash(
+                    conn,
+                    project_id=project_id,
+                    body=body,
+                )
+            )
         copy_safe_bodies.sort(key=lambda body: str(body.get("task_id") or ""))
         lane_projections.sort(
             key=lambda lane: str(lane.get("task_id") or "")
@@ -19060,6 +19283,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     effective_body: dict[str, Any] = dict(ctx.body or {})
     batch_route_resolved = False
     batch_target_authority: dict[str, Any] = {}
+    allocation_precheck_verification: dict[str, Any] = {}
     allocation_ref_name = str(
         ctx.body.get("ref_name") or ctx.body.get("target_branch") or "main"
     )
@@ -19068,6 +19292,13 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             ctx,
             conn,
             "graph-governance.parallel-branches.allocate",
+        )
+        allocation_precheck_verification = (
+            _parallel_branch_allocate_precheck_receipt_verification(
+                conn,
+                project_id=project_id,
+                body=ctx.body or {},
+            )
         )
         rev8_allocation_record = (
             _parallel_branch_allocate_mf_parallel_rev8_record(
@@ -19917,6 +20148,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             "branch_strategy": worktree_result["branch_strategy"] if worktree_result else None,
             "commit_verification": commit_verification,
             "acceptance_scope_closure": acceptance_scope_closure,
+            "allocation_precheck_verification": allocation_precheck_verification,
         }
         if runtime_contract_revision:
             response["runtime_contract_revision"] = runtime_contract_revision

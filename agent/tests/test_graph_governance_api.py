@@ -23630,8 +23630,22 @@ def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_si
     receipt = response["copy_safe_allocation_bodies"][0][
         "allocation_precheck"
     ]
-    assert receipt == {
-        "schema_version": "parallel_branch_allocate_precheck.receipt.v1",
+    assert {
+        key: receipt[key]
+        for key in (
+            "schema_version",
+            "status",
+            "submit_unchanged",
+            "zero_write",
+            "expected_lane_count",
+            "atomic",
+            "scope",
+            "cardinality_source",
+            "authority_source",
+            "bound_fields",
+        )
+    } == {
+        "schema_version": "parallel_branch_allocate_precheck.receipt.v2",
         "status": "ready",
         "submit_unchanged": True,
         "zero_write": True,
@@ -23639,7 +23653,12 @@ def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_si
         "atomic": False,
         "scope": "standalone_contract",
         "cardinality_source": "observer_selected_standalone_cardinality",
+        "authority_source": "observer_route_token_refs.private_digest",
+        "bound_fields": list(
+            server._PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS
+        ),
     }
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", receipt["authority_hash"])
     assert response["zero_write_proof"]["writes_performed"] is False
     assert conn.total_changes == before_total_changes
     assert {
@@ -23648,6 +23667,46 @@ def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_si
     } == before
     assert not (repository_root / ".worktrees").exists()
     copy_safe_body = response["copy_safe_allocation_bodies"][0]
+    before_allocation_changes = conn.total_changes
+    drift_cases = {
+        "project_id": "foreign-project",
+        "task_id": "standalone-one-worker-drift",
+        "worker_id": "slot-standalone-one-drift",
+        "target_project_root": str(repository_root),
+        "worktree_path": str(repository_root),
+        "branch_ref": "refs/heads/codex/standalone-one-worker-drift",
+        "base_commit": "f" * 40,
+        "target_head_commit": "f" * 40,
+        "route_id": "route-drift",
+        "owned_files": ["README.md"],
+        "target_files": ["README.md"],
+        "allocation_precheck.expected_lane_count": 2,
+    }
+    for field, value in drift_cases.items():
+        drifted = copy.deepcopy(copy_safe_body)
+        if field.startswith("allocation_precheck."):
+            drifted["allocation_precheck"][field.split(".", 1)[1]] = value
+        else:
+            drifted[field] = value
+        with pytest.raises(GovernanceError) as rejected:
+            server.handle_graph_governance_parallel_branch_allocate(
+                _ctx(
+                    {"project_id": PID},
+                    method="POST",
+                    body=drifted,
+                )
+            )
+        assert rejected.value.code == (
+            "parallel_branch_allocate_precheck_receipt_mismatch"
+        )
+        assert rejected.value.details["zero_write_rejection"] is True
+        assert rejected.value.details["writes_performed"] is False
+        assert rejected.value.details["mutation_performed"] is False
+        assert rejected.value.details["raw_paths_exposed"] is False
+        assert str(repository_root) not in json.dumps(rejected.value.details)
+        assert conn.total_changes == before_allocation_changes
+        assert not (repository_root / ".worktrees").exists()
+
     status, allocated = server.handle_graph_governance_parallel_branch_allocate(
         _ctx(
             {"project_id": PID},
@@ -23661,7 +23720,27 @@ def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_si
     assert allocated["context"]["worktree_path"] == (
         copy_safe_body["worktree_path"]
     )
+    assert allocated["allocation_precheck_verification"]["status"] == "verified"
+    assert allocated["allocation_precheck_verification"]["verified"] is True
+    assert allocated["allocation_precheck_verification"][
+        "legacy_compatibility"
+    ] is False
     assert Path(allocated["context"]["worktree_path"]).exists()
+
+    legacy = server._parallel_branch_allocate_precheck_receipt_verification(
+        conn,
+        project_id=PID,
+        body={"task_id": "legacy-allocation-without-precheck-receipt"},
+    )
+    assert legacy == {
+        "schema_version": "parallel_branch_allocate.precheck_verification.v1",
+        "status": "legacy_no_receipt",
+        "verified": False,
+        "accepted": True,
+        "legacy_compatibility": True,
+        "policy": "allow_legacy_request_without_precheck_receipt",
+        "writes_performed": False,
+    }
 
 
 def _setup_parallel_retry_allocation_rebind_case(
@@ -24168,8 +24247,12 @@ def test_parallel_branch_allocate_retry_rejects_tampered_authority_before_write(
         )
 
     assert rejected.value.code == (
-        "parallel_branch_allocate_retry_authority_mismatch"
+        "parallel_branch_allocate_precheck_receipt_mismatch"
     )
+    assert rejected.value.details["field"] == (
+        "allocation_precheck.authority_hash"
+    )
+    assert rejected.value.details["actual"] == "body_or_receipt_drift"
     assert rejected.value.details["writes_performed"] is False
     assert rejected.value.details["mutation_performed"] is False
     assert conn.total_changes == before_changes
@@ -24254,10 +24337,25 @@ def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
     assert response["acceptance_scope_closure"][
         "per_child_contract_authoritative"
     ] is True
-    assert response["copy_safe_allocation_bodies"][0][
+    batch_receipt = response["copy_safe_allocation_bodies"][0][
         "allocation_precheck"
-    ] == {
-        "schema_version": "parallel_branch_allocate_precheck.receipt.v1",
+    ]
+    assert {
+        key: batch_receipt[key]
+        for key in (
+            "schema_version",
+            "status",
+            "submit_unchanged",
+            "zero_write",
+            "expected_lane_count",
+            "atomic",
+            "scope",
+            "cardinality_source",
+            "authority_source",
+            "bound_fields",
+        )
+    } == {
+        "schema_version": "parallel_branch_allocate_precheck.receipt.v2",
         "status": "ready",
         "submit_unchanged": True,
         "zero_write": True,
@@ -24265,7 +24363,14 @@ def test_parallel_branch_allocate_precheck_accepts_one_batch_child_lane(
         "atomic": False,
         "scope": "per_child_contract",
         "cardinality_source": "verified_batch_child_lineage",
+        "authority_source": "observer_route_token_refs.private_digest",
+        "bound_fields": list(
+            server._PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS
+        ),
     }
+    assert re.fullmatch(
+        r"sha256:[0-9a-f]{64}", batch_receipt["authority_hash"]
+    )
     copy_safe_body = response["copy_safe_allocation_bodies"][0]
     allocation_action = response["canonical_executable_actions"][0]
     assert allocation_action["mcp_tool"] == "parallel_branch_allocate"
