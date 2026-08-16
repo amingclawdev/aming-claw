@@ -115382,23 +115382,157 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
         if isinstance(guide.get("next_legal_action"), Mapping)
         else {}
     )
-    if str(selected.get("line_id") or "").strip() != "observer_reconcile":
-        return aggregate
     execution_id = str(record.get("contract_execution_id") or "").strip()
-    runtime_context_projection = (
-        _contract_runtime_authoritative_runtime_context_projection(
-            conn,
-            project_id=project_id,
-            record=record,
-        )
+    selected_line_pending = bool(
+        str(selected.get("line_id") or "").strip()
+        == "observer_reconcile"
     )
-    current_values = (
-        runtime_context_projection.get("current_values")
-        if isinstance(
-            runtime_context_projection.get("current_values"), Mapping
+    if selected_line_pending:
+        runtime_context_projection = (
+            _contract_runtime_authoritative_runtime_context_projection(
+                conn,
+                project_id=project_id,
+                record=record,
+            )
         )
-        else {}
-    )
+        current_values = (
+            runtime_context_projection.get("current_values")
+            if isinstance(
+                runtime_context_projection.get("current_values"), Mapping
+            )
+            else {}
+        )
+    else:
+        # After observer_reconcile is accepted, the current Guide advances to
+        # postmerge QA/close and no longer carries the selected reconcile-lane
+        # identity.  Recover it only from the one immutable, server-authored
+        # receipt whose hash and aggregate merge tuple still verify.  This is
+        # a read-only close projection; caller fields never participate.
+        receipt_candidates: list[dict[str, Any]] = []
+        for line_index, line in enumerate(
+            record.get("completed_lines") or []
+        ):
+            if not isinstance(line, Mapping) or str(
+                line.get("line_id") or ""
+            ).strip() != "observer_reconcile":
+                continue
+            payload = (
+                line.get("payload")
+                if isinstance(line.get("payload"), Mapping)
+                else {}
+            )
+            authority = (
+                payload.get("reconcile_authority")
+                if isinstance(
+                    payload.get("reconcile_authority"), Mapping
+                )
+                else {}
+            )
+            runtime_context_id = str(
+                authority.get("runtime_context_id") or ""
+            ).strip()
+            task_id = str(authority.get("task_id") or "").strip()
+            parent_task_id = str(
+                authority.get("parent_task_id") or ""
+            ).strip()
+            merge_queue_id = str(
+                authority.get("merge_queue_id") or ""
+            ).strip()
+            if not (
+                line_index > int(
+                    aggregate.get("dispatch_completed_line_index") or -1
+                )
+                and _contract_runtime_line_status_passes(line)
+                and str(line.get("actor_role") or "").strip()
+                == "observer"
+                and str(authority.get("schema_version") or "")
+                == (
+                    "contract_runtime."
+                    "observer_reconcile_record_authority.v1"
+                )
+                and str(authority.get("source") or "")
+                == "contract_runtime.server_reconcile_record_projection"
+                and authority.get("server_derived") is True
+                and authority.get("record_verified") is True
+                and authority.get("merge_projection_verified") is True
+                and authority.get("dispatch_lineage_verified") is True
+                and authority.get("all_lane_merges_verified") is True
+                and int(authority.get("lane_merge_count") or 0)
+                == int(aggregate.get("lane_merge_count") or 0)
+                and _contract_runtime_close_authority_hash_matches(
+                    authority
+                )
+                and str(authority.get("project_id") or "").strip()
+                == str(project_id or "").strip()
+                and str(authority.get("backlog_id") or "").strip()
+                == str(record.get("backlog_id") or "").strip()
+                and str(
+                    authority.get("contract_execution_id") or ""
+                ).strip()
+                == execution_id
+                and parent_task_id == execution_id
+                and runtime_context_id
+                in {
+                    str(value or "").strip()
+                    for value in aggregate.get(
+                        "lane_runtime_context_ids"
+                    )
+                    or []
+                }
+                and merge_queue_id
+                in {
+                    str(value or "").strip()
+                    for value in aggregate.get("lane_merge_queue_ids")
+                    or []
+                }
+                and task_id
+                and str(
+                    authority.get("merged_commit_sha") or ""
+                ).strip().lower()
+                == str(
+                    aggregate.get("merged_commit_sha") or ""
+                ).strip().lower()
+                and int(authority.get("merge_event_id") or 0)
+                == int(aggregate.get("merge_event_id") or 0)
+                and str(authority.get("merge_source_ref") or "").strip()
+                == str(aggregate.get("merge_source_ref") or "").strip()
+                and str(
+                    authority.get("merge_event_created_at") or ""
+                ).strip()
+                == str(
+                    aggregate.get("merge_event_created_at") or ""
+                ).strip()
+                and authority.get("reconcile_event_recorded") is True
+                and int(authority.get("reconcile_event_id") or 0)
+                > int(authority.get("merge_event_id") or 0)
+                and str(
+                    authority.get("reconcile_source_ref") or ""
+                ).strip()
+                == f"timeline:{int(authority.get('reconcile_event_id') or 0)}"
+                and str(
+                    authority.get("reconcile_event_created_at") or ""
+                ).strip()
+                and str(
+                    authority.get("reconcile_runtime_context_id") or ""
+                ).strip()
+                == runtime_context_id
+                and str(
+                    authority.get("reconcile_task_id") or ""
+                ).strip()
+                == task_id
+            ):
+                continue
+            receipt_candidates.append(
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": parent_task_id,
+                    "merge_queue_id": merge_queue_id,
+                }
+            )
+        if len(receipt_candidates) != 1:
+            return aggregate
+        current_values = receipt_candidates[0]
     runtime_context_id = str(
         current_values.get("runtime_context_id") or ""
     ).strip()
@@ -144707,7 +144841,12 @@ def _contract_runtime_close_grade_merge_projection(
             project_id=project_id,
         )
         if merge.get("timeline_verified") is True:
-            return merge
+            return _contract_runtime_rev8_selected_reconcile_lane_projection(
+                conn,
+                project_id=project_id,
+                record=record,
+                aggregate_merge=merge,
+            )
     return _contract_runtime_trusted_merge_projection(
         conn,
         project_id=project_id,
