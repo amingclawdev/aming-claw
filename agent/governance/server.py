@@ -67953,8 +67953,8 @@ def _parallel_branch_merge_repo_root_authority(
     """Resolve merge git operations from durable runtime identity, never cwd."""
 
     from .parallel_branch_runtime import (
+        _list_merge_queue_items_with_target_fallback,
         get_branch_context,
-        list_merge_queue_items,
         select_merge_queue_item,
     )
 
@@ -67963,18 +67963,14 @@ def _parallel_branch_merge_repo_root_authority(
     ).strip()
     selected_task_id = str(task_id or "").strip()
     if merge_queue_id:
-        items = list_merge_queue_items(
+        items = _list_merge_queue_items_with_target_fallback(
             conn,
             project_id,
             merge_queue_id,
             target_ref=target_ref,
+            queue_item_id=str(queue_item_id or "").strip(),
+            task_id=selected_task_id,
         )
-        if not items and target_ref:
-            items = list_merge_queue_items(
-                conn,
-                project_id,
-                merge_queue_id,
-            )
         item = select_merge_queue_item(
             items,
             queue_item_id=str(queue_item_id or "").strip(),

@@ -488,6 +488,108 @@ def _runtime_conn() -> sqlite3.Connection:
     return conn
 
 
+def test_merge_queue_target_fallback_uses_requested_durable_selector() -> None:
+    conn = _runtime_conn()
+    queue_id = "mq-target-alias-selector"
+    items = [
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=queue_id,
+            queue_item_id="mqitem-main-spelling",
+            task_id="task-main-spelling",
+            branch_ref="refs/heads/codex/task-main-spelling",
+            queue_index=1,
+            status=STATE_MERGE_READY,
+            target_ref="main",
+        ),
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=queue_id,
+            queue_item_id="mqitem-full-ref-spelling",
+            task_id="task-full-ref-spelling",
+            branch_ref="refs/heads/codex/task-full-ref-spelling",
+            queue_index=2,
+            status=STATE_MERGE_READY,
+            target_ref="refs/heads/main",
+        ),
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=queue_id,
+            queue_item_id="mqitem-release",
+            task_id="task-release",
+            branch_ref="refs/heads/codex/task-release",
+            queue_index=3,
+            status=STATE_MERGE_READY,
+            target_ref="refs/heads/release",
+        ),
+    ]
+    for item in items:
+        upsert_merge_queue_item(conn, item, now_iso=NOW)
+
+    exact_slice = parallel_branch_runtime._list_merge_queue_items_with_target_fallback(
+        conn,
+        PROJECT_ID,
+        queue_id,
+        target_ref="main",
+    )
+    assert [item.queue_item_id for item in exact_slice] == [
+        "mqitem-main-spelling"
+    ]
+
+    selector_fallback = (
+        parallel_branch_runtime._list_merge_queue_items_with_target_fallback(
+            conn,
+            PROJECT_ID,
+            queue_id,
+            target_ref="main",
+            queue_item_id="mqitem-full-ref-spelling",
+        )
+    )
+    assert [item.queue_item_id for item in selector_fallback] == [
+        "mqitem-main-spelling",
+        "mqitem-full-ref-spelling",
+        "mqitem-release",
+    ]
+    assert (
+        parallel_branch_runtime.select_merge_queue_item(
+            selector_fallback,
+            queue_item_id="mqitem-full-ref-spelling",
+        ).task_id
+        == "task-full-ref-spelling"
+    )
+    gate = parallel_branch_runtime.decide_persisted_merge_gate(
+        conn,
+        PROJECT_ID,
+        queue_id,
+        target_ref="main",
+        queue_item_id="mqitem-full-ref-spelling",
+    )
+    assert gate.queue_item_id == "mqitem-full-ref-spelling"
+    assert gate.task_id == "task-full-ref-spelling"
+
+    missing_selector = (
+        parallel_branch_runtime._list_merge_queue_items_with_target_fallback(
+            conn,
+            PROJECT_ID,
+            queue_id,
+            target_ref="main",
+            queue_item_id="mqitem-missing",
+        )
+    )
+    with pytest.raises(
+        parallel_branch_runtime.MergeQueueItemNotFoundError
+    ) as not_found:
+        parallel_branch_runtime.select_merge_queue_item(
+            missing_selector,
+            queue_item_id="mqitem-missing",
+        )
+    assert not_found.value.details["visible_queue_item_ids"] == [
+        "mqitem-main-spelling",
+        "mqitem-full-ref-spelling",
+        "mqitem-release",
+    ]
+
+
 def _canonical_test_hash(value: object) -> str:
     body = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()

@@ -137166,6 +137166,90 @@ def test_parallel_merge_repo_root_comes_from_runtime_context(conn, tmp_path):
         )
 
 
+def test_parallel_merge_repo_root_falls_back_for_selected_target_ref_alias(
+    conn,
+    tmp_path,
+):
+    merge_queue_id = "mq-merge-root-target-alias"
+    decoy_root = tmp_path / "decoy-target"
+    selected_root = tmp_path / "selected-target"
+    decoy_root.mkdir()
+    selected_root.mkdir()
+    contexts = [
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="merge-root-main-spelling",
+            branch_ref="refs/heads/codex/merge-root-main-spelling",
+            status=STATE_VALIDATED,
+            runtime_context_id="mfrctx-merge-root-main-spelling",
+            target_project_root=str(decoy_root),
+            merge_queue_id=merge_queue_id,
+        ),
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="merge-root-full-ref-spelling",
+            branch_ref="refs/heads/codex/merge-root-full-ref-spelling",
+            status=STATE_VALIDATED,
+            runtime_context_id="mfrctx-merge-root-full-ref-spelling",
+            target_project_root=str(selected_root),
+            merge_queue_id=merge_queue_id,
+        ),
+    ]
+    for context in contexts:
+        upsert_branch_context(conn, context)
+    for item in [
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=merge_queue_id,
+            queue_item_id="mqitem-main-spelling",
+            task_id=contexts[0].task_id,
+            branch_ref=contexts[0].branch_ref,
+            queue_index=1,
+            status="validated",
+            target_ref="main",
+        ),
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=merge_queue_id,
+            queue_item_id="mqitem-full-ref-spelling",
+            task_id=contexts[1].task_id,
+            branch_ref=contexts[1].branch_ref,
+            queue_index=2,
+            status="validated",
+            target_ref="refs/heads/main",
+        ),
+    ]:
+        upsert_merge_queue_item(conn, item)
+
+    root, source = server._parallel_branch_merge_repo_root_authority(
+        conn,
+        project_id=PID,
+        body={},
+        merge_queue_id=merge_queue_id,
+        queue_item_id="mqitem-full-ref-spelling",
+        task_id=contexts[1].task_id,
+        target_ref="main",
+    )
+
+    assert root == str(selected_root.resolve())
+    assert source == "runtime_context.target_project_root"
+    with pytest.raises(
+        parallel_branch_runtime.MergeQueueItemNotFoundError
+    ) as missing:
+        server._parallel_branch_merge_repo_root_authority(
+            conn,
+            project_id=PID,
+            body={},
+            merge_queue_id=merge_queue_id,
+            queue_item_id="mqitem-missing",
+            target_ref="main",
+        )
+    assert missing.value.details["visible_queue_item_ids"] == [
+        "mqitem-main-spelling",
+        "mqitem-full-ref-spelling",
+    ]
+
+
 def test_contract_runtime_cli_views_are_compact_and_role_actionable():
     reader_hash = "sha256:" + "1" * 64
     writer_hash = "sha256:" + "2" * 64

@@ -13323,14 +13323,32 @@ def _list_merge_queue_items_with_target_fallback(
     merge_queue_id: str,
     *,
     target_ref: str = "",
+    queue_item_id: str = "",
+    task_id: str = "",
 ) -> list[MergeQueueItem]:
+    """List the target slice, falling back when it hides the requested item.
+
+    Durable queue rows created through older or differently normalized callers
+    may spell the same branch as ``main`` or ``refs/heads/main``.  A non-empty
+    exact slice is not sufficient when it does not contain the caller's exact
+    queue/task selector; in that case selection and its not-found diagnostics
+    must use the complete durable queue.
+    """
+
     items = list_merge_queue_items(
         conn,
         project_id,
         merge_queue_id,
         target_ref=target_ref,
     )
-    if not items and str(target_ref or "").strip():
+    item_id = str(queue_item_id or "").strip()
+    task = str(task_id or "").strip()
+    selector_missing = bool(item_id or task) and not any(
+        (item_id and item.queue_item_id == item_id)
+        or (task and item.task_id == task)
+        for item in items
+    )
+    if str(target_ref or "").strip() and (not items or selector_missing):
         items = list_merge_queue_items(
             conn,
             project_id,
@@ -13922,6 +13940,8 @@ def decide_persisted_merge_gate(
                 project_id,
                 merge_queue_id,
                 target_ref=target_ref,
+                queue_item_id=queue_item_id,
+                task_id=task_id,
             ),
             target_ref=target_ref,
         ),
@@ -13970,6 +13990,8 @@ def record_merge_queue_result(
             project_id,
             merge_queue_id,
             target_ref=target_ref,
+            queue_item_id=queue_item_id,
+            task_id=task_id,
         ),
         target_ref=target_ref,
     )
@@ -14371,6 +14393,8 @@ def preflight_merge_queue_result_record_authority(
             project_id,
             merge_queue_id,
             target_ref=target_ref,
+            queue_item_id=queue_item_id,
+            task_id=task_id,
         ),
         target_ref=target_ref,
     )
@@ -24320,6 +24344,8 @@ def execute_merge_queue_item(
             project_id,
             merge_queue_id,
             target_ref=target_ref,
+            queue_item_id=queue_item_id,
+            task_id=task_id,
         ),
         target_ref=target_ref,
     )
