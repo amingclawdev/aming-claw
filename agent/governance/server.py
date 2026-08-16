@@ -124106,6 +124106,115 @@ def _onboard_route_guide_completed_mf_batch_action_input(
     }
 
 
+def _onboard_route_guide_completed_contract_update_action(
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+    route_scope_ready: bool,
+    target_files: Sequence[str],
+) -> dict[str, Any]:
+    """Project the exact service-root successor and its bounded route grant."""
+
+    parent_execution_id = _onboard_service_execution_id(project_id, backlog_id)
+    scoped_target_files = _runtime_context_public_file_values(target_files)
+    scoped_route_grant = {
+        "schema_version": (
+            "onboard_route_guide.contract_update_route_grant.v1"
+        ),
+        "required": not route_scope_ready,
+        "mcp_tool": "observer_route_context_issue",
+        "copy_safe_body": {
+            "project_id": project_id,
+            "caller_role": "observer",
+            "backlog_id": backlog_id,
+            "task_id": parent_execution_id,
+            "target_files": scoped_target_files,
+            "allowed_actions": ["contract_update_start"],
+            "evidence_refs": [
+                f"onboard_service:{parent_execution_id}",
+                f"backlog:{backlog_id}",
+            ],
+        },
+        "bind_response_field": "route_token_ref",
+        "replacement_path": "copy_safe_body.observer_route_token_ref",
+        "exact_action_grant": "contract_update_start",
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+    action_route_token_ref = (
+        str(route_token_ref or "").strip()
+        if route_scope_ready
+        else "<copy scoped_route_grant response.route_token_ref>"
+    )
+    action_input = {
+        "schema_version": (
+            "onboard_route_guide.contract_update_start_input.v1"
+        ),
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "observer_route_token_ref": action_route_token_ref,
+    }
+    return {
+        "schema_version": "onboard_route_guide.next_action.v1",
+        "id": "contract_update_start",
+        "action": "contract_update_start",
+        "interface": "contract_update_start",
+        "mcp_tool": "contract_update_start",
+        "method": "POST",
+        "path": "/api/projects/{project_id}/contract-update/start",
+        "requires_role": "observer",
+        "owner_role": "observer",
+        "requires_route_token_ref": True,
+        "requires_active_observer_session": True,
+        "action_input": action_input,
+        "copy_safe_body": action_input,
+        "action_input_copy_safe": True,
+        "action_input_ready": route_scope_ready,
+        "action_input_missing_fields": (
+            [] if route_scope_ready else ["scoped_route_token_ref"]
+        ),
+        "observer_route_context_issue": scoped_route_grant,
+        "scoped_route_grant": scoped_route_grant,
+        "host_realization": {
+            "required_replacement_paths": (
+                []
+                if route_scope_ready
+                else ["copy_safe_body.observer_route_token_ref"]
+            ),
+            "replacement_source": (
+                "observer_route_context_issue.route_token_ref"
+            ),
+            "refresh_after_route_issue": True,
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
+        "source": "onboard_route_guide_service",
+        "source_of_authority": (
+            "canonical_completed_onboard_service_root"
+        ),
+        "precedence": "contract_complete_projection",
+        "action_scope": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": parent_execution_id,
+            "root_contract_execution_id": parent_execution_id,
+        },
+        "server_derived_authority": {
+            "parent_contract_execution_id": parent_execution_id,
+            "parent_remains_complete": True,
+            "successor_contract_id": CONTRACT_UPDATE_CONTRACT_ID,
+            "legacy_onboard_contract_waived": True,
+            "caller_claims_accepted": False,
+        },
+        "next_step": (
+            "issue the exact scoped route grant when required, bind its "
+            "route_token_ref into this unchanged copy-safe body, then call "
+            "contract_update_start; do not reopen the completed service parent"
+        ),
+    }
+
+
 def _onboard_route_guide_completed_next_action(
     *,
     role: str = "",
@@ -124117,6 +124226,7 @@ def _onboard_route_guide_completed_next_action(
     route_token_ref: str = "",
     target_files: Sequence[str] = (),
     request_body: Mapping[str, Any] | None = None,
+    onboard_service_continuation_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
@@ -124161,6 +124271,28 @@ def _onboard_route_guide_completed_next_action(
             "next_step": (
                 "backlog row is terminal and contract runtime is complete; do not "
                 "issue a successor-enter route or current runtime write requirement."
+            ),
+        }
+    continuation_authority = (
+        onboard_service_continuation_authority
+        if isinstance(onboard_service_continuation_authority, Mapping)
+        else {}
+    )
+    if (
+        selected_role == "observer"
+        and selected_work_type == "continue_contract_chain"
+        and continuation_authority.get("ready") is True
+    ):
+        return {
+            **base,
+            **_onboard_route_guide_completed_contract_update_action(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                route_token_ref=route_token_ref,
+                route_scope_ready=(
+                    continuation_authority.get("route_scope_ready") is True
+                ),
+                target_files=target_files,
             ),
         }
     if selected_work_type == "operator_supervised_direct_main":
@@ -129769,6 +129901,21 @@ def _onboard_route_guide_service_response(
             **dict(current_projection),
             "failure_domain_disposition": failure_domain_disposition,
         }
+    onboard_service_continuation_authority = {}
+    if (
+        str(role or "").strip() == "observer"
+        and str(work_type or "").strip() == "continue_contract_chain"
+    ):
+        onboard_service_continuation_authority = (
+            _onboard_service_contract_update_continuation_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                current_projection=current_projection,
+                route_token_ref=route_token_ref,
+                target_files=target_files,
+            )
+        )
     next_action = _onboard_route_guide_service_next_action(
         role=role,
         work_type=work_type,
@@ -129786,6 +129933,9 @@ def _onboard_route_guide_service_response(
                 route_token_ref=route_token_ref,
                 target_files=target_files,
                 request_body=batch_action_request_body,
+                onboard_service_continuation_authority=(
+                    onboard_service_continuation_authority
+                ),
             )
         elif runtime_resume.get("scheduler_eligible") is False:
             next_action = {}
@@ -129802,6 +129952,9 @@ def _onboard_route_guide_service_response(
                 route_token_ref=route_token_ref,
                 target_files=target_files,
                 request_body=batch_action_request_body,
+                onboard_service_continuation_authority=(
+                    onboard_service_continuation_authority
+                ),
             )
     managed_hotfix_attempt = (
         _onboard_legacy_operator_hotfix_attempt_projection(
@@ -133903,6 +134056,120 @@ def _onboard_service_parent_for_successor(
             parent_contract_execution_id=parent_contract_execution_id,
         )
     return record
+
+
+def _onboard_service_contract_update_continuation_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    current_projection: Mapping[str, Any],
+    route_token_ref: str,
+    target_files: Sequence[str],
+) -> dict[str, Any]:
+    """Prove the one synthetic completed root eligible for contract_update."""
+
+    expected_execution_id = _onboard_service_execution_id(project_id, backlog_id)
+    expected_chain_id = _onboard_service_chain_id(project_id, backlog_id)
+    projection = (
+        current_projection
+        if isinstance(current_projection, Mapping)
+        else {}
+    )
+    projection_identity_ready = bool(
+        str(projection.get("projection_source") or "")
+        == "backlog_contract_chain_current"
+        and str(projection.get("project_id") or "") == project_id
+        and str(projection.get("backlog_id") or "") == backlog_id
+        and str(projection.get("contract_chain_id") or "")
+        == expected_chain_id
+        and str(projection.get("root_contract_execution_id") or "")
+        == expected_execution_id
+        and str(projection.get("current_contract_execution_id") or "")
+        == expected_execution_id
+        and str(projection.get("current_contract_id") or "")
+        == ONBOARD_ROUTE_GUIDE_SERVICE_ID
+        and not str(
+            projection.get("active_child_contract_execution_id") or ""
+        ).strip()
+        and str(projection.get("readiness_state") or "")
+        == "contract_complete"
+        and not (
+            projection.get("next_legal_action")
+            if isinstance(projection.get("next_legal_action"), Mapping)
+            else {}
+        )
+    )
+    if not projection_identity_ready:
+        return {}
+    try:
+        parent = _onboard_service_parent_for_successor(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            parent_contract_execution_id=expected_execution_id,
+            require_complete=True,
+        )
+    except (ContractRuntimeError, ValidationError):
+        return {}
+    canonical_waiver = _onboard_service_waiver_line()
+    completed_lines = parent.get("completed_lines")
+    if not (
+        isinstance(completed_lines, list)
+        and completed_lines == [canonical_waiver]
+    ):
+        return {}
+
+    from . import observer_route_context
+
+    resolved_route: Mapping[str, Any] = {}
+    normalized_route_token_ref = str(route_token_ref or "").strip()
+    if normalized_route_token_ref:
+        try:
+            resolved_route = observer_route_context.resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=normalized_route_token_ref,
+                backlog_id=backlog_id,
+                task_id=expected_execution_id,
+            ) or {}
+        except observer_route_context.RouteTokenRefError:
+            resolved_route = {}
+    expected_files = _runtime_context_public_file_values(target_files)
+    actual_target_files = _runtime_context_public_file_values(
+        resolved_route.get("target_files") or []
+    )
+    actual_owned_files = _runtime_context_public_file_values(
+        resolved_route.get("owned_files") or []
+    )
+    actual_actions = [
+        str(item or "").strip()
+        for item in resolved_route.get("allowed_actions") or []
+        if str(item or "").strip()
+    ]
+    route_scope_ready = bool(
+        resolved_route
+        and str(resolved_route.get("caller_role") or "").strip()
+        == "observer"
+        and actual_actions == ["contract_update_start"]
+        and sorted(actual_target_files) == sorted(expected_files)
+        and sorted(actual_owned_files) == sorted(expected_files)
+    )
+    return {
+        "schema_version": (
+            "onboard_route_guide.contract_update_continuation_authority.v1"
+        ),
+        "ready": True,
+        "source": (
+            "ContractRuntime+backlog_contract_chain_current+"
+            "observer_route_token_refs"
+        ),
+        "parent_contract_execution_id": expected_execution_id,
+        "parent_remains_complete": True,
+        "canonical_waiver_verified": True,
+        "route_scope_ready": route_scope_ready,
+        "caller_claims_accepted": False,
+    }
 
 
 def _observer_hotfix_onboard_service_parent_for_successor(
