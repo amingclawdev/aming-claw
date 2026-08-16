@@ -1,6 +1,7 @@
 import type { DemoEnvironment, DemoEnvironmentsResponse } from "../lib/api";
 import {
   DAILY_PLANNER_TEMPLATE_ID,
+  DEMO_EXECUTION_TOPOLOGY,
   dailyPlannerTemplateFrom,
   demoEnvironmentLinks,
   demoEnvironmentStatus,
@@ -142,6 +143,15 @@ export function assertDemoLaunchFixtureCoverage(): string[] {
   if (!created.launch_prompt.includes("Focus/UI lane")) throw new Error("launch prompt must name the Focus/UI lane");
   if (!created.launch_prompt.includes("Reminder/domain lane")) throw new Error("launch prompt must name the Reminder/domain lane");
   if (prompts.length !== 3) throw new Error("daily planner demo should surface three launch prompts");
+  if (DEMO_EXECUTION_TOPOLOGY.environmentCount !== 3) throw new Error("three-lane demo must require three independent environments");
+  if (DEMO_EXECUTION_TOPOLOGY.order.join("|") !== "Direct Main|MF Parallel|MF Batch Parallel") throw new Error("three-lane demo must run in strict Contract order");
+  if (!DEMO_EXECUTION_TOPOLOGY.environmentRule.includes("exactly one lane")) throw new Error("each environment must be exclusive to one lane");
+  if (!DEMO_EXECUTION_TOPOLOGY.ownerRuntimeRule.includes("same exact Owner runtime RC")) throw new Error("all environments must pin the same exact Owner runtime RC");
+  if (!DEMO_EXECUTION_TOPOLOGY.sequenceRule.includes("Close each lane before starting the next")) throw new Error("lanes must run strictly sequentially");
+  if (!DEMO_EXECUTION_TOPOLOGY.authorityRule.includes("server-provided")) throw new Error("the UI must not duplicate backend prompt authority");
+  for (const forbidden of ["force_admit", "merge_into", "title camouflage", "bypass/no-PASS warranty", "direct_fix recovery"]) {
+    if (!DEMO_EXECUTION_TOPOLOGY.forbiddenRule.includes(forbidden)) throw new Error(`topology must forbid ${forbidden}`);
+  }
   if (prompts.map((prompt) => prompt.label).join("|") !== "Direct Main|MF Parallel|MF Batch Parallel") throw new Error("three launch prompts must use the canonical panel order");
   if (!prompts.some((prompt) => prompt.id === "direct_main" && prompt.prompt.includes("operator_supervised_direct_main"))) throw new Error("direct_main prompt must be available");
   if (!prompts.some((prompt) => prompt.id === "mf_parallel" && prompt.prompt.includes("mf_parallel"))) throw new Error("mf_parallel prompt must be available");
