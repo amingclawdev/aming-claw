@@ -18241,16 +18241,84 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
     if not all((source_task_id, fresh_task_id, fresh_worker_id, fresh_worker_slot_id)):
         return {}
 
-    if conn.execute(
-        """
-        SELECT 1
-        FROM parallel_branch_runtime_contexts
-        WHERE project_id = ? AND task_id = ?
-        LIMIT 1
-        """,
-        (project_id, fresh_task_id),
-    ).fetchone() is not None:
-        return {}
+    existing_fresh_context = get_branch_context(
+        conn,
+        project_id,
+        fresh_task_id,
+    )
+    existing_context_recovery = False
+    if existing_fresh_context is not None:
+        existing_runtime_context_id, existing_task_id, existing_parent_task_id = (
+            _contract_runtime_context_identity(existing_fresh_context)
+        )
+        requested_target_root = _runtime_context_public_text(
+            body.get("target_project_root"),
+            body.get("workspace_root"),
+        )
+        existing_target_root = _runtime_context_effective_target_project_root(
+            existing_fresh_context
+        )
+        requested_files = sorted(
+            set(
+                _runtime_context_service_query_values(
+                    body,
+                    "owned_files",
+                    "target_files",
+                )
+            )
+        )
+        existing_files = sorted(
+            set(
+                getattr(existing_fresh_context, "owned_files", ())
+                or getattr(existing_fresh_context, "target_files", ())
+                or ()
+            )
+        )
+        existing_context_recovery = bool(
+            existing_runtime_context_id
+            and existing_task_id == fresh_task_id
+            and existing_parent_task_id == contract_execution_id
+            and str(
+                getattr(existing_fresh_context, "backlog_id", "") or ""
+            ).strip()
+            == str(verified_batch_child.get("child_backlog_id") or "").strip()
+            and str(
+                getattr(existing_fresh_context, "batch_id", "") or ""
+            ).strip()
+            == str(verified_batch_child.get("batch_id") or "").strip()
+            and str(
+                getattr(existing_fresh_context, "merge_queue_id", "") or ""
+            ).strip()
+            == str(verified_batch_child.get("merge_queue_id") or "").strip()
+            and str(
+                getattr(existing_fresh_context, "stage_type", "") or ""
+            ).strip()
+            == "failed_qa_rework"
+            and int(getattr(existing_fresh_context, "attempt", 0) or 0) >= 2
+            and str(
+                getattr(existing_fresh_context, "worker_id", "")
+                or getattr(existing_fresh_context, "worker_slot_id", "")
+                or ""
+            ).strip()
+            == fresh_worker_id
+            and str(
+                getattr(existing_fresh_context, "worker_slot_id", "")
+                or getattr(existing_fresh_context, "worker_id", "")
+                or ""
+            ).strip()
+            == fresh_worker_slot_id
+            and (
+                not requested_target_root
+                or requested_target_root == existing_target_root
+            )
+            and (not requested_files or requested_files == existing_files)
+            and not _contract_runtime_dispatch_line_match(
+                record,
+                existing_fresh_context,
+            )
+        )
+        if not existing_context_recovery:
+            return {}
 
     source_worker_ids = {
         str(value or "").strip()
@@ -18290,8 +18358,8 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
     }
     family_rows = conn.execute(
         """
-        SELECT agent_id, worker_id, allocation_owner, worker_slot_id,
-               actual_host_worker_id
+        SELECT task_id, runtime_context_id, agent_id, worker_id,
+               allocation_owner, worker_slot_id, actual_host_worker_id
         FROM parallel_branch_runtime_contexts
         WHERE project_id = ? AND backlog_id = ? AND parent_task_id = ?
           AND batch_id = ? AND merge_queue_id = ?
@@ -18305,7 +18373,23 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
         ),
     ).fetchall()
     if any(
-        requested_worker_identities
+        not (
+            existing_context_recovery
+            and str(_row_get(row, "task_id", "") or "").strip()
+            == fresh_task_id
+            and str(
+                _row_get(row, "runtime_context_id", "") or ""
+            ).strip()
+            == str(
+                getattr(
+                    existing_fresh_context,
+                    "runtime_context_id",
+                    "",
+                )
+                or ""
+            ).strip()
+        )
+        and requested_worker_identities
         & {
             str(_row_get(row, field, "") or "").strip()
             for field in (
@@ -18365,6 +18449,9 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
             "source_queue_item_status": "merged",
             "source_queue_item_remains_terminal": True,
             "fresh_runtime_context_required": True,
+            "existing_unbound_runtime_context_recovery": (
+                existing_context_recovery
+            ),
             "minimum_attempt": 2,
             "normal_terminal_queue_allocation_unchanged": True,
             **(
@@ -18605,6 +18692,7 @@ def _parallel_branch_allocate_failed_qa_dispatch_revision(
     project_id: str,
     context,
     body: Mapping[str, Any],
+    failed_qa_rework_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Append fresh failed-QA dispatch authority during production allocate."""
 
@@ -18644,7 +18732,375 @@ def _parallel_branch_allocate_failed_qa_dispatch_revision(
         source_record=record,
     )
     if failed_qa_index < 0:
-        return {}
+        allocation_authority = (
+            dict(failed_qa_rework_authority)
+            if isinstance(failed_qa_rework_authority, Mapping)
+            else {}
+        )
+        timeline_authority = (
+            dict(
+                allocation_authority.get(
+                    "postmerge_failed_qa_boundary_authority"
+                )
+            )
+            if isinstance(
+                allocation_authority.get(
+                    "postmerge_failed_qa_boundary_authority"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        source_task_id = str(
+            allocation_authority.get("source_task_id") or ""
+        ).strip()
+        runtime_context_id = str(
+            getattr(context, "runtime_context_id", "") or ""
+        ).strip()
+        task_id = str(getattr(context, "task_id", "") or "").strip()
+        worker_id = str(
+            getattr(context, "worker_id", "")
+            or getattr(context, "worker_slot_id", "")
+            or ""
+        ).strip()
+        worker_slot_id = str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip()
+        if not (
+            allocation_authority.get("server_derived") is True
+            and allocation_authority.get("db_verified") is True
+            and str(allocation_authority.get("schema_version") or "").strip()
+            == (
+                "parallel_branch_allocate."
+                "merged_batch_failed_qa_rework_authority.v1"
+            )
+            and str(
+                allocation_authority.get("contract_execution_id") or ""
+            ).strip()
+            == contract_execution_id
+            and str(
+                allocation_authority.get("failed_qa_boundary_source") or ""
+            ).strip()
+            == "authenticated_postmerge_timeline"
+            and str(allocation_authority.get("fresh_task_id") or "").strip()
+            == task_id
+            and str(
+                allocation_authority.get("fresh_worker_id") or ""
+            ).strip()
+            == worker_id
+            and str(
+                allocation_authority.get("fresh_worker_slot_id") or ""
+            ).strip()
+            == worker_slot_id
+            and source_task_id
+            and timeline_authority
+        ):
+            raise GovernanceError(
+                "parallel_branch_allocate_failed_qa_timeline_authority_invalid",
+                (
+                    "timeline-backed failed-QA allocation requires the exact "
+                    "server-derived rework authority"
+                ),
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "writes_performed": False,
+                    "allocation_transaction_rolled_back": True,
+                },
+            )
+
+        from . import task_timeline
+        from .parallel_branch_runtime import get_branch_context
+
+        source_context = get_branch_context(conn, project_id, source_task_id)
+        source_runtime_context_id = str(
+            getattr(source_context, "runtime_context_id", "") or ""
+        ).strip()
+        if (
+            source_context is None
+            or source_runtime_context_id
+            != str(
+                allocation_authority.get("source_runtime_context_id") or ""
+            ).strip()
+        ):
+            raise GovernanceError(
+                "parallel_branch_allocate_failed_qa_source_context_changed",
+                (
+                    "timeline-backed failed-QA source RuntimeContext changed "
+                    "before dispatch revision"
+                ),
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "source_task_id": source_task_id,
+                    "writes_performed": False,
+                    "allocation_transaction_rolled_back": True,
+                },
+            )
+        timeline_events = task_timeline.list_events(
+            conn,
+            project_id,
+            backlog_id=str(record.get("backlog_id") or "").strip(),
+            limit=1000,
+        )
+        current_timeline_authority = (
+            _runtime_context_authenticated_failed_qa_timeline_boundary(
+                conn=conn,
+                context=source_context,
+                runtime_context_id=source_runtime_context_id,
+                timeline_events=timeline_events,
+            )
+        )
+        if (
+            not current_timeline_authority
+            or current_timeline_authority != timeline_authority
+            or str(current_timeline_authority.get("source_ref") or "").strip()
+            != str(
+                allocation_authority.get("failed_qa_source_ref") or ""
+            ).strip()
+        ):
+            raise GovernanceError(
+                "parallel_branch_allocate_failed_qa_timeline_boundary_changed",
+                (
+                    "authenticated failed-QA timeline boundary changed before "
+                    "dispatch revision"
+                ),
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "source_task_id": source_task_id,
+                    "writes_performed": False,
+                    "allocation_transaction_rolled_back": True,
+                },
+            )
+        failed_qa_event_id = int(
+            current_timeline_authority.get("event_id") or 0
+        )
+        failed_qa_event = next(
+            (
+                dict(event)
+                for event in timeline_events
+                if isinstance(event, Mapping)
+                and int(event.get("id") or 0) == failed_qa_event_id
+            ),
+            {},
+        )
+        failed_qa_event_payload = (
+            failed_qa_event.get("payload")
+            if isinstance(failed_qa_event.get("payload"), Mapping)
+            else {}
+        )
+        source_authority = (
+            failed_qa_event_payload.get("source_backed_contract_gate_authority")
+            if isinstance(
+                failed_qa_event_payload.get(
+                    "source_backed_contract_gate_authority"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        qa_session_proof = (
+            source_authority.get("qa_session_proof")
+            if isinstance(source_authority.get("qa_session_proof"), Mapping)
+            else {}
+        )
+        qa_principal = str(
+            current_timeline_authority.get("actor") or ""
+        ).strip()
+        qa_session_id = str(
+            current_timeline_authority.get("qa_session_id") or ""
+        ).strip()
+        qa_provenance = {
+            "schema_version": "qa_evidence_provenance.v1",
+            "source": "authenticated_failed_qa_timeline_dispatch_boundary",
+            "server_derived": True,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_role": "qa",
+            "evidence_owner_actor": qa_principal,
+            "evidence_owner_session": qa_session_id,
+            "submitter_principal": qa_principal,
+            "submitter_session": qa_session_id,
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "completion_status_gate": {
+                "status": "failed",
+                "close_satisfying": False,
+                "overall_release_pass_claimed": False,
+                "candidate_new_failures": failed_qa_event_payload.get(
+                    "candidate_new_failures"
+                ),
+            },
+            "authenticated_qa_binding": {
+                "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+                "server_derived": True,
+                "qa_principal": qa_principal,
+                "qa_session_id": qa_session_id,
+                "independent_verification_session_matched": True,
+                "timeline_event_ref": str(
+                    current_timeline_authority.get("source_ref") or ""
+                ),
+                "qa_scope_binding_ref": str(
+                    qa_session_proof.get("qa_scope_binding_ref") or ""
+                ),
+                "authority_hash": str(
+                    source_authority.get("authority_hash") or ""
+                ),
+            },
+        }
+        source_parent_task_id = _runtime_context_mf_sub_parent_task_id(
+            source_context
+        )
+        boundary_line = _contract_runtime_projected_post_worker_line(
+            record=record,
+            context=source_context,
+            event=failed_qa_event,
+            stage_id="qa",
+            line_id="qa_independent_verification",
+            evidence_kind="independent_verification",
+            actor_role="qa",
+            source_key="failed_qa_dispatch_revision_boundary",
+        )
+        boundary_line.pop("_source_ref", None)
+        boundary_payload = (
+            dict(boundary_line.get("payload"))
+            if isinstance(boundary_line.get("payload"), Mapping)
+            else {}
+        )
+        boundary_payload.update(
+            {
+                "schema_version": (
+                    "contract_runtime."
+                    "authenticated_failed_qa_revision_boundary.v1"
+                ),
+                "source": "server_authenticated_qa_timeline_materialization",
+                "source_ref": str(
+                    current_timeline_authority.get("source_ref") or ""
+                ),
+                "source_of_authority": "qa_session_verification",
+                "source_backed": True,
+                "projection_persists_completed_line": True,
+                "observer_authored_qa_backfill": False,
+                "runtime_context_id": source_runtime_context_id,
+                "task_id": source_task_id,
+                "parent_task_id": source_parent_task_id,
+                "status": "failed",
+                "verdict": "FAIL",
+                "qa_evidence_provenance": qa_provenance,
+            }
+        )
+        boundary_line.update(
+            {
+                "runtime_context_id": source_runtime_context_id,
+                "task_id": source_task_id,
+                "parent_task_id": source_parent_task_id,
+                "status": "failed",
+                "commit_sha": str(
+                    current_timeline_authority.get("commit_sha") or ""
+                ),
+                "actor_session_principal": qa_principal,
+                "authorization_source": "qa_session_token_ref",
+                "evidence_owner_actor": qa_principal,
+                "evidence_owner_role": "qa",
+                "evidence_owner_session": qa_session_id,
+                "submitter_principal": qa_principal,
+                "submitter_session": qa_session_id,
+                "observer_impersonation": False,
+                "parent_materialization_authorized": False,
+                "qa_evidence_provenance": qa_provenance,
+                "payload": boundary_payload,
+            }
+        )
+        source_dispatch_match = _contract_runtime_dispatch_line_match(
+            record,
+            source_context,
+        )
+        proposed_lines = [*completed_lines, boundary_line]
+        proposed_record = {**record, "completed_lines": proposed_lines}
+        proposed_failed_qa_index = _active_failed_qa_line_index(
+            proposed_lines,
+            source_record=proposed_record,
+        )
+        if not (
+            failed_qa_event
+            and qa_principal
+            and qa_session_id
+            and source_parent_task_id == contract_execution_id
+            and source_dispatch_match
+            and _runtime_context_contract_failed_qa_has_canonical_provenance(
+                boundary_line
+            )
+            and _runtime_context_failed_qa_line_matches_context(
+                boundary_line,
+                context=source_context,
+                server_identity=source_dispatch_match,
+            )
+            and proposed_failed_qa_index == len(completed_lines)
+        ):
+            raise GovernanceError(
+                "parallel_branch_allocate_failed_qa_timeline_materialization_invalid",
+                (
+                    "authenticated failed-QA timeline boundary could not be "
+                    "materialized as exact append-only ContractRuntime authority"
+                ),
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "source_task_id": source_task_id,
+                    "writes_performed": False,
+                    "allocation_transaction_rolled_back": True,
+                },
+            )
+        expected_revision = int(record.get("execution_state_revision") or 1)
+        candidate_record = dict(record)
+        candidate_record["completed_lines"] = proposed_lines
+        candidate_record["execution_state_revision"] = expected_revision + 1
+        prepared = runtime._record_view(
+            candidate_record,
+            actor_role="observer",
+            completed_lines=proposed_lines,
+        )
+        try:
+            runtime.store.update(
+                contract_execution_id,
+                prepared,
+                expected_revision=expected_revision,
+            )
+        except ContractRuntimeError as exc:
+            raise GovernanceError(
+                "parallel_branch_allocate_failed_qa_timeline_revision_conflict",
+                str(exc),
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "source_task_id": source_task_id,
+                    "allocation_transaction_rolled_back": True,
+                },
+            ) from exc
+        record = runtime.store.get(contract_execution_id)
+        completed_lines = list(record.get("completed_lines") or [])
+        failed_qa_index = _active_failed_qa_line_index(
+            completed_lines,
+            source_record=record,
+        )
+        if failed_qa_index != proposed_failed_qa_index:
+            raise GovernanceError(
+                "parallel_branch_allocate_failed_qa_timeline_persistence_invalid",
+                (
+                    "persisted failed-QA boundary does not remain the active "
+                    "ContractRuntime failure"
+                ),
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "source_task_id": source_task_id,
+                    "allocation_transaction_rolled_back": True,
+                },
+            )
 
     route_identity = _parallel_branch_runtime_contract_route_identity(body)
     owned_files = _runtime_context_public_file_values(
@@ -18810,6 +19266,22 @@ def _parallel_branch_allocate_failed_qa_dispatch_revision(
         )
     stored = result.get("record") if isinstance(result.get("record"), Mapping) else {}
     dispatch_match = _contract_runtime_dispatch_line_match(stored, context)
+    if not dispatch_match:
+        raise GovernanceError(
+            "parallel_branch_allocate_failed_qa_dispatch_persistence_invalid",
+            (
+                "fresh failed-QA dispatch revision did not persist the exact "
+                "replacement RuntimeContext identity"
+            ),
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "allocation_transaction_rolled_back": True,
+                "contract_runtime_line_mutated": False,
+            },
+        )
     return {
         "schema_version": (
             "parallel_branch_allocate.failed_qa_dispatch_revision.v1"
@@ -19727,6 +20199,34 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             existing_retry is not None
             and int(_row_get(existing_retry, "attempt", 1) or 1)
             == int(context.attempt or 1)
+            and not (
+                isinstance(
+                    batch_target_authority.get(
+                        "failed_qa_rework_authority"
+                    ),
+                    Mapping,
+                )
+                and batch_target_authority[
+                    "failed_qa_rework_authority"
+                ].get("existing_unbound_runtime_context_recovery")
+                is True
+                and str(
+                    _row_get(
+                        existing_retry,
+                        "runtime_context_id",
+                        "",
+                    )
+                    or ""
+                ).strip()
+                == str(
+                    getattr(
+                        get_branch_context(conn, project_id, task_id),
+                        "runtime_context_id",
+                        "",
+                    )
+                    or ""
+                ).strip()
+            )
         ):
             raise GovernanceError(
                 "parallel_branch_allocate_retry_duplicate",
@@ -19913,6 +20413,23 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             planned=context,
             body=effective_body,
         )
+        if (
+            preexisting_context is not None
+            and isinstance(
+                batch_target_authority.get("failed_qa_rework_authority"),
+                Mapping,
+            )
+            and batch_target_authority[
+                "failed_qa_rework_authority"
+            ].get("existing_unbound_runtime_context_recovery")
+            is True
+        ):
+            # The old server may have committed the fresh RuntimeContext but
+            # rolled back or skipped its ContractRuntime dispatch revision.
+            # Admission above already matched the complete immutable identity;
+            # keep that exact context instead of comparing it with a newly
+            # generated planning id.
+            context = preexisting_context
         continuing_materialized_worker = (
             not create_worktree and is_materialized_branch_context(preexisting_context)
         )
@@ -20177,6 +20694,18 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                     project_id=project_id,
                     context=saved,
                     body=effective_body,
+                    failed_qa_rework_authority=(
+                        batch_target_authority.get(
+                            "failed_qa_rework_authority"
+                        )
+                        if isinstance(
+                            batch_target_authority.get(
+                                "failed_qa_rework_authority"
+                            ),
+                            Mapping,
+                        )
+                        else None
+                    ),
                 )
             )
             contract_runtime_retry_rebind = (

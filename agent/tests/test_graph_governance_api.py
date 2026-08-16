@@ -41677,6 +41677,277 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         "failed_qa_source_ref"
     ] == f"timeline:{failed['id']}"
 
+    fresh_task_id = "batch-child-postmerge-failure-rework-2"
+    fresh_worker_id = "batch-child-postmerge-failure-worker-2"
+    route_identity = {
+        "route_id": "route-batch-child-postmerge-failure-rework-2",
+        "route_context_hash": _fake_sha(
+            "batch-child-postmerge-failure-rework-route"
+        ),
+        "prompt_contract_id": (
+            "rprompt-batch-child-postmerge-failure-rework-2"
+        ),
+        "prompt_contract_hash": _fake_sha(
+            "batch-child-postmerge-failure-rework-prompt"
+        ),
+        "visible_injection_manifest_hash": _fake_sha(
+            "batch-child-postmerge-failure-rework-visible"
+        ),
+        "route_token_ref": "rtok-batch-child-postmerge-failure-rework-2",
+    }
+    _persist_parallel_allocate_route_ref(
+        conn,
+        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        contract_execution_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+        **route_identity,
+    )
+    conn.commit()
+    before_allocate = server._contract_runtime_store(conn).get(
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    )
+    assert server._active_failed_qa_line_index(
+        before_allocate["completed_lines"],
+        source_record=before_allocate,
+    ) < 0
+    allocate_body = {
+        "task_id": fresh_task_id,
+        "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+        "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+        "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+        "root_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+        "batch_id": _BATCH_QA_BATCH_ID,
+        "stage_type": "failed_qa_rework",
+        "attempt": 2,
+        "workspace_root": str(world.root),
+        "worktree_root": str(world.root),
+        "target_project_root": str(world.root),
+        "base_commit": world.final_head,
+        "target_head_commit": world.final_head,
+        "merge_queue_id": _BATCH_QA_MERGE_QUEUE_ID,
+        "failed_qa_source_ref": f"timeline:{failed['id']}",
+        "owned_files": ["batch-child-1.txt"],
+        "target_files": ["batch-child-1.txt"],
+        "allocation_owner": fresh_worker_id,
+        "agent_id": fresh_worker_id,
+        "worker_id": fresh_worker_id,
+        "worker_slot_id": fresh_worker_id,
+        "profile_requirements": dict(
+            server._MF_PARALLEL_DEFAULT_PROFILE_REQUIREMENTS
+        ),
+        "retry_policy": dict(server._MF_PARALLEL_DEFAULT_RETRY_POLICY),
+        "create_worktree": False,
+        **route_identity,
+    }
+    negative_authorities = []
+    missing_authority = {}
+    negative_authorities.append(
+        (
+            "missing",
+            missing_authority,
+            "parallel_branch_allocate_failed_qa_timeline_authority_invalid",
+        )
+    )
+    wrong_source = copy.deepcopy(rework["failed_qa_rework_authority"])
+    wrong_source["source_task_id"] = "sibling-batch-child-task"
+    negative_authorities.append(
+        (
+            "cross_lane",
+            wrong_source,
+            "parallel_branch_allocate_failed_qa_source_context_changed",
+        )
+    )
+    forged_boundary = copy.deepcopy(rework["failed_qa_rework_authority"])
+    forged_boundary["postmerge_failed_qa_boundary_authority"][
+        "authority_hash"
+    ] = _fake_sha("forged-postmerge-failed-qa-boundary")
+    negative_authorities.append(
+        (
+            "forged",
+            forged_boundary,
+            "parallel_branch_allocate_failed_qa_timeline_boundary_changed",
+        )
+    )
+    wrong_fresh_identity = copy.deepcopy(
+        rework["failed_qa_rework_authority"]
+    )
+    wrong_fresh_identity["fresh_worker_id"] = "sibling-worker"
+    negative_authorities.append(
+        (
+            "wrong_identity",
+            wrong_fresh_identity,
+            "parallel_branch_allocate_failed_qa_timeline_authority_invalid",
+        )
+    )
+    for ordinal, (_case, submitted_authority, expected_code) in enumerate(
+        negative_authorities,
+        start=1,
+    ):
+        direct_context = upsert_branch_context(
+            conn,
+            replace(
+                world.child_contexts[index],
+                runtime_context_id=(
+                    f"mfrctx-batch-child-postmerge-negative-{ordinal}"
+                ),
+                task_id=fresh_task_id,
+                worker_id=fresh_worker_id,
+                worker_slot_id=fresh_worker_id,
+                allocation_owner=fresh_worker_id,
+                agent_id=fresh_worker_id,
+                status=STATE_WORKTREE_READY,
+                stage_type="failed_qa_rework",
+                attempt=2,
+                retry_round=1,
+                parent_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+                root_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+                base_commit=world.final_head,
+                head_commit=world.final_head,
+                target_head_commit=world.final_head,
+                owned_files=("batch-child-1.txt",),
+                target_files=("batch-child-1.txt",),
+            ),
+        )
+        before_negative = copy.deepcopy(
+            server._contract_runtime_store(conn).get(
+                _BATCH_QA_CHILD_EXECUTIONS[index]
+            )
+        )
+        with pytest.raises(GovernanceError) as rejected:
+            server._parallel_branch_allocate_failed_qa_dispatch_revision(
+                conn,
+                project_id=PID,
+                context=direct_context,
+                body=allocate_body,
+                failed_qa_rework_authority=submitted_authority,
+            )
+        assert rejected.value.code == expected_code
+        assert server._contract_runtime_store(conn).get(
+            _BATCH_QA_CHILD_EXECUTIONS[index]
+        ) == before_negative
+        conn.execute(
+            """
+            DELETE FROM parallel_branch_runtime_contexts
+            WHERE project_id = ? AND task_id = ?
+            """,
+            (PID, fresh_task_id),
+        )
+        conn.commit()
+        assert get_branch_context(conn, PID, fresh_task_id) is None
+
+    preexisting_context = upsert_branch_context(
+        conn,
+        replace(
+            world.child_contexts[index],
+            runtime_context_id="mfrctx-batch-child-postmerge-rework-2",
+            task_id=fresh_task_id,
+            branch_ref=f"refs/heads/codex/{fresh_task_id}",
+            worker_id=fresh_worker_id,
+            worker_slot_id=fresh_worker_id,
+            allocation_owner=fresh_worker_id,
+            agent_id=fresh_worker_id,
+            status=STATE_WORKTREE_READY,
+            stage_type="failed_qa_rework",
+            attempt=2,
+            retry_round=1,
+            parent_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+            root_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+            base_commit=world.final_head,
+            head_commit=world.final_head,
+            target_head_commit=world.final_head,
+            fence_token="fence-batch-child-postmerge-rework-2",
+            lease_expires_at="",
+            owned_files=("batch-child-1.txt",),
+            target_files=("batch-child-1.txt",),
+        ),
+    )
+    conn.commit()
+    assert not server._contract_runtime_dispatch_line_match(
+        before_allocate,
+        preexisting_context,
+    )
+    retry_rework_authority = (
+        server._parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
+            conn,
+            project_id=PID,
+            record=before_allocate,
+            verified_batch_child=verified_batch_child,
+            body=allocate_body,
+        )
+    )
+    assert retry_rework_authority, (
+        parallel_branch_runtime.branch_context_to_dict(preexisting_context)
+    )
+
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=allocate_body,
+        )
+    )
+    assert status == 201, allocated
+    fresh_context = get_branch_context(conn, PID, fresh_task_id)
+    assert fresh_context is not None
+    assert fresh_context.runtime_context_id == (
+        preexisting_context.runtime_context_id
+    )
+    revision = allocated["contract_runtime_dispatch_revision"]
+    assert revision["status"] == "revised"
+    after_allocate = server._contract_runtime_store(conn).get(
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    )
+    failed_index = server._active_failed_qa_line_index(
+        after_allocate["completed_lines"],
+        source_record=after_allocate,
+    )
+    assert failed_index == len(before_allocate["completed_lines"])
+    failed_line = after_allocate["completed_lines"][failed_index]
+    assert failed_line["runtime_context_id"] == (
+        world.child_contexts[index].runtime_context_id
+    )
+    assert failed_line["task_id"] == world.child_contexts[index].task_id
+    dispatch_match = server._contract_runtime_dispatch_line_match(
+        after_allocate,
+        fresh_context,
+    )
+    assert dispatch_match["source_ref"] == revision["source_ref"]
+
+    joined = (
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": fresh_task_id,
+                    "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                    "contract_execution_id": (
+                        _BATCH_QA_CHILD_EXECUTIONS[index]
+                    ),
+                    "target_project_root": str(world.root),
+                    "worker_id": fresh_worker_id,
+                    "worker_slot_id": fresh_worker_id,
+                    "agent_id": fresh_worker_id,
+                    "actual_host_worker_id": fresh_worker_id,
+                    "worker_session_id": (
+                        "codex:batch-child-postmerge-failure-rework-2"
+                    ),
+                    "host_session_id": (
+                        "codex:batch-child-postmerge-failure-rework-2"
+                    ),
+                    "reason": "fresh timeline-backed failed-QA rework",
+                    **route_identity,
+                },
+            )
+        )
+    )
+    assert joined["ok"] is True
+    assert joined["runtime_context_id"] == fresh_context.runtime_context_id
+
 
 @pytest.mark.parametrize(
     ("lane_next", "binding_override", "accepted"),
