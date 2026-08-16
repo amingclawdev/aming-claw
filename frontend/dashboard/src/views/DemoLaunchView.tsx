@@ -34,6 +34,17 @@ const DEMO_LAUNCH_PROMPT_VARIANTS = [
   { id: "mf_batch_parallel", label: "MF Batch Parallel" },
 ] as const;
 
+export const DEMO_EXECUTION_TOPOLOGY = {
+  environmentCount: 3,
+  headline: "Three independent environments",
+  order: ["Direct Main", "MF Parallel", "MF Batch Parallel"],
+  environmentRule: "Choose exactly one lane for each environment.",
+  ownerRuntimeRule: "Pin all three environments to the same exact Owner runtime RC.",
+  sequenceRule: "Close each lane before starting the next one.",
+  authorityRule: "Launch panels remain server-provided copy-safe prompts.",
+  forbiddenRule: "No force_admit, merge_into lane collapse, title camouflage, bypass/no-PASS warranty, or direct_fix recovery.",
+} as const;
+
 function normalizedPromptId(id: string): string {
   return id.trim().toLowerCase().replace(/[-\s]+/g, "_");
 }
@@ -332,6 +343,23 @@ export default function DemoLaunchView({ projectId }: Props) {
         </div>
       ) : null}
 
+      <section className="demo-template-panel card" aria-label="Three-lane execution topology" data-testid="demo-execution-topology">
+        <div className="demo-template-main">
+          <div className="demo-template-label-row">
+            <span className="status-badge status-not-queued">Execution topology</span>
+            <span className="demo-template-id mono">3 environments · 1 exact Owner runtime RC</span>
+          </div>
+          <h3>{DEMO_EXECUTION_TOPOLOGY.headline}</h3>
+          <p>{DEMO_EXECUTION_TOPOLOGY.environmentRule} {DEMO_EXECUTION_TOPOLOGY.ownerRuntimeRule}</p>
+          <ol>
+            {DEMO_EXECUTION_TOPOLOGY.order.map((lane) => <li key={lane}>{lane}</li>)}
+          </ol>
+          <p>{DEMO_EXECUTION_TOPOLOGY.sequenceRule}</p>
+          <p>{DEMO_EXECUTION_TOPOLOGY.authorityRule}</p>
+          <p><strong>Forbidden:</strong> {DEMO_EXECUTION_TOPOLOGY.forbiddenRule}</p>
+        </div>
+      </section>
+
       <section className="section">
         <div className="section-head">
           Managed environments
@@ -440,7 +468,7 @@ function DemoEnvironmentCard(props: {
         </section>
         <section className="demo-prompt-area" aria-label={`${env.label || env.id} launch prompts`}>
           <div className="demo-prompt-area-head">
-            <span>Launch prompts</span>
+            <span>Launch prompts · choose one lane for this environment</span>
             <span>{prompts.length ? `${prompts.length} path${prompts.length === 1 ? "" : "s"}` : "Unavailable"}</span>
           </div>
           <div className={`demo-prompt-grid demo-prompt-grid-${Math.min(Math.max(prompts.length, 1), 3)}`}>
