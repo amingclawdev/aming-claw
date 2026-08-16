@@ -101477,11 +101477,11 @@ def _contract_runtime_bind_observer_dispatch_transport_proof(
     record: Mapping[str, Any],
     observer_proof: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Bind copy-safe observer transport proof to an atomic dispatch body.
+    """Bind copy-safe observer transport proof to an observer-owned body.
 
-    The dispatch writer body is copied from the current/guide response into a
-    later MCP call.  The MCP transport authenticates as the coordinator by
-    default, so an observer-owned body must carry the already-validated opaque
+    Writer bodies are copied from an enter/current/guide response into a later
+    MCP call.  The MCP transport authenticates as the coordinator by default,
+    so every observer-owned body must carry the already-validated opaque
     observer session id and route-token ref.  These fields are transport proof
     only: ``_contract_runtime_line_write_body`` does not persist them as line
     evidence.
@@ -101511,9 +101511,9 @@ def _contract_runtime_bind_observer_dispatch_transport_proof(
         if isinstance(guide.get("next_legal_action"), Mapping)
         else {}
     )
+    next_line_id = str(next_action.get("line_id") or "").strip()
     if (
-        str(next_action.get("line_id") or "").strip()
-        != "observer_dispatch_bounded_workers"
+        not next_line_id
         or str(next_action.get("owner_role") or "").strip() != "observer"
     ):
         return projected
@@ -101529,8 +101529,7 @@ def _contract_runtime_bind_observer_dispatch_transport_proof(
         else {}
     )
     if (
-        str(copy_payload.get("line_id") or "").strip()
-        != "observer_dispatch_bounded_workers"
+        str(copy_payload.get("line_id") or "").strip() != next_line_id
         or str(copy_payload.get("actor_role") or "").strip() != "observer"
     ):
         return projected
@@ -135826,6 +135825,7 @@ def _mf_parallel_successor_runtime_enter(
     metadata: Mapping[str, Any] | None = None,
     acceptance_scope_criteria: Sequence[Any],
     acceptance_scope_closure: Mapping[str, Any],
+    observer_proof: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime = _contract_runtime(conn)
     store = runtime.store
@@ -136007,6 +136007,15 @@ def _mf_parallel_successor_runtime_enter(
         successor_execution_id,
         actor_role=actor_role,
     )
+    successor_route_ref = str(successor.get("route_token_ref") or "")
+    if successor_route_ref and isinstance(observer_proof, Mapping):
+        successor = _contract_runtime_bind_observer_dispatch_transport_proof(
+            successor,
+            {
+                **dict(observer_proof),
+                "route_token_ref": successor_route_ref,
+            },
+        )
     current_state = _runtime_current_state_from_record(successor)
     runtime_guide = successor.get("runtime_guide") or {}
     route_token_ref_binding = (
@@ -136016,7 +136025,6 @@ def _mf_parallel_successor_runtime_enter(
     )
     if not isinstance(route_token_ref_binding, Mapping) or not route_token_ref_binding:
         route_token_ref_binding = child_route_binding
-    successor_route_ref = str(successor.get("route_token_ref") or "")
     response_route_ref = successor_route_ref or route_token_ref
     route_token_ref_guidance: dict[str, Any] = {
         "schema_version": "mf_parallel.child_route_token_ref_guidance.v1",
@@ -166773,6 +166781,11 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             metadata=metadata,
             acceptance_scope_criteria=acceptance_scope_criteria,
             acceptance_scope_closure=acceptance_scope_closure,
+            observer_proof=getattr(
+                ctx,
+                "_contract_runtime_observer_proof",
+                None,
+            ),
         )
         payload = {
             "schema_version": "mf_parallel_entered.v1",

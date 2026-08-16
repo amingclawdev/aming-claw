@@ -107399,6 +107399,117 @@ def test_observer_dispatch_transport_proof_does_not_widen_other_roles(
     assert "observer_route_token_ref" not in copy_payload
 
 
+def test_mf_parallel_enter_projects_executable_observer_prefill_transport_proof(
+    conn,
+):
+    backlog_id = "AC-MF-PARALLEL-PREFILL-TRANSPORT-PROOF"
+    task_id = "mf-parallel-prefill-transport-proof"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-mf-parallel-prefill-transport-proof",
+    )
+    parent_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    contract_execution_id = server._mf_parallel_execution_id(
+        PID,
+        backlog_id,
+        parent_execution_id,
+        task_id,
+    )
+    route_token_ref = "rtok-mf-parallel-prefill-transport-proof"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=[
+            "mf_parallel_enter",
+            "contract_runtime_current",
+            "contract_runtime_submit_line",
+        ],
+    )
+
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "reason": "Enter with a copy-ready observer prefill envelope.",
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+                "onboard_service_waiver": True,
+                "owned_files": ["agent/governance/server.py"],
+                "metadata": {"required_worker_count": 1},
+            },
+        )
+    )
+
+    assert entered["contract_execution_id"] == contract_execution_id
+    next_action = entered["next_legal_action"]
+    assert next_action["id"] == "observer_prefill_child_contracts"
+    copy_body = next_action["writer_role_safe_copy_payload"]["copy_payload"]
+    assert copy_body["line_id"] == "observer_prefill_child_contracts"
+    assert copy_body["actor_role"] == "observer"
+    assert copy_body["observer_session_id"] == observer_session_id
+    assert copy_body["observer_route_token_ref"] == route_token_ref
+    assert '"route_token":' not in json.dumps(entered, sort_keys=True)
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            query={
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+            },
+        )
+    )
+    current_copy_body = current["next_legal_action"][
+        "writer_role_safe_copy_payload"
+    ]["copy_payload"]
+    assert current_copy_body == copy_body
+
+    missing_proof_body = dict(copy_body)
+    missing_proof_body.pop("observer_session_id")
+    missing_proof_body.pop("observer_route_token_ref")
+    revision_before = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )["execution_state_revision"]
+    rejected = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            method="POST",
+            body=missing_proof_body,
+        )
+    )
+    assert rejected["ok"] is False
+    assert rejected["actor_role"] == "coordinator"
+    assert server._contract_runtime_store(conn).get(contract_execution_id)[
+        "execution_state_revision"
+    ] == revision_before
+
+    accepted = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            method="POST",
+            body=copy_body,
+        )
+    )
+    assert accepted["ok"] is True
+    assert accepted["actor_role"] == "observer"
+    assert accepted["execution_state_revision"] == revision_before + 1
+
+
 def test_rev8_atomic_dispatch_preserves_lane_fences_and_closes_row_scope_on_union(
     conn,
     tmp_path,
