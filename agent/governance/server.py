@@ -103015,10 +103015,22 @@ def _contract_runtime_effective_actor_role(
             backlog_id=backlog_id,
             contract_execution_id=contract_execution_id,
         )
+        authority_record = record or {}
+        if observer_proof:
+            # The stored runtime guide may lag the current mf_parallel lane
+            # projection after an ordered merge.  Resolve observer_merge
+            # authority from the same server-projected record returned by the
+            # current/Guide read path so pre-auth and the subsequent write
+            # binder select one identical lane.
+            authority_record = _contract_runtime_read(
+                conn,
+                contract_execution_id=contract_execution_id,
+                actor_role="observer",
+            )
         durable_authority = _contract_runtime_observer_merge_durable_authority(
             conn,
             project_id=project_id,
-            record=record or {},
+            record=authority_record,
         )
         lane_mismatches = (
             _contract_runtime_observer_merge_lane_identity_mismatches(

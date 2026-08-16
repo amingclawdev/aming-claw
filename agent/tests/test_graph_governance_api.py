@@ -649,6 +649,14 @@ def test_mf_parallel_terminal_lane_observer_merge_rejects_cross_lane_identity(
     )
     monkeypatch.setattr(
         server,
+        "_contract_runtime_read",
+        lambda *_args, **_kwargs: {
+            "contract_id": "mf_parallel.v2",
+            "contract_execution_id": execution_id,
+        },
+    )
+    monkeypatch.setattr(
+        server,
         "_contract_runtime_observer_merge_durable_authority",
         lambda *_args, **_kwargs: dict(lane_identity),
     )
@@ -669,6 +677,112 @@ def test_mf_parallel_terminal_lane_observer_merge_rejects_cross_lane_identity(
         "observer_merge_lane_identity_mismatch"
     )
     assert rejected.value.details["identity_mismatches"][0]["field"] == field
+
+
+def test_observer_merge_pre_auth_uses_current_projected_lane_record(
+    conn,
+    monkeypatch,
+):
+    execution_id = "cex-observer-merge-projected-pre-auth"
+    backlog_id = "AC-OBSERVER-MERGE-PROJECTED-PRE-AUTH"
+    focus_identity = {
+        "runtime_context_id": "mfrctx-focus-stored",
+        "task_id": "focus-stored-task",
+        "parent_task_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": "focus-stored-worker",
+        "worker_slot_id": "focus-stored-slot",
+        "lane_id": "focus-stored-slot",
+        "line_instance_id": "runtime_context:mfrctx-focus-stored",
+    }
+    reminder_identity = {
+        "runtime_context_id": "mfrctx-reminder-current",
+        "task_id": "reminder-current-task",
+        "parent_task_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": "reminder-current-worker",
+        "worker_slot_id": "reminder-current-slot",
+        "lane_id": "reminder-current-slot",
+        "line_instance_id": "runtime_context:mfrctx-reminder-current",
+    }
+    stored_record = {
+        "contract_id": "mf_parallel.v2",
+        "contract_execution_id": execution_id,
+        "runtime_guide": {
+            "next_legal_action": {
+                "line_id": "observer_merge",
+                **focus_identity,
+            }
+        },
+    }
+    projected_record = {
+        "contract_id": "mf_parallel.v2",
+        "contract_execution_id": execution_id,
+        "runtime_guide": {
+            "next_legal_action": {
+                "line_id": "observer_merge",
+                **reminder_identity,
+            }
+        },
+    }
+    ctx = _ctx_with_role(
+        {"project_id": PID, "contract_execution_id": execution_id},
+        "coordinator",
+        method="POST",
+        body={
+            "stage_id": "observer_lane_merge",
+            "line_id": "observer_merge",
+            "evidence_kind": "merge",
+            **reminder_identity,
+            "observer_session_id": "obs-reminder-current",
+            "observer_route_token_ref": "rtok-reminder-current",
+        },
+    )
+    read_calls = []
+    authority_records = []
+
+    monkeypatch.setattr(
+        server,
+        "_resolve_contract_runtime_observer_proof",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+
+    def current_read(*_args, **kwargs):
+        read_calls.append(kwargs)
+        return projected_record
+
+    def durable_authority(*_args, **kwargs):
+        authority_record = kwargs["record"]
+        authority_records.append(authority_record)
+        if authority_record is projected_record:
+            return dict(reminder_identity)
+        return dict(focus_identity)
+
+    monkeypatch.setattr(server, "_contract_runtime_read", current_read)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_observer_merge_durable_authority",
+        durable_authority,
+    )
+
+    assert (
+        server._contract_runtime_effective_actor_role(
+            ctx,
+            conn,
+            action="contract_runtime_submit_line",
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            record=stored_record,
+        )
+        == "observer"
+    )
+    assert read_calls == [
+        {
+            "contract_execution_id": execution_id,
+            "actor_role": "observer",
+        }
+    ]
+    assert authority_records == [projected_record]
 
 
 @pytest.mark.parametrize(
@@ -40152,6 +40266,11 @@ def test_mf_parallel_terminal_lane_observer_merge_prefers_exact_observer_proof(
         server,
         "_resolve_contract_runtime_observer_proof",
         resolve_observer,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_read",
+        lambda *_args, **_kwargs: record,
     )
     monkeypatch.setattr(
         server,
