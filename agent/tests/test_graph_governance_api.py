@@ -74069,12 +74069,17 @@ def _install_rev8_postmerge_qa_helper_boundaries(
     *,
     terminal_commit: str = "2" * 40,
     verified_batch_child: bool = False,
+    reconcile_worker_index: int = -1,
+    persist_current_receipt: bool = False,
 ) -> dict[str, Any]:
     merged_commit = "2" * 40
     final_commit = terminal_commit
     final_worker = record["completed_lines"][0]["payload"][
         "bounded_workers"
     ][1]
+    reconcile_worker = record["completed_lines"][0]["payload"][
+        "bounded_workers"
+    ][reconcile_worker_index]
     target_owner = Path("/tmp/rev8-final-integration-target")
     reconcile_line = record["completed_lines"][-1]
     reconcile_receipt = reconcile_line["payload"]["reconcile_authority"]
@@ -74082,6 +74087,11 @@ def _install_rev8_postmerge_qa_helper_boundaries(
         **final_worker,
         backlog_id=record["backlog_id"],
         worktree_path="/tmp/rev8-premerge-test-worker",
+    )
+    reconcile_context = SimpleNamespace(
+        **reconcile_worker,
+        backlog_id=record["backlog_id"],
+        worktree_path="/tmp/rev8-premerge-reconcile-worker",
     )
     queue_item = MergeQueueItem(
         project_id=PID,
@@ -74119,6 +74129,21 @@ def _install_rev8_postmerge_qa_helper_boundaries(
         ),
         "target_project_root_override": "",
     }
+    state["current_full"].update(
+        {
+            "runtime_context_id": reconcile_worker["runtime_context_id"],
+            "task_id": reconcile_worker["task_id"],
+            "parent_task_id": reconcile_worker["parent_task_id"],
+            "merge_queue_id": reconcile_worker["merge_queue_id"],
+        }
+    )
+    state["current_full"]["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in state["current_full"].items()
+            if key != "authority_hash"
+        }
+    )
     current_receipt = copy.deepcopy(reconcile_receipt)
     current_receipt.update(
         {
@@ -74126,8 +74151,12 @@ def _install_rev8_postmerge_qa_helper_boundaries(
             "reconcile_source_ref": "timeline:903",
             "reconcile_event_id": 903,
             "reconcile_event_created_at": "2026-08-01T15:00:03Z",
-            "reconcile_task_id": final_worker["task_id"],
-            "reconcile_runtime_context_id": final_worker[
+            "runtime_context_id": reconcile_worker["runtime_context_id"],
+            "task_id": reconcile_worker["task_id"],
+            "parent_task_id": reconcile_worker["parent_task_id"],
+            "merge_queue_id": reconcile_worker["merge_queue_id"],
+            "reconcile_task_id": reconcile_worker["task_id"],
+            "reconcile_runtime_context_id": reconcile_worker[
                 "runtime_context_id"
             ],
             "current_full_reconcile_activation_verified": True,
@@ -74144,35 +74173,52 @@ def _install_rev8_postmerge_qa_helper_boundaries(
         }
     )
     state["current_receipt"] = current_receipt
-    source_line_index = len(record["completed_lines"]) - 1
-    correction_marker = (
-        server._contract_runtime_reconcile_receipt_correction_marker(
-            record=record,
-            source_line=reconcile_line,
-            source_line_index=source_line_index,
-            authority=current_receipt,
+    if persist_current_receipt:
+        reconcile_line.update(
+            {
+                "status": "accepted",
+                "commit_sha": final_commit,
+                "runtime_context_id": reconcile_worker[
+                    "runtime_context_id"
+                ],
+                "task_id": reconcile_worker["task_id"],
+                "parent_task_id": reconcile_worker["parent_task_id"],
+                "merge_queue_id": reconcile_worker["merge_queue_id"],
+                "payload": {"reconcile_authority": current_receipt},
+            }
         )
-    )
-    record["completed_lines"].append(
-        {
-            "stage_id": "observer_integration",
-            "line_id": "observer_reconcile",
-            "actor_role": "observer",
-            "evidence_kind": "reconcile",
-            "status": "accepted",
-            "commit_sha": final_commit,
-            "runtime_context_id": final_worker["runtime_context_id"],
-            "task_id": final_worker["task_id"],
-            "parent_task_id": record["contract_execution_id"],
-            "merge_queue_id": final_worker["merge_queue_id"],
-            "payload": {
-                "reconcile_authority": current_receipt,
-                "canonical_reconcile_receipt_correction": (
-                    correction_marker
-                ),
-            },
-        }
-    )
+    else:
+        source_line_index = len(record["completed_lines"]) - 1
+        correction_marker = (
+            server._contract_runtime_reconcile_receipt_correction_marker(
+                record=record,
+                source_line=reconcile_line,
+                source_line_index=source_line_index,
+                authority=current_receipt,
+            )
+        )
+        record["completed_lines"].append(
+            {
+                "stage_id": "observer_integration",
+                "line_id": "observer_reconcile",
+                "actor_role": "observer",
+                "evidence_kind": "reconcile",
+                "status": "accepted",
+                "commit_sha": final_commit,
+                "runtime_context_id": reconcile_worker[
+                    "runtime_context_id"
+                ],
+                "task_id": reconcile_worker["task_id"],
+                "parent_task_id": record["contract_execution_id"],
+                "merge_queue_id": reconcile_worker["merge_queue_id"],
+                "payload": {
+                    "reconcile_authority": current_receipt,
+                    "canonical_reconcile_receipt_correction": (
+                        correction_marker
+                    ),
+                },
+            }
+        )
     monkeypatch.setattr(
         server,
         "_contract_runtime_completed_line_acceptance",
@@ -74195,7 +74241,12 @@ def _install_rev8_postmerge_qa_helper_boundaries(
     monkeypatch.setattr(
         server,
         "_contract_runtime_contexts_for_dispatch_line",
-        lambda *_args, **_kwargs: [context],
+        lambda *_args, **_kwargs: list(
+            {
+                candidate.runtime_context_id: candidate
+                for candidate in (context, reconcile_context)
+            }.values()
+        ),
     )
     monkeypatch.setattr(
         parallel_branch_runtime,
@@ -74319,6 +74370,71 @@ def test_rev8_postmerge_qa_authority_joins_progress_receipt_to_final_live_state(
     assert authority["authority_hash"] == server.stable_sha256(
         {key: value for key, value in authority.items() if key != "authority_hash"}
     )
+
+
+def test_rev8_postmerge_qa_prefers_persisted_reconcile_lane_over_projection(
+    monkeypatch,
+):
+    record = _rev8_postmerge_qa_binding_record()
+    state = _install_rev8_postmerge_qa_helper_boundaries(
+        monkeypatch,
+        record,
+        reconcile_worker_index=0,
+        persist_current_receipt=True,
+    )
+    aggregate = server._contract_runtime_rev8_two_worker_merge_projection(
+        record,
+        required_worker_count=2,
+    )
+    transient = copy.deepcopy(record)
+    transient["completed_lines"][-1]["payload"] = {
+        "schema_version": (
+            "mf_parallel.runtime_context_post_worker_line_projection.v1"
+        ),
+        "source": "runtime_context_post_worker_timeline_evidence",
+        "source_backed": False,
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_canonical_post_worker_projection",
+        lambda *_args, **_kwargs: {
+            "record": transient,
+            "merge": copy.deepcopy(aggregate),
+        },
+    )
+
+    authority = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+
+    workers = record["completed_lines"][0]["payload"]["bounded_workers"]
+    assert authority["verified"] is True
+    assert authority["runtime_context_id"] == workers[1]["runtime_context_id"]
+    assert authority["task_id"] == workers[1]["task_id"]
+    assert authority["reconcile_runtime_context_id"] == workers[0][
+        "runtime_context_id"
+    ]
+    assert authority["reconcile_task_id"] == workers[0]["task_id"]
+    assert authority["reconcile_source_ref"] == "timeline:903"
+
+    state["current_receipt"]["reconcile_task_id"] = "wrong-reconcile-task"
+    state["current_receipt"]["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in state["current_receipt"].items()
+            if key != "authority_hash"
+        }
+    )
+    blocked = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+    assert blocked["blocker_codes"] == [
+        "observer_reconcile_receipt_unverified"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -74813,6 +74929,25 @@ def test_rev8_postmerge_qa_authority_consumes_exact_projected_lane_merges(
     projected_record["completed_lines"][-1]["payload"][
         "source_backed"
     ] = False
+    persisted_wins = server._contract_runtime_rev8_postmerge_qa_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+    assert persisted_wins["verified"] is True
+    assert persisted_wins["reconcile_source_ref"] == "timeline:903"
+
+    # A transient projection may remain available after the real reconcile
+    # line is accepted.  It must not mask a missing or conflicting durable
+    # receipt, however.
+    state["current_receipt"]["task_id"] = "wrong-persisted-task"
+    state["current_receipt"]["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in state["current_receipt"].items()
+            if key != "authority_hash"
+        }
+    )
     blocked = server._contract_runtime_rev8_postmerge_qa_authority(
         object(),
         project_id=PID,

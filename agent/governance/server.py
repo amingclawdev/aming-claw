@@ -108261,11 +108261,76 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         or merge_completed_line_index <= dispatch_completed_line_index
     ):
         return blocked("observer_reconcile_line_not_unique")
-    expected_reconcile_receipt = _contract_runtime_reconcile_record_authority(
-        conn,
-        project_id=project_id,
-        record=merge_record,
+    declared_batch_child = _parallel_branch_allocate_declares_batch_child(
+        record
     )
+    persisted_reconcile_lines = [
+        line
+        for line in record.get("completed_lines") or []
+        if required_worker_count > 1
+        and not declared_batch_child
+        and isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "observer_reconcile"
+        and str(line.get("actor_role") or "").strip() == "observer"
+        and str(line.get("evidence_kind") or "").strip() == "reconcile"
+        and str(
+            (
+                line.get("payload")
+                if isinstance(line.get("payload"), Mapping)
+                else {}
+            ).get("schema_version")
+            or ""
+        ).strip()
+        != "mf_parallel.runtime_context_post_worker_line_projection.v1"
+    ]
+    persisted_reconcile_line_present = bool(persisted_reconcile_lines)
+    persisted_expected_reconcile_receipt = (
+        _contract_runtime_close_authority_payload_mapping(
+            persisted_reconcile_lines[-1],
+            "reconcile_authority",
+        )
+        if persisted_reconcile_line_present
+        else {}
+    )
+    persisted_receipt_resolution = (
+        _contract_runtime_reconcile_receipt_resolution(
+            conn,
+            project_id=project_id,
+            record=record,
+            authority=persisted_expected_reconcile_receipt,
+        )
+        if persisted_reconcile_line_present
+        else {}
+    )
+    persisted_reconcile_receipt_available = (
+        persisted_receipt_resolution.get("status")
+        in {"current", "corrected"}
+    )
+    if (
+        persisted_reconcile_line_present
+        and not persisted_reconcile_receipt_available
+    ):
+        return blocked("observer_reconcile_receipt_unverified")
+    expected_reconcile_receipt = (
+        persisted_expected_reconcile_receipt
+        if persisted_reconcile_receipt_available
+        else _contract_runtime_reconcile_record_authority(
+            conn,
+            project_id=project_id,
+            record=merge_record,
+        )
+    )
+    if persisted_reconcile_receipt_available:
+        # Once observer_reconcile is durably accepted, its server-authored
+        # receipt is the only authority for final QA.  A canonical transient
+        # post-worker projection can still exist for read continuity, but it
+        # must never reinterpret that persisted line as a transient
+        # runtime_context_post_worker_line_projection payload.
+        projected_post_worker_authority = False
+    reconcile_runtime_context_id = runtime_context_id
+    reconcile_task_id = task_id
+    reconcile_parent_task_id = parent_task_id
+    reconcile_merge_queue_id = merge_queue_id
     projected_reconcile_authority: dict[str, Any] = {}
     if projected_post_worker_authority:
         projected_reconcile_lines = [
@@ -108339,6 +108404,7 @@ def _contract_runtime_rev8_postmerge_qa_authority(
             == merge_queue_id
         ):
             return blocked("observer_reconcile_receipt_unverified")
+
         reconcile_acceptance = {
             "db_verified": True,
             "acceptance_ref": str(
@@ -108347,11 +108413,15 @@ def _contract_runtime_rev8_postmerge_qa_authority(
             "completed_line_ref": "",
         }
     else:
-        receipt_resolution = _contract_runtime_reconcile_receipt_resolution(
-            conn,
-            project_id=project_id,
-            record=record,
-            authority=expected_reconcile_receipt,
+        receipt_resolution = (
+            persisted_receipt_resolution
+            if persisted_reconcile_receipt_available
+            else _contract_runtime_reconcile_receipt_resolution(
+                conn,
+                project_id=project_id,
+                record=record,
+                authority=expected_reconcile_receipt,
+            )
         )
         if receipt_resolution.get("status") not in {"current", "corrected"}:
             return blocked("observer_reconcile_receipt_unverified")
@@ -108376,7 +108446,136 @@ def _contract_runtime_rev8_postmerge_qa_authority(
                 persisted_reconcile_receipt.get("merged_commit_sha") or ""
             ).strip().lower()
             == merged_commit
-            and str(
+        ):
+            return blocked("observer_reconcile_receipt_unverified")
+        if persisted_reconcile_receipt_available:
+            if not (
+                str(
+                    persisted_reconcile_receipt.get("project_id") or ""
+                ).strip()
+                == project_id
+                and str(
+                    persisted_reconcile_receipt.get("backlog_id") or ""
+                ).strip()
+                == str(record.get("backlog_id") or "").strip()
+                and str(
+                    persisted_reconcile_receipt.get(
+                        "contract_execution_id"
+                    )
+                    or ""
+                ).strip()
+                == str(record.get("contract_execution_id") or "").strip()
+                and str(
+                    persisted_reconcile_receipt.get("parent_task_id") or ""
+                ).strip()
+                == parent_task_id
+                and persisted_reconcile_receipt.get(
+                    "all_lane_merges_verified"
+                )
+                is True
+                and int(
+                    persisted_reconcile_receipt.get("lane_merge_count") or 0
+                )
+                == required_worker_count
+                and {
+                    str(value or "").strip()
+                    for value in persisted_reconcile_receipt.get(
+                        "lane_runtime_context_ids"
+                    )
+                    or []
+                    if str(value or "").strip()
+                }
+                == {
+                    str(value or "").strip()
+                    for value in merge.get("lane_runtime_context_ids") or []
+                    if str(value or "").strip()
+                }
+                and {
+                    str(value or "").strip()
+                    for value in persisted_reconcile_receipt.get(
+                        "lane_merge_queue_ids"
+                    )
+                    or []
+                    if str(value or "").strip()
+                }
+                == {
+                    str(value or "").strip()
+                    for value in merge.get("lane_merge_queue_ids") or []
+                    if str(value or "").strip()
+                }
+                and str(
+                    persisted_reconcile_receipt.get("merge_source_ref") or ""
+                ).strip()
+                == str(merge.get("merge_source_ref") or "").strip()
+                and int(
+                    persisted_reconcile_receipt.get("merge_event_id") or 0
+                )
+                == int(merge.get("merge_event_id") or 0)
+                and str(
+                    persisted_reconcile_receipt.get(
+                        "contract_runtime_dispatch_source_ref"
+                    )
+                    or ""
+                ).strip()
+                == str(
+                    merge.get("contract_runtime_dispatch_source_ref") or ""
+                ).strip()
+                and persisted_reconcile_receipt.get(
+                    "reconcile_event_recorded"
+                )
+                is True
+                and int(
+                    persisted_reconcile_receipt.get("reconcile_event_id") or 0
+                )
+                > int(merge.get("merge_event_id") or 0)
+                and str(
+                    persisted_reconcile_receipt.get("reconcile_source_ref")
+                    or ""
+                ).startswith("timeline:")
+                and persisted_reconcile_receipt.get(
+                    "current_full_reconcile_activation_verified"
+                )
+                is True
+            ):
+                return blocked("observer_reconcile_receipt_unverified")
+            reconcile_runtime_context_id = str(
+                persisted_reconcile_receipt.get("runtime_context_id") or ""
+            ).strip()
+            reconcile_task_id = str(
+                persisted_reconcile_receipt.get("task_id") or ""
+            ).strip()
+            reconcile_parent_task_id = str(
+                persisted_reconcile_receipt.get("parent_task_id") or ""
+            ).strip()
+            reconcile_merge_queue_id = str(
+                persisted_reconcile_receipt.get("merge_queue_id") or ""
+            ).strip()
+            if not (
+                reconcile_runtime_context_id
+                in {
+                    str(value or "").strip()
+                    for value in merge.get("lane_runtime_context_ids") or []
+                }
+                and reconcile_merge_queue_id
+                in {
+                    str(value or "").strip()
+                    for value in merge.get("lane_merge_queue_ids") or []
+                }
+                and str(
+                    persisted_reconcile_receipt.get("reconcile_task_id") or ""
+                ).strip()
+                == reconcile_task_id
+                and str(
+                    persisted_reconcile_receipt.get(
+                        "reconcile_runtime_context_id"
+                    )
+                    or ""
+                ).strip()
+                == reconcile_runtime_context_id
+            ):
+                return blocked("observer_reconcile_receipt_unverified")
+        elif not (
+            str(
                 persisted_reconcile_receipt.get("runtime_context_id") or ""
             ).strip()
             == runtime_context_id
@@ -108395,9 +108594,41 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         ):
             return blocked("observer_reconcile_receipt_unverified")
 
-    declared_batch_child = _parallel_branch_allocate_declares_batch_child(
-        record
-    )
+    reconcile_merge = dict(merge)
+    if (
+        reconcile_runtime_context_id,
+        reconcile_task_id,
+        reconcile_parent_task_id,
+        reconcile_merge_queue_id,
+    ) != (
+        runtime_context_id,
+        task_id,
+        parent_task_id,
+        merge_queue_id,
+    ):
+        reconcile_merge.update(
+            {
+                "aggregate_final_merge_identity": {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": parent_task_id,
+                    "merge_queue_id": merge_queue_id,
+                    "queue_item_id": queue_item_id,
+                },
+                "runtime_context_id": reconcile_runtime_context_id,
+                "task_id": reconcile_task_id,
+                "parent_task_id": reconcile_parent_task_id,
+                "merge_queue_id": reconcile_merge_queue_id,
+                "reconcile_line_instance_id": (
+                    f"runtime_context:{reconcile_runtime_context_id}"
+                ),
+                "reconcile_lane_identity_source": (
+                    "ContractRuntime.completed_lines.observer_reconcile."
+                    "reconcile_authority"
+                ),
+            }
+        )
+
     verified_batch_child = (
         _parallel_branch_allocate_verified_batch_child_lineage_authority(
             conn,
@@ -108508,6 +108739,7 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         ).strip()
     )
     matching_contexts: dict[str, Any] = {}
+    reconcile_matching_contexts: dict[str, Any] = {}
     for dispatch_line in record.get("completed_lines") or []:
         if not isinstance(dispatch_line, Mapping) or str(
             dispatch_line.get("line_id") or ""
@@ -108520,12 +108752,29 @@ def _contract_runtime_rev8_postmerge_qa_authority(
             line=dispatch_line,
         ):
             identity = _contract_runtime_context_identity(context)
-            if identity != (runtime_context_id, task_id, parent_task_id):
-                continue
-            matching_contexts[runtime_context_id] = context
+            if identity == (runtime_context_id, task_id, parent_task_id):
+                matching_contexts[runtime_context_id] = context
+            if (
+                identity
+                == (
+                    reconcile_runtime_context_id,
+                    reconcile_task_id,
+                    reconcile_parent_task_id,
+                )
+                and str(
+                    getattr(context, "merge_queue_id", "") or ""
+                ).strip()
+                == reconcile_merge_queue_id
+            ):
+                reconcile_matching_contexts[
+                    reconcile_runtime_context_id
+                ] = context
     if len(matching_contexts) != 1:
         return blocked("final_merge_runtime_context_unresolved")
     context = next(iter(matching_contexts.values()))
+    if len(reconcile_matching_contexts) != 1:
+        return blocked("observer_reconcile_receipt_unverified")
+    reconcile_context = next(iter(reconcile_matching_contexts.values()))
 
     from .parallel_branch_runtime import (
         _git_target_owner_alignment_evidence,
@@ -108574,16 +108823,16 @@ def _contract_runtime_rev8_postmerge_qa_authority(
     timeline_events = _runtime_context_service_timeline_events(
         conn,
         project_id=project_id,
-        task_id=task_id,
+        task_id=reconcile_task_id,
         backlog_id=str(record.get("backlog_id") or ""),
     )
     reconciled_merge = _contract_runtime_completed_merge_reconcile_authority(
         conn,
         project_id=project_id,
         record=record,
-        context=context,
+        context=reconcile_context,
         timeline_events=timeline_events,
-        merge=merge,
+        merge=reconcile_merge,
     )
     if not (
         int(reconciled_merge.get("reconcile_event_id") or 0)
@@ -108691,7 +108940,7 @@ def _contract_runtime_rev8_postmerge_qa_authority(
                 conn,
                 project_id=project_id,
                 record=record,
-                merge=merge,
+                merge=reconcile_merge,
                 reconcile=reconciled_merge,
                 target_project_root_override=str(target_owner),
             )
@@ -108712,12 +108961,13 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         and str(current_full.get("target_project_root") or "").strip()
         == str(target_owner)
         and str(current_full.get("runtime_context_id") or "").strip()
-        == runtime_context_id
-        and str(current_full.get("task_id") or "").strip() == task_id
+        == reconcile_runtime_context_id
+        and str(current_full.get("task_id") or "").strip()
+        == reconcile_task_id
         and str(current_full.get("parent_task_id") or "").strip()
-        == parent_task_id
+        == reconcile_parent_task_id
         and str(current_full.get("merge_queue_id") or "").strip()
-        == merge_queue_id
+        == reconcile_merge_queue_id
     ):
         return blocked("current_full_active_snapshot_unverified")
 
@@ -108773,6 +109023,10 @@ def _contract_runtime_rev8_postmerge_qa_authority(
         "qa_graph_trace_task_source": qa_graph_trace_task_source,
         "merge_queue_id": merge_queue_id,
         "queue_item_id": queue_item_id,
+        "reconcile_runtime_context_id": reconcile_runtime_context_id,
+        "reconcile_task_id": reconcile_task_id,
+        "reconcile_parent_task_id": reconcile_parent_task_id,
+        "reconcile_merge_queue_id": reconcile_merge_queue_id,
         "target_ref": target_ref,
         "target_project_root": str(target_owner),
         "target_root_source": target_owner_source,
