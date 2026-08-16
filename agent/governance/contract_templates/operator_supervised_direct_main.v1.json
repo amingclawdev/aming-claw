@@ -1,0 +1,175 @@
+{
+  "schema_version": "operator_supervised_direct_main_contract_template.v1",
+  "template_id": "operator_supervised_direct_main.v1",
+  "version": "v1",
+  "task_types": [
+    "operator_supervised_direct_main"
+  ],
+  "stages": [
+    "route_gate",
+    "graph_first",
+    "pre_mutation",
+    "implementation",
+    "qa_graph_context",
+    "qa",
+    "reconcile",
+    "close_ready"
+  ],
+  "applicability": {
+    "allowed_only_for": "one_bounded_operator_supervised_current_world_direct_main_flow",
+    "activation_ready": false,
+    "new_execution_allowed": false,
+    "template_selection_allowed": false,
+    "dependency_state": "dependency_unresolved",
+    "unresolved_dependency_id": "AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815",
+    "requires_new_definition_revision_after_dependency_resolution": true,
+    "not_for": [
+      "unbounded_or_multi_lane_implementation",
+      "same_generation_retry_after_no_pass",
+      "historical_evidence_backfill",
+      "implicit_common_rule_inference"
+    ]
+  },
+  "source": {
+    "type": "source_controlled",
+    "path": "contract_definitions/operator_supervised_direct_main.v1.rev1.json",
+    "authority": "contract_definition",
+    "template_is_authoritative": false,
+    "contract_id": "operator_supervised_direct_main",
+    "version": "v1",
+    "revision": "rev1",
+    "definition_hash": "sha256:3b0da25cf3ab87f7e4bd59b65dca81882798f13fa92558def8707a4f174a21bb",
+    "definition_source_sha256": "sha256:2559e1e2302c8a03d63a297c173afce6ffeb11100afadc53c85ff09101428a15"
+  },
+  "activation_policy": {
+    "schema_version": "contract_activation_dependency.v1",
+    "state": "dependency_unresolved",
+    "activation_ready": false,
+    "new_execution_allowed": false,
+    "template_selection_allowed": false,
+    "unresolved_dependencies": [
+      {
+        "dependency_id": "AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815",
+        "kind": "verification_only_external_dependency",
+        "resolution_requires_new_contract_revision": true
+      }
+    ],
+    "result": {
+      "schema_version": "contract_dependency_unresolved.v1",
+      "code": "contract_dependency_unresolved",
+      "error": "contract_dependency_unresolved",
+      "status": "rejected",
+      "classification": "external_dependency",
+      "retryable": false,
+      "message": "operator_supervised_direct_main v1 rev1 cannot start until the Common Rule package is source-backed and a new Direct revision pins its exact applicability join",
+      "authorizes_write": false,
+      "activation_ready": false,
+      "next_legal_action": {
+        "id": "complete_common_rule_package_then_create_direct_revision",
+        "action": "continue_sequential_contract_authoring",
+        "next_step": "Complete AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815, then create a new Direct revision that pins the exact package version, digest, rule_ids, and scopes."
+      }
+    }
+  },
+  "common_rule_applicability": {
+    "schema_version": "contract_common_rule_applicability.unresolved.v1",
+    "join_state": "unresolved",
+    "dependency_id": "AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815",
+    "package_id": "",
+    "package_version": "",
+    "package_digest": "",
+    "rule_ids": [],
+    "scopes": [],
+    "omitted_rules_apply": false,
+    "server_inference_allowed": false,
+    "activation_allowed": false,
+    "resolution_requires_new_contract_revision": true
+  },
+  "gate_policy": {
+    "schema_version": "operator_supervised_direct_main_gate_policy.v1",
+    "non_authoritative_template_mirror": true,
+    "authority": "contract_definitions/operator_supervised_direct_main.v1.rev1.json",
+    "fail_closed": true,
+    "activation_ready": false,
+    "entry_allowed": false,
+    "same_generation_retry_allowed": false,
+    "post_hoc_pass_backfill_allowed": false,
+    "graph_first_required": true,
+    "role_separated_qa_required": true,
+    "current_head_full_reconcile_required": true,
+    "close_ready_required": true
+  },
+  "evidence_requirements": [
+    {
+      "id": "observer_bind_direct_scope",
+      "required": true,
+      "phase": "route_gate",
+      "kind": "contract_binding",
+      "owner_role": "observer"
+    },
+    {
+      "id": "observer_graph_context",
+      "required": true,
+      "phase": "graph_first",
+      "kind": "graph_trace",
+      "owner_role": "observer"
+    },
+    {
+      "id": "observer_direct_implementation_exception",
+      "required": true,
+      "phase": "pre_mutation",
+      "kind": "observer_direct_implementation_exception",
+      "owner_role": "observer"
+    },
+    {
+      "id": "observer_implementation",
+      "required": true,
+      "phase": "implementation",
+      "kind": "implementation",
+      "owner_role": "observer"
+    },
+    {
+      "id": "qa_graph_context",
+      "required": true,
+      "phase": "qa_graph_context",
+      "kind": "graph_trace",
+      "owner_role": "qa"
+    },
+    {
+      "id": "qa_independent_verification",
+      "required": true,
+      "phase": "qa",
+      "kind": "independent_verification",
+      "owner_role": "qa"
+    },
+    {
+      "id": "observer_reconcile",
+      "required": true,
+      "phase": "reconcile",
+      "kind": "current_full_reconcile",
+      "owner_role": "observer"
+    },
+    {
+      "id": "observer_close_ready",
+      "required": true,
+      "phase": "close_ready",
+      "kind": "close_ready",
+      "owner_role": "observer"
+    }
+  ],
+  "retry_policy": {
+    "same_execution_retry_allowed": false,
+    "same_generation_retry_allowed": false,
+    "failed_source_generation_terminal": true,
+    "fresh_bounded_row_required": true,
+    "historical_source_retained_as_audit": true,
+    "new_revision_required_after_dependency_resolution": true
+  },
+  "historical_behavior_oracle": {
+    "commit_prefix": "8a6ef43",
+    "classification": "behavior_oracle_only",
+    "authority": false,
+    "certificate": false,
+    "proves_current_activation": false
+  }
+}

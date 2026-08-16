@@ -15,6 +15,7 @@ from agent.governance import (
     task_timeline,
 )
 from agent.governance.contracts import ContractDefinitionRegistry
+from agent.governance.contracts.registry import ContractDependencyUnresolvedError
 from agent.governance.contracts.runtime import (
     ContractRetirementError,
     ContractRuntime,
@@ -124,6 +125,85 @@ def test_direct_fix_frozen_entry_gate_matches_contract_retirement_result():
     ):
         assert gate_result[field] == contract_result[field]
     assert contract_result["code"] == gate_result["error"]
+
+
+@pytest.mark.parametrize(
+    "contract_id",
+    [
+        "operator_supervised_direct_main",
+        "operator_supervised_direct_main.v1",
+        "direct_main",
+        "direct_main.v1",
+    ],
+)
+def test_direct_main_rev1_dependency_unresolved_prevents_new_execution(
+    contract_id,
+):
+    runtime = ContractRuntime(ContractDefinitionRegistry())
+
+    with pytest.raises(ContractDependencyUnresolvedError) as raised:
+        runtime.start_execution(
+            contract_id,
+            version="v1",
+            revision="rev1",
+            project_id="aming-claw",
+            backlog_id="AC-DIRECT-MAIN-DEPENDENCY-UNRESOLVED",
+            actor_role="observer",
+            contract_execution_id="cex-direct-main-dependency-unresolved",
+        )
+
+    error = raised.value.to_dict()
+    assert error["schema_version"] == "contract_dependency_unresolved.v1"
+    assert error["code"] == "contract_dependency_unresolved"
+    assert error["error"] == "contract_dependency_unresolved"
+    assert error["status"] == "rejected"
+    assert error["classification"] == "external_dependency"
+    assert error["retryable"] is False
+    assert error["authorizes_write"] is False
+    assert error["activation_ready"] is False
+    assert error["contract_id"] == "operator_supervised_direct_main"
+    assert error["revision"] == "rev1"
+    assert [
+        dependency["dependency_id"]
+        for dependency in error["unresolved_dependencies"]
+    ] == ["AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815"]
+    assert runtime.store._records == {}
+
+
+def test_ordinary_direct_contract_has_no_retired_world_alias_or_dependency():
+    definition = ContractDefinitionRegistry().get(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev1",
+    )
+
+    assert "direct_fix" not in json.dumps(definition, sort_keys=True)
+    assert set(definition["compat_aliases"]) == {
+        "operator_supervised_direct_main.v1",
+        "direct_main",
+        "direct_main.v1",
+    }
+    assert {
+        successor["contract_id"] for successor in definition["successors"]
+    } == {"operator_supervised_direct_main", "mf_parallel.v2"}
+    assert definition["system_layer"]["retry_policy"] == {
+        "same_execution_retry_allowed": False,
+        "same_generation_retry_allowed": False,
+        "post_hoc_pass_backfill_allowed": False,
+        "failed_source_generation_terminal": True,
+        "fresh_bounded_row_required": True,
+        "fresh_contract_revision_required_after_dependency_resolution": True,
+        "historical_source_retained_as_audit": True,
+    }
+    oracle = definition["metadata"]["historical_behavior_oracle"]
+    assert oracle == {
+        "commit_prefix": "8a6ef43",
+        "classification": "behavior_oracle_only",
+        "authority": False,
+        "certificate": False,
+        "relabels_historical_execution": False,
+        "proves_current_activation": False,
+    }
 
 
 def test_terminal_retirement_does_not_rewrite_pinned_execution(tmp_path):

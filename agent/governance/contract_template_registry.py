@@ -20,12 +20,15 @@ FORBIDDEN_ROUTE_KEYS = {"ai_provider", "model", "prompt", "llm", "ai_call"}
 NON_TEMPLATE_CONTRACT_FILES = {"meta_contract.v1.json"}
 CONTRACT_TEMPLATE_ALIASES = {
     "direct_fix": "direct_fix.v1",
+    "direct_main": "operator_supervised_direct_main.v1",
+    "operator_supervised_direct_main": "operator_supervised_direct_main.v1",
     "mf_parallel": "mf_parallel.v2",
     "parallel_worker": "mf_parallel.v2",
     "hotfix.v1": "observer_hotfix_direct_mutation.v1",
     "observer_hotfix.v1": "observer_hotfix_direct_mutation.v1",
 }
 CONTRACT_TASK_TYPE_ALIASES = {
+    "direct_main": "operator_supervised_direct_main",
     "hotfix": "observer_hotfix",
 }
 
@@ -40,6 +43,58 @@ class UnknownContractTemplateError(ContractTemplateError):
 
 class MalformedContractTemplateError(ContractTemplateError):
     """Raised when a template file is not usable by the registry."""
+
+
+class ContractTemplateDependencyUnresolvedError(ContractTemplateError):
+    """Typed denial when a template mirror is not activation-ready."""
+
+    def __init__(self, template: Mapping[str, Any]) -> None:
+        activation = template.get("activation_policy")
+        result = (
+            activation.get("result")
+            if isinstance(activation, Mapping)
+            and isinstance(activation.get("result"), Mapping)
+            else {}
+        )
+        self.template = dict(template)
+        self.result = dict(result)
+        self.code = str(result.get("code") or "contract_dependency_unresolved")
+        message = str(
+            result.get("message")
+            or "Contract template activation dependency is unresolved"
+        )
+        super().__init__(f"{self.code}: {message}")
+
+    def to_dict(self) -> dict[str, Any]:
+        activation = self.template.get("activation_policy")
+        payload = dict(self.result)
+        payload.update(
+            {
+                "schema_version": str(
+                    self.result.get("schema_version")
+                    or "contract_dependency_unresolved.v1"
+                ),
+                "code": self.code,
+                "error": str(self.result.get("error") or self.code),
+                "status": str(self.result.get("status") or "rejected"),
+                "classification": str(
+                    self.result.get("classification") or "external_dependency"
+                ),
+                "retryable": bool(self.result.get("retryable", False)),
+                "authorizes_write": bool(
+                    self.result.get("authorizes_write", False)
+                ),
+                "activation_ready": False,
+                "template_id": str(self.template.get("template_id") or ""),
+                "version": str(self.template.get("version") or ""),
+                "unresolved_dependencies": list(
+                    activation.get("unresolved_dependencies") or []
+                )
+                if isinstance(activation, Mapping)
+                else [],
+            }
+        )
+        return payload
 
 
 def _template_paths(template_dir: str | Path = DEFAULT_TEMPLATE_DIR) -> list[Path]:
@@ -449,7 +504,10 @@ def resolve_contract_template(
             "ambiguous contract template resolution: "
             + ", ".join(str(template["template_id"]) for template in templates)
         )
-    return templates[0]
+    selected = templates[0]
+    if _unresolved_template_activation_dependency(selected):
+        raise ContractTemplateDependencyUnresolvedError(selected)
+    return selected
 
 
 def _canonical_template_id(template_id: str) -> str:
@@ -483,6 +541,34 @@ def _is_terminal_retirement_mirror(template: Mapping[str, Any]) -> bool:
         and isinstance(gate_policy, Mapping)
         and gate_policy.get("terminal_retirement") is True
     )
+
+
+def _unresolved_template_activation_dependency(
+    template: Mapping[str, Any],
+) -> dict[str, Any]:
+    activation = template.get("activation_policy")
+    if not isinstance(activation, Mapping):
+        return {}
+    dependencies = activation.get("unresolved_dependencies")
+    result = activation.get("result")
+    if (
+        activation.get("state") != "dependency_unresolved"
+        or activation.get("activation_ready") is not False
+        or activation.get("new_execution_allowed") is not False
+        or activation.get("template_selection_allowed") is not False
+        or not isinstance(dependencies, list)
+        or not dependencies
+        or not isinstance(result, Mapping)
+        or result.get("code") != "contract_dependency_unresolved"
+        or result.get("error") != "contract_dependency_unresolved"
+        or result.get("status") != "rejected"
+        or result.get("classification") != "external_dependency"
+        or result.get("retryable") is not False
+        or result.get("authorizes_write") is not False
+        or result.get("activation_ready") is not False
+    ):
+        return {}
+    return dict(activation)
 
 
 def _matches(template: Mapping[str, Any], *, task_type: str | None, stage: str | None) -> bool:
