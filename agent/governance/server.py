@@ -330,14 +330,86 @@ _GOVERNANCE_MANAGER_CERTIFICATES_LOCK = RLock()
 _GOVERNANCE_SINGLETON_LEASE: Any | None = None
 
 
+def _certify_late_registered_governance_project(
+    project_id: str,
+) -> dict[str, Any]:
+    """Bind a newly registered project to the still-live manager generation.
+
+    Governance startup certifies every project DB visible at that instant.  A
+    project registered later must not be left permanently unable to run a
+    current-full reconcile, but it also must not infer or accept a caller-owned
+    manager identity.  Serialize the first-use certification with publication,
+    prove the original singleton lease is still held by this process, append the
+    exact same generation to the project's durable history, and publish only
+    after the durable write succeeds.
+    """
+
+    project = str(project_id or "").strip()
+    if not project:
+        raise RuntimeError("governance_manager_generation_not_certified")
+
+    with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
+        existing = dict(_GOVERNANCE_MANAGER_CERTIFICATES.get(project) or {})
+        if existing:
+            return existing
+        if project not in set(_governance_generation_project_ids()):
+            raise RuntimeError("governance_manager_generation_not_certified")
+
+        lease = _GOVERNANCE_SINGLETON_LEASE
+        if (
+            lease is None
+            or getattr(lease, "_released", True)
+            or getattr(getattr(lease, "_lock_handle", None), "closed", True)
+        ):
+            raise RuntimeError("governance_manager_generation_lease_not_live")
+        lease_receipt = dict(lease.public_receipt())
+        if (
+            int(lease_receipt.get("manager_pid") or 0) != os.getpid()
+            or str(lease_receipt.get("process_start_identity") or "")
+            != _process_start_identity(os.getpid())
+        ):
+            raise RuntimeError("governance_manager_generation_lease_mismatch")
+
+        certified = _certify_governance_manager_generation(
+            lease, project_ids=[project]
+        )
+        certificate = dict(certified.get(project) or {})
+        bindings = (
+            "generation_id",
+            "manager_pid",
+            "manager_started_at",
+            "process_start_identity",
+            "manager_start_identity",
+            "lock_identity",
+            "prior_manager_pid",
+            "observed_prior_generation_id",
+            "prior_process_start_identity",
+            "prior_pid_death_method",
+            "prior_pid_death_verified_at",
+        )
+        if (
+            not certificate
+            or any(
+                certificate.get(key) != lease_receipt.get(key) for key in bindings
+            )
+            or certificate.get("certified_at")
+            != lease_receipt.get("lock_acquired_at")
+        ):
+            raise RuntimeError("governance_manager_generation_certificate_mismatch")
+        _GOVERNANCE_MANAGER_CERTIFICATES[project] = certificate
+        return certificate
+
+
 def _current_full_build_manager_identity(project_id: str = "") -> dict[str, Any]:
     """Return only the private, durably certified current manager identity."""
 
+    project = str(project_id or "").strip()
     with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
-        project = str(project_id or "")
         if not project and len(_GOVERNANCE_MANAGER_CERTIFICATES) == 1:
             project = next(iter(_GOVERNANCE_MANAGER_CERTIFICATES))
         certificate = dict(_GOVERNANCE_MANAGER_CERTIFICATES.get(project) or {})
+    if not certificate and project:
+        certificate = _certify_late_registered_governance_project(project)
     if not certificate:
         raise RuntimeError("governance_manager_generation_not_certified")
     from . import graph_snapshot_store as store

@@ -2588,9 +2588,181 @@ def _lease_receipt(
 class _FakeGenerationLease:
     def __init__(self, receipt: Mapping[str, Any]):
         self.receipt = dict(receipt)
+        self._released = False
+        self._lock_handle = SimpleNamespace(closed=False)
 
     def public_receipt(self) -> dict[str, Any]:
         return dict(self.receipt)
+
+
+def test_late_registered_project_is_certified_from_live_generation_once(
+    tmp_path,
+    monkeypatch,
+):
+    project_id = "late-registered-project"
+    db_path = tmp_path / "late.sqlite"
+
+    def connection_for(actual_project_id: str):
+        assert actual_project_id == project_id
+        connection = sqlite3.connect(db_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    receipt = _lease_receipt("generation-late", os.getpid())
+    lease = _FakeGenerationLease(receipt)
+    certificates: dict[str, dict[str, Any]] = {}
+    monkeypatch.setattr(server, "get_connection", connection_for)
+    monkeypatch.setattr(
+        server, "_governance_generation_project_ids", lambda: [project_id]
+    )
+    monkeypatch.setattr(server, "_GOVERNANCE_MANAGER_CERTIFICATES", certificates)
+    monkeypatch.setattr(server, "_GOVERNANCE_SINGLETON_LEASE", lease)
+    monkeypatch.setattr(
+        server,
+        "_process_start_identity",
+        lambda pid: receipt["process_start_identity"] if pid == os.getpid() else "",
+    )
+
+    first = server._current_full_build_manager_identity(project_id)
+    second = server._current_full_build_manager_identity(project_id)
+
+    assert first == second
+    assert first["project_id"] == project_id
+    assert first["generation_id"] == receipt["generation_id"]
+    assert first["manager_pid"] == os.getpid()
+    assert first["server_derived"] is True
+    assert set(certificates) == {project_id}
+    check = connection_for(project_id)
+    try:
+        rows = check.execute(
+            "SELECT generation_id, manager_pid FROM "
+            "graph_reconcile_manager_generations WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+        assert [(row["generation_id"], row["manager_pid"]) for row in rows] == [
+            (receipt["generation_id"], os.getpid())
+        ]
+    finally:
+        check.close()
+
+
+def test_late_registered_project_concurrent_first_use_publishes_once(monkeypatch):
+    project_id = "late-concurrent-project"
+    receipt = _lease_receipt("generation-concurrent", os.getpid())
+    lease = _FakeGenerationLease(receipt)
+    certificates: dict[str, dict[str, Any]] = {}
+    calls: list[str] = []
+
+    def certify(actual_lease, *, project_ids=None):
+        assert actual_lease is lease
+        assert project_ids == [project_id]
+        calls.append(project_id)
+        time.sleep(0.01)
+        return {
+            project_id: {
+                "schema_version": "graph_reconcile_manager_generation_certificate.v1",
+                "project_id": project_id,
+                "certificate_id": "gmcert-concurrent",
+                "sequence": 1,
+                **receipt,
+                "certified_at": receipt["lock_acquired_at"],
+                "certificate_hash": "sha256:" + "c" * 64,
+            }
+        }
+
+    monkeypatch.setattr(
+        server, "_governance_generation_project_ids", lambda: [project_id]
+    )
+    monkeypatch.setattr(server, "_GOVERNANCE_MANAGER_CERTIFICATES", certificates)
+    monkeypatch.setattr(server, "_GOVERNANCE_SINGLETON_LEASE", lease)
+    monkeypatch.setattr(server, "_certify_governance_manager_generation", certify)
+    monkeypatch.setattr(
+        server, "_process_start_identity", lambda _pid: receipt["process_start_identity"]
+    )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(
+            executor.map(
+                lambda _index: server._current_full_build_manager_identity(project_id),
+                range(8),
+            )
+        )
+
+    assert calls == [project_id]
+    assert {result["certificate_id"] for result in results} == {
+        "gmcert-concurrent"
+    }
+
+
+@pytest.mark.parametrize(
+    ("registered", "released", "process_matches", "expected"),
+    [
+        (False, False, True, "governance_manager_generation_not_certified"),
+        (True, True, True, "governance_manager_generation_lease_not_live"),
+        (True, False, False, "governance_manager_generation_lease_mismatch"),
+    ],
+)
+def test_late_registered_project_failures_never_publish(
+    monkeypatch,
+    registered,
+    released,
+    process_matches,
+    expected,
+):
+    project_id = "late-rejected-project"
+    receipt = _lease_receipt("generation-rejected", os.getpid())
+    lease = _FakeGenerationLease(receipt)
+    lease._released = released
+    certificates: dict[str, dict[str, Any]] = {}
+    monkeypatch.setattr(
+        server,
+        "_governance_generation_project_ids",
+        lambda: [project_id] if registered else [PID],
+    )
+    monkeypatch.setattr(server, "_GOVERNANCE_MANAGER_CERTIFICATES", certificates)
+    monkeypatch.setattr(server, "_GOVERNANCE_SINGLETON_LEASE", lease)
+    monkeypatch.setattr(
+        server,
+        "_process_start_identity",
+        lambda _pid: (
+            receipt["process_start_identity"] if process_matches else "different-process"
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_certify_governance_manager_generation",
+        lambda *_args, **_kwargs: pytest.fail("certification must not run"),
+    )
+
+    with pytest.raises(RuntimeError, match=expected):
+        server._current_full_build_manager_identity(project_id)
+    assert certificates == {}
+
+
+def test_late_registered_project_db_fault_never_publishes(monkeypatch):
+    project_id = "late-db-fault-project"
+    receipt = _lease_receipt("generation-db-fault", os.getpid())
+    lease = _FakeGenerationLease(receipt)
+    certificates: dict[str, dict[str, Any]] = {}
+    monkeypatch.setattr(
+        server, "_governance_generation_project_ids", lambda: [project_id]
+    )
+    monkeypatch.setattr(server, "_GOVERNANCE_MANAGER_CERTIFICATES", certificates)
+    monkeypatch.setattr(server, "_GOVERNANCE_SINGLETON_LEASE", lease)
+    monkeypatch.setattr(
+        server, "_process_start_identity", lambda _pid: receipt["process_start_identity"]
+    )
+    monkeypatch.setattr(
+        server,
+        "_certify_governance_manager_generation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected-late-project-db-fault")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="injected-late-project-db-fault"):
+        server._current_full_build_manager_identity(project_id)
+    assert certificates == {}
 
 
 def test_server_certification_recovers_all_projects_after_partial_fault(
