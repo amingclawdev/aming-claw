@@ -160866,11 +160866,6 @@ def test_rev9_reconcile_authority_uses_selected_lane_with_aggregate_final_merge(
             "next_legal_action": {
                 "stage_id": "observer_reconcile",
                 "line_id": "observer_reconcile",
-                "runtime_context_id": focus_runtime_id,
-                "task_id": focus.task_id,
-                "parent_task_id": execution_id,
-                "merge_queue_id": focus.merge_queue_id,
-                "line_instance_id": f"runtime_context:{focus_runtime_id}",
             }
         },
     }
@@ -160919,6 +160914,23 @@ def test_rev9_reconcile_authority_uses_selected_lane_with_aggregate_final_merge(
             context.task_id,
             context.parent_task_id,
         ),
+    )
+    selected_current_values = {
+        "schema_version": "runtime_context.authoritative_current_values.v1",
+        "status": "ready",
+        "source": "parallel_branch_runtime_contexts",
+        "source_of_authority": "RuntimeContext.current_values",
+        "current_values": {
+            "runtime_context_id": focus_runtime_id,
+            "task_id": focus.task_id,
+            "parent_task_id": execution_id,
+            "merge_queue_id": focus.merge_queue_id,
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_authoritative_runtime_context_projection",
+        lambda *_args, **_kwargs: selected_current_values,
     )
     monkeypatch.setattr(
         server,
@@ -160975,21 +160987,41 @@ def test_rev9_reconcile_authority_uses_selected_lane_with_aggregate_final_merge(
     assert selected["merge_event_id"] == 35
     assert selected["reconcile_event_id"] == 36
 
-    wrong = copy.deepcopy(record)
-    wrong["runtime_guide"]["next_legal_action"][
-        "runtime_context_id"
-    ] = "mfrctx-caller-shaped"
     before = server.stable_sha256(aggregate)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_authoritative_runtime_context_projection",
+        lambda *_args, **_kwargs: {
+            **selected_current_values,
+            "current_values": {
+                **selected_current_values["current_values"],
+                "runtime_context_id": "mfrctx-caller-shaped",
+            },
+        },
+    )
     rejected = (
         server._contract_runtime_rev8_selected_reconcile_lane_projection(
             object(),
             project_id=PID,
-            record=wrong,
+            record=record,
             aggregate_merge=aggregate,
         )
     )
     assert rejected == aggregate
     assert server.stable_sha256(aggregate) == before
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_authoritative_runtime_context_projection",
+        lambda *_args, **_kwargs: {},
+    )
+    missing = server._contract_runtime_rev8_selected_reconcile_lane_projection(
+        object(),
+        project_id=PID,
+        record=record,
+        aggregate_merge=aggregate,
+    )
+    assert missing == aggregate
 
 
 def test_rev9_observer_reconcile_binds_selected_lane_current_full_authority(

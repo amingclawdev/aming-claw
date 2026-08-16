@@ -115131,15 +115131,35 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
     if str(selected.get("line_id") or "").strip() != "observer_reconcile":
         return aggregate
     execution_id = str(record.get("contract_execution_id") or "").strip()
+    runtime_context_projection = (
+        _contract_runtime_authoritative_runtime_context_projection(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+    )
+    current_values = (
+        runtime_context_projection.get("current_values")
+        if isinstance(
+            runtime_context_projection.get("current_values"), Mapping
+        )
+        else {}
+    )
     runtime_context_id = str(
-        selected.get("runtime_context_id") or ""
+        current_values.get("runtime_context_id") or ""
     ).strip()
-    task_id = str(selected.get("task_id") or "").strip()
-    parent_task_id = str(selected.get("parent_task_id") or "").strip()
-    merge_queue_id = str(selected.get("merge_queue_id") or "").strip()
-    line_instance_id = str(
-        selected.get("line_instance_id") or ""
+    task_id = str(current_values.get("task_id") or "").strip()
+    parent_task_id = str(
+        current_values.get("parent_task_id") or ""
     ).strip()
+    merge_queue_id = str(
+        current_values.get("merge_queue_id") or ""
+    ).strip()
+    line_instance_id = (
+        f"runtime_context:{runtime_context_id}"
+        if runtime_context_id
+        else ""
+    )
     lane_runtime_context_ids = {
         str(value or "").strip()
         for value in aggregate.get("lane_runtime_context_ids") or []
@@ -115213,7 +115233,7 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
         "merge_queue_id": merge_queue_id,
         "reconcile_line_instance_id": line_instance_id,
         "reconcile_lane_identity_source": (
-            "ContractRuntime.runtime_guide.next_legal_action"
+            "RuntimeContext.current_values"
         ),
     }
     timeline_events = _runtime_context_service_timeline_events(
