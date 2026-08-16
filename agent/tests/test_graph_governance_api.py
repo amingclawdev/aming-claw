@@ -17015,8 +17015,15 @@ def test_demo_environment_create_registers_fixture_and_copyable_prompt(tmp_path,
         assert "do not act as the worker from the observer session" in path_prompt
         assert "Do not stop after planning" in path_prompt
         assert "friction" in path_prompt
+        assert "three independent demo environments" in path_prompt
+        assert "same exact Owner release candidate commit" in path_prompt
+        assert (
+            "Direct Main, then MF Parallel, then MF Batch Parallel"
+            in path_prompt
+        )
+        assert "preserve the duplicate Gate result" in path_prompt
     assert "operator_supervised_direct_main" in launch_prompts["direct_main"]
-    assert "observer_direct_implementation_exception" in launch_prompts["direct_main"]
+    assert "observer_direct_mutation_exception" in launch_prompts["direct_main"]
     assert "mf_parallel" in launch_prompts["mf_parallel"]
     assert "runtime_context_worker_guide" in launch_prompts["mf_parallel"]
     assert "separate Codex Desktop host-created subagent" in launch_prompts["mf_parallel"]
@@ -96479,6 +96486,16 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     ] is False
     copy_safe_event = direct_main["copy_safe_pre_mutation_event"]
     assert copy_safe_event == template["pre_mutation_event"]["copy_safe_event"]
+    assert copy_safe_event["mcp_tool"] == "observer_direct_mutation_exception"
+    direct_exception_interface = guide["onboard_route_guide"]["interface_index"][
+        "observer_direct_mutation_exception"
+    ]
+    assert direct_exception_interface["mcp_tool"] == (
+        "observer_direct_mutation_exception"
+    )
+    assert direct_exception_interface["path"] == (
+        "/api/projects/{project_id}/observer/direct-mutation-exception"
+    )
     assert copy_safe_event["identity_ready"] is True
     assert copy_safe_event["executable"] is False
     assert copy_safe_event["copy_safe"] is True
@@ -96659,7 +96676,11 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         token={
             **route_identity,
             "caller_role": "observer",
-            "allowed_actions": ["backlog_close", "task_timeline_append"],
+            "allowed_actions": [
+                "backlog_close",
+                "observer_direct_mutation_exception",
+                "task_timeline_append",
+            ],
             "scope": {
                 "project_id": PID,
                 "backlog_id": backlog_id,
@@ -96706,7 +96727,29 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     pre_mutation_arguments["artifact_refs"][
         "operator_approval_ref"
     ] = replacement_approval_ref
-    pre_mutation_result = server.handle_task_timeline_append(
+    storage_before_rejection = "\n".join(conn.iterdump())
+    total_changes_before_rejection = conn.total_changes
+    invalid_facade_arguments = copy.deepcopy(pre_mutation_arguments)
+    invalid_facade_arguments["phase"] = "implementation"
+    with pytest.raises(GovernanceError) as invalid_facade:
+        server.handle_observer_direct_mutation_exception(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=invalid_facade_arguments,
+            )
+        )
+    assert invalid_facade.value.code == (
+        "observer_direct_mutation_exception_shape_required"
+    )
+    assert invalid_facade.value.details["zero_write_rejection"] is True
+    assert invalid_facade.value.details["writes_performed"] is False
+    assert invalid_facade.value.details["mutation_performed"] is False
+    assert conn.total_changes == total_changes_before_rejection
+    assert "\n".join(conn.iterdump()) == storage_before_rejection
+
+    pre_mutation_result = server.handle_observer_direct_mutation_exception(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
@@ -100423,7 +100466,12 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     direct_exception_interface = route_guide["interface_index"][
         "observer_direct_mutation_exception"
     ]
-    assert direct_exception_interface["mcp_tool"] == "task_timeline_append"
+    assert direct_exception_interface["mcp_tool"] == (
+        "observer_direct_mutation_exception"
+    )
+    assert direct_exception_interface["path"] == (
+        "/api/projects/{project_id}/observer/direct-mutation-exception"
+    )
     assert direct_exception_interface["event_kind"] == (
         "observer_direct_implementation_exception"
     )

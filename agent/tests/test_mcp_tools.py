@@ -338,6 +338,86 @@ def test_task_timeline_append_schema_separates_qa_audit_from_close_statuses():
     ]
 
 
+def test_observer_direct_mutation_exception_managed_dispatch_is_literal_and_fail_closed():
+    tool = next(
+        item
+        for item in TOOLS
+        if item.get("name") == "observer_direct_mutation_exception"
+    )
+    schema = tool["inputSchema"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["event_type"]["enum"] == [
+        "mf.observer_direct_implementation_exception"
+    ]
+    assert schema["properties"]["route_token_ref"]["type"] == "string"
+
+    literal_guide_arguments = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DIRECT-GUIDE-LITERAL",
+        "task_id": "onboard-service-direct-guide-literal",
+        "event_type": "mf.observer_direct_implementation_exception",
+        "event_kind": "observer_direct_implementation_exception",
+        "phase": "pre_mutation",
+        "status": "accepted",
+        "decision": "operator_supervised_direct_main_approved",
+        "actor": "observer",
+        "payload": {
+            "reason": "bounded operator-approved change",
+            "observer_direct_mutation": True,
+            "tiny_deterministic_scope": True,
+        },
+        "verification": {
+            "db_verified_pre_implementation_graph_trace": True,
+        },
+        "artifact_refs": {"graph_trace_ids": ["gqt-direct-guide"]},
+        "route_token_ref": "rtok-direct-guide-literal",
+    }
+    expected_body = {
+        key: value
+        for key, value in literal_guide_arguments.items()
+        if key != "project_id"
+    }
+    recorder = _Recorder()
+    result = _dispatcher(recorder).dispatch(
+        "observer_direct_mutation_exception",
+        literal_guide_arguments,
+    )
+    assert result["ok"] is True
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer/direct-mutation-exception",
+            expected_body,
+        )
+    ]
+
+    class RejectedDirectFacade(_Recorder):
+        def api(
+            self,
+            method: str,
+            path: str,
+            data: dict | None = None,
+        ) -> dict:
+            self.calls.append((method, path, data))
+            return {
+                "error": "observer_direct_mutation_exception_shape_required",
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            }
+
+    rejected_recorder = RejectedDirectFacade()
+    rejected = _dispatcher(rejected_recorder).dispatch(
+        "observer_direct_mutation_exception",
+        {**literal_guide_arguments, "phase": "implementation"},
+    )
+    assert rejected["zero_write_rejection"] is True
+    assert rejected["writes_performed"] is False
+    assert len(rejected_recorder.calls) == 1
+    assert rejected_recorder.calls[0][1].endswith(
+        "/observer/direct-mutation-exception"
+    )
+
+
 def test_parallel_branch_merge_queue_apply_forwards_branch_ref():
     properties = _tool_properties("parallel_branch_merge_queue_apply")
     assert "branch_ref" in properties
