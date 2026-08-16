@@ -3650,6 +3650,15 @@ def _demo_launch_prompt_common_lines() -> list[str]:
 def _build_demo_launch_prompts(environment: Mapping[str, Any]) -> list[dict[str, str]]:
     target_lines = _demo_launch_prompt_target_lines(environment)
     common_lines = _demo_launch_prompt_common_lines()
+    topology_lines = [
+        "Three-lane execution topology:",
+        "Prepare three independent demo environments, one dedicated environment for each launch prompt.",
+        "Pin every environment to the same exact Owner release candidate commit before starting any lane.",
+        "Run the lanes sequentially in this fixed order: Direct Main, then MF Parallel, then MF Batch Parallel.",
+        "Do not reuse one environment, repository root, backlog row, or dirty worktree across lane modes.",
+        "This prompt owns only its named lane and dedicated environment; do not start either of the other lane modes here.",
+        "If this lane reaches a genuine governance gate, preserve the duplicate Gate result and stop this lane; do not convert it into another mode or bypass it.",
+    ]
     variants = [
         {
             "id": "direct_main",
@@ -3659,7 +3668,7 @@ def _build_demo_launch_prompts(environment: Mapping[str, Any]) -> list[dict[str,
                 "Path-specific route:",
                 "Use operator_supervised_direct_main for a tiny deterministic implementation.",
                 "Create or select exactly one backlog row for the planner requirement, then call onboard_route_guide with work_type=operator_supervised_direct_main.",
-                "The observer must run rg and graph_query before mutation, record observer_direct_implementation_exception evidence with DB-verified graph trace ids, and edit only approved row-scoped files.",
+                "The observer must run rg and graph_query before mutation, call the Guide's literal observer_direct_mutation_exception action with DB-verified graph trace ids, and edit only approved row-scoped files.",
                 "Do not write mf_sub implementation evidence in this path. Use independent QA/verifier evidence before merge, reconcile, or close.",
                 "If direct_main guide or close gate demands worker-owned evidence, stop and report that route friction instead of backfilling fake worker evidence.",
             ],
@@ -3710,6 +3719,8 @@ def _build_demo_launch_prompts(environment: Mapping[str, Any]) -> list[dict[str,
             f"Run the Aming Claw Daily Planner Lite {variant['label']} happy-path demo from start to finish.",
             "",
             *target_lines,
+            "",
+            *topology_lines,
             "",
             *variant["path_lines"],
             *common_lines,
@@ -120789,7 +120800,7 @@ def _onboard_parentless_direct_main_pre_mutation_event_guidance(
             "copy_safe_pre_mutation_event.v1"
         ),
         "authority_schema_version": authority_schema["schema_version"],
-        "mcp_tool": "task_timeline_append",
+        "mcp_tool": "observer_direct_mutation_exception",
         "copy_safe": True,
         "raw_route_token_required": False,
         "identity_ready": all(
@@ -122544,9 +122555,12 @@ def _onboard_contract_route_guide(
         },
         "observer_direct_mutation_exception": {
             "kind": "mcp_or_http",
-            "mcp_tool": "task_timeline_append",
+            "mcp_tool": "observer_direct_mutation_exception",
             "method": "POST",
-            "path": "/api/task/{project_id}/timeline",
+            "path": (
+                "/api/projects/{project_id}/observer/"
+                "direct-mutation-exception"
+            ),
             "event_type": "mf.observer_direct_implementation_exception",
             "event_kind": "observer_direct_implementation_exception",
             "canonical_timeline_event": (
@@ -122830,7 +122844,7 @@ def _onboard_contract_route_guide(
                 "server_diagnostic_field": "operator_approval_shape",
             },
             "pre_mutation_event": {
-                "mcp_tool": "task_timeline_append",
+                "mcp_tool": "observer_direct_mutation_exception",
                 "event_type": "mf.observer_direct_implementation_exception",
                 "event_kind": "observer_direct_implementation_exception",
                 "phase": "pre_mutation",
@@ -152839,6 +152853,107 @@ def _runtime_context_canonical_line_from_close_gate(
         "canonical_submit_skipped": True,
         "single_write_authority": "contract_runtime_close_evidence_gate",
     }
+
+
+def _observer_direct_mutation_exception_facade_preflight(
+    body: Mapping[str, Any],
+) -> None:
+    """Require the literal Guide event before entering the shared write path."""
+
+    canonical = _onboard_parentless_direct_main_canonical_timeline_event()
+    expected_top_level = (
+        canonical.get("top_level")
+        if isinstance(canonical.get("top_level"), Mapping)
+        else {}
+    )
+    mismatches = [
+        {
+            "field": field,
+            "expected": expected,
+            "actual": body.get(field),
+        }
+        for field, expected in expected_top_level.items()
+        if body.get(field) != expected
+    ]
+    for field in ("backlog_id", "task_id", "route_token_ref"):
+        if not str(body.get(field) or "").strip():
+            mismatches.append(
+                {
+                    "field": field,
+                    "expected": "non_empty_copy_safe_value",
+                    "actual": "missing_or_empty",
+                }
+            )
+    if str(body.get("actor") or "").strip() != "observer":
+        mismatches.append(
+            {
+                "field": "actor",
+                "expected": "observer",
+                "actual": str(body.get("actor") or "").strip(),
+            }
+        )
+    for field in ("payload", "verification", "artifact_refs"):
+        if not isinstance(body.get(field), Mapping):
+            mismatches.append(
+                {
+                    "field": field,
+                    "expected": "object",
+                    "actual": type(body.get(field)).__name__,
+                }
+            )
+    if mismatches:
+        raise GovernanceError(
+            "observer_direct_mutation_exception_shape_required",
+            (
+                "observer_direct_mutation_exception requires the literal "
+                "canonical Guide event shape"
+            ),
+            422,
+            {
+                "schema_version": (
+                    "observer_direct_mutation_exception.facade_preflight.v1"
+                ),
+                "canonical_timeline_event": canonical,
+                "field_mismatches": mismatches,
+                "guide": {
+                    "source": (
+                        "onboard_route_guide.next_legal_action.action_input"
+                    ),
+                    "correction": (
+                        "refresh onboard_route_guide and retry its literal "
+                        "observer_direct_mutation_exception arguments"
+                    ),
+                },
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "fail_closed": True,
+            },
+        )
+
+
+@route(
+    "POST",
+    "/api/projects/{project_id}/observer/direct-mutation-exception",
+)
+def handle_observer_direct_mutation_exception(ctx: RequestContext):
+    """Validate the Direct Guide facade, then reuse the timeline authority."""
+
+    project_id = ctx.get_project_id()
+    _observer_direct_mutation_exception_facade_preflight(ctx.body or {})
+    route_gate = _require_route_token_mutation_gate(
+        ctx,
+        action="observer_direct_mutation_exception",
+        project_id=project_id,
+        backlog_id=str(ctx.body.get("backlog_id") or "").strip(),
+        task_id=str(ctx.body.get("task_id") or "").strip(),
+    )
+    forwarded_request = _runtime_context_forward_request(
+        ctx,
+        body=ctx.body or {},
+        trusted_route_gate=route_gate,
+    )
+    return handle_task_timeline_append(forwarded_request)
 
 
 @route("POST", "/api/task/{project_id}/timeline")

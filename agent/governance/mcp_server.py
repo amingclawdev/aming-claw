@@ -1813,6 +1813,63 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "observer_direct_mutation_exception",
+        "description": (
+            "Append the canonical pre-mutation Direct Main exception from "
+            "onboard_route_guide. This facade validates its exact event shape "
+            "and route before delegating to the authoritative timeline writer."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "event_type": {
+                    "type": "string",
+                    "enum": ["mf.observer_direct_implementation_exception"],
+                },
+                "event_kind": {
+                    "type": "string",
+                    "enum": ["observer_direct_implementation_exception"],
+                },
+                "phase": {"type": "string", "enum": ["pre_mutation"]},
+                "status": {"type": "string", "enum": ["accepted"]},
+                "decision": {
+                    "type": "string",
+                    "enum": ["operator_supervised_direct_main_approved"],
+                },
+                "actor": {"type": "string", "enum": ["observer"]},
+                "payload": {"type": "object"},
+                "verification": {"type": "object"},
+                "artifact_refs": {"type": "object"},
+                "route_token_ref": {
+                    "type": "string",
+                    "description": (
+                        "Copy-safe opaque route reference from the active Direct "
+                        "Main Guide; raw route credentials are not accepted."
+                    ),
+                },
+            },
+            "required": [
+                "project_id",
+                "backlog_id",
+                "task_id",
+                "event_type",
+                "event_kind",
+                "phase",
+                "status",
+                "decision",
+                "actor",
+                "payload",
+                "verification",
+                "artifact_refs",
+                "route_token_ref",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "task_timeline_list",
         "description": "List append-only observer/agent timeline events by backlog, task, trace, phase, or event kind.",
         "inputSchema": {
@@ -3434,6 +3491,14 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             if key not in {"project_id", "bug_id"} and value is not None
         }
         return _http("POST", f"/api/backlog/{pid}/{bug_id}/audit-archive", body)
+
+    if name == "observer_direct_mutation_exception":
+        pid = args["project_id"]
+        return _http(
+            "POST",
+            f"/api/projects/{pid}/observer/direct-mutation-exception",
+            _task_timeline_body(args),
+        )
 
     if name == "task_timeline_append":
         pid = args["project_id"]

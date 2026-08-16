@@ -3631,6 +3631,84 @@ def test_governance_mcp_task_timeline_append_rejects_managed_qa_ref_without_regi
     assert calls == []
 
 
+def test_governance_mcp_observer_direct_mutation_exception_is_literal_and_fail_closed(
+    monkeypatch,
+):
+    tool = next(
+        item
+        for item in governance_mcp_server.TOOLS
+        if item.get("name") == "observer_direct_mutation_exception"
+    )
+    schema = tool["inputSchema"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["event_kind"]["enum"] == [
+        "observer_direct_implementation_exception"
+    ]
+
+    calls = []
+
+    def fake_http(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        if data and data.get("phase") != "pre_mutation":
+            return {
+                "error": "observer_direct_mutation_exception_shape_required",
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            }
+        return {"ok": True}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    literal_guide_arguments = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DIRECT-GUIDE-STDIO",
+        "task_id": "onboard-service-direct-guide-stdio",
+        "event_type": "mf.observer_direct_implementation_exception",
+        "event_kind": "observer_direct_implementation_exception",
+        "phase": "pre_mutation",
+        "status": "accepted",
+        "decision": "operator_supervised_direct_main_approved",
+        "actor": "observer",
+        "payload": {
+            "reason": "bounded operator-approved change",
+            "observer_direct_mutation": True,
+            "tiny_deterministic_scope": True,
+        },
+        "verification": {
+            "db_verified_pre_implementation_graph_trace": True,
+        },
+        "artifact_refs": {"graph_trace_ids": ["gqt-direct-guide"]},
+        "route_token_ref": "rtok-direct-guide-stdio",
+    }
+    expected_body = {
+        key: value
+        for key, value in literal_guide_arguments.items()
+        if key != "project_id"
+    }
+    assert governance_mcp_server._dispatch_tool(
+        "observer_direct_mutation_exception",
+        literal_guide_arguments,
+    ) == {"ok": True}
+    assert calls == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer/direct-mutation-exception",
+            expected_body,
+        )
+    ]
+
+    rejected = governance_mcp_server._dispatch_tool(
+        "observer_direct_mutation_exception",
+        {**literal_guide_arguments, "phase": "implementation"},
+    )
+    assert rejected["zero_write_rejection"] is True
+    assert rejected["writes_performed"] is False
+    assert len(calls) == 2
+    assert all(
+        path.endswith("/observer/direct-mutation-exception")
+        for _method, path, _body in calls
+    )
+
+
 def test_mcp_contract_add_dispatches_to_guided_http_facade(monkeypatch):
     calls = []
 
