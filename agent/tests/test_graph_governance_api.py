@@ -60706,6 +60706,439 @@ def _setup_pre_lineage_rejoin_recovery_case(
     }
 
 
+def _setup_contract_update_initial_join_allocation_case(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    suffix: str,
+) -> dict[str, Any]:
+    """Create the exact ContractUpdate allocate -> initial-join topology."""
+
+    now_iso = "2099-08-02T02:00:00Z"
+    monkeypatch.setattr(server, "_utc_now", lambda: now_iso)
+    backlog_id = f"AC-CONTRACT-UPDATE-INITIAL-JOIN-{suffix.upper()}"
+    task_id = f"contract-update-initial-join-{suffix}-worker"
+    worker_id = f"contract-update-initial-join-{suffix}"
+    worker_agent_id = f"/root/{worker_id}"
+    target_root = tmp_path / f"contract-update-initial-join-{suffix}"
+    worktree_path = target_root / "worker"
+    worktree_path.mkdir(parents=True)
+    owned_files = (
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    )
+
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id=f"obs-contract-update-initial-join-{suffix}",
+    )
+    start_route_ref = f"rtok-contract-update-start-{suffix}"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id="",
+        route_token_ref=start_route_ref,
+        allowed_actions=["contract_update_start"],
+    )
+    started = server.handle_project_contract_update_start(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": start_route_ref,
+                "onboard_service_waiver": True,
+            },
+        )
+    )
+    execution_id = started["contract_execution_id"]
+    route_identity = {
+        "route_id": f"route-contract-update-initial-join-{suffix}",
+        "route_context_hash": _fake_sha(
+            f"contract-update-initial-join-{suffix}:route"
+        ),
+        "prompt_contract_id": f"rprompt-contract-update-initial-join-{suffix}",
+        "prompt_contract_hash": _fake_sha(
+            f"contract-update-initial-join-{suffix}:prompt"
+        ),
+        "route_token_ref": f"rtok-contract-update-initial-join-{suffix}",
+        "visible_injection_manifest_hash": _fake_sha(
+            f"contract-update-initial-join-{suffix}:manifest"
+        ),
+    }
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=execution_id,
+        target_files=list(owned_files),
+        allowed_actions=["parallel_branch_allocate", "task_timeline_append"],
+        **route_identity,
+    )
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            worktree_path=str(worktree_path),
+            target_files=owned_files,
+            owned_files=owned_files,
+            task_id=task_id,
+            parent_task_id=execution_id,
+            root_task_id=started["root_contract_execution_id"],
+            backlog_id=backlog_id,
+            stage_task_id=task_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_id,
+            agent_id=worker_agent_id,
+            allocation_owner=worker_agent_id,
+            branch_ref=f"refs/heads/codex/{worker_id}",
+            base_commit="a" * 40,
+            head_commit="a" * 40,
+            target_head_commit="a" * 40,
+            merge_queue_id=f"mq-contract-update-initial-join-{suffix}",
+            status=STATE_WORKTREE_READY,
+            fence_token=f"fence-contract-update-initial-join-{suffix}",
+            attempt=1,
+            retry_round=0,
+        ),
+        now_iso=now_iso,
+    )
+    revision = append_branch_contract_revision(
+        conn,
+        context,
+        payload={
+            "schema_version": "parallel_branch_allocate_contract_revision.v1",
+            "source": "parallel_branch_allocate",
+            "contract_execution_id": execution_id,
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": execution_id,
+            "target_project_root": context.target_project_root,
+            "worktree_path": context.worktree_path,
+            "branch_ref": context.branch_ref,
+            "base_commit": context.base_commit,
+            "target_head_commit": context.target_head_commit,
+            "merge_queue_id": context.merge_queue_id,
+            "owned_files": list(owned_files),
+            "target_files": list(owned_files),
+            "route_identity": route_identity,
+        },
+        route_identity=route_identity,
+        route_gate={
+            "schema_version": "parallel_branch_allocate_route_gate.v1",
+            "source": "parallel_branch_allocate",
+            "decision": "allocated",
+            "caller_role": "observer",
+            "allowed_action": "parallel_branch_allocate",
+            **route_identity,
+        },
+        route_evidence_type="parallel_branch_allocate",
+        actor="parallel_branch_allocate",
+        now_iso=now_iso,
+    )
+    dispatch = {
+        "schema_version": "bounded_implementation_worker_dispatch.v1",
+        "source": "parallel_branch_allocate",
+        "service_generated": True,
+        "backlog_id": backlog_id,
+        "observer_command_id": execution_id,
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": execution_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_id,
+        "agent_id": worker_agent_id,
+        "target_project_root": context.target_project_root,
+        "worktree_path": context.worktree_path,
+        "branch_ref": context.branch_ref,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "merge_queue_id": context.merge_queue_id,
+        "owned_files": list(owned_files),
+        **route_identity,
+    }
+    dispatch_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="bounded_implementation_worker_dispatch",
+        event_kind="bounded_implementation_worker_dispatch",
+        phase="dispatch",
+        status="accepted",
+        payload={
+            **dispatch,
+            "dispatch_source": "parallel_branch_allocate",
+            "meta_contract_gate": {
+                "allowed": True,
+                "role": "observer",
+                "action": "dispatch_bounded_worker",
+                "observer_event_validated": True,
+            },
+            "bounded_implementation_worker_dispatch": dispatch,
+        },
+        actor="observer",
+    )
+    conn.commit()
+    return {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "execution_id": execution_id,
+        "worker_id": worker_id,
+        "worker_agent_id": worker_agent_id,
+        "target_root": target_root,
+        "owned_files": owned_files,
+        "route_identity": route_identity,
+        "context": context,
+        "revision": revision,
+        "dispatch_event_id": int(dispatch_event["id"]),
+    }
+
+
+def _contract_update_initial_join_body(case: Mapping[str, Any]) -> dict[str, Any]:
+    context = case["context"]
+    worker_id = case["worker_id"]
+    return {
+        "task_id": case["task_id"],
+        "parent_task_id": case["execution_id"],
+        "contract_execution_id": case["execution_id"],
+        "target_project_root": str(case["target_root"]),
+        "worker_id": worker_id,
+        "worker_slot_id": worker_id,
+        "agent_id": worker_id,
+        "actual_host_worker_id": worker_id,
+        "worker_session_id": f"session-{worker_id}",
+        "host_startup_id": f"startup-{worker_id}",
+        "host_session_id": f"session-{worker_id}",
+        **case["route_identity"],
+        "reason": "consume the exact ContractUpdate allocation once",
+        "ttl_seconds": 3600,
+        "now_iso": "2099-08-02T02:00:00Z",
+    }
+
+
+def test_contract_update_initial_join_uses_exact_allocation_and_dispatch_anchor(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_contract_update_initial_join_allocation_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="accepted",
+    )
+    context = case["context"]
+    anchor = server._runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+        conn,
+        project_id=PID,
+        context=context,
+        runtime_context_id=context.runtime_context_id,
+        contract_execution_id=case["execution_id"],
+    )
+
+    assert anchor["contract_id"] == "contract_update"
+    assert anchor["server_derived"] is True
+    assert anchor["source"] == (
+        "parallel_branch_allocate_contract_revision+"
+        "bounded_implementation_worker_dispatch"
+    )
+    assert anchor["allocation_revision_ref"] == (
+        f"contract-revision:{case['revision'].revision_id}"
+    )
+    assert anchor["dispatch_event_ref"] == (
+        f"timeline:{case['dispatch_event_id']}"
+    )
+    assert anchor["route_resolution_status"] == "resolved_append_scoped_ref"
+    assert anchor["raw_credentials_persisted"] is False
+
+    result = (
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=_contract_update_initial_join_body(case),
+            )
+        )
+    )
+    assert result["ok"] is True
+    assert result["status"] == "session_token_initial_join_issued"
+    binding = result["canonical_identity_binding"]
+    assert binding["contract_dispatch_identity_anchor"] == anchor
+    serialized = json.dumps(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=case["backlog_id"],
+            task_id=case["task_id"],
+        ),
+        sort_keys=True,
+    )
+    assert result["session_token"] not in serialized
+    assert result["fence_token"] not in serialized
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "duplicate_revision",
+        "duplicate_dispatch",
+        "revision_route",
+        "dispatch_task",
+        "dispatch_gate",
+        "context_branch",
+        "route_files",
+    ],
+)
+def test_contract_update_initial_join_allocation_drift_is_fail_closed(
+    conn,
+    monkeypatch,
+    tmp_path,
+    drift,
+):
+    case = _setup_contract_update_initial_join_allocation_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=drift.replace("_", "-"),
+    )
+    context = case["context"]
+    if drift == "duplicate_revision":
+        row = conn.execute(
+            "SELECT * FROM parallel_branch_runtime_contract_revisions "
+            "WHERE project_id = ? AND runtime_context_id = ?",
+            (PID, context.runtime_context_id),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO parallel_branch_runtime_contract_revisions "
+            "SELECT project_id, runtime_context_id, ?, task_id, parent_task_id, "
+            "backlog_id, contract_version, payload_json, route_identity_json, "
+            "route_gate_json, route_evidence_type, actor, ? "
+            "FROM parallel_branch_runtime_contract_revisions "
+            "WHERE project_id = ? AND runtime_context_id = ? AND revision_id = ?",
+            (
+                _fake_sha(f"{drift}:duplicate"),
+                "2099-08-02T02:00:01Z",
+                PID,
+                context.runtime_context_id,
+                row["revision_id"],
+            ),
+        )
+    elif drift == "duplicate_dispatch":
+        row = conn.execute(
+            "SELECT * FROM task_timeline_events WHERE id = ?",
+            (case["dispatch_event_id"],),
+        ).fetchone()
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=case["backlog_id"],
+            task_id=case["task_id"],
+            event_type="bounded_implementation_worker_dispatch",
+            event_kind="bounded_implementation_worker_dispatch",
+            phase="dispatch",
+            status="accepted",
+            payload=json.loads(row["payload_json"]),
+            actor="observer",
+        )
+    elif drift == "revision_route":
+        row = conn.execute(
+            "SELECT route_identity_json FROM parallel_branch_runtime_contract_revisions "
+            "WHERE project_id = ? AND runtime_context_id = ?",
+            (PID, context.runtime_context_id),
+        ).fetchone()
+        route = json.loads(row["route_identity_json"])
+        route["route_id"] = "route-forged-contract-update"
+        conn.execute(
+            "UPDATE parallel_branch_runtime_contract_revisions "
+            "SET route_identity_json = ? WHERE project_id = ? "
+            "AND runtime_context_id = ?",
+            (json.dumps(route, sort_keys=True), PID, context.runtime_context_id),
+        )
+    elif drift in {"dispatch_task", "dispatch_gate"}:
+        row = conn.execute(
+            "SELECT payload_json FROM task_timeline_events WHERE id = ?",
+            (case["dispatch_event_id"],),
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        if drift == "dispatch_task":
+            payload["bounded_implementation_worker_dispatch"]["task_id"] = (
+                "forged-contract-update-task"
+            )
+        else:
+            payload["meta_contract_gate"]["allowed"] = False
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True), case["dispatch_event_id"]),
+        )
+    elif drift == "context_branch":
+        conn.execute(
+            "UPDATE parallel_branch_runtime_contexts SET branch_ref = ? "
+            "WHERE project_id = ? AND runtime_context_id = ?",
+            (
+                "refs/heads/codex/forged-contract-update",
+                PID,
+                context.runtime_context_id,
+            ),
+        )
+        context = get_branch_context(conn, PID, case["task_id"])
+        assert context is not None
+    else:
+        conn.execute(
+            "UPDATE observer_route_token_refs SET target_files_json = ? "
+            "WHERE project_id = ? AND route_token_ref = ?",
+            (
+                json.dumps(["agent/governance/server.py"]),
+                PID,
+                case["route_identity"]["route_token_ref"],
+            ),
+        )
+    conn.commit()
+    before = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+
+    anchor = server._runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
+        conn,
+        project_id=PID,
+        context=context,
+        runtime_context_id=context.runtime_context_id,
+        contract_execution_id=case["execution_id"],
+    )
+
+    assert anchor == {}
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=_contract_update_initial_join_body(
+                    {**case, "context": context}
+                ),
+            )
+        )
+    assert rejected.value.code == (
+        "runtime_context_initial_join_dispatch_identity_mismatch"
+    )
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["timeline_event_persisted"] is False
+    assert rejected.value.details["credential_rotated"] is False
+    assert "\n".join(conn.iterdump()) == before
+    assert conn.total_changes == before_changes
+
+
 def _pre_lineage_rejoin_body(case: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "task_id": case["task_id"],
