@@ -46646,6 +46646,421 @@ def _runtime_context_closed_canonical_owned_file_set(
     return tuple(sorted(canonical_files))
 
 
+def _runtime_context_contract_update_allocation_identity_anchor(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    contract_execution_id: str,
+    contract_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind a contract_update worker to its accepted allocator evidence.
+
+    ``contract_update.v1`` deliberately has no mf_parallel
+    ``observer_dispatch_bounded_workers`` line.  Its worker allocation still
+    has two independent, server-authored identity records: the immutable
+    ``parallel_branch_allocate`` contract revision and the accepted bounded
+    dispatch timeline event.  Both must agree byte-for-field with the durable
+    RuntimeContext and with one live append-scoped observer route.
+
+    This is not an mf_parallel fallback.  The caller has already resolved the
+    exact parent ContractRuntime row, and this helper accepts only the
+    ``contract_update`` contract id.  Any missing, duplicate, stale, or
+    conflicting evidence returns an empty anchor so the existing initial-join
+    Gate remains zero-write/fail-closed.
+    """
+
+    execution_id = str(contract_execution_id or "").strip()
+    runtime_id = str(runtime_context_id or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    if (
+        not execution_id
+        or not runtime_id
+        or parent_task_id != execution_id
+        or str(contract_record.get("contract_id") or "").strip()
+        != "contract_update"
+        or str(contract_record.get("project_id") or "").strip() != project_id
+        or str(contract_record.get("backlog_id") or "").strip() != backlog_id
+        or str(contract_record.get("contract_execution_id") or "").strip()
+        != execution_id
+    ):
+        return {}
+
+    revision_rows = conn.execute(
+        """
+        SELECT revision_id, task_id, parent_task_id, backlog_id,
+               payload_json, route_identity_json, route_gate_json,
+               route_evidence_type, actor, created_at
+          FROM parallel_branch_runtime_contract_revisions
+         WHERE project_id = ? AND runtime_context_id = ?
+           AND route_evidence_type = 'parallel_branch_allocate'
+        """,
+        (project_id, runtime_id),
+    ).fetchall()
+    if len(revision_rows) != 1:
+        return {}
+    revision_row = revision_rows[0]
+    try:
+        revision_payload = json.loads(str(revision_row["payload_json"] or "{}"))
+        revision_route = json.loads(
+            str(revision_row["route_identity_json"] or "{}")
+        )
+        revision_route_gate = json.loads(
+            str(revision_row["route_gate_json"] or "{}")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not all(
+        isinstance(value, Mapping)
+        for value in (revision_payload, revision_route, revision_route_gate)
+    ):
+        return {}
+
+    revision_receipt = (
+        revision_payload.get("revision_receipt")
+        if isinstance(revision_payload.get("revision_receipt"), Mapping)
+        else {}
+    )
+    revision_id = str(revision_row["revision_id"] or "").strip()
+    expected_owned_files = _runtime_context_closed_canonical_owned_file_set(
+        tuple(getattr(context, "owned_files", ()) or ())
+        or tuple(getattr(context, "target_files", ()) or ())
+    )
+    revision_owned_files = _runtime_context_closed_canonical_owned_file_set(
+        revision_payload.get("owned_files")
+    )
+    revision_target_files = _runtime_context_closed_canonical_owned_file_set(
+        revision_payload.get("target_files")
+    )
+    if (
+        not expected_owned_files
+        or revision_owned_files != expected_owned_files
+        or revision_target_files != expected_owned_files
+        or str(revision_row["task_id"] or "").strip() != task_id
+        or str(revision_row["parent_task_id"] or "").strip()
+        != parent_task_id
+        or str(revision_row["backlog_id"] or "").strip() != backlog_id
+        or str(revision_row["actor"] or "").strip()
+        != "parallel_branch_allocate"
+        or str(revision_payload.get("schema_version") or "").strip()
+        != "parallel_branch_allocate_contract_revision.v1"
+        or str(revision_payload.get("source") or "").strip()
+        != "parallel_branch_allocate"
+        or str(revision_payload.get("contract_execution_id") or "").strip()
+        != execution_id
+        or str(revision_payload.get("runtime_context_id") or "").strip()
+        != runtime_id
+        or str(
+            revision_receipt.get("canonical_visible_contract_text_hash") or ""
+        ).strip()
+        != revision_id
+    ):
+        return {}
+
+    identity = {
+        "runtime_context_id": runtime_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": str(getattr(context, "worker_id", "") or "").strip(),
+        "worker_slot_id": str(
+            getattr(context, "worker_slot_id", "")
+            or getattr(context, "worker_id", "")
+            or ""
+        ).strip(),
+        "target_project_root": _runtime_context_effective_target_project_root(
+            context
+        ),
+        "worktree_path": str(
+            getattr(context, "worktree_path", "") or ""
+        ).strip(),
+        "branch_ref": str(
+            getattr(context, "branch_ref", "") or ""
+        ).strip(),
+        "base_commit": str(
+            getattr(context, "base_commit", "") or ""
+        ).strip(),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "") or ""
+        ).strip(),
+        "merge_queue_id": str(
+            getattr(context, "merge_queue_id", "") or ""
+        ).strip(),
+    }
+    allocation_agent_id = str(
+        getattr(context, "agent_id", "")
+        or getattr(context, "allocation_owner", "")
+        or ""
+    ).strip()
+    allocation_owner = str(
+        getattr(context, "allocation_owner", "") or ""
+    ).strip()
+    if (
+        any(not identity.get(field) for field in identity)
+        or not allocation_agent_id
+        or allocation_agent_id != allocation_owner
+        or str(revision_payload.get("task_id") or task_id).strip() != task_id
+        or str(revision_payload.get("parent_task_id") or parent_task_id).strip()
+        != parent_task_id
+        or str(revision_payload.get("target_project_root") or "").strip()
+        != identity["target_project_root"]
+        or str(revision_payload.get("worktree_path") or "").strip()
+        != identity["worktree_path"]
+        or str(revision_payload.get("branch_ref") or "").strip()
+        != identity["branch_ref"]
+        or str(revision_payload.get("base_commit") or "").strip()
+        != identity["base_commit"]
+        or str(revision_payload.get("target_head_commit") or "").strip()
+        != identity["target_head_commit"]
+        or str(revision_payload.get("merge_queue_id") or "").strip()
+        != identity["merge_queue_id"]
+    ):
+        return {}
+
+    revision_route_payload = (
+        revision_payload.get("route_identity")
+        if isinstance(revision_payload.get("route_identity"), Mapping)
+        else {}
+    )
+    allocation_route = {
+        field: str(
+            revision_route.get(field)
+            or revision_route_payload.get(field)
+            or ""
+        ).strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if (
+        any(not value for value in allocation_route.values())
+        or any(
+            str(revision_route_payload.get(field) or "").strip() != value
+            for field, value in allocation_route.items()
+        )
+        or str(revision_route_gate.get("source") or "").strip()
+        != "parallel_branch_allocate"
+        or str(revision_route_gate.get("decision") or "").strip()
+        != "allocated"
+        or str(revision_route_gate.get("caller_role") or "").strip()
+        != "observer"
+        or str(revision_route_gate.get("allowed_action") or "").strip()
+        != "parallel_branch_allocate"
+        or any(
+            str(revision_route_gate.get(field) or "").strip() != value
+            for field, value in allocation_route.items()
+        )
+    ):
+        return {}
+
+    # Initial join evaluates this anchor once in read preflight and once under
+    # ``BEGIN IMMEDIATE``.  Do not use the schema-ensuring timeline facade in
+    # the locked check: its ``executescript`` can implicitly commit.  The
+    # accepted allocation already proves the timeline table exists.
+    timeline_rows = conn.execute(
+        """
+        SELECT id, event_kind, status, actor, payload_json
+          FROM task_timeline_events
+         WHERE project_id = ? AND task_id = ? AND backlog_id = ?
+         ORDER BY id ASC
+        """,
+        (project_id, task_id, backlog_id),
+    ).fetchall()
+    timeline_events: list[dict[str, Any]] = []
+    for row in timeline_rows:
+        try:
+            event_payload = json.loads(str(row["payload_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(event_payload, Mapping):
+            return {}
+        timeline_events.append(
+            {
+                "id": int(row["id"] or 0),
+                "event_kind": str(row["event_kind"] or ""),
+                "status": str(row["status"] or ""),
+                "actor": str(row["actor"] or ""),
+                "payload": event_payload,
+            }
+        )
+    dispatch_candidates: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    for event in timeline_events:
+        if (
+            str(event.get("event_kind") or "").strip()
+            != "bounded_implementation_worker_dispatch"
+            or str(event.get("status") or "").strip().lower()
+            not in {"accepted", "passed"}
+        ):
+            continue
+        event_payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        dispatch = (
+            event_payload.get("bounded_implementation_worker_dispatch")
+            if isinstance(
+                event_payload.get("bounded_implementation_worker_dispatch"),
+                Mapping,
+            )
+            else {}
+        )
+        meta_contract_gate = (
+            event_payload.get("meta_contract_gate")
+            if isinstance(event_payload.get("meta_contract_gate"), Mapping)
+            else {}
+        )
+        if (
+            str(dispatch.get("runtime_context_id") or "").strip()
+            == runtime_id
+            and str(event.get("actor") or "").strip() == "observer"
+            and str(event_payload.get("schema_version") or "").strip()
+            == "bounded_implementation_worker_dispatch.v1"
+            and str(event_payload.get("source") or "").strip()
+            == "parallel_branch_allocate"
+            and str(event_payload.get("dispatch_source") or "").strip()
+            == "parallel_branch_allocate"
+            and event_payload.get("service_generated") is True
+            and meta_contract_gate.get("allowed") is True
+            and str(meta_contract_gate.get("role") or "").strip()
+            == "observer"
+            and str(meta_contract_gate.get("action") or "").strip()
+            == "dispatch_bounded_worker"
+            and meta_contract_gate.get("observer_event_validated") is True
+        ):
+            dispatch_candidates.append((event, dispatch))
+    if len(dispatch_candidates) != 1:
+        return {}
+    dispatch_event, dispatch = dispatch_candidates[0]
+    dispatch_owned_files = _runtime_context_closed_canonical_owned_file_set(
+        dispatch.get("owned_files")
+    )
+    if (
+        str(dispatch.get("schema_version") or "").strip()
+        != "bounded_implementation_worker_dispatch.v1"
+        or str(dispatch.get("source") or "").strip()
+        != "parallel_branch_allocate"
+        or dispatch.get("service_generated") is not True
+        or str(dispatch.get("backlog_id") or "").strip() != backlog_id
+        or str(dispatch.get("observer_command_id") or "").strip()
+        != execution_id
+        or str(dispatch.get("task_id") or "").strip() != task_id
+        or str(dispatch.get("parent_task_id") or "").strip()
+        != parent_task_id
+        or str(dispatch.get("worker_id") or "").strip()
+        != identity["worker_id"]
+        or str(dispatch.get("worker_slot_id") or "").strip()
+        != identity["worker_slot_id"]
+        or str(dispatch.get("agent_id") or "").strip()
+        != allocation_agent_id
+        or dispatch_owned_files != expected_owned_files
+        or any(
+            str(dispatch.get(field) or "").strip() != expected
+            for field, expected in identity.items()
+        )
+        or any(
+            str(dispatch.get(field) or "").strip() != expected
+            for field, expected in allocation_route.items()
+        )
+    ):
+        return {}
+
+    route_rows = conn.execute(
+        """
+        SELECT route_id, route_context_hash, prompt_contract_id,
+               prompt_contract_hash, visible_injection_manifest_hash,
+               backlog_id, task_id, caller_role, allowed_actions_json,
+               expires_at, scope_json, target_files_json, owned_files_json
+          FROM observer_route_token_refs
+         WHERE project_id = ? AND route_token_ref = ? AND status = 'active'
+        """,
+        (project_id, allocation_route["route_token_ref"]),
+    ).fetchall()
+    if len(route_rows) != 1:
+        return {}
+    try:
+        route_row = route_rows[0]
+        route_scope = json.loads(str(route_row["scope_json"] or "{}"))
+        route_allowed_actions = json.loads(
+            str(route_row["allowed_actions_json"] or "[]")
+        )
+        route_target_files = _runtime_context_closed_canonical_owned_file_set(
+            json.loads(str(route_row["target_files_json"] or "[]"))
+        )
+        route_owned_files = _runtime_context_closed_canonical_owned_file_set(
+            json.loads(str(route_row["owned_files_json"] or "[]"))
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(route_scope, Mapping) or not isinstance(
+        route_allowed_actions, list
+    ):
+        return {}
+    current_route = {
+        field: str(
+            route_row[field]
+            if field != "route_token_ref"
+            else allocation_route["route_token_ref"]
+        ).strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    normalized_route_actions = {
+        str(action or "").strip().lower().replace("-", "_").replace(".", "_")
+        for action in route_allowed_actions
+        if str(action or "").strip()
+    }
+    if (
+        current_route != allocation_route
+        or str(route_row["backlog_id"] or "").strip() != backlog_id
+        or str(route_row["task_id"] or "").strip() != execution_id
+        or str(route_row["caller_role"] or "").strip() != "observer"
+        or not {
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        }.issubset(normalized_route_actions)
+        or any(
+            str(route_scope.get(field) or "").strip() != expected
+            for field, expected in (
+                ("project_id", project_id),
+                ("backlog_id", backlog_id),
+                ("task_id", execution_id),
+            )
+        )
+        or not str(route_row["expires_at"] or "").strip()
+        or str(route_row["expires_at"] or "").strip()
+        <= str(_utc_now() or "").strip()
+        or route_target_files != expected_owned_files
+        or route_owned_files != expected_owned_files
+    ):
+        return {}
+
+    core = {
+        "schema_version": (
+            "runtime_context.contract_update_allocation_identity_anchor.v1"
+        ),
+        "server_derived": True,
+        "source": (
+            "parallel_branch_allocate_contract_revision+"
+            "bounded_implementation_worker_dispatch"
+        ),
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "contract_update",
+        "allocation_revision_id": revision_id,
+        "allocation_revision_ref": f"contract-revision:{revision_id}",
+        "dispatch_event_ref": f"timeline:{int(dispatch_event.get('id') or 0)}",
+        **identity,
+        "route_identity": dict(current_route),
+        "allocated_route_identity": dict(allocation_route),
+        "owned_files": list(expected_owned_files),
+        "agent_id": allocation_agent_id,
+        "route_resolution_status": "resolved_append_scoped_ref",
+        "raw_credentials_persisted": False,
+    }
+    return {**core, "anchor_hash": _stable_public_hash(core)}
+
+
 def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
     conn,
     *,
@@ -46676,6 +47091,16 @@ def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
         != execution_id
     ):
         return {}
+
+    if str(record.get("contract_id") or "").strip() == "contract_update":
+        return _runtime_context_contract_update_allocation_identity_anchor(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_id,
+            contract_execution_id=execution_id,
+            contract_record=record,
+        )
 
     dispatch_match = _contract_runtime_dispatch_line_match(record, context)
     if not dispatch_match:
