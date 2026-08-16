@@ -101248,6 +101248,92 @@ _CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS = (
 )
 
 
+def _contract_runtime_observer_merge_current_lane_identity(
+    record: Mapping[str, Any],
+) -> dict[str, str]:
+    """Return the server-projected atomic lane selected for observer_merge."""
+
+    next_line = _contract_runtime_next_line(record)
+    if (
+        str(next_line.get("stage_id") or "").strip()
+        != "observer_lane_merge"
+        or str(next_line.get("line_id") or "").strip()
+        != "observer_merge"
+    ):
+        return {}
+    safe_copy = (
+        next_line.get("writer_role_safe_copy_payload")
+        if isinstance(
+            next_line.get("writer_role_safe_copy_payload"), Mapping
+        )
+        else {}
+    )
+    copy_payload = (
+        safe_copy.get("copy_payload")
+        if isinstance(safe_copy.get("copy_payload"), Mapping)
+        else {}
+    )
+    identity: dict[str, str] = {}
+    for field in _CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS:
+        values = {
+            str(source.get(field) or "").strip()
+            for source in (next_line, copy_payload)
+            if str(source.get(field) or "").strip()
+        }
+        if len(values) > 1:
+            return {}
+        identity[field] = next(iter(values)) if values else ""
+    required_selector_fields = (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "worker_slot_id",
+        "lane_id",
+        "line_instance_id",
+    )
+    if any(not identity.get(field) for field in required_selector_fields):
+        return {}
+    if identity["line_instance_id"] != (
+        f"runtime_context:{identity['runtime_context_id']}"
+    ):
+        return {}
+    return identity
+
+
+def _contract_runtime_select_observer_merge_durable_authority(
+    record: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Select one durable merge tuple from the current atomic lane only."""
+
+    unique = {
+        stable_sha256(dict(item)): dict(item)
+        for item in candidates
+        if isinstance(item, Mapping)
+    }
+    if (
+        _is_mf_parallel_postmerge_revision(record)
+        and str(_contract_runtime_next_line(record).get("line_id") or "").strip()
+        == "observer_merge"
+    ):
+        selector = _contract_runtime_observer_merge_current_lane_identity(
+            record
+        )
+        if not selector:
+            return {}
+        unique = {
+            digest: item
+            for digest, item in unique.items()
+            if all(
+                not expected
+                or str(item.get(field) or "").strip() == expected
+                for field, expected in selector.items()
+            )
+        }
+    return next(iter(unique.values())) if len(unique) == 1 else {}
+
+
 def _contract_runtime_observer_merge_lane_identity_mismatches(
     value: Mapping[str, Any] | None,
     authority: Mapping[str, Any] | None,
@@ -101476,6 +101562,9 @@ def _resolve_contract_runtime_observer_proof(
 def _contract_runtime_bind_observer_dispatch_transport_proof(
     record: Mapping[str, Any],
     observer_proof: Mapping[str, Any] | None,
+    *,
+    conn=None,
+    project_id: str = "",
 ) -> dict[str, Any]:
     """Bind copy-safe observer transport proof to an observer-owned body.
 
@@ -101486,19 +101575,6 @@ def _contract_runtime_bind_observer_dispatch_transport_proof(
     only: ``_contract_runtime_line_write_body`` does not persist them as line
     evidence.
     """
-
-    if not isinstance(observer_proof, Mapping):
-        return dict(record)
-    observer_session_id = str(
-        observer_proof.get("observer_session_id") or ""
-    ).strip()
-    route_token_ref = str(observer_proof.get("route_token_ref") or "").strip()
-    if (
-        str(observer_proof.get("role") or "").strip() != "observer"
-        or not observer_session_id
-        or not route_token_ref
-    ):
-        return dict(record)
 
     projected = dict(record)
     guide = (
@@ -101517,7 +101593,6 @@ def _contract_runtime_bind_observer_dispatch_transport_proof(
         or str(next_action.get("owner_role") or "").strip() != "observer"
     ):
         return projected
-
     safe_copy = (
         dict(guide.get("writer_role_safe_copy_payload") or {})
         if isinstance(guide.get("writer_role_safe_copy_payload"), Mapping)
@@ -101532,6 +101607,46 @@ def _contract_runtime_bind_observer_dispatch_transport_proof(
         str(copy_payload.get("line_id") or "").strip() != next_line_id
         or str(copy_payload.get("actor_role") or "").strip() != "observer"
     ):
+        return projected
+
+    if (
+        conn is not None
+        and project_id
+        and next_line_id == "observer_merge"
+    ):
+        authority = _contract_runtime_observer_merge_durable_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+        if authority:
+            for field in _CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS:
+                value = str(authority.get(field) or "").strip()
+                if value:
+                    next_action[field] = value
+                    copy_payload[field] = value
+
+    if not isinstance(observer_proof, Mapping):
+        safe_copy["copy_payload"] = copy_payload
+        guide["writer_role_safe_copy_payload"] = safe_copy
+        next_action["writer_role_safe_copy_payload"] = dict(safe_copy)
+        guide["next_legal_action"] = next_action
+        projected["runtime_guide"] = guide
+        return projected
+    observer_session_id = str(
+        observer_proof.get("observer_session_id") or ""
+    ).strip()
+    route_token_ref = str(observer_proof.get("route_token_ref") or "").strip()
+    if (
+        str(observer_proof.get("role") or "").strip() != "observer"
+        or not observer_session_id
+        or not route_token_ref
+    ):
+        safe_copy["copy_payload"] = copy_payload
+        guide["writer_role_safe_copy_payload"] = safe_copy
+        next_action["writer_role_safe_copy_payload"] = dict(safe_copy)
+        guide["next_legal_action"] = next_action
+        projected["runtime_guide"] = guide
         return projected
 
     copy_payload["observer_session_id"] = observer_session_id
@@ -112755,8 +112870,10 @@ def _contract_runtime_observer_merge_durable_authority(
                     ),
                 }
             )
-    unique = {stable_sha256(item): item for item in candidates}
-    return next(iter(unique.values())) if len(unique) == 1 else {}
+    return _contract_runtime_select_observer_merge_durable_authority(
+        record,
+        candidates,
+    )
 
 
 def _contract_runtime_bind_observer_merge_authority(
@@ -170425,6 +170542,8 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
             record = _contract_runtime_bind_observer_dispatch_transport_proof(
                 record,
                 getattr(ctx, "_contract_runtime_observer_proof", None),
+                conn=conn,
+                project_id=project_id,
             )
         except StalePinnedContractExecutionError as exc:
             return _contract_runtime_stale_recovery_projection(

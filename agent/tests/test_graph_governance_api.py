@@ -739,6 +739,171 @@ def test_observer_merge_binder_rejects_top_level_cross_lane_identity(
     assert rejected.value.details["mismatches"][0]["field"] == field
 
 
+def test_mf_parallel_two_lane_observer_merge_selects_current_atomic_lane():
+    execution_id = "cex-two-lane-observer-merge-selection"
+
+    def lane(name):
+        return {
+            "runtime_context_id": f"mfrctx-{name}",
+            "task_id": f"{name}-task",
+            "parent_task_id": execution_id,
+            "worker_role": "mf_sub",
+            "worker_id": f"{name}-worker",
+            "worker_slot_id": f"{name}-slot",
+            "lane_id": f"{name}-slot",
+            "line_instance_id": f"runtime_context:mfrctx-{name}",
+            "merge_commit": ("a" if name == "focus" else "b") * 40,
+        }
+
+    focus = lane("focus")
+    reminder = lane("reminder")
+    guide_identity = {
+        field: reminder[field]
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_role",
+            "worker_slot_id",
+            "lane_id",
+            "line_instance_id",
+        )
+    }
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev9",
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "observer_lane_merge",
+                "line_id": "observer_merge",
+                "owner_role": "observer",
+                **guide_identity,
+                "writer_role_safe_copy_payload": {
+                    "copy_payload": {
+                        "stage_id": "observer_lane_merge",
+                        "line_id": "observer_merge",
+                        "actor_role": "observer",
+                        **guide_identity,
+                    }
+                },
+            }
+        },
+    }
+
+    selected = (
+        server._contract_runtime_select_observer_merge_durable_authority(
+            record,
+            [focus, reminder],
+        )
+    )
+    assert selected["runtime_context_id"] == "mfrctx-reminder"
+    assert selected["worker_id"] == "reminder-worker"
+
+    conflicting = copy.deepcopy(record)
+    conflicting["runtime_guide"]["next_legal_action"]["task_id"] = (
+        "focus-task"
+    )
+    assert (
+        server._contract_runtime_select_observer_merge_durable_authority(
+            conflicting,
+            [focus, reminder],
+        )
+        == {}
+    )
+
+
+def test_observer_merge_guide_binds_complete_server_lane_identity(
+    monkeypatch,
+):
+    execution_id = "cex-observer-merge-guide-lane-identity"
+    authority = {
+        "runtime_context_id": "mfrctx-reminder-guide",
+        "task_id": "reminder-guide-task",
+        "parent_task_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": "reminder-guide-worker",
+        "worker_slot_id": "reminder-guide-slot",
+        "lane_id": "reminder-guide-slot",
+        "line_instance_id": "runtime_context:mfrctx-reminder-guide",
+    }
+    guide_identity = {
+        key: value
+        for key, value in authority.items()
+        if key != "worker_id"
+    }
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev9",
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "observer_lane_merge",
+                "line_id": "observer_merge",
+                "owner_role": "observer",
+                **guide_identity,
+                "writer_role_safe_copy_payload": {
+                    "copy_payload": {
+                        "stage_id": "observer_lane_merge",
+                        "line_id": "observer_merge",
+                        "actor_role": "observer",
+                        **guide_identity,
+                    }
+                },
+            },
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    "stage_id": "observer_lane_merge",
+                    "line_id": "observer_merge",
+                    "actor_role": "observer",
+                    **guide_identity,
+                }
+            },
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_observer_merge_durable_authority",
+        lambda *_args, **_kwargs: dict(authority),
+    )
+
+    projected = server._contract_runtime_bind_observer_dispatch_transport_proof(
+        record,
+        None,
+        conn=object(),
+        project_id=PID,
+    )
+    next_action = projected["runtime_guide"]["next_legal_action"]
+    copy_payload = next_action["writer_role_safe_copy_payload"][
+        "copy_payload"
+    ]
+    for field, expected in authority.items():
+        assert next_action[field] == expected
+        assert copy_payload[field] == expected
+
+    projected_with_proof = (
+        server._contract_runtime_bind_observer_dispatch_transport_proof(
+            record,
+            {
+                "role": "observer",
+                "observer_session_id": "obs-observer-merge-guide",
+                "route_token_ref": "rtok-observer-merge-guide",
+            },
+            conn=object(),
+            project_id=PID,
+        )
+    )
+    proof_payload = projected_with_proof["runtime_guide"][
+        "next_legal_action"
+    ]["writer_role_safe_copy_payload"]["copy_payload"]
+    assert proof_payload["observer_session_id"] == (
+        "obs-observer-merge-guide"
+    )
+    assert proof_payload["observer_route_token_ref"] == (
+        "rtok-observer-merge-guide"
+    )
+    for field, expected in authority.items():
+        assert proof_payload[field] == expected
+
+
 @pytest.mark.parametrize(
     ("tamper", "expected_reason"),
     [
