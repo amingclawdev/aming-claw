@@ -104164,10 +104164,11 @@ def test_onboard_route_guide_parallel_contracts_still_select_eligible_queue_head
 
 
 def test_onboard_route_guide_complete_projection_suppresses_stale_ledger(conn):
+    candidate_server, _ = _preload_candidate_server_module()
     backlog_id = "AC-ONBOARD-COMPLETE-PROJECTION-SUPPRESSES-STALE-LEDGER"
     _insert_simple_mf_close_backlog(conn, backlog_id)
 
-    first = server.handle_project_onboard_route_guide(
+    first = candidate_server.handle_project_onboard_route_guide(
         _ctx(
             {"project_id": PID},
             method="POST",
@@ -104205,7 +104206,7 @@ def test_onboard_route_guide_complete_projection_suppresses_stale_ledger(conn):
     )
     conn.commit()
 
-    result = server.handle_project_onboard_route_guide(
+    result = candidate_server.handle_project_onboard_route_guide(
         _ctx(
             {"project_id": PID},
             method="POST",
@@ -104226,10 +104227,318 @@ def test_onboard_route_guide_complete_projection_suppresses_stale_ledger(conn):
     if conflict:
         assert conflict["status"] == "suppressed_stale_resume"
         assert conflict["shadowed_source"] == "task_timeline_compact_ledger"
-    assert result["next_legal_action"]["id"] == "contract_complete_no_runtime_action"
-    assert result["next_legal_action"]["action"] == "no_runtime_action"
+    next_action = result["next_legal_action"]
+    assert next_action["id"] == "contract_update_start"
+    assert next_action["action"] == "contract_update_start"
+    assert next_action["interface"] == "contract_update_start"
+    assert next_action["mcp_tool"] == "contract_update_start"
     assert result["next_legal_action"]["contract_complete_runtime_no_remaining_line"] is True
-    assert "successor-enter route" in result["next_legal_action"]["next_step"]
+    assert next_action["server_derived_authority"]["parent_remains_complete"] is True
+    assert next_action["server_derived_authority"]["successor_contract_id"] == (
+        candidate_server.CONTRACT_UPDATE_CONTRACT_ID
+    )
+    assert result["contract_chain_current"]["current_contract_execution_id"] == (
+        candidate_server._onboard_service_execution_id(PID, backlog_id)
+    )
+    assert result["contract_chain_current"]["active_child_contract_execution_id"] == ""
+
+
+def test_completed_onboard_service_open_row_projects_unique_contract_update_in_full_compact_and_capsule(
+    conn,
+):
+    candidate_server, candidate_server_path = _preload_candidate_server_module()
+    assert Path(candidate_server.__file__).resolve() == candidate_server_path
+    backlog_id = "AC-ONBOARD-COMPLETED-SERVICE-CONTRACT-UPDATE"
+    target_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'OPEN', target_files = ?, "
+        "test_files = '[]' WHERE bug_id = ?",
+        (json.dumps(target_files), backlog_id),
+    )
+    conn.commit()
+
+    request = {
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "continue_contract_chain",
+    }
+    full = candidate_server.handle_project_onboard_route_guide(
+        _ctx({"project_id": PID}, method="POST", body=request)
+    )
+    parent_execution_id = candidate_server._onboard_service_execution_id(
+        PID, backlog_id
+    )
+    expected_body = {
+        "schema_version": "onboard_route_guide.contract_update_start_input.v1",
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "observer_route_token_ref": (
+            "<copy scoped_route_grant response.route_token_ref>"
+        ),
+    }
+    next_action = full["next_legal_action"]
+    assert {
+        next_action["id"],
+        next_action["action"],
+        next_action["interface"],
+        next_action["mcp_tool"],
+    } == {"contract_update_start"}
+    assert next_action["action_input"] == expected_body
+    assert next_action["copy_safe_body"] == expected_body
+    assert next_action["action_input_ready"] is False
+    assert next_action["action_input_missing_fields"] == [
+        "scoped_route_token_ref"
+    ]
+    route_grant = next_action["observer_route_context_issue"]
+    assert route_grant == next_action["scoped_route_grant"]
+    assert route_grant["required"] is True
+    assert route_grant["copy_safe_body"] == {
+        "project_id": PID,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": parent_execution_id,
+        "target_files": target_files,
+        "allowed_actions": ["contract_update_start"],
+        "evidence_refs": [
+            f"onboard_service:{parent_execution_id}",
+            f"backlog:{backlog_id}",
+        ],
+    }
+    assert next_action["host_realization"]["required_replacement_paths"] == [
+        "copy_safe_body.observer_route_token_ref"
+    ]
+
+    parent = candidate_server._contract_runtime_store(conn).get(
+        parent_execution_id
+    )
+    assert parent["completed_lines"] == [
+        candidate_server._onboard_service_waiver_line()
+    ]
+    assert parent["runtime_guide"]["next_legal_action"] is None
+    current = full["contract_chain_current"]
+    assert current["readiness_state"] == "contract_complete"
+    assert current["root_contract_execution_id"] == parent_execution_id
+    assert current["current_contract_execution_id"] == parent_execution_id
+    assert current["active_child_contract_execution_id"] == ""
+
+    compact = candidate_server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={**request, "response_view": "compact"},
+        )
+    )
+    assert compact["next_legal_action"]["action"] == "contract_update_start"
+    assert compact["action_input"] == expected_body
+    assert compact["copy_safe_body"] == expected_body
+    assert compact["canonical_executable_action"]["mcp_tool"] == (
+        "contract_update_start"
+    )
+    assert compact["canonical_executable_action"]["copy_safe_body"] == (
+        expected_body
+    )
+    capsule = candidate_server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": compact["guide_capsule_ref"],
+                "sections": ["next_action", "action_input"],
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+            },
+        )
+    )
+    assert capsule["ok"] is True
+    assert capsule["sections"]["next_action"]["action"] == (
+        "contract_update_start"
+    )
+    assert capsule["sections"]["action_input"]["body"] == expected_body
+    assert capsule["sections"]["action_input"][
+        "canonical_executable_action"
+    ]["copy_safe_body"] == expected_body
+
+
+def test_completed_onboard_service_contract_update_uses_exact_scoped_route_when_available(
+    conn,
+):
+    candidate_server, _ = _preload_candidate_server_module()
+    backlog_id = "AC-ONBOARD-COMPLETED-SERVICE-EXACT-CONTRACT-UPDATE-ROUTE"
+    target_files = ["agent/governance/server.py"]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'OPEN', target_files = ?, "
+        "test_files = '[]' WHERE bug_id = ?",
+        (json.dumps(target_files), backlog_id),
+    )
+    parent_execution_id = candidate_server._onboard_service_execution_id(
+        PID, backlog_id
+    )
+    candidate_server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    route_token_ref = "rtok-completed-onboard-contract-update-exact"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=parent_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["contract_update_start"],
+        target_files=target_files,
+        evidence_refs=[
+            f"onboard_service:{parent_execution_id}",
+            f"backlog:{backlog_id}",
+        ],
+    )
+    conn.commit()
+
+    result = candidate_server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "route_token_ref": route_token_ref,
+            },
+        )
+    )
+
+    next_action = result["next_legal_action"]
+    assert next_action["action"] == "contract_update_start"
+    assert next_action["action_input_ready"] is True
+    assert next_action["action_input_missing_fields"] == []
+    assert next_action["action_input"]["observer_route_token_ref"] == (
+        route_token_ref
+    )
+    assert next_action["observer_route_context_issue"]["required"] is False
+    assert next_action["host_realization"]["required_replacement_paths"] == []
+    parent = candidate_server._contract_runtime_store(conn).get(
+        parent_execution_id
+    )
+    assert parent["completed_lines"] == [
+        candidate_server._onboard_service_waiver_line()
+    ]
+    assert parent["runtime_guide"]["next_legal_action"] is None
+
+
+def test_completed_onboard_service_contract_update_negatives_are_no_action_zero_write(
+    conn,
+):
+    candidate_server, _ = _preload_candidate_server_module()
+    backlog_id = "AC-ONBOARD-COMPLETED-SERVICE-CONTRACT-UPDATE-NEGATIVES"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent_execution_id = candidate_server._onboard_service_execution_id(
+        PID, backlog_id
+    )
+    candidate_server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    canonical_projection = candidate_server._contract_chain_current_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    assert canonical_projection["readiness_state"] == "contract_complete"
+    canonical_authority = (
+        candidate_server._onboard_service_contract_update_continuation_authority(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            current_projection=canonical_projection,
+            route_token_ref="",
+            target_files=[],
+        )
+    )
+    assert canonical_authority["ready"] is True
+    invalid_projections = {
+        "actual_non_service_completed_work_chain": {
+            **canonical_projection,
+            "contract_chain_id": "cchain-real-work",
+            "root_contract_execution_id": "cex-real-work",
+            "current_contract_execution_id": "cex-real-work",
+            "current_contract_id": candidate_server.MF_PARALLEL_CONTRACT_ID,
+        },
+        "wrong_project_scope": {
+            **canonical_projection,
+            "project_id": "wrong-project",
+        },
+        "ambiguous_root_current_identity": {
+            **canonical_projection,
+            "root_contract_execution_id": parent_execution_id,
+            "current_contract_execution_id": "cex-other-completed-root",
+        },
+        "active_child": {
+            **canonical_projection,
+            "active_child_contract_execution_id": "cex-active-child",
+        },
+    }
+    before_changes = conn.total_changes
+    for label, projection in invalid_projections.items():
+        authority = (
+            candidate_server._onboard_service_contract_update_continuation_authority(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                current_projection=projection,
+                route_token_ref="",
+                target_files=[],
+            )
+        )
+        assert authority == {}, label
+        next_action = candidate_server._onboard_route_guide_completed_next_action(
+            role="observer",
+            work_type="continue_contract_chain",
+            runtime_resume={
+                "readiness_state": "contract_complete",
+                "next_legal_action": {},
+            },
+            backlog_row_status="OPEN",
+            project_id=PID,
+            backlog_id=backlog_id,
+            onboard_service_continuation_authority=authority,
+        )
+        assert next_action["action"] == "no_runtime_action", label
+
+    wrong_role = candidate_server._onboard_route_guide_completed_next_action(
+        role="mf_sub",
+        work_type="continue_contract_chain",
+        runtime_resume={
+            "readiness_state": "contract_complete",
+            "next_legal_action": {},
+        },
+        backlog_row_status="OPEN",
+        project_id=PID,
+        backlog_id=backlog_id,
+        onboard_service_continuation_authority=canonical_authority,
+    )
+    assert wrong_role["action"] == "no_runtime_action"
+    fixed = candidate_server._onboard_route_guide_completed_next_action(
+        role="observer",
+        work_type="continue_contract_chain",
+        runtime_resume={
+            "readiness_state": "contract_complete",
+            "next_legal_action": {},
+        },
+        backlog_row_status="FIXED",
+        project_id=PID,
+        backlog_id=backlog_id,
+        onboard_service_continuation_authority=canonical_authority,
+    )
+    assert fixed["action"] == "no_runtime_action"
+    assert fixed["terminal_backlog_row"] is True
+    assert conn.total_changes == before_changes
 
 
 def test_timeline_gate_views_suppress_complete_compact_ledger_stale_action(conn):
@@ -104509,10 +104818,11 @@ def test_onboard_route_guide_completed_projection_returns_selected_successor_ent
     work_type,
     expected_interface,
 ):
+    candidate_server, _ = _preload_candidate_server_module()
     backlog_id = f"AC-ONBOARD-COMPLETE-{work_type.upper().replace('_', '-')}"
     _insert_simple_mf_close_backlog(conn, backlog_id)
 
-    result = server.handle_project_onboard_route_guide(
+    result = candidate_server.handle_project_onboard_route_guide(
         _ctx(
             {"project_id": PID},
             method="POST",
