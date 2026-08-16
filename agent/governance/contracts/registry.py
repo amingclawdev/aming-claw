@@ -33,6 +33,63 @@ class UnknownContractDefinitionError(ContractDefinitionError):
     """Raised when a contract definition cannot be found."""
 
 
+class ContractDependencyUnresolvedError(ContractDefinitionError):
+    """Typed denial for a source definition with an unresolved activation join."""
+
+    def __init__(self, definition: Mapping[str, Any]) -> None:
+        metadata = definition.get("metadata")
+        activation = (
+            metadata.get("activation") if isinstance(metadata, Mapping) else {}
+        )
+        result = (
+            activation.get("result")
+            if isinstance(activation, Mapping)
+            and isinstance(activation.get("result"), Mapping)
+            else {}
+        )
+        self.definition = deepcopy(dict(definition))
+        self.result = deepcopy(dict(result))
+        self.code = str(result.get("code") or "contract_dependency_unresolved")
+        message = str(
+            result.get("message")
+            or "Contract activation dependency is unresolved"
+        )
+        super().__init__(f"{self.code}: {message}")
+
+    def to_dict(self) -> dict[str, Any]:
+        metadata = self.definition.get("metadata")
+        activation = (
+            metadata.get("activation") if isinstance(metadata, Mapping) else {}
+        )
+        payload = deepcopy(self.result)
+        payload.update(
+            {
+                "schema_version": str(
+                    self.result.get("schema_version")
+                    or "contract_dependency_unresolved.v1"
+                ),
+                "code": self.code,
+                "error": str(self.result.get("error") or self.code),
+                "status": str(self.result.get("status") or "rejected"),
+                "classification": str(
+                    self.result.get("classification") or "external_dependency"
+                ),
+                "retryable": bool(self.result.get("retryable", False)),
+                "authorizes_write": bool(
+                    self.result.get("authorizes_write", False)
+                ),
+                "activation_ready": False,
+                "contract_id": str(self.definition.get("contract_id") or ""),
+                "version": str(self.definition.get("version") or ""),
+                "revision": str(self.definition.get("revision") or ""),
+                "unresolved_dependencies": deepcopy(
+                    list(activation.get("unresolved_dependencies") or [])
+                ),
+            }
+        )
+        return payload
+
+
 class ContractDefinitionRegistry:
     """Registry for source-controlled contract definition config files."""
 
@@ -219,12 +276,14 @@ class ContractDefinitionRegistry:
             canonical_contract_id,
             version=canonical_version,
         )
-        if retirement is None:
-            return selected
-        # A terminal retirement dominates every new attempt in the same
-        # contract/version chain. Reintroduction requires a distinct version
-        # or contract id; a later same-version revision cannot bypass it.
-        return retirement
+        if retirement is not None:
+            # A terminal retirement dominates every new attempt in the same
+            # contract/version chain. Reintroduction requires a distinct version
+            # or contract id; a later same-version revision cannot bypass it.
+            return retirement
+        if _unresolved_activation_dependency(selected):
+            raise ContractDependencyUnresolvedError(selected)
+        return selected
 
     def validate_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         return normalize_definition(payload)
@@ -414,6 +473,39 @@ def _terminal_retirement_lifecycle(
     if lifecycle.get("terminal_retirement") is not True:
         return {}
     return dict(lifecycle)
+
+
+def _unresolved_activation_dependency(
+    definition: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return a complete fail-closed activation dependency declaration."""
+
+    metadata = definition.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return {}
+    activation = metadata.get("activation")
+    if not isinstance(activation, Mapping):
+        return {}
+    dependencies = activation.get("unresolved_dependencies")
+    result = activation.get("result")
+    if (
+        activation.get("state") != "dependency_unresolved"
+        or activation.get("activation_ready") is not False
+        or activation.get("new_execution_allowed") is not False
+        or activation.get("template_selection_allowed") is not False
+        or not isinstance(dependencies, list)
+        or not dependencies
+        or not isinstance(result, Mapping)
+        or result.get("code") != "contract_dependency_unresolved"
+        or result.get("error") != "contract_dependency_unresolved"
+        or result.get("status") != "rejected"
+        or result.get("classification") != "external_dependency"
+        or result.get("retryable") is not False
+        or result.get("authorizes_write") is not False
+        or result.get("activation_ready") is not False
+    ):
+        return {}
+    return dict(activation)
 
 
 def _matches(

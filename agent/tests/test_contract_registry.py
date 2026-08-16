@@ -17,7 +17,16 @@ from agent.governance.contracts import (
     validate_contract_write,
 )
 from agent.governance.contracts.hash import file_sha256, stable_sha256
-from agent.governance.contracts.registry import UnknownContractDefinitionError
+from agent.governance.contracts.registry import (
+    ContractDependencyUnresolvedError,
+    UnknownContractDefinitionError,
+)
+from agent.governance.contract_template_registry import (
+    ContractTemplateDependencyUnresolvedError,
+    get_contract_template,
+    list_contract_templates,
+    resolve_contract_template,
+)
 
 
 _SYSTEM_LAYER_POLICY_NAMES = [
@@ -1488,3 +1497,102 @@ def test_latest_qa_gate_accepts_each_pinned_exact_upgrade_trigger(trigger: str) 
         write,
         require_next_action=False,
     ).ok is True
+
+
+def test_direct_main_rev1_is_exact_auditable_and_dependency_blocked() -> None:
+    registry = ContractDefinitionRegistry()
+    definition = registry.get(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev1",
+    )
+
+    assert definition["contract_id"] == "operator_supervised_direct_main"
+    assert definition["version"] == "v1"
+    assert definition["revision"] == "rev1"
+    assert definition["status"] == "draft"
+    assert definition["definition_hash"] == (
+        "sha256:3b0da25cf3ab87f7e4bd59b65dca81882798f13fa92558def8707a4f174a21bb"
+    )
+    source_path = (
+        registry_module.DEFAULT_DEFINITION_DIR
+        / "operator_supervised_direct_main.v1.rev1.json"
+    )
+    assert definition["source_sha256"] == file_sha256(source_path)
+    assert registry.get("direct_main", revision="rev1")["definition_hash"] == (
+        definition["definition_hash"]
+    )
+    assert registry.get("direct_main.v1", revision="rev1")["definition_hash"] == (
+        definition["definition_hash"]
+    )
+    assert is_new_execution_allowed(definition) is False
+
+    activation = definition["metadata"]["activation"]
+    assert activation["state"] == "dependency_unresolved"
+    assert activation["activation_ready"] is False
+    assert activation["new_execution_allowed"] is False
+    assert activation["template_selection_allowed"] is False
+    assert [
+        item["dependency_id"] for item in activation["unresolved_dependencies"]
+    ] == ["AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815"]
+
+    with pytest.raises(ContractDependencyUnresolvedError) as raised:
+        registry.resolve_for_new_execution(
+            "operator_supervised_direct_main",
+            version="v1",
+            requested_revision="rev1",
+        )
+    error = raised.value.to_dict()
+    assert error["schema_version"] == "contract_dependency_unresolved.v1"
+    assert error["code"] == "contract_dependency_unresolved"
+    assert error["error"] == "contract_dependency_unresolved"
+    assert error["status"] == "rejected"
+    assert error["classification"] == "external_dependency"
+    assert error["retryable"] is False
+    assert error["authorizes_write"] is False
+    assert error["activation_ready"] is False
+    assert error["contract_id"] == "operator_supervised_direct_main"
+    assert error["version"] == "v1"
+    assert error["revision"] == "rev1"
+    assert error["next_legal_action"]["id"] == (
+        "complete_common_rule_package_then_create_direct_revision"
+    )
+
+
+def test_direct_main_template_exact_read_and_task_selection_fail_closed() -> None:
+    template = get_contract_template("operator_supervised_direct_main")
+
+    assert template["template_id"] == "operator_supervised_direct_main.v1"
+    assert template["source"] == {
+        "type": "source_controlled",
+        "path": "contract_definitions/operator_supervised_direct_main.v1.rev1.json",
+        "authority": "contract_definition",
+        "template_is_authoritative": False,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev1",
+        "definition_hash": (
+            "sha256:3b0da25cf3ab87f7e4bd59b65dca81882798f13fa92558def8707a4f174a21bb"
+        ),
+        "definition_source_sha256": (
+            "sha256:2559e1e2302c8a03d63a297c173afce6ffeb11100afadc53c85ff09101428a15"
+        ),
+    }
+    assert [
+        item["template_id"]
+        for item in list_contract_templates(task_type="direct_main")
+    ] == ["operator_supervised_direct_main.v1"]
+
+    for query in (
+        {"template_id": "direct_main"},
+        {"template_id": "operator_supervised_direct_main"},
+        {"task_type": "direct_main"},
+        {"task_type": "operator_supervised_direct_main"},
+    ):
+        with pytest.raises(ContractTemplateDependencyUnresolvedError) as raised:
+            resolve_contract_template(**query)
+        error = raised.value.to_dict()
+        assert error["code"] == "contract_dependency_unresolved"
+        assert error["template_id"] == "operator_supervised_direct_main.v1"
+        assert error["activation_ready"] is False
+        assert error["authorizes_write"] is False
