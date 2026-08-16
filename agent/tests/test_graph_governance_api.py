@@ -160500,6 +160500,327 @@ def test_premerge_qa_projects_lane_merge_without_final_qa_or_close(
     assert lines[0]["lane_id"] == "premerge-projection-worker"
 
 
+def test_rev9_postmerge_projection_requires_fresh_qa_after_reconcile(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-REV9-FRESH-POSTMERGE-QA"
+    parent_task_id = "cex-rev9-fresh-postmerge-qa"
+    task_id = "rev9-fresh-postmerge-final-lane"
+    runtime_context_id = "mfrctx-rev9-fresh-postmerge-final-lane"
+    candidate_commit = "8" * 40
+    merged_commit = "9" * 40
+    target_root = "/tmp/rev9-fresh-postmerge-canonical"
+    premerge_trace_id = "gqt-rev9-premerge-candidate"
+    final_trace_id = "gqt-rev9-final-canonical"
+    context = SimpleNamespace(
+        backlog_id=backlog_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        runtime_context_id=runtime_context_id,
+        worker_id="rev9-final-lane-worker",
+        worker_slot_id="rev9-final-lane-slot",
+        worktree_path="/tmp/rev9-final-lane-worker",
+        target_project_root="/tmp/rev9-final-lane-worker",
+        merge_queue_id="mq-rev9-fresh-postmerge",
+    )
+    definition = server._contract_runtime(conn).registry.get(
+        "mf_parallel.v2",
+        version="v2",
+        revision="rev9",
+        include_deprecated=True,
+    )
+    record = {
+        "contract_id": definition["contract_id"],
+        "version": definition["version"],
+        "revision": definition["revision"],
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition.get("source_sha256") or "",
+        "contract_execution_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "completed_lines": [],
+    }
+
+    def event(
+        event_id,
+        *,
+        kind,
+        phase,
+        actor,
+        created_at,
+        commit_sha="",
+        graph_trace_ids=(),
+    ):
+        return {
+            "id": event_id,
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "event_kind": kind,
+            "event_type": kind,
+            "phase": phase,
+            "actor": actor,
+            "actor_role": actor,
+            "status": "passed",
+            "commit_sha": commit_sha,
+            "created_at": created_at,
+            "payload": {
+                "contract_execution_id": parent_task_id,
+                "parent_task_id": parent_task_id,
+                "runtime_context_id": runtime_context_id,
+                "graph_trace_ids": list(graph_trace_ids),
+                "merge_commit": commit_sha if kind == "live_merge" else "",
+                "target_head_after_merge": (
+                    commit_sha if kind == "live_merge" else ""
+                ),
+            },
+        }
+
+    premerge = event(
+        100,
+        kind="independent_verification",
+        phase="verification",
+        actor="qa",
+        created_at="2026-08-16T01:00:00Z",
+        commit_sha=candidate_commit,
+        graph_trace_ids=[premerge_trace_id],
+    )
+    merge = event(
+        101,
+        kind="live_merge",
+        phase="live_merge",
+        actor="observer",
+        created_at="2026-08-16T01:01:00Z",
+        commit_sha=merged_commit,
+    )
+    reconcile = event(
+        102,
+        kind="reconcile",
+        phase="reconcile",
+        actor="observer",
+        created_at="2026-08-16T01:02:00Z",
+        commit_sha=merged_commit,
+    )
+    final_qa = event(
+        103,
+        kind="independent_verification",
+        phase="verification",
+        actor="qa",
+        created_at="2026-08-16T01:03:00Z",
+        commit_sha=merged_commit,
+        graph_trace_ids=[final_trace_id],
+    )
+    close_ready = event(
+        104,
+        kind="close_ready",
+        phase="close_ready",
+        actor="observer",
+        created_at="2026-08-16T01:04:00Z",
+        commit_sha=merged_commit,
+    )
+
+    def authenticated_verdict(
+        *, timeline_events, before_event_id=0, **_kwargs
+    ):
+        available = [
+            item
+            for item in timeline_events
+            if item["event_kind"] == "independent_verification"
+            and (not before_event_id or item["id"] < before_event_id)
+        ]
+        if not available:
+            return {}
+        selected = max(available, key=lambda item: item["id"])
+        return {
+            "event_id": selected["id"],
+            "status": "passed",
+            "commit_sha": selected["commit_sha"],
+            "qa_session_id": (
+                selected["payload"].get("qa_session_id")
+                or (
+                    "ses-rev9-premerge"
+                    if selected["id"] == 100
+                    else "ses-rev9-final"
+                )
+            ),
+            "premerge_candidate_receipt_only": selected["id"] == 100,
+        }
+
+    def graph_refs(_conn, **kwargs):
+        if kwargs["explicit_trace_ids"] != [final_trace_id]:
+            return {
+                "db_verified": False,
+                "verified_trace_ids": [],
+            }
+        assert kwargs["target_project_root"] == target_root
+        assert kwargs["expected_task_id"] == parent_task_id
+        assert kwargs["expected_candidate_commit_sha"] == merged_commit
+        return {
+            "db_verified": True,
+            "verified_trace_ids": [final_trace_id],
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "target_project_root": target_root,
+            "candidate_commit_sha": merged_commit,
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_authenticated_qa_timeline_verdict",
+        authenticated_verdict,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_qa_graph_trace_refs",
+        graph_refs,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_projected_lane_merge_durable_authority",
+        lambda *_args, **_kwargs: {
+            "schema_version": (
+                "contract_runtime.observer_merge_durable_authority.v1"
+            ),
+            "server_derived": True,
+            "db_verified": True,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "merge_commit": merged_commit,
+            "merge_event_ref": "timeline:101",
+            "merge_event_id": 101,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        lambda *_args, **_kwargs: {
+            "db_verified": True,
+            "live_verified": True,
+            "active_snapshot_verified": True,
+            "graph_reconciled": True,
+            "merged_commit_sha": merged_commit,
+            "reconciled_commit_sha": merged_commit,
+            "canonical_head_commit": merged_commit,
+            "active_snapshot_commit": merged_commit,
+            "target_project_root": target_root,
+        },
+    )
+
+    before_final = server._contract_runtime_projection_post_worker_lines(
+        conn=conn,
+        project_id=PID,
+        record=record,
+        context=context,
+        timeline_events=[premerge, merge, reconcile],
+    )
+    assert {line["line_id"] for line in before_final} == {
+        "observer_merge",
+        "observer_reconcile",
+    }
+
+    after_final = server._contract_runtime_projection_post_worker_lines(
+        conn=conn,
+        project_id=PID,
+        record=record,
+        context=context,
+        timeline_events=[premerge, merge, reconcile, final_qa],
+    )
+    assert {line["line_id"] for line in after_final} == {
+        "observer_merge",
+        "observer_reconcile",
+        "qa_graph_context",
+        "qa_independent_verification",
+    }
+
+    wrong_commit = copy.deepcopy(final_qa)
+    wrong_commit["commit_sha"] = "7" * 40
+    wrong_commit["created_at"] = "2026-08-16T01:03:01Z"
+    wrong_commit_lines = server._contract_runtime_projection_post_worker_lines(
+        conn=conn,
+        project_id=PID,
+        record=record,
+        context=context,
+        timeline_events=[premerge, merge, reconcile, wrong_commit],
+    )
+    assert {line["line_id"] for line in wrong_commit_lines} == {
+        "observer_merge",
+        "observer_reconcile",
+    }
+
+    pre_reconcile_final = copy.deepcopy(final_qa)
+    pre_reconcile_final["created_at"] = "2026-08-16T01:01:30Z"
+    pre_reconcile_lines = (
+        server._contract_runtime_projection_post_worker_lines(
+            conn=conn,
+            project_id=PID,
+            record=record,
+            context=context,
+            timeline_events=[
+                premerge,
+                merge,
+                reconcile,
+                pre_reconcile_final,
+            ],
+        )
+    )
+    assert {line["line_id"] for line in pre_reconcile_lines} == {
+        "observer_merge",
+        "observer_reconcile",
+    }
+
+    wrong_snapshot_qa = copy.deepcopy(final_qa)
+    wrong_snapshot_qa["payload"]["graph_trace_ids"] = [
+        "gqt-rev9-wrong-snapshot"
+    ]
+    wrong_snapshot_lines = (
+        server._contract_runtime_projection_post_worker_lines(
+            conn=conn,
+            project_id=PID,
+            record=record,
+            context=context,
+            timeline_events=[premerge, merge, reconcile, wrong_snapshot_qa],
+        )
+    )
+    assert {line["line_id"] for line in wrong_snapshot_lines} == {
+        "observer_merge",
+        "observer_reconcile",
+    }
+
+    reused_session_qa = copy.deepcopy(final_qa)
+    reused_session_qa["payload"]["qa_session_id"] = (
+        "ses-rev9-premerge"
+    )
+    reused_session_lines = (
+        server._contract_runtime_projection_post_worker_lines(
+            conn=conn,
+            project_id=PID,
+            record=record,
+            context=context,
+            timeline_events=[premerge, merge, reconcile, reused_session_qa],
+        )
+    )
+    assert {line["line_id"] for line in reused_session_lines} == {
+        "observer_merge",
+        "observer_reconcile",
+    }
+
+    after_close = server._contract_runtime_projection_post_worker_lines(
+        conn=conn,
+        project_id=PID,
+        record=record,
+        context=context,
+        timeline_events=[premerge, merge, reconcile, final_qa, close_ready],
+    )
+    assert {line["line_id"] for line in after_close} == {
+        "observer_merge",
+        "observer_reconcile",
+        "qa_graph_context",
+        "qa_independent_verification",
+        "observer_close_ready",
+    }
+
+
 def _bounded_replacement_graph_trace_case(conn, monkeypatch):
     candidate_server, _ = _preload_candidate_server_module()
     task_id = "bounded-replacement-graph-trace-worker"

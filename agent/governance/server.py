@@ -99626,7 +99626,64 @@ def _contract_runtime_projection_post_worker_lines(
         authoritative_qa_verdict.get("premerge_candidate_receipt_only")
         is True
     )
-    if authoritative_qa_event_id > 0 and authoritative_qa_passed:
+    postmerge_revision = _is_mf_parallel_postmerge_revision(record)
+    premerge_qa_verdict: dict[str, Any] = {}
+    premerge_qa_event: Mapping[str, Any] = {}
+    if (
+        postmerge_revision
+        and authoritative_qa_premerge_only
+        and authoritative_qa_event_id > 0
+    ):
+        premerge_qa_verdict = dict(authoritative_qa_verdict)
+        premerge_qa_event = next(
+            (
+                event
+                for event in timeline_events
+                if isinstance(event, Mapping)
+                and int(event.get("id") or 0) == authoritative_qa_event_id
+            ),
+            {},
+        )
+    if postmerge_revision and not premerge_qa_event:
+        before_event_id = 0
+        while True:
+            candidate_premerge_verdict = (
+                _runtime_context_latest_authenticated_qa_timeline_verdict(
+                    conn=conn,
+                    context=context,
+                    runtime_context_id=runtime_context_id,
+                    timeline_events=timeline_events,
+                    before_event_id=before_event_id,
+                )
+            )
+            candidate_event_id = int(
+                candidate_premerge_verdict.get("event_id") or 0
+            )
+            if candidate_event_id <= 0:
+                break
+            if (
+                candidate_premerge_verdict.get(
+                    "premerge_candidate_receipt_only"
+                )
+                is True
+            ):
+                premerge_qa_verdict = dict(candidate_premerge_verdict)
+                premerge_qa_event = next(
+                    (
+                        event
+                        for event in timeline_events
+                        if isinstance(event, Mapping)
+                        and int(event.get("id") or 0) == candidate_event_id
+                    ),
+                    {},
+                )
+                break
+            before_event_id = candidate_event_id
+    if (
+        not postmerge_revision
+        and authoritative_qa_event_id > 0
+        and authoritative_qa_passed
+    ):
         candidate_qa_event = next(
             (
                 event
@@ -99661,7 +99718,11 @@ def _contract_runtime_projection_post_worker_lines(
             )
             if qa_graph_refs.get("db_verified") is True:
                 qa_event = candidate_qa_event
-    while not authoritative_qa_event_id and qa_candidates:
+    while (
+        not postmerge_revision
+        and not authoritative_qa_event_id
+        and qa_candidates
+    ):
         candidate_qa_event = _contract_runtime_projection_latest_timeline_event(
             qa_candidates,
             runtime_context_id=runtime_context_id,
@@ -99762,7 +99823,7 @@ def _contract_runtime_projection_post_worker_lines(
         direct_parent_task_id=parent_task_id,
         server_bound_supplemental_related_task_ids=server_bound_root_task_ids,
     )
-    if authoritative_qa_event_id > 0:
+    if not postmerge_revision and authoritative_qa_event_id > 0:
         qa_event_id = _contract_runtime_projection_timeline_event_id(qa_event)
         merge_event_id = _contract_runtime_projection_timeline_event_id(
             merge_event
@@ -99780,16 +99841,23 @@ def _contract_runtime_projection_post_worker_lines(
             reconcile_event = {}
             close_ready_event = {}
     if reconcile_policy:
-        qa_event_id = _contract_runtime_projection_timeline_event_id(qa_event)
+        merge_qa_event = premerge_qa_event if postmerge_revision else qa_event
+        qa_event_id = _contract_runtime_projection_timeline_event_id(
+            merge_qa_event
+        )
         merge_event_id = _contract_runtime_projection_timeline_event_id(merge_event)
         reconcile_event_id = _contract_runtime_projection_timeline_event_id(
             reconcile_event
         )
         qa_authoritative = bool(
-            qa_event_id > 0 and qa_graph_refs.get("db_verified") is True
+            qa_event_id > 0
+            and (
+                postmerge_revision
+                or qa_graph_refs.get("db_verified") is True
+            )
         )
         qa_event_created_at = _contract_runtime_projection_timeline_event_time(
-            qa_event
+            merge_qa_event
         )
         merge_event_created_at = _contract_runtime_projection_timeline_event_time(
             merge_event
@@ -99834,7 +99902,7 @@ def _contract_runtime_projection_post_worker_lines(
                 record=record,
                 context=context,
                 merge_event=merge_event,
-                qa_event=qa_event,
+                qa_event=(premerge_qa_event or qa_event),
             )
         )
         if not durable_merge_authority:
@@ -99922,6 +99990,143 @@ def _contract_runtime_projection_post_worker_lines(
             ):
                 reconcile_event = {}
                 reconcile_authority = {}
+    if postmerge_revision:
+        # Candidate QA is merge materialization evidence only.  Final QA for
+        # rev8/rev9 is a distinct, authenticated round over the reconciled
+        # canonical HEAD and may complete the shared QA lines only after the
+        # exact current-full receipt above is verified.
+        qa_event = {}
+        qa_graph_refs = {}
+        authoritative_qa_premerge_only = False
+        if reconcile_event and reconcile_authority:
+            final_qa_verdict = (
+                _runtime_context_latest_authenticated_qa_timeline_verdict(
+                    conn=conn,
+                    context=context,
+                    runtime_context_id=runtime_context_id,
+                    timeline_events=timeline_events,
+                )
+            )
+            final_qa_event_id = int(final_qa_verdict.get("event_id") or 0)
+            final_qa_status = str(
+                final_qa_verdict.get("status") or ""
+            ).strip().lower()
+            candidate_final_qa_event = next(
+                (
+                    event
+                    for event in timeline_events
+                    if isinstance(event, Mapping)
+                    and int(event.get("id") or 0) == final_qa_event_id
+                ),
+                {},
+            )
+            reconcile_event_id = (
+                _contract_runtime_projection_timeline_event_id(
+                    reconcile_event
+                )
+            )
+            reconcile_time = _contract_runtime_close_authority_time_order_value(
+                _contract_runtime_projection_timeline_event_time(
+                    reconcile_event
+                )
+            )
+            final_qa_time = _contract_runtime_close_authority_time_order_value(
+                _contract_runtime_projection_timeline_event_time(
+                    candidate_final_qa_event
+                )
+            )
+            expected_final_commit = str(
+                reconcile_authority.get("reconciled_commit_sha")
+                or reconcile_authority.get("canonical_head_commit")
+                or reconcile_authority.get("active_snapshot_commit")
+                or reconcile_authority.get("merged_commit_sha")
+                or ""
+            ).strip().lower()
+            final_event_commit = str(
+                final_qa_verdict.get("commit_sha")
+                or candidate_final_qa_event.get("commit_sha")
+                or ""
+            ).strip().lower()
+            premerge_qa_session_id = str(
+                premerge_qa_verdict.get("qa_session_id") or ""
+            ).strip()
+            final_qa_session_id = str(
+                final_qa_verdict.get("qa_session_id") or ""
+            ).strip()
+            if (
+                candidate_final_qa_event
+                and final_qa_verdict.get(
+                    "premerge_candidate_receipt_only"
+                )
+                is not True
+                and final_qa_status
+                in _CONTRACT_RUNTIME_AUTHORITATIVE_QA_PASS_STATUSES
+                and final_qa_event_id > reconcile_event_id > 0
+                and reconcile_time is not None
+                and final_qa_time is not None
+                and reconcile_time <= final_qa_time
+                and expected_final_commit
+                and final_event_commit == expected_final_commit
+                and premerge_qa_session_id
+                and final_qa_session_id
+                and final_qa_session_id != premerge_qa_session_id
+            ):
+                final_qa_graph_task_id = (
+                    str(record.get("contract_execution_id") or "").strip()
+                    if parent_task_id
+                    == str(record.get("contract_execution_id") or "").strip()
+                    else task_id
+                )
+                candidate_graph_refs = (
+                    _runtime_context_service_qa_graph_trace_refs(
+                        conn,
+                        project_id=project_id,
+                        explicit_trace_ids=(
+                            _runtime_context_service_graph_trace_values_from_event(
+                                candidate_final_qa_event
+                            )
+                        ),
+                        target_project_root=str(
+                            reconcile_authority.get("target_project_root")
+                            or ""
+                        ),
+                        expected_backlog_id=backlog_id,
+                        expected_task_id=final_qa_graph_task_id,
+                        expected_candidate_commit_sha=expected_final_commit,
+                        require_complete_authority=True,
+                        strict_bounded_qa=True,
+                    )
+                )
+                if candidate_graph_refs.get("db_verified") is True:
+                    qa_event = candidate_final_qa_event
+                    qa_graph_refs = candidate_graph_refs
+        if close_ready_event:
+            qa_event_id = _contract_runtime_projection_timeline_event_id(
+                qa_event
+            )
+            close_ready_event_id = (
+                _contract_runtime_projection_timeline_event_id(
+                    close_ready_event
+                )
+            )
+            qa_time = _contract_runtime_close_authority_time_order_value(
+                _contract_runtime_projection_timeline_event_time(qa_event)
+            )
+            close_ready_time = (
+                _contract_runtime_close_authority_time_order_value(
+                    _contract_runtime_projection_timeline_event_time(
+                        close_ready_event
+                    )
+                )
+            )
+            if not (
+                qa_event_id > 0
+                and close_ready_event_id > qa_event_id
+                and qa_time is not None
+                and close_ready_time is not None
+                and qa_time <= close_ready_time
+            ):
+                close_ready_event = {}
     if close_ready_event and not reconcile_event:
         close_ready_event = {}
 
@@ -100036,6 +100241,7 @@ def _contract_runtime_projection_post_worker_lines(
     elif (
         merge_event
         and reconcile_event
+        and not postmerge_revision
         and not authoritative_qa_premerge_only
         and projected_stage_ids.get("observer_close_ready")
     ):
