@@ -40848,6 +40848,498 @@ def test_two_worker_premerge_qa_receipts_persist_at_observer_merge_without_writi
     ) == persisted_count
 
 
+def test_batch_child_premerge_qa_uses_server_cardinality_without_widening_scope(
+    conn,
+    monkeypatch,
+):
+    execution_id = "cex-one-worker-batch-child-premerge"
+    backlog_id = "AC-ONE-WORKER-BATCH-CHILD-PREMERGE"
+    task_id = "one-worker-batch-child"
+    runtime_context_id = "mfrctx-one-worker-batch-child"
+    candidate_commit = "a" * 40
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            backlog_id=backlog_id,
+            root_task_id=execution_id,
+            parent_task_id=execution_id,
+            task_id=task_id,
+            runtime_context_id=runtime_context_id,
+            worker_id="one-worker-slot",
+            worker_slot_id="one-worker-slot",
+            branch_ref="refs/heads/codex/one-worker-batch-child",
+            worktree_path="/tmp/one-worker-batch-child",
+            target_project_root="/tmp/one-worker-batch-child",
+            status=STATE_VALIDATED,
+            base_commit="0" * 40,
+            head_commit=candidate_commit,
+            target_head_commit="0" * 40,
+            merge_queue_id="mq-one-worker-batch-child",
+            owned_files=("src/one-worker.py",),
+            target_files=("src/one-worker.py",),
+        ),
+    )
+    conn.commit()
+    worker = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": execution_id,
+        "worker_id": "one-worker-slot",
+        "worker_slot_id": "one-worker-slot",
+        "merge_queue_id": context.merge_queue_id,
+    }
+    next_line = {
+        "stage_id": "observer_lane_merge",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "owner_role": "observer",
+        "evidence_kind": "merge",
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
+        "contract_execution_id": execution_id,
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "status": "passed",
+                "payload": {"worker_count": 1, "bounded_workers": [worker]},
+            }
+        ],
+    }
+    proof = {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session",
+        "verified": True,
+        "role": "qa",
+        "db_verified_graph_trace": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "observer_impersonation": False,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "candidate_commit_sha": candidate_commit,
+        "query_root": "/tmp/one-worker-batch-child",
+        "qa_principal": "qa:one-worker-batch-child",
+        "qa_session_id": "ses-one-worker-batch-child",
+        "qa_scope_binding_ref": "qa-scope:one-worker-batch-child",
+        "graph_trace_ids": ["gqt-one-worker-batch-child"],
+        "evidence_status": "passed",
+        "audit_only": False,
+    }
+    body = {
+        "task_id": task_id,
+        "actor": "qa:one-worker-batch-child",
+        "commit_sha": candidate_commit,
+        "payload": {"runtime_context_id": runtime_context_id},
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_current_generation_worker_count",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: {},
+    )
+
+    gate = server._contract_runtime_premerge_candidate_qa_receipt_gate(
+        conn,
+        project_id=PID,
+        runtime=object(),
+        record=record,
+        source_record=record,
+        projection={},
+        body=body,
+        event_kind="independent_verification",
+        normalized_status="passed",
+        actor_role="qa",
+        trusted_qa_verification_authority=proof,
+        trusted_actor_session={
+            "principal_id": "qa:one-worker-batch-child",
+            "session_id": "ses-one-worker-batch-child",
+        },
+        current_state={"next_legal_action": next_line},
+    )
+
+    assert gate["status"] == "accepted_premerge_candidate_qa_receipt"
+    assert gate["materialize_satisfying"] is True
+    forged = copy.deepcopy(body)
+    forged["payload"]["runtime_context_id"] = "mfrctx-wrong-worker"
+    with pytest.raises(GovernanceError) as wrong_worker:
+        server._contract_runtime_premerge_candidate_qa_receipt_gate(
+            conn,
+            project_id=PID,
+            runtime=object(),
+            record=record,
+            source_record=record,
+            projection={},
+            body=forged,
+            event_kind="independent_verification",
+            normalized_status="passed",
+            actor_role="qa",
+            trusted_qa_verification_authority=proof,
+            trusted_actor_session={
+                "principal_id": "qa:one-worker-batch-child",
+                "session_id": "ses-one-worker-batch-child",
+            },
+            current_state={"next_legal_action": next_line},
+        )
+    assert wrong_worker.value.code == (
+        "premerge_candidate_qa_receipt_scope_mismatch"
+    )
+    assert wrong_worker.value.details["field"] == "dispatch.worker_identity"
+
+
+def test_postmerge_failed_qa_boundary_is_not_a_premerge_candidate_pass(
+    conn,
+    monkeypatch,
+):
+    execution_id = "cex-postmerge-failed-boundary"
+    backlog_id = "AC-POSTMERGE-FAILED-BOUNDARY"
+    candidate_commit = "c" * 40
+    next_line = {
+        "stage_id": "observer_lane_merge",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "owner_role": "observer",
+        "evidence_kind": "merge",
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
+        "contract_execution_id": execution_id,
+        "completed_lines": [],
+    }
+    postmerge = {
+        "schema_version": "contract_runtime.rev8_postmerge_qa_authority.v1",
+        "verified": True,
+        "server_derived": True,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": "mfrctx-final-lane",
+        "task_id": "final-lane-task",
+        "parent_task_id": execution_id,
+        "qa_graph_trace_task_id": execution_id,
+        "candidate_commit_sha": candidate_commit,
+        "target_project_root": "/tmp/postmerge-failed-boundary",
+    }
+    postmerge["authority_hash"] = server.stable_sha256(postmerge)
+    proof = {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session",
+        "verified": True,
+        "role": "qa",
+        "db_verified_graph_trace": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "observer_impersonation": False,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "candidate_commit_sha": candidate_commit,
+        "query_root": "/tmp/postmerge-failed-boundary",
+        "qa_principal": "qa:postmerge-failed-boundary",
+        "qa_session_id": "ses-postmerge-failed-boundary",
+        "qa_scope_binding_ref": "qa-scope:postmerge-failed-boundary",
+        "graph_trace_ids": ["gqt-postmerge-failed-boundary"],
+        "evidence_status": "failed",
+        "audit_only": True,
+    }
+    body = {
+        "task_id": execution_id,
+        "actor": "qa:postmerge-failed-boundary",
+        "commit_sha": candidate_commit,
+        "payload": {},
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: dict(postmerge),
+    )
+    gate = server._contract_runtime_premerge_candidate_qa_receipt_gate(
+        conn,
+        project_id=PID,
+        runtime=object(),
+        record=record,
+        source_record=record,
+        projection={},
+        body=body,
+        event_kind="independent_verification",
+        normalized_status="failed",
+        actor_role="qa",
+        trusted_qa_verification_authority=proof,
+        trusted_actor_session={
+            "principal_id": "qa:postmerge-failed-boundary",
+            "session_id": "ses-postmerge-failed-boundary",
+        },
+        current_state={"next_legal_action": next_line},
+    )
+    assert gate["status"] == "accepted_postmerge_failed_qa_boundary"
+    assert gate["audit_only"] is True
+    assert gate["failed_qa_rework_eligible"] is True
+    assert gate["contract_runtime_mutated"] is False
+
+    wrong_commit = copy.deepcopy(body)
+    wrong_commit["commit_sha"] = "d" * 40
+    with pytest.raises(GovernanceError) as rejected:
+        server._contract_runtime_premerge_candidate_qa_receipt_gate(
+            conn,
+            project_id=PID,
+            runtime=object(),
+            record=record,
+            source_record=record,
+            projection={},
+            body=wrong_commit,
+            event_kind="independent_verification",
+            normalized_status="failed",
+            actor_role="qa",
+            trusted_qa_verification_authority=proof,
+            trusted_actor_session={
+                "principal_id": "qa:postmerge-failed-boundary",
+                "session_id": "ses-postmerge-failed-boundary",
+            },
+            current_state={"next_legal_action": next_line},
+        )
+    assert rejected.value.code == "postmerge_failed_qa_boundary_scope_mismatch"
+    assert rejected.value.details["field"] == "request.commit_sha"
+
+    with pytest.raises(GovernanceError) as pass_cannot_use_failure_boundary:
+        server._contract_runtime_premerge_candidate_qa_receipt_gate(
+            conn,
+            project_id=PID,
+            runtime=object(),
+            record=record,
+            source_record=record,
+            projection={},
+            body=body,
+            event_kind="independent_verification",
+            normalized_status="passed",
+            actor_role="qa",
+            trusted_qa_verification_authority={
+                **proof,
+                "evidence_status": "passed",
+                "audit_only": False,
+            },
+            trusted_actor_session={
+                "principal_id": "qa:postmerge-failed-boundary",
+                "session_id": "ses-postmerge-failed-boundary",
+            },
+            current_state={"next_legal_action": next_line},
+        )
+    assert pass_cannot_use_failure_boundary.value.code == (
+        "premerge_candidate_qa_receipt_scope_mismatch"
+    )
+
+
+def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    world = _mf_batch_child_postmerge_qa_world(conn, tmp_path, monkeypatch)
+    index = 0
+    record = server._contract_runtime(conn).store.get(
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    )
+    authority = server._contract_runtime_rev8_postmerge_qa_authority(
+        conn,
+        project_id=PID,
+        record=record,
+    )
+    assert authority["verified"] is True
+    assert authority["candidate_commit_sha"] == world.final_head
+    observer_merge_next = {
+        "stage_id": "observer_lane_merge",
+        "line_id": "observer_merge",
+        "actor_role": "observer",
+        "owner_role": "observer",
+        "evidence_kind": "merge",
+    }
+    record = copy.deepcopy(record)
+    record["runtime_guide"] = {
+        **dict(record.get("runtime_guide") or {}),
+        "next_legal_action": observer_merge_next,
+    }
+    record["execution_state"] = {
+        **dict(record.get("execution_state") or {}),
+        "next_legal_action": observer_merge_next,
+    }
+    actual_runtime = server._contract_runtime(conn)
+
+    class TimelineRuntime:
+        store = actual_runtime.store
+
+        @staticmethod
+        def current_record(requested_execution_id, *, actor_role):
+            assert requested_execution_id == _BATCH_QA_CHILD_EXECUTIONS[index]
+            assert actor_role == "qa"
+            return copy.deepcopy(record)
+
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: TimelineRuntime())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda _conn, **kwargs: (copy.deepcopy(kwargs["record"]), {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(authority),
+    )
+    qa_task_id = authority["qa_graph_trace_task_id"]
+    qa_principal = "qa:batch-child-postmerge-failure"
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        task_id=qa_task_id,
+        commit_sha=world.final_head,
+    )
+    qa_scope = [
+        f"backlog:{_BATCH_QA_CHILD_BACKLOGS[index]}",
+        f"task:{qa_task_id}",
+        f"commit:{world.final_head}",
+        qa_scope_binding_ref,
+    ]
+    qa_session = server.role_service.register(
+        conn,
+        qa_principal,
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    qa_graph_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+            "task_id": qa_task_id,
+            "commit_sha": world.final_head,
+            "project_root": str(world.root),
+        },
+    )
+    qa_graph_ctx._session.update(
+        {
+            "session_id": qa_session["session_id"],
+            "principal_id": qa_principal,
+            "scope": qa_scope,
+        }
+    )
+    qa_graph = server.handle_graph_governance_query(qa_graph_ctx)
+    timeline_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+            "task_id": qa_task_id,
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "verification",
+            "status": "failed",
+            "actor": qa_principal,
+            "commit_sha": world.final_head,
+            "verification": {
+                "result": "failed",
+                "verdict": "FAIL",
+                "candidate_new_failures": 1,
+                "candidate_specific_issues": ["browser default-state mismatch"],
+                "overall_release_pass_claimed": False,
+            },
+            "payload": {
+                "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                "graph_trace_ids": [qa_graph["trace_id"]],
+                "candidate_new_failures": 1,
+                "observer_impersonation": False,
+            },
+        },
+    )
+    timeline_ctx._session = dict(qa_graph_ctx._session)
+
+    failed = server.handle_task_timeline_append(timeline_ctx)
+
+    gate = failed["contract_runtime_close_evidence_gate"]
+    assert gate["status"] == "accepted_postmerge_failed_qa_boundary"
+    assert gate["failed_qa_rework_eligible"] is True
+    assert gate["contract_runtime_mutated"] is False
+    persisted_authority = failed["payload"][
+        "postmerge_failed_qa_boundary_authority"
+    ]
+    assert persisted_authority["runtime_context_id"] == (
+        authority["runtime_context_id"]
+    )
+    assert persisted_authority["task_id"] == authority["task_id"]
+    assert persisted_authority["candidate_commit_sha"] == world.final_head
+    assert persisted_authority["authority_hash"] == server.stable_sha256(
+        {
+            key: value
+            for key, value in persisted_authority.items()
+            if key != "authority_hash"
+        }
+    )
+    timeline_boundary = (
+        server._runtime_context_authenticated_failed_qa_timeline_boundary(
+            conn=conn,
+            context=world.child_contexts[index],
+            runtime_context_id=authority["runtime_context_id"],
+            timeline_events=task_timeline.list_events(
+                conn,
+                PID,
+                backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+                limit=1000,
+            ),
+        )
+    )
+    assert timeline_boundary["source_ref"] == f"timeline:{failed['id']}"
+    assert timeline_boundary["runtime_context_binding_source"] == (
+        "server_postmerge_failed_qa_boundary_authority"
+    )
+    verified_batch_child = (
+        server._parallel_branch_allocate_verified_batch_child_lineage_authority(
+            conn,
+            project_id=PID,
+            record=record,
+        )
+    )
+    rework = server._parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
+        conn,
+        project_id=PID,
+        record=record,
+        verified_batch_child=verified_batch_child,
+        body={
+            "stage_type": "failed_qa_rework",
+            "attempt": 2,
+            "task_id": "batch-child-postmerge-failure-rework-2",
+            "worker_id": "batch-child-postmerge-failure-worker-2",
+            "worker_slot_id": "batch-child-postmerge-failure-worker-2",
+            "failed_qa_source_ref": timeline_boundary["source_ref"],
+        },
+    )
+    assert rework["failed_qa_rework_authority"][
+        "failed_qa_boundary_source"
+    ] == "authenticated_postmerge_timeline"
+    assert rework["failed_qa_rework_authority"][
+        "failed_qa_source_ref"
+    ] == f"timeline:{failed['id']}"
+
+
 @pytest.mark.parametrize(
     ("lane_next", "binding_override", "accepted"),
     [

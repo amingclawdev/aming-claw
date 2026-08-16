@@ -18163,8 +18163,9 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
     """Admit one fresh rework worker from an exact merged batch child.
 
     The original batch queue row stays terminal and immutable.  It supplies
-    only the frozen target-ref/row lineage for a new RuntimeContext.  The
-    active failed-QA ContractRuntime line supplies the recovery authority.
+    only the frozen target-ref/row lineage for a new RuntimeContext.  Recovery
+    authority comes from either the active failed-QA ContractRuntime line or
+    the exact authenticated merged-canonical failed-QA timeline boundary.
     """
 
     if (
@@ -18175,25 +18176,61 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
     contract_execution_id = str(
         record.get("contract_execution_id") or ""
     ).strip()
+    source_task_id = str(
+        verified_batch_child.get("child_task_id") or ""
+    ).strip()
+    from .parallel_branch_runtime import get_branch_context
+
+    source_context = get_branch_context(conn, project_id, source_task_id)
+    if source_context is None:
+        return {}
+    source_runtime_context_id, resolved_source_task_id, source_parent_task_id = (
+        _contract_runtime_context_identity(source_context)
+    )
     completed_lines = list(record.get("completed_lines") or [])
     failed_qa_index = _active_failed_qa_line_index(
         completed_lines,
         source_record=record,
     )
-    if failed_qa_index < 0:
-        return {}
-    expected_failed_qa_source_ref = (
-        f"contract_runtime:{contract_execution_id}:completed_lines:"
-        f"{failed_qa_index}"
-    )
+    failed_qa_line: Mapping[str, Any] | None = None
+    failed_qa_timeline_authority: dict[str, Any] = {}
+    if failed_qa_index >= 0:
+        expected_failed_qa_source_ref = (
+            f"contract_runtime:{contract_execution_id}:completed_lines:"
+            f"{failed_qa_index}"
+        )
+        candidate_failed_line = completed_lines[failed_qa_index]
+        failed_qa_line = (
+            candidate_failed_line
+            if isinstance(candidate_failed_line, Mapping)
+            else None
+        )
+    else:
+        from . import task_timeline
+
+        failed_qa_timeline_authority = (
+            _runtime_context_authenticated_failed_qa_timeline_boundary(
+                conn=conn,
+                context=source_context,
+                runtime_context_id=source_runtime_context_id,
+                timeline_events=task_timeline.list_events(
+                    conn,
+                    project_id,
+                    backlog_id=str(record.get("backlog_id") or "").strip(),
+                    limit=1000,
+                ),
+            )
+        )
+        expected_failed_qa_source_ref = str(
+            failed_qa_timeline_authority.get("source_ref") or ""
+        ).strip()
+        if not expected_failed_qa_source_ref:
+            return {}
     if str(body.get("failed_qa_source_ref") or "").strip() != (
         expected_failed_qa_source_ref
     ):
         return {}
 
-    source_task_id = str(
-        verified_batch_child.get("child_task_id") or ""
-    ).strip()
     fresh_task_id = str(body.get("task_id") or "").strip()
     fresh_worker_id = str(
         body.get("worker_id") or body.get("worker_slot_id") or ""
@@ -18215,14 +18252,6 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
     ).fetchone() is not None:
         return {}
 
-    from .parallel_branch_runtime import get_branch_context
-
-    source_context = get_branch_context(conn, project_id, source_task_id)
-    if source_context is None:
-        return {}
-    source_runtime_context_id, resolved_source_task_id, source_parent_task_id = (
-        _contract_runtime_context_identity(source_context)
-    )
     source_worker_ids = {
         str(value or "").strip()
         for value in (
@@ -18292,18 +18321,21 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
     ):
         return {}
 
-    failed_qa_line = completed_lines[failed_qa_index]
-    if not isinstance(failed_qa_line, Mapping):
-        return {}
     dispatch_match = _contract_runtime_dispatch_line_match(
         record,
         source_context,
     )
-    if not dispatch_match or not _runtime_context_failed_qa_line_matches_context(
-        failed_qa_line,
-        context=source_context,
-        server_identity=dispatch_match,
+    if not dispatch_match:
+        return {}
+    if failed_qa_line is not None and not (
+        _runtime_context_failed_qa_line_matches_context(
+            failed_qa_line,
+            context=source_context,
+            server_identity=dispatch_match,
+        )
     ):
+        return {}
+    if failed_qa_line is None and not failed_qa_timeline_authority:
         return {}
 
     return {
@@ -18320,6 +18352,11 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
             "db_verified": True,
             "contract_execution_id": contract_execution_id,
             "failed_qa_source_ref": expected_failed_qa_source_ref,
+            "failed_qa_boundary_source": (
+                "authenticated_postmerge_timeline"
+                if failed_qa_timeline_authority
+                else "ContractRuntime.completed_lines"
+            ),
             "source_runtime_context_id": source_runtime_context_id,
             "source_task_id": source_task_id,
             "fresh_task_id": fresh_task_id,
@@ -18330,6 +18367,15 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
             "fresh_runtime_context_required": True,
             "minimum_attempt": 2,
             "normal_terminal_queue_allocation_unchanged": True,
+            **(
+                {
+                    "postmerge_failed_qa_boundary_authority": dict(
+                        failed_qa_timeline_authority
+                    )
+                }
+                if failed_qa_timeline_authority
+                else {}
+            ),
         }
     }
 
@@ -42980,6 +43026,47 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
             if isinstance(event.get("verification"), Mapping)
             else {}
         )
+        postmerge_failed_boundary = (
+            payload.get("postmerge_failed_qa_boundary_authority")
+            if isinstance(
+                payload.get("postmerge_failed_qa_boundary_authority"), Mapping
+            )
+            else {}
+        )
+        postmerge_failed_boundary_valid = bool(
+            str(postmerge_failed_boundary.get("schema_version") or "").strip()
+            == "contract_runtime.postmerge_failed_qa_boundary_authority.v1"
+            and postmerge_failed_boundary.get("server_derived") is True
+            and postmerge_failed_boundary.get("db_verified") is True
+            and postmerge_failed_boundary.get("audit_only") is True
+            and postmerge_failed_boundary.get("close_satisfying") is False
+            and postmerge_failed_boundary.get("failed_qa_rework_eligible") is True
+            and str(postmerge_failed_boundary.get("authority_hash") or "").strip()
+            == stable_sha256(
+                {
+                    key: value
+                    for key, value in postmerge_failed_boundary.items()
+                    if key != "authority_hash"
+                }
+            )
+            and str(postmerge_failed_boundary.get("project_id") or "").strip()
+            == str(event.get("project_id") or "").strip()
+            and str(postmerge_failed_boundary.get("backlog_id") or "").strip()
+            == backlog_id
+            and str(postmerge_failed_boundary.get("runtime_context_id") or "").strip()
+            == str(runtime_context_id or "").strip()
+            and str(postmerge_failed_boundary.get("task_id") or "").strip()
+            == task_id
+            and str(postmerge_failed_boundary.get("parent_task_id") or "").strip()
+            == str(getattr(context, "parent_task_id", "") or "").strip()
+        )
+        qa_scope_task_id = (
+            str(
+                postmerge_failed_boundary.get("qa_graph_trace_task_id") or ""
+            ).strip()
+            if postmerge_failed_boundary_valid
+            else task_id
+        )
         event_task_id = str(
             event.get("task_id")
             or payload.get("task_id")
@@ -42989,7 +43076,7 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
         event_backlog_id = str(
             event.get("backlog_id") or payload.get("backlog_id") or ""
         ).strip()
-        if task_id and event_task_id != task_id:
+        if qa_scope_task_id and event_task_id != qa_scope_task_id:
             continue
         if backlog_id and event_backlog_id != backlog_id:
             continue
@@ -43043,6 +43130,15 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
             or qa_proof.get("commit_sha")
             or ""
         ).strip()
+        if postmerge_failed_boundary_valid and (
+            str(
+                postmerge_failed_boundary.get("candidate_commit_sha") or ""
+            )
+            .strip()
+            .lower()
+            != event_commit.lower()
+        ):
+            continue
         qa_observer_impersonation_forbidden = (
             qa_proof.get("observer_impersonation") is False
             and (
@@ -43073,7 +43169,8 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
             and bool(str(qa_proof.get("qa_scope_binding_ref") or "").strip())
             and str(qa_proof.get("project_id") or "").strip()
             == str(event.get("project_id") or "").strip()
-            and str(qa_proof.get("task_id") or "").strip() == task_id
+            and str(qa_proof.get("task_id") or "").strip()
+            == qa_scope_task_id
             and str(qa_proof.get("backlog_id") or "").strip() == backlog_id
             and str(qa_proof.get("event_kind") or "").strip()
             in {"independent_verification", "qa_verification"}
@@ -43136,7 +43233,18 @@ def _runtime_context_latest_authenticated_qa_timeline_verdict(
             )
             if str(value or "").strip()
         }
-        if explicit_runtime_context_ids:
+        if postmerge_failed_boundary_valid:
+            runtime_context_binding = {
+                "schema_version": "runtime_context.timeline_runtime_binding.v1",
+                "source": "server_postmerge_failed_qa_boundary_authority",
+                "server_derived": True,
+                "runtime_context_id": str(runtime_context_id or "").strip(),
+                "project_id": str(getattr(context, "project_id", "") or "").strip(),
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "qa_scope_task_id": qa_scope_task_id,
+            }
+        elif explicit_runtime_context_ids:
             if explicit_runtime_context_ids != {
                 str(runtime_context_id or "").strip()
             }:
@@ -140860,6 +140968,225 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
         proof.get("candidate_commit_sha") or proof.get("commit_sha") or ""
     ).strip().lower()
     proof_query_root = str(proof.get("query_root") or "").strip()
+    evidence_status = str(normalized_status or "").strip().lower()
+    close_satisfying_verdict = evidence_status in _QA_TIMELINE_CLOSE_STATUSES
+    audit_only = evidence_status in _QA_TIMELINE_AUDIT_STATUSES
+
+    # A batch child has one bounded worker, but its final QA reviews the
+    # reconciled batch head from the coordination CEX.  Once the server can
+    # prove that post-merge authority, an authenticated failure is a rework
+    # boundary, not another worker-candidate receipt.  Keep passing receipts
+    # on the strict pre-merge path below: a PASS may never use this branch to
+    # skip candidate/dispatch/worker identity checks.
+    postmerge_authority = (
+        _contract_runtime_rev8_postmerge_qa_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+        )
+        if (
+            global_observer_merge_ready
+            and audit_only
+            and _is_mf_parallel_postmerge_revision(record)
+        )
+        else {}
+    )
+    if postmerge_authority.get("verified") is True:
+        postmerge_candidate = str(
+            postmerge_authority.get("candidate_commit_sha") or ""
+        ).strip().lower()
+        postmerge_qa_task_id = str(
+            postmerge_authority.get("qa_graph_trace_task_id") or ""
+        ).strip()
+        postmerge_root = str(
+            postmerge_authority.get("target_project_root") or ""
+        ).strip()
+        postmerge_trace_ids = [
+            str(value or "").strip()
+            for value in proof.get("graph_trace_ids") or []
+            if str(value or "").strip()
+        ]
+        postmerge_mismatches: list[dict[str, Any]] = []
+
+        def require_postmerge(field: str, expected: Any, actual: Any) -> None:
+            if actual != expected:
+                postmerge_mismatches.append(
+                    {"field": field, "expected": expected, "actual": actual}
+                )
+
+        for field, expected in {
+            "schema_version": "qa_session_scope_proof.v1",
+            "source": "authenticated_qa_session",
+            "verified": True,
+            "role": "qa",
+            "db_verified_graph_trace": True,
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "observer_impersonation": False,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": postmerge_qa_task_id,
+        }.items():
+            raw_actual = proof.get(field)
+            actual = (
+                raw_actual
+                if isinstance(expected, bool)
+                else str(raw_actual or "")
+            )
+            require_postmerge(f"qa_session_proof.{field}", expected, actual)
+        require_postmerge("request.task_id", postmerge_qa_task_id, task_id)
+        require_postmerge("request.commit_sha", postmerge_candidate, commit_sha)
+        require_postmerge(
+            "qa_session_proof.commit_sha", postmerge_candidate, proof_commit
+        )
+        require_postmerge(
+            "qa_session.principal", session_principal, proof_principal
+        )
+        require_postmerge("qa_session.session_id", session_id, proof_session_id)
+        require_postmerge(
+            "request.actor", session_principal, str(body.get("actor") or "").strip()
+        )
+        require_postmerge(
+            "qa_session_scope_binding_ref",
+            True,
+            bool(str(proof.get("qa_scope_binding_ref") or "").strip()),
+        )
+        require_postmerge("graph_trace_ids", True, bool(postmerge_trace_ids))
+        require_postmerge("status.audit_only", True, audit_only)
+        require_postmerge(
+            "qa_session_proof.evidence_status",
+            evidence_status,
+            str(proof.get("evidence_status") or "").strip().lower(),
+        )
+        require_postmerge(
+            "qa_session_proof.audit_only", True, proof.get("audit_only") is True
+        )
+        require_postmerge(
+            "postmerge_qa_authority.authority_hash",
+            str(postmerge_authority.get("authority_hash") or ""),
+            stable_sha256(
+                {
+                    key: value
+                    for key, value in postmerge_authority.items()
+                    if key != "authority_hash"
+                }
+            ),
+        )
+        if postmerge_root:
+            require_postmerge(
+                "qa_session_proof.query_root",
+                str(Path(postmerge_root).resolve()),
+                str(Path(proof_query_root).resolve()) if proof_query_root else "",
+            )
+        explicit_runtime_context_id = str(
+            payload.get("runtime_context_id") or ""
+        ).strip()
+        if explicit_runtime_context_id:
+            require_postmerge(
+                "request.runtime_context_id",
+                str(postmerge_authority.get("runtime_context_id") or "").strip(),
+                explicit_runtime_context_id,
+            )
+        if postmerge_mismatches:
+            first = postmerge_mismatches[0]
+            raise GovernanceError(
+                "postmerge_failed_qa_boundary_scope_mismatch",
+                (
+                    "postmerge failed QA does not match the exact reconciled "
+                    "batch-child authority"
+                ),
+                422,
+                {
+                    "field": first["field"],
+                    "expected": first["expected"],
+                    "actual": first["actual"],
+                    "identity_mismatches": postmerge_mismatches,
+                    "source": (
+                        "server._contract_runtime_premerge_candidate_qa_receipt_gate."
+                        "postmerge_failed_qa_boundary.v1"
+                    ),
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                    "retry_same_world_allowed": True,
+                    "contract_runtime_mutated": False,
+                    "runtime_context_mutated": False,
+                    "timeline_mutated": False,
+                    "observer_merge_written": False,
+                    "fail_closed": True,
+                    "public_safe": True,
+                    "secret_safe": True,
+                },
+            )
+
+        boundary_authority = {
+            "schema_version": (
+                "contract_runtime.postmerge_failed_qa_boundary_authority.v1"
+            ),
+            "source": (
+                "authenticated_qa_session+rev8_postmerge_qa_authority"
+            ),
+            "server_derived": True,
+            "db_verified": True,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "runtime_context_id": str(
+                postmerge_authority.get("runtime_context_id") or ""
+            ).strip(),
+            "task_id": str(postmerge_authority.get("task_id") or "").strip(),
+            "parent_task_id": str(
+                postmerge_authority.get("parent_task_id") or ""
+            ).strip(),
+            "qa_graph_trace_task_id": postmerge_qa_task_id,
+            "candidate_commit_sha": postmerge_candidate,
+            "target_project_root": postmerge_root,
+            "qa_principal": proof_principal,
+            "qa_session_id": proof_session_id,
+            "qa_scope_binding_ref": str(
+                proof.get("qa_scope_binding_ref") or ""
+            ).strip(),
+            "graph_trace_ids": postmerge_trace_ids,
+            "evidence_status": evidence_status,
+            "close_satisfying": False,
+            "audit_only": True,
+            "failed_qa_rework_eligible": True,
+            "observer_merge_written": False,
+            "observer_merge_bypassed": False,
+            "postmerge_qa_authority": dict(postmerge_authority),
+        }
+        boundary_authority["authority_hash"] = stable_sha256(
+            boundary_authority
+        )
+        return {
+            "schema_version": _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION,
+            "accepted": True,
+            "status": "accepted_postmerge_failed_qa_boundary",
+            "primary_decision_source": True,
+            "agent_facing_decision_source": (
+                "source_backed_postmerge_failed_qa_boundary"
+            ),
+            "meta_contract_gate_decision_source": False,
+            "contract_execution_id": execution_id,
+            "contract_id": contract_id,
+            "actor_role": "qa",
+            "requested_event_kind": event_kind,
+            "stage_id": "qa_postmerge",
+            "line_id": "qa_independent_verification",
+            "evidence_kind": "independent_verification",
+            "next_legal_action": dict(next_line),
+            "canonical_submit_required": False,
+            "contract_runtime_mutated": False,
+            "close_satisfying": False,
+            "audit_only": True,
+            "failed_qa_rework_eligible": True,
+            "observer_merge_written": False,
+            "observer_merge_bypassed": False,
+            "timeline_append_required": True,
+            "timeline_append_authoritative": True,
+            "postmerge_failed_qa_boundary_authority": boundary_authority,
+        }
+
     context_parent_ids = {
         str(value or "").strip()
         for value in (
@@ -140877,7 +141204,16 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
                 {"field": field, "expected": expected, "actual": actual}
             )
 
-    require("dispatch.worker_count", 2, len(dispatch_workers))
+    expected_worker_count = (
+        _contract_runtime_mf_parallel_current_generation_worker_count(
+            record,
+            conn=conn,
+            project_id=project_id,
+        )
+    )
+    require(
+        "dispatch.worker_count", expected_worker_count, len(dispatch_workers)
+    )
     require("dispatch.worker_identity", 1, len(matching_dispatch_workers))
     proof_requirements = {
         "schema_version": "qa_session_scope_proof.v1",
@@ -140944,9 +141280,6 @@ def _contract_runtime_premerge_candidate_qa_receipt_gate(
         bool(str(proof.get("qa_scope_binding_ref") or "").strip()),
     )
     require("graph_trace_ids", True, bool(proof_trace_ids))
-    evidence_status = str(normalized_status or "").strip().lower()
-    close_satisfying_verdict = evidence_status in _QA_TIMELINE_CLOSE_STATUSES
-    audit_only = evidence_status in _QA_TIMELINE_AUDIT_STATUSES
     require(
         "status",
         True,
@@ -154406,6 +154739,18 @@ def handle_task_timeline_append(ctx: RequestContext):
             ):
                 norm_payload["premerge_candidate_qa_receipt_authority"] = (
                     dict(premerge_candidate_qa_receipt_authority)
+                )
+            postmerge_failed_qa_boundary_authority = (
+                contract_runtime_close_evidence_gate.get(
+                    "postmerge_failed_qa_boundary_authority"
+                )
+            )
+            if isinstance(
+                postmerge_failed_qa_boundary_authority,
+                Mapping,
+            ):
+                norm_payload["postmerge_failed_qa_boundary_authority"] = (
+                    dict(postmerge_failed_qa_boundary_authority)
                 )
             norm_payload["agent_facing_decision_source"] = (
                 contract_runtime_close_evidence_gate.get(
