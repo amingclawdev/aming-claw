@@ -461,6 +461,13 @@ def _task_timeline_body(args: dict) -> dict:
 _RUNTIME_CONTEXT_QUERY_FIELDS = (
     "fence_token",
     "parent_task_id",
+    "task_id",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
     "view",
     "graph_trace_id",
     "session_token",
@@ -526,6 +533,19 @@ def _runtime_context_schema_properties() -> dict[str, Any]:
             "type": "string",
             "description": "Parent observer/MF task id for worker fence validation.",
         },
+        "task_id": {
+            "type": "string",
+            "description": "Bounded worker task id for runtime identity validation.",
+        },
+        "route_id": {"type": "string"},
+        "route_context_hash": {"type": "string"},
+        "prompt_contract_id": {"type": "string"},
+        "prompt_contract_hash": {"type": "string"},
+        "route_token_ref": {
+            "type": "string",
+            "description": "Copy-safe observer route-token reference.",
+        },
+        "visible_injection_manifest_hash": {"type": "string"},
         "view": {
             "type": "string",
             "enum": ["auto", "current", "gate_inputs", "worker_view", "close_gate_view", "all"],
@@ -541,7 +561,7 @@ def _runtime_context_schema_properties() -> dict[str, Any]:
         },
         "session_token_ref": {
             "type": "string",
-            "description": "Opaque scoped worker session-token reference.",
+            "description": "Copy-safe scoped worker session token reference from runtime_context_worker_guide.",
         },
         "target_project_root": {
             "type": "string",

@@ -1585,6 +1585,13 @@ def test_active_runtime_context_tools_are_read_only_and_route_to_current_service
         "runtime_context_id",
         "fence_token",
         "parent_task_id",
+        "task_id",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
         "view",
         "graph_trace_id",
         "session_token",
@@ -1608,6 +1615,13 @@ def test_active_runtime_context_tools_are_read_only_and_route_to_current_service
         "runtime_context_id": "mfrctx-test",
         "fence_token": "fence-test",
         "parent_task_id": "AC-PARENT",
+        "task_id": "worker-task",
+        "route_id": "route-test",
+        "route_context_hash": "sha256:route-context",
+        "prompt_contract_id": "rprompt-test",
+        "prompt_contract_hash": "sha256:prompt-contract",
+        "route_token_ref": "rtok-test",
+        "visible_injection_manifest_hash": "sha256:visible-manifest",
         "view": "worker_view",
         "graph_trace_id": "gqt-test",
         "session_token": "session-test",
@@ -1618,7 +1632,11 @@ def test_active_runtime_context_tools_are_read_only_and_route_to_current_service
     dispatcher.dispatch("runtime_context_worker_guide", args)
 
     query = (
-        "fence_token=fence-test&parent_task_id=AC-PARENT&view=worker_view&"
+        "fence_token=fence-test&parent_task_id=AC-PARENT&task_id=worker-task&"
+        "route_id=route-test&route_context_hash=sha256%3Aroute-context&"
+        "prompt_contract_id=rprompt-test&prompt_contract_hash=sha256%3Aprompt-contract&"
+        "route_token_ref=rtok-test&"
+        "visible_injection_manifest_hash=sha256%3Avisible-manifest&view=worker_view&"
         "graph_trace_id=gqt-test&session_token=session-test&"
         "target_project_root=%2Frepo%2Ffixture"
     )
@@ -1636,6 +1654,28 @@ def test_active_runtime_context_tools_are_read_only_and_route_to_current_service
             None,
         ),
     ]
+
+
+def test_runtime_context_worker_guide_adapter_schemas_preserve_safe_route_identity():
+    expected = {
+        "task_id",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    }
+
+    for registry in (TOOLS, governance_mcp_server.TOOLS):
+        tool = next(
+            item for item in registry
+            if item["name"] == "runtime_context_worker_guide"
+        )
+        properties = tool["inputSchema"]["properties"]
+        assert expected.issubset(properties)
+        assert "route_token" not in properties
+        assert "session_token_ref" in properties
 
 
 def test_mcp_observer_command_list_advertises_consumer_recovery_diagnostics():

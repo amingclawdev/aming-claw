@@ -2207,6 +2207,13 @@ def test_governance_mcp_runtime_context_current_tool_is_read_only(monkeypatch):
     assert schema["required"] == ["project_id", "runtime_context_id"]
     assert "fence_token" in schema["properties"]
     assert "parent_task_id" in schema["properties"]
+    assert "task_id" in schema["properties"]
+    assert "route_id" in schema["properties"]
+    assert "route_context_hash" in schema["properties"]
+    assert "prompt_contract_id" in schema["properties"]
+    assert "prompt_contract_hash" in schema["properties"]
+    assert "route_token_ref" in schema["properties"]
+    assert "visible_injection_manifest_hash" in schema["properties"]
     assert "session_token" in schema["properties"]
     assert "target_project_root" in schema["properties"]
 
@@ -2251,6 +2258,13 @@ def test_governance_mcp_runtime_context_worker_guide_tool_is_read_only(monkeypat
     assert "read/write guide" in tool["description"]
     assert "fence_token" in schema["properties"]
     assert "parent_task_id" in schema["properties"]
+    assert "task_id" in schema["properties"]
+    assert "route_id" in schema["properties"]
+    assert "route_context_hash" in schema["properties"]
+    assert "prompt_contract_id" in schema["properties"]
+    assert "prompt_contract_hash" in schema["properties"]
+    assert "route_token_ref" in schema["properties"]
+    assert "visible_injection_manifest_hash" in schema["properties"]
     assert "view" in schema["properties"]
     assert "graph_trace_id" in schema["properties"]
     assert "session_token" in schema["properties"]
@@ -2273,6 +2287,13 @@ def test_governance_mcp_runtime_context_worker_guide_tool_is_read_only(monkeypat
             "runtime_context_id": "mfrctx-test",
             "fence_token": "fence-test",
             "parent_task_id": "AC-PARENT",
+            "task_id": "worker-task",
+            "route_id": "route-test",
+            "route_context_hash": "sha256:route-context",
+            "prompt_contract_id": "rprompt-test",
+            "prompt_contract_hash": "sha256:prompt-contract",
+            "route_token_ref": "rtok-test",
+            "visible_injection_manifest_hash": "sha256:visible-manifest",
             "view": "worker_view",
             "graph_trace_id": "gqt-test",
             "session_token": "session-test",
@@ -2286,12 +2307,64 @@ def test_governance_mcp_runtime_context_worker_guide_tool_is_read_only(monkeypat
             "GET",
             "/api/graph-governance/aming-claw/runtime-contexts/"
             "mfrctx-test/worker-guide?"
-            "fence_token=fence-test&parent_task_id=AC-PARENT&view=worker_view&"
+            "fence_token=fence-test&parent_task_id=AC-PARENT&task_id=worker-task&"
+            "route_id=route-test&route_context_hash=sha256%3Aroute-context&"
+            "prompt_contract_id=rprompt-test&"
+            "prompt_contract_hash=sha256%3Aprompt-contract&"
+            "route_token_ref=rtok-test&"
+            "visible_injection_manifest_hash=sha256%3Avisible-manifest&"
+            "view=worker_view&"
             "graph_trace_id=gqt-test&session_token=session-test&"
             "target_project_root=%2Frepo%2Ffixture",
             None,
         )
     ]
+
+
+def test_runtime_context_worker_guide_schema_matches_both_stdio_adapters():
+    expected = {
+        "task_id",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    }
+    schemas = []
+    for registry in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        tool = next(
+            item for item in registry
+            if item["name"] == "runtime_context_worker_guide"
+        )
+        schema = tool["inputSchema"]
+        schemas.append(schema)
+        assert expected.issubset(schema["properties"])
+        assert "route_token" not in schema["properties"]
+    assert schemas[0] == schemas[1]
+
+
+def test_mcp_stdio_tools_list_projects_worker_guide_route_identity():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
+    properties = tools["runtime_context_worker_guide"]["inputSchema"][
+        "properties"
+    ]
+    assert {
+        "task_id",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    }.issubset(properties)
+    assert "route_token" not in properties
 
 
 def test_mcp_runtime_reads_preserve_authoritative_merge_queue_projection(
