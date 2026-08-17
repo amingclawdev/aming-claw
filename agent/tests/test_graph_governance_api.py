@@ -42617,11 +42617,195 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert rescue_marker["max_legacy_rescues"] == 1
     assert rescue_marker["general_loss_replacement_limit_raised"] is False
     managed_before_legacy_rescue = managed
-    managed = legacy_rescue
+    # The exact R2 rescue response was accepted, but its process-local
+    # envelope was lost before the host could stage it.  Once that final
+    # reissue lease expires, Guide must not fall back to initial_join (the
+    # verifier-only runtime no longer has a raw allocation fence).  It may
+    # project one verifier-backed pre-lineage rejoin from the pinned successor
+    # dispatch/join/anchor, and the facade must consume that authority once.
+    monkeypatch.setattr(server, "_utc_now", lambda: "2099-08-17T07:00:00Z")
+    expired_after_legacy_rescue = get_branch_context(
+        conn,
+        PID,
+        fresh_task_id,
+    )
+    assert expired_after_legacy_rescue is not None
+    with pytest.raises(GovernanceError) as rejoin_guide:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "task_id": fresh_task_id,
+                    "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                    "worker_id": fresh_worker_id,
+                    "worker_slot_id": fresh_worker_id,
+                    "target_project_root": str(world.root),
+                    **route_identity,
+                },
+            )
+        )
+    assert rejoin_guide.value.code == "fence_invalidated_or_unknown"
+    rejoin_details = rejoin_guide.value.details
+    assert rejoin_details["next_legal_action"] == (
+        "request_runtime_context_pre_lineage_rejoin_host_envelope"
+    )
+    rejoin_eligibility = rejoin_details["diagnostics"][
+        "session_token_rejoin_eligibility"
+    ]
+    assert rejoin_eligibility["eligible"] is True
+    assert rejoin_eligibility["mode"] == (
+        "verifier_backed_pre_lineage_rejoin"
+    )
+    verifier_authority = rejoin_eligibility["authority"]
+    assert verifier_authority["authorization_mode"] == (
+        "verifier_backed_exhausted_reissue_successor_dispatch"
+    )
+    assert verifier_authority["initial_join_event_ref"] == (
+        pinned_initial_join_ref
+    )
+    assert verifier_authority["reissue_event_ref"] == (
+        legacy_rescue["audit_event_ref"]
+    )
+    assert verifier_authority["loss_replacement_generation"] == 3
+    assert verifier_authority["max_loss_replacements"] == 2
+    assert "session_token_initial_join_submission" not in (
+        rejoin_details["actionable_payloads"]
+    )
+    rejoin_submission = rejoin_details["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]
+    rejoin_body = copy.deepcopy(rejoin_submission["copy_safe_body"])
+    assert rejoin_submission["path"].endswith("/session-token/rejoin")
+    rejoin_body["reason"] = (
+        "recover the exhausted verifier-backed failed-QA successor once"
+    )
+    authority_context = get_branch_context(conn, PID, fresh_task_id)
+    assert authority_context is not None
+    authority_events = server._runtime_context_service_timeline_events(
+        conn,
+        project_id=PID,
+        task_id=fresh_task_id,
+        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+    )
+    authority_kwargs = {
+        "project_id": PID,
+        "context": authority_context,
+        "runtime_context_id": fresh_context.runtime_context_id,
+        "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+        "route_identity": route_identity,
+        "timeline_events": authority_events,
+    }
+    active_lease_authority = (
+        server._runtime_context_verifier_backed_pre_lineage_rejoin_authority(
+            conn,
+            body=rejoin_body,
+            now_iso="2099-08-17T05:30:00Z",
+            **authority_kwargs,
+        )
+    )
+    assert active_lease_authority["eligible"] is False
+    assert "current_reissue_lease_not_expired" in active_lease_authority["errors"]
+    for field, wrong_value in (
+        ("session_token_ref", managed_before_legacy_rescue["session_token_ref"]),
+        ("task_id", "cross-lane-rework-task"),
+        ("route_id", "route-cross-lane-rework"),
+    ):
+        wrong_body = {**rejoin_body, field: wrong_value}
+        rejected_authority = (
+            server._runtime_context_verifier_backed_pre_lineage_rejoin_authority(
+                conn,
+                body=wrong_body,
+                now_iso="2099-08-17T07:00:00Z",
+                **authority_kwargs,
+            )
+        )
+        assert rejected_authority["eligible"] is False
+        assert rejected_authority["fail_closed"] is True
+    current_reissue_event = next(
+        event
+        for event in reversed(authority_events)
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_reissue"
+        and (event.get("payload") or {}).get("session_token_ref")
+        == legacy_rescue["session_token_ref"]
+    )
+    ambiguous_events = [
+        *authority_events,
+        {**copy.deepcopy(current_reissue_event), "id": 999_999},
+    ]
+    ambiguous_authority = (
+        server._runtime_context_verifier_backed_pre_lineage_rejoin_authority(
+            conn,
+            body=rejoin_body,
+            timeline_events=ambiguous_events,
+            now_iso="2099-08-17T07:00:00Z",
+            **{
+                key: value
+                for key, value in authority_kwargs.items()
+                if key != "timeline_events"
+            },
+        )
+    )
+    assert ambiguous_authority["eligible"] is False
+    assert ambiguous_authority["fail_closed"] is True
+    before_rejoin_attempt = get_branch_context(conn, PID, fresh_task_id)
+    managed = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": fresh_context.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body=rejoin_body,
+        )
+    )
+    assert managed["ok"] is True
+    assert managed["pre_lineage_auth_only_rejoin"] is True
+    assert managed["bounded_rejoin_kind"] == "special_authority_rejoin"
+    assert managed["revision_rejoin_applied"] is False
+    assert managed["attempt"] == before_rejoin_attempt.attempt
+    assert managed["retry_round"] == before_rejoin_attempt.retry_round
+    assert managed["pre_lineage_rejoin_authority"][
+        "authorization_mode"
+    ] == "verifier_backed_exhausted_reissue_successor_dispatch"
+    after_rejoin = get_branch_context(conn, PID, fresh_task_id)
+    assert after_rejoin is not None
+    assert after_rejoin.last_recovery_action == (
+        "mf_subagent_pre_lineage_session_token_rejoin_issued"
+    )
+    assert runtime_context_session_token_ref(after_rejoin) == (
+        managed["session_token_ref"]
+    )
+    before_replay = "\n".join(conn.iterdump())
+    replay_body = copy.deepcopy(rejoin_body)
+    replay_body["session_token_ref"] = managed["session_token_ref"]
+    with pytest.raises(GovernanceError) as replay:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=replay_body,
+            )
+        )
+    assert replay.value.code in {
+        "runtime_context_pre_lineage_rejoin_already_consumed",
+        "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid",
+        "runtime_context_bounded_replacement_rejoin_rejected",
+    }
+    assert "\n".join(conn.iterdump()) == before_replay
     managed_continuity = ManagedHostEnvelopeContinuity()
     managed_public = managed_continuity.dispatch(
-        "runtime_context_session_token_reissue",
-        legacy_rescue_body,
+        "runtime_context_session_token_rejoin",
+        rejoin_body,
         lambda _args: copy.deepcopy(managed),
     )
     assert managed_public["ok"] is True
@@ -42728,6 +42912,35 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
                 "fence_token": managed["fence_token"],
             }
         )
+
+    prepare_guide = replacement_worker_guide()
+    assert prepare_guide["next_legal_action"] == (
+        "observer_runtime_text_prepare"
+    )
+    prepare_action = prepare_guide["canonical_executable_action"]
+    assert prepare_action["mcp_tool"] == "observer_runtime_text_prepare"
+    context_local_prepare_authority = (
+        server._observer_runtime_text_failed_qa_context_local_prepare_authority(
+            conn,
+            project_id=PID,
+            body=prepare_action["copy_safe_body"],
+        )
+    )
+    assert context_local_prepare_authority, context_local_prepare_authority
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(prepare_action["copy_safe_body"]),
+        )
+    )
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", prepared["launch_text_hash"])
+    assert prepared["runtime_context_id"] == fresh_context.runtime_context_id
+    assert prepared["status"] == "prepared_context_local_failed_qa_replacement"
+    assert prepared["failed_qa_context_local_prepare_authority"][
+        "new_dispatch_issued"
+    ] is False
 
     guide_before_receipt = replacement_worker_guide()
     receipt_next = guide_before_receipt[

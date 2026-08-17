@@ -25207,10 +25207,21 @@ def _runtime_context_failed_qa_context_local_setup_next_action(
         dict(item)
         for item in projection.get("failed_qa_revision_rejoin_contexts") or []
         if isinstance(item, Mapping)
-        and str(item.get("schema_version") or "").strip()
-        == "contract_runtime.failed_qa_revision_initial_join_marker.v1"
-        and str(item.get("source") or "").strip()
-        == "accepted_runtime_context_initial_join"
+        and (
+            (
+                str(item.get("schema_version") or "").strip()
+                == "contract_runtime.failed_qa_revision_initial_join_marker.v1"
+                and str(item.get("source") or "").strip()
+                == "accepted_runtime_context_initial_join"
+            )
+            or (
+                str(item.get("schema_version") or "").strip()
+                == "contract_runtime.failed_qa_revision_rejoin_marker.v1"
+                and str(item.get("source") or "").strip()
+                == "accepted_runtime_context_rejoin_event"
+                and bool(str(item.get("dispatch_source_ref") or "").strip())
+            )
+        )
         and str(item.get("runtime_context_id") or "").strip()
         == runtime_context_id
         and str(item.get("task_id") or "").strip() == task_id
@@ -37246,7 +37257,10 @@ def _runtime_context_worker_recovery_details(
             missing_worker_lineage
             and session_token_rejoin_eligibility.get("eligible") is True
             and session_token_rejoin_eligibility.get("mode")
-            == "pre_lineage_bootstrap_auth_only"
+            in {
+                "pre_lineage_bootstrap_auth_only",
+                "verifier_backed_pre_lineage_rejoin",
+            }
         )
         bounded_replacement_recovery = bool(
             session_token_rejoin_eligibility.get("eligible") is True
@@ -37257,6 +37271,18 @@ def _runtime_context_worker_recovery_details(
             session_token_rejoin_eligibility.get("eligible") is True
             and session_token_rejoin_eligibility.get("mode")
             == "safe_ref_prestartup_reissue"
+        )
+        verifier_backed_recovery_exhausted = bool(
+            session_token_rejoin_eligibility.get("eligible") is not True
+            and session_token_rejoin_eligibility.get("mode")
+            == "pre_lineage_rejoin_exhausted"
+            and isinstance(
+                session_token_rejoin_eligibility.get("authority"), Mapping
+            )
+            and session_token_rejoin_eligibility["authority"].get(
+                "applicable"
+            )
+            is True
         )
         if auth_material_missing:
             diagnostics["reason"] = "worker_auth_material_missing"
@@ -37269,6 +37295,7 @@ def _runtime_context_worker_recovery_details(
                 missing_worker_lineage
                 and not pre_lineage_bootstrap_recovery
                 and not safe_ref_prestartup_reissue
+                and not verifier_backed_recovery_exhausted
             ):
                 next_legal_action = "request_runtime_context_initial_join_host_envelope"
                 recovery_action_id = "request_runtime_context_initial_join_host_envelope"
@@ -47060,6 +47087,9 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             "composed_across_auth_rotation": composed_timeline_reopen_authority,
             "contract_execution_id": marker_contract_execution_id,
             "failed_qa_source_ref": failed_qa_source_ref,
+            "dispatch_source_ref": str(
+                successor_dispatch_authority.get("dispatch_source_ref") or ""
+            ).strip(),
             "failed_qa_source": (
                 "server_qa_session_verification"
                 if canonical_timeline_reopen_authority
@@ -47913,6 +47943,7 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
         in {
             "mf_subagent_initial_join_issued",
             "mf_subagent_session_token_reissued",
+            "mf_subagent_pre_lineage_session_token_rejoin_issued",
         }
     )
     if (
@@ -51643,6 +51674,396 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
     return authority
 
 
+def _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    body: Mapping[str, Any],
+    contract_execution_id: str,
+    route_identity: Mapping[str, Any],
+    timeline_events: Sequence[Mapping[str, Any]],
+    effective_read_receipt_ref: str = "",
+    effective_startup_ref: str = "",
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Authorize one verifier-backed rejoin after bounded reissue exhaustion.
+
+    A failed-QA replacement can outlive every process-local envelope while its
+    canonical successor dispatch, latest pinned initial join, identity anchor,
+    current verifier and copy-safe ref remain durable.  Replaying initial_join
+    in that world is both misleading and rejected by the raw-fence validator.
+    This predicate instead grants exactly one ordinary rejoin, and only while
+    no receipt/startup or prior pre-lineage rejoin exists.
+    """
+
+    from .parallel_branch_runtime import (
+        ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
+        runtime_context_fence_token_verifier,
+        runtime_context_id_for_branch_context,
+        runtime_context_session_token_lease_view,
+        runtime_context_session_token_ref,
+    )
+
+    runtime_id = str(runtime_context_id or "").strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    actual_host_worker_id = str(
+        getattr(context, "actual_host_worker_id", "") or ""
+    ).strip()
+    host_session_id = str(
+        getattr(context, "host_session_id", "") or ""
+    ).strip()
+    host_startup_id = str(
+        getattr(context, "host_startup_id", "") or ""
+    ).strip()
+    target_project_root = _runtime_context_effective_target_project_root(
+        context
+    )
+    active_session_token_ref = runtime_context_session_token_ref(context)
+    fence_token_hash = runtime_context_fence_token_verifier(context)
+    last_recovery_action = str(
+        getattr(context, "last_recovery_action", "") or ""
+    ).strip()
+    candidate_applicable = bool(
+        not effective_read_receipt_ref
+        and not effective_startup_ref
+        and last_recovery_action
+        in {
+            "mf_subagent_session_token_reissued",
+            "mf_subagent_pre_lineage_session_token_rejoin_issued",
+        }
+    )
+    successor_contract_evidence = (
+        _runtime_context_failed_qa_revision_contract_runtime_evidence(
+            conn,
+            project_id=project_id,
+            context=context,
+        )
+        if candidate_applicable
+        else {}
+    )
+    successor_dispatch_authority = (
+        successor_contract_evidence.get(
+            "successor_dispatch_revision_authority"
+        )
+        if isinstance(
+            successor_contract_evidence.get(
+                "successor_dispatch_revision_authority"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    marker = (
+        _runtime_context_failed_qa_revision_rejoin_marker(
+            conn=conn,
+            context=context,
+            runtime_context_id=runtime_id,
+            timeline_events=timeline_events,
+        )
+        if candidate_applicable
+        else {}
+    )
+    applicable = bool(
+        candidate_applicable
+        and successor_dispatch_authority
+    )
+    authority: dict[str, Any] = {
+        "schema_version": "runtime_context.pre_lineage_rejoin_authority.v1",
+        "applicable": applicable,
+        "eligible": False,
+        "status": "not_applicable" if not applicable else "blocked",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "authorization_mode": (
+            "verifier_backed_exhausted_reissue_successor_dispatch"
+        ),
+        "auth_only": True,
+        "one_shot": True,
+        "evidence_synthesized": False,
+        "attempt_transition_applied": False,
+        "retry_round_transition_applied": False,
+        "status_transition_applied": False,
+        "project_id": project_id,
+        "runtime_context_id": runtime_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "actual_host_worker_id": actual_host_worker_id,
+        "worker_session_id": host_session_id,
+        "host_startup_id": host_startup_id,
+        "host_session_id": host_session_id,
+        "target_project_root": target_project_root,
+        "session_token_ref": active_session_token_ref,
+        "fence_token_hash": fence_token_hash,
+        "errors": [],
+        "failure_code": "",
+        "reason": "",
+        "fail_closed": False,
+    }
+    if not applicable:
+        return authority
+
+    errors: list[str] = []
+    lease = runtime_context_session_token_lease_view(
+        context,
+        now_iso=now_iso,
+    )
+    if str(getattr(context, "status", "") or "").strip() not in (
+        ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
+    ):
+        errors.append("runtime_context_not_active")
+    if (
+        not runtime_id
+        or runtime_id != runtime_context_id_for_branch_context(context)
+        or str(getattr(context, "project_id", "") or "").strip()
+        != project_id
+    ):
+        errors.append("runtime_context_identity_mismatch")
+    if not (
+        re.fullmatch(r"sha256:[0-9a-f]{64}", fence_token_hash)
+        and str(getattr(context, "session_token_hash", "") or "").strip()
+        and active_session_token_ref
+        and not str(getattr(context, "fence_token", "") or "").strip()
+    ):
+        errors.append("verifier_backed_current_auth_binding_invalid")
+    if not (
+        lease.get("lease_record_valid") is True
+        and lease.get("status") == "expired"
+        and lease.get("expired") is True
+        and lease.get("authorization_valid") is False
+    ):
+        errors.append("current_reissue_lease_not_expired")
+
+    expected_identity = {
+        "runtime_context_id": runtime_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+        "target_project_root": target_project_root,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": actual_host_worker_id,
+        "actual_host_worker_id": actual_host_worker_id,
+        "worker_session_id": host_session_id,
+        "host_startup_id": host_startup_id,
+        "host_session_id": host_session_id,
+        "session_token_ref": active_session_token_ref,
+    }
+    for field, expected in expected_identity.items():
+        actual = str(body.get(field) or "").strip()
+        if not expected or actual != expected:
+            errors.append(f"{field}_mismatch_or_missing")
+    canonical_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    for field, expected in canonical_route_identity.items():
+        if not expected or str(body.get(field) or "").strip() != expected:
+            errors.append(f"request_route_{field}_mismatch_or_missing")
+
+    initial_join_event_ref = str(
+        marker.get("revision_event_ref") or ""
+    ).strip()
+    identity_anchor_ref = str(
+        marker.get("initial_join_identity_anchor_event_ref") or ""
+    ).strip()
+    if (
+        str(marker.get("source") or "").strip()
+        != "accepted_runtime_context_initial_join"
+        or str(marker.get("contract_execution_id") or "").strip()
+        != str(contract_execution_id or "").strip()
+        or str(marker.get("runtime_context_id") or "").strip() != runtime_id
+        or str(marker.get("task_id") or "").strip() != task_id
+        or str(marker.get("parent_task_id") or "").strip() != parent_task_id
+        or not re.fullmatch(r"timeline:[1-9][0-9]*", initial_join_event_ref)
+        or not re.fullmatch(r"timeline:[1-9][0-9]*", identity_anchor_ref)
+    ):
+        errors.append("failed_qa_successor_join_lineage_invalid")
+
+    accepted_reissues: list[Mapping[str, Any]] = []
+    current_ref_reissues: list[Mapping[str, Any]] = []
+    accepted_rejoins: list[Mapping[str, Any]] = []
+    initial_join_event_id = int(
+        initial_join_event_ref.removeprefix("timeline:") or 0
+    )
+    for event in timeline_events:
+        if not isinstance(event, Mapping):
+            continue
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        if str(event.get("status") or "").strip().lower() not in {
+            "accepted",
+            "ok",
+            "pass",
+            "passed",
+            "success",
+            "succeeded",
+        }:
+            continue
+        if (
+            str(payload.get("runtime_context_id") or "").strip()
+            != runtime_id
+            or str(payload.get("task_id") or event.get("task_id") or "").strip()
+            != task_id
+            or str(event.get("backlog_id") or payload.get("backlog_id") or "").strip()
+            != backlog_id
+        ):
+            continue
+        action = str(payload.get("action") or "").strip()
+        if action == "runtime_context_session_token_reissue":
+            accepted_reissues.append(event)
+            if (
+                str(payload.get("session_token_ref") or "").strip()
+                == active_session_token_ref
+            ):
+                current_ref_reissues.append(event)
+        elif (
+            action == "runtime_context_session_token_rejoin"
+            and int(event.get("id") or 0) > initial_join_event_id
+        ):
+            accepted_rejoins.append(event)
+
+    current_reissue = (
+        current_ref_reissues[0] if len(current_ref_reissues) == 1 else {}
+    )
+    current_reissue_payload = (
+        current_reissue.get("payload")
+        if isinstance(current_reissue.get("payload"), Mapping)
+        else {}
+    )
+    current_reissue_authority = (
+        current_reissue_payload.get("safe_ref_reissue_authority")
+        if isinstance(
+            current_reissue_payload.get("safe_ref_reissue_authority"), Mapping
+        )
+        else {}
+    )
+    current_reissue_source = (
+        current_reissue_payload.get("safe_ref_session_authority_source")
+        if isinstance(
+            current_reissue_payload.get("safe_ref_session_authority_source"),
+            Mapping,
+        )
+        else {}
+    )
+    loss_authority = (
+        current_reissue_payload.get("safe_ref_loss_replacement_authority")
+        if isinstance(
+            current_reissue_payload.get("safe_ref_loss_replacement_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    loss_generation = int(
+        loss_authority.get("loss_replacement_generation") or 0
+    )
+    max_loss_replacements = int(
+        loss_authority.get("max_loss_replacements") or 0
+    )
+    if (
+        len(current_ref_reissues) != 1
+        or not accepted_reissues
+        or int(current_reissue.get("id") or 0)
+        != max(int(event.get("id") or 0) for event in accepted_reissues)
+        or str(current_reissue_payload.get("contract_execution_id") or "").strip()
+        != str(contract_execution_id or "").strip()
+        or str(current_reissue_payload.get("fence_token_hash") or "").strip()
+        != fence_token_hash
+        or dict(current_reissue_payload.get("route_identity") or {})
+        != canonical_route_identity
+        or str(current_reissue_authority.get("initial_join_event_ref") or "").strip()
+        != initial_join_event_ref
+        or str(current_reissue_source.get("event_ref") or "").strip()
+        != initial_join_event_ref
+        or str(current_reissue_source.get("source_kind") or "").strip()
+        != "initial_join"
+    ):
+        errors.append("current_reissue_source_binding_invalid")
+    if not (
+        loss_generation > 0
+        and max_loss_replacements > 0
+        and loss_generation >= max_loss_replacements
+        and loss_authority.get("worker_receipt_consumed") is False
+        and loss_authority.get("worker_startup_consumed") is False
+    ):
+        errors.append("safe_ref_reissue_budget_not_exhausted")
+    if accepted_rejoins:
+        errors.append("pre_lineage_rejoin_already_consumed")
+
+    errors = list(dict.fromkeys(errors))
+    failure_code = ""
+    failure_reason = ""
+    if "pre_lineage_rejoin_already_consumed" in errors:
+        failure_code = "runtime_context_pre_lineage_rejoin_already_consumed"
+        failure_reason = "pre_lineage_rejoin_already_consumed"
+    elif any("mismatch" in error for error in errors):
+        failure_code = "runtime_context_pre_lineage_rejoin_identity_mismatch"
+        failure_reason = "runtime_identity_mismatch"
+    elif "failed_qa_successor_join_lineage_invalid" in errors:
+        failure_code = (
+            "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid"
+        )
+        failure_reason = "canonical_initial_join_audit_invalid"
+    else:
+        failure_code = "runtime_context_pre_lineage_rejoin_authority_invalid"
+        failure_reason = errors[0] if errors else ""
+    authority.update(
+        {
+            "eligible": not errors,
+            "status": "eligible" if not errors else "blocked",
+            "initial_join_event_ref": initial_join_event_ref,
+            "canonical_identity_binding_anchor_ref": identity_anchor_ref,
+            "audit_cardinality": 1 if initial_join_event_ref else 0,
+            "audit_valid": bool(initial_join_event_ref and identity_anchor_ref),
+            "identity_contract_version": (
+                "runtime_context.initial_join_identity.v2"
+            ),
+            "canonical_identity_binding_required": True,
+            "canonical_identity_binding_valid": bool(marker),
+            "canonical_identity_cutover_valid": bool(marker),
+            "route_identity": canonical_route_identity,
+            "lease": {
+                "lease_id": str(lease.get("lease_id") or ""),
+                "lease_expires_at": str(lease.get("lease_expires_at") or ""),
+                "status": str(lease.get("status") or ""),
+                "authorization_valid": lease.get("authorization_valid") is True,
+                "expired": lease.get("expired") is True,
+            },
+            "reissue_event_ref": (
+                f"timeline:{current_reissue.get('id', '')}"
+                if current_reissue
+                else ""
+            ),
+            "loss_replacement_generation": loss_generation,
+            "max_loss_replacements": max_loss_replacements,
+            "errors": errors,
+            "failure_code": failure_code if errors else "",
+            "reason": failure_reason if errors else "",
+            "fail_closed": bool(errors),
+            "next_legal_action": (
+                "rotate_pre_lineage_auth_once_then_parse_content_text_same_call"
+                if not errors
+                else "stop_and_report_bounded_pre_lineage_recovery_exhausted"
+            ),
+        }
+    )
+    return authority
+
+
 def _runtime_context_pre_lineage_guidance_authority(
     conn,
     *,
@@ -51710,6 +52131,23 @@ def _runtime_context_pre_lineage_guidance_authority(
             for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
         },
     }
+    verifier_backed_authority = (
+        _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            body=body,
+            contract_execution_id=contract_execution_id,
+            route_identity=route_identity,
+            timeline_events=timeline_events,
+            effective_read_receipt_ref=effective_read_receipt_ref,
+            effective_startup_ref=effective_startup_ref,
+            now_iso=_utc_now(),
+        )
+    )
+    if verifier_backed_authority.get("applicable") is True:
+        return verifier_backed_authority, resolution
     return (
         _runtime_context_pre_lineage_bootstrap_rejoin_authority(
             conn,
@@ -53441,11 +53879,7 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                 }
             )
             return projection
-    if (
-        len(missing_lineage) == 2
-        and str(getattr(context, "last_recovery_action", "") or "").strip()
-        == "mf_subagent_initial_join_issued"
-    ):
+    if len(missing_lineage) == 2:
         authority, contract_resolution = (
             _runtime_context_pre_lineage_guidance_authority(
                 conn,
@@ -53459,26 +53893,48 @@ def _runtime_context_session_rejoin_guidance_eligibility(
             )
         )
         eligible = authority.get("eligible") is True
-        projection.update(
-            {
-                "eligible": eligible,
-                "mode": (
-                    "pre_lineage_bootstrap_auth_only" if eligible else "blocked"
-                ),
-                "authority": authority,
-                "contract_execution_resolution": contract_resolution,
-                "blockers": list(authority.get("errors") or []),
-            }
+        verifier_backed = bool(
+            authority.get("applicable") is True
+            and authority.get("authorization_mode")
+            == "verifier_backed_exhausted_reissue_successor_dispatch"
         )
-        if eligible:
-            projection["required_response_handling"] = {
-                "parse_mcp_content_text_in_same_call": True,
-                "inject_host_envelope_env_process_locally": True,
-                "if_replacement_envelope_lost": (
-                    "stop_without_retry_or_second_rejoin"
-                ),
-            }
-        return projection
+        initial_join_bootstrap = bool(
+            str(getattr(context, "last_recovery_action", "") or "").strip()
+            == "mf_subagent_initial_join_issued"
+        )
+        if not verifier_backed and not initial_join_bootstrap:
+            authority = {}
+        else:
+            projection.update(
+                {
+                    "eligible": eligible,
+                    "mode": (
+                        (
+                            "verifier_backed_pre_lineage_rejoin"
+                            if verifier_backed
+                            else "pre_lineage_bootstrap_auth_only"
+                        )
+                        if eligible
+                        else (
+                            "pre_lineage_rejoin_exhausted"
+                            if verifier_backed
+                            else "blocked"
+                        )
+                    ),
+                    "authority": authority,
+                    "contract_execution_resolution": contract_resolution,
+                    "blockers": list(authority.get("errors") or []),
+                }
+            )
+            if eligible:
+                projection["required_response_handling"] = {
+                    "parse_mcp_content_text_in_same_call": True,
+                    "inject_host_envelope_env_process_locally": True,
+                    "if_replacement_envelope_lost": (
+                        "stop_without_retry_or_second_rejoin"
+                    ),
+                }
+            return projection
     if status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
         replacement_authority = (
             _runtime_context_bounded_replacement_rejoin_authority(
@@ -54144,9 +54600,10 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             )
         pre_lineage_bootstrap_rejoin_authority: dict[str, Any] = {}
         pre_lineage_bounded_replacement_authority: dict[str, Any] = {}
+        verifier_backed_pre_lineage_authority_applicable = False
         if missing_lineage:
             pre_lineage_bootstrap_rejoin_authority = (
-                _runtime_context_pre_lineage_bootstrap_rejoin_authority(
+                _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
                     conn,
                     project_id=project_id,
                     context=context,
@@ -54160,16 +54617,38 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     now_iso=authoritative_now_iso,
                 )
             )
-            if pre_lineage_bootstrap_rejoin_authority.get("eligible") is not True:
-                pre_lineage_bounded_replacement_authority = (
-                    _runtime_context_bounded_replacement_rejoin_authority(
+            verifier_backed_pre_lineage_authority_applicable = bool(
+                pre_lineage_bootstrap_rejoin_authority.get("applicable") is True
+            )
+            if (
+                not verifier_backed_pre_lineage_authority_applicable
+            ):
+                pre_lineage_bootstrap_rejoin_authority = (
+                    _runtime_context_pre_lineage_bootstrap_rejoin_authority(
                         conn,
                         project_id=project_id,
                         context=context,
+                        runtime_context_id=runtime_context_id,
+                        body=pre_lineage_authority_body,
+                        contract_execution_id=resolved_contract_execution_id,
+                        route_identity=pre_lineage_authority_route_identity,
                         timeline_events=timeline_events,
-                        body=body,
+                        effective_read_receipt_ref=effective_read_receipt_ref,
+                        effective_startup_ref=effective_startup_ref,
+                        now_iso=authoritative_now_iso,
                     )
                 )
+            if pre_lineage_bootstrap_rejoin_authority.get("eligible") is not True:
+                if not verifier_backed_pre_lineage_authority_applicable:
+                    pre_lineage_bounded_replacement_authority = (
+                        _runtime_context_bounded_replacement_rejoin_authority(
+                            conn,
+                            project_id=project_id,
+                            context=context,
+                            timeline_events=timeline_events,
+                            body=body,
+                        )
+                    )
             pre_lineage_request_binding_errors = [
                 str(error or "").strip()
                 for error in (
@@ -54561,6 +55040,13 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     )
                 bounded_replacement_rejoin = True
         try:
+            pre_lineage_auth_only_rejoin = bool(
+                pre_lineage_bootstrap_rejoin_authority.get("eligible") is True
+            )
+            effective_failed_qa_reopen_for_revision = bool(
+                failed_qa_reopen_for_revision
+                and not pre_lineage_auth_only_rejoin
+            )
             if legacy_startup_template_repair_authority:
                 if conn.in_transaction:
                     conn.execute(
@@ -54683,7 +55169,9 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     ttl_seconds=body.get("ttl_seconds"),
                     reason=reason,
                     now_iso=authoritative_now_iso,
-                    reopen_for_revision=failed_qa_reopen_for_revision,
+                    reopen_for_revision=(
+                        effective_failed_qa_reopen_for_revision
+                    ),
                     failed_qa_running_revision_rejoin_authority=(
                         failed_qa_running_revision_rejoin_authority
                     ),
@@ -54859,9 +55347,11 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             result["legacy_startup_template_repair_authority"] = dict(
                 legacy_startup_template_repair_authority
             )
-        result["reopen_for_revision"] = reopen_for_revision
+        result["reopen_for_revision"] = bool(
+            reopen_for_revision and not pre_lineage_auth_only_rejoin
+        )
         result["reopen_for_failed_qa_revision"] = (
-            failed_qa_reopen_for_revision
+            effective_failed_qa_reopen_for_revision
         )
         if failed_qa_running_revision_rejoin_authority is not None:
             result["failed_qa_running_revision_rejoin_authority"] = asdict(
@@ -55086,7 +55576,9 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 "bounded_replacement_rejoin_authority": dict(
                     bounded_replacement_rejoin_authority
                 ),
-                "reopen_for_revision": reopen_for_revision,
+                "reopen_for_revision": bool(
+                    reopen_for_revision and not pre_lineage_auth_only_rejoin
+                ),
                 "timeline_reopen_for_revision": timeline_reopen_for_revision,
                 "contract_runtime_failed_qa_revision": (
                     contract_runtime_failed_qa_revision
@@ -61132,11 +61624,21 @@ def _runtime_context_context_local_setup_authority(
         project_id=project_id,
         command_id=observer_command_id,
     )
-    initial_join_marker = bool(
-        str(marker.get("schema_version") or "").strip()
-        == "contract_runtime.failed_qa_revision_initial_join_marker.v1"
-        and str(marker.get("source") or "").strip()
-        == "accepted_runtime_context_initial_join"
+    source_backed_join_marker = bool(
+        (
+            (
+                str(marker.get("schema_version") or "").strip()
+                == "contract_runtime.failed_qa_revision_initial_join_marker.v1"
+                and str(marker.get("source") or "").strip()
+                == "accepted_runtime_context_initial_join"
+            )
+            or (
+                str(marker.get("schema_version") or "").strip()
+                == "contract_runtime.failed_qa_revision_rejoin_marker.v1"
+                and str(marker.get("source") or "").strip()
+                == "accepted_runtime_context_rejoin_event"
+            )
+        )
         and str(marker.get("revision_event_ref") or "").strip().startswith(
             "timeline:"
         )
@@ -61145,7 +61647,7 @@ def _runtime_context_context_local_setup_authority(
         and marker.get("route_identity_rebound") is False
         and marker.get("evidence_backfill") is False
     )
-    if not isinstance(command, Mapping) and not initial_join_marker:
+    if not isinstance(command, Mapping) and not source_backed_join_marker:
         return {}
     command_payload = (
         command.get("payload")
@@ -61198,7 +61700,7 @@ def _runtime_context_context_local_setup_authority(
             and actual != expected
         ):
             return {}
-    if initial_join_marker and str(
+    if source_backed_join_marker and str(
         marker.get("route_token_ref") or ""
     ).strip() != str(latest_route_identity.get("route_token_ref") or "").strip():
         return {}
@@ -61377,7 +61879,7 @@ def _runtime_context_context_local_setup_authority(
                 if isinstance(command, Mapping)
                 else ""
             ),
-            "required": not initial_join_marker,
+            "required": not source_backed_join_marker,
         },
         "active_worker_proof": active_worker_proof,
         "local_read_receipt": local_read_receipt,
@@ -163327,6 +163829,115 @@ def _observer_runtime_text_contract_revision_payload(
     }
 
 
+def _observer_runtime_text_failed_qa_context_local_prepare_authority(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authorize launch-text preparation for an already dispatched rework.
+
+    The generic runtime-text builder also decides whether it may issue a new
+    execution ticket.  A failed-QA replacement is already dispatched, so that
+    ticket window is intentionally closed even though its context-local worker
+    read still needs one source-backed launch hash.  Reuse the same exact-lane
+    projection as Worker Guide and permit only the revision preparation; this
+    does not reopen the global ContractRuntime line or mint another dispatch.
+    """
+
+    from .parallel_branch_runtime import (
+        get_branch_context_by_runtime_context_id,
+        runtime_context_id_for_branch_context,
+    )
+
+    runtime_context_id = str(body.get("runtime_context_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    execution_id = str(body.get("contract_execution_id") or "").strip()
+    context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        runtime_context_id,
+    )
+    if context is None or not all((runtime_context_id, task_id, execution_id)):
+        return {}
+    if not (
+        runtime_context_id_for_branch_context(context) == runtime_context_id
+        and str(getattr(context, "task_id", "") or "").strip() == task_id
+        and _runtime_context_mf_sub_parent_task_id(context) == execution_id
+        and str(getattr(context, "last_recovery_action", "") or "").strip()
+        == "mf_subagent_pre_lineage_session_token_rejoin_issued"
+    ):
+        return {}
+    try:
+        source_record = _contract_runtime_store(conn).get(execution_id)
+        projected_record, projection = (
+            _contract_runtime_apply_mf_parallel_context_projection(
+                conn,
+                project_id=project_id,
+                record=source_record,
+                actor_role="mf_sub",
+            )
+        )
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+    canonical_next = _runtime_next_action_from_guide(
+        projected_record.get("runtime_guide") or {},
+        source="contract_runtime_current_state",
+    )
+    context_local_next = (
+        _runtime_context_failed_qa_context_local_setup_next_action(
+            canonical_next,
+            record=projected_record,
+            projection=projection,
+            context=context,
+        )
+    )
+    expected_route_identity = _runtime_context_latest_route_identity(conn, context)
+    supplied_route_identity = {
+        field: str(body.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not (
+        context_local_next.get(
+            "failed_qa_replacement_context_local_setup_projection"
+        )
+        is True
+        and str(context_local_next.get("action") or "").strip()
+        == "submit_mf_subagent_read_receipt"
+        and str(context_local_next.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(context_local_next.get("task_id") or "").strip() == task_id
+        and str(context_local_next.get("parent_task_id") or "").strip()
+        == execution_id
+        and expected_route_identity
+        and supplied_route_identity == expected_route_identity
+    ):
+        return {}
+    core = {
+        "schema_version": (
+            "observer_runtime_text.failed_qa_context_local_prepare_authority.v1"
+        ),
+        "source": "server_verified_failed_qa_replacement_dispatch",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "contract_execution_id": execution_id,
+        "dispatch_source_ref": str(
+            context_local_next.get("dispatch_source_ref") or ""
+        ).strip(),
+        "initial_join_event_ref": str(
+            context_local_next.get("initial_join_event_ref") or ""
+        ).strip(),
+        "route_identity": expected_route_identity,
+        "prepare_only": True,
+        "new_dispatch_issued": False,
+        "contract_runtime_mutated": False,
+    }
+    return {**core, "authority_hash": stable_sha256(core)}
+
+
 def _persist_observer_runtime_text_contract_revision(
     project_id: str,
     body: Mapping[str, Any],
@@ -164505,6 +165116,7 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         "owned_files",
         "target_files",
     )
+    failed_qa_context_local_prepare_authority: dict[str, Any] = {}
     conn = get_connection(project_id)
     try:
         contract_runtime_current_state = (
@@ -164567,6 +165179,13 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
                 body,
                 resolved_context,
                 owned_files,
+            )
+        )
+        failed_qa_context_local_prepare_authority = (
+            _observer_runtime_text_failed_qa_context_local_prepare_authority(
+                conn,
+                project_id=project_id,
+                body=body,
             )
         )
         conn.commit()
@@ -164715,6 +165334,26 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         ),
     )
     prepared = build_observer_runtime_text_context(request)
+    if failed_qa_context_local_prepare_authority:
+        prepared_launch_text_hash = str(
+            prepared.get("launch_text_hash") or ""
+        ).strip()
+        if (
+            str(prepared.get("runtime_context_id") or "").strip()
+            == resolved_runtime_context_id
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", prepared_launch_text_hash)
+        ):
+            prepared["ok"] = True
+            prepared["status"] = "prepared_context_local_failed_qa_replacement"
+            prepared["failed_qa_context_local_prepare_authority"] = dict(
+                failed_qa_context_local_prepare_authority
+            )
+            prepared["dispatch_gate_validation"] = {
+                "allowed": False,
+                "status": "existing_dispatch_context_local_prepare_only",
+                "startup_intent_event_generated": False,
+                "new_dispatch_issued": False,
+            }
     if worker_route_identity_evidence:
         prepared["worker_route_identity_evidence"] = dict(
             worker_route_identity_evidence
@@ -164836,6 +165475,9 @@ def handle_observer_runtime_text_prepare(ctx: RequestContext):
         ),
         "worker_launch_pack": dict(prepared.get("worker_launch_pack") or {}),
         "execution_ticket": dict(prepared.get("execution_ticket") or {}),
+        "failed_qa_context_local_prepare_authority": dict(
+            prepared.get("failed_qa_context_local_prepare_authority") or {}
+        ),
         "local_runtime_context_bridge": local_runtime_context_bridge,
         "dispatch_timeline_event": dispatch_timeline_event,
         "full_payload_path": full_payload_path,
