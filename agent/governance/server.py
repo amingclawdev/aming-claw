@@ -29166,6 +29166,7 @@ def _runtime_context_finish_guide_authority_is_exact(
 
 _RUNTIME_CONTEXT_GUIDE_STAGE_FACADES = {
     "join": "runtime_context_session_token_initial_join",
+    "runtime_text_prepare": "observer_runtime_text_prepare",
     "receipt": "runtime_context_read_receipt",
     "startup": "parallel_branch_startup",
     "graph": "graph_query",
@@ -29275,6 +29276,18 @@ def _runtime_context_guide_executable_actions(
             default_action="request_runtime_context_rejoin_host_envelope",
             default_tool="runtime_context_session_token_rejoin",
             optional_omission_fields=("host_startup_id", "host_session_id"),
+        )
+
+    runtime_text_prepare = actionable_payloads.get(
+        "runtime_text_prepare_submission"
+    )
+    if isinstance(runtime_text_prepare, Mapping):
+        add(
+            "runtime_text_prepare",
+            runtime_text_prepare,
+            default_action="prepare_runtime_context_launch_text",
+            default_tool="observer_runtime_text_prepare",
+            default_facade="observer.runtime_text_prepare",
         )
 
     for stage, key, action, tool, facade in (
@@ -29724,6 +29737,10 @@ def _runtime_context_worker_guide_current_stage(
         ("implementation", ("implementation",)),
         ("graph", ("graph",)),
         ("startup", ("startup",)),
+        (
+            "runtime_text_prepare",
+            ("observer_runtime_text_prepare", "runtime_text_prepare"),
+        ),
         ("receipt", ("receipt", "worker_read")),
         (
             "join",
@@ -29879,6 +29896,7 @@ def _runtime_context_worker_guide_bounded_actionable_payloads(
             selected_keys.add("session_token_rejoin_submission")
     selected_keys.update(
         {
+            "runtime_text_prepare": {"runtime_text_prepare_submission"},
             "receipt": {"read_receipt_facade_payload_skeleton"},
             "startup": {"startup_facade_payload_skeleton"},
             "implementation": {
@@ -29911,6 +29929,7 @@ def _runtime_context_worker_guide_bounded_actionable_payloads(
             "session_token_initial_join_submission",
             "session_token_reissue_submission",
             "session_token_rejoin_submission",
+            "runtime_text_prepare_submission",
             "read_receipt_facade_payload_skeleton",
             "startup_facade_payload_skeleton",
             "implementation_evidence_facade_payload_skeleton",
@@ -30015,6 +30034,65 @@ def _runtime_context_worker_guide_alias_actionable_bodies(
     return project(value, source_path=field)
 
 
+def _runtime_context_worker_guide_compact_current_action(
+    action: Mapping[str, Any],
+    *,
+    current_stage: str,
+    detail_ref: str,
+) -> dict[str, Any]:
+    """Keep optional policy diagnostics out of the executable startup body."""
+
+    compact = deepcopy(dict(action or {}))
+    if current_stage != "startup":
+        return compact
+    body = compact.get("copy_safe_body")
+    if not isinstance(body, Mapping):
+        return compact
+    source_body = dict(body)
+    omitted_fields = (
+        "worker_session_lifecycle_policy",
+        "write_authorization_policy",
+        "worker_identity_pointers",
+        "semantic_role_binding",
+    )
+    bounded_body = {
+        key: deepcopy(value)
+        for key, value in source_body.items()
+        if key not in omitted_fields
+    }
+    omitted = [key for key in omitted_fields if key in source_body]
+    if not omitted:
+        return compact
+    compact["copy_safe_body"] = bounded_body
+    compact["source_copy_safe_body_hash"] = _stable_public_hash(source_body)
+    compact["omitted_optional_body_metadata"] = {
+        "schema_version": (
+            "runtime_context.worker_guide_optional_body_metadata.v1"
+        ),
+        "fields": omitted,
+        "detail_ref": detail_ref,
+        "source_body_hash": compact["source_copy_safe_body_hash"],
+        "execution_semantics_changed": False,
+        "semantic_truncation_performed": False,
+    }
+    host_realization = compact.get("host_realization")
+    if isinstance(host_realization, Mapping):
+        projected_host_realization = deepcopy(dict(host_realization))
+        replacement_paths = list(
+            projected_host_realization.get("required_replacement_paths") or []
+        )
+        projected_host_realization["required_replacement_paths"] = [
+            path
+            for path in replacement_paths
+            if not any(
+                str(path).startswith(f"copy_safe_body.{field}")
+                for field in omitted
+            )
+        ]
+        compact["host_realization"] = projected_host_realization
+    return compact
+
+
 def _runtime_context_worker_guide_compact_response(
     response: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -30070,6 +30148,11 @@ def _runtime_context_worker_guide_compact_response(
         field="actionable_payloads",
         detail_ref=detail_ref,
         canonical_action=current_action,
+    )
+    current_action = _runtime_context_worker_guide_compact_current_action(
+        current_action,
+        current_stage=current_stage,
+        detail_ref=detail_ref,
     )
     actionable_paged_sections = compact_actionable.pop("paged_sections", {})
     actionable_paged_sections = (
@@ -30576,6 +30659,7 @@ def _runtime_context_worker_guide_early_compact_response(
         recovery.get("next_legal_action") or ""
     ).strip()
     recovery_must_precede_worker_write = recovery_next_action in {
+        "observer_runtime_text_prepare",
         "reissue_runtime_session_token",
         "request_runtime_context_initial_join_host_envelope",
         "request_runtime_context_rejoin_host_envelope",
@@ -34246,6 +34330,7 @@ def _runtime_context_worker_recovery_payloads(
     worker_id: str,
     worker_slot_id: str,
     target_project_root: str,
+    worktree_path: str = "",
     backlog_id: str = "",
     agent_id: str = "",
     allocation_owner: str = "",
@@ -34417,6 +34502,20 @@ def _runtime_context_worker_recovery_payloads(
         if canonical_dispatch_identity.get("accepted")
         else ""
     )
+    normalized_launch_text_hash = str(launch_text_hash or "").strip()
+    launch_text_hash_ready = bool(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", normalized_launch_text_hash)
+    )
+    receipt_hash_value = (
+        normalized_launch_text_hash
+        if launch_text_hash_ready
+        else "<worker-computed-read-receipt-hash>"
+    )
+    launch_hash_value = (
+        normalized_launch_text_hash
+        if launch_text_hash_ready
+        else "<launch-text-sha256-if-known>"
+    )
     canonical_dispatch_fields = (
         _contract_runtime_dispatch_identity_projection_fields(
             canonical_dispatch_identity
@@ -34515,6 +34614,9 @@ def _runtime_context_worker_recovery_payloads(
     normalized_base_commit = str(base_commit or "").strip()
     normalized_target_head_commit = str(target_head_commit or "").strip()
     normalized_merge_queue_id = str(merge_queue_id or "").strip()
+    normalized_worktree_path = str(
+        worktree_path or target_project_root or ""
+    ).strip()
     normalized_backlog_id = str(backlog_id or "").strip()
     capacity_fallback_guidance = _mf_sub_capacity_fallback_guidance(
         runtime_context_id=runtime_context_id,
@@ -35008,8 +35110,8 @@ def _runtime_context_worker_recovery_payloads(
         ),
         "contract_hash": contract_hash or "<contract revision hash>",
         "acknowledged_at": "<worker-generated ISO-8601 timestamp>",
-        "receipt_hash": "<worker-computed-read-receipt-hash>",
-        "read_receipt_hash": "<worker-computed-read-receipt-hash>",
+        "receipt_hash": receipt_hash_value,
+        "read_receipt_hash": receipt_hash_value,
         "graph_trace_id": graph_trace_id,
         "raw_session_token_persisted": False,
         "raw_fence_token_persisted": False,
@@ -35046,8 +35148,8 @@ def _runtime_context_worker_recovery_payloads(
         "event_type": "mf_subagent_read_receipt",
         "event_kind": "contract_context_read_receipt",
         "status": "accepted",
-        "read_receipt_hash": "<worker-computed-read-receipt-hash>",
-        "launch_text_hash": launch_text_hash or "<launch-text-sha256-if-known>",
+        "read_receipt_hash": receipt_hash_value,
+        "launch_text_hash": launch_hash_value,
         "session_token_env": session_token_env,
         "session_token_ref": session_token_ref_placeholder,
         "session_token_ref_present": bool(context_session_token_ref),
@@ -35077,8 +35179,8 @@ def _runtime_context_worker_recovery_payloads(
         "event_type": "mf_subagent_read_receipt",
         "event_kind": "contract_context_read_receipt",
         "status": "accepted",
-        "read_receipt_hash": "<worker-computed-read-receipt-hash>",
-        "launch_text_hash": launch_text_hash or "<launch-text-sha256-if-known>",
+        "read_receipt_hash": receipt_hash_value,
+        "launch_text_hash": launch_hash_value,
         "contract_context_read_receipt": dict(canonical_context_receipt_template),
         **safe_route_identity,
         "payload": dict(read_receipt_payload),
@@ -35143,6 +35245,87 @@ def _runtime_context_worker_recovery_payloads(
         "placeholder_field_name_inference_allowed": False,
         "authority_inference_allowed": False,
         "raw_launch_text_process_local_only": True,
+    }
+    prepare_body = {
+        "project_id": project_id,
+        "backlog_id": normalized_backlog_id,
+        "contract_execution_id": (
+            successor_contract_execution_id or contract_execution_id
+        ),
+        "runtime_context_id": runtime_context_id,
+        "branch_runtime_registration_ref": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "observer_command_id": canonical_observer_command_id,
+        "worker_id": worker_id,
+        "actual_host_worker_id": allocated_governed_worker_id,
+        "main_worktree": target_project_root,
+        "workspace_root": target_project_root,
+        "target_project_root": target_project_root,
+        "worktree_path": normalized_worktree_path,
+        "base_commit": normalized_base_commit,
+        "target_head_commit": normalized_target_head_commit,
+        "merge_queue_id": normalized_merge_queue_id,
+        "owned_files": list(active_owned_files),
+        "worker_next_legal_action": "submit_mf_subagent_read_receipt",
+        **safe_route_identity,
+    }
+    prepare_required_fields = {
+        "project_id": project_id,
+        "backlog_id": normalized_backlog_id,
+        "contract_execution_id": (
+            successor_contract_execution_id or contract_execution_id
+        ),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "observer_command_id": canonical_observer_command_id,
+        "worker_id": worker_id,
+        "target_project_root": target_project_root,
+        "worktree_path": normalized_worktree_path,
+        "base_commit": normalized_base_commit,
+        "target_head_commit": normalized_target_head_commit,
+        "merge_queue_id": normalized_merge_queue_id,
+        **safe_route_identity,
+    }
+    prepare_missing_fields = [
+        field
+        for field, value in prepare_required_fields.items()
+        if not _runtime_context_non_placeholder_text(value)
+    ]
+    runtime_text_prepare_submission = {
+        "schema_version": "runtime_context.runtime_text_prepare_submission.v1",
+        "action": "prepare_runtime_context_launch_text",
+        "semantic_next_action": "observer_runtime_text_prepare",
+        "facade": "observer.runtime_text_prepare",
+        "mcp_tool": "observer_runtime_text_prepare",
+        "owner_role": "observer",
+        "method": "POST",
+        "path": f"/api/projects/{project_id}/observer/runtime-text/prepare",
+        "body_source": "copy_safe_body",
+        "copy_safe_body": prepare_body,
+        "actionable": bool(not launch_text_hash_ready and not prepare_missing_fields),
+        "status": (
+            "actionable_missing_source_backed_launch_text_hash"
+            if not launch_text_hash_ready and not prepare_missing_fields
+            else "not_required_source_backed_launch_text_hash_present"
+            if launch_text_hash_ready
+            else "blocked_incomplete_prepare_authority"
+        ),
+        "missing_fields": prepare_missing_fields,
+        "source_of_authority": (
+            "ContractRuntime.completed_lines.observer_dispatch_bounded_workers+"
+            "RuntimeContext.current+latest_contract_revision"
+        ),
+        "worker_actionable": False,
+        "observer_actionable": bool(
+            not launch_text_hash_ready and not prepare_missing_fields
+        ),
+        "guide_auto_prepare_allowed": False,
+        "raw_launch_text_process_local_only": True,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
     }
     startup_identity_required_fields = [
         "worker_session_id",
@@ -35770,6 +35953,14 @@ def _runtime_context_worker_recovery_payloads(
         "raw_fence_token_exposed": False,
         "raw_route_token_exposed": False,
         "endpoints": {
+            "observer_runtime_text_prepare": {
+                "method": "POST",
+                "path": f"/api/projects/{project_id}/observer/runtime-text/prepare",
+                "tool": "observer_runtime_text_prepare",
+                "mcp_tool": "observer_runtime_text_prepare",
+                "facade": "observer.runtime_text_prepare",
+                "body_source": "runtime_text_prepare_submission.copy_safe_body",
+            },
             "runtime_context_read_receipts": {
                 "method": "POST",
                 "path": read_receipt_path,
@@ -35882,9 +36073,17 @@ def _runtime_context_worker_recovery_payloads(
             ],
             "canonical_event_kind": "contract_context_read_receipt",
             "legacy_event_kind": "mf_subagent_read_receipt",
-            "copy_safe_body_is_template_not_executable_until_replaced": True,
+            "actionable": launch_text_hash_ready,
+            "status": (
+                "actionable_source_backed_launch_text_hash"
+                if launch_text_hash_ready
+                else "non_actionable_requires_observer_runtime_text_prepare"
+            ),
+            "copy_safe_body_is_template_not_executable_until_replaced": (
+                not launch_text_hash_ready
+            ),
             "placeholder_submission_forbidden": True,
-            "must_replace_before_submit": [
+            "must_replace_before_submit": [] if launch_text_hash_ready else [
                 "copy_safe_body.read_receipt_hash",
                 "copy_safe_body.launch_text_hash when placeholder-valued",
                 (
@@ -36227,6 +36426,7 @@ def _runtime_context_worker_recovery_payloads(
         },
         "session_token_initial_join_submission": session_token_initial_join_submission,
         "session_token_reissue_submission": session_token_reissue_submission,
+        "runtime_text_prepare_submission": runtime_text_prepare_submission,
         **(
             {"session_token_rejoin_submission": session_token_rejoin_submission}
             if rejoin_advertised
@@ -36931,6 +37131,31 @@ def _runtime_context_worker_recovery_details(
                 context=context,
             )
         )
+        latest_revision_payload = _runtime_context_latest_contract_revision_payload(
+            conn,
+            context,
+        )
+        source_backed_launch_text_hash = (
+            _runtime_context_source_backed_launch_text_hash(
+                latest_revision_payload
+            )
+        )
+        diagnostics["read_receipt_hash_prerequisite"] = {
+            "schema_version": (
+                "runtime_context.read_receipt_hash_prerequisite.v1"
+            ),
+            "status": (
+                "ready"
+                if source_backed_launch_text_hash
+                else "observer_runtime_text_prepare_required"
+            ),
+            "source": "latest_persisted_contract_revision",
+            "launch_text_hash_valid": bool(source_backed_launch_text_hash),
+            "guide_auto_prepare_allowed": False,
+            "receipt_template_actionable": bool(
+                source_backed_launch_text_hash
+            ),
+        }
         diagnostics["timeline"] = {
             "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),
             "startup_event_ref": timeline_refs.get("startup_event_ref", ""),
@@ -37003,6 +37228,20 @@ def _runtime_context_worker_recovery_details(
             )
         ):
             rejoin_contract_execution_id = expected_parent_task_id
+        contract_runtime_dispatch_identity: dict[str, Any] = {}
+        if rejoin_contract_execution_id:
+            try:
+                contract_runtime_record = _contract_runtime_store(conn).get(
+                    rejoin_contract_execution_id
+                )
+                contract_runtime_dispatch_identity = (
+                    _contract_runtime_dispatch_identity_resolution(
+                        contract_runtime_record,
+                        context,
+                    )
+                )
+            except (ContractRuntimeError, sqlite3.Error):
+                contract_runtime_dispatch_identity = {}
         pre_lineage_bootstrap_recovery = bool(
             missing_worker_lineage
             and session_token_rejoin_eligibility.get("eligible") is True
@@ -37273,8 +37512,12 @@ def _runtime_context_worker_recovery_details(
                 next_legal_action = "verify_runtime_context_identity"
                 recovery_action_id = "retry_with_matching_runtime_context_identity"
         elif not effective_read_receipt_ref:
-            next_legal_action = "submit_mf_subagent_read_receipt"
-            recovery_action_id = "post_runtime_context_read_receipt"
+            if source_backed_launch_text_hash:
+                next_legal_action = "submit_mf_subagent_read_receipt"
+                recovery_action_id = "post_runtime_context_read_receipt"
+            else:
+                next_legal_action = "observer_runtime_text_prepare"
+                recovery_action_id = "prepare_runtime_context_launch_text"
         elif not effective_startup_ref:
             next_legal_action = "record_mf_subagent_startup"
             recovery_action_id = "post_runtime_context_startup"
@@ -37293,6 +37536,7 @@ def _runtime_context_worker_recovery_details(
             worker_id=expected_worker_id,
             worker_slot_id=expected_worker_slot_id,
             target_project_root=expected_target_root,
+            worktree_path=str(getattr(context, "worktree_path", "") or ""),
             agent_id=str(getattr(context, "agent_id", "") or ""),
             allocation_owner=str(
                 getattr(context, "allocation_owner", "")
@@ -37314,6 +37558,7 @@ def _runtime_context_worker_recovery_details(
             route_identity=expected_route_identity or supplied_route_identity,
             fence_token_hash=fence_token_hash,
             session_token_ref=runtime_context_session_token_ref(context),
+            launch_text_hash=source_backed_launch_text_hash,
             read_receipt_event_ref=str(timeline_refs.get("read_receipt_event_ref") or ""),
             read_receipt_authority=(
                 _runtime_context_post_read_startup_receipt_authority(
@@ -37334,6 +37579,15 @@ def _runtime_context_worker_recovery_details(
                 )
             ),
             contract_execution_id=rejoin_contract_execution_id,
+            successor_contract_execution_id=rejoin_contract_execution_id,
+            contract_runtime_dispatch_identity=(
+                contract_runtime_dispatch_identity
+            ),
+            authority_revision={
+                "active_owned_files": list(
+                    getattr(context, "owned_files", ()) or ()
+                )
+            },
             session_token_rejoin_eligibility=(
                 session_token_rejoin_eligibility
             ),
@@ -66410,6 +66664,34 @@ def _runtime_context_latest_contract_revision_payload(conn, context) -> dict[str
         runtime_context_id_for_branch_context(context),
     )
     return branch_contract_revision_to_dict(revision) if revision else {}
+
+
+def _runtime_context_source_backed_launch_text_hash(
+    revision: Mapping[str, Any] | None,
+) -> str:
+    """Return one valid launch hash from the current persisted revision only."""
+
+    source = revision if isinstance(revision, Mapping) else {}
+    payload = source.get("payload")
+    payload = payload if isinstance(payload, Mapping) else {}
+    candidates: list[Any] = [payload.get("launch_text_hash")]
+    for key in (
+        "registered_host_adapter_spawn",
+        "host_adapter_spawn_identity",
+        "host_adapter_startup_identity",
+    ):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            candidates.append(nested.get("launch_text_hash"))
+    normalized = {
+        str(value or "").strip()
+        for value in candidates
+        if str(value or "").strip()
+    }
+    if len(normalized) != 1:
+        return ""
+    value = next(iter(normalized))
+    return value if re.fullmatch(r"sha256:[0-9a-f]{64}", value) else ""
 
 
 def _parallel_branch_finish_gate_route_token_binding(

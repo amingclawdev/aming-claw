@@ -2222,6 +2222,7 @@ def test_runtime_context_action_plan_reads_nested_revision_route_token_ref() -> 
         },
         "payload": {
             "target_files": ["agent/governance/parallel_branch_runtime.py"],
+            "launch_text_hash": "sha256:" + "7" * 64,
             "route_identity": {
                 "route_id": "route-runtime-context",
                 "route_context_hash": "sha256:route-runtime-context",
@@ -2273,8 +2274,10 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     handoff = action_plan["worker_handoff_projection"]
 
     assert current_values["owned_files"] == ["agent/governance/parallel_branch_runtime.py"]
-    assert read_action["status"] == "missing"
-    assert read_action["next_action"] == "submit_mf_subagent_read_receipt"
+    assert read_action["status"] == "blocked_missing_source_hash"
+    assert read_action["next_action"] == "observer_runtime_text_prepare"
+    assert action_plan["next_legal_action"] == "observer_runtime_text_prepare"
+    assert read_action["launch_text_hash_valid"] is False
     assert read_action["guide_id"] == "runtime_context_worker_guide.startup_bridge.v1"
     assert read_action["guide_hash"].startswith("sha256:")
     assert read_action["worker_identity"] == {
@@ -2309,6 +2312,7 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
     assert bridge["schema_version"] == "runtime_context.worker_startup_bridge.v1"
     assert [step["id"] for step in bridge["steps"]] == [
         "query_runtime_contract",
+        "observer_runtime_text_prepare",
         "record_read_receipt",
         "record_startup",
         "worker_graph_query",
@@ -2324,27 +2328,31 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         "session_token" in field
         for field in contract_step["entrypoint"]["required_query_fields"]
     )
-    read_receipt_step = bridge["steps"][1]
+    prepare_step = bridge["steps"][1]
+    assert prepare_step["owner_role"] == "observer"
+    assert prepare_step["status"] == "required"
+    assert prepare_step["guide_auto_prepare_allowed"] is False
+    read_receipt_step = bridge["steps"][2]
     assert read_receipt_step["hash_bridge"]["accepted_inputs"] == [
         "read_receipt_hash",
         "launch_text_hash",
     ]
     assert read_receipt_step["hash_bridge"]["startup_field"] == "read_receipt_hash"
     assert "observer_command_id" in read_receipt_step["required_payload_fields"]
-    startup_step = bridge["steps"][2]
+    startup_step = bridge["steps"][3]
     assert "worker_transcript_ref or worker_transcript_path" in startup_step[
         "required_fields"
     ]
     assert "graph_trace_ids" not in startup_step["required_fields"]
     assert "close_satisfying=false" in startup_step["close_satisfying_rule"]
-    graph_query_step = bridge["steps"][3]
+    graph_query_step = bridge["steps"][4]
     assert graph_query_step["entrypoint"]["path"] == (
         "/api/graph-governance/{project_id}/query"
     )
     assert graph_query_step["entrypoint"]["query_source"] == "mf_subagent"
     assert graph_query_step["entrypoint"]["query_purpose"] == "subagent_context_build"
     assert "runtime_context_id" in graph_query_step["entrypoint"]["required_body_fields"]
-    implementation_step = bridge["steps"][4]
+    implementation_step = bridge["steps"][5]
     assert implementation_step["owned_files"] == [
         "agent/governance/parallel_branch_runtime.py"
     ]
@@ -2362,7 +2370,7 @@ def test_runtime_context_action_plan_reports_read_receipt_hash_entrypoint() -> N
         "finish_gate",
         "verification_or_test_results",
     ]
-    transcript_step = bridge["steps"][5]
+    transcript_step = bridge["steps"][6]
     assert "worker_session_id and filer_principal from the real worker" in transcript_step[
         "required_facts"
     ]
@@ -2612,7 +2620,7 @@ def test_runtime_context_worker_guide_carries_nested_dispatch_owned_files() -> N
     gate_inputs = projection["views"]["gate_inputs"]
     worker_view = projection["views"]["worker_view"]
     read_action = projection["views"]["action_plan"]["read_receipt_hash_action"]
-    implementation_step = read_action["ordered_worker_startup_bridge"]["steps"][4]
+    implementation_step = read_action["ordered_worker_startup_bridge"]["steps"][5]
 
     assert current_values["owned_files"] == owned_files
     assert current["work"]["owned_files"] == owned_files
@@ -2651,7 +2659,7 @@ def test_runtime_context_worker_guide_carries_branch_runtime_owned_files() -> No
     gate_inputs = projection["views"]["gate_inputs"]
     worker_view = projection["views"]["worker_view"]
     read_action = projection["views"]["action_plan"]["read_receipt_hash_action"]
-    implementation_step = read_action["ordered_worker_startup_bridge"]["steps"][4]
+    implementation_step = read_action["ordered_worker_startup_bridge"]["steps"][5]
 
     assert current["work"]["target_files"] == list(target_files)
     assert current["work"]["owned_files"] == list(owned_files)

@@ -5362,6 +5362,7 @@ def _runtime_context_current_values(
     *,
     runtime_context_id: str,
     observer_command_id: str,
+    launch_text_hash: str,
     route_identity: Mapping[str, Any],
     timeline_refs: Mapping[str, Any],
     graph_trace_refs: Mapping[str, Any],
@@ -5515,6 +5516,7 @@ def _runtime_context_current_values(
         "repo_root": target_project_root,
         "runtime_context_id": runtime_context_id,
         "observer_command_id": observer_command_id,
+        "launch_text_hash": launch_text_hash,
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "backlog_id": context.backlog_id,
@@ -6910,10 +6912,35 @@ def build_runtime_context_current_view(
         or finish.get("observer_command_id")
         or close.get("observer_command_id")
     )
+    launch_text_hash_candidates = {
+        _runtime_context_text(value)
+        for value in (
+            revision_payload.get("launch_text_hash"),
+            _runtime_context_mapping(
+                revision_payload.get("registered_host_adapter_spawn")
+            ).get("launch_text_hash"),
+            _runtime_context_mapping(
+                revision_payload.get("host_adapter_spawn_identity")
+            ).get("launch_text_hash"),
+            _runtime_context_mapping(
+                revision_payload.get("host_adapter_startup_identity")
+            ).get("launch_text_hash"),
+        )
+        if _runtime_context_text(value)
+    }
+    launch_text_hash = (
+        next(iter(launch_text_hash_candidates))
+        if len(launch_text_hash_candidates) == 1
+        and _runtime_context_valid_worker_receipt_hash(
+            next(iter(launch_text_hash_candidates))
+        )
+        else ""
+    )
     current_values = _runtime_context_current_values(
         context,
         runtime_context_id=runtime_context_id,
         observer_command_id=observer_command_id,
+        launch_text_hash=launch_text_hash,
         route_identity=route,
         timeline_refs=timeline,
         graph_trace_refs=graph_trace,
@@ -7891,6 +7918,10 @@ def _runtime_context_read_receipt_hash_action(
     startup_read_receipt_hash = _runtime_context_text(
         values.get("startup_read_receipt_hash")
     )
+    launch_text_hash = _runtime_context_text(values.get("launch_text_hash"))
+    launch_text_hash_ready = _runtime_context_valid_worker_receipt_hash(
+        launch_text_hash
+    )
     invalid_foundational_evidence = bool(
         read_receipt_ref
         and not _runtime_context_valid_worker_receipt_hash(
@@ -7915,7 +7946,13 @@ def _runtime_context_read_receipt_hash_action(
     status = (
         "invalid_foundational_evidence"
         if invalid_foundational_evidence
-        else ("present" if read_receipt_ref else "missing")
+        else (
+            "present"
+            if read_receipt_ref
+            else "missing"
+            if launch_text_hash_ready
+            else "blocked_missing_source_hash"
+        )
     )
     worker_query = _runtime_context_mapping(values.get("graph_query_identity"))
     owned_files = _runtime_context_dedupe(
@@ -7978,8 +8015,29 @@ def _runtime_context_read_receipt_hash_action(
             ],
         },
         {
+            "id": "observer_runtime_text_prepare",
+            "status": (
+                "not_required"
+                if read_receipt_ref or launch_text_hash_ready
+                else "required"
+            ),
+            "owner_role": "observer",
+            "entrypoint": {
+                "method": "POST",
+                "path": "/api/projects/{project_id}/observer/runtime-text/prepare",
+                "mcp_tool": "observer_runtime_text_prepare",
+            },
+            "must_precede": ["record_read_receipt"],
+            "guide_auto_prepare_allowed": False,
+            "source_of_authority": "latest_persisted_contract_revision",
+        },
+        {
             "id": "record_read_receipt",
-            "status": status,
+            "status": (
+                status
+                if read_receipt_ref or launch_text_hash_ready
+                else "blocked_on_observer_runtime_text_prepare"
+            ),
             "timeline_event_kind": "mf_subagent_read_receipt",
             "required_payload_fields": [
                 "runtime_context_id",
@@ -8135,9 +8193,15 @@ def _runtime_context_read_receipt_hash_action(
             else (
                 "none"
                 if read_receipt_ref
-                else "submit_mf_subagent_read_receipt"
+                else (
+                    "submit_mf_subagent_read_receipt"
+                    if launch_text_hash_ready
+                    else "observer_runtime_text_prepare"
+                )
             )
         ),
+        "launch_text_hash_valid": launch_text_hash_ready,
+        "launch_text_hash_source": "latest_persisted_contract_revision",
         "read_receipt_event_ref": read_receipt_ref,
         "startup_read_receipt_hash_valid": bool(
             startup_read_receipt_hash
@@ -9146,7 +9210,11 @@ def _runtime_context_next_legal_action(
     if route_token_action.get("status") in {"missing", "stale"}:
         return "refresh_route_token_ref"
     if read_receipt_hash_action.get("status") == "missing":
-        return "submit_mf_subagent_read_receipt"
+        return _runtime_context_text(
+            read_receipt_hash_action.get("next_action")
+        ) or "submit_mf_subagent_read_receipt"
+    if read_receipt_hash_action.get("status") == "blocked_missing_source_hash":
+        return "observer_runtime_text_prepare"
     if not _runtime_context_text(values.get("startup_event_ref")):
         return "record_mf_subagent_startup"
     startup_identity_fields = (

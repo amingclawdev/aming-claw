@@ -164783,3 +164783,210 @@ def test_worker_guide_compact_builds_directly_from_bounded_authority(
     stdio_guide = json.loads(stdio_responses[-1]["result"]["content"][0]["text"])
     assert stdio_guide["runtime_context_id"] == context.runtime_context_id
     assert stdio_guide["serialized_bytes"] <= compact["max_serialized_bytes"]
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        {},
+        {"payload": {"launch_text_hash": "<launch-text-sha256-if-known>"}},
+        {"payload": {"launch_text_hash": "sha256:not-a-digest"}},
+        {
+            "payload": {
+                "launch_text_hash": "sha256:" + "a" * 64,
+                "registered_host_adapter_spawn": {
+                    "launch_text_hash": "sha256:" + "b" * 64,
+                },
+            }
+        },
+        {
+            "payload": {
+                "previous_contract_revision": {
+                    "launch_text_hash": "sha256:" + "c" * 64,
+                }
+            }
+        },
+        {
+            "payload": {
+                "other_runtime_context": {
+                    "registered_host_adapter_spawn": {
+                        "launch_text_hash": "sha256:" + "d" * 64,
+                    }
+                }
+            }
+        },
+    ],
+)
+def test_worker_guide_source_launch_hash_fails_closed(revision):
+    assert server._runtime_context_source_backed_launch_text_hash(revision) == ""
+
+
+def test_worker_guide_receipt_requires_prepare_then_projects_eight_hashes(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-WORKER-GUIDE-RECEIPT-PREPARE"
+    worker_task_id = "worker-guide-receipt-prepare"
+    worker_fence = "fence-worker-guide-receipt-prepare"
+    worker_token = "token-worker-guide-receipt-prepare"
+    repo = _git_repo(tmp_path)
+    successor, context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="worker-guide-receipt-prepare-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(repo),
+        target_project_root=str(tmp_path),
+        parent_task_is_contract_execution=True,
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _pid: _NoCloseConn(conn))
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+
+    def read_guide():
+        return server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": successor["contract_execution_id"],
+                    "fence_token": worker_fence,
+                    "session_token": worker_token,
+                    "session_token_ref": runtime_context_session_token_ref(context),
+                    "target_project_root": str(tmp_path),
+                    "view": "compact",
+                    **route_identity,
+                },
+            )
+        )
+
+    before = "\n".join(conn.iterdump())
+    missing_hash_guide = read_guide()
+    assert "\n".join(conn.iterdump()) == before
+    assert missing_hash_guide["next_legal_action"] == (
+        "observer_runtime_text_prepare"
+    )
+    prepare_action = missing_hash_guide["canonical_executable_action"]
+    assert prepare_action["mcp_tool"] == "observer_runtime_text_prepare"
+    prepare_body = copy.deepcopy(prepare_action["copy_safe_body"])
+    assert missing_hash_guide["actionable_payloads"][
+        "runtime_text_prepare_submission"
+    ]["actionable"] is True
+    assert "read_receipt_facade_payload_skeleton" not in (
+        missing_hash_guide["actionable_payloads"]
+    )
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=prepare_body,
+        )
+    )
+    assert prepared["ok"] is True
+    launch_hash = prepared["launch_text_hash"]
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", launch_hash)
+
+    receipt_guide = read_guide()
+    assert receipt_guide["next_legal_action"] in {
+        "record_read_receipt",
+        "submit_mf_subagent_read_receipt",
+    }
+    receipt_action = receipt_guide["canonical_executable_action"]
+    assert receipt_action["mcp_tool"] == "runtime_context_read_receipt"
+    receipt_body = copy.deepcopy(receipt_action["copy_safe_body"])
+    hash_paths = (
+        ("read_receipt_hash",),
+        ("launch_text_hash",),
+        ("contract_context_read_receipt", "receipt_hash"),
+        ("contract_context_read_receipt", "read_receipt_hash"),
+        ("payload", "read_receipt_hash"),
+        ("payload", "launch_text_hash"),
+        ("payload", "contract_context_read_receipt", "receipt_hash"),
+        ("payload", "contract_context_read_receipt", "read_receipt_hash"),
+    )
+    for path in hash_paths:
+        value = receipt_body
+        for key in path:
+            value = value[key]
+        assert value == launch_hash
+    assert receipt_guide["actionable_payloads"][
+        "read_receipt_facade_payload_skeleton"
+    ]["actionable"] is True
+    assert "runtime_text_prepare_submission" not in (
+        receipt_guide["actionable_payloads"]
+    )
+
+    receipt_body.update(
+        {
+            "session_token": worker_token,
+            "fence_token": worker_fence,
+        }
+    )
+    receipt = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=receipt_body,
+        )
+    )
+    assert receipt["ok"] is True
+
+    startup_guide = read_guide()
+    assert startup_guide["next_legal_action"] == "record_mf_subagent_startup"
+    startup_body = copy.deepcopy(
+        startup_guide["canonical_executable_action"]["copy_safe_body"]
+    )
+    assert startup_guide["serialized_bytes"] < 32 * 1024
+    assert startup_guide["canonical_executable_action"][
+        "omitted_optional_body_metadata"
+    ]["execution_semantics_changed"] is False
+    startup_body.update(
+        {
+            "session_token": worker_token,
+            "fence_token": worker_fence,
+            "agent_id": context.worker_id,
+            "actual_host_worker_id": context.worker_id,
+            "worker_session_id": "/root/worker_guide_receipt_prepare",
+            "host_startup_id": "multi_agent:/root/worker_guide_receipt_prepare",
+            "host_session_id": "/root/worker_guide_receipt_prepare",
+            "worker_transcript_ref": "codex:/root/worker_guide_receipt_prepare",
+            "worker_transcript_path": str(repo / "worker-transcript.jsonl"),
+            "harness_type": "codex",
+            "filer_principal": "/root/worker_guide_receipt_prepare",
+            "actual_cwd": str(repo),
+            "actual_git_root": str(repo),
+            "head_commit": context.base_commit,
+            "read_receipt_event_id": receipt["read_receipt_event_id"],
+            "read_receipt_hash": receipt["read_receipt_hash"],
+            **route_identity,
+        }
+    )
+    startup_identity = runtime_context_startup_identity_preflight(startup_body)
+    assert startup_identity["accepted"] is True
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=startup_body,
+        )
+    )
+    assert startup["ok"] is True
