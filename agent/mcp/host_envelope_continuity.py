@@ -76,6 +76,20 @@ _WORKER_BINDING_FIELDS = (
 )
 _RAW_RESPONSE_FIELDS = ("session_token", "fence_token")
 _OWNER_ID = "mcp-host-envelope-continuity"
+_POST_RESPONSE_SAFE_FIELDS = (
+    "request_id",
+    "audit_event_ref",
+    "audit_event_id",
+    "status",
+    "delivery",
+    "session_token_ref",
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "contract_execution_id",
+    "expires_at",
+    "ttl_seconds",
+)
 
 
 def _text(value: Any) -> str:
@@ -101,6 +115,42 @@ def _local_error(code: str, message: str, **details: Any) -> dict[str, Any]:
         "zero_write_rejection": True,
         "writes_performed": False,
         "http_request_performed": False,
+        "raw_worker_auth_exposed": False,
+        **details,
+    }
+
+
+def _post_response_error(
+    result: dict[str, Any],
+    code: str,
+    message: str,
+    **details: Any,
+) -> dict[str, Any]:
+    """Return a secret-free error without erasing a successful HTTP write.
+
+    Host capture runs after the protected facade returns.  When that facade
+    accepted a credential rotation, a local staging failure must not be
+    described as a zero-write rejection: doing so hides the new current safe
+    ref and makes the next recovery attempt stale before it begins.
+    """
+
+    safe_result = {
+        field: result.get(field)
+        for field in _POST_RESPONSE_SAFE_FIELDS
+        if result.get(field) not in (None, "")
+    }
+    scrub_host_envelope_payload(result)
+    result.pop("host_envelope", None)
+    return {
+        **safe_result,
+        "ok": False,
+        "error": code,
+        "message": message,
+        "source": "mcp_host_envelope_continuity",
+        "zero_write_rejection": False,
+        "writes_performed": True,
+        "http_request_performed": True,
+        "server_mutation_accepted": True,
         "raw_worker_auth_exposed": False,
         **details,
     }
@@ -145,6 +195,58 @@ class ManagedHostEnvelopeContinuity:
         with self._lock:
             return len(self._entries)
 
+    @staticmethod
+    def _preflight_issuance(
+        tool_name: str,
+        args: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Validate immutable caller identity before an issuance HTTP call."""
+
+        required = ("project_id", "runtime_context_id", "task_id")
+        missing = [field for field in required if not _text(args.get(field))]
+        if missing:
+            return _local_error(
+                "managed_host_envelope_identity_incomplete",
+                "Host-envelope issuance is missing immutable request identity.",
+                missing_fields=missing,
+            )
+        alias_groups = {
+            "target_project_root": (
+                args.get("target_project_root"),
+                args.get("project_root"),
+                args.get("repo_root"),
+            ),
+            "actual_host_worker_id": (
+                args.get("actual_host_worker_id"),
+                args.get("host_worker_id"),
+            ),
+        }
+        nested_route = args.get("route_identity")
+        nested_route = nested_route if isinstance(nested_route, Mapping) else {}
+        for field in _ROUTE_FIELDS:
+            alias_groups[field] = (args.get(field), nested_route.get(field))
+        conflicting = [
+            field
+            for field, candidates in alias_groups.items()
+            if len({_text(value) for value in candidates if _text(value)}) > 1
+        ]
+        if conflicting:
+            return _local_error(
+                "managed_host_envelope_identity_ambiguous",
+                "Host-envelope issuance contains conflicting immutable identity.",
+                mismatched_fields=sorted(conflicting),
+            )
+        if (
+            tool_name == "runtime_context_session_token_reissue"
+            and bool(_text(args.get("session_token")))
+            != bool(_text(args.get("fence_token")))
+        ):
+            return _local_error(
+                "managed_host_envelope_auth_ambiguous",
+                "Session-token reissue must use one complete authentication branch.",
+            )
+        return None
+
     def _capture_issuance(
         self,
         args: Mapping[str, Any],
@@ -157,20 +259,21 @@ class ManagedHostEnvelopeContinuity:
             return result
         host_envelope = result.get("host_envelope")
         if not isinstance(host_envelope, dict):
-            scrub_host_envelope_payload(result)
             # Preserve compatibility with mocked/legacy host facades that do
             # not claim delivery.  A real ``delivery=worker_host_envelope``
             # response must carry the typed envelope and fails closed below.
             if _text(result.get("delivery")) != "worker_host_envelope":
+                scrub_host_envelope_payload(result)
                 return result
-            return _local_error(
+            return _post_response_error(
+                result,
                 "managed_host_envelope_missing",
                 "Successful host authentication did not return a typed host envelope.",
             )
         environment = host_envelope.get("env")
         if not isinstance(environment, Mapping):
-            scrub_host_envelope_payload(result)
-            return _local_error(
+            return _post_response_error(
+                result,
                 "managed_host_envelope_incomplete",
                 "Successful host authentication returned no process-local auth env.",
             )
@@ -181,8 +284,8 @@ class ManagedHostEnvelopeContinuity:
         if not raw_session or not raw_fence or (
             top_session and top_session != raw_session
         ) or (top_fence and top_fence != raw_fence):
-            scrub_host_envelope_payload(result)
-            return _local_error(
+            return _post_response_error(
+                result,
                 "managed_host_envelope_auth_mismatch",
                 "Host envelope auth does not match the successful response.",
             )
@@ -192,8 +295,8 @@ class ManagedHostEnvelopeContinuity:
         ):
             verifier = _text(result.get(field) or host_envelope.get(field))
             if verifier and verifier != _sha256(raw_value):
-                scrub_host_envelope_payload(result)
-                return _local_error(
+                return _post_response_error(
+                    result,
                     "managed_host_envelope_verifier_mismatch",
                     "Host envelope verifier does not match the delivered credential.",
                     field=field,
@@ -205,7 +308,14 @@ class ManagedHostEnvelopeContinuity:
             **_route_identity(host_envelope),
         }
         binding: dict[str, str] = {}
-        for field in (*_BASE_BINDING_FIELDS, *_WORKER_BINDING_FIELDS):
+        for field in (
+            *(
+                candidate
+                for candidate in _BASE_BINDING_FIELDS
+                if candidate != "session_token_ref"
+            ),
+            *_WORKER_BINDING_FIELDS,
+        ):
             values = {
                 _text(source.get(field))
                 for source in (args, result, host_envelope)
@@ -214,14 +324,27 @@ class ManagedHostEnvelopeContinuity:
             if field in _ROUTE_FIELDS and route.get(field):
                 values.add(route[field])
             if len(values) > 1:
-                scrub_host_envelope_payload(result)
-                return _local_error(
+                return _post_response_error(
+                    result,
                     "managed_host_envelope_identity_mismatch",
                     "Host envelope identity does not match the request/response scope.",
                     field=field,
                 )
             if values:
                 binding[field] = values.pop()
+        response_refs = {
+            _text(source.get("session_token_ref"))
+            for source in (result, host_envelope)
+            if _text(source.get("session_token_ref"))
+        }
+        if len(response_refs) != 1:
+            return _post_response_error(
+                result,
+                "managed_host_envelope_identity_mismatch",
+                "Host envelope response did not identify one exact current safe ref.",
+                field="session_token_ref",
+            )
+        binding["session_token_ref"] = response_refs.pop()
         required = (
             "project_id",
             "runtime_context_id",
@@ -232,8 +355,8 @@ class ManagedHostEnvelopeContinuity:
         )
         missing = [field for field in required if not binding.get(field)]
         if missing:
-            scrub_host_envelope_payload(result)
-            return _local_error(
+            return _post_response_error(
+                result,
                 "managed_host_envelope_identity_incomplete",
                 "Host envelope is missing required copy-safe identity.",
                 missing_fields=missing,
@@ -254,8 +377,8 @@ class ManagedHostEnvelopeContinuity:
                 expires_at=result.get("expires_at"),
             )
         except HostEnvelopeError:
-            scrub_host_envelope_payload(result)
-            return _local_error(
+            return _post_response_error(
+                result,
                 "managed_host_envelope_stage_rejected",
                 "Host envelope could not be staged in this MCP process.",
             )
@@ -354,6 +477,9 @@ class ManagedHostEnvelopeContinuity:
     ) -> Any:
         request_args = dict(args)
         if tool_name in ISSUANCE_TOOLS:
+            preflight = self._preflight_issuance(tool_name, request_args)
+            if preflight is not None:
+                return preflight
             return self._capture_issuance(request_args, send(request_args))
 
         entry = self._entry_for(request_args)

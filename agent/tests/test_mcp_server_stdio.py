@@ -241,8 +241,12 @@ def test_governance_stdio_mirror_manages_same_host_envelope_flow(monkeypatch):
         "worker_session_id": "desktop-mirror-managed",
         "host_startup_id": "desktop-mirror-managed",
         "host_session_id": "desktop-mirror-managed",
-        "session_token_ref": "wstok-mirror-managed",
+        "session_token_ref": "wstok-mirror-managed-before",
         **route,
+    }
+    current_identity = {
+        **identity,
+        "session_token_ref": "wstok-mirror-managed-after",
     }
     calls = []
 
@@ -251,13 +255,15 @@ def test_governance_stdio_mirror_manages_same_host_envelope_flow(monkeypatch):
         if path.endswith("/session-token/reissue"):
             return {
                 "ok": True,
+                "request_id": "req-mirror-managed-rotation",
+                "audit_event_ref": "timeline:49",
                 "status": "session_token_reissued",
                 "delivery": "worker_host_envelope",
-                **identity,
+                **current_identity,
                 "session_token": raw_session,
                 "fence_token": raw_fence,
                 "host_envelope": {
-                    **identity,
+                    **current_identity,
                     "env": {
                         "AMING_WORKER_SESSION_TOKEN": raw_session,
                         "AMING_WORKER_FENCE_TOKEN": raw_fence,
@@ -286,11 +292,12 @@ def test_governance_stdio_mirror_manages_same_host_envelope_flow(monkeypatch):
         {**identity, "reason": "stage in mirror"},
     )
     assert issued["auth_loaded"] is True
+    assert issued["session_token_ref"] == current_identity["session_token_ref"]
     assert raw_session not in json.dumps(issued, sort_keys=True)
     assert raw_fence not in json.dumps(issued, sort_keys=True)
     guide_args = {
         key: value
-        for key, value in identity.items()
+        for key, value in current_identity.items()
         if key
         in {
             "project_id",
@@ -306,10 +313,10 @@ def test_governance_stdio_mirror_manages_same_host_envelope_flow(monkeypatch):
         "runtime_context_worker_guide", guide_args
     )["ok"] is True
     assert governance_mcp_server._dispatch_tool(
-        "runtime_context_read_receipt", identity
+        "runtime_context_read_receipt", current_identity
     )["ok"] is True
     startup = governance_mcp_server._dispatch_tool(
-        "parallel_branch_startup", {**identity, "worker_role": "mf_sub"}
+        "parallel_branch_startup", {**current_identity, "worker_role": "mf_sub"}
     )
     assert startup["managed_host_envelope_consumed"] is True
     assert continuity.pending_count() == 0

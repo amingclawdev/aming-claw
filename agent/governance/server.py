@@ -41155,6 +41155,144 @@ def _runtime_context_modern_special_rejoin_authority_valid(
     )
 
 
+_RUNTIME_CONTEXT_LEGACY_R2_MANAGED_CAPTURE_LOSS_RESCUE = {
+    "schema_version": (
+        "runtime_context.legacy_r2_managed_capture_loss_rescue_binding.v1"
+    ),
+    "project_id": "daily-planner-lite-20260816180518-8858affd",
+    "backlog_id": "AC-DEMO-R4-BATCH-FOCUS-8858AFFD",
+    "contract_execution_id": "cex-mf-parallel-d0f91cf2825d5de2f00a",
+    "runtime_context_id": "mfrctx-74b9d971e1f08de3",
+    "task_id": "r4-batch-focus-failed-qa-rework-2-8858affd",
+    "parent_task_id": "cex-mf-parallel-d0f91cf2825d5de2f00a",
+    "worker_id": "r4-batch-focus-failed-qa-rework-2-mf-sub-8858affd",
+    "worker_slot_id": "r4-batch-focus-failed-qa-rework-2-mf-sub-8858affd",
+    "source_event_ref": "timeline:49",
+    "prior_reissue_event_ref": "timeline:48",
+    "initial_join_event_ref": "timeline:45",
+    "source_created_at": "2026-08-17T09:22:04Z",
+    "r2_adapter_schema_version": "mcp.managed_host_envelope.v1",
+    "r2_governance_commit": "2290553890dc4142f25723990e5b51b2e48bb06a",
+}
+
+
+def _runtime_context_exact_legacy_r2_capture_loss_rescue(
+    *,
+    project_id: str,
+    context: Any,
+    contract_execution_id: str,
+    prior_event: Mapping[str, Any],
+    stage_reissue_events: Sequence[Mapping[str, Any]],
+    prior_loss_authority: Mapping[str, Any],
+    stage_checkpoint_id: str,
+    route_identity_hash: str,
+) -> dict[str, Any]:
+    """Authorize only the audited R2 capture-loss world exhausted at event 49.
+
+    This is a one-time migration seam, not a third generic replacement.  The
+    exact incident binding is source-owned and all mutable/current authority
+    (safe ref, lease, route, receipt/startup state) is still checked by the
+    ordinary safe-ref gate around this predicate.
+    """
+
+    binding = dict(_RUNTIME_CONTEXT_LEGACY_R2_MANAGED_CAPTURE_LOSS_RESCUE)
+    payload = (
+        prior_event.get("payload")
+        if isinstance(prior_event.get("payload"), Mapping)
+        else {}
+    )
+    event_ref = f"timeline:{prior_event.get('id', '')}"
+    stage_refs = [f"timeline:{event.get('id', '')}" for event in stage_reissue_events]
+    expected_identity = {
+        "project_id": project_id,
+        "backlog_id": str(context.backlog_id or "").strip(),
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+        "runtime_context_id": str(context.runtime_context_id or "").strip(),
+        "task_id": str(context.task_id or "").strip(),
+        "parent_task_id": _runtime_context_mf_sub_parent_task_id(context),
+        "worker_id": str(context.worker_id or "").strip(),
+        "worker_slot_id": str(
+            context.worker_slot_id or context.worker_id or ""
+        ).strip(),
+    }
+    if (
+        len(stage_reissue_events) != 3
+        or event_ref != str(binding.get("source_event_ref") or "").strip()
+        or stage_refs[-2:] != [
+            str(binding.get("prior_reissue_event_ref") or "").strip(),
+            str(binding.get("source_event_ref") or "").strip(),
+        ]
+        or str(prior_event.get("created_at") or "").strip()
+        != str(binding.get("source_created_at") or "").strip()
+        or any(
+            expected_identity[field]
+            != str(binding.get(field) or "").strip()
+            for field in expected_identity
+        )
+        or str(prior_loss_authority.get("schema_version") or "").strip()
+        != "runtime_context.safe_ref_loss_replacement_authority.v1"
+        or prior_loss_authority.get("server_derived") is not True
+        or prior_loss_authority.get("caller_claims_trusted") is not False
+        or int(prior_loss_authority.get("prior_stage_reissue_count") or 0) != 2
+        or int(prior_loss_authority.get("loss_replacement_generation") or 0) != 2
+        or int(prior_loss_authority.get("max_loss_replacements") or 0) != 2
+        or prior_loss_authority.get("managed_host_continuity_loss_replacement")
+        is not True
+        or str(prior_loss_authority.get("prior_reissue_event_ref") or "").strip()
+        != str(binding.get("prior_reissue_event_ref") or "").strip()
+        or str(prior_loss_authority.get("stage_checkpoint_id") or "").strip()
+        != stage_checkpoint_id
+        or str(prior_loss_authority.get("route_identity_hash") or "").strip()
+        != route_identity_hash
+        or prior_loss_authority.get("worker_receipt_consumed") is not False
+        or prior_loss_authority.get("worker_startup_consumed") is not False
+        or prior_loss_authority.get("raw_credentials_persisted") is not False
+        or str(prior_loss_authority.get("authority_hash") or "").strip()
+        != _stable_public_hash(
+            {
+                key: value
+                for key, value in prior_loss_authority.items()
+                if key != "authority_hash"
+            }
+        )
+        or str(
+            (
+                payload.get("safe_ref_reissue_authority")
+                if isinstance(payload.get("safe_ref_reissue_authority"), Mapping)
+                else {}
+            ).get("initial_join_event_ref")
+            or ""
+        ).strip()
+        != str(binding.get("initial_join_event_ref") or "").strip()
+    ):
+        return {}
+    rescue = {
+        "schema_version": (
+            "runtime_context.legacy_r2_managed_capture_loss_rescue.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "source_event_ref": event_ref,
+        "prior_reissue_event_ref": str(
+            binding.get("prior_reissue_event_ref") or ""
+        ).strip(),
+        "r2_adapter_schema_version": str(
+            binding.get("r2_adapter_schema_version") or ""
+        ).strip(),
+        "r2_governance_commit": str(
+            binding.get("r2_governance_commit") or ""
+        ).strip(),
+        "legacy_rescue_generation": 1,
+        "max_legacy_rescues": 1,
+        "general_loss_replacement_limit_raised": False,
+        "worker_receipt_consumed": False,
+        "worker_startup_consumed": False,
+        "raw_credentials_persisted": False,
+    }
+    rescue["authority_hash"] = _stable_public_hash(rescue)
+    return rescue
+
+
 def _runtime_context_safe_ref_prestartup_reissue_authority(
     ctx: RequestContext,
     conn,
@@ -41610,7 +41748,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
     prior_safe_ref_reissue_event: Mapping[str, Any] | None = None
     if (
         not matching_session_authorities
-        and len(stage_reissue_events) in {1, 2}
+        and len(stage_reissue_events) in {1, 2, 3}
         and len(matching_stage_reissue_events) == 1
     ):
         candidate_event = matching_stage_reissue_events[0]
@@ -41832,6 +41970,20 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             if stage_reissue_events
             else ""
         )
+        legacy_r2_capture_loss_rescue = (
+            _runtime_context_exact_legacy_r2_capture_loss_rescue(
+                project_id=project_id,
+                context=context,
+                contract_execution_id=presented_contract_execution_id,
+                prior_event=prior_safe_ref_reissue_event,
+                stage_reissue_events=stage_reissue_events,
+                prior_loss_authority=prior_loss_authority,
+                stage_checkpoint_id=stage_checkpoint_id,
+                route_identity_hash=route_identity_hash,
+            )
+            if prior_stage_reissue_count == 3
+            else {}
+        )
         prior_loss_chain_valid = bool(
             (
                 prior_stage_reissue_count == 1
@@ -41880,10 +42032,14 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
                     }
                 )
             )
+            or (
+                prior_stage_reissue_count == 3
+                and bool(legacy_r2_capture_loss_rescue)
+            )
         )
         if (
             not prior_loss_chain_valid
-            or prior_stage_reissue_count not in {1, 2}
+            or prior_stage_reissue_count not in {1, 2, 3}
             or prior_identity != expected_prior_identity
             or prior_payload.get("ok") is not True
             or str(prior_payload.get("schema_version") or "").strip()
@@ -41968,7 +42124,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             "loss_replacement_generation": prior_stage_reissue_count,
             "max_loss_replacements": 2,
             "managed_host_continuity_loss_replacement": (
-                prior_stage_reissue_count == 2
+                prior_stage_reissue_count >= 2
             ),
             "session_token_ref": presented_session_ref,
             "lease_id": str(context.lease_id or "").strip(),
@@ -41978,6 +42134,10 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             "route_identity_hash": route_identity_hash,
             "raw_credentials_persisted": False,
         }
+        if legacy_r2_capture_loss_rescue:
+            replacement_core["legacy_r2_capture_loss_rescue"] = dict(
+                legacy_r2_capture_loss_rescue
+            )
         safe_ref_loss_replacement_authority = {
             **replacement_core,
             "authority_hash": _stable_public_hash(replacement_core),

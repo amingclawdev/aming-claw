@@ -42509,6 +42509,126 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         "session_token_rejoin_eligibility"
     ]["eligible"] is False
 
+    # A third generic loss remains exhausted.  Only the one source-bound R2
+    # incident may consume one legacy rescue, and that rescue does not raise
+    # the generic two-replacement ceiling.
+    stage_reissue_events = [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+            limit=1000,
+        )
+        if str((event.get("payload") or {}).get("action") or "").strip()
+        == "runtime_context_session_token_reissue"
+        and str((event.get("payload") or {}).get("runtime_context_id") or "").strip()
+        == fresh_context.runtime_context_id
+    ]
+    assert len(stage_reissue_events) == 3
+    legacy_source_event = stage_reissue_events[-1]
+    legacy_prior_event = stage_reissue_events[-2]
+    monkeypatch.setattr(
+        server,
+        "_RUNTIME_CONTEXT_LEGACY_R2_MANAGED_CAPTURE_LOSS_RESCUE",
+        {
+            "schema_version": (
+                "runtime_context.legacy_r2_managed_capture_loss_rescue_binding.v1"
+            ),
+            "project_id": PID,
+            "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
+            "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+            "runtime_context_id": fresh_context.runtime_context_id,
+            "task_id": fresh_task_id,
+            "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+            "worker_id": fresh_worker_id,
+            "worker_slot_id": fresh_worker_id,
+            "source_event_ref": f"timeline:{legacy_source_event['id']}",
+            "prior_reissue_event_ref": f"timeline:{legacy_prior_event['id']}",
+            "initial_join_event_ref": pinned_initial_join_ref,
+            "source_created_at": legacy_source_event["created_at"],
+            "r2_adapter_schema_version": "mcp.managed_host_envelope.v1",
+            "r2_governance_commit": (
+                "2290553890dc4142f25723990e5b51b2e48bb06a"
+            ),
+        },
+    )
+    with pytest.raises(GovernanceError) as legacy_rescue_guide:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "task_id": fresh_task_id,
+                    "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                    "worker_id": fresh_worker_id,
+                    "worker_slot_id": fresh_worker_id,
+                    "session_token_ref": managed["session_token_ref"],
+                    "target_project_root": str(world.root),
+                    **route_identity,
+                },
+            )
+        )
+    assert legacy_rescue_guide.value.code == "fence_invalidated_or_unknown"
+    legacy_eligibility = legacy_rescue_guide.value.details["diagnostics"][
+        "session_token_rejoin_eligibility"
+    ]
+    assert legacy_eligibility["eligible"] is True
+    assert legacy_eligibility["mode"] == "safe_ref_prestartup_reissue"
+    legacy_rescue_body = copy.deepcopy(
+        legacy_rescue_guide.value.details["actionable_payloads"]
+        ["session_token_reissue_submission"]["copy_safe_body"]
+    )
+    legacy_rescue_body["reason"] = (
+        "rescue the one exact R2 post-write host capture loss"
+    )
+    legacy_rescue = (
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=legacy_rescue_body,
+            )
+        )
+    )
+    legacy_authority = legacy_rescue["safe_ref_loss_replacement_authority"]
+    assert legacy_authority["loss_replacement_generation"] == 3
+    assert legacy_authority["max_loss_replacements"] == 2
+    rescue_marker = legacy_authority["legacy_r2_capture_loss_rescue"]
+    assert rescue_marker["source_event_ref"] == (
+        f"timeline:{legacy_source_event['id']}"
+    )
+    assert rescue_marker["legacy_rescue_generation"] == 1
+    assert rescue_marker["max_legacy_rescues"] == 1
+    assert rescue_marker["general_loss_replacement_limit_raised"] is False
+    managed_before_legacy_rescue = managed
+    managed = legacy_rescue
+
+    duplicate_rescue_body = copy.deepcopy(legacy_rescue_body)
+    duplicate_rescue_body["session_token_ref"] = managed["session_token_ref"]
+    before_duplicate_rescue = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as duplicate_rescue:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=duplicate_rescue_body,
+            )
+        )
+    assert duplicate_rescue.value.code == "fence_invalidated_or_unknown"
+    assert "\n".join(conn.iterdump()) == before_duplicate_rescue
+
     # Prepare the same-current-ref request while it is still a valid pre-read
     # world.  After receipt/startup consume the envelope, this byte-identical
     # request must fail closed and make no write.
@@ -42827,6 +42947,8 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         joined["fence_token"],
         managed["session_token"],
         managed["fence_token"],
+        managed_before_legacy_rescue["session_token"],
+        managed_before_legacy_rescue["fence_token"],
     ):
         assert raw_secret not in serialized_events
 

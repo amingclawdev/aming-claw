@@ -144,6 +144,153 @@ def test_managed_mcp_host_envelope_stages_injects_and_acks_startup():
     assert len(calls) == call_count
 
 
+def test_managed_mcp_host_envelope_accepts_authoritative_safe_ref_rotation():
+    continuity = mcp_tools.ManagedHostEnvelopeContinuity()
+    old_ref = "wstok-before-managed-capture"
+    new_ref = "wstok-after-managed-capture"
+    raw_session = "rotated-managed-session"
+    raw_fence = "rotated-managed-fence"
+    route = {
+        "route_id": "route-managed-rotation",
+        "route_context_hash": "sha256:" + ("1" * 64),
+        "prompt_contract_id": "rprompt-managed-rotation",
+        "prompt_contract_hash": "sha256:" + ("2" * 64),
+        "route_token_ref": "rtok-managed-rotation",
+        "visible_injection_manifest_hash": "sha256:" + ("3" * 64),
+    }
+    request = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-managed-rotation",
+        "task_id": "worker-managed-rotation",
+        "parent_task_id": "cex-managed-rotation",
+        "contract_execution_id": "cex-managed-rotation",
+        "target_project_root": "/tmp/managed-rotation",
+        "worker_id": "worker-managed-rotation",
+        "worker_slot_id": "worker-managed-rotation",
+        "agent_id": "worker-managed-rotation",
+        "allocation_owner": "worker-managed-rotation",
+        "actual_host_worker_id": "worker-managed-rotation",
+        "worker_session_id": "desktop-managed-rotation",
+        "host_startup_id": "desktop-managed-rotation",
+        "host_session_id": "desktop-managed-rotation",
+        "session_token_ref": old_ref,
+        **route,
+    }
+    response_identity = {**request, "session_token_ref": new_ref}
+    issued = continuity.dispatch(
+        "runtime_context_session_token_reissue",
+        request,
+        lambda _args: {
+            "ok": True,
+            "request_id": "req-managed-rotation",
+            "audit_event_ref": "timeline:49",
+            "status": "session_token_reissued",
+            "delivery": "worker_host_envelope",
+            **response_identity,
+            "session_token": raw_session,
+            "fence_token": raw_fence,
+            "session_token_hash": "sha256:"
+            + hashlib.sha256(raw_session.encode()).hexdigest(),
+            "fence_token_hash": "sha256:"
+            + hashlib.sha256(raw_fence.encode()).hexdigest(),
+            "host_envelope": {
+                **response_identity,
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": raw_session,
+                    "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                },
+            },
+        },
+    )
+
+    assert issued["auth_loaded"] is True
+    assert issued["session_token_ref"] == new_ref
+    assert issued["managed_host_envelope"]["session_token_ref"] == new_ref
+    assert old_ref not in json.dumps(issued, sort_keys=True)
+    calls = []
+    continued = continuity.dispatch(
+        "runtime_context_worker_guide",
+        {**request, "session_token_ref": new_ref},
+        lambda args: calls.append(dict(args)) or {"ok": True},
+    )
+    assert continued == {"ok": True}
+    assert calls[0]["session_token"] == raw_session
+    assert calls[0]["fence_token"] == raw_fence
+
+
+def test_managed_mcp_host_envelope_post_response_failure_preserves_write_truth():
+    continuity = mcp_tools.ManagedHostEnvelopeContinuity()
+    raw_session = "mutation-aware-session"
+    raw_fence = "mutation-aware-fence"
+    request = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-mutation-aware",
+        "task_id": "worker-mutation-aware",
+    }
+    result = continuity.dispatch(
+        "runtime_context_session_token_reissue",
+        request,
+        lambda _args: {
+            "ok": True,
+            "request_id": "req-mutation-aware",
+            "audit_event_ref": "timeline:49",
+            "status": "session_token_reissued",
+            "delivery": "worker_host_envelope",
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-mutation-aware",
+            "task_id": "different-worker",
+            "session_token_ref": "wstok-current-after-write",
+            "session_token": raw_session,
+            "fence_token": raw_fence,
+            "host_envelope": {
+                "project_id": "aming-claw",
+                "runtime_context_id": "mfrctx-mutation-aware",
+                "task_id": "different-worker",
+                "session_token_ref": "wstok-current-after-write",
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": raw_session,
+                    "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                },
+            },
+        },
+    )
+
+    assert result["error"] == "managed_host_envelope_identity_mismatch"
+    assert result["field"] == "task_id"
+    assert result["http_request_performed"] is True
+    assert result["writes_performed"] is True
+    assert result["server_mutation_accepted"] is True
+    assert result["zero_write_rejection"] is False
+    assert result["request_id"] == "req-mutation-aware"
+    assert result["audit_event_ref"] == "timeline:49"
+    assert result["session_token_ref"] == "wstok-current-after-write"
+    assert raw_session not in json.dumps(result, sort_keys=True)
+    assert raw_fence not in json.dumps(result, sort_keys=True)
+    assert continuity.pending_count() == 0
+
+
+def test_managed_mcp_host_envelope_preflight_conflict_is_zero_http():
+    continuity = mcp_tools.ManagedHostEnvelopeContinuity()
+    calls = []
+    result = continuity.dispatch(
+        "runtime_context_session_token_reissue",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-preflight-conflict",
+            "task_id": "worker-preflight-conflict",
+            "session_token_ref": "wstok-preflight-conflict",
+            "route_id": "route-current",
+            "route_identity": {"route_id": "route-stale"},
+        },
+        lambda args: calls.append(args),
+    )
+    assert result["error"] == "managed_host_envelope_identity_ambiguous"
+    assert result["mismatched_fields"] == ["route_id"]
+    assert result["http_request_performed"] is False
+    assert result["writes_performed"] is False
+    assert calls == []
+
+
 def test_managed_mcp_host_envelope_cross_scope_is_zero_http():
     continuity = mcp_tools.ManagedHostEnvelopeContinuity()
     calls = []
