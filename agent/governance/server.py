@@ -43928,6 +43928,291 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
         return {}
     expected_route_identity = _runtime_context_latest_route_identity(conn, context)
 
+    # A fresh failed-QA replacement uses initial-join, not revision-rejoin.
+    # Bind that pre-lineage host transition to the canonical successor
+    # dispatch and its independently persisted identity anchor before allowing
+    # the replacement context to project its own read/startup setup evidence.
+    # This is deliberately context-local: it never reopens or duplicates the
+    # globally completed worker-read/startup Contract lines.
+    if successor_dispatch_authority:
+        route_identity_hash = _stable_public_hash(expected_route_identity)
+        initial_join_candidates: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+        identity_anchor_candidates: list[Mapping[str, Any]] = []
+        for event in timeline_events:
+            if not isinstance(event, Mapping):
+                continue
+            event_payload = (
+                event.get("payload")
+                if isinstance(event.get("payload"), Mapping)
+                else {}
+            )
+            event_status = str(event.get("status") or "").strip().lower()
+            if event_status not in {
+                "accepted",
+                "ok",
+                "pass",
+                "passed",
+                "success",
+                "succeeded",
+            }:
+                continue
+            action = str(event_payload.get("action") or "").strip()
+            if action == (
+                "runtime_context_session_token_initial_join_identity_binding_anchor"
+            ):
+                identity_anchor_candidates.append(event)
+                continue
+            if (
+                str(event.get("event_type") or "").strip()
+                != "observer.runtime_context_session_token_initial_join"
+                or str(event.get("event_kind") or "").strip()
+                != "observer_command"
+                or str(event.get("phase") or "").strip()
+                != "runtime_context_initial_join"
+                or action != "runtime_context_session_token_initial_join"
+            ):
+                continue
+            canonical_binding = (
+                event_payload.get("canonical_identity_binding")
+                if isinstance(
+                    event_payload.get("canonical_identity_binding"), Mapping
+                )
+                else {}
+            )
+            binding_core = {
+                key: value
+                for key, value in canonical_binding.items()
+                if key != "binding_hash"
+            }
+            dispatch_anchor = (
+                canonical_binding.get("contract_dispatch_identity_anchor")
+                if isinstance(
+                    canonical_binding.get("contract_dispatch_identity_anchor"),
+                    Mapping,
+                )
+                else {}
+            )
+            expected_values = {
+                "project_id": str(
+                    getattr(context, "project_id", "") or ""
+                ).strip(),
+                "runtime_context_id": runtime_context_id,
+                "contract_execution_id": str(
+                    successor_contract_evidence.get("contract_execution_id")
+                    or ""
+                ).strip(),
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "backlog_id": backlog_id,
+                "worker_id": expected_worker_id,
+                "worker_slot_id": expected_worker_slot_id,
+                "session_token_ref": active_session_token_ref,
+                "target_project_root": expected_target_project_root,
+            }
+            if (
+                int(event.get("id") or 0) <= 0
+                or str(event.get("task_id") or "").strip() != task_id
+                or str(event.get("backlog_id") or "").strip() != backlog_id
+                or any(
+                    str(event_payload.get(field) or "").strip() != expected
+                    for field, expected in expected_values.items()
+                    if field != "target_project_root"
+                )
+                or str(event_payload.get("fence_token_hash") or "").strip()
+                != expected_fence_token_hash
+                or event_payload.get("raw_session_token_persisted") is not False
+                or event_payload.get("raw_fence_token_persisted_to_timeline")
+                is not False
+                or event_payload.get("session_token_persisted") is not False
+                or event_payload.get("canonical_identity_binding_required")
+                is not True
+                or str(canonical_binding.get("schema_version") or "").strip()
+                != "runtime_context.initial_join_canonical_identity_binding.v1"
+                or canonical_binding.get("server_derived") is not True
+                or any(
+                    str(canonical_binding.get(field) or "").strip()
+                    != expected
+                    for field, expected in expected_values.items()
+                )
+                or str(canonical_binding.get("governed_worker_id") or "").strip()
+                != expected_worker_id
+                or str(canonical_binding.get("agent_id") or "").strip()
+                != expected_worker_id
+                or str(
+                    canonical_binding.get("actual_host_worker_id") or ""
+                ).strip()
+                != expected_worker_id
+                or str(canonical_binding.get("context_status") or "").strip()
+                != "worktree_ready"
+                or str(
+                    canonical_binding.get("last_recovery_action") or ""
+                ).strip()
+                != "mf_subagent_initial_join_issued"
+                or list(canonical_binding.get("missing_lineage") or [])
+                != ["mf_subagent_read_receipt", "mf_subagent_startup"]
+                or canonical_binding.get("raw_credentials_persisted") is not False
+                or canonical_binding.get(
+                    "contract_dispatch_identity_anchor_required"
+                )
+                is not True
+                or str(canonical_binding.get("binding_hash") or "").strip()
+                != _stable_public_hash(binding_core)
+                or dict(canonical_binding.get("route_identity") or {})
+                != expected_route_identity
+                or str(dispatch_anchor.get("schema_version") or "").strip()
+                != "runtime_context.pre_lineage_legacy_dispatch_identity_anchor.v1"
+                or dispatch_anchor.get("server_derived") is not True
+                or str(dispatch_anchor.get("source") or "").strip()
+                != "ContractRuntime.completed_lines.observer_dispatch_bounded_workers"
+                or str(dispatch_anchor.get("source_ref") or "").strip()
+                != str(
+                    successor_dispatch_authority.get("dispatch_source_ref")
+                    or ""
+                ).strip()
+                or any(
+                    str(dispatch_anchor.get(field) or "").strip()
+                    != expected
+                    for field, expected in expected_values.items()
+                    if field
+                    in {
+                        "project_id",
+                        "runtime_context_id",
+                        "contract_execution_id",
+                        "task_id",
+                        "parent_task_id",
+                        "backlog_id",
+                        "worker_id",
+                        "worker_slot_id",
+                        "target_project_root",
+                    }
+                )
+                or dict(dispatch_anchor.get("route_identity") or {})
+                != expected_route_identity
+                or dict(event_payload.get("route_identity") or {})
+                != expected_route_identity
+            ):
+                continue
+            initial_join_candidates.append((event, canonical_binding))
+
+        if len(initial_join_candidates) == 1:
+            initial_join_event, canonical_binding = initial_join_candidates[0]
+            initial_join_event_id = int(initial_join_event.get("id") or 0)
+            initial_join_event_ref = f"timeline:{initial_join_event_id}"
+            matching_anchors: list[Mapping[str, Any]] = []
+            for event in identity_anchor_candidates:
+                event_payload = (
+                    event.get("payload")
+                    if isinstance(event.get("payload"), Mapping)
+                    else {}
+                )
+                anchor_core = {
+                    key: value
+                    for key, value in event_payload.items()
+                    if key
+                    not in {
+                        "anchor_hash",
+                        "contract_gate_decision",
+                        "meta_contract_gate",
+                        "agent_facing_decision_source",
+                        "meta_contract_gate_decision_source",
+                    }
+                }
+                if (
+                    int(event.get("id") or 0) <= initial_join_event_id
+                    or str(event.get("event_type") or "").strip()
+                    != "observer.runtime_context_session_token_initial_join_identity_binding"
+                    or str(event.get("event_kind") or "").strip()
+                    != "observer_command"
+                    or str(event.get("phase") or "").strip()
+                    != "runtime_context_initial_join_identity_binding"
+                    or str(event.get("task_id") or "").strip() != task_id
+                    or str(event.get("backlog_id") or "").strip()
+                    != backlog_id
+                    or str(event_payload.get("schema_version") or "").strip()
+                    != "runtime_context.initial_join_identity_binding_anchor.v1"
+                    or event_payload.get("server_derived") is not True
+                    or event_payload.get("raw_credentials_persisted") is not False
+                    or str(
+                        event_payload.get("runtime_context_id") or ""
+                    ).strip()
+                    != runtime_context_id
+                    or str(event_payload.get("contract_execution_id") or "").strip()
+                    != str(
+                        successor_contract_evidence.get("contract_execution_id")
+                        or ""
+                    ).strip()
+                    or str(event_payload.get("task_id") or "").strip()
+                    != task_id
+                    or str(event_payload.get("backlog_id") or "").strip()
+                    != backlog_id
+                    or str(event_payload.get("initial_join_event_ref") or "").strip()
+                    != initial_join_event_ref
+                    or str(
+                        event_payload.get("canonical_binding_hash") or ""
+                    ).strip()
+                    != str(canonical_binding.get("binding_hash") or "").strip()
+                    or str(event_payload.get("session_token_ref") or "").strip()
+                    != active_session_token_ref
+                    or str(event_payload.get("route_identity_hash") or "").strip()
+                    != route_identity_hash
+                    or str(event_payload.get("anchor_hash") or "").strip()
+                    != _stable_public_hash(anchor_core)
+                ):
+                    continue
+                matching_anchors.append(event)
+            if len(matching_anchors) == 1:
+                identity_anchor = matching_anchors[0]
+                return {
+                    "schema_version": (
+                        "contract_runtime.failed_qa_revision_initial_join_marker.v1"
+                    ),
+                    "source": "accepted_runtime_context_initial_join",
+                    "reopen_authority_source": (
+                        "canonical_successor_dispatch_revision+"
+                        "initial_join_identity_anchor"
+                    ),
+                    "revision_event_id": initial_join_event_id,
+                    "revision_event_ref": initial_join_event_ref,
+                    "authoritative_rejoin_event_ref": initial_join_event_ref,
+                    "latest_rotation_event_ref": initial_join_event_ref,
+                    "composed_across_auth_rotation": False,
+                    "contract_execution_id": str(
+                        successor_contract_evidence.get("contract_execution_id")
+                        or ""
+                    ).strip(),
+                    "failed_qa_source_ref": str(
+                        successor_dispatch_authority.get("failed_qa_source_ref")
+                        or successor_contract_evidence.get("failed_qa_source_ref")
+                        or ""
+                    ).strip(),
+                    "failed_qa_source": "contract_runtime_completed_lines",
+                    "dispatch_source_ref": str(
+                        successor_dispatch_authority.get(
+                            "dispatch_source_ref"
+                        )
+                        or ""
+                    ).strip(),
+                    "failed_qa_event_id": 0,
+                    "failed_qa_authority_hash": "",
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": parent_task_id,
+                    "backlog_id": backlog_id,
+                    "attempt": expected_attempt,
+                    "retry_round": expected_retry_round,
+                    "route_token_ref": str(
+                        expected_route_identity.get("route_token_ref") or ""
+                    ).strip(),
+                    "route_identity_rebound": False,
+                    "evidence_backfill": False,
+                    "initial_join_identity_anchor_event_ref": (
+                        f"timeline:{int(identity_anchor.get('id') or 0)}"
+                    ),
+                    "successor_dispatch_revision_authority": dict(
+                        successor_dispatch_authority
+                    ),
+                }
+
     def _matches_preserved_auth_only(event: Mapping[str, Any]) -> bool:
         payload = (
             event.get("payload")
@@ -44911,13 +45196,11 @@ def _runtime_context_failed_qa_successor_dispatch_revision_authority(
 ) -> dict[str, Any]:
     """Bind an old failed-QA line to one exact replacement dispatch."""
 
-    selected = _contract_runtime_current_dispatch_authority_line(record)
     failed_index = int(failed_line.get("_completed_line_index") or -1)
     dispatch_index = int(dispatch_match.get("line_index") or -1)
-    selected_index = int(selected.get("completed_line_index") or -1)
     payload = (
-        selected.get("payload")
-        if isinstance(selected.get("payload"), Mapping)
+        dispatch_match.get("payload")
+        if isinstance(dispatch_match.get("payload"), Mapping)
         else {}
     )
     revision = (
@@ -44939,10 +45222,8 @@ def _runtime_context_failed_qa_successor_dispatch_revision_authority(
         record.get("contract_execution_id") or ""
     ).strip()
     if (
-        selected.get("status") != "selected"
-        or failed_index < 0
+        failed_index < 0
         or dispatch_index <= failed_index
-        or selected_index != dispatch_index
         or str(dispatch_match.get("source_ref") or "").strip()
         != f"contract_runtime:{contract_execution_id}:completed_lines:{dispatch_index}"
         or revision.get("append_only_history_preserved") is not True
@@ -45019,7 +45300,54 @@ def _runtime_context_failed_qa_successor_dispatch_revision_authority(
             task_id=failed_task_id,
         )
     )
-    if (
+    failed_payload = (
+        failed_line.get("payload")
+        if isinstance(failed_line.get("payload"), Mapping)
+        else {}
+    )
+    qa_provenance = (
+        failed_line.get("qa_evidence_provenance")
+        if isinstance(failed_line.get("qa_evidence_provenance"), Mapping)
+        else {}
+    )
+    qa_binding = (
+        qa_provenance.get("authenticated_qa_binding")
+        if isinstance(qa_provenance.get("authenticated_qa_binding"), Mapping)
+        else {}
+    )
+    timeline_materialized_commit_authority = bool(
+        _runtime_context_contract_failed_qa_has_canonical_provenance(
+            failed_line
+        )
+        and str(qa_provenance.get("source") or "").strip()
+        == "authenticated_failed_qa_timeline_dispatch_boundary"
+        and qa_provenance.get("server_derived") is True
+        and qa_binding.get("server_derived") is True
+        and qa_binding.get("independent_verification_session_matched") is True
+        and str(failed_payload.get("schema_version") or "").strip()
+        == "contract_runtime.authenticated_failed_qa_revision_boundary.v1"
+        and str(failed_payload.get("source") or "").strip()
+        == "server_authenticated_qa_timeline_materialization"
+        and str(failed_payload.get("source_of_authority") or "").strip()
+        == "qa_session_verification"
+        and failed_payload.get("source_backed") is True
+        and failed_payload.get("projection_persists_completed_line") is True
+        and failed_payload.get("observer_authored_qa_backfill") is False
+        and failed_payload.get("observer_authored_worker_backfill") is False
+        and str(
+            failed_payload.get("projection_contract_execution_id") or ""
+        ).strip()
+        == contract_execution_id
+        and str(failed_payload.get("runtime_context_id") or "").strip()
+        == failed_runtime_context_id
+        and str(failed_payload.get("task_id") or "").strip()
+        == failed_task_id
+        and str(failed_payload.get("parent_task_id") or "").strip()
+        == failed_parent_task_id
+        and str(failed_payload.get("source_ref") or "").strip()
+        == str(qa_binding.get("timeline_event_ref") or "").strip()
+    )
+    if not timeline_materialized_commit_authority and (
         superseded_commit_authority.get("errors")
         or str(superseded_commit_authority.get("commit_sha") or "").strip()
         != failed_commit
@@ -45044,6 +45372,11 @@ def _runtime_context_failed_qa_successor_dispatch_revision_authority(
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "dispatch_source_ref": str(dispatch_match.get("source_ref") or ""),
+        "failed_commit_authority_source": (
+            "authenticated_failed_qa_timeline_materialization"
+            if timeline_materialized_commit_authority
+            else "superseded_implementation_commit_authority"
+        ),
         "superseded_implementation_commit_authority": dict(
             superseded_commit_authority
         ),
@@ -45087,10 +45420,18 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
         and int(getattr(context, "attempt", 0) or 0) > 1
         and int(getattr(context, "retry_round", 0) or 0) == 0
     )
+    fresh_failed_qa_replacement_initial_joined = (
+        context_status == STATE_WORKTREE_READY
+        and int(getattr(context, "attempt", 0) or 0) > 1
+        and int(getattr(context, "retry_round", 0) or 0) == 0
+        and str(getattr(context, "last_recovery_action", "") or "")
+        == "mf_subagent_initial_join_issued"
+    )
     if (
         context_status not in FAILED_QA_REVISION_REJOIN_STATES
         and not failed_qa_rejoin_reopened
         and not fresh_failed_qa_replacement_running
+        and not fresh_failed_qa_replacement_initial_joined
     ):
         return {}
     backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
@@ -54083,7 +54424,7 @@ def handle_graph_governance_runtime_context_startup(ctx: RequestContext):
     result = handle_graph_governance_parallel_branch_startup(
         _runtime_context_forward_request(ctx, body=startup_body)
     )
-    return _runtime_context_write_response(
+    response = _runtime_context_write_response(
         action="startup",
         project_id=project_id,
         runtime_context_id=runtime_context_id,
@@ -54098,6 +54439,14 @@ def handle_graph_governance_runtime_context_startup(ctx: RequestContext):
         gate=result.get("startup_gate") if isinstance(result, Mapping) else None,
         updated_context=result.get("context") if isinstance(result, Mapping) else None,
     )
+    if isinstance(
+        result.get("contract_runtime_canonical_line"),
+        Mapping,
+    ):
+        response["contract_runtime_canonical_line"] = result.get(
+            "contract_runtime_canonical_line"
+        )
+    return response
 
 
 @route("POST", "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/checkpoints")
@@ -58265,39 +58614,54 @@ def _runtime_context_context_local_setup_authority(
         project_id=project_id,
         command_id=observer_command_id,
     )
-    if not isinstance(command, Mapping):
+    initial_join_marker = bool(
+        str(marker.get("schema_version") or "").strip()
+        == "contract_runtime.failed_qa_revision_initial_join_marker.v1"
+        and str(marker.get("source") or "").strip()
+        == "accepted_runtime_context_initial_join"
+        and str(marker.get("revision_event_ref") or "").strip().startswith(
+            "timeline:"
+        )
+        and str(marker.get("dispatch_source_ref") or "").strip()
+        == str(dispatch_identity.get("source_ref") or "").strip()
+        and marker.get("route_identity_rebound") is False
+        and marker.get("evidence_backfill") is False
+    )
+    if not isinstance(command, Mapping) and not initial_join_marker:
         return {}
     command_payload = (
         command.get("payload")
-        if isinstance(command.get("payload"), Mapping)
+        if isinstance(command, Mapping)
+        and isinstance(command.get("payload"), Mapping)
         else {}
     )
-    if (
-        str(command.get("command_type") or "").strip()
-        != "execute_backlog_row"
-        or str(command.get("status") or "").strip()
-        not in {"claimed", "running"}
-        or not str(command.get("claimed_by_session_id") or "").strip()
-        or str(command_payload.get("backlog_id") or "").strip()
-        != backlog_id
-    ):
-        return {}
-    command_execution_id = str(
-        command_payload.get("contract_execution_id") or ""
-    ).strip()
-    if command_execution_id != execution_id:
-        return {}
-    command_task_id = str(
-        command_payload.get("worker_task_id")
-        or command_payload.get("task_id")
-        or ""
-    ).strip()
-    if command_task_id and command_task_id not in {
-        task_id,
-        parent_task_id,
-        execution_id,
-    }:
-        return {}
+    if isinstance(command, Mapping):
+        if (
+            str(command.get("command_type") or "").strip()
+            != "execute_backlog_row"
+            or str(command.get("status") or "").strip()
+            not in {"claimed", "running"}
+            or not str(command.get("claimed_by_session_id") or "").strip()
+            or str(command_payload.get("backlog_id") or "").strip()
+            != backlog_id
+        ):
+            return {}
+        command_execution_id = str(
+            command_payload.get("contract_execution_id") or ""
+        ).strip()
+        if command_execution_id != execution_id:
+            return {}
+        command_task_id = str(
+            command_payload.get("worker_task_id")
+            or command_payload.get("task_id")
+            or ""
+        ).strip()
+        if command_task_id and command_task_id not in {
+            task_id,
+            parent_task_id,
+            execution_id,
+        }:
+            return {}
 
     latest_route_identity = _runtime_context_latest_route_identity(conn, context)
     for field in (
@@ -58310,8 +58674,16 @@ def _runtime_context_context_local_setup_authority(
     ):
         expected = str(latest_route_identity.get(field) or "").strip()
         actual = _route_request_identity_value(command_payload, field)
-        if expected and actual != expected:
+        if (
+            expected
+            and isinstance(command, Mapping)
+            and actual != expected
+        ):
             return {}
+    if initial_join_marker and str(
+        marker.get("route_token_ref") or ""
+    ).strip() != str(latest_route_identity.get("route_token_ref") or "").strip():
+        return {}
 
     prior_line: dict[str, Any] = {}
     for completed in record.get("completed_lines") or []:
@@ -58382,7 +58754,10 @@ def _runtime_context_context_local_setup_authority(
                 str(event.get("event_type") or "").strip()
                 != "mf_subagent_read_receipt"
                 or str(event.get("event_kind") or "").strip()
-                != "contract_context_read_receipt"
+                not in {
+                    "contract_context_read_receipt",
+                    "mf_subagent_read_receipt",
+                }
                 or str(event.get("status") or "").strip().lower()
                 not in {"ok", "accepted", "passed", "succeeded"}
                 or str(event_payload.get("runtime_context_id") or "").strip()
@@ -58474,10 +58849,17 @@ def _runtime_context_context_local_setup_authority(
         },
         "observer_command": {
             "command_id": observer_command_id,
-            "status": str(command.get("status") or ""),
-            "claimed_by_session_id": str(
-                command.get("claimed_by_session_id") or ""
+            "status": (
+                str(command.get("status") or "")
+                if isinstance(command, Mapping)
+                else ""
             ),
+            "claimed_by_session_id": (
+                str(command.get("claimed_by_session_id") or "")
+                if isinstance(command, Mapping)
+                else ""
+            ),
+            "required": not initial_join_marker,
         },
         "active_worker_proof": active_worker_proof,
         "local_read_receipt": local_read_receipt,
@@ -59286,6 +59668,7 @@ def _runtime_context_submit_canonical_contract_line(
                     "contract_execution_id",
                     "failed_qa_source_ref",
                     "failed_qa_source",
+                    "dispatch_source_ref",
                     "failed_qa_event_id",
                     "failed_qa_authority_hash",
                     "runtime_context_id",
@@ -97822,6 +98205,7 @@ def _contract_runtime_mf_parallel_context_projection(
                     "contract_execution_id",
                     "failed_qa_source_ref",
                     "failed_qa_source",
+                    "dispatch_source_ref",
                     "failed_qa_event_id",
                     "failed_qa_authority_hash",
                     "attempt",
@@ -98796,16 +99180,14 @@ def _contract_runtime_projection_for_context(
             context=context,
         )
     )
-    failed_qa_revision_rejoin_marker = {}
-    if not contract_runtime_failed_qa:
-        failed_qa_revision_rejoin_marker = (
-            _runtime_context_failed_qa_revision_rejoin_marker(
-                conn=conn,
-                context=context,
-                runtime_context_id=runtime_context_id,
-                timeline_events=timeline_events,
-            )
+    failed_qa_revision_rejoin_marker = (
+        _runtime_context_failed_qa_revision_rejoin_marker(
+            conn=conn,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            timeline_events=timeline_events,
         )
+    )
     failed_qa_revision_rejoin = bool(
         contract_runtime_failed_qa or failed_qa_revision_rejoin_marker
     )

@@ -41679,6 +41679,12 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
 
     fresh_task_id = "batch-child-postmerge-failure-rework-2"
     fresh_worker_id = "batch-child-postmerge-failure-worker-2"
+    fresh_worker_session_id = (
+        "codex:batch-child-postmerge-failure-rework-2"
+    )
+    fresh_host_startup_id = (
+        "codex-startup:batch-child-postmerge-failure-rework-2"
+    )
     route_identity = {
         "route_id": "route-batch-child-postmerge-failure-rework-2",
         "route_context_hash": _fake_sha(
@@ -41933,12 +41939,9 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
                     "worker_slot_id": fresh_worker_id,
                     "agent_id": fresh_worker_id,
                     "actual_host_worker_id": fresh_worker_id,
-                    "worker_session_id": (
-                        "codex:batch-child-postmerge-failure-rework-2"
-                    ),
-                    "host_session_id": (
-                        "codex:batch-child-postmerge-failure-rework-2"
-                    ),
+                    "worker_session_id": fresh_worker_session_id,
+                    "host_startup_id": fresh_host_startup_id,
+                    "host_session_id": fresh_worker_session_id,
                     "reason": "fresh timeline-backed failed-QA rework",
                     **route_identity,
                 },
@@ -41947,6 +41950,194 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     )
     assert joined["ok"] is True
     assert joined["runtime_context_id"] == fresh_context.runtime_context_id
+
+    # The fresh successor owns an append-only dispatch plus an audited
+    # initial-join/identity-anchor pair.  Those three persisted authorities,
+    # rather than the globally completed original lane, must select this
+    # context for its local read/startup setup sequence.
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: actual_runtime)
+    fresh_context = get_branch_context(conn, PID, fresh_task_id)
+    assert fresh_context is not None
+    fresh_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        limit=1000,
+    )
+    marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=conn,
+        context=fresh_context,
+        runtime_context_id=fresh_context.runtime_context_id,
+        timeline_events=fresh_events,
+    )
+    assert marker["source"] == "accepted_runtime_context_initial_join"
+    assert marker["contract_execution_id"] == (
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    )
+    assert marker["runtime_context_id"] == fresh_context.runtime_context_id
+    assert marker["task_id"] == fresh_task_id
+    assert marker["retry_round"] == fresh_context.retry_round
+    assert marker["successor_dispatch_revision_authority"][
+        "dispatch_source_ref"
+    ] == revision["source_ref"]
+
+    initial_join_event = next(
+        event
+        for event in fresh_events
+        if str((event.get("payload") or {}).get("action") or "")
+        == "runtime_context_session_token_initial_join"
+        and str(event.get("task_id") or "") == fresh_task_id
+    )
+    identity_anchor_event = next(
+        event
+        for event in fresh_events
+        if str((event.get("payload") or {}).get("action") or "")
+        == (
+            "runtime_context_session_token_initial_join_"
+            "identity_binding_anchor"
+        )
+        and str(event.get("task_id") or "") == fresh_task_id
+    )
+    wrong_identity_events = copy.deepcopy(fresh_events)
+    wrong_initial_join = next(
+        event
+        for event in wrong_identity_events
+        if int(event.get("id") or 0)
+        == int(initial_join_event.get("id") or 0)
+    )
+    wrong_initial_join["payload"]["canonical_identity_binding"][
+        "worker_id"
+    ] = "sibling-worker"
+    out_of_order_events = copy.deepcopy(fresh_events)
+    wrong_order_anchor = next(
+        event
+        for event in out_of_order_events
+        if int(event.get("id") or 0)
+        == int(identity_anchor_event.get("id") or 0)
+    )
+    wrong_order_anchor["id"] = int(initial_join_event["id"]) - 1
+    duplicate_events = copy.deepcopy(fresh_events)
+    duplicate_initial_join = copy.deepcopy(initial_join_event)
+    duplicate_initial_join["id"] = max(
+        int(event.get("id") or 0) for event in fresh_events
+    ) + 1
+    duplicate_events.append(duplicate_initial_join)
+    for invalid_events in (
+        [
+            event
+            for event in fresh_events
+            if int(event.get("id") or 0)
+            != int(identity_anchor_event.get("id") or 0)
+        ],
+        wrong_identity_events,
+        out_of_order_events,
+        duplicate_events,
+    ):
+        assert server._runtime_context_failed_qa_revision_rejoin_marker(
+            conn=conn,
+            context=fresh_context,
+            runtime_context_id=fresh_context.runtime_context_id,
+            timeline_events=invalid_events,
+        ) == {}
+
+    stored_before_receipt = copy.deepcopy(
+        actual_runtime.store.get(_BATCH_QA_CHILD_EXECUTIONS[index])
+    )
+    receipt_hash = _fake_sha(
+        "batch-child-postmerge-failure-rework-2-read-receipt"
+    )
+    receipt = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": fresh_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": fresh_context.runtime_context_id,
+                "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                "task_id": fresh_task_id,
+                "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                "worker_id": fresh_worker_id,
+                "worker_slot_id": fresh_worker_id,
+                "fence_token": joined["fence_token"],
+                "session_token": joined["session_token"],
+                "session_token_ref": joined["session_token_ref"],
+                "target_project_root": str(world.root),
+                "actor": fresh_worker_id,
+                "read_receipt_hash": receipt_hash,
+                "launch_text_hash": receipt_hash,
+                **route_identity,
+            },
+        )
+    )
+    assert receipt["ok"] is True, receipt
+    assert receipt["contract_runtime_canonical_line"]["status"] == (
+        "context_local_receipt_after_prior_contract_line"
+    )
+    assert receipt["contract_runtime_canonical_line"][
+        "contract_runtime_mutated"
+    ] is False
+    assert actual_runtime.store.get(
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    ) == stored_before_receipt
+
+    startup_context = get_branch_context(conn, PID, fresh_task_id)
+    assert startup_context is not None
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": startup_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": startup_context.runtime_context_id,
+                "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                "task_id": fresh_task_id,
+                "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                "session_token": joined["session_token"],
+                "session_token_ref": joined["session_token_ref"],
+                "fence_token": joined["fence_token"],
+                "target_project_root": str(world.root),
+                "agent_id": fresh_worker_id,
+                "actual_host_worker_id": fresh_worker_id,
+                "worker_session_id": fresh_worker_session_id,
+                "host_startup_id": fresh_host_startup_id,
+                "host_session_id": fresh_worker_session_id,
+                "worker_transcript_ref": (
+                    f"codex:{fresh_worker_session_id}"
+                ),
+                "harness_type": "codex",
+                "filer_principal": fresh_worker_session_id,
+                "actual_cwd": str(world.root),
+                "actual_git_root": str(world.root),
+                "branch": startup_context.branch_ref,
+                "head_commit": startup_context.head_commit,
+                "base_commit": startup_context.base_commit,
+                "target_head_commit": startup_context.target_head_commit,
+                "merge_queue_id": startup_context.merge_queue_id,
+                "owned_files": list(startup_context.owned_files),
+                "read_receipt_hash": receipt_hash,
+                "read_receipt_event_id": str(receipt["read_receipt_event_id"]),
+                "startup_source": "codex_desktop_governed_dispatch",
+                **route_identity,
+            },
+        )
+    )
+    assert startup["ok"] is True, startup
+    assert startup["status"] == "startup_recorded"
+    assert startup["contract_runtime_canonical_line"]["status"] == (
+        "context_local_startup_after_prior_contract_line"
+    )
+    assert startup["contract_runtime_canonical_line"][
+        "contract_runtime_mutated"
+    ] is False
+    assert actual_runtime.store.get(
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    ) == stored_before_receipt
 
 
 @pytest.mark.parametrize(
@@ -127647,6 +127838,10 @@ def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resu
         current_guide=lambda _execution_id, actor_role: None,
         current_record=lambda _execution_id, actor_role: record,
         store=SimpleNamespace(get=lambda _execution_id: record),
+        mf_parallel_atomic_lane_gate_view=lambda _record, _guide, _line, **_kwargs: (
+            {},
+            {},
+        ),
         submit_line_write=lambda *args, **kwargs: pytest.fail(
             "context-local receipt must not resubmit the global Contract line"
         ),
@@ -127902,7 +128097,7 @@ def test_context_local_rework_startup_requires_exact_canonical_receipt_identity(
     }
     events = [event]
     if mutation == "wrong_event_kind":
-        event["event_kind"] = "mf_subagent_read_receipt"
+        event["event_kind"] = "worker_progress"
     elif mutation == "wrong_event_type":
         event["event_type"] = "contract_context_read_receipt"
     elif mutation == "stale_session_ref":
