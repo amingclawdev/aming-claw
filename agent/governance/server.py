@@ -25144,6 +25144,36 @@ def _runtime_context_contract_next_action_override_eligible(
     return True
 
 
+def _runtime_context_failed_qa_marker_route_authorized(
+    marker: Mapping[str, Any],
+) -> bool:
+    """Accept only an unchanged route or its exact registered descendant."""
+
+    if marker.get("route_identity_rebound") is False:
+        return True
+    if marker.get("route_identity_rebound") is not True:
+        return False
+    binding = (
+        marker.get("current_reissue_route_binding")
+        if isinstance(marker.get("current_reissue_route_binding"), Mapping)
+        else {}
+    )
+    canonical = (
+        binding.get("canonical_route_identity")
+        if isinstance(binding.get("canonical_route_identity"), Mapping)
+        else {}
+    )
+    return bool(
+        binding.get("valid") is True
+        and binding.get("registry_verified") is True
+        and binding.get("exact_scope_verified") is True
+        and binding.get("scope_actions_files_verified") is True
+        and binding.get("historical_event_rewritten") is False
+        and str(canonical.get("route_token_ref") or "").strip()
+        == str(marker.get("route_token_ref") or "").strip()
+    )
+
+
 def _runtime_context_failed_qa_context_local_setup_next_action(
     canonical_next_action: Mapping[str, Any],
     *,
@@ -25232,7 +25262,7 @@ def _runtime_context_failed_qa_context_local_setup_next_action(
         and str(item.get("revision_event_ref") or "").strip().startswith(
             "timeline:"
         )
-        and item.get("route_identity_rebound") is False
+        and _runtime_context_failed_qa_marker_route_authorized(item)
         and item.get("evidence_backfill") is False
     ]
     if len(markers) != 1:
@@ -37179,6 +37209,7 @@ def _runtime_context_worker_recovery_details(
                 conn,
                 project_id=project_id,
                 context=context,
+                route_identity_override=expected_route_identity,
             )
         )
         diagnostics["session_token_rejoin_eligibility"] = dict(
@@ -37212,6 +37243,16 @@ def _runtime_context_worker_recovery_details(
                     and not bool(session_token or session_token_ref)
                 )
             )
+        )
+        auth_authorization_invalid = bool(
+            context is not None
+            and (
+                auth_material_missing
+                or lease_view.get("authorization_valid") is not True
+            )
+        )
+        diagnostics["session_token"]["authorization_invalid"] = (
+            auth_authorization_invalid
         )
         session_token_initial_join_submission: dict[str, Any] = {}
         session_token_rejoin_submission: dict[str, Any] = {}
@@ -37284,8 +37325,14 @@ def _runtime_context_worker_recovery_details(
             )
             is True
         )
-        if auth_material_missing:
-            diagnostics["reason"] = "worker_auth_material_missing"
+        if auth_authorization_invalid:
+            diagnostics["reason"] = (
+                "worker_auth_material_missing"
+                if auth_material_missing
+                else "runtime_session_token_expired"
+                if lease_view.get("expired") is True
+                else "worker_auth_authorization_invalid"
+            )
             if safe_ref_prestartup_reissue:
                 next_legal_action = "reissue_runtime_session_token"
                 recovery_action_id = (
@@ -39799,13 +39846,6 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
         resolved_ref = str(
             renewal_resolution.get("resolved_route_token_ref") or ""
         ).strip()
-        expected_scope = {
-            "project_id": project_id,
-            "backlog_id": str(
-                getattr(context, "backlog_id", "") or ""
-            ).strip(),
-            "task_id": str(getattr(context, "task_id", "") or "").strip(),
-        }
         resolution_scope = dict(renewal_resolution.get("scope") or {})
         if (
             not resolved_ref
@@ -39813,10 +39853,10 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
             or route_token_ref not in {expected_ref, resolved_ref}
             or renewal_resolution.get("registry_verified") is not True
             or renewal_resolution.get("exact_scope_verified") is not True
-            or any(
-                str(resolution_scope.get(field) or "").strip() != value
-                for field, value in expected_scope.items()
-            )
+            or str(resolution_scope.get("project_id") or "").strip()
+            != project_id
+            or not str(resolution_scope.get("backlog_id") or "").strip()
+            or not str(resolution_scope.get("task_id") or "").strip()
         ):
             raise GovernanceError(
                 "runtime_context_pre_lineage_rejoin_route_descendant_unproven",
@@ -39856,7 +39896,10 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
                     "registry_verified": True,
                     "raw_route_token_exposed": False,
                 },
-                "resolved_route_scope": expected_scope,
+                "resolved_route_scope": {
+                    field: str(resolution_scope.get(field) or "").strip()
+                    for field in ("project_id", "backlog_id", "task_id")
+                },
                 "_runtime_context_pre_lineage_route_successor_resolved": True,
             }
         )
@@ -47035,6 +47078,42 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             if isinstance(payload.get("route_identity"), Mapping)
             else {}
         )
+        pre_lineage_rejoin_authority = (
+            payload.get("pre_lineage_rejoin_authority")
+            if isinstance(
+                payload.get("pre_lineage_rejoin_authority"), Mapping
+            )
+            else {}
+        )
+        current_reissue_route_binding = (
+            pre_lineage_rejoin_authority.get(
+                "current_reissue_route_binding"
+            )
+            if isinstance(
+                pre_lineage_rejoin_authority.get(
+                    "current_reissue_route_binding"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        if (
+            not current_reissue_route_binding
+            and payload.get("route_identity_rebound") is True
+            and isinstance(payload.get("previous_route_identity"), Mapping)
+        ):
+            current_reissue_route_binding = (
+                _runtime_context_current_reissue_route_binding(
+                    conn,
+                    project_id=str(
+                        getattr(context, "project_id", "") or ""
+                    ).strip(),
+                    historical_route_identity=payload[
+                        "previous_route_identity"
+                    ],
+                    canonical_route_identity=route_identity,
+                )
+            )
         route_token_ref = str(route_identity.get("route_token_ref") or "").strip()
         contract_runtime_worker_sequence = (
             payload.get("contract_runtime_worker_sequence")
@@ -47116,6 +47195,9 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             "retry_round": expected_retry_round,
             "route_token_ref": route_token_ref,
             "route_identity_rebound": bool(payload.get("route_identity_rebound")),
+            "current_reissue_route_binding": dict(
+                current_reissue_route_binding
+            ),
             "evidence_backfill": False,
             "successor_dispatch_revision_authority": dict(
                 successor_dispatch_authority
@@ -51674,6 +51756,162 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
     return authority
 
 
+def _runtime_context_current_reissue_route_binding(
+    conn,
+    *,
+    project_id: str,
+    historical_route_identity: Mapping[str, Any],
+    canonical_route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove an immutable reissue route still reaches the current route.
+
+    Reissue timeline evidence is append-only and therefore keeps the route
+    identity that was current when the envelope was issued.  A later exact
+    same-scope route renewal must not rewrite that event.  Instead, resolve
+    the historical opaque ref through the server registry and accept only one
+    active descendant whose full public identity is the current canonical
+    identity.  The registry resolver also proves unchanged scope, caller
+    role, actions, target files, and owned files at every hop.
+    """
+
+    historical = {
+        field: str(historical_route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    canonical = {
+        field: str(canonical_route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    binding: dict[str, Any] = {
+        "schema_version": (
+            "runtime_context.current_reissue_route_binding.v1"
+        ),
+        "valid": False,
+        "status": "blocked",
+        "binding_source": "",
+        "historical_route_identity": historical,
+        "canonical_route_identity": canonical,
+        "historical_event_rewritten": False,
+        "registry_verified": False,
+        "exact_scope_verified": False,
+        "scope_actions_files_verified": False,
+        "writes_performed": False,
+        "error_code": "",
+    }
+    if not all(historical.values()) or not all(canonical.values()):
+        binding["error_code"] = "route_identity_missing"
+        return binding
+    if historical == canonical:
+        binding.update(
+            {
+                "valid": True,
+                "status": "exact_current_route",
+                "binding_source": "immutable_event_exact_current_route",
+            }
+        )
+        return binding
+
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref_renewal_descendant(
+            conn,
+            project_id=project_id,
+            route_token_ref=historical["route_token_ref"],
+        )
+    except (
+        observer_route_context.RouteTokenRefError,
+        sqlite3.Error,
+        ValueError,
+    ) as exc:
+        binding.update(
+            {
+                "status": "renewal_lineage_rejected",
+                "error_code": str(
+                    getattr(exc, "code", "")
+                    or type(exc).__name__
+                ),
+            }
+        )
+        return binding
+    if not isinstance(resolved, Mapping):
+        binding.update(
+            {
+                "status": "renewal_lineage_missing",
+                "error_code": "route_token_ref_renewal_descendant_missing",
+            }
+        )
+        return binding
+
+    resolved_identity_source = _parallel_branch_runtime_contract_route_identity(
+        resolved
+    )
+    resolved_identity = {
+        field: str(resolved_identity_source.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    renewal = (
+        dict(resolved.get("renewal_resolution") or {})
+        if isinstance(resolved.get("renewal_resolution"), Mapping)
+        else {}
+    )
+    requested_identity = (
+        dict(renewal.get("requested_route_identity") or {})
+        if isinstance(renewal.get("requested_route_identity"), Mapping)
+        else {}
+    )
+    renewed_identity = (
+        dict(renewal.get("resolved_route_identity") or {})
+        if isinstance(renewal.get("resolved_route_identity"), Mapping)
+        else {}
+    )
+    requested_identity = {
+        field: str(requested_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    renewed_identity = {
+        field: str(renewed_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    valid = bool(
+        resolved.get("resolved_from_ref") is True
+        and str(resolved.get("status") or "").strip() == "active"
+        and str(renewal.get("status") or "").strip()
+        == "resolved_active_descendant"
+        and renewal.get("registry_verified") is True
+        and renewal.get("exact_scope_verified") is True
+        and requested_identity == historical
+        and renewed_identity == canonical
+        and resolved_identity == canonical
+    )
+    binding.update(
+        {
+            "valid": valid,
+            "status": (
+                "resolved_active_descendant"
+                if valid
+                else "renewal_lineage_identity_mismatch"
+            ),
+            "binding_source": (
+                "server_registered_exact_same_scope_renewal_descendant"
+                if valid
+                else ""
+            ),
+            "registry_verified": renewal.get("registry_verified") is True,
+            "exact_scope_verified": renewal.get("exact_scope_verified") is True,
+            "scope_actions_files_verified": valid,
+            "route_token_ref_chain": list(
+                renewal.get("route_token_ref_chain") or []
+            ),
+            "resolved_route_identity": resolved_identity,
+            "error_code": (
+                "" if valid else "route_token_ref_renewal_binding_mismatch"
+            ),
+        }
+    )
+    return binding
+
+
 def _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
     conn,
     *,
@@ -51974,6 +52212,20 @@ def _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
     max_loss_replacements = int(
         loss_authority.get("max_loss_replacements") or 0
     )
+    current_reissue_route_binding = (
+        _runtime_context_current_reissue_route_binding(
+            conn,
+            project_id=project_id,
+            historical_route_identity=(
+                current_reissue_payload.get("route_identity")
+                if isinstance(
+                    current_reissue_payload.get("route_identity"), Mapping
+                )
+                else {}
+            ),
+            canonical_route_identity=canonical_route_identity,
+        )
+    )
     if (
         len(current_ref_reissues) != 1
         or not accepted_reissues
@@ -51983,8 +52235,7 @@ def _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
         != str(contract_execution_id or "").strip()
         or str(current_reissue_payload.get("fence_token_hash") or "").strip()
         != fence_token_hash
-        or dict(current_reissue_payload.get("route_identity") or {})
-        != canonical_route_identity
+        or current_reissue_route_binding.get("valid") is not True
         or str(current_reissue_authority.get("initial_join_event_ref") or "").strip()
         != initial_join_event_ref
         or str(current_reissue_source.get("event_ref") or "").strip()
@@ -52036,6 +52287,9 @@ def _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
             "canonical_identity_binding_valid": bool(marker),
             "canonical_identity_cutover_valid": bool(marker),
             "route_identity": canonical_route_identity,
+            "current_reissue_route_binding": (
+                current_reissue_route_binding
+            ),
             "lease": {
                 "lease_id": str(lease.get("lease_id") or ""),
                 "lease_expires_at": str(lease.get("lease_expires_at") or ""),
@@ -52097,11 +52351,15 @@ def _runtime_context_pre_lineage_guidance_authority(
         ).get("contract_execution_id")
         or ""
     ).strip()
+    latest_route_identity = _runtime_context_latest_route_identity(
+        conn,
+        context,
+    )
     route_identity = (
         dict(route_identity_override)
         if isinstance(route_identity_override, Mapping)
         and route_identity_override
-        else _runtime_context_latest_route_identity(conn, context)
+        else latest_route_identity
     )
     worker_id = str(getattr(context, "worker_id", "") or "").strip()
     actual_host_worker_id = str(
@@ -52148,15 +52406,22 @@ def _runtime_context_pre_lineage_guidance_authority(
     )
     if verifier_backed_authority.get("applicable") is True:
         return verifier_backed_authority, resolution
+    bootstrap_body = dict(body)
+    bootstrap_body.update(
+        {
+            field: str(latest_route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+    )
     return (
         _runtime_context_pre_lineage_bootstrap_rejoin_authority(
             conn,
             project_id=project_id,
             context=context,
             runtime_context_id=runtime_context_id,
-            body=body,
+            body=bootstrap_body,
             contract_execution_id=contract_execution_id,
-            route_identity=route_identity,
+            route_identity=latest_route_identity,
             timeline_events=timeline_events,
             effective_read_receipt_ref=effective_read_receipt_ref,
             effective_startup_ref=effective_startup_ref,
@@ -54602,21 +54867,45 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         pre_lineage_bounded_replacement_authority: dict[str, Any] = {}
         verifier_backed_pre_lineage_authority_applicable = False
         if missing_lineage:
-            pre_lineage_bootstrap_rejoin_authority = (
-                _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
-                    conn,
-                    project_id=project_id,
-                    context=context,
-                    runtime_context_id=runtime_context_id,
-                    body=pre_lineage_authority_body,
-                    contract_execution_id=resolved_contract_execution_id,
-                    route_identity=pre_lineage_authority_route_identity,
-                    timeline_events=timeline_events,
-                    effective_read_receipt_ref=effective_read_receipt_ref,
-                    effective_startup_ref=effective_startup_ref,
-                    now_iso=authoritative_now_iso,
+            renewed_verifier_authority: dict[str, Any] = {}
+            if rejoin_route_lineage_payload.get(
+                "_runtime_context_pre_lineage_route_successor_resolved"
+            ) is True:
+                renewed_verifier_authority = (
+                    _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
+                        conn,
+                        project_id=project_id,
+                        context=context,
+                        runtime_context_id=runtime_context_id,
+                        body=body,
+                        contract_execution_id=resolved_contract_execution_id,
+                        route_identity=selected_route_identity,
+                        timeline_events=timeline_events,
+                        effective_read_receipt_ref=effective_read_receipt_ref,
+                        effective_startup_ref=effective_startup_ref,
+                        now_iso=authoritative_now_iso,
+                    )
                 )
-            )
+            if renewed_verifier_authority.get("applicable") is True:
+                pre_lineage_bootstrap_rejoin_authority = dict(
+                    renewed_verifier_authority
+                )
+            else:
+                pre_lineage_bootstrap_rejoin_authority = (
+                    _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
+                        conn,
+                        project_id=project_id,
+                        context=context,
+                        runtime_context_id=runtime_context_id,
+                        body=pre_lineage_authority_body,
+                        contract_execution_id=resolved_contract_execution_id,
+                        route_identity=pre_lineage_authority_route_identity,
+                        timeline_events=timeline_events,
+                        effective_read_receipt_ref=effective_read_receipt_ref,
+                        effective_startup_ref=effective_startup_ref,
+                        now_iso=authoritative_now_iso,
+                    )
+                )
             verifier_backed_pre_lineage_authority_applicable = bool(
                 pre_lineage_bootstrap_rejoin_authority.get("applicable") is True
             )
@@ -61644,7 +61933,7 @@ def _runtime_context_context_local_setup_authority(
         )
         and str(marker.get("dispatch_source_ref") or "").strip()
         == str(dispatch_identity.get("source_ref") or "").strip()
-        and marker.get("route_identity_rebound") is False
+        and _runtime_context_failed_qa_marker_route_authorized(marker)
         and marker.get("evidence_backfill") is False
     )
     if not isinstance(command, Mapping) and not source_backed_join_marker:
@@ -62698,6 +62987,7 @@ def _runtime_context_submit_canonical_contract_line(
                     "retry_round",
                     "route_token_ref",
                     "route_identity_rebound",
+                    "current_reissue_route_binding",
                     "evidence_backfill",
                 }
             }
@@ -101291,6 +101581,7 @@ def _contract_runtime_mf_parallel_context_projection(
                     "retry_round",
                     "route_token_ref",
                     "route_identity_rebound",
+                    "current_reissue_route_binding",
                     "evidence_backfill",
                 }
             },

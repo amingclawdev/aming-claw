@@ -9483,6 +9483,7 @@ def _persist_parallel_allocate_route_ref(
     prompt_contract_hash: str,
     visible_injection_manifest_hash: str,
     route_token_ref: str,
+    target_files: list[str] | None = None,
 ) -> None:
     observer_route_context.persist_route_token_ref(
         conn,
@@ -9507,6 +9508,8 @@ def _persist_parallel_allocate_route_ref(
             },
             "expires_at": "2999-01-01T00:00:00Z",
             "evidence_refs": ["test:parallel-branch-allocate-route-ref"],
+            "target_files": list(target_files or []),
+            "owned_files": list(target_files or []),
         },
     )
 
@@ -41713,6 +41716,7 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         conn,
         backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
         contract_execution_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+        target_files=["batch-child-1.txt"],
         **route_identity,
     )
     conn.commit()
@@ -42617,6 +42621,65 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert rescue_marker["max_legacy_rescues"] == 1
     assert rescue_marker["general_loss_replacement_limit_raised"] is False
     managed_before_legacy_rescue = managed
+    historical_route_identity = copy.deepcopy(route_identity)
+    events_before_route_renewal = (
+        server._runtime_context_service_timeline_events(
+            conn,
+            project_id=PID,
+            task_id=fresh_task_id,
+            backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        )
+    )
+    historical_current_reissue = next(
+        event
+        for event in reversed(events_before_route_renewal)
+        if (event.get("payload") or {}).get("action")
+        == "runtime_context_session_token_reissue"
+        and (event.get("payload") or {}).get("session_token_ref")
+        == legacy_rescue["session_token_ref"]
+    )
+    historical_current_reissue = copy.deepcopy(historical_current_reissue)
+    renewed_route = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=historical_route_identity["route_token_ref"],
+        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 17, 6, 30, tzinfo=timezone.utc),
+    )
+    route_identity = copy.deepcopy(renewed_route["route_identity"])
+    assert route_identity != historical_route_identity
+    renewed_resolution = (
+        observer_route_context.resolve_route_token_ref_renewal_descendant(
+            conn,
+            project_id=PID,
+            route_token_ref=historical_route_identity["route_token_ref"],
+            now=datetime(2099, 8, 17, 6, 31, tzinfo=timezone.utc),
+        )
+    )
+    assert renewed_resolution is not None
+    assert {
+        field: renewed_resolution[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == route_identity
+    assert next(
+        event
+        for event in server._runtime_context_service_timeline_events(
+            conn,
+            project_id=PID,
+            task_id=fresh_task_id,
+            backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        )
+        if event.get("id") == historical_current_reissue["id"]
+    ) == historical_current_reissue
+    assert historical_current_reissue["payload"]["route_identity"] == (
+        historical_route_identity
+    )
     # The exact R2 rescue response was accepted, but its process-local
     # envelope was lost before the host could stage it.  Once that final
     # reissue lease expires, Guide must not fall back to initial_join (the
@@ -42672,6 +42735,19 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     )
     assert verifier_authority["loss_replacement_generation"] == 3
     assert verifier_authority["max_loss_replacements"] == 2
+    reissue_route_binding = verifier_authority[
+        "current_reissue_route_binding"
+    ]
+    assert reissue_route_binding["valid"] is True
+    assert reissue_route_binding["status"] == "resolved_active_descendant"
+    assert reissue_route_binding["registry_verified"] is True
+    assert reissue_route_binding["exact_scope_verified"] is True
+    assert reissue_route_binding["scope_actions_files_verified"] is True
+    assert reissue_route_binding["historical_event_rewritten"] is False
+    assert reissue_route_binding["historical_route_identity"] == (
+        historical_route_identity
+    )
+    assert reissue_route_binding["canonical_route_identity"] == route_identity
     assert "session_token_initial_join_submission" not in (
         rejoin_details["actionable_payloads"]
     )
@@ -42773,6 +42849,16 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert managed["pre_lineage_rejoin_authority"][
         "authorization_mode"
     ] == "verifier_backed_exhausted_reissue_successor_dispatch"
+    assert next(
+        event
+        for event in server._runtime_context_service_timeline_events(
+            conn,
+            project_id=PID,
+            task_id=fresh_task_id,
+            backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        )
+        if event.get("id") == historical_current_reissue["id"]
+    ) == historical_current_reissue
     after_rejoin = get_branch_context(conn, PID, fresh_task_id)
     assert after_rejoin is not None
     assert after_rejoin.last_recovery_action == (
@@ -42781,6 +42867,28 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert runtime_context_session_token_ref(after_rejoin) == (
         managed["session_token_ref"]
     )
+    marker_after_renewed_rejoin = (
+        server._runtime_context_failed_qa_revision_rejoin_marker(
+            conn=conn,
+            context=after_rejoin,
+            runtime_context_id=after_rejoin.runtime_context_id,
+            timeline_events=server._runtime_context_service_timeline_events(
+                conn,
+                project_id=PID,
+                task_id=fresh_task_id,
+                backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+            ),
+        )
+    )
+    assert marker_after_renewed_rejoin["route_identity_rebound"] is True
+    marker_route_binding = marker_after_renewed_rejoin[
+        "current_reissue_route_binding"
+    ]
+    assert marker_route_binding["valid"] is True
+    assert marker_route_binding["registry_verified"] is True
+    assert marker_route_binding["exact_scope_verified"] is True
+    assert marker_route_binding["scope_actions_files_verified"] is True
+    assert marker_route_binding["historical_event_rewritten"] is False
     before_replay = "\n".join(conn.iterdump())
     replay_body = copy.deepcopy(rejoin_body)
     replay_body["session_token_ref"] = managed["session_token_ref"]
@@ -42919,20 +43027,22 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     )
     prepare_action = prepare_guide["canonical_executable_action"]
     assert prepare_action["mcp_tool"] == "observer_runtime_text_prepare"
+    prepare_body = copy.deepcopy(prepare_action["copy_safe_body"])
+    prepare_body["now_iso"] = "2099-08-17T07:01:00Z"
     context_local_prepare_authority = (
         server._observer_runtime_text_failed_qa_context_local_prepare_authority(
             conn,
             project_id=PID,
-            body=prepare_action["copy_safe_body"],
+            body=prepare_body,
         )
     )
-    assert context_local_prepare_authority, context_local_prepare_authority
+    assert context_local_prepare_authority
     prepared = server.handle_observer_runtime_text_prepare(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
             method="POST",
-            body=copy.deepcopy(prepare_action["copy_safe_body"]),
+            body=prepare_body,
         )
     )
     assert re.fullmatch(r"sha256:[0-9a-f]{64}", prepared["launch_text_hash"])
@@ -42941,6 +43051,15 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert prepared["failed_qa_context_local_prepare_authority"][
         "new_dispatch_issued"
     ] is False
+    prepared_revision = (
+        server._runtime_context_latest_contract_revision_payload(
+            conn,
+            get_branch_context(conn, PID, fresh_task_id),
+        )
+    )
+    assert server._runtime_context_source_backed_launch_text_hash(
+        prepared_revision
+    ) == prepared["launch_text_hash"]
 
     guide_before_receipt = replacement_worker_guide()
     receipt_next = guide_before_receipt[
@@ -68841,6 +68960,8 @@ def test_runtime_context_worker_guide_registry_backed_missing_ref_is_not_legacy(
     ("lineage_fault", "expected_error_code"),
     [
         ("wrong_scope", "route_token_ref_renewal_scope_mismatch"),
+        ("wrong_actions", "route_token_ref_renewal_allowed_actions_mismatch"),
+        ("wrong_files", "route_token_ref_renewal_target_files_mismatch"),
         ("ambiguous", "route_token_ref_renewal_descendant_ambiguous"),
     ],
 )
@@ -68887,6 +69008,23 @@ def test_runtime_context_pre_lineage_rejoin_rejects_unproven_renewal_descendant_
                 PID,
                 renewed["route_token_ref"],
             ),
+        )
+        conn.commit()
+    elif lineage_fault in {"wrong_actions", "wrong_files"}:
+        column = (
+            "allowed_actions_json"
+            if lineage_fault == "wrong_actions"
+            else "target_files_json"
+        )
+        value = (
+            ["wrong_action"]
+            if lineage_fault == "wrong_actions"
+            else ["wrong-renewal.py"]
+        )
+        conn.execute(
+            f"UPDATE observer_route_token_refs SET {column}=? "
+            "WHERE project_id=? AND route_token_ref=?",
+            (json.dumps(value), PID, renewed["route_token_ref"]),
         )
         conn.commit()
     else:
