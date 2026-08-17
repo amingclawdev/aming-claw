@@ -2056,6 +2056,83 @@ def test_runtime_context_worker_guide_adapter_schemas_preserve_safe_route_identi
         assert expected.issubset(properties)
         assert "route_token" not in properties
         assert "session_token_ref" in properties
+        assert {"compact", "all", "full"}.issubset(
+            properties["view"]["enum"]
+        )
+
+
+def test_worker_guide_managed_adapters_default_compact_and_preserve_explicit_view(
+    monkeypatch,
+):
+    args = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-compact-default",
+        "__aming_managed_host_envelope_continuity_bypass": True,
+    }
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+
+    assert dispatcher.dispatch("runtime_context_worker_guide", args)["ok"] is True
+    default_query = __import__(
+        "urllib.parse", fromlist=["parse_qs", "urlparse"]
+    ).parse_qs(
+        __import__("urllib.parse", fromlist=["urlparse"]).urlparse(
+            recorder.calls[-1][1]
+        ).query
+    )
+    assert default_query["view"] == ["compact"]
+
+    dispatcher.dispatch(
+        "runtime_context_worker_guide",
+        {**args, "view": "all"},
+    )
+    explicit_query = __import__(
+        "urllib.parse", fromlist=["parse_qs", "urlparse"]
+    ).parse_qs(
+        __import__("urllib.parse", fromlist=["urlparse"]).urlparse(
+            recorder.calls[-1][1]
+        ).query
+    )
+    assert explicit_query["view"] == ["all"]
+
+    mirror_calls = []
+
+    def fake_http(method, path, data=None, **_kwargs):
+        mirror_calls.append((method, path, data))
+        return {"ok": True, "response_view": "compact"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    mirrored = governance_mcp_server._dispatch_tool(
+        "runtime_context_worker_guide",
+        dict(args),
+    )
+    assert mirrored["ok"] is True
+    mirror_query = __import__(
+        "urllib.parse", fromlist=["parse_qs", "urlparse"]
+    ).parse_qs(
+        __import__("urllib.parse", fromlist=["urlparse"]).urlparse(
+            mirror_calls[-1][1]
+        ).query
+    )
+    assert mirror_query["view"] == ["compact"]
+
+
+def test_worker_guide_managed_adapter_size_guard_fails_closed_with_parity():
+    oversized = {
+        "ok": True,
+        "response_view": "compact",
+        "required_semantics": "x"
+        * (mcp_tools._WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES + 1),
+    }
+    primary = mcp_tools._bounded_worker_guide_result(oversized)
+    mirror = governance_mcp_server._bounded_worker_guide_result(oversized)
+
+    assert primary == mirror
+    assert primary["ok"] is False
+    assert primary["error"] == "runtime_context_worker_guide_response_too_large"
+    assert primary["semantic_truncation_performed"] is False
+    assert primary["writes_performed"] is False
+    assert primary["serialized_bytes"] > primary["max_serialized_bytes"]
 
 
 def test_mcp_observer_command_list_advertises_consumer_recovery_diagnostics():

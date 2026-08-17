@@ -164095,3 +164095,208 @@ def test_finish_attestation_executable_action_requires_concrete_identity(body):
     )
 
     assert "attestation" not in coverage["actions"]
+
+
+def _representative_oversized_worker_guide() -> dict[str, Any]:
+    route_identity = {
+        "route_id": "route-compact-guide",
+        "route_context_hash": "sha256:" + ("a" * 64),
+        "prompt_contract_id": "rprompt-compact-guide",
+        "prompt_contract_hash": "sha256:" + ("b" * 64),
+        "route_token_ref": "rtok-compact-guide",
+        "visible_injection_manifest_hash": "sha256:" + ("c" * 64),
+    }
+    reissue_body = {
+        "project_id": PID,
+        "runtime_context_id": "mfrctx-compact-guide",
+        "task_id": "worker-compact-guide",
+        "parent_task_id": "cex-compact-guide",
+        "session_token_ref": "wstok-compact-guide",
+        "target_project_root": "/tmp/compact-guide",
+        **route_identity,
+    }
+    rejoin = {
+        "schema_version": "runtime_context.session_token_rejoin_submission.v1",
+        "eligibility": {
+            "eligible": True,
+            "session_token_reissue_submission": {
+                "copy_safe_body": copy.deepcopy(reissue_body),
+            },
+        },
+    }
+    receipt_action = {
+        "mcp_tool": "runtime_context_read_receipt",
+        "copy_safe_body": {
+            **reissue_body,
+            "read_receipt_hash": "sha256:" + ("d" * 64),
+        },
+    }
+    duplicate = "x" * 700_000
+    actionable = {
+        "schema_version": "runtime_context.worker_recovery_payloads.v1",
+        "project_id": PID,
+        "runtime_context_id": "mfrctx-compact-guide",
+        "task_id": "worker-compact-guide",
+        "parent_task_id": "cex-compact-guide",
+        "route_identity": route_identity,
+        "session_token_ref": "wstok-compact-guide",
+        "session_token_rejoin_submission": rejoin,
+        "read_receipt_facade_payload_skeleton": receipt_action,
+        "merge_gate_evidence_payloads": {"omitted_duplicate": duplicate},
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    return {
+        "ok": True,
+        "schema_version": "runtime_context.worker_guide_response.v1",
+        "project_id": PID,
+        "governance_project_id": PID,
+        "target_project_id": PID,
+        "runtime_context_id": "mfrctx-compact-guide",
+        "task_id": "worker-compact-guide",
+        "parent_task_id": "cex-compact-guide",
+        "contract_execution_id": "cex-compact-guide",
+        "target_project_root": "/tmp/compact-guide",
+        "project_root": "/tmp/compact-guide",
+        "repo_root": "/tmp/compact-guide",
+        "worktree_path": "/tmp/compact-guide",
+        "owned_files": ["src/app.py"],
+        "target_files": ["src/app.py"],
+        "session_token_ref": "wstok-compact-guide",
+        "session_token_ref_present": True,
+        "next_legal_action": "submit_mf_subagent_read_receipt",
+        "next_required_evidence": ["read_receipt"],
+        "missing_evidence": ["read_receipt"],
+        "blocking_reasons": [],
+        "contract_runtime_next_legal_action": {
+            "action": "record_mf_subagent_read_receipt",
+            "stage_id": "worker_read",
+            "line_id": "worker_read_runtime_guide",
+        },
+        "contract_runtime_current_state": {
+            "schema_version": "contract_runtime.current_state.v1",
+            "contract_execution_id": "cex-compact-guide",
+            "runtime_context_id": "mfrctx-compact-guide",
+            "task_id": "worker-compact-guide",
+            "execution_state_revision": 7,
+            "next_legal_action": {
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+            },
+            "duplicated_runtime_guide": duplicate,
+        },
+        "canonical_executable_actions": {"receipt": receipt_action},
+        "actionable_payloads": actionable,
+        "worker_guide": {
+            "route_identity": route_identity,
+            "graph_query_identity": {
+                "runtime_context_id": "mfrctx-compact-guide",
+                "task_id": "worker-compact-guide",
+                "parent_task_id": "cex-compact-guide",
+                "target_project_root": "/tmp/compact-guide",
+                "payload_shape": {"tool": "function_index"},
+            },
+            "session_token_lease": {"status": "expired"},
+            "worker_execution_safety": {"writes_require_fence": True},
+            "recursive_duplicate": duplicate,
+        },
+        "executable_contract": {"recursive_duplicate": duplicate},
+        "guide_to_facade_coverage": {"recursive_duplicate": duplicate},
+        "source_refs": {"branch_runtime": "runtime:compact-guide"},
+        "privacy_boundary": {"raw_session_token_exposed": False},
+    }
+
+
+def test_worker_guide_compact_projection_is_bounded_and_semantically_complete():
+    full = _representative_oversized_worker_guide()
+    assert server._runtime_context_worker_guide_serialized_bytes(full) > 1_900_000
+
+    compact = server._runtime_context_worker_guide_compact_response(full)
+
+    assert compact["response_view"] == "compact"
+    assert compact["serialized_bytes"] <= compact["max_serialized_bytes"]
+    assert compact["serialized_bytes"] == (
+        server._runtime_context_worker_guide_serialized_bytes(compact)
+    )
+    assert compact["runtime_context_id"] == "mfrctx-compact-guide"
+    assert compact["task_id"] == "worker-compact-guide"
+    assert compact["parent_task_id"] == "cex-compact-guide"
+    assert compact["route_identity"]["route_token_ref"] == "rtok-compact-guide"
+    assert compact["next_legal_action"] == "submit_mf_subagent_read_receipt"
+    assert compact["canonical_executable_action"]["copy_safe_body"][
+        "read_receipt_hash"
+    ].startswith("sha256:")
+    projected_reissue = compact["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]["eligibility"]["session_token_reissue_submission"]["copy_safe_body"]
+    expected_reissue = full["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]["eligibility"]["session_token_reissue_submission"]["copy_safe_body"]
+    assert projected_reissue == expected_reissue
+    assert "worker_guide" not in compact
+    assert "executable_contract" not in compact
+    assert "guide_to_facade_coverage" not in compact
+    assert "merge_gate_evidence_payloads" not in compact["actionable_payloads"]
+
+
+def test_worker_guide_compact_projection_fails_closed_instead_of_truncating():
+    full = _representative_oversized_worker_guide()
+    full["actionable_payloads"]["session_token_rejoin_submission"][
+        "eligibility"
+    ]["session_token_reissue_submission"]["copy_safe_body"]["required_semantics"] = (
+        "y" * server._RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+    )
+
+    with pytest.raises(GovernanceError) as exc_info:
+        server._runtime_context_worker_guide_compact_response(full)
+
+    assert exc_info.value.code == (
+        "runtime_context_worker_guide_compact_response_too_large"
+    )
+    assert exc_info.value.details["semantic_truncation_performed"] is False
+    assert exc_info.value.details["writes_performed"] is False
+
+
+def test_worker_guide_handler_honors_compact_view_without_forcing_all(monkeypatch):
+    full = _representative_oversized_worker_guide()
+    captured = {}
+
+    def current_state(ctx):
+        captured["view"] = ctx.query.get("view")
+        return {"state": "fixture"}
+
+    monkeypatch.setattr(
+        server,
+        "handle_graph_governance_parallel_branch_runtime_context_current_state",
+        current_state,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_guide_response",
+        lambda _state: copy.deepcopy(full),
+    )
+
+    compact = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx(
+            {
+                "project_id": PID,
+                "runtime_context_id": "mfrctx-compact-guide",
+            },
+            query={"view": "compact"},
+        )
+    )
+    assert captured["view"] == "worker_view"
+    assert compact["response_view"] == "compact"
+
+    full_result = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx(
+            {
+                "project_id": PID,
+                "runtime_context_id": "mfrctx-compact-guide",
+            }
+        )
+    )
+    assert captured["view"] == "all"
+    assert full_result["response_view"] == "all"
+    assert "worker_guide" in full_result

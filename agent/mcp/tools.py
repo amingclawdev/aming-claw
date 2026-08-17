@@ -43,6 +43,7 @@ _CONTRACT_RUNTIME_MCP_TIMEOUT_LEGACY_SECONDS = 15
 _CONTRACT_RUNTIME_MCP_TIMEOUT_ENV_KEYS = (
     "AMING_CONTRACT_RUNTIME_MCP_TIMEOUT_SECONDS",
 )
+_WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES = 256 * 1024
 _WORKER_AUTH_ENV_FIELDS = {
     "session_token": "AMING_WORKER_SESSION_TOKEN",
     "fence_token": "AMING_WORKER_FENCE_TOKEN",
@@ -54,6 +55,44 @@ WORKER_MCP_HOST_ONLY_TOOLS = frozenset(
         "runtime_context_session_token_rejoin",
     }
 )
+
+
+def _bounded_worker_guide_result(value: Any) -> Any:
+    """Fail closed before an oversized Worker Guide reaches stdio/Desktop."""
+
+    if not isinstance(value, dict):
+        return value
+    try:
+        serialized_bytes = len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "runtime_context_worker_guide_response_not_serializable",
+            "message": str(exc),
+            "writes_performed": False,
+            "semantic_truncation_performed": False,
+        }
+    if serialized_bytes <= _WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES:
+        return value
+    return {
+        "ok": False,
+        "error": "runtime_context_worker_guide_response_too_large",
+        "message": "Worker Guide exceeded the managed MCP response limit.",
+        "response_view": str(value.get("response_view") or ""),
+        "serialized_bytes": serialized_bytes,
+        "max_serialized_bytes": _WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES,
+        "writes_performed": False,
+        "semantic_truncation_performed": False,
+        "retry_with_view_all_allowed_for_managed_transport": False,
+    }
 
 _ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES = [
     "",
@@ -552,8 +591,8 @@ def _runtime_context_schema_properties() -> dict[str, Any]:
         "visible_injection_manifest_hash": {"type": "string"},
         "view": {
             "type": "string",
-            "enum": ["auto", "current", "gate_inputs", "worker_view", "close_gate_view", "all"],
-            "description": "Observer view selector. mf_sub callers always receive worker_view.",
+            "enum": ["auto", "compact", "current", "gate_inputs", "worker_view", "close_gate_view", "all", "full"],
+            "description": "Worker Guide response selector. Managed MCP defaults worker-guide to compact; all/full are explicit diagnostic views.",
         },
         "graph_trace_id": {
             "type": "string",
@@ -6232,13 +6271,21 @@ class ToolDispatcher:
         if name in {"runtime_context_current", "runtime_context_worker_guide"}:
             pid = args["project_id"]
             runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
-            query = _runtime_context_query(_worker_auth_from_env(args))
+            request_args = _worker_auth_from_env(args)
+            if name == "runtime_context_worker_guide":
+                request_args.setdefault("view", "compact")
+            query = _runtime_context_query(request_args)
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             suffix = "current-state" if name == "runtime_context_current" else "worker-guide"
-            return self._api(
+            result = self._api(
                 "GET",
                 f"/api/graph-governance/{pid}/runtime-contexts/"
                 f"{runtime_context_id}/{suffix}{qs}",
+            )
+            return (
+                _bounded_worker_guide_result(result)
+                if name == "runtime_context_worker_guide"
+                else result
             )
 
         if name in {
