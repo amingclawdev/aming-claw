@@ -42043,6 +42043,138 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     stored_before_receipt = copy.deepcopy(
         actual_runtime.store.get(_BATCH_QA_CHILD_EXECUTIONS[index])
     )
+
+    def replacement_worker_guide():
+        return (
+            server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": fresh_context.runtime_context_id,
+                    },
+                    "mf_sub",
+                    query={
+                        "task_id": fresh_task_id,
+                        "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                        "worker_id": fresh_worker_id,
+                        "worker_slot_id": fresh_worker_id,
+                        "fence_token": joined["fence_token"],
+                        "session_token": joined["session_token"],
+                        "session_token_ref": joined["session_token_ref"],
+                        "target_project_root": str(world.root),
+                    },
+                )
+            )
+        )
+
+    guide_before_receipt = replacement_worker_guide()
+    receipt_next = guide_before_receipt[
+        "contract_runtime_next_legal_action"
+    ]
+    assert guide_before_receipt["next_legal_action"] == (
+        "submit_mf_subagent_read_receipt"
+    )
+    assert guide_before_receipt[
+        "contract_runtime_next_action_took_precedence"
+    ] is True
+    assert receipt_next["line_id"] == "worker_read_runtime_guide"
+    assert receipt_next["runtime_context_id"] == fresh_context.runtime_context_id
+    assert receipt_next["task_id"] == fresh_task_id
+    assert receipt_next["parent_task_id"] == (
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    )
+    assert receipt_next["worker_id"] == fresh_worker_id
+    assert receipt_next["worker_slot_id"] == fresh_worker_id
+    assert receipt_next["dispatch_source_ref"] == revision["source_ref"]
+    assert receipt_next["source_of_authority"] == (
+        "server_verified_failed_qa_replacement_dispatch"
+    )
+    assert receipt_next[
+        "failed_qa_replacement_context_local_setup_projection"
+    ] is True
+    assert receipt_next["contract_runtime_mutated"] is False
+    assert receipt_next["global_contract_line_already_completed"] is True
+    assert receipt_next["submit_line_guidance"] == {
+        "schema_version": (
+            "contract_runtime.failed_qa_context_local_setup_guidance.v1"
+        ),
+        "generic_contract_runtime_submit_line_allowed": False,
+        "runtime_context_facade_required": True,
+        "runtime_context_facade": "runtime_context_read_receipt",
+        "contract_runtime_completed_lines_mutated": False,
+        "message": (
+            "Use the exact replacement RuntimeContext facade; this records "
+            "context-local worker evidence without reopening the globally "
+            "completed Contract line."
+        ),
+    }
+    assert "writer_role_safe_copy_payload" not in receipt_next
+    assert actual_runtime.store.get(
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    ) == stored_before_receipt
+
+    source_record_for_projection = actual_runtime.current_record(
+        _BATCH_QA_CHILD_EXECUTIONS[index],
+        actor_role="mf_sub",
+    )
+    projected_record, context_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=source_record_for_projection,
+            actor_role="mf_sub",
+        )
+    )
+    canonical_next_before_local_setup = server._runtime_next_action_from_guide(
+        projected_record["runtime_guide"],
+        source="contract_runtime_current_state",
+    )
+    assert server._runtime_context_failed_qa_context_local_setup_next_action(
+        canonical_next_before_local_setup,
+        record=projected_record,
+        projection=context_projection,
+        context=fresh_context,
+    )["action"] == "submit_mf_subagent_read_receipt"
+    exact_markers = list(
+        context_projection["failed_qa_revision_rejoin_contexts"]
+    )
+    wrong_dispatch_projection = copy.deepcopy(context_projection)
+    wrong_dispatch_projection["failed_qa_revision_rejoin_contexts"][0][
+        "dispatch_source_ref"
+    ] = "contract_runtime:cex-sibling:completed_lines:99"
+    for invalid_projection in (
+        {
+            **copy.deepcopy(context_projection),
+            "failed_qa_revision_rejoin_contexts": [],
+        },
+        {
+            **copy.deepcopy(context_projection),
+            "failed_qa_revision_rejoin_contexts": [
+                *copy.deepcopy(exact_markers),
+                *copy.deepcopy(exact_markers),
+            ],
+        },
+        wrong_dispatch_projection,
+    ):
+        assert (
+            server._runtime_context_failed_qa_context_local_setup_next_action(
+                canonical_next_before_local_setup,
+                record=projected_record,
+                projection=invalid_projection,
+                context=fresh_context,
+            )
+            == canonical_next_before_local_setup
+        )
+    assert (
+        server._runtime_context_failed_qa_context_local_setup_next_action(
+            canonical_next_before_local_setup,
+            record=projected_record,
+            projection=context_projection,
+            context=world.child_contexts[index],
+        )
+        == canonical_next_before_local_setup
+    )
+
     receipt_hash = _fake_sha(
         "batch-child-postmerge-failure-rework-2-read-receipt"
     )
@@ -42079,6 +42211,27 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert receipt["contract_runtime_canonical_line"][
         "contract_runtime_mutated"
     ] is False
+    assert actual_runtime.store.get(
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    ) == stored_before_receipt
+
+    guide_before_startup = replacement_worker_guide()
+    startup_next = guide_before_startup[
+        "contract_runtime_next_legal_action"
+    ]
+    assert guide_before_startup["next_legal_action"] == (
+        "record_mf_subagent_startup"
+    )
+    assert guide_before_startup[
+        "contract_runtime_next_action_took_precedence"
+    ] is True
+    assert startup_next["line_id"] == "worker_startup"
+    assert startup_next["runtime_context_id"] == fresh_context.runtime_context_id
+    assert startup_next["task_id"] == fresh_task_id
+    assert startup_next["dispatch_source_ref"] == revision["source_ref"]
+    assert startup_next["submit_line_guidance"][
+        "runtime_context_facade"
+    ] == "runtime_context_startup"
     assert actual_runtime.store.get(
         _BATCH_QA_CHILD_EXECUTIONS[index]
     ) == stored_before_receipt
@@ -42135,6 +42288,18 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert startup["contract_runtime_canonical_line"][
         "contract_runtime_mutated"
     ] is False
+    assert actual_runtime.store.get(
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    ) == stored_before_receipt
+
+    guide_after_startup = replacement_worker_guide()
+    assert guide_after_startup["next_legal_action"] not in {
+        "submit_mf_subagent_read_receipt",
+        "record_mf_subagent_startup",
+    }
+    assert guide_after_startup[
+        "contract_runtime_next_legal_action"
+    ].get("failed_qa_replacement_context_local_setup_projection") is not True
     assert actual_runtime.store.get(
         _BATCH_QA_CHILD_EXECUTIONS[index]
     ) == stored_before_receipt

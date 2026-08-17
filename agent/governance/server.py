@@ -25144,6 +25144,254 @@ def _runtime_context_contract_next_action_override_eligible(
     return True
 
 
+def _runtime_context_failed_qa_context_local_setup_next_action(
+    canonical_next_action: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any],
+    projection: Mapping[str, Any],
+    context: Any,
+) -> dict[str, Any]:
+    """Project the exact replacement worker's local read/startup action.
+
+    An mf_parallel Contract has one canonical worker-read/startup sequence.
+    Failed-QA rework can allocate a replacement RuntimeContext after the
+    original worker completed those global lines.  The replacement still has
+    to author its own authenticated read receipt and startup evidence, but it
+    must not reopen or rewrite the append-only ContractRuntime history.  This
+    reader-only projection mirrors the context-local write authority and is
+    deliberately inert unless the persisted replacement dispatch and initial
+    join marker bind one unambiguous runtime/task/parent tuple.
+    """
+
+    next_action = (
+        dict(canonical_next_action)
+        if isinstance(canonical_next_action, Mapping)
+        else {}
+    )
+    if not (
+        isinstance(record, Mapping)
+        and isinstance(projection, Mapping)
+        and context is not None
+        and _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+    ):
+        return next_action
+
+    runtime_context_id, task_id, parent_task_id = (
+        _contract_runtime_context_identity(context)
+    )
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    if not all(
+        (
+            runtime_context_id,
+            task_id,
+            parent_task_id,
+            execution_id,
+            worker_id,
+            worker_slot_id,
+        )
+    ):
+        return next_action
+    if str(getattr(context, "status", "") or "").strip() not in {
+        "worktree_ready",
+        "running",
+    }:
+        return next_action
+
+    markers = [
+        dict(item)
+        for item in projection.get("failed_qa_revision_rejoin_contexts") or []
+        if isinstance(item, Mapping)
+        and str(item.get("schema_version") or "").strip()
+        == "contract_runtime.failed_qa_revision_initial_join_marker.v1"
+        and str(item.get("source") or "").strip()
+        == "accepted_runtime_context_initial_join"
+        and str(item.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(item.get("task_id") or "").strip() == task_id
+        and str(item.get("parent_task_id") or "").strip()
+        == parent_task_id
+        and str(item.get("contract_execution_id") or "").strip()
+        == execution_id
+        and str(item.get("revision_event_ref") or "").strip().startswith(
+            "timeline:"
+        )
+        and item.get("route_identity_rebound") is False
+        and item.get("evidence_backfill") is False
+    ]
+    if len(markers) != 1:
+        return next_action
+    marker = markers[0]
+
+    dispatch_match = _contract_runtime_dispatch_line_match(record, context)
+    dispatch_lineage = _contract_runtime_verified_dispatch_lineage(
+        record,
+        context,
+        dispatch_match,
+    )
+    dispatch_source_ref = str(
+        dispatch_lineage.get("contract_runtime_dispatch_source_ref") or ""
+    ).strip()
+    if (
+        dispatch_lineage.get("dispatch_lineage_verified") is not True
+        or not dispatch_source_ref
+        or str(marker.get("dispatch_source_ref") or "").strip()
+        != dispatch_source_ref
+    ):
+        return next_action
+
+    exact_setup_lines: dict[str, list[Mapping[str, Any]]] = {
+        "worker_read_runtime_guide": [],
+        "worker_startup": [],
+    }
+    completed_lines = projection.get("projected_completed_lines")
+    if not isinstance(completed_lines, list):
+        completed_lines = record.get("completed_lines")
+    for line in completed_lines or []:
+        if not isinstance(line, Mapping):
+            continue
+        line_id = str(line.get("line_id") or "").strip()
+        if line_id not in exact_setup_lines:
+            continue
+        if _contract_runtime_exact_lane_completed_line_binding(
+            record,
+            context,
+            line,
+        ):
+            exact_setup_lines[line_id].append(line)
+
+    receipt_count = len(exact_setup_lines["worker_read_runtime_guide"])
+    startup_count = len(exact_setup_lines["worker_startup"])
+    if receipt_count > 1 or startup_count > 1 or (
+        startup_count and not receipt_count
+    ):
+        return next_action
+    if receipt_count and startup_count:
+        return next_action
+
+    if not receipt_count:
+        stage_id = "worker_read"
+        line_id = "worker_read_runtime_guide"
+        evidence_kind = "read_receipt"
+        action = "submit_mf_subagent_read_receipt"
+        facade = "runtime_context_read_receipt"
+    else:
+        stage_id = "worker_startup"
+        line_id = "worker_startup"
+        evidence_kind = "mf_subagent_startup"
+        action = "record_mf_subagent_startup"
+        facade = "runtime_context_startup"
+
+    canonical_before_setup = {
+        key: next_action.get(key)
+        for key in (
+            "id",
+            "action",
+            "stage_id",
+            "line_id",
+            "owner_role",
+            "evidence_kind",
+            "runtime_context_id",
+            "task_id",
+        )
+        if next_action.get(key) not in (None, "")
+    }
+    for unsafe_key in (
+        "action_input",
+        "writer_role_safe_copy_payload",
+        "mf_sub_host_bridge_guidance",
+    ):
+        next_action.pop(unsafe_key, None)
+    line_instance_id = f"runtime_context:{runtime_context_id}"
+    setup_reader_hash = stable_sha256(
+        {
+            "schema_version": (
+                "contract_runtime.failed_qa_context_local_setup_reader.v1"
+            ),
+            "canonical_runtime_guide_hash": str(
+                next_action.get("runtime_guide_hash") or ""
+            ).strip(),
+            "contract_execution_id": execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "line_id": line_id,
+            "dispatch_source_ref": dispatch_source_ref,
+            "revision_event_ref": str(
+                marker.get("revision_event_ref") or ""
+            ).strip(),
+        }
+    )
+    next_action.update(
+        {
+            "schema_version": "contract_runtime_next_legal_action.v1",
+            "id": line_id,
+            "action": action,
+            "source": (
+                "contract_runtime_failed_qa_context_local_setup_projection"
+            ),
+            "source_of_authority": (
+                "server_verified_failed_qa_replacement_dispatch"
+            ),
+            "authority_decision_source": (
+                "server_verified_failed_qa_replacement_dispatch"
+            ),
+            "precedence": (
+                "server_verified_failed_qa_replacement_context_local_setup"
+            ),
+            "runtime_guide_hash": setup_reader_hash,
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "owner_role": "mf_sub",
+            "allowed_writer_roles": ["mf_sub"],
+            "evidence_kind": evidence_kind,
+            "required": True,
+            "meta_contract_gate_decision_source": False,
+            "contract_execution_id": execution_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_role": "mf_sub",
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "lane_id": worker_slot_id,
+            "line_instance_id": line_instance_id,
+            "failed_qa_replacement_context_local_setup_projection": True,
+            "dispatch_source_ref": dispatch_source_ref,
+            "initial_join_event_ref": str(
+                marker.get("revision_event_ref") or ""
+            ).strip(),
+            "contract_runtime_mutated": False,
+            "global_contract_line_already_completed": True,
+            "canonical_next_action_before_context_local_setup": (
+                canonical_before_setup
+            ),
+            "submit_line_guidance": {
+                "schema_version": (
+                    "contract_runtime.failed_qa_context_local_setup_guidance.v1"
+                ),
+                "generic_contract_runtime_submit_line_allowed": False,
+                "runtime_context_facade_required": True,
+                "runtime_context_facade": facade,
+                "contract_runtime_completed_lines_mutated": False,
+                "message": (
+                    "Use the exact replacement RuntimeContext facade; this "
+                    "records context-local worker evidence without reopening "
+                    "the globally completed Contract line."
+                ),
+            },
+        }
+    )
+    return next_action
+
+
 def _runtime_context_same_lane_recovery_next_action(
     canonical_next_action: Mapping[str, Any],
     recovery: Mapping[str, Any] | None,
@@ -26537,6 +26785,36 @@ def _runtime_context_contract_runtime_worker_projection(
             if not str(next_action.get("task_id") or "").strip():
                 next_action["task_id"] = task_id
         current_state["next_legal_action"] = dict(next_action)
+    if context is not None:
+        context_local_setup_action = (
+            _runtime_context_failed_qa_context_local_setup_next_action(
+                next_action,
+                record=canonical_record,
+                projection=context_projection,
+                context=context,
+            )
+        )
+        if context_local_setup_action != next_action:
+            current_state[
+                "canonical_next_legal_action_before_context_local_setup"
+            ] = dict(next_action)
+            next_action = context_local_setup_action
+            current_state["next_legal_action"] = dict(next_action)
+            current_state["failed_qa_replacement_context_local_setup"] = {
+                "schema_version": (
+                    "contract_runtime.failed_qa_context_local_setup_projection.v1"
+                ),
+                "source": (
+                    "server_verified_failed_qa_replacement_dispatch"
+                ),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "dispatch_source_ref": str(
+                    next_action.get("dispatch_source_ref") or ""
+                ),
+                "contract_runtime_mutated": False,
+                "append_only_history_preserved": True,
+            }
     current_repair_authority: dict[str, str] = {}
     if context is not None:
         from .parallel_branch_runtime import (
