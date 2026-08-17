@@ -3164,6 +3164,118 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         assert "observer_route_token_ref" in properties
 
 
+def test_contract_runtime_recover_mcp_schema_is_copy_safe_and_stdio_listed():
+    schemas = []
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        tool = next(
+            item for item in tools if item["name"] == "contract_runtime_recover"
+        )
+        schema = tool["inputSchema"]
+        schemas.append(schema)
+        assert schema["additionalProperties"] is False
+        assert schema["required"] == [
+            "project_id",
+            "backlog_id",
+            "recovery_policy",
+            "stale_contract_execution_id",
+            "observer_session_id",
+            "observer_route_token_ref",
+        ]
+        assert set(schema["properties"]) == {
+            "project_id",
+            "backlog_id",
+            "recovery_policy",
+            "stale_contract_execution_id",
+            "recovery_authority_hash",
+            "observer_session_id",
+            "observer_route_token_ref",
+        }
+        assert not {
+            "token",
+            "route_token",
+            "session_token",
+            "qa_session_token",
+            "recovery_contract_execution_id",
+            "authoritative_pass_synthesized",
+        } & set(schema["properties"])
+    assert schemas[0] == schemas[1]
+
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ])
+    assert returncode == 0
+    assert stderr == ""
+    listed = {
+        tool["name"]: tool for tool in responses[0]["result"]["tools"]
+    }
+    assert listed["contract_runtime_recover"]["inputSchema"] == schemas[1]
+
+
+def test_contract_runtime_recover_mcp_dispatchers_forward_only_copy_safe_proof(
+    monkeypatch,
+):
+    governance_calls = []
+    runtime_calls = []
+
+    def fake_http(method, path, body=None, **_kwargs):
+        governance_calls.append((method, path, body))
+        return {"ok": True, "adapter": "governance"}
+
+    def fake_api(method, path, body=None):
+        runtime_calls.append((method, path, body))
+        return {"ok": True, "adapter": "runtime"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    arguments = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-STALE-RECOVERY",
+        "recovery_policy": "start_new_execution",
+        "stale_contract_execution_id": "cex-stale",
+        "recovery_authority_hash": "sha256:authority",
+        "observer_session_id": "obs-copy-safe",
+        "observer_route_token_ref": "rtok-copy-safe-ref",
+        "qa_session_token": "raw-qa-secret",
+        "session_token": "raw-worker-secret",
+        "route_token": "raw-route-secret",
+        "recovery_contract_execution_id": "cex-caller-forged",
+        "authoritative_pass_synthesized": True,
+    }
+    expected_body = {
+        "backlog_id": "AC-STALE-RECOVERY",
+        "recovery_policy": "start_new_execution",
+        "stale_contract_execution_id": "cex-stale",
+        "recovery_authority_hash": "sha256:authority",
+        "observer_session_id": "obs-copy-safe",
+        "observer_route_token_ref": "rtok-copy-safe-ref",
+    }
+
+    assert governance_mcp_server._dispatch_tool(
+        "contract_runtime_recover", arguments
+    ) == {"ok": True, "adapter": "governance"}
+    assert dispatcher.dispatch("contract_runtime_recover", arguments) == {
+        "ok": True,
+        "adapter": "runtime",
+    }
+    expected_call = (
+        "POST",
+        "/api/projects/aming-claw/contract-runtime/recover",
+        expected_body,
+    )
+    assert governance_calls == [expected_call]
+    assert runtime_calls == [expected_call]
+    serialized = json.dumps([governance_calls, runtime_calls])
+    assert "raw-qa-secret" not in serialized
+    assert "raw-worker-secret" not in serialized
+    assert "raw-route-secret" not in serialized
+    assert "cex-caller-forged" not in serialized
+
+
 def test_governance_mcp_contract_runtime_qa_token_is_header_only(monkeypatch):
     calls = []
 

@@ -114918,6 +114918,50 @@ def test_contract_add_stale_pinned_execution_returns_recovery_next_action(conn):
     assert recovered["next_legal_action"]["id"] == "observer_request_contract_add"
 
 
+def test_generic_stale_contract_runtime_projection_exposes_copy_safe_mcp_recovery():
+    stale = server.StalePinnedContractExecutionError(
+        "definition_hash",
+        "sha256:pinned",
+        "sha256:current",
+        record={
+            "project_id": PID,
+            "backlog_id": "AC-GENERIC-STALE-PROJECTION",
+            "contract_execution_id": "cex-generic-stale",
+            "contract_id": "mf_parallel.v2",
+            "version": "2",
+            "revision": "rev1",
+            "definition_hash": "sha256:pinned",
+        },
+        definition={"definition_hash": "sha256:current"},
+    )
+
+    projected = server._contract_runtime_stale_recovery_projection(
+        stale,
+        action="contract_runtime_current",
+    )
+
+    recovery_action = projected["next_legal_action"]
+    assert recovery_action["endpoint"].endswith("/contract-runtime/recover")
+    assert recovery_action["mcp_tool"] == "contract_runtime_recover"
+    assert recovery_action["copy_safe_body"] == recovery_action["body"]
+    assert recovery_action["body"] == {
+        "backlog_id": "AC-GENERIC-STALE-PROJECTION",
+        "recovery_policy": "start_new_execution",
+        "stale_contract_execution_id": "cex-generic-stale",
+        "observer_session_id": "<active observer session id>",
+        "observer_route_token_ref": "<current observer route token ref>",
+    }
+    assert recovery_action["host_realization"] == {
+        "mode": "replace_declared_placeholders_then_spread_to_mcp",
+        "required_replacements": [
+            "observer_session_id",
+            "observer_route_token_ref",
+        ],
+        "optional_omission_fields": ["recovery_authority_hash"],
+        "raw_token_required": False,
+    }
+
+
 def test_generic_contract_runtime_recovery_preserves_stale_evidence_without_replay(
     conn, tmp_path
 ):
@@ -114960,9 +115004,28 @@ def test_generic_contract_runtime_recovery_preserves_stale_evidence_without_repl
         )
     )
     assert current["status"] == "blocked_stale_pinned_execution"
-    assert current["next_legal_action"]["endpoint"].endswith(
+    recovery_action = current["next_legal_action"]
+    assert recovery_action["endpoint"].endswith(
         "/contract-runtime/recover"
     )
+    assert recovery_action["mcp_tool"] == "contract_runtime_recover"
+    assert recovery_action["body_source"] == "copy_safe_body"
+    assert recovery_action["copy_safe_body"] == recovery_action["body"]
+    assert recovery_action["body"] == {
+        "backlog_id": backlog_id,
+        "recovery_policy": "start_new_execution",
+        "stale_contract_execution_id": execution_id,
+        "observer_session_id": "<active observer session id>",
+        "observer_route_token_ref": "<current observer route token ref>",
+    }
+    assert recovery_action["host_realization"]["raw_token_required"] is False
+    assert {
+        "observer_session_id",
+        "observer_route_token_ref",
+    } == set(recovery_action["host_realization"]["required_replacements"])
+    assert "qa_session_token" not in recovery_action["body"]
+    assert "session_token" not in recovery_action["body"]
+    assert "route_token" not in recovery_action["body"]
 
     request_body = {
         "backlog_id": backlog_id,

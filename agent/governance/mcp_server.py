@@ -2638,6 +2638,50 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "contract_runtime_recover",
+        "description": (
+            "Start the server-derived replacement execution for one stale "
+            "pinned ContractRuntime using copy-safe observer session and "
+            "route references. Raw authorization tokens are not accepted."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "project_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "recovery_policy": {
+                    "type": "string",
+                    "enum": [
+                        "start_new_execution",
+                        "invalid_runtime_context_authority",
+                    ],
+                },
+                "stale_contract_execution_id": {"type": "string"},
+                "recovery_authority_hash": {"type": "string"},
+                "observer_session_id": {
+                    "type": "string",
+                    "description": "Opaque active observer session id.",
+                },
+                "observer_route_token_ref": {
+                    "type": "string",
+                    "description": (
+                        "Opaque server-registered observer route ref; raw "
+                        "route tokens are not accepted."
+                    ),
+                },
+            },
+            "required": [
+                "project_id",
+                "backlog_id",
+                "recovery_policy",
+                "stale_contract_execution_id",
+                "observer_session_id",
+                "observer_route_token_ref",
+            ],
+        },
+    },
+    {
         "name": "contract_runtime_current",
         "description": "Read a source-backed ContractRuntime execution current-state through the generic facade.",
         "inputSchema": {
@@ -3764,6 +3808,26 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             f"/api/projects/{pid}/contract-update/{execution_id}/line-writes",
             body,
             gov_token=qa_session_token,
+        )
+
+    if name == "contract_runtime_recover":
+        pid = args["project_id"]
+        body = {
+            key: args[key]
+            for key in (
+                "backlog_id",
+                "recovery_policy",
+                "stale_contract_execution_id",
+                "recovery_authority_hash",
+                "observer_session_id",
+                "observer_route_token_ref",
+            )
+            if key in args and args[key] is not None
+        }
+        return _http(
+            "POST",
+            f"/api/projects/{pid}/contract-runtime/recover",
+            body,
         )
 
     if name in {"contract_runtime_current", "contract_runtime_guide"}:

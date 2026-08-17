@@ -96569,6 +96569,16 @@ def _contract_runtime_recovery_start_endpoint(contract_id: str) -> str:
     return "contract-runtime/recover"
 
 
+def _contract_runtime_recovery_start_mcp_tool(contract_id: str) -> str:
+    if contract_id == ONBOARD_CONTRACT_ID:
+        return "onboard_route_guide"
+    if contract_id == CONTRACT_ADD_CONTRACT_ID:
+        return "contract_add_start"
+    if contract_id == CONTRACT_UPDATE_CONTRACT_ID:
+        return "contract_update_start"
+    return "contract_runtime_recover"
+
+
 def _contract_runtime_retirement_projection(
     retired: ContractRetirementError,
     *,
@@ -96623,6 +96633,7 @@ def _contract_runtime_stale_recovery_projection(
     stale_execution_id = str(record.get("contract_execution_id") or "")
     recovery_execution_id = _contract_runtime_stale_recovery_id(stale)
     endpoint_suffix = _contract_runtime_recovery_start_endpoint(contract_id)
+    mcp_tool = _contract_runtime_recovery_start_mcp_tool(contract_id)
     if contract_id == ONBOARD_CONTRACT_ID:
         body = {
             "backlog_id": backlog_id,
@@ -96635,7 +96646,12 @@ def _contract_runtime_stale_recovery_projection(
             "recovery_policy": "start_new_execution",
             "stale_contract_execution_id": stale_execution_id,
         }
-    if route_token_ref:
+    if mcp_tool == "contract_runtime_recover":
+        body["observer_session_id"] = "<active observer session id>"
+        body["observer_route_token_ref"] = (
+            route_token_ref or "<current observer route token ref>"
+        )
+    elif route_token_ref:
         body["route_token_ref"] = route_token_ref
     next_action = {
         "schema_version": "contract_runtime_next_legal_action.v1",
@@ -96651,10 +96667,25 @@ def _contract_runtime_stale_recovery_projection(
         "allowed_writer_roles": ["observer"],
         "evidence_kind": "contract_runtime_recovery",
         "required": True,
+        "interface": mcp_tool,
+        "facade": mcp_tool,
+        "mcp_tool": mcp_tool,
         "endpoint": f"/api/projects/{project_id}/{endpoint_suffix}",
+        "body_source": "copy_safe_body",
+        "copy_safe_body": body,
         "body": body,
         "meta_contract_gate_decision_source": False,
     }
+    if mcp_tool == "contract_runtime_recover":
+        next_action["host_realization"] = {
+            "mode": "replace_declared_placeholders_then_spread_to_mcp",
+            "required_replacements": [
+                "observer_session_id",
+                "observer_route_token_ref",
+            ],
+            "optional_omission_fields": ["recovery_authority_hash"],
+            "raw_token_required": False,
+        }
     return {
         "schema_version": "contract_runtime.stale_pinned_execution_recovery.v1",
         "ok": False,
