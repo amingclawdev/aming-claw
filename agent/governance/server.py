@@ -29782,15 +29782,21 @@ def _runtime_context_worker_guide_current_stage(
             "runtime_text_prepare",
             ("observer_runtime_text_prepare", "runtime_text_prepare"),
         ),
+        (
+            "rejoin",
+            (
+                "pre_lineage_rejoin",
+                "session_token_rejoin",
+                "runtime_context_rejoin_host_envelope",
+            ),
+        ),
         ("receipt", ("receipt", "worker_read")),
         (
             "join",
             (
                 "initial_join",
-                "session_token_rejoin",
                 "session_token_reissue",
                 "reissue_runtime_session_token",
-                "runtime_context_rejoin_host_envelope",
                 "runtime_context_initial_join_host_envelope",
             ),
         ),
@@ -29935,6 +29941,13 @@ def _runtime_context_worker_guide_bounded_actionable_payloads(
             selected_keys.add("session_token_reissue_submission")
         else:
             selected_keys.add("session_token_rejoin_submission")
+    elif current_stage == "rejoin":
+        selected_keys.add("session_token_rejoin_submission")
+    if current_stage in {"join", "rejoin"}:
+        # The immediately subsequent receipt remains visible but cannot be
+        # mistaken for the current action.  The compact aliasing pass below
+        # replaces its body with an explicit fresh-Guide prerequisite.
+        selected_keys.add("read_receipt_facade_payload_skeleton")
     selected_keys.update(
         {
             "runtime_text_prepare": {"runtime_text_prepare_submission"},
@@ -30704,6 +30717,7 @@ def _runtime_context_worker_guide_early_compact_response(
         "reissue_runtime_session_token",
         "request_runtime_context_initial_join_host_envelope",
         "request_runtime_context_rejoin_host_envelope",
+        "request_runtime_context_pre_lineage_rejoin_host_envelope",
         "stop_and_refresh_runtime_context",
         "verify_runtime_context_identity",
         "retry_with_matching_runtime_context_identity",

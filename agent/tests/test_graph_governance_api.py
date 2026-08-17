@@ -42693,6 +42693,71 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         fresh_task_id,
     )
     assert expired_after_legacy_rescue is not None
+    compact_guide_query = {
+        "task_id": fresh_task_id,
+        "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+        "worker_id": fresh_worker_id,
+        "worker_slot_id": fresh_worker_id,
+        "target_project_root": str(world.root),
+        "view": "compact",
+        **route_identity,
+    }
+    before_compact_guide = "\n".join(conn.iterdump())
+    compact_rejoin_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "observer",
+                query=compact_guide_query,
+            )
+        )
+    )
+    assert "\n".join(conn.iterdump()) == before_compact_guide
+    assert compact_rejoin_guide["response_view"] == "compact"
+    assert compact_rejoin_guide["builder"] == "bounded_current_authority"
+    assert compact_rejoin_guide["next_legal_action"] == (
+        "request_runtime_context_pre_lineage_rejoin_host_envelope"
+    )
+    assert compact_rejoin_guide["next_legal_action_decision_source"] == (
+        "runtime_context_recovery_authority"
+    )
+    assert compact_rejoin_guide[
+        "contract_runtime_next_action_took_precedence"
+    ] is False
+    compact_rejoin_action = compact_rejoin_guide[
+        "canonical_executable_action"
+    ]
+    assert compact_rejoin_action["mcp_tool"] == (
+        "runtime_context_session_token_rejoin"
+    )
+    assert compact_rejoin_action["action"] == (
+        "request_runtime_context_pre_lineage_rejoin_host_envelope"
+    )
+    compact_rejoin_payloads = compact_rejoin_guide["actionable_payloads"]
+    assert "session_token_initial_join_submission" not in (
+        compact_rejoin_payloads
+    )
+    compact_rejoin_alias = compact_rejoin_payloads[
+        "session_token_rejoin_submission"
+    ]["copy_safe_body"]
+    assert compact_rejoin_alias["status"] == "canonical_current_action"
+    assert compact_rejoin_alias["canonical_action_path"] == (
+        "canonical_executable_action.copy_safe_body"
+    )
+    compact_receipt_alias = compact_rejoin_payloads[
+        "read_receipt_facade_payload_skeleton"
+    ]["copy_safe_body"]
+    assert compact_receipt_alias["status"] == (
+        "inactive_action_requires_fresh_guide"
+    )
+    assert compact_receipt_alias["canonical_action_path"] == ""
+    assert compact_receipt_alias["refresh_worker_guide_required"] is True
+    assert compact_rejoin_guide["raw_session_token_exposed"] is False
+    assert compact_rejoin_guide["raw_fence_token_exposed"] is False
+    assert compact_rejoin_guide["raw_route_token_exposed"] is False
     with pytest.raises(GovernanceError) as rejoin_guide:
         server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
             _ctx_with_role(
@@ -42754,7 +42819,8 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     rejoin_submission = rejoin_details["actionable_payloads"][
         "session_token_rejoin_submission"
     ]
-    rejoin_body = copy.deepcopy(rejoin_submission["copy_safe_body"])
+    rejoin_body = copy.deepcopy(compact_rejoin_action["copy_safe_body"])
+    assert rejoin_body == rejoin_submission["copy_safe_body"]
     assert rejoin_submission["path"].endswith("/session-token/rejoin")
     rejoin_body["reason"] = (
         "recover the exhausted verifier-backed failed-QA successor once"
