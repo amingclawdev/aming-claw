@@ -129260,9 +129260,9 @@ def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resu
         _context_local_rework_receipt_fixture()
     )
     execution_id = record["contract_execution_id"]
-    # A prior receipt attempt for this reissued context may already be projected
-    # as an idempotent global line. Context-local failed-QA authority must win
-    # before that generic already-completed shortcut.
+    # Persist the production shape: the global next line still has the same
+    # line id and its immutable identity belongs to the prior worker. The
+    # replacement receipt is context-local and must never resubmit that line.
     record["completed_lines"].append(
         {
             "stage_id": "worker_read",
@@ -129285,7 +129285,25 @@ def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resu
         store=SimpleNamespace(get=lambda _execution_id: record),
         mf_parallel_atomic_lane_gate_view=lambda _record, _guide, _line, **_kwargs: (
             {},
-            {},
+            {
+                "next_legal_action": {
+                    "stage_id": "worker_read",
+                    "line_id": "worker_read_runtime_guide",
+                    "owner_role": "mf_sub",
+                    "allowed_writer_roles": ["mf_sub"],
+                    "evidence_kind": "read_receipt",
+                    "required": True,
+                    "runtime_context_id": "mfrctx-prior-worker",
+                    "task_id": "prior-worker-task",
+                    "worker_slot_id": "prior-worker-slot",
+                    "lane_id": "prior-worker-slot",
+                    "line_instance_id": (
+                        "runtime_context:mfrctx-prior-worker"
+                    ),
+                    "atomic_lane_gate_bound": True,
+                },
+                "atomic_lane_gate_binding": {"bound": True},
+            },
         ),
         submit_line_write=lambda *args, **kwargs: pytest.fail(
             "context-local receipt must not resubmit the global Contract line"
@@ -129366,14 +129384,22 @@ def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resu
     "mutation",
     [
         "missing_failed_qa_marker",
+        "ambiguous_failed_qa_marker",
         "missing_marker_contract",
+        "wrong_marker_runtime",
         "wrong_marker_task",
+        "wrong_marker_parent",
         "missing_command_contract",
         "wrong_command_contract",
         "wrong_command_task",
+        "wrong_dispatch_slot",
+        "wrong_route",
         "unclaimed_command",
         "observer_impersonation",
         "missing_active_worker",
+        "inactive_context",
+        "wrong_prior_line_instance",
+        "same_task_prior_line",
         "startup_without_local_receipt",
     ],
 )
@@ -129399,6 +129425,8 @@ def test_context_local_rework_receipt_rejects_noncanonical_backfill(
     }
     if mutation == "missing_failed_qa_marker":
         markers = []
+    elif mutation == "ambiguous_failed_qa_marker":
+        markers = [marker, copy.deepcopy(marker)]
     elif mutation == "missing_marker_contract":
         markers = [
             {
@@ -129407,14 +129435,20 @@ def test_context_local_rework_receipt_rejects_noncanonical_backfill(
                 if key != "contract_execution_id"
             }
         ]
+    elif mutation == "wrong_marker_runtime":
+        markers = [{**marker, "runtime_context_id": "mfrctx-wrong"}]
     elif mutation == "wrong_marker_task":
         markers = [{**marker, "task_id": "different-rework-task"}]
+    elif mutation == "wrong_marker_parent":
+        markers = [{**marker, "parent_task_id": "cex-wrong-parent"}]
     elif mutation == "missing_command_contract":
         command["payload"].pop("contract_execution_id")
     elif mutation == "wrong_command_contract":
         command["payload"]["contract_execution_id"] = "cex-different"
     elif mutation == "wrong_command_task":
         command["payload"]["worker_task_id"] = "different-worker-task"
+    elif mutation == "wrong_route":
+        command["payload"]["route_token_ref"] = "rtok-wrong-route"
     elif mutation == "unclaimed_command":
         command["status"] = "notified"
         command["claimed_by_session_id"] = ""
@@ -129423,6 +129457,14 @@ def test_context_local_rework_receipt_rejects_noncanonical_backfill(
         payload["actor_role"] = "observer"
     elif mutation == "missing_active_worker":
         context.actual_host_worker_id = ""
+    elif mutation == "inactive_context":
+        context.status = "allocated"
+    elif mutation == "wrong_prior_line_instance":
+        record["completed_lines"][0]["line_instance_id"] = (
+            "runtime_context:mfrctx-wrong-prior-worker"
+        )
+    elif mutation == "same_task_prior_line":
+        record["completed_lines"][0]["payload"]["task_id"] = context.task_id
     elif mutation == "startup_without_local_receipt":
         stage_id = "worker_startup"
         line_id = "worker_startup"
@@ -129441,14 +129483,28 @@ def test_context_local_rework_receipt_rejects_noncanonical_backfill(
             }
         )
 
+    dispatch_resolution = {
+        "accepted": True,
+        "reconstructable": True,
+        "observer_command_id": command["command_id"],
+    }
+    if mutation == "wrong_dispatch_slot":
+        dispatch_resolution = {
+            "accepted": False,
+            "reconstructable": False,
+            "observer_command_id": command["command_id"],
+            "identity_mismatches": [
+                {
+                    "field": "worker_slot_id",
+                    "expected": context.worker_slot_id,
+                    "actual": "wrong-worker-slot",
+                }
+            ],
+        }
     monkeypatch.setattr(
         server,
         "_contract_runtime_dispatch_identity_resolution",
-        lambda _record, _context: {
-            "accepted": True,
-            "reconstructable": True,
-            "observer_command_id": command["command_id"],
-        },
+        lambda _record, _context: dispatch_resolution,
     )
     monkeypatch.setattr(
         observer_session,
@@ -129461,6 +129517,7 @@ def test_context_local_rework_receipt_rejects_noncanonical_backfill(
         lambda _conn, _context: route_identity,
     )
 
+    before_changes = conn.total_changes
     assert server._runtime_context_context_local_setup_authority(
         conn,
         project_id=PID,
@@ -129472,6 +129529,7 @@ def test_context_local_rework_receipt_rejects_noncanonical_backfill(
         payload=payload,
         failed_qa_rejoin_contexts=markers,
     ) == {}
+    assert conn.total_changes == before_changes
 
 
 @pytest.mark.parametrize(
@@ -129812,6 +129870,18 @@ def test_fresh_failed_qa_context_read_receipt_persists_and_startup_discovers_it(
     updated_record["completed_lines"] = completed_lines
     updated_guide = dict(record.get("runtime_guide") or {})
     updated_guide["completed_lines"] = completed_lines
+    # Reproduce the persisted production boundary: the canonical global
+    # Contract line still names the old worker-read line, while its immutable
+    # lane identity belongs to the failed worker and the fresh replacement
+    # must record only context-local receipt/startup evidence.
+    updated_guide["next_legal_action"] = {
+        "stage_id": "worker_read",
+        "line_id": "worker_read_runtime_guide",
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "evidence_kind": "read_receipt",
+        "required": True,
+    }
     updated_record["runtime_guide"] = updated_guide
     runtime.store.update(contract_execution_id, updated_record)
     conn.commit()
@@ -129879,6 +129949,30 @@ def test_fresh_failed_qa_context_read_receipt_persists_and_startup_discovers_it(
     assert marker["source"] == "accepted_runtime_context_rejoin_event"
 
     source_backed_record = runtime.store.get(contract_execution_id)
+    persisted_next = source_backed_record["runtime_guide"][
+        "next_legal_action"
+    ]
+    assert persisted_next["line_id"] == "worker_read_runtime_guide"
+    prior_read_line = next(
+        line
+        for line in source_backed_record["completed_lines"]
+        if line.get("line_id") == "worker_read_runtime_guide"
+        and server._timeline_first_deep_text(
+            {"line": line, "payload": line.get("payload") or {}},
+            "runtime_context_id",
+        )
+        == old_context.runtime_context_id
+    )
+    assert server._timeline_first_deep_text(
+        {"line": prior_read_line, "payload": prior_read_line.get("payload") or {}},
+        "task_id",
+    ) == old_context.task_id
+    assert prior_read_line["line_instance_id"] == (
+        f"runtime_context:{old_context.runtime_context_id}"
+    )
+    assert old_context.runtime_context_id != fresh_context.runtime_context_id
+    assert old_context.task_id != fresh_context.task_id
+    assert old_context.worker_slot_id != fresh_context.worker_slot_id
     dispatch_resolution = server._contract_runtime_dispatch_identity_resolution(
         source_backed_record,
         fresh_context,

@@ -61827,20 +61827,20 @@ def _runtime_context_context_local_setup_authority(
         or getattr(context, "project_id", "")
         or ""
     ).strip()
-    marker = next(
-        (
-            dict(item)
-            for item in failed_qa_rejoin_contexts
-            if isinstance(item, Mapping)
-            and str(item.get("runtime_context_id") or "").strip()
-            == runtime_context_id
-            and str(item.get("task_id") or "").strip() == task_id
-            and str(item.get("parent_task_id") or "").strip()
-            == parent_task_id
-            and str(item.get("contract_execution_id") or "").strip()
-            == execution_id
-        ),
-        {},
+    marker_candidates = [
+        dict(item)
+        for item in failed_qa_rejoin_contexts
+        if isinstance(item, Mapping)
+        and str(item.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(item.get("task_id") or "").strip() == task_id
+        and str(item.get("parent_task_id") or "").strip()
+        == parent_task_id
+        and str(item.get("contract_execution_id") or "").strip()
+        == execution_id
+    ]
+    marker = (
+        marker_candidates[0] if len(marker_candidates) == 1 else {}
     )
     if (
         not marker
@@ -62033,9 +62033,18 @@ def _runtime_context_context_local_setup_authority(
             {"line": completed, "payload": completed_payload},
             "task_id",
         )
+        completed_line_instance_id = str(
+            completed.get("line_instance_id") or ""
+        ).strip()
         if completed_runtime_context_id == runtime_context_id:
             continue
-        if not completed_runtime_context_id or not completed_task_id:
+        if (
+            not completed_runtime_context_id
+            or not completed_task_id
+            or completed_task_id == task_id
+            or completed_line_instance_id
+            != f"runtime_context:{completed_runtime_context_id}"
+        ):
             continue
         prior_line = dict(completed)
         break
@@ -63152,7 +63161,43 @@ def _runtime_context_submit_canonical_contract_line(
                     )
                 return precommit_correction
 
-    if next_line_id != line_id:
+    context_local_identity_fields = (
+        "runtime_context_id",
+        "task_id",
+        "worker_slot_id",
+        "lane_id",
+        "line_instance_id",
+    )
+
+    def same_line_has_different_lane_identity(
+        projected_identity: Mapping[str, Any],
+    ) -> bool:
+        actual_identity = {
+            field: str(projected_identity.get(field) or "").strip()
+            for field in context_local_identity_fields
+        }
+        return bool(
+            all(actual_identity.values())
+            and any(
+                actual_identity[field]
+                != str(lane_probe_payload.get(field) or "").strip()
+                for field in context_local_identity_fields
+            )
+        )
+
+    same_line_context_local_takeover = bool(
+        next_line_id == line_id
+        and (
+            same_line_has_different_lane_identity(next_line)
+            or (
+                atomic_lane_binding.get("bound") is True
+                and same_line_has_different_lane_identity(
+                    atomic_lane_binding
+                )
+            )
+        )
+    )
+    if next_line_id != line_id or same_line_context_local_takeover:
         context_local_setup = (
             _runtime_context_context_local_setup_authority(
                 conn,
