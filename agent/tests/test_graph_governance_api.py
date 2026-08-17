@@ -41854,7 +41854,7 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
             status=STATE_WORKTREE_READY,
             stage_type="failed_qa_rework",
             attempt=2,
-            retry_round=1,
+            retry_round=0,
             parent_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
             root_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
             base_commit=world.final_head,
@@ -41871,6 +41871,18 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         before_allocate,
         preexisting_context,
     )
+    # A rotated ref is only a stage signal.  Without an exact canonical
+    # failed-QA successor dispatch, an ordinary attempt-2/retry-0 context must
+    # remain unprojected.
+    ordinary_rotated_context = replace(
+        preexisting_context,
+        last_recovery_action="mf_subagent_session_token_reissued",
+    )
+    assert server._runtime_context_failed_qa_revision_contract_runtime_evidence(
+        conn,
+        project_id=PID,
+        context=ordinary_rotated_context,
+    ) == {}
     retry_rework_authority = (
         server._parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
             conn,

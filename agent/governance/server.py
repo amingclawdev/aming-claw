@@ -45984,18 +45984,21 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
         and int(getattr(context, "attempt", 0) or 0) > 1
         and int(getattr(context, "retry_round", 0) or 0) == 0
     )
-    fresh_failed_qa_replacement_initial_joined = (
+    fresh_failed_qa_replacement_host_joined_or_reissued = (
         context_status == STATE_WORKTREE_READY
         and int(getattr(context, "attempt", 0) or 0) > 1
         and int(getattr(context, "retry_round", 0) or 0) == 0
         and str(getattr(context, "last_recovery_action", "") or "")
-        == "mf_subagent_initial_join_issued"
+        in {
+            "mf_subagent_initial_join_issued",
+            "mf_subagent_session_token_reissued",
+        }
     )
     if (
         context_status not in FAILED_QA_REVISION_REJOIN_STATES
         and not failed_qa_rejoin_reopened
         and not fresh_failed_qa_replacement_running
-        and not fresh_failed_qa_replacement_initial_joined
+        and not fresh_failed_qa_replacement_host_joined_or_reissued
     ):
         return {}
     backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
