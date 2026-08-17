@@ -23569,7 +23569,13 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
         )
     )
     worker_guide = guide["worker_guide"]
-    assert worker_guide["next_legal_action"] == "submit_mf_subagent_read_receipt"
+    assert worker_guide["next_legal_action"] == "observer_runtime_text_prepare"
+    prepare_submission = worker_guide["actionable_payloads"][
+        "runtime_text_prepare_submission"
+    ]
+    assert prepare_submission["mcp_tool"] == "observer_runtime_text_prepare"
+    assert prepare_submission["actionable"] is False
+    assert prepare_submission["guide_auto_prepare_allowed"] is False
     assert worker_guide["control_plane_summary"]["route_token_action"][
         "canonical_route_identity"
     ]["route_token_ref"] == "rtok-allocate-contract"
