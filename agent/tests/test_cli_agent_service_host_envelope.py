@@ -357,6 +357,58 @@ def test_host_envelope_consume_rejects_wrong_lease_owner_and_zeroizes():
     assert store.pending_count() == 0
 
 
+def test_host_envelope_borrow_retains_until_exact_ack_and_zeroizes():
+    import pytest
+
+    from cli_agent_service.launchers import HostEnvelopeError, HostEnvelopeStore
+
+    store = HostEnvelopeStore()
+    session_token, fence_token = _auth_values()
+    staged = store.stage(
+        "run-managed-continuity",
+        _host_envelope(session_token, fence_token, suffix="managed-continuity"),
+        lease_owner_id=LEASE_OWNER,
+    )
+    expected = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-secure-envelope-managed-continuity",
+        "task_id": "worker-secure-envelope-managed-continuity",
+        "session_token_ref": staged["session_token_ref"],
+    }
+    delivery = store.borrow(
+        "run-managed-continuity",
+        lease_owner_id=LEASE_OWNER,
+        envelope_ref=staged["envelope_ref"],
+        expected_public_refs=expected,
+    )
+    assert delivery is not None
+    environment = {}
+    delivery.apply_to(environment)
+    assert environment == {
+        "AMING_WORKER_SESSION_TOKEN": session_token,
+        "AMING_WORKER_FENCE_TOKEN": fence_token,
+    }
+    environment.clear()
+    delivery.discard()
+    assert store.pending_count() == 1
+
+    with pytest.raises(HostEnvelopeError, match="public identity"):
+        store.borrow(
+            "run-managed-continuity",
+            lease_owner_id=LEASE_OWNER,
+            envelope_ref=staged["envelope_ref"],
+            expected_public_refs={**expected, "task_id": "foreign-task"},
+        )
+    consumed = store.acknowledge(
+        "run-managed-continuity",
+        lease_owner_id=LEASE_OWNER,
+        envelope_ref=staged["envelope_ref"],
+        expected_public_refs=expected,
+    )
+    assert consumed["status"] == "consumed"
+    assert store.pending_count() == 0
+
+
 def test_service_host_envelope_operation_is_public_safe_and_host_local(tmp_path):
     from cli_agent_service.launchers import HostEnvelopeStore
     from cli_agent_service.service import (

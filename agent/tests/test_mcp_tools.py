@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from threading import Event, Thread
 from types import SimpleNamespace
+
+import pytest
 
 from agent.governance import mcp_server as governance_mcp_server
 from agent.mcp import tools as mcp_tools
@@ -19,6 +23,235 @@ def _tool_names() -> set[str]:
 def _tool_properties(name: str) -> dict:
     tool = next(tool for tool in TOOLS if tool.get("name") == name)
     return tool["inputSchema"]["properties"]
+
+
+def test_managed_mcp_host_envelope_stages_injects_and_acks_startup():
+    raw_session = "managed-session-secret"
+    raw_fence = "managed-fence-secret"
+    route = {
+        "route_id": "route-managed-continuity",
+        "route_context_hash": "sha256:" + ("a" * 64),
+        "prompt_contract_id": "rprompt-managed-continuity",
+        "prompt_contract_hash": "sha256:" + ("b" * 64),
+        "route_token_ref": "rtok-managed-continuity",
+        "visible_injection_manifest_hash": "sha256:" + ("c" * 64),
+    }
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-managed-continuity",
+        "task_id": "worker-managed-continuity",
+        "parent_task_id": "cex-managed-continuity",
+        "contract_execution_id": "cex-managed-continuity",
+        "target_project_root": "/tmp/managed-continuity",
+        "worker_id": "worker-managed-continuity",
+        "worker_slot_id": "worker-managed-continuity",
+        "agent_id": "worker-managed-continuity",
+        "allocation_owner": "worker-managed-continuity",
+        "actual_host_worker_id": "worker-managed-continuity",
+        "worker_session_id": "desktop-managed-continuity",
+        "host_startup_id": "desktop-managed-continuity",
+        "host_session_id": "desktop-managed-continuity",
+        "session_token_ref": "wstok-managed-continuity",
+        **route,
+    }
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        if path.endswith("/session-token/reissue"):
+            envelope_identity = {
+                key: value
+                for key, value in identity.items()
+                if key not in route
+            }
+            return {
+                "ok": True,
+                "status": "session_token_reissued",
+                "delivery": "worker_host_envelope",
+                **envelope_identity,
+                "route_identity": dict(route),
+                "session_token": raw_session,
+                "fence_token": raw_fence,
+                "session_token_hash": "sha256:"
+                + hashlib.sha256(raw_session.encode()).hexdigest(),
+                "fence_token_hash": "sha256:"
+                + hashlib.sha256(raw_fence.encode()).hexdigest(),
+                "host_envelope": {
+                    **envelope_identity,
+                    "route_identity": dict(route),
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": raw_session,
+                        "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                    },
+                },
+            }
+        if "/worker-guide" in path:
+            parsed = __import__("urllib.parse", fromlist=["parse_qs", "urlparse"])
+            query = parsed.parse_qs(parsed.urlparse(path).query)
+            assert query["session_token"] == [raw_session]
+            assert query["fence_token"] == [raw_fence]
+            return {"ok": True, "status": "worker_guide_ready"}
+        assert data is not None
+        assert data["session_token"] == raw_session
+        assert data["fence_token"] == raw_fence
+        return {
+            "ok": True,
+            "status": (
+                "startup_recorded"
+                if path.endswith("/parallel-branches/startup")
+                else "accepted"
+            ),
+        }
+
+    dispatcher = ToolDispatcher(fake_api, worker_pool=None)
+    issued = dispatcher.dispatch(
+        "runtime_context_session_token_reissue",
+        {**identity, "reason": "load managed MCP host auth"},
+    )
+    serialized = json.dumps(issued, sort_keys=True)
+    assert issued["auth_loaded"] is True
+    assert issued["managed_host_envelope"]["process_local"] is True
+    assert "host_envelope" not in issued
+    assert raw_session not in serialized
+    assert raw_fence not in serialized
+    assert dispatcher._host_envelope_continuity.pending_count() == 1
+
+    assert dispatcher.dispatch(
+        "runtime_context_worker_guide",
+        {
+            "project_id": identity["project_id"],
+            "runtime_context_id": identity["runtime_context_id"],
+            **{
+                key: identity[key]
+                for key in mcp_tools._RUNTIME_CONTEXT_QUERY_FIELDS
+                if key in identity
+            },
+        },
+    )["ok"] is True
+    receipt = dispatcher.dispatch("runtime_context_read_receipt", dict(identity))
+    assert receipt["ok"] is True
+    assert dispatcher._host_envelope_continuity.pending_count() == 1
+
+    startup = dispatcher.dispatch(
+        "parallel_branch_startup",
+        {**identity, "worker_role": "mf_sub"},
+    )
+    assert startup["managed_host_envelope_consumed"] is True
+    assert dispatcher._host_envelope_continuity.pending_count() == 0
+    call_count = len(calls)
+    rejected = dispatcher.dispatch("runtime_context_read_receipt", dict(identity))
+    assert rejected["error"] == "managed_host_envelope_not_loaded"
+    assert len(calls) == call_count
+
+
+def test_managed_mcp_host_envelope_cross_scope_is_zero_http():
+    continuity = mcp_tools.ManagedHostEnvelopeContinuity()
+    calls = []
+    request = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-cross-scope",
+        "task_id": "worker-cross-scope",
+        "parent_task_id": "cex-cross-scope",
+        "target_project_root": "/tmp/cross-scope",
+        "session_token_ref": "wstok-cross-scope",
+        "route_id": "route-cross-scope",
+        "route_context_hash": "sha256:" + ("d" * 64),
+        "prompt_contract_id": "rprompt-cross-scope",
+        "prompt_contract_hash": "sha256:" + ("e" * 64),
+        "route_token_ref": "rtok-cross-scope",
+        "visible_injection_manifest_hash": "sha256:" + ("f" * 64),
+    }
+    raw_session = "cross-session-secret"
+    raw_fence = "cross-fence-secret"
+    response = {
+        "ok": True,
+        "status": "session_token_reissued",
+        "delivery": "worker_host_envelope",
+        **request,
+        "session_token": raw_session,
+        "fence_token": raw_fence,
+        "host_envelope": {
+            **request,
+            "env": {
+                "AMING_WORKER_SESSION_TOKEN": raw_session,
+                "AMING_WORKER_FENCE_TOKEN": raw_fence,
+            },
+        },
+    }
+    continuity.dispatch("runtime_context_session_token_reissue", request, lambda _: response)
+    rejected = continuity.dispatch(
+        "runtime_context_worker_guide",
+        {**request, "route_id": "route-foreign"},
+        lambda args: calls.append(args),
+    )
+    assert rejected["error"] == "managed_host_envelope_scope_mismatch"
+    assert rejected["http_request_performed"] is False
+    assert calls == []
+
+
+def test_managed_mcp_host_envelope_concurrent_continuation_fails_closed():
+    continuity = mcp_tools.ManagedHostEnvelopeContinuity()
+    route = {
+        "route_id": "route-concurrent",
+        "route_context_hash": "sha256:" + ("7" * 64),
+        "prompt_contract_id": "rprompt-concurrent",
+        "prompt_contract_hash": "sha256:" + ("8" * 64),
+        "route_token_ref": "rtok-concurrent",
+        "visible_injection_manifest_hash": "sha256:" + ("9" * 64),
+    }
+    request = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-concurrent",
+        "task_id": "worker-concurrent",
+        "parent_task_id": "cex-concurrent",
+        "target_project_root": "/tmp/concurrent",
+        "session_token_ref": "wstok-concurrent",
+        **route,
+    }
+    continuity.dispatch(
+        "runtime_context_session_token_reissue",
+        request,
+        lambda _: {
+            "ok": True,
+            "status": "session_token_reissued",
+            "delivery": "worker_host_envelope",
+            **request,
+            "session_token": "concurrent-session-secret",
+            "fence_token": "concurrent-fence-secret",
+            "host_envelope": {
+                **request,
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": "concurrent-session-secret",
+                    "AMING_WORKER_FENCE_TOKEN": "concurrent-fence-secret",
+                },
+            },
+        },
+    )
+    entered = Event()
+    release = Event()
+    first_result = []
+
+    def slow_send(_args):
+        entered.set()
+        assert release.wait(2)
+        return {"ok": True, "status": "worker_guide_ready"}
+
+    thread = Thread(
+        target=lambda: first_result.append(
+            continuity.dispatch("runtime_context_worker_guide", request, slow_send)
+        )
+    )
+    thread.start()
+    assert entered.wait(2)
+    second = continuity.dispatch(
+        "runtime_context_worker_guide",
+        request,
+        lambda _args: pytest.fail("concurrent request reached HTTP"),
+    )
+    release.set()
+    thread.join(timeout=2)
+    assert second["error"] == "managed_host_envelope_concurrent_use"
+    assert first_result == [{"ok": True, "status": "worker_guide_ready"}]
 
 
 def test_guide_facade_schemas_require_project_adapter_and_top_level_revise_count():

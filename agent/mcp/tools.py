@@ -20,6 +20,7 @@ import urllib.error
 from datetime import datetime, timezone
 from typing import Any
 
+from .host_envelope_continuity import ManagedHostEnvelopeContinuity
 from .schema_contract import (
     MCP_TOOL_SCHEMA_MIN_CLIENT_VERSION,
     MCP_TOOL_SCHEMA_VERSION,
@@ -4896,6 +4897,7 @@ class ToolDispatcher:
         self._qa_session_refs_lock = threading.Lock()
         self._observer_session_refs: dict[str, dict[str, str]] = {}
         self._observer_session_refs_lock = threading.Lock()
+        self._host_envelope_continuity = ManagedHostEnvelopeContinuity()
 
     @staticmethod
     def _qa_session_ref_error(error: str, message: str, **details: Any) -> dict:
@@ -5198,6 +5200,24 @@ class ToolDispatcher:
 
     def dispatch(self, name: str, args: dict) -> Any:
         args = dict(args or {})
+        continuity_bypass = bool(
+            args.pop("__aming_managed_host_envelope_continuity_bypass", False)
+        )
+        if (
+            not continuity_bypass
+            and self._host_envelope_continuity.handles(name)
+        ):
+            return self._host_envelope_continuity.dispatch(
+                name,
+                args,
+                lambda request_args: self.dispatch(
+                    name,
+                    {
+                        **request_args,
+                        "__aming_managed_host_envelope_continuity_bypass": True,
+                    },
+                ),
+            )
         if worker_host_envelope_present() and name in WORKER_MCP_HOST_ONLY_TOOLS:
             raise ValueError("host-only authentication tool is unavailable in worker MCP")
         required_argument_rejection = _runtime_context_required_argument_rejection(

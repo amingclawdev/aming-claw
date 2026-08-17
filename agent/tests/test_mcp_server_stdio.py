@@ -5,7 +5,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,298 @@ from agent.mcp.tools import ToolDispatcher
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
+    raw_session = "stdio-managed-session-secret"
+    raw_fence = "stdio-managed-fence-secret"
+    route = {
+        "route_id": "route-stdio-managed",
+        "route_context_hash": "sha256:" + ("1" * 64),
+        "prompt_contract_id": "rprompt-stdio-managed",
+        "prompt_contract_hash": "sha256:" + ("2" * 64),
+        "route_token_ref": "rtok-stdio-managed",
+        "visible_injection_manifest_hash": "sha256:" + ("3" * 64),
+    }
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-stdio-managed",
+        "task_id": "worker-stdio-managed",
+        "parent_task_id": "cex-stdio-managed",
+        "contract_execution_id": "cex-stdio-managed",
+        "target_project_root": str(tmp_path),
+        "worker_id": "worker-stdio-managed",
+        "worker_slot_id": "worker-stdio-managed",
+        "agent_id": "worker-stdio-managed",
+        "allocation_owner": "worker-stdio-managed",
+        "actual_host_worker_id": "worker-stdio-managed",
+        "worker_session_id": "desktop-stdio-managed",
+        "host_startup_id": "desktop-stdio-managed",
+        "host_session_id": "desktop-stdio-managed",
+        "session_token_ref": "wstok-stdio-managed",
+        **route,
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        calls = []
+
+        def log_message(self, *_args):
+            return None
+
+        def _send(self, payload):
+            encoded = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            assert query["session_token"] == [raw_session]
+            assert query["fence_token"] == [raw_fence]
+            self.__class__.calls.append(("GET", self.path, None))
+            self._send({"ok": True, "status": "worker_guide_ready"})
+
+        def do_POST(self):
+            size = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(size) or b"{}")
+            self.__class__.calls.append(("POST", self.path, body))
+            if self.path.endswith("/session-token/reissue"):
+                envelope_identity = {
+                    key: value for key, value in identity.items() if key not in route
+                }
+                self._send(
+                    {
+                        "ok": True,
+                        "status": "session_token_reissued",
+                        "delivery": "worker_host_envelope",
+                        **envelope_identity,
+                        "route_identity": route,
+                        "session_token": raw_session,
+                        "fence_token": raw_fence,
+                        "host_envelope": {
+                            **envelope_identity,
+                            "route_identity": route,
+                            "env": {
+                                "AMING_WORKER_SESSION_TOKEN": raw_session,
+                                "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                            },
+                        },
+                    }
+                )
+                return
+            assert body["session_token"] == raw_session
+            assert body["fence_token"] == raw_fence
+            self._send(
+                {
+                    "ok": True,
+                    "status": (
+                        "startup_recorded"
+                        if self.path.endswith("/parallel-branches/startup")
+                        else "accepted"
+                    ),
+                }
+            )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    guide_args = {
+        key: value
+        for key, value in identity.items()
+        if key
+        in {
+            "project_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "target_project_root",
+            "session_token_ref",
+            *route,
+        }
+    }
+    try:
+        responses, stderr, returncode = _run_mcp_probe(
+            [
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "runtime_context_session_token_reissue",
+                        "arguments": {**identity, "reason": "stage privately"},
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "runtime_context_worker_guide",
+                        "arguments": guide_args,
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "runtime_context_read_receipt",
+                        "arguments": identity,
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "parallel_branch_startup",
+                        "arguments": {**identity, "worker_role": "mf_sub"},
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "runtime_context_read_receipt",
+                        "arguments": identity,
+                    },
+                },
+            ],
+            extra_args=[
+                "--governance-url",
+                f"http://127.0.0.1:{server.server_address[1]}",
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert returncode == 0
+    assert stderr == ""
+    payloads = [
+        json.loads(item["result"]["content"][0]["text"])
+        for item in responses[1:]
+    ]
+    assert payloads[0]["auth_loaded"] is True
+    assert payloads[0]["managed_host_envelope"]["process_local"] is True
+    assert payloads[3]["managed_host_envelope_consumed"] is True
+    assert payloads[4]["error"] == "managed_host_envelope_not_loaded"
+    assert len(Handler.calls) == 4
+    serialized = json.dumps(responses, sort_keys=True) + stderr
+    assert raw_session not in serialized
+    assert raw_fence not in serialized
+
+
+def test_governance_stdio_mirror_manages_same_host_envelope_flow(monkeypatch):
+    continuity = runtime_mcp_tool_module.ManagedHostEnvelopeContinuity()
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_HOST_ENVELOPE_CONTINUITY",
+        continuity,
+    )
+    raw_session = "mirror-managed-session"
+    raw_fence = "mirror-managed-fence"
+    route = {
+        "route_id": "route-mirror-managed",
+        "route_context_hash": "sha256:" + ("4" * 64),
+        "prompt_contract_id": "rprompt-mirror-managed",
+        "prompt_contract_hash": "sha256:" + ("5" * 64),
+        "route_token_ref": "rtok-mirror-managed",
+        "visible_injection_manifest_hash": "sha256:" + ("6" * 64),
+    }
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-mirror-managed",
+        "task_id": "worker-mirror-managed",
+        "parent_task_id": "cex-mirror-managed",
+        "contract_execution_id": "cex-mirror-managed",
+        "target_project_root": "/tmp/mirror-managed",
+        "worker_id": "worker-mirror-managed",
+        "worker_slot_id": "worker-mirror-managed",
+        "agent_id": "worker-mirror-managed",
+        "allocation_owner": "worker-mirror-managed",
+        "actual_host_worker_id": "worker-mirror-managed",
+        "worker_session_id": "desktop-mirror-managed",
+        "host_startup_id": "desktop-mirror-managed",
+        "host_session_id": "desktop-mirror-managed",
+        "session_token_ref": "wstok-mirror-managed",
+        **route,
+    }
+    calls = []
+
+    def fake_http(method, path, body=None, *args, **kwargs):
+        calls.append((method, path, body))
+        if path.endswith("/session-token/reissue"):
+            return {
+                "ok": True,
+                "status": "session_token_reissued",
+                "delivery": "worker_host_envelope",
+                **identity,
+                "session_token": raw_session,
+                "fence_token": raw_fence,
+                "host_envelope": {
+                    **identity,
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": raw_session,
+                        "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                    },
+                },
+            }
+        if method == "GET":
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+            assert query["session_token"] == [raw_session]
+            assert query["fence_token"] == [raw_fence]
+            return {"ok": True, "status": "worker_guide_ready"}
+        assert body["session_token"] == raw_session
+        assert body["fence_token"] == raw_fence
+        return {
+            "ok": True,
+            "status": (
+                "startup_recorded"
+                if path.endswith("/parallel-branches/startup")
+                else "accepted"
+            ),
+        }
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    issued = governance_mcp_server._dispatch_tool(
+        "runtime_context_session_token_reissue",
+        {**identity, "reason": "stage in mirror"},
+    )
+    assert issued["auth_loaded"] is True
+    assert raw_session not in json.dumps(issued, sort_keys=True)
+    assert raw_fence not in json.dumps(issued, sort_keys=True)
+    guide_args = {
+        key: value
+        for key, value in identity.items()
+        if key
+        in {
+            "project_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "target_project_root",
+            "session_token_ref",
+            *route,
+        }
+    }
+    assert governance_mcp_server._dispatch_tool(
+        "runtime_context_worker_guide", guide_args
+    )["ok"] is True
+    assert governance_mcp_server._dispatch_tool(
+        "runtime_context_read_receipt", identity
+    )["ok"] is True
+    startup = governance_mcp_server._dispatch_tool(
+        "parallel_branch_startup", {**identity, "worker_role": "mf_sub"}
+    )
+    assert startup["managed_host_envelope_consumed"] is True
+    assert continuity.pending_count() == 0
+    assert len(calls) == 4
 
 
 def _run_mcp_probe(

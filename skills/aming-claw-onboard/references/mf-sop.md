@@ -49,3 +49,24 @@ DB-verified graph tuple prove the same commits, its base and candidate failure
 node IDs are identical, candidate-new failures are zero, and it explicitly
 claims no overall PASS. Compatibility recognition never rewrites history and
 never synthesizes PASS.
+
+## Managed MCP worker host-envelope continuity
+
+For a non-CLI MCP host, a successful `initial_join`, `reissue`, or `rejoin`
+must be consumed by the same long-lived MCP process. The adapter stages the
+typed `host_envelope.env` in the shared in-memory `HostEnvelopeStore`, removes
+all raw session/fence values from the public `tools/call` result, and returns
+only the copy-safe `session_token_ref` plus `auth_loaded=true`. Raw auth must
+never enter model-visible content, logs, timeline evidence, or disk.
+
+The same MCP process may inject that staged envelope only for an exact
+project/runtime/task/worker/route/generation match while executing Worker
+Guide, read receipt, and startup. Read receipt retains the envelope. An
+accepted startup is the consumption acknowledgement: the adapter immediately
+zeroizes the stored values, and every later retrieval or cross-scope call
+fails closed. A process restart intentionally loses the store; it must refresh
+the Worker Guide and use only the server-projected bounded replacement, never
+reconstruct or replay raw credentials. The server permits one additional
+managed-host loss replacement for the exact unconsumed current generation and
+rejects another loss, ambiguity, stale refs, identity drift, or any request
+after receipt/startup consumption.

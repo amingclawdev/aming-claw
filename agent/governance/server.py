@@ -41610,7 +41610,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
     prior_safe_ref_reissue_event: Mapping[str, Any] | None = None
     if (
         not matching_session_authorities
-        and len(stage_reissue_events) == 1
+        and len(stage_reissue_events) in {1, 2}
         and len(matching_stage_reissue_events) == 1
     ):
         candidate_event = matching_stage_reissue_events[0]
@@ -41637,7 +41637,13 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             for item in validated_session_authorities.get(source_ref, [])
             if item[1] == source_kind
         ]
-        if len(source_matches) == 1:
+        latest_stage_event_id = max(
+            int(item.get("id") or 0) for item in stage_reissue_events
+        )
+        if (
+            len(source_matches) == 1
+            and int(candidate_event.get("id") or 0) == latest_stage_event_id
+        ):
             prior_safe_ref_reissue_event = candidate_event
             matching_session_authorities = source_matches
     selected_initial_join: Mapping[str, Any]
@@ -41812,8 +41818,73 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             "lease_record_valid": True,
             "expired": False,
         }
+        prior_loss_authority = (
+            prior_payload.get("safe_ref_loss_replacement_authority")
+            if isinstance(
+                prior_payload.get("safe_ref_loss_replacement_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        prior_stage_reissue_count = len(stage_reissue_events)
+        expected_prior_stage_event_ref = (
+            f"timeline:{stage_reissue_events[0].get('id', '')}"
+            if stage_reissue_events
+            else ""
+        )
+        prior_loss_chain_valid = bool(
+            (
+                prior_stage_reissue_count == 1
+                and not prior_loss_authority
+            )
+            or (
+                prior_stage_reissue_count == 2
+                and str(
+                    prior_loss_authority.get("schema_version") or ""
+                ).strip()
+                == "runtime_context.safe_ref_loss_replacement_authority.v1"
+                and prior_loss_authority.get("server_derived") is True
+                and prior_loss_authority.get("caller_claims_trusted") is False
+                and int(
+                    prior_loss_authority.get("prior_stage_reissue_count") or 0
+                )
+                == 1
+                and int(
+                    prior_loss_authority.get("loss_replacement_generation") or 1
+                )
+                == 1
+                and int(
+                    prior_loss_authority.get("max_loss_replacements") or 0
+                )
+                in {1, 2}
+                and str(
+                    prior_loss_authority.get("prior_reissue_event_ref") or ""
+                ).strip()
+                == expected_prior_stage_event_ref
+                and prior_loss_authority.get("worker_receipt_consumed") is False
+                and prior_loss_authority.get("worker_startup_consumed") is False
+                and prior_loss_authority.get("raw_credentials_persisted") is False
+                and re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    str(prior_loss_authority.get("authority_hash") or ""),
+                )
+                is not None
+                and str(
+                    prior_loss_authority.get("authority_hash") or ""
+                ).strip()
+                == _stable_public_hash(
+                    {
+                        key: value
+                        for key, value in prior_loss_authority.items()
+                        if key != "authority_hash"
+                    }
+                )
+            )
+        )
         if (
-            prior_identity != expected_prior_identity
+            not prior_loss_chain_valid
+            or prior_stage_reissue_count not in {1, 2}
+            or prior_identity != expected_prior_identity
             or prior_payload.get("ok") is not True
             or str(prior_payload.get("schema_version") or "").strip()
             != "mf_subagent_session_token_reissue_response.v1"
@@ -41893,8 +41964,12 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
                 f"timeline:{prior_safe_ref_reissue_event.get('id', '')}"
             ),
             "stage_checkpoint_id": stage_checkpoint_id,
-            "prior_stage_reissue_count": 1,
-            "max_loss_replacements": 1,
+            "prior_stage_reissue_count": prior_stage_reissue_count,
+            "loss_replacement_generation": prior_stage_reissue_count,
+            "max_loss_replacements": 2,
+            "managed_host_continuity_loss_replacement": (
+                prior_stage_reissue_count == 2
+            ),
             "session_token_ref": presented_session_ref,
             "lease_id": str(context.lease_id or "").strip(),
             "lease_status_at_replacement": current_lease_status,

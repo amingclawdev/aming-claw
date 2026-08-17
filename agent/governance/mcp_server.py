@@ -35,6 +35,15 @@ import urllib.error
 from pathlib import Path
 from typing import Any
 
+try:
+    from agent.mcp.host_envelope_continuity import (
+        default_managed_host_envelope_continuity,
+    )
+except ModuleNotFoundError:  # Direct ``python agent/governance/mcp_server.py``.
+    from mcp.host_envelope_continuity import (
+        default_managed_host_envelope_continuity,
+    )
+
 # ---------------------------------------------------------------------------
 # Ensure the agent package root is on sys.path so relative imports work when
 # the file is executed directly (python mcp_server.py).
@@ -70,6 +79,7 @@ _WORKER_MCP_HOST_ONLY_TOOLS = frozenset(
         "runtime_context_session_token_rejoin",
     }
 )
+_HOST_ENVELOPE_CONTINUITY = default_managed_host_envelope_continuity()
 
 
 def _copy_safe_observer_route_context_issue_result(value: Any) -> Any:
@@ -3041,6 +3051,26 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "parallel_branch_startup",
+        "description": "Record actual host-created bounded mf_sub startup evidence. Managed MCP hosts consume and zeroize the exact process-local worker host envelope only after an accepted startup response.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                **_runtime_context_write_schema_properties(),
+                "actual_cwd": {"type": "string"},
+                "actual_git_root": {"type": "string"},
+                "branch": {"type": "string"},
+                "branch_ref": {"type": "string"},
+                "branch_head": {"type": "string"},
+                "base_commit": {"type": "string"},
+                "target_head_commit": {"type": "string"},
+                "merge_queue_id": {"type": "string"},
+                "startup_source": {"type": "string"},
+            },
+            "required": ["project_id", "runtime_context_id", "task_id"],
+        },
+    },
+    {
         "name": "parallel_branch_merge_queue_status",
         "description": (
             "Copy-safe merge queue status for direct-fix, hotfix, mf_parallel, "
@@ -3450,6 +3480,7 @@ _RUNTIME_CONTEXT_IDENTITY_REQUIRED_TOOLS = frozenset(
         "runtime_context_session_token_initial_join",
         "runtime_context_session_token_reissue",
         "runtime_context_session_token_rejoin",
+        "parallel_branch_startup",
     }
 )
 
@@ -3487,10 +3518,25 @@ def _runtime_context_required_argument_rejection(
 
 
 def _dispatch_tool(name: str, args: dict) -> Any:
+    args = dict(args or {})
+    continuity_bypass = bool(
+        args.pop("__aming_managed_host_envelope_continuity_bypass", False)
+    )
+    if not continuity_bypass and _HOST_ENVELOPE_CONTINUITY.handles(name):
+        return _HOST_ENVELOPE_CONTINUITY.dispatch(
+            name,
+            args,
+            lambda request_args: _dispatch_tool(
+                name,
+                {
+                    **request_args,
+                    "__aming_managed_host_envelope_continuity_bypass": True,
+                },
+            ),
+        )
     if _worker_host_envelope_present() and name in _WORKER_MCP_HOST_ONLY_TOOLS:
         raise ValueError("host-only authentication tool is unavailable in worker MCP")
     """Dispatch a tools/call to the governance HTTP API."""
-    args = dict(args or {})
     required_argument_rejection = _runtime_context_required_argument_rejection(
         name,
         args,
@@ -4085,6 +4131,20 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         return _http(
             "POST",
             f"/api/graph-governance/{pid}/parallel-branches/allocate",
+            body,
+        )
+
+    if name == "parallel_branch_startup":
+        pid = args["project_id"]
+        request_args = _worker_auth_from_env(args)
+        body = {
+            key: value
+            for key, value in request_args.items()
+            if key != "project_id" and value is not None
+        }
+        return _http(
+            "POST",
+            f"/api/graph-governance/{pid}/parallel-branches/startup",
             body,
         )
 

@@ -42420,7 +42420,8 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     )
     replacement_authority = joined["safe_ref_loss_replacement_authority"]
     assert replacement_authority["prior_stage_reissue_count"] == 1
-    assert replacement_authority["max_loss_replacements"] == 1
+    assert replacement_authority["loss_replacement_generation"] == 1
+    assert replacement_authority["max_loss_replacements"] == 2
     assert replacement_authority["lease_status_at_replacement"] == "expired"
     assert replacement_authority["worker_receipt_consumed"] is False
     assert replacement_authority["worker_startup_consumed"] is False
@@ -42439,7 +42440,7 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         )
     assert competing_retry.value.code == "fence_invalidated_or_unknown"
     assert "\n".join(conn.iterdump()) == before_competing_retry
-    with pytest.raises(GovernanceError) as exhausted_guide:
+    with pytest.raises(GovernanceError) as managed_guide:
         server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
             _ctx_with_role(
                 {
@@ -42458,14 +42459,55 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
                 },
             )
         )
+    assert managed_guide.value.code == "fence_invalidated_or_unknown"
+    managed_details = managed_guide.value.details
+    assert managed_details["diagnostics"][
+        "session_token_rejoin_eligibility"
+    ]["eligible"] is True
+    managed_body = copy.deepcopy(
+        managed_details["actionable_payloads"]
+        ["session_token_reissue_submission"]["copy_safe_body"]
+    )
+    managed_body["reason"] = (
+        "replace the process-local managed envelope lost before delivery"
+    )
+    managed = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": fresh_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=managed_body,
+        )
+    )
+    managed_authority = managed["safe_ref_loss_replacement_authority"]
+    assert managed_authority["loss_replacement_generation"] == 2
+    assert managed_authority["managed_host_continuity_loss_replacement"] is True
+    with pytest.raises(GovernanceError) as exhausted_guide:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "task_id": fresh_task_id,
+                    "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                    "worker_id": fresh_worker_id,
+                    "worker_slot_id": fresh_worker_id,
+                    "session_token_ref": managed["session_token_ref"],
+                    "target_project_root": str(world.root),
+                    **route_identity,
+                },
+            )
+        )
     assert exhausted_guide.value.code == "fence_invalidated_or_unknown"
-    exhausted_details = exhausted_guide.value.details
-    assert exhausted_details["diagnostics"][
+    assert exhausted_guide.value.details["diagnostics"][
         "session_token_rejoin_eligibility"
     ]["eligible"] is False
-    assert "session_token_reissue_submission" not in exhausted_details[
-        "actionable_payloads"
-    ]
 
     # Prepare the same-current-ref request while it is still a valid pre-read
     # world.  After receipt/startup consume the envelope, this byte-identical
@@ -42486,7 +42528,7 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         host_startup_id=fresh_host_startup_id,
         host_session_id=fresh_worker_session_id,
         route_identity=route_identity,
-        session_token_ref=joined["session_token_ref"],
+        session_token_ref=managed["session_token_ref"],
         contract_execution_id=_BATCH_QA_CHILD_EXECUTIONS[index],
     )
     post_consumption_reissue_body = copy.deepcopy(
@@ -42516,9 +42558,9 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
                         "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
                         "worker_id": fresh_worker_id,
                         "worker_slot_id": fresh_worker_id,
-                        "fence_token": joined["fence_token"],
-                        "session_token": joined["session_token"],
-                        "session_token_ref": joined["session_token_ref"],
+                        "fence_token": managed["fence_token"],
+                        "session_token": managed["session_token"],
+                        "session_token_ref": managed["session_token_ref"],
                         "target_project_root": str(world.root),
                     },
                 )
@@ -42651,9 +42693,9 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
                 "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
                 "worker_id": fresh_worker_id,
                 "worker_slot_id": fresh_worker_id,
-                "fence_token": joined["fence_token"],
-                "session_token": joined["session_token"],
-                "session_token_ref": joined["session_token_ref"],
+                "fence_token": managed["fence_token"],
+                "session_token": managed["session_token"],
+                "session_token_ref": managed["session_token_ref"],
                 "target_project_root": str(world.root),
                 "actor": fresh_worker_id,
                 "read_receipt_hash": receipt_hash,
@@ -42709,9 +42751,9 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
                 "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
                 "task_id": fresh_task_id,
                 "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
-                "session_token": joined["session_token"],
-                "session_token_ref": joined["session_token_ref"],
-                "fence_token": joined["fence_token"],
+                "session_token": managed["session_token"],
+                "session_token_ref": managed["session_token_ref"],
+                "fence_token": managed["fence_token"],
                 "target_project_root": str(world.root),
                 "agent_id": fresh_worker_id,
                 "actual_host_worker_id": fresh_worker_id,
@@ -42783,6 +42825,8 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         first_reissued["fence_token"],
         joined["session_token"],
         joined["fence_token"],
+        managed["session_token"],
+        managed["fence_token"],
     ):
         assert raw_secret not in serialized_events
 
@@ -61744,11 +61788,34 @@ def test_legacy_v1_replacement_expired_latest_ref_reissues_then_starts(
         "audit_event_ref"
     ]
     assert loss_authority["prior_stage_reissue_count"] == 1
-    assert loss_authority["max_loss_replacements"] == 1
-    exhausted_body = {
+    assert loss_authority["loss_replacement_generation"] == 1
+    assert loss_authority["max_loss_replacements"] == 2
+    managed_body = {
         **replacement_body,
         "session_token_ref": replaced["session_token_ref"],
-        "reason": "a second loss replacement is forbidden",
+        "reason": "replace the managed-host envelope lost before consumption",
+    }
+    managed = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=managed_body,
+        )
+    )
+    assert managed["safe_ref_loss_replacement_authority"][
+        "loss_replacement_generation"
+    ] == 2
+    assert managed["safe_ref_loss_replacement_authority"][
+        "managed_host_continuity_loss_replacement"
+    ] is True
+    exhausted_body = {
+        **replacement_body,
+        "session_token_ref": managed["session_token_ref"],
+        "reason": "a post-managed-continuity loss replacement is forbidden",
     }
     before_exhausted_dump = "\n".join(conn.iterdump())
     before_exhausted_changes = conn.total_changes
@@ -61783,9 +61850,9 @@ def test_legacy_v1_replacement_expired_latest_ref_reissues_then_starts(
                 "contract_execution_id": case["parent_task_id"],
                 "task_id": case["task_id"],
                 "parent_task_id": case["parent_task_id"],
-                "session_token": replaced["session_token"],
-                "session_token_ref": replaced["session_token_ref"],
-                "fence_token": replaced["fence_token"],
+                "session_token": managed["session_token"],
+                "session_token_ref": managed["session_token_ref"],
+                "fence_token": managed["fence_token"],
                 "target_project_root": str(case["target_root"]),
                 "agent_id": case["worker_id"],
                 "actual_host_worker_id": case["worker_id"],
@@ -61821,6 +61888,8 @@ def test_legacy_v1_replacement_expired_latest_ref_reissues_then_starts(
         reissued["fence_token"],
         replaced["session_token"],
         replaced["fence_token"],
+        managed["session_token"],
+        managed["fence_token"],
     ):
         assert raw_value not in serialized
 
@@ -63933,11 +64002,34 @@ def test_special_safe_ref_reissue_and_blocked_startup_loss_replacement_are_bound
     )
     assert replacement["safe_ref_loss_replacement_authority"][
         "max_loss_replacements"
+    ] == 2
+    assert replacement["safe_ref_loss_replacement_authority"][
+        "loss_replacement_generation"
     ] == 1
 
-    exhausted_body = recovery_body(
+    managed_body = recovery_body(
         replacement["session_token_ref"],
-        "a second loss replacement must fail closed",
+        "replace the one envelope lost at the managed MCP host boundary",
+    )
+    managed = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": current.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=managed_body,
+        )
+    )
+    managed_authority = managed["safe_ref_loss_replacement_authority"]
+    assert managed_authority["loss_replacement_generation"] == 2
+    assert managed_authority["managed_host_continuity_loss_replacement"] is True
+    assert managed_authority["max_loss_replacements"] == 2
+
+    exhausted_body = recovery_body(
+        managed["session_token_ref"],
+        "a post-managed-continuity loss replacement must fail closed",
     )
     before_exhausted = "\n".join(conn.iterdump())
     with pytest.raises(GovernanceError) as exhausted:
@@ -63963,6 +64055,8 @@ def test_special_safe_ref_reissue_and_blocked_startup_loss_replacement_are_bound
         first["fence_token"],
         replacement["session_token"],
         replacement["fence_token"],
+        managed["session_token"],
+        managed["fence_token"],
     ):
         assert raw_secret not in serialized
 

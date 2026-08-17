@@ -27,12 +27,25 @@ _PUBLIC_FIELDS = (
     "task_id",
     "parent_task_id",
     "backlog_id",
+    "contract_execution_id",
+    "target_project_root",
     "worker_role",
     "worker_id",
     "worker_slot_id",
+    "agent_id",
+    "allocation_owner",
+    "principal_id",
     "actual_host_worker_id",
     "worker_session_id",
+    "host_startup_id",
+    "host_session_id",
     "session_token_ref",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
 )
 _RAW_FIELDS = {
     "session_token",
@@ -78,7 +91,7 @@ def _safe_text(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    if not _SAFE_REF.fullmatch(text):
+    if len(text) > 4096 or any(ord(character) < 32 for character in text):
         raise HostEnvelopeError("host envelope contains an invalid copy-safe reference")
     return text
 
@@ -357,6 +370,94 @@ class HostEnvelopeStore:
         environment = entry.environment
         entry.environment = {}
         return HostEnvelopeDelivery(environment)
+
+    def borrow(
+        self,
+        run_id: str,
+        *,
+        lease_owner_id: str,
+        envelope_ref: str,
+        expected_public_refs: Mapping[str, Any],
+    ) -> HostEnvelopeDelivery | None:
+        """Copy one exact envelope for a protected call without consuming it.
+
+        This is an internal host-continuity seam, not a raw read API: callers
+        receive only a delivery object whose values can be applied to a
+        temporary mapping and are wiped by ``discard``.  Exact public identity
+        matching prevents a process-local envelope from crossing runtimes,
+        tasks, workers, routes, or generations.
+        """
+
+        normalized_run_id = str(run_id or "").strip()
+        normalized_owner_id = str(lease_owner_id or "").strip()
+        normalized_envelope_ref = str(envelope_ref or "").strip()
+        with self._lock:
+            self._purge_expired_locked()
+            entry = self._entries.get(normalized_run_id)
+            if entry is None:
+                return None
+            if entry.lease_owner_id != normalized_owner_id:
+                raise HostEnvelopeError("host envelope lease owner does not match")
+            if entry.envelope_ref != normalized_envelope_ref:
+                raise HostEnvelopeError("host envelope ref does not match delivery scope")
+            expected = {
+                str(key): str(value or "").strip()
+                for key, value in expected_public_refs.items()
+                if str(value or "").strip()
+            }
+            if any(
+                str(entry.public_refs.get(key) or "").strip() != value
+                for key, value in expected.items()
+            ):
+                raise HostEnvelopeError("host envelope public identity does not match")
+            copied = {
+                key: bytearray(value)
+                for key, value in entry.environment.items()
+            }
+        return HostEnvelopeDelivery(copied)
+
+    def acknowledge(
+        self,
+        run_id: str,
+        *,
+        lease_owner_id: str,
+        envelope_ref: str,
+        expected_public_refs: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Consume and zeroize the exact staged envelope after startup ack."""
+
+        normalized_run_id = str(run_id or "").strip()
+        normalized_owner_id = str(lease_owner_id or "").strip()
+        normalized_envelope_ref = str(envelope_ref or "").strip()
+        with self._lock:
+            self._purge_expired_locked()
+            entry = self._entries.get(normalized_run_id)
+            if entry is None:
+                return {
+                    "schema_version": "cli_agent_service.host_envelope_receipt.v1",
+                    "status": "not_found",
+                    "run_id": normalized_run_id,
+                    "single_use": True,
+                    "raw_worker_auth_exposed": False,
+                }
+            if entry.lease_owner_id != normalized_owner_id:
+                raise HostEnvelopeError("host envelope lease owner does not match")
+            if entry.envelope_ref != normalized_envelope_ref:
+                raise HostEnvelopeError("host envelope ref does not match delivery scope")
+            expected = {
+                str(key): str(value or "").strip()
+                for key, value in expected_public_refs.items()
+                if str(value or "").strip()
+            }
+            if any(
+                str(entry.public_refs.get(key) or "").strip() != value
+                for key, value in expected.items()
+            ):
+                raise HostEnvelopeError("host envelope public identity does not match")
+            self._entries.pop(normalized_run_id)
+        summary = entry.summary("consumed")
+        entry.wipe()
+        return summary
 
     def revoke(
         self,
