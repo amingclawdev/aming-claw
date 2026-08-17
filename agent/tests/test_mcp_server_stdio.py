@@ -1694,26 +1694,24 @@ def test_mcp_stdio_reissue_schema_accepts_safe_ref_or_raw_worker_auth_proof():
     assert stderr == ""
     tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
     schema = tools["runtime_context_session_token_reissue"]["inputSchema"]
+    identity = ["project_id", "runtime_context_id", "task_id"]
+
+    def projected_branch(*proof_fields: str) -> dict:
+        fields = [*identity, *proof_fields]
+        return {
+            "type": "object",
+            "required": fields,
+            "properties": {
+                field: {"type": "string", "minLength": 1}
+                for field in fields
+            },
+        }
+
     expected_schema = {
-        "required": [
-            "project_id",
-            "runtime_context_id",
-            "task_id",
-        ],
+        "required": identity,
         "anyOf": [
-            {
-                "required": ["session_token_ref"],
-                "properties": {
-                    "session_token_ref": {"type": "string", "minLength": 1},
-                },
-            },
-            {
-                "required": ["fence_token", "session_token"],
-                "properties": {
-                    "fence_token": {"type": "string", "minLength": 1},
-                    "session_token": {"type": "string", "minLength": 1},
-                },
-            },
+            projected_branch("session_token_ref"),
+            projected_branch("fence_token", "session_token"),
         ],
     }
     assert schema["required"] == expected_schema["required"]
@@ -1725,6 +1723,7 @@ def test_mcp_stdio_reissue_schema_accepts_safe_ref_or_raw_worker_auth_proof():
     )
     assert standalone_schema["required"] == expected_schema["required"]
     assert standalone_schema["anyOf"] == expected_schema["anyOf"]
+    assert standalone_schema["anyOf"] == schema["anyOf"]
     assert {
         "project_id",
         "runtime_context_id",
@@ -1735,6 +1734,76 @@ def test_mcp_stdio_reissue_schema_accepts_safe_ref_or_raw_worker_auth_proof():
         "target_project_root",
         "ttl_seconds",
     }.issubset(schema["properties"])
+
+
+def test_mcp_reissue_codex_union_projection_rejects_incomplete_auth_before_http():
+    schemas = [
+        next(
+            tool["inputSchema"]
+            for tool in tools
+            if tool["name"] == "runtime_context_session_token_reissue"
+        )
+        for tools in (runtime_mcp_tools, governance_mcp_server.TOOLS)
+    ]
+    http_calls: list[tuple] = []
+
+    def host_accepts(projected_schema: dict, arguments: dict) -> bool:
+        for field in projected_schema["required"]:
+            value = arguments.get(field)
+            field_schema = projected_schema["properties"][field]
+            if field_schema["type"] != "string" or not isinstance(value, str):
+                return False
+            if field_schema.get("minLength", 0) and not value:
+                return False
+        return True
+
+    malformed = [
+        {
+            "runtime_context_id": "mfrctx-projected",
+            "task_id": "worker-projected",
+            "session_token_ref": "wstok-projected",
+        },
+        {
+            "project_id": 7,
+            "runtime_context_id": "mfrctx-projected",
+            "task_id": "worker-projected",
+            "session_token_ref": "wstok-projected",
+        },
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-projected",
+            "task_id": "worker-projected",
+            "fence_token": "fence-projected",
+        },
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "",
+            "task_id": "worker-from-another-runtime",
+            "session_token_ref": "wstok-projected",
+        },
+    ]
+    valid = [
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-projected",
+            "task_id": "worker-projected",
+            "session_token_ref": "wstok-projected",
+        },
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-projected",
+            "task_id": "worker-projected",
+            "fence_token": "fence-projected",
+            "session_token": "session-projected",
+        },
+    ]
+
+    for schema in schemas:
+        safe_ref, raw = schema["anyOf"]
+        assert all(not host_accepts(branch, payload) for branch in (safe_ref, raw) for payload in malformed)
+        assert host_accepts(safe_ref, valid[0])
+        assert host_accepts(raw, valid[1])
+    assert http_calls == []
 
 
 def test_mcp_stdio_parallel_branch_allocate_schema_exposes_dispatch_ready_fields():
@@ -2671,6 +2740,74 @@ def test_mcp_dispatcher_runtime_context_reissue_forwards_safe_ref_recovery_body(
                 if key != "project_id"
             },
         )
+    ]
+
+
+def test_governance_mcp_runtime_context_reissue_posts_guide_safe_ref_and_raw_bodies(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_http(method, path, body=None, *args, **kwargs):
+        calls.append((method, path, body))
+        return {"ok": True, "status": "session_token_reissued"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    safe_ref_body = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-guide-safe-ref",
+        "contract_execution_id": "cex-guide-safe-ref",
+        "task_id": "worker-guide-safe-ref",
+        "parent_task_id": "cex-guide-safe-ref",
+        "target_project_root": "/repo/guide-safe-ref",
+        "worker_id": "worker-guide-safe-ref",
+        "worker_slot_id": "worker-guide-safe-ref",
+        "agent_id": "worker-guide-safe-ref",
+        "allocation_owner": "worker-guide-safe-ref",
+        "actual_host_worker_id": "worker-guide-safe-ref",
+        "worker_session_id": "session-guide-safe-ref",
+        "host_session_id": "session-guide-safe-ref",
+        "session_token_ref": "wstok-guide-safe-ref",
+        "reason": "recover the exact Guide-projected pre-startup envelope",
+        "ttl_seconds": 1200,
+    }
+    raw_body = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-guide-raw",
+        "task_id": "worker-guide-raw",
+        "session_token": "session-guide-raw",
+        "fence_token": "fence-guide-raw",
+    }
+
+    assert governance_mcp_server._dispatch_tool(
+        "runtime_context_session_token_reissue",
+        safe_ref_body,
+    ) == {"ok": True, "status": "session_token_reissued"}
+    assert governance_mcp_server._dispatch_tool(
+        "runtime_context_session_token_reissue",
+        raw_body,
+    ) == {"ok": True, "status": "session_token_reissued"}
+    assert calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            "mfrctx-guide-safe-ref/session-token/reissue",
+            {
+                key: value
+                for key, value in safe_ref_body.items()
+                if key != "project_id"
+            },
+        ),
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            "mfrctx-guide-raw/session-token/reissue",
+            {
+                key: value
+                for key, value in raw_body.items()
+                if key != "project_id"
+            },
+        ),
     ]
 
 

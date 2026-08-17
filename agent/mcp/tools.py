@@ -676,6 +676,28 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
     return properties
 
 
+def _runtime_context_session_token_reissue_auth_branches() -> list[dict[str, Any]]:
+    """Return self-contained auth alternatives for host schema projection."""
+
+    identity_fields = ("project_id", "runtime_context_id", "task_id")
+
+    def branch(*proof_fields: str) -> dict[str, Any]:
+        fields = (*identity_fields, *proof_fields)
+        return {
+            "type": "object",
+            "required": list(fields),
+            "properties": {
+                field: {"type": "string", "minLength": 1}
+                for field in fields
+            },
+        }
+
+    return [
+        branch("session_token_ref"),
+        branch("fence_token", "session_token"),
+    ]
+
+
 def _runtime_context_write_body(args: dict) -> dict:
     return {
         key: value
@@ -3870,24 +3892,7 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": _runtime_context_write_schema_properties(),
             "required": ["project_id", "runtime_context_id", "task_id"],
-            "anyOf": [
-                {
-                    "required": ["session_token_ref"],
-                    "properties": {
-                        "session_token_ref": {
-                            "type": "string",
-                            "minLength": 1,
-                        },
-                    },
-                },
-                {
-                    "required": ["fence_token", "session_token"],
-                    "properties": {
-                        "fence_token": {"type": "string", "minLength": 1},
-                        "session_token": {"type": "string", "minLength": 1},
-                    },
-                },
-            ],
+            "anyOf": _runtime_context_session_token_reissue_auth_branches(),
         },
     },
     {
