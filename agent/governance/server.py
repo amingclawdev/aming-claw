@@ -29616,7 +29616,12 @@ def _runtime_context_worker_guide_paged_value(
             "contract_execution_id",
             "worker_id",
             "worker_slot_id",
+            "dispatch_source_ref",
+            "source_of_authority",
             "required_role",
+            "failed_qa_replacement_context_local_setup_projection",
+            "contract_runtime_mutated",
+            "global_contract_line_already_completed",
             "code",
             "error",
             "reason",
@@ -29632,6 +29637,13 @@ def _runtime_context_worker_guide_paged_value(
             if key in value
             and isinstance(value[key], (str, int, float, bool, type(None)))
         }
+        submit_line_guidance = value.get("submit_line_guidance")
+        if isinstance(submit_line_guidance, Mapping):
+            inline["submit_line_guidance"] = {
+                key: deepcopy(child)
+                for key, child in submit_line_guidance.items()
+                if isinstance(child, (str, int, float, bool, type(None)))
+            }
         remaining_count = max(0, len(value) - len(inline))
     elif isinstance(value, (list, tuple)):
         inline_items = []
@@ -29930,6 +29942,79 @@ def _runtime_context_worker_guide_bounded_actionable_payloads(
     return result
 
 
+def _runtime_context_worker_guide_alias_actionable_bodies(
+    value: Any,
+    *,
+    field: str,
+    detail_ref: str,
+    canonical_action: Mapping[str, Any],
+) -> Any:
+    """Replace duplicate executable bodies with stable source-addressed aliases.
+
+    The compact Guide has exactly one executable body: the current
+    ``canonical_executable_action``.  Recovery/actionable projections retain
+    their shape, eligibility, and diagnostics, but their repeated
+    ``copy_safe_body`` values point at that canonical action (when current) or
+    at a fresh Guide/detail continuation (when inactive).  This is semantic
+    deduplication, not truncation: an inactive action becomes executable only
+    after a fresh Guide makes it canonical.
+    """
+
+    canonical_body = canonical_action.get("copy_safe_body")
+    canonical_body_hash = (
+        _stable_public_hash(canonical_body)
+        if isinstance(canonical_body, Mapping)
+        else ""
+    )
+
+    def project(item: Any, *, source_path: str) -> Any:
+        if isinstance(item, Mapping):
+            projected: dict[str, Any] = {}
+            for key, child in item.items():
+                child_path = f"{source_path}.{key}" if source_path else str(key)
+                if key == "copy_safe_body" and isinstance(child, Mapping):
+                    source_hash = _stable_public_hash(child)
+                    is_current = bool(
+                        canonical_body_hash and source_hash == canonical_body_hash
+                    )
+                    projected[key] = {
+                        "schema_version": (
+                            "runtime_context.worker_guide_action_body_alias.v1"
+                        ),
+                        "status": (
+                            "canonical_current_action"
+                            if is_current
+                            else "inactive_action_requires_fresh_guide"
+                        ),
+                        "source_path": child_path,
+                        "source_hash": source_hash,
+                        "detail_ref": detail_ref,
+                        "canonical_action_path": (
+                            "canonical_executable_action.copy_safe_body"
+                            if is_current
+                            else ""
+                        ),
+                        "refresh_worker_guide_required": not is_current,
+                        "semantic_truncation_performed": False,
+                    }
+                else:
+                    projected[key] = project(child, source_path=child_path)
+            return projected
+        if isinstance(item, list):
+            return [
+                project(child, source_path=f"{source_path}[{index}]")
+                for index, child in enumerate(item)
+            ]
+        if isinstance(item, tuple):
+            return [
+                project(child, source_path=f"{source_path}[{index}]")
+                for index, child in enumerate(item)
+            ]
+        return deepcopy(item)
+
+    return project(value, source_path=field)
+
+
 def _runtime_context_worker_guide_compact_response(
     response: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -29980,6 +30065,18 @@ def _runtime_context_worker_guide_compact_response(
         if current_stage and isinstance(executable_actions.get(current_stage), Mapping)
         else {}
     )
+    compact_actionable = _runtime_context_worker_guide_alias_actionable_bodies(
+        compact_actionable,
+        field="actionable_payloads",
+        detail_ref=detail_ref,
+        canonical_action=current_action,
+    )
+    actionable_paged_sections = compact_actionable.pop("paged_sections", {})
+    actionable_paged_sections = (
+        actionable_paged_sections
+        if isinstance(actionable_paged_sections, Mapping)
+        else {}
+    )
     route_identity = nested.get("route_identity")
     if not isinstance(route_identity, Mapping):
         route_identity = actionable.get("route_identity")
@@ -29998,6 +30095,17 @@ def _runtime_context_worker_guide_compact_response(
         else {}
     )
     paged_sections: dict[str, Any] = {}
+    paged_sections.update(deepcopy(dict(actionable_paged_sections)))
+    if actionable_paged_sections:
+        compact_actionable["paged_sections_ref"] = {
+            "schema_version": (
+                "runtime_context.worker_guide_paged_sections_alias.v1"
+            ),
+            "source_path": "paged_sections",
+            "detail_ref": detail_ref,
+            "source_hash": _stable_public_hash(actionable_paged_sections),
+            "semantic_truncation_performed": False,
+        }
 
     def paged(field: str, value: Any) -> Any:
         compact_value, page = _runtime_context_worker_guide_paged_value(
@@ -30083,6 +30191,7 @@ def _runtime_context_worker_guide_compact_response(
         "raw_session_token_exposed": False,
         "raw_fence_token_exposed": False,
         "raw_route_token_exposed": False,
+        "semantic_truncation_performed": False,
         "route_identity": deepcopy(dict(route_identity or {})),
         "graph_query_identity": deepcopy(dict(graph_query_identity)),
         "session_token_lease": deepcopy(dict(session_token_lease)),
@@ -30105,6 +30214,8 @@ def _runtime_context_worker_guide_compact_response(
         "missing_evidence": missing_evidence,
         "blocking_reasons": blocking_reasons,
         "canonical_executable_action": current_action,
+        "canonical_executable_action_path": "canonical_executable_action",
+        "canonical_executable_action_hash": _stable_public_hash(current_action),
         "actionable_payloads": compact_actionable,
         "source_refs": deepcopy(full.get("source_refs") or {}),
         "privacy_boundary": deepcopy(full.get("privacy_boundary") or {}),

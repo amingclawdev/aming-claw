@@ -79,6 +79,7 @@ from agent.governance.errors import (
     ValidationError,
 )
 from agent.mcp.schema_contract import MCP_TOOL_SCHEMA_VERSION
+from agent.mcp.host_envelope_continuity import ManagedHostEnvelopeContinuity
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
 from agent.governance.mf_subagent_contract import (
     MfSubagentContractError,
@@ -42611,6 +42612,23 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert rescue_marker["general_loss_replacement_limit_raised"] is False
     managed_before_legacy_rescue = managed
     managed = legacy_rescue
+    managed_continuity = ManagedHostEnvelopeContinuity()
+    managed_public = managed_continuity.dispatch(
+        "runtime_context_session_token_reissue",
+        legacy_rescue_body,
+        lambda _args: copy.deepcopy(managed),
+    )
+    assert managed_public["ok"] is True
+    assert managed_public["auth_loaded"] is True
+    assert managed_public["managed_host_envelope"]["status"] == "staged"
+    assert managed_public.get("raw_worker_auth_exposed") is not True
+    assert managed_public["managed_host_envelope"][
+        "raw_worker_auth_exposed"
+    ] is False
+    assert "session_token" not in managed_public
+    assert "fence_token" not in managed_public
+    assert "host_envelope" not in managed_public
+    assert managed_continuity.pending_count() == 1
 
     duplicate_rescue_body = copy.deepcopy(legacy_rescue_body)
     duplicate_rescue_body["session_token_ref"] = managed["session_token_ref"]
@@ -42665,27 +42683,44 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         actual_runtime.store.get(_BATCH_QA_CHILD_EXECUTIONS[index])
     )
 
-    def replacement_worker_guide():
-        return (
-            server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+    managed_guide_args = {
+        "project_id": PID,
+        "runtime_context_id": fresh_context.runtime_context_id,
+        "task_id": fresh_task_id,
+        "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+        "worker_id": fresh_worker_id,
+        "worker_slot_id": fresh_worker_id,
+        "session_token_ref": managed["session_token_ref"],
+        "target_project_root": str(world.root),
+        "view": "compact",
+        **route_identity,
+    }
+
+    def replacement_worker_guide(*, use_managed_continuity=True):
+        def send(query):
+            return server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
                 _ctx_with_role(
                     {
                         "project_id": PID,
                         "runtime_context_id": fresh_context.runtime_context_id,
                     },
                     "mf_sub",
-                    query={
-                        "task_id": fresh_task_id,
-                        "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
-                        "worker_id": fresh_worker_id,
-                        "worker_slot_id": fresh_worker_id,
-                        "fence_token": managed["fence_token"],
-                        "session_token": managed["session_token"],
-                        "session_token_ref": managed["session_token_ref"],
-                        "target_project_root": str(world.root),
-                    },
+                    query=query,
                 )
             )
+
+        if use_managed_continuity:
+            return managed_continuity.dispatch(
+                "runtime_context_worker_guide",
+                managed_guide_args,
+                send,
+            )
+        return send(
+            {
+                **managed_guide_args,
+                "session_token": managed["session_token"],
+                "fence_token": managed["fence_token"],
+            }
         )
 
     guide_before_receipt = replacement_worker_guide()
@@ -42694,6 +42729,41 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     ]
     assert guide_before_receipt["next_legal_action"] == (
         "submit_mf_subagent_read_receipt"
+    )
+    guide_frame = {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        guide_before_receipt,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                }
+            ]
+        },
+    }
+    assert guide_before_receipt["serialized_bytes"] < 32 * 1024
+    assert len(
+        json.dumps(
+            guide_frame,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ) < 48 * 1024
+    assert guide_before_receipt["semantic_truncation_performed"] is False
+    assert guide_before_receipt["canonical_executable_action"]["mcp_tool"] == (
+        "runtime_context_read_receipt"
+    )
+    receipt_alias = guide_before_receipt["actionable_payloads"][
+        "read_receipt_facade_payload_skeleton"
+    ]["copy_safe_body"]
+    assert receipt_alias["status"] == "canonical_current_action"
+    assert receipt_alias["canonical_action_path"] == (
+        "canonical_executable_action.copy_safe_body"
     )
     assert guide_before_receipt[
         "contract_runtime_next_action_took_precedence"
@@ -42799,31 +42869,37 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     receipt_hash = _fake_sha(
         "batch-child-postmerge-failure-rework-2-read-receipt"
     )
-    receipt = server.handle_graph_governance_runtime_context_read_receipt(
-        _ctx_with_role(
-            {
-                "project_id": PID,
-                "runtime_context_id": fresh_context.runtime_context_id,
-            },
-            "mf_sub",
-            method="POST",
-            body={
-                "runtime_context_id": fresh_context.runtime_context_id,
-                "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
-                "task_id": fresh_task_id,
-                "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
-                "worker_id": fresh_worker_id,
-                "worker_slot_id": fresh_worker_id,
-                "fence_token": managed["fence_token"],
-                "session_token": managed["session_token"],
-                "session_token_ref": managed["session_token_ref"],
-                "target_project_root": str(world.root),
-                "actor": fresh_worker_id,
-                "read_receipt_hash": receipt_hash,
-                "launch_text_hash": receipt_hash,
-                **route_identity,
-            },
-        )
+    receipt_body = {
+        "project_id": PID,
+        "runtime_context_id": fresh_context.runtime_context_id,
+        "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+        "task_id": fresh_task_id,
+        "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+        "worker_id": fresh_worker_id,
+        "worker_slot_id": fresh_worker_id,
+        "session_token_ref": managed["session_token_ref"],
+        "target_project_root": str(world.root),
+        "actor": fresh_worker_id,
+        "read_receipt_hash": receipt_hash,
+        "launch_text_hash": receipt_hash,
+        **route_identity,
+    }
+    receipt = managed_continuity.dispatch(
+        "runtime_context_read_receipt",
+        receipt_body,
+        lambda enriched: (
+            server.handle_graph_governance_runtime_context_read_receipt(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": fresh_context.runtime_context_id,
+                    },
+                    "mf_sub",
+                    method="POST",
+                    body=enriched,
+                )
+            )
+        ),
     )
     assert receipt["ok"] is True, receipt
     assert receipt["contract_runtime_canonical_line"]["status"] == (
@@ -42859,47 +42935,49 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
 
     startup_context = get_branch_context(conn, PID, fresh_task_id)
     assert startup_context is not None
-    startup = server.handle_graph_governance_runtime_context_startup(
-        _ctx_with_role(
-            {
-                "project_id": PID,
-                "runtime_context_id": startup_context.runtime_context_id,
-            },
-            "mf_sub",
-            method="POST",
-            body={
-                "runtime_context_id": startup_context.runtime_context_id,
-                "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
-                "task_id": fresh_task_id,
-                "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
-                "session_token": managed["session_token"],
-                "session_token_ref": managed["session_token_ref"],
-                "fence_token": managed["fence_token"],
-                "target_project_root": str(world.root),
-                "agent_id": fresh_worker_id,
-                "actual_host_worker_id": fresh_worker_id,
-                "worker_session_id": fresh_worker_session_id,
-                "host_startup_id": fresh_host_startup_id,
-                "host_session_id": fresh_worker_session_id,
-                "worker_transcript_ref": (
-                    f"codex:{fresh_worker_session_id}"
-                ),
-                "harness_type": "codex",
-                "filer_principal": fresh_worker_session_id,
-                "actual_cwd": str(world.root),
-                "actual_git_root": str(world.root),
-                "branch": startup_context.branch_ref,
-                "head_commit": startup_context.head_commit,
-                "base_commit": startup_context.base_commit,
-                "target_head_commit": startup_context.target_head_commit,
-                "merge_queue_id": startup_context.merge_queue_id,
-                "owned_files": list(startup_context.owned_files),
-                "read_receipt_hash": receipt_hash,
-                "read_receipt_event_id": str(receipt["read_receipt_event_id"]),
-                "startup_source": "codex_desktop_governed_dispatch",
-                **route_identity,
-            },
-        )
+    startup_body = {
+        "project_id": PID,
+        "runtime_context_id": startup_context.runtime_context_id,
+        "contract_execution_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+        "task_id": fresh_task_id,
+        "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+        "session_token_ref": managed["session_token_ref"],
+        "target_project_root": str(world.root),
+        "agent_id": fresh_worker_id,
+        "actual_host_worker_id": fresh_worker_id,
+        "worker_session_id": fresh_worker_session_id,
+        "host_startup_id": fresh_host_startup_id,
+        "host_session_id": fresh_worker_session_id,
+        "worker_transcript_ref": f"codex:{fresh_worker_session_id}",
+        "harness_type": "codex",
+        "filer_principal": fresh_worker_session_id,
+        "actual_cwd": str(world.root),
+        "actual_git_root": str(world.root),
+        "branch": startup_context.branch_ref,
+        "head_commit": startup_context.head_commit,
+        "base_commit": startup_context.base_commit,
+        "target_head_commit": startup_context.target_head_commit,
+        "merge_queue_id": startup_context.merge_queue_id,
+        "owned_files": list(startup_context.owned_files),
+        "read_receipt_hash": receipt_hash,
+        "read_receipt_event_id": str(receipt["read_receipt_event_id"]),
+        "startup_source": "codex_desktop_governed_dispatch",
+        **route_identity,
+    }
+    startup = managed_continuity.dispatch(
+        "parallel_branch_startup",
+        startup_body,
+        lambda enriched: server.handle_graph_governance_runtime_context_startup(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": startup_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=enriched,
+            )
+        ),
     )
     assert startup["ok"] is True, startup
     assert startup["status"] == "startup_recorded"
@@ -42909,6 +42987,9 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert startup["contract_runtime_canonical_line"][
         "contract_runtime_mutated"
     ] is False
+    assert startup["managed_host_envelope_consumed"] is True
+    assert startup["raw_worker_auth_exposed"] is False
+    assert managed_continuity.pending_count() == 0
     assert actual_runtime.store.get(
         _BATCH_QA_CHILD_EXECUTIONS[index]
     ) == stored_before_receipt
@@ -42953,7 +43034,9 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     ):
         assert raw_secret not in serialized_events
 
-    guide_after_startup = replacement_worker_guide()
+    guide_after_startup = replacement_worker_guide(
+        use_managed_continuity=False
+    )
     assert guide_after_startup["next_legal_action"] not in {
         "submit_mf_subagent_read_receipt",
         "record_mf_subagent_startup",
@@ -164225,6 +164308,11 @@ def test_worker_guide_compact_projection_is_bounded_and_semantically_complete():
     assert compact["parent_task_id"] == "cex-compact-guide"
     assert compact["route_identity"]["route_token_ref"] == "rtok-compact-guide"
     assert compact["next_legal_action"] == "submit_mf_subagent_read_receipt"
+    assert compact["missing_evidence"] == ["read_receipt"]
+    assert compact["session_token_lease"]["status"] == "expired"
+    assert compact["raw_session_token_exposed"] is False
+    assert compact["raw_fence_token_exposed"] is False
+    assert compact["raw_route_token_exposed"] is False
     assert compact["canonical_executable_action"]["copy_safe_body"][
         "read_receipt_hash"
     ].startswith("sha256:")
@@ -164234,7 +164322,25 @@ def test_worker_guide_compact_projection_is_bounded_and_semantically_complete():
     expected_reissue = full["actionable_payloads"][
         "session_token_rejoin_submission"
     ]["eligibility"]["session_token_reissue_submission"]["copy_safe_body"]
-    assert projected_reissue == expected_reissue
+    assert projected_reissue == {
+        "schema_version": "runtime_context.worker_guide_action_body_alias.v1",
+        "status": "inactive_action_requires_fresh_guide",
+        "source_path": (
+            "actionable_payloads.session_token_rejoin_submission.eligibility."
+            "session_token_reissue_submission.copy_safe_body"
+        ),
+        "source_hash": server._stable_public_hash(expected_reissue),
+        "detail_ref": compact["detail_continuation"]["detail_ref"],
+        "canonical_action_path": "",
+        "refresh_worker_guide_required": True,
+        "semantic_truncation_performed": False,
+    }
+    assert compact["canonical_executable_action_path"] == (
+        "canonical_executable_action"
+    )
+    assert compact["canonical_executable_action_hash"] == (
+        server._stable_public_hash(compact["canonical_executable_action"])
+    )
     assert "worker_guide" not in compact
     assert "executable_contract" not in compact
     assert "guide_to_facade_coverage" not in compact
@@ -164316,7 +164422,16 @@ def test_worker_guide_compact_pages_large_diagnostics_and_fits_desktop_frame():
     projected_reissue = compact["actionable_payloads"][
         "session_token_rejoin_submission"
     ]["eligibility"]["session_token_reissue_submission"]["copy_safe_body"]
-    assert projected_reissue == expected_reissue
+    assert projected_reissue["status"] == "canonical_current_action"
+    assert projected_reissue["source_hash"] == server._stable_public_hash(
+        expected_reissue
+    )
+    assert projected_reissue["canonical_action_path"] == (
+        "canonical_executable_action.copy_safe_body"
+    )
+    assert compact["canonical_executable_action"]["copy_safe_body"] == (
+        expected_reissue
+    )
     assert compact["canonical_executable_action"]["mcp_tool"] == (
         "runtime_context_session_token_reissue"
     )
@@ -164326,11 +164441,18 @@ def test_worker_guide_compact_pages_large_diagnostics_and_fits_desktop_frame():
 
 def test_worker_guide_compact_projection_fails_closed_instead_of_truncating():
     full = _representative_oversized_worker_guide()
-    full["actionable_payloads"]["session_token_rejoin_submission"][
-        "eligibility"
-    ]["session_token_reissue_submission"]["copy_safe_body"]["required_semantics"] = (
+    oversized_body = copy.deepcopy(
+        full["actionable_payloads"]["session_token_rejoin_submission"]
+        ["eligibility"]["session_token_reissue_submission"]["copy_safe_body"]
+    )
+    oversized_body["required_semantics"] = (
         "y" * server._RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
     )
+    full["next_legal_action"] = "reissue_runtime_session_token"
+    full["canonical_executable_actions"]["join"] = {
+        "mcp_tool": "runtime_context_session_token_reissue",
+        "copy_safe_body": oversized_body,
+    }
 
     with pytest.raises(GovernanceError) as exc_info:
         server._runtime_context_worker_guide_compact_response(full)
@@ -164340,6 +164462,61 @@ def test_worker_guide_compact_projection_fails_closed_instead_of_truncating():
     )
     assert exc_info.value.details["semantic_truncation_performed"] is False
     assert exc_info.value.details["writes_performed"] is False
+
+
+def test_worker_guide_compact_has_one_full_current_action_in_post_auth_world():
+    full = _representative_oversized_worker_guide()
+    receipt = full["canonical_executable_actions"]["receipt"]
+    receipt["copy_safe_body"]["live_route_proof"] = "r" * 9_000
+    nested_reissue = full["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]["eligibility"]["session_token_reissue_submission"]
+    nested_reissue["copy_safe_body"]["live_route_proof"] = "r" * 9_000
+    full["actionable_payloads"]["read_receipt_facade_payload_skeleton"] = (
+        copy.deepcopy(receipt)
+    )
+
+    compact = server._runtime_context_worker_guide_compact_response(full)
+    frame = {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        compact,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                }
+            ]
+        },
+    }
+    frame_bytes = len(
+        json.dumps(frame, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+
+    assert compact["serialized_bytes"] < 32 * 1024
+    assert frame_bytes < 48 * 1024
+    assert compact["canonical_executable_action"]["copy_safe_body"] == (
+        receipt["copy_safe_body"]
+    )
+    receipt_alias = compact["actionable_payloads"][
+        "read_receipt_facade_payload_skeleton"
+    ]["copy_safe_body"]
+    assert receipt_alias["status"] == "canonical_current_action"
+    assert receipt_alias["canonical_action_path"] == (
+        "canonical_executable_action.copy_safe_body"
+    )
+    reissue_alias = compact["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]["eligibility"]["session_token_reissue_submission"]["copy_safe_body"]
+    assert reissue_alias["status"] == "inactive_action_requires_fresh_guide"
+    assert reissue_alias["refresh_worker_guide_required"] is True
+    assert compact["semantic_truncation_performed"] is False
 
 
 def test_worker_guide_handler_honors_compact_view_without_forcing_all(monkeypatch):
