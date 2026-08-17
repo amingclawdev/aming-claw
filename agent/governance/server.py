@@ -29786,6 +29786,7 @@ def _runtime_context_worker_guide_current_stage(
             "rejoin",
             (
                 "pre_lineage_rejoin",
+                "bounded_replacement_rejoin",
                 "session_token_rejoin",
                 "runtime_context_rejoin_host_envelope",
             ),
@@ -30718,6 +30719,7 @@ def _runtime_context_worker_guide_early_compact_response(
         "request_runtime_context_initial_join_host_envelope",
         "request_runtime_context_rejoin_host_envelope",
         "request_runtime_context_pre_lineage_rejoin_host_envelope",
+        "request_runtime_context_bounded_replacement_rejoin_host_envelope",
         "stop_and_refresh_runtime_context",
         "verify_runtime_context_identity",
         "retry_with_matching_runtime_context_identity",
@@ -37322,6 +37324,22 @@ def _runtime_context_worker_recovery_details(
             and session_token_rejoin_eligibility.get("mode")
             == "bounded_post_lineage_replacement_auth_only"
         )
+        bounded_replacement_recovery_ineligible = bool(
+            session_token_rejoin_eligibility.get("eligible") is not True
+            and isinstance(
+                session_token_rejoin_eligibility.get("authority"), Mapping
+            )
+            and str(
+                session_token_rejoin_eligibility["authority"].get(
+                    "schema_version"
+                )
+                or ""
+            ).startswith("runtime_context.bounded_replacement_rejoin_authority.")
+            and session_token_rejoin_eligibility["authority"].get(
+                "applicable"
+            )
+            is True
+        )
         safe_ref_prestartup_reissue = bool(
             session_token_rejoin_eligibility.get("eligible") is True
             and session_token_rejoin_eligibility.get("mode")
@@ -37355,6 +37373,8 @@ def _runtime_context_worker_recovery_details(
             elif (
                 missing_worker_lineage
                 and not pre_lineage_bootstrap_recovery
+                and not bounded_replacement_recovery
+                and not bounded_replacement_recovery_ineligible
                 and not safe_ref_prestartup_reissue
                 and not verifier_backed_recovery_exhausted
             ):
@@ -47111,6 +47131,92 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             )
             else {}
         )
+        bounded_replacement_authority = (
+            payload.get("bounded_replacement_rejoin_authority")
+            if isinstance(
+                payload.get("bounded_replacement_rejoin_authority"), Mapping
+            )
+            else {}
+        )
+        if (
+            current_reissue_route_binding.get("valid") is not True
+            and str(payload.get("bounded_rejoin_kind") or "").strip()
+            == "bounded_replacement_rejoin"
+        ):
+            source_event_ref = str(
+                bounded_replacement_authority.get("source_event_ref") or ""
+            ).strip()
+            source_event_id_text = source_event_ref.removeprefix("timeline:")
+            source_event_id = (
+                int(source_event_id_text)
+                if source_event_id_text.isdigit()
+                else 0
+            )
+            source_events = [
+                candidate
+                for candidate in timeline_events
+                if isinstance(candidate, Mapping)
+                and int(candidate.get("id") or 0) == source_event_id
+            ]
+            source_event = source_events[0] if len(source_events) == 1 else {}
+            source_payload = (
+                source_event.get("payload")
+                if isinstance(source_event.get("payload"), Mapping)
+                else {}
+            )
+            source_pre_lineage_authority = (
+                source_payload.get("pre_lineage_rejoin_authority")
+                if isinstance(
+                    source_payload.get("pre_lineage_rejoin_authority"),
+                    Mapping,
+                )
+                else {}
+            )
+            source_route_binding = (
+                source_pre_lineage_authority.get(
+                    "current_reissue_route_binding"
+                )
+                if isinstance(
+                    source_pre_lineage_authority.get(
+                        "current_reissue_route_binding"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            source_route_identity = (
+                source_payload.get("route_identity")
+                if isinstance(source_payload.get("route_identity"), Mapping)
+                else {}
+            )
+            if (
+                source_event_id > 0
+                and source_event_id < event_id
+                and str(source_event.get("status") or "").strip().lower()
+                in {"accepted", "passed", "succeeded"}
+                and str(source_payload.get("action") or "").strip()
+                == "runtime_context_session_token_rejoin"
+                and str(source_payload.get("runtime_context_id") or "").strip()
+                == runtime_context_id
+                and str(source_payload.get("task_id") or "").strip()
+                == task_id
+                and str(source_payload.get("bounded_rejoin_kind") or "").strip()
+                == "special_authority_rejoin"
+                and dict(source_route_identity) == dict(route_identity)
+                and source_route_binding.get("valid") is True
+                and source_route_binding.get("registry_verified") is True
+                and source_route_binding.get("exact_scope_verified") is True
+                and source_route_binding.get("scope_actions_files_verified")
+                is True
+                and source_route_binding.get("historical_event_rewritten")
+                is False
+            ):
+                current_reissue_route_binding = {
+                    **dict(source_route_binding),
+                    "composed_through_bounded_replacement": True,
+                    "bounded_replacement_event_ref": event_ref,
+                    "bounded_replacement_source_event_ref": source_event_ref,
+                }
         if (
             not current_reissue_route_binding
             and payload.get("route_identity_rebound") is True
@@ -48040,6 +48146,7 @@ def _runtime_context_failed_qa_revision_contract_runtime_evidence(
             "mf_subagent_initial_join_issued",
             "mf_subagent_session_token_reissued",
             "mf_subagent_pre_lineage_session_token_rejoin_issued",
+            _RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION,
         }
     )
     if (
@@ -54181,6 +54288,39 @@ def _runtime_context_session_rejoin_guidance_eligibility(
             str(getattr(context, "last_recovery_action", "") or "").strip()
             == "mf_subagent_initial_join_issued"
         )
+        if verifier_backed and not eligible:
+            replacement_authority = (
+                _runtime_context_bounded_replacement_rejoin_authority(
+                    conn,
+                    project_id=project_id,
+                    context=context,
+                    timeline_events=timeline_events,
+                )
+            )
+            if replacement_authority.get("applicable") is True:
+                projection.update(
+                    {
+                        "eligible": (
+                            replacement_authority.get("eligible") is True
+                        ),
+                        "mode": str(
+                            replacement_authority.get("mode") or "blocked"
+                        ),
+                        "authority": replacement_authority,
+                        "contract_execution_resolution": contract_resolution,
+                        "blockers": list(
+                            replacement_authority.get("errors") or []
+                        ),
+                        "required_response_handling": {
+                            "parse_mcp_content_text_in_same_call": True,
+                            "inject_host_envelope_env_process_locally": True,
+                            "if_bounded_replacement_envelope_lost": (
+                                "stop_and_report_bounded_rejoin_recovery_exhausted"
+                            ),
+                        },
+                    }
+                )
+                return projection
         if not verifier_backed and not initial_join_bootstrap:
             authority = {}
         else:
@@ -54941,17 +55081,15 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                         now_iso=authoritative_now_iso,
                     )
                 )
-            if pre_lineage_bootstrap_rejoin_authority.get("eligible") is not True:
-                if not verifier_backed_pre_lineage_authority_applicable:
-                    pre_lineage_bounded_replacement_authority = (
-                        _runtime_context_bounded_replacement_rejoin_authority(
-                            conn,
-                            project_id=project_id,
-                            context=context,
-                            timeline_events=timeline_events,
-                            body=body,
-                        )
-                    )
+            pre_lineage_bounded_replacement_authority = (
+                _runtime_context_bounded_replacement_rejoin_authority(
+                    conn,
+                    project_id=project_id,
+                    context=context,
+                    timeline_events=timeline_events,
+                    body=body,
+                )
+            )
             pre_lineage_request_binding_errors = [
                 str(error or "").strip()
                 for error in (
@@ -55241,13 +55379,16 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         )
         bounded_replacement_rejoin = False
         if (
-            not failed_qa_reopen_for_revision
-            and post_qa_merge_conflict_rejoin_authority is None
-            and post_qa_rejoin_retarget_authority is None
-            and validated_missing_finish_rejoin_authority.get("eligible")
-            is not True
-            and pre_lineage_bootstrap_rejoin_authority.get("eligible")
-            is not True
+            pre_lineage_bounded_replacement_authority.get("applicable") is True
+            or (
+                not failed_qa_reopen_for_revision
+                and post_qa_merge_conflict_rejoin_authority is None
+                and post_qa_rejoin_retarget_authority is None
+                and validated_missing_finish_rejoin_authority.get("eligible")
+                is not True
+                and pre_lineage_bootstrap_rejoin_authority.get("eligible")
+                is not True
+            )
         ):
             if not bounded_replacement_rejoin_authority:
                 bounded_replacement_rejoin_authority = (
@@ -55345,10 +55486,12 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
         try:
             pre_lineage_auth_only_rejoin = bool(
                 pre_lineage_bootstrap_rejoin_authority.get("eligible") is True
+                and not bounded_replacement_rejoin
             )
             effective_failed_qa_reopen_for_revision = bool(
                 failed_qa_reopen_for_revision
                 and not pre_lineage_auth_only_rejoin
+                and not bounded_replacement_rejoin
             )
             if legacy_startup_template_repair_authority:
                 if conn.in_transaction:
@@ -55550,7 +55693,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 },
             ) from exc
 
-        if pre_lineage_bootstrap_rejoin_authority.get("eligible") is True and (
+        if pre_lineage_auth_only_rejoin and (
             int(result.get("attempt") or 0) != int(context.attempt or 0)
             or int(result.get("retry_round") or 0)
             != int(context.retry_round or 0)
@@ -55561,7 +55704,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 409,
                 {"mutation_performed": False, "fail_closed": True},
             )
-        if pre_lineage_bootstrap_rejoin_authority.get("eligible") is True:
+        if pre_lineage_auth_only_rejoin:
             rotated_context = get_branch_context_by_runtime_context_id(
                 conn,
                 project_id,
@@ -55672,9 +55815,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 validated_missing_finish_rejoin_authority
             )
         if pre_lineage_bootstrap_rejoin_authority:
-            result["pre_lineage_auth_only_rejoin"] = bool(
-                pre_lineage_bootstrap_rejoin_authority.get("eligible") is True
-            )
+            result["pre_lineage_auth_only_rejoin"] = pre_lineage_auth_only_rejoin
             result["pre_lineage_rejoin_authority"] = dict(
                 pre_lineage_bootstrap_rejoin_authority
             )
@@ -55699,7 +55840,7 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             or post_qa_merge_conflict_rejoin_authority is not None
             or post_qa_rejoin_retarget_authority is not None
             or validated_missing_finish_rejoin_authority.get("eligible") is True
-            or pre_lineage_bootstrap_rejoin_authority.get("eligible") is True
+            or pre_lineage_auth_only_rejoin
         )
         bounded_rejoin_kind = (
             "bounded_replacement_rejoin"
@@ -164210,12 +164351,53 @@ def _observer_runtime_text_failed_qa_context_local_prepare_authority(
     )
     if context is None or not all((runtime_context_id, task_id, execution_id)):
         return {}
+    last_recovery_action = str(
+        getattr(context, "last_recovery_action", "") or ""
+    ).strip()
+    bounded_replacement_prepare_authority: dict[str, Any] = {}
+    if last_recovery_action == _RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION:
+        timeline_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=str(getattr(context, "task_id", "") or ""),
+            backlog_id=str(getattr(context, "backlog_id", "") or ""),
+        )
+        bounded_replacement_prepare_authority = (
+            _runtime_context_bounded_replacement_rejoin_authority(
+                conn,
+                project_id=project_id,
+                context=context,
+                timeline_events=timeline_events,
+                body=body,
+            )
+        )
+    exact_recovery_action = bool(
+        last_recovery_action
+        == "mf_subagent_pre_lineage_session_token_rejoin_issued"
+        or (
+            bounded_replacement_prepare_authority.get("applicable") is True
+            and bounded_replacement_prepare_authority.get("eligible") is False
+            and bounded_replacement_prepare_authority.get("mode")
+            == "replacement_exhausted"
+            and bounded_replacement_prepare_authority.get(
+                "replacement_generation"
+            )
+            == 1
+            and not any(
+                mismatch.get("field") != "bounded_replacement_rejoin_count"
+                for mismatch in bounded_replacement_prepare_authority.get(
+                    "identity_mismatches"
+                )
+                or []
+                if isinstance(mismatch, Mapping)
+            )
+        )
+    )
     if not (
         runtime_context_id_for_branch_context(context) == runtime_context_id
         and str(getattr(context, "task_id", "") or "").strip() == task_id
         and _runtime_context_mf_sub_parent_task_id(context) == execution_id
-        and str(getattr(context, "last_recovery_action", "") or "").strip()
-        == "mf_subagent_pre_lineage_session_token_rejoin_issued"
+        and exact_recovery_action
     ):
         return {}
     try:
@@ -164281,6 +164463,11 @@ def _observer_runtime_text_failed_qa_context_local_prepare_authority(
             context_local_next.get("initial_join_event_ref") or ""
         ).strip(),
         "route_identity": expected_route_identity,
+        "recovery_authority": (
+            "bounded_replacement_rejoin_consumed_current_checkpoint"
+            if bounded_replacement_prepare_authority
+            else "verifier_backed_pre_lineage_rejoin"
+        ),
         "prepare_only": True,
         "new_dispatch_issued": False,
         "contract_runtime_mutated": False,

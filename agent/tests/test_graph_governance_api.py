@@ -42955,10 +42955,150 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert marker_route_binding["exact_scope_verified"] is True
     assert marker_route_binding["scope_actions_files_verified"] is True
     assert marker_route_binding["historical_event_rewritten"] is False
-    before_replay = "\n".join(conn.iterdump())
-    replay_body = copy.deepcopy(rejoin_body)
-    replay_body["session_token_ref"] = managed["session_token_ref"]
-    with pytest.raises(GovernanceError) as replay:
+    # The verifier-backed envelope is process-local.  Model a host exit before
+    # receipt/startup and let its lease expire.  Guide must fall through from
+    # the consumed one-shot verifier authority to the existing strict bounded
+    # replacement authority instead of exposing an inactive receipt action.
+    verifier_rejoin = managed
+    monkeypatch.setattr(server, "_utc_now", lambda: "2099-08-17T08:01:00Z")
+    bounded_guide_before = "\n".join(conn.iterdump())
+    bounded_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "observer",
+                query=compact_guide_query,
+            )
+        )
+    )
+    assert "\n".join(conn.iterdump()) == bounded_guide_before
+    assert bounded_guide["next_legal_action"] == (
+        "request_runtime_context_bounded_replacement_rejoin_host_envelope"
+    )
+    bounded_action = bounded_guide["canonical_executable_action"]
+    assert bounded_action["mcp_tool"] == "runtime_context_session_token_rejoin"
+    assert bounded_action["action"] == (
+        "request_runtime_context_bounded_replacement_rejoin_host_envelope"
+    )
+    bounded_body = copy.deepcopy(bounded_action["copy_safe_body"])
+    bounded_body["reason"] = (
+        "replace the expired verifier rejoin envelope lost before receipt"
+    )
+    assert bounded_body["session_token_ref"] == (
+        verifier_rejoin["session_token_ref"]
+    )
+    bounded_eligibility = (
+        server._runtime_context_session_rejoin_guidance_eligibility(
+            conn,
+            project_id=PID,
+            context=get_branch_context(conn, PID, fresh_task_id),
+            route_identity_override=route_identity,
+        )
+    )
+    assert bounded_eligibility["eligible"] is True
+    assert bounded_eligibility["mode"] == (
+        "bounded_post_lineage_replacement_auth_only"
+    )
+    receipt_alias_during_recovery = bounded_guide["actionable_payloads"][
+        "read_receipt_facade_payload_skeleton"
+    ]["copy_safe_body"]
+    assert receipt_alias_during_recovery["status"] == (
+        "inactive_action_requires_fresh_guide"
+    )
+    assert receipt_alias_during_recovery["canonical_action_path"] == ""
+
+    bounded_context = get_branch_context(conn, PID, fresh_task_id)
+    assert bounded_context is not None
+    bounded_events = server._runtime_context_service_timeline_events(
+        conn,
+        project_id=PID,
+        task_id=fresh_task_id,
+        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+    )
+    rejected_bounded = (
+        server._runtime_context_bounded_replacement_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=bounded_context,
+            timeline_events=bounded_events,
+            body={
+                **bounded_body,
+                "session_token_ref": managed_before_legacy_rescue[
+                    "session_token_ref"
+                ],
+            },
+        )
+    )
+    assert rejected_bounded["eligible"] is False
+    assert rejected_bounded["errors"]
+    bounded_source_event_id = int(
+        str(bounded_eligibility["authority"]["source_event_ref"])
+        .removeprefix("timeline:")
+    )
+    bounded_source_event = next(
+        event
+        for event in bounded_events
+        if int(event.get("id") or 0) == bounded_source_event_id
+    )
+    ambiguous_bounded = (
+        server._runtime_context_bounded_replacement_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=bounded_context,
+            timeline_events=[
+                *bounded_events,
+                {**copy.deepcopy(bounded_source_event), "id": 999_998},
+            ],
+            body=bounded_body,
+        )
+    )
+    assert ambiguous_bounded["eligible"] is False
+    assert ambiguous_bounded["mode"] == (
+        "checkpoint_audit_cardinality_drift"
+    )
+    for field, wrong_value in (
+        ("task_id", "cross-bounded-replacement-task"),
+        ("route_id", "route-cross-bounded-replacement"),
+    ):
+        before_wrong_bounded = "\n".join(conn.iterdump())
+        with pytest.raises(GovernanceError):
+            server.handle_graph_governance_runtime_context_session_token_rejoin(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": fresh_context.runtime_context_id,
+                    },
+                    "coordinator",
+                    method="POST",
+                    body={**bounded_body, field: wrong_value},
+                )
+            )
+        assert "\n".join(conn.iterdump()) == before_wrong_bounded
+
+    managed = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": fresh_context.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body=bounded_body,
+        )
+    )
+    assert managed["ok"] is True
+    assert managed["bounded_rejoin_kind"] == "bounded_replacement_rejoin"
+    assert managed["bounded_replacement_rejoin"] is True
+    assert managed["session_token_ref"] != verifier_rejoin["session_token_ref"]
+    assert bounded_guide_before != "\n".join(conn.iterdump())
+
+    duplicate_rejoin_body = copy.deepcopy(bounded_body)
+    duplicate_rejoin_body["session_token_ref"] = managed["session_token_ref"]
+    before_duplicate_rejoin = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as duplicate_rejoin:
         server.handle_graph_governance_runtime_context_session_token_rejoin(
             _ctx_with_role(
                 {
@@ -42967,19 +43107,44 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
                 },
                 "coordinator",
                 method="POST",
-                body=replay_body,
+                body=duplicate_rejoin_body,
             )
         )
-    assert replay.value.code in {
-        "runtime_context_pre_lineage_rejoin_already_consumed",
-        "runtime_context_pre_lineage_rejoin_initial_join_audit_invalid",
+    assert duplicate_rejoin.value.code in {
+        "runtime_context_bounded_replacement_rejoin_exhausted",
         "runtime_context_bounded_replacement_rejoin_rejected",
     }
-    assert "\n".join(conn.iterdump()) == before_replay
+    assert "\n".join(conn.iterdump()) == before_duplicate_rejoin
+
+    before_exhausted_guide = "\n".join(conn.iterdump())
+    exhausted_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "observer",
+                query=compact_guide_query,
+            )
+        )
+    )
+    assert "\n".join(conn.iterdump()) == before_exhausted_guide
+    assert exhausted_guide["next_legal_action"] == (
+        "stop_and_refresh_runtime_context"
+    )
+    assert exhausted_guide["canonical_executable_action"] == {}
+    exhausted_receipt_alias = exhausted_guide["actionable_payloads"][
+        "read_receipt_facade_payload_skeleton"
+    ]["copy_safe_body"]
+    assert exhausted_receipt_alias["status"] == (
+        "inactive_action_requires_fresh_guide"
+    )
+
     managed_continuity = ManagedHostEnvelopeContinuity()
     managed_public = managed_continuity.dispatch(
         "runtime_context_session_token_rejoin",
-        rejoin_body,
+        bounded_body,
         lambda _args: copy.deepcopy(managed),
     )
     assert managed_public["ok"] is True
@@ -43094,7 +43259,103 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     prepare_action = prepare_guide["canonical_executable_action"]
     assert prepare_action["mcp_tool"] == "observer_runtime_text_prepare"
     prepare_body = copy.deepcopy(prepare_action["copy_safe_body"])
-    prepare_body["now_iso"] = "2099-08-17T07:01:00Z"
+    prepare_body["now_iso"] = "2099-08-17T08:02:00Z"
+    prepare_context = get_branch_context(conn, PID, fresh_task_id)
+    assert prepare_context is not None
+    assert prepare_context.last_recovery_action == (
+        "mf_subagent_session_token_rejoin_replacement_issued"
+    )
+    prepare_bounded_authority = (
+        server._runtime_context_bounded_replacement_rejoin_authority(
+            conn,
+            project_id=PID,
+            context=prepare_context,
+            timeline_events=server._runtime_context_service_timeline_events(
+                conn,
+                project_id=PID,
+                task_id=fresh_task_id,
+                backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+            ),
+            body=prepare_body,
+        )
+    )
+    assert prepare_bounded_authority["mode"] == "replacement_exhausted"
+    assert prepare_bounded_authority["replacement_generation"] == 1
+    prepare_contract_evidence = (
+        server._runtime_context_failed_qa_revision_contract_runtime_evidence(
+            conn,
+            project_id=PID,
+            context=prepare_context,
+        )
+    )
+    assert prepare_contract_evidence.get(
+        "successor_dispatch_revision_authority"
+    )
+    prepare_marker = server._runtime_context_failed_qa_revision_rejoin_marker(
+        conn=conn,
+        context=prepare_context,
+        runtime_context_id=prepare_context.runtime_context_id,
+        timeline_events=server._runtime_context_service_timeline_events(
+            conn,
+            project_id=PID,
+            task_id=fresh_task_id,
+            backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        ),
+    )
+    assert prepare_marker
+    prepare_source_record = actual_runtime.store.get(
+        _BATCH_QA_CHILD_EXECUTIONS[index]
+    )
+    prepare_projected_record, prepare_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=prepare_source_record,
+            actor_role="mf_sub",
+        )
+    )
+    assert prepare_projection.get("failed_qa_revision_rejoin_contexts"), (
+        prepare_projection.get("expected_context_summaries"),
+        prepare_projection,
+    )
+    prepare_projection_markers = prepare_projection[
+        "failed_qa_revision_rejoin_contexts"
+    ]
+    assert len(prepare_projection_markers) == 1
+    prepare_projection_marker = prepare_projection_markers[0]
+    assert prepare_projection_marker["route_identity_rebound"] is True
+    prepare_projection_route_binding = prepare_projection_marker[
+        "current_reissue_route_binding"
+    ]
+    assert prepare_projection_route_binding.get("valid") is True, (
+        prepare_projection_route_binding
+    )
+    assert server._runtime_context_failed_qa_marker_route_authorized(
+        prepare_projection_marker
+    ), prepare_projection_marker
+    assert prepare_projection_marker["evidence_backfill"] is False
+    prepare_canonical_next = server._runtime_next_action_from_guide(
+        prepare_projected_record.get("runtime_guide") or {},
+        source="contract_runtime_current_state",
+    )
+    prepare_context_local_next = (
+        server._runtime_context_failed_qa_context_local_setup_next_action(
+            prepare_canonical_next,
+            record=prepare_projected_record,
+            projection=prepare_projection,
+            context=prepare_context,
+        )
+    )
+    assert prepare_context_local_next.get(
+        "failed_qa_replacement_context_local_setup_projection"
+    ) is True
+    assert prepare_context_local_next["action"] == (
+        "submit_mf_subagent_read_receipt"
+    )
+    assert {
+        field: str(prepare_body.get(field) or "").strip()
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == server._runtime_context_latest_route_identity(conn, prepare_context)
     context_local_prepare_authority = (
         server._observer_runtime_text_failed_qa_context_local_prepare_authority(
             conn,
@@ -43126,6 +43387,8 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert server._runtime_context_source_backed_launch_text_hash(
         prepared_revision
     ) == prepared["launch_text_hash"]
+
+    monkeypatch.setattr(server, "_utc_now", lambda: "2099-08-17T08:03:00Z")
 
     guide_before_receipt = replacement_worker_guide()
     receipt_next = guide_before_receipt[
