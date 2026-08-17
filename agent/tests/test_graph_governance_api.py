@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 from threading import Event, Thread, get_ident
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -164262,14 +164263,37 @@ def test_worker_guide_handler_honors_compact_view_without_forcing_all(monkeypatc
     full = _representative_oversized_worker_guide()
     captured = {}
 
-    def current_state(ctx):
+    class _Connection:
+        def close(self):
+            captured["closed"] = True
+
+    def read_context(ctx, _conn, **kwargs):
+        captured["bounded_worker_guide"] = kwargs.get("bounded_worker_guide")
+        return SimpleNamespace(), "observer", {}
+
+    def early_compact(ctx, _conn, **_kwargs):
         captured["view"] = ctx.query.get("view")
-        return {"state": "fixture"}
+        return server._runtime_context_worker_guide_compact_response(full)
 
     monkeypatch.setattr(
         server,
+        "get_connection",
+        lambda _project_id: _Connection(),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_mf_sub_read_context",
+        read_context,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_guide_early_compact_response",
+        early_compact,
+    )
+    monkeypatch.setattr(
+        server,
         "handle_graph_governance_parallel_branch_runtime_context_current_state",
-        current_state,
+        lambda _ctx: {"state": "fixture"},
     )
     monkeypatch.setattr(
         server,
@@ -164286,7 +164310,9 @@ def test_worker_guide_handler_honors_compact_view_without_forcing_all(monkeypatc
             query={"view": "compact"},
         )
     )
-    assert captured["view"] == "worker_view"
+    assert captured["view"] == "compact"
+    assert captured["bounded_worker_guide"] is True
+    assert captured["closed"] is True
     assert compact["response_view"] == "compact"
 
     full_result = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
@@ -164297,6 +164323,203 @@ def test_worker_guide_handler_honors_compact_view_without_forcing_all(monkeypatc
             }
         )
     )
-    assert captured["view"] == "all"
     assert full_result["response_view"] == "all"
     assert "worker_guide" in full_result
+
+
+def test_worker_guide_compact_builds_directly_from_bounded_authority(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-WORKER-GUIDE-EARLY-COMPACT"
+    worker_task_id = "worker-guide-early-compact"
+    worker_fence = "fence-worker-guide-early-compact"
+    worker_token = "token-worker-guide-early-compact"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="worker-guide-early-compact-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+        target_project_root=str(worker_root),
+        parent_task_is_contract_execution=True,
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _pid: _NoCloseConn(conn))
+
+    def must_not_call(*_args, **_kwargs):
+        raise AssertionError("compact Guide must not build full recursive projection")
+
+    monkeypatch.setattr(server, "_runtime_context_projection_response", must_not_call)
+    monkeypatch.setattr(server, "_runtime_context_worker_guide_response", must_not_call)
+    started = time.monotonic()
+    compact = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            query={
+                "parent_task_id": successor["contract_execution_id"],
+                "fence_token": worker_fence,
+                "session_token": worker_token,
+                "session_token_ref": runtime_context_session_token_ref(context),
+                "target_project_root": str(worker_root),
+                "view": "compact",
+                "route_id": f"route-{worker_task_id}",
+                "route_context_hash": f"sha256:route-{worker_task_id}",
+                "prompt_contract_id": f"rprompt-{worker_task_id}",
+                "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+                "route_token_ref": f"rtok-{worker_task_id}",
+                "visible_injection_manifest_hash": (
+                    f"sha256:visible-{worker_task_id}"
+                ),
+            },
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5.0
+    assert compact["builder"] == "bounded_current_authority"
+    assert compact["full_worker_guide_builder_called"] is False
+    assert compact["full_runtime_projection_called"] is False
+    assert compact["serialized_bytes"] <= compact["max_serialized_bytes"]
+    assert compact["runtime_context_id"] == context.runtime_context_id
+    assert compact["task_id"] == context.task_id
+    assert compact["parent_task_id"] == successor["contract_execution_id"]
+    assert compact["route_identity"]["route_token_ref"] == (
+        f"rtok-{worker_task_id}"
+    )
+    assert compact["next_legal_action"]
+    assert compact["contract_runtime_next_legal_action"]
+    assert compact["canonical_executable_action"]["copy_safe_body"]
+    continuation = compact["detail_continuation"]
+    assert continuation["mode"] == "bounded_source_pages"
+    assert continuation["semantic_truncation_performed"] is False
+
+    detail = server._runtime_context_worker_guide_detail_page(
+        compact,
+        detail_ref=continuation["detail_ref"],
+        detail_cursor="recovery",
+    )
+    assert detail["response_view"] == "compact_detail"
+    assert detail["serialized_bytes"] <= compact["max_serialized_bytes"]
+    assert detail["section"]["canonical_executable_action"]["copy_safe_body"]
+
+    recovery_started = time.monotonic()
+    with pytest.raises(GovernanceError) as recovery_gate:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": successor["contract_execution_id"],
+                    "session_token_ref": runtime_context_session_token_ref(context),
+                    "target_project_root": str(worker_root),
+                    "view": "compact",
+                    "route_id": f"route-{worker_task_id}",
+                    "route_context_hash": f"sha256:route-{worker_task_id}",
+                    "prompt_contract_id": f"rprompt-{worker_task_id}",
+                    "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+                    "route_token_ref": f"rtok-{worker_task_id}",
+                    "visible_injection_manifest_hash": (
+                        f"sha256:visible-{worker_task_id}"
+                    ),
+                },
+            )
+        )
+    assert time.monotonic() - recovery_started < 5.0
+    assert recovery_gate.value.code == "fence_invalidated_or_unknown"
+    recovery_details = recovery_gate.value.details
+    assert recovery_details["actionable_payloads"]
+    assert recovery_details["diagnostics"]["finish_facade_projection"] == {
+        "status": "available_via_bounded_detail_continuation",
+        "source": "bounded_runtime_context_authority",
+        "access_audit_recorded": False,
+    }
+
+    class _GuideHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return None
+
+        def do_GET(self):
+            encoded = json.dumps(compact).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _GuideHandler)
+    thread = Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    messages = "\n".join(
+        json.dumps(message)
+        for message in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "runtime_context_worker_guide",
+                    "arguments": {
+                        "project_id": PID,
+                        "runtime_context_id": context.runtime_context_id,
+                        "task_id": context.task_id,
+                        "parent_task_id": successor["contract_execution_id"],
+                        "target_project_root": str(worker_root),
+                        "session_token_ref": runtime_context_session_token_ref(
+                            context
+                        ),
+                        "route_id": f"route-{worker_task_id}",
+                        "route_context_hash": f"sha256:route-{worker_task_id}",
+                        "prompt_contract_id": f"rprompt-{worker_task_id}",
+                        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+                        "route_token_ref": f"rtok-{worker_task_id}",
+                        "visible_injection_manifest_hash": (
+                            f"sha256:visible-{worker_task_id}"
+                        ),
+                    },
+                },
+            },
+        )
+    ) + "\n"
+    try:
+        stdio = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "agent.mcp.server",
+                "--project",
+                PID,
+                "--workers",
+                "0",
+                "--governance-url",
+                f"http://127.0.0.1:{httpd.server_address[1]}",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            input=messages,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+    stdio_responses = [
+        json.loads(line) for line in stdio.stdout.splitlines() if line.strip()
+    ]
+    stdio_guide = json.loads(stdio_responses[-1]["result"]["content"][0]["text"])
+    assert stdio_guide["runtime_context_id"] == context.runtime_context_id
+    assert stdio_guide["serialized_bytes"] <= compact["max_serialized_bytes"]

@@ -29611,6 +29611,116 @@ def _runtime_context_worker_guide_current_stage(
     return ""
 
 
+def _runtime_context_worker_guide_bounded_actionable_payloads(
+    actionable: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep executable bodies and bounded policy, never recursive guide copies."""
+
+    scalar_or_bounded_keys = (
+        "schema_version",
+        "project_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "worker_id",
+        "worker_slot_id",
+        "agent_id",
+        "allocation_owner",
+        "observer_allocation_owner",
+        "actual_host_worker_id",
+        "worker_session_id",
+        "host_startup_id",
+        "host_session_id",
+        "branch_ref",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "target_project_root",
+        "route_identity",
+        "route_token_ref",
+        "copy_safe_route_token_scope",
+        "session_token_ref",
+        "session_token_ref_available",
+        "fence_token_ref",
+        "fence_token_hash",
+        "worker_session_lifecycle_policy",
+        "write_authorization_policy",
+        "raw_session_token_exposed",
+        "raw_fence_token_exposed",
+        "raw_route_token_exposed",
+    )
+    result = {
+        key: deepcopy(actionable[key])
+        for key in scalar_or_bounded_keys
+        if key in actionable
+    }
+
+    def bounded_submission(source: Any) -> dict[str, Any]:
+        if not isinstance(source, Mapping):
+            return {}
+        bounded = {
+            key: deepcopy(source[key])
+            for key in (
+                "schema_version",
+                "action",
+                "semantic_next_action",
+                "actionable",
+                "method",
+                "path",
+                "body_source",
+                "copy_safe_body",
+                "successful_response",
+                "security_boundary",
+                "required_response_handling",
+            )
+            if key in source
+        }
+        eligibility = source.get("eligibility")
+        if isinstance(eligibility, Mapping):
+            bounded_eligibility = {
+                key: deepcopy(eligibility[key])
+                for key in (
+                    "schema_version",
+                    "eligible",
+                    "mode",
+                    "context_status",
+                    "blockers",
+                    "required_response_handling",
+                    "post_receipt_pre_startup_recovery",
+                    "pre_receipt_safe_ref_loss_replacement",
+                )
+                if key in eligibility
+            }
+            nested_reissue = eligibility.get("session_token_reissue_submission")
+            if isinstance(nested_reissue, Mapping):
+                bounded_eligibility["session_token_reissue_submission"] = (
+                    bounded_submission(nested_reissue)
+                )
+            bounded["eligibility"] = bounded_eligibility
+        return bounded
+
+    for key in (
+        "session_token_initial_join_submission",
+        "session_token_reissue_submission",
+        "session_token_rejoin_submission",
+        "read_receipt_facade_payload_skeleton",
+        "startup_facade_payload_skeleton",
+        "implementation_evidence_facade_payload_skeleton",
+        "scope_insufficiency_request_facade_payload_skeleton",
+        "worker_commit_facade_payload_skeleton",
+        "finish_time_worker_attestation_submission",
+        "finish_time_worker_attestation_facade_payload_skeleton",
+        "finish_time_worker_self_attestation_facade_payload_skeleton",
+        "finish_time_attestation_facade_payload_skeleton",
+        "finish_gate_facade_payload_skeleton",
+    ):
+        bounded = bounded_submission(actionable.get(key))
+        if bounded:
+            result[key] = bounded
+    return result
+
+
 def _runtime_context_worker_guide_compact_response(
     response: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -29621,11 +29731,9 @@ def _runtime_context_worker_guide_compact_response(
     nested = nested if isinstance(nested, Mapping) else {}
     actionable = full.get("actionable_payloads")
     actionable = actionable if isinstance(actionable, Mapping) else {}
-    compact_actionable = {
-        key: deepcopy(actionable[key])
-        for key in _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_ACTIONABLE_KEYS
-        if key in actionable
-    }
+    compact_actionable = (
+        _runtime_context_worker_guide_bounded_actionable_payloads(actionable)
+    )
     contract_state = full.get("contract_runtime_current_state")
     contract_state = contract_state if isinstance(contract_state, Mapping) else {}
     compact_contract_state = {
@@ -29727,6 +29835,9 @@ def _runtime_context_worker_guide_compact_response(
         "actionable_payloads": compact_actionable,
         "source_refs": deepcopy(full.get("source_refs") or {}),
         "privacy_boundary": deepcopy(full.get("privacy_boundary") or {}),
+        "detail_continuation": deepcopy(
+            full.get("detail_continuation") or {}
+        ),
         "omitted_recursive_sections": [
             "worker_guide",
             "executable_contract",
@@ -29756,6 +29867,590 @@ def _runtime_context_worker_guide_compact_response(
             },
         )
     compact["serialized_bytes"] = serialized_bytes
+    return compact
+
+
+def _runtime_context_worker_guide_detail_continuation(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    contract_revision_id: str,
+    session_token_ref: str,
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Describe bounded, source-addressed detail pages without building them."""
+
+    identity = {
+        "project_id": str(project_id or "").strip(),
+        "runtime_context_id": str(runtime_context_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "parent_task_id": str(parent_task_id or "").strip(),
+        "contract_revision_id": str(contract_revision_id or "").strip(),
+        "session_token_ref": str(session_token_ref or "").strip(),
+        "route_identity": {
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
+    }
+    detail_ref = "worker-guide-detail:" + _stable_public_hash(identity)
+    sections = (
+        "identity",
+        "contract_runtime",
+        "recovery",
+        "evidence",
+    )
+    return {
+        "schema_version": (
+            "runtime_context.worker_guide_detail_continuation.v1"
+        ),
+        "detail_ref": detail_ref,
+        "mode": "bounded_source_pages",
+        "sections": list(sections),
+        "page_size": 1,
+        "next_cursor": sections[0],
+        "fetch": {
+            "method": "GET",
+            "path": (
+                "/api/graph-governance/{project_id}/runtime-contexts/"
+                "{runtime_context_id}/worker-guide"
+            ),
+            "query": {
+                "view": "compact",
+                "detail_ref": detail_ref,
+                "detail_cursor": "<one section from sections>",
+            },
+        },
+        "source_identity_hash": _stable_public_hash(identity),
+        "full_projection_required": False,
+        "semantic_truncation_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _runtime_context_worker_guide_detail_page(
+    compact: Mapping[str, Any],
+    *,
+    detail_ref: str,
+    detail_cursor: str,
+) -> dict[str, Any]:
+    """Return one bounded page from an already-bounded Worker Guide."""
+
+    continuation = compact.get("detail_continuation")
+    continuation = continuation if isinstance(continuation, Mapping) else {}
+    expected_ref = str(continuation.get("detail_ref") or "").strip()
+    cursor = str(detail_cursor or "").strip()
+    sections = list(continuation.get("sections") or [])
+    if not expected_ref or str(detail_ref or "").strip() != expected_ref:
+        raise GovernanceError(
+            "runtime_context_worker_guide_detail_ref_invalid",
+            "bounded Worker Guide detail ref is stale or mismatched",
+            409,
+            {
+                "expected": expected_ref or "current bounded detail_ref",
+                "actual": str(detail_ref or "").strip() or "missing",
+                "writes_performed": False,
+                "semantic_truncation_performed": False,
+            },
+        )
+    if cursor not in sections:
+        raise ValidationError(
+            "detail_cursor must name one advertised bounded detail section"
+        )
+    pages = {
+        "identity": {
+            key: deepcopy(compact.get(key))
+            for key in (
+                "project_id",
+                "governance_project_id",
+                "target_project_id",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "contract_execution_id",
+                "target_project_root",
+                "worktree_path",
+                "branch_ref",
+                "worker_scope",
+                "route_identity",
+                "session_token_ref",
+            )
+        },
+        "contract_runtime": {
+            "contract_runtime_execution_resolution": deepcopy(
+                compact.get("contract_runtime_execution_resolution") or {}
+            ),
+            "contract_runtime_current_state": deepcopy(
+                compact.get("contract_runtime_current_state") or {}
+            ),
+            "contract_runtime_next_legal_action": deepcopy(
+                compact.get("contract_runtime_next_legal_action") or {}
+            ),
+            "next_legal_action": deepcopy(compact.get("next_legal_action")),
+            "next_legal_action_decision_source": compact.get(
+                "next_legal_action_decision_source"
+            ),
+        },
+        "recovery": {
+            "session_token_lease": deepcopy(
+                compact.get("session_token_lease") or {}
+            ),
+            "canonical_executable_action": deepcopy(
+                compact.get("canonical_executable_action") or {}
+            ),
+            "actionable_payloads": deepcopy(
+                compact.get("actionable_payloads") or {}
+            ),
+        },
+        "evidence": {
+            "next_required_evidence": deepcopy(
+                compact.get("next_required_evidence") or []
+            ),
+            "missing_evidence": deepcopy(compact.get("missing_evidence") or []),
+            "blocking_reasons": deepcopy(compact.get("blocking_reasons") or []),
+            "source_refs": deepcopy(compact.get("source_refs") or {}),
+        },
+    }
+    index = sections.index(cursor)
+    next_cursor = sections[index + 1] if index + 1 < len(sections) else ""
+    response = {
+        "ok": True,
+        "schema_version": "runtime_context.worker_guide_detail_page.v1",
+        "response_view": "compact_detail",
+        "detail_ref": expected_ref,
+        "detail_cursor": cursor,
+        "next_cursor": next_cursor,
+        "continuation_complete": not next_cursor,
+        "section": pages[cursor],
+        "semantic_truncation_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    response["serialized_bytes"] = (
+        _runtime_context_worker_guide_serialized_bytes(response)
+    )
+    if (
+        response["serialized_bytes"]
+        > _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+    ):
+        raise GovernanceError(
+            "runtime_context_worker_guide_detail_page_too_large",
+            "bounded Worker Guide detail page exceeds the managed response limit",
+            503,
+            {
+                "detail_cursor": cursor,
+                "serialized_bytes": response["serialized_bytes"],
+                "max_serialized_bytes": (
+                    _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+                ),
+                "writes_performed": False,
+                "semantic_truncation_performed": False,
+            },
+        )
+    return response
+
+
+def _runtime_context_worker_guide_early_compact_response(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    role: str,
+) -> dict[str, Any]:
+    """Build the managed Worker Guide without materializing the full projection."""
+
+    from .parallel_branch_runtime import (
+        runtime_context_fence_token_verifier,
+        runtime_context_id_for_branch_context,
+        runtime_context_session_token_lease_view,
+        runtime_context_session_token_ref,
+    )
+
+    runtime_context_id = runtime_context_id_for_branch_context(context)
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    worker_id = str(
+        getattr(context, "worker_id", "")
+        or getattr(context, "worker_slot_id", "")
+        or task_id
+        or ""
+    ).strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    target_project_root = _runtime_context_effective_target_project_root(context)
+    worktree_path = str(
+        getattr(context, "worktree_path", "") or target_project_root
+    ).strip()
+    latest_revision_payload = _runtime_context_latest_contract_revision_payload(
+        conn,
+        context,
+    )
+    contract_revision_id = str(
+        latest_revision_payload.get("revision_id") or ""
+    ).strip()
+    persisted_route_identity = _parallel_branch_runtime_contract_route_identity(
+        latest_revision_payload
+    )
+    route_identity = (
+        _runtime_context_worker_projected_route_identity(
+            conn,
+            context,
+            revision_payload=latest_revision_payload,
+        )
+        if persisted_route_identity
+        else _parallel_branch_runtime_contract_route_identity(
+            latest_revision_payload,
+            ctx.query,
+        )
+    )
+    session_token_ref = runtime_context_session_token_ref(context)
+    session_token_lease = runtime_context_session_token_lease_view(context)
+    recovery = _runtime_context_worker_recovery_details(
+        ctx,
+        conn,
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        fence_token=_runtime_context_request_value(ctx, "fence_token"),
+        session_token=_runtime_context_request_value(ctx, "session_token"),
+        session_token_ref=(
+            _runtime_context_request_value(ctx, "session_token_ref")
+            or _runtime_context_request_value(ctx, "worker_session_token_ref")
+        ),
+        target_project_root=_runtime_context_requested_target_project_root(ctx),
+        route_identity=route_identity,
+        reason="runtime_context_sequence_check",
+        context=context,
+        include_full_finish_projection=False,
+    )
+    actionable_payloads = dict(recovery.get("actionable_payloads") or {})
+    contract_identity = _runtime_context_contract_execution_identity(
+        latest_revision_payload,
+        contract_revision_id=contract_revision_id,
+    )
+    contract_identity, contract_execution_resolution = (
+        _runtime_context_resolve_contract_execution_identity(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            contract_identity=contract_identity,
+        )
+    )
+    contract_execution_id = str(
+        contract_identity.get("contract_execution_id") or ""
+    ).strip()
+    contract_projection = _runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        context=context,
+    )
+    contract_state = dict(
+        contract_projection.get("contract_runtime_current_state") or {}
+    )
+    contract_next_action = dict(
+        contract_projection.get("contract_runtime_next_legal_action") or {}
+    )
+    recovery_next_action = str(
+        recovery.get("next_legal_action") or ""
+    ).strip()
+    recovery_must_precede_worker_write = recovery_next_action in {
+        "reissue_runtime_session_token",
+        "request_runtime_context_initial_join_host_envelope",
+        "request_runtime_context_rejoin_host_envelope",
+        "stop_and_refresh_runtime_context",
+        "verify_runtime_context_identity",
+        "retry_with_matching_runtime_context_identity",
+        "retry_with_target_project_root",
+    }
+    contract_action = str(contract_next_action.get("action") or "").strip()
+    if recovery_must_precede_worker_write:
+        next_legal_action = recovery_next_action
+        next_legal_action_decision_source = (
+            "runtime_context_recovery_authority"
+        )
+        contract_took_precedence = False
+    elif _runtime_context_contract_next_action_override_eligible(
+        contract_next_action,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        current_next_legal_action=recovery_next_action,
+    ):
+        next_legal_action = contract_action or recovery_next_action
+        next_legal_action_decision_source = "contract_runtime_current_state"
+        contract_took_precedence = bool(contract_action)
+    else:
+        next_legal_action = recovery_next_action
+        next_legal_action_decision_source = (
+            "runtime_context_sequence_projection"
+        )
+        contract_took_precedence = False
+
+    worker_scope_files = _runtime_context_collect_worker_scope_files(
+        task_id=task_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        latest_revision_payload=latest_revision_payload,
+        sources=[
+            {
+                "owned_files": getattr(context, "owned_files", []),
+                "target_files": getattr(context, "target_files", []),
+            },
+            latest_revision_payload,
+            actionable_payloads,
+        ],
+    )
+    target_root_projection = _runtime_context_target_root_projection(
+        project_id=project_id,
+        requested_target_project_root=_runtime_context_requested_target_project_root(
+            ctx
+        ),
+        canonical_target_project_root=target_project_root,
+        worktree_path=worktree_path,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        route_identity=route_identity,
+    )
+    graph_query_identity = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "worktree_path": worktree_path,
+        "branch_ref": str(getattr(context, "branch_ref", "") or ""),
+        "base_commit": str(getattr(context, "base_commit", "") or ""),
+        "target_head_commit": str(
+            getattr(context, "target_head_commit", "") or ""
+        ),
+        "merge_queue_id": str(getattr(context, "merge_queue_id", "") or ""),
+        "payload_shape": {
+            "tool": "function_index",
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+        },
+    }
+    graph_copy_safe_body = _runtime_context_graph_copy_safe_body(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        target_project_root=target_project_root,
+        session_token_ref=session_token_ref,
+        route_identity=route_identity,
+    )
+    coverage = _runtime_context_guide_executable_actions(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        parent_contract_execution_id=str(
+            contract_identity.get("parent_contract_execution_id") or ""
+        ),
+        actionable_payloads=actionable_payloads,
+        graph_copy_safe_body=graph_copy_safe_body,
+        qa_verification_guide={},
+        contract_runtime_next_action=contract_next_action,
+    )
+    canonical_actions = dict(coverage.get("actions") or {})
+    if "reissue" in next_legal_action:
+        reissue = actionable_payloads.get("session_token_reissue_submission")
+        if isinstance(reissue, Mapping) and isinstance(
+            reissue.get("copy_safe_body"), Mapping
+        ):
+            canonical_actions["join"] = _guide_canonical_executable_action(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=contract_execution_id,
+                parent_contract_execution_id=str(
+                    contract_identity.get("parent_contract_execution_id") or ""
+                ),
+                action=str(reissue.get("action") or "session_token_reissue"),
+                facade="runtime_context.session_token_reissue",
+                mcp_tool="runtime_context_session_token_reissue",
+                method=str(reissue.get("method") or "POST"),
+                path=str(reissue.get("path") or ""),
+                stage_id="join",
+                line_id="session_token_reissue",
+                body=dict(reissue.get("copy_safe_body") or {}),
+            )
+    current_values = {
+        key: str(getattr(context, key, "") or "")
+        for key in (
+            "runtime_context_id",
+            "task_id",
+            "branch_ref",
+            "base_commit",
+            "target_head_commit",
+            "merge_queue_id",
+            "status",
+            "last_recovery_action",
+        )
+    }
+    current_values.update(
+        {
+            "parent_task_id": parent_task_id,
+            "target_project_root": target_project_root,
+            "worktree_path": worktree_path,
+        }
+    )
+    rejoin_eligibility = (
+        recovery.get("diagnostics", {}).get("session_token_rejoin_eligibility", {})
+        if isinstance(recovery.get("diagnostics"), Mapping)
+        else {}
+    )
+    blockers = list(rejoin_eligibility.get("blockers") or [])
+    detail_continuation = _runtime_context_worker_guide_detail_continuation(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        contract_revision_id=contract_revision_id,
+        session_token_ref=session_token_ref,
+        route_identity=route_identity,
+    )
+    bounded_source = {
+        "ok": True,
+        "project_id": project_id,
+        "governance_project_id": str(
+            getattr(context, "project_id", "") or project_id
+        ),
+        "target_project_id": str(
+            getattr(context, "target_project_id", "") or project_id
+        ),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "contract_execution_id": contract_execution_id,
+        "target_project_root": target_project_root,
+        "project_root": target_project_root,
+        "repo_root": target_project_root,
+        "worktree_path": worktree_path,
+        "branch_ref": str(getattr(context, "branch_ref", "") or ""),
+        "worker_scope": _runtime_context_worker_scope_projection(
+            worker_scope_files
+        ),
+        "owned_files": list(worker_scope_files),
+        "target_files": list(worker_scope_files),
+        "runtime_context": {
+            "schema_version": (
+                "runtime_context.authoritative_current_values.v1"
+            ),
+            "status": str(getattr(context, "status", "") or ""),
+            "source": "parallel_branch_runtime_contexts",
+            "source_of_authority": "RuntimeContext.current_values",
+            "current_values": current_values,
+            "copy_safe": True,
+        },
+        "session_token_ref": session_token_ref,
+        "session_token_ref_present": bool(session_token_ref),
+        "child_route_token_ref": str(
+            route_identity.get("route_token_ref") or ""
+        ),
+        "target_project_root_projection": target_root_projection,
+        "corrected_request_shapes": dict(
+            target_root_projection.get("corrected_request_shapes") or {}
+        ),
+        "contract_runtime_execution_resolution": (
+            contract_execution_resolution
+        ),
+        "contract_runtime_current_state": contract_state,
+        "contract_runtime_next_legal_action": contract_next_action,
+        "contract_runtime_authority_decision_source": (
+            contract_projection.get("authority_decision_source")
+            or "contract_runtime_current_state"
+        ),
+        "contract_runtime_next_action_took_precedence": (
+            contract_took_precedence
+        ),
+        "next_legal_action": next_legal_action,
+        "next_legal_action_decision_source": (
+            next_legal_action_decision_source
+        ),
+        "next_required_evidence": [
+            {
+                "id": "current_runtime_context_action",
+                "status": "required",
+                "producer": "runtime_context_service",
+                "next_legal_action": next_legal_action,
+            }
+        ],
+        "missing_evidence": [],
+        "blocking_reasons": blockers,
+        "canonical_executable_actions": canonical_actions,
+        "actionable_payloads": actionable_payloads,
+        "source_refs": {
+            "branch_runtime": (
+                "parallel_branch_runtime_contexts/"
+                f"{project_id}/{runtime_context_id}"
+            ),
+            "contract_revision_id": contract_revision_id,
+            "contract_runtime": (
+                f"contract_runtime:{contract_execution_id}"
+                if contract_execution_id
+                else ""
+            ),
+        },
+        "privacy_boundary": {
+            "raw_private_context_exposed": False,
+            "other_worker_contexts_exposed": False,
+            "raw_source_of_truth_copied": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        },
+        "detail_continuation": detail_continuation,
+        "worker_guide": {
+            "route_identity": dict(route_identity),
+            "graph_query_identity": graph_query_identity,
+            "session_token_lease": session_token_lease,
+            "worker_execution_safety": {
+                "writes_require_fence": True,
+                "session_token_ref_alone_authorizes_writes": False,
+                "raw_worker_auth_process_local_only": True,
+            },
+        },
+    }
+    compact = _runtime_context_worker_guide_compact_response(bounded_source)
+    compact["builder"] = "bounded_current_authority"
+    compact["full_worker_guide_builder_called"] = False
+    compact["full_runtime_projection_called"] = False
+    compact["role_scope"] = role
+    compact["serialized_bytes"] = (
+        _runtime_context_worker_guide_serialized_bytes(compact)
+    )
+    if (
+        compact["serialized_bytes"]
+        > _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+    ):
+        raise GovernanceError(
+            "runtime_context_worker_guide_compact_response_too_large",
+            "bounded Worker Guide projection exceeds the managed response limit",
+            503,
+            {
+                "response_view": "compact",
+                "serialized_bytes": compact["serialized_bytes"],
+                "max_serialized_bytes": (
+                    _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+                ),
+                "semantic_truncation_performed": False,
+                "writes_performed": False,
+            },
+        )
     return compact
 
 
@@ -35541,6 +36236,7 @@ def _runtime_context_worker_recovery_details(
     route_identity: Mapping[str, Any] | None = None,
     reason: str = "",
     context=None,
+    include_full_finish_projection: bool = True,
 ) -> dict[str, Any]:
     from .parallel_branch_runtime import (
         get_branch_context,
@@ -36309,6 +37005,8 @@ def _runtime_context_worker_recovery_details(
             if isinstance(session_renewal_hints, dict):
                 session_renewal_hints["rejoin"] = session_token_rejoin_submission
         try:
+            if not include_full_finish_projection:
+                raise LookupError("bounded_worker_guide_skips_full_finish_projection")
             projection_query = dict(ctx.query or {})
             projection_query["view"] = "all"
             projection_ctx = RequestContext(
@@ -36360,10 +37058,24 @@ def _runtime_context_worker_recovery_details(
                 "source": "durable_runtime_context_worker_guide",
                 "access_audit_recorded": False,
             }
-        except (GovernanceError, ValidationError, sqlite3.Error, ValueError):
+        except (
+            GovernanceError,
+            ValidationError,
+            sqlite3.Error,
+            ValueError,
+            LookupError,
+        ):
             diagnostics["finish_facade_projection"] = {
-                "status": "fail_closed_unavailable",
-                "source": "durable_runtime_context_worker_guide",
+                "status": (
+                    "available_via_bounded_detail_continuation"
+                    if not include_full_finish_projection
+                    else "fail_closed_unavailable"
+                ),
+                "source": (
+                    "bounded_runtime_context_authority"
+                    if not include_full_finish_projection
+                    else "durable_runtime_context_worker_guide"
+                ),
                 "access_audit_recorded": False,
             }
     recovery_actions = [
@@ -36491,6 +37203,7 @@ def _runtime_context_validate_mf_sub_lookup(
     require_target_project_root: bool = False,
     allow_validated: bool = False,
     allow_worktree_target_root_alias: bool = False,
+    bounded_worker_guide: bool = False,
 ):
     from .parallel_branch_runtime import (
         ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
@@ -36583,6 +37296,7 @@ def _runtime_context_validate_mf_sub_lookup(
                 session_token_ref=session_token_ref,
                 target_project_root=target_project_root,
                 reason=reason,
+                include_full_finish_projection=not bounded_worker_guide,
             )
         )
         if reason == "runtime_session_token_expired":
@@ -36610,6 +37324,7 @@ def _runtime_context_mf_sub_read_context(
     *,
     action: str,
     runtime_context_id: str,
+    bounded_worker_guide: bool = False,
 ):
     from .parallel_branch_runtime import get_branch_context_by_runtime_context_id
     from .permissions import session_role
@@ -36625,6 +37340,7 @@ def _runtime_context_mf_sub_read_context(
             runtime_context_id=runtime_context_id,
             allow_validated=True,
             allow_worktree_target_root_alias=True,
+            bounded_worker_guide=bounded_worker_guide,
         )
         return context, "mf_sub", session
     if (
@@ -36643,6 +37359,7 @@ def _runtime_context_mf_sub_read_context(
             require_session_token=True,
             allow_validated=True,
             allow_worktree_target_root_alias=True,
+            bounded_worker_guide=bounded_worker_guide,
         )
         session = _runtime_context_scoped_mf_sub_session(
             project_id=project_id,
@@ -41184,10 +41901,46 @@ def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: Re
     query = dict(ctx.query or {})
     requested_view = str(query.get("view") or "all").strip().lower()
     compact = requested_view == "compact"
+    if compact:
+        project_id = ctx.get_project_id()
+        runtime_context_id = str(
+            ctx.path_params.get("runtime_context_id")
+            or ctx.query.get("runtime_context_id")
+            or ""
+        ).strip()
+        if not runtime_context_id:
+            raise ValidationError("runtime_context_id is required")
+        conn = get_connection(project_id)
+        try:
+            context, role, _session = _runtime_context_mf_sub_read_context(
+                ctx,
+                conn,
+                action=(
+                    "graph-governance.parallel-branches."
+                    "runtime-context.worker-guide"
+                ),
+                runtime_context_id=runtime_context_id,
+                bounded_worker_guide=True,
+            )
+            response = _runtime_context_worker_guide_early_compact_response(
+                ctx,
+                conn,
+                project_id=project_id,
+                context=context,
+                role=role,
+            )
+            detail_cursor = str(query.get("detail_cursor") or "").strip()
+            if detail_cursor:
+                return _runtime_context_worker_guide_detail_page(
+                    response,
+                    detail_ref=str(query.get("detail_ref") or ""),
+                    detail_cursor=detail_cursor,
+                )
+            return response
+        finally:
+            conn.close()
     query["view"] = (
-        "worker_view"
-        if compact
-        else "all"
+        "all"
         if requested_view in {"all", "full"}
         else requested_view
     )
@@ -41206,8 +41959,6 @@ def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: Re
         state_ctx
     )
     response = _runtime_context_worker_guide_response(current_state)
-    if compact:
-        return _runtime_context_worker_guide_compact_response(response)
     response["response_view"] = "all"
     return response
 
