@@ -42323,6 +42323,107 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         pinned_initial_join_ref
     )
 
+    # Simulate the real host boundary: the first reissue client exits before
+    # delivering its raw envelope, so only the copy-safe current ref survives.
+    # Once that envelope expires, the exact same failed-QA generation may
+    # obtain one usable replacement while neither receipt nor startup exists.
+    first_reissued = joined
+    monkeypatch.setattr(server, "_utc_now", lambda: "2099-08-17T05:00:00Z")
+    current_after_first_delivery = get_branch_context(
+        conn,
+        PID,
+        fresh_task_id,
+    )
+    assert current_after_first_delivery is not None
+    repeat_payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id=current_after_first_delivery.runtime_context_id,
+        task_id=fresh_task_id,
+        parent_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+        worker_id=fresh_worker_id,
+        worker_slot_id=fresh_worker_id,
+        target_project_root=str(world.root),
+        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        agent_id=fresh_worker_id,
+        allocation_owner=fresh_worker_id,
+        actual_host_worker_id=fresh_worker_id,
+        worker_session_id=fresh_worker_session_id,
+        host_startup_id=fresh_host_startup_id,
+        host_session_id=fresh_worker_session_id,
+        route_identity=route_identity,
+        session_token_ref=first_reissued["session_token_ref"],
+        contract_execution_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+    )
+    repeat_body = copy.deepcopy(
+        repeat_payloads["session_token_reissue_submission"]["copy_safe_body"]
+    )
+    repeat_body["reason"] = (
+        "replace the expired undelivered envelope in the same generation"
+    )
+    joined = server.handle_graph_governance_runtime_context_session_token_reissue(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": fresh_context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body=repeat_body,
+        )
+    )
+    replacement_authority = joined["safe_ref_loss_replacement_authority"]
+    assert replacement_authority["prior_stage_reissue_count"] == 1
+    assert replacement_authority["max_loss_replacements"] == 1
+    assert replacement_authority["lease_status_at_replacement"] == "expired"
+    assert replacement_authority["worker_receipt_consumed"] is False
+    assert replacement_authority["worker_startup_consumed"] is False
+    before_competing_retry = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as competing_retry:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=repeat_body,
+            )
+        )
+    assert competing_retry.value.code == "fence_invalidated_or_unknown"
+    assert "\n".join(conn.iterdump()) == before_competing_retry
+
+    # Prepare the same-current-ref request while it is still a valid pre-read
+    # world.  After receipt/startup consume the envelope, this byte-identical
+    # request must fail closed and make no write.
+    post_consumption_payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id=fresh_context.runtime_context_id,
+        task_id=fresh_task_id,
+        parent_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+        worker_id=fresh_worker_id,
+        worker_slot_id=fresh_worker_id,
+        target_project_root=str(world.root),
+        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        agent_id=fresh_worker_id,
+        allocation_owner=fresh_worker_id,
+        actual_host_worker_id=fresh_worker_id,
+        worker_session_id=fresh_worker_session_id,
+        host_startup_id=fresh_host_startup_id,
+        host_session_id=fresh_worker_session_id,
+        route_identity=route_identity,
+        session_token_ref=joined["session_token_ref"],
+        contract_execution_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+    )
+    post_consumption_reissue_body = copy.deepcopy(
+        post_consumption_payloads["session_token_reissue_submission"][
+            "copy_safe_body"
+        ]
+    )
+    post_consumption_reissue_body["reason"] = (
+        "a consumed envelope must not be retrievable"
+    )
+
     stored_before_receipt = copy.deepcopy(
         actual_runtime.store.get(_BATCH_QA_CHILD_EXECUTIONS[index])
     )
@@ -42574,6 +42675,21 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert actual_runtime.store.get(
         _BATCH_QA_CHILD_EXECUTIONS[index]
     ) == stored_before_receipt
+    before_consumed_retry = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as consumed_retry:
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": startup_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=post_consumption_reissue_body,
+            )
+        )
+    assert consumed_retry.value.code == "fence_invalidated_or_unknown"
+    assert "\n".join(conn.iterdump()) == before_consumed_retry
 
     serialized_events = json.dumps(
         task_timeline.list_events(
@@ -42589,6 +42705,8 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         first_joined["fence_token"],
         second_joined["session_token"],
         second_joined["fence_token"],
+        first_reissued["session_token"],
+        first_reissued["fence_token"],
         joined["session_token"],
         joined["fence_token"],
     ):

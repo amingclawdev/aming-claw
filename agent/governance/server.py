@@ -41741,6 +41741,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             context,
             now_iso=now_iso,
         )
+        current_lease_status = str(current_lease.get("status") or "").strip()
         expected_principal = str(
             context.actual_host_worker_id
             or context.worker_slot_id
@@ -41823,10 +41824,22 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
                 prior_lease.get(field) != expected
                 for field, expected in prior_lease_expected.items()
             )
-            or str(current_lease.get("status") or "").strip() != "active"
-            or current_lease.get("authorization_valid") is not True
             or current_lease.get("lease_record_valid") is not True
-            or current_lease.get("expired") is not False
+            or current_lease_status not in {"active", "expired"}
+            or (
+                current_lease_status == "active"
+                and (
+                    current_lease.get("authorization_valid") is not True
+                    or current_lease.get("expired") is not False
+                )
+            )
+            or (
+                current_lease_status == "expired"
+                and (
+                    current_lease.get("authorization_valid") is not False
+                    or current_lease.get("expired") is not True
+                )
+            )
             or str(prior_authority.get("schema_version") or "").strip()
             != "runtime_context.safe_ref_prestartup_reissue_authority.v2"
             or prior_authority.get("server_derived") is not True
@@ -41866,6 +41879,9 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             "max_loss_replacements": 1,
             "session_token_ref": presented_session_ref,
             "lease_id": str(context.lease_id or "").strip(),
+            "lease_status_at_replacement": current_lease_status,
+            "worker_receipt_consumed": False,
+            "worker_startup_consumed": False,
             "route_identity_hash": route_identity_hash,
             "raw_credentials_persisted": False,
         }
