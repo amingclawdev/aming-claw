@@ -29500,7 +29500,9 @@ def _runtime_context_graph_copy_safe_body(
     return body
 
 
-_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES = 256 * 1024
+_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES = 32 * 1024
+_RUNTIME_CONTEXT_WORKER_GUIDE_INLINE_DIAGNOSTIC_BYTES = 2 * 1024
+_RUNTIME_CONTEXT_WORKER_GUIDE_INLINE_DIAGNOSTIC_ITEMS = 8
 
 _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_ACTIONABLE_KEYS = (
     "schema_version",
@@ -29582,21 +29584,128 @@ def _runtime_context_worker_guide_serialized_bytes(value: Any) -> int:
     )
 
 
+def _runtime_context_worker_guide_paged_value(
+    value: Any,
+    *,
+    field: str,
+    detail_ref: str,
+) -> tuple[Any, dict[str, Any]]:
+    """Keep small diagnostics inline and source-address larger values."""
+
+    serialized_bytes = _runtime_context_worker_guide_serialized_bytes(value)
+    if serialized_bytes <= _RUNTIME_CONTEXT_WORKER_GUIDE_INLINE_DIAGNOSTIC_BYTES:
+        return deepcopy(value), {}
+
+    item_count = len(value) if isinstance(value, (Mapping, list, tuple)) else 1
+    inline: Any
+    remaining_count = 0
+    if isinstance(value, Mapping):
+        scalar_keys = (
+            "schema_version",
+            "status",
+            "mode",
+            "eligible",
+            "action",
+            "next_legal_action",
+            "stage_id",
+            "line_id",
+            "line_instance_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "contract_execution_id",
+            "worker_id",
+            "worker_slot_id",
+            "required_role",
+            "code",
+            "error",
+            "reason",
+            "message",
+            "source",
+            "field",
+            "expected",
+            "actual",
+        )
+        inline = {
+            key: deepcopy(value[key])
+            for key in scalar_keys
+            if key in value
+            and isinstance(value[key], (str, int, float, bool, type(None)))
+        }
+        remaining_count = max(0, len(value) - len(inline))
+    elif isinstance(value, (list, tuple)):
+        inline_items = []
+        for item in list(value)[:_RUNTIME_CONTEXT_WORKER_GUIDE_INLINE_DIAGNOSTIC_ITEMS]:
+            if isinstance(item, Mapping):
+                inline_items.append(
+                    {
+                        key: deepcopy(item[key])
+                        for key in (
+                            "id",
+                            "status",
+                            "code",
+                            "error",
+                            "reason",
+                            "message",
+                            "action",
+                            "next_legal_action",
+                            "producer",
+                            "field",
+                            "source",
+                        )
+                        if key in item
+                        and isinstance(
+                            item[key], (str, int, float, bool, type(None))
+                        )
+                    }
+                )
+            else:
+                inline_items.append(deepcopy(item))
+        inline = inline_items
+        remaining_count = max(0, len(value) - len(inline_items))
+    else:
+        inline = {
+            "status": "available_via_bounded_detail_continuation",
+        }
+
+    detail_cursor = (
+        "recovery"
+        if field.startswith(("session_token_", "read_receipt_", "startup_", "finish_"))
+        or ".eligibility." in field
+        else (
+            "contract_runtime"
+            if field.startswith(
+                (
+                    "target_project_root_projection",
+                    "contract_runtime_execution_resolution",
+                )
+            )
+            else "evidence"
+        )
+    )
+    page = {
+        "schema_version": "runtime_context.worker_guide_paged_value.v1",
+        "field": field,
+        "detail_ref": detail_ref,
+        "detail_cursor": detail_cursor,
+        "source_hash": _stable_public_hash(value),
+        "source_serialized_bytes": serialized_bytes,
+        "item_count": item_count,
+        "inline_item_count": (
+            len(inline) if isinstance(inline, (Mapping, list, tuple)) else 1
+        ),
+        "remaining_count": remaining_count,
+        "semantic_truncation_performed": False,
+    }
+    return inline, page
+
+
 def _runtime_context_worker_guide_current_stage(
     response: Mapping[str, Any],
 ) -> str:
     next_action = response.get("contract_runtime_next_legal_action")
     next_action = next_action if isinstance(next_action, Mapping) else {}
-    signal = " ".join(
-        str(value or "").strip().lower()
-        for value in (
-            next_action.get("stage_id"),
-            next_action.get("line_id"),
-            next_action.get("action"),
-            response.get("next_legal_action"),
-        )
-    )
-    for stage, markers in (
+    stage_markers = (
         ("finish", ("finish_gate", "finish gate")),
         ("attestation", ("finish_time", "attestation")),
         ("commit", ("worker_commit", "worker commit")),
@@ -29604,17 +29713,44 @@ def _runtime_context_worker_guide_current_stage(
         ("graph", ("graph",)),
         ("startup", ("startup",)),
         ("receipt", ("receipt", "worker_read")),
-        ("join", ("initial_join", "session_token_rejoin", "session_token_reissue")),
-    ):
-        if any(marker in signal for marker in markers):
-            return stage
+        (
+            "join",
+            (
+                "initial_join",
+                "session_token_rejoin",
+                "session_token_reissue",
+                "reissue_runtime_session_token",
+                "runtime_context_rejoin_host_envelope",
+                "runtime_context_initial_join_host_envelope",
+            ),
+        ),
+    )
+    signals = (
+        str(response.get("next_legal_action") or "").strip().lower(),
+        " ".join(
+            str(value or "").strip().lower()
+            for value in (
+                next_action.get("stage_id"),
+                next_action.get("line_id"),
+                next_action.get("action"),
+            )
+        ),
+    )
+    for signal in signals:
+        for stage, markers in stage_markers:
+            if any(marker in signal for marker in markers):
+                return stage
     return ""
 
 
 def _runtime_context_worker_guide_bounded_actionable_payloads(
     actionable: Mapping[str, Any],
+    *,
+    current_stage: str = "",
+    next_legal_action: str = "",
+    detail_ref: str = "",
 ) -> dict[str, Any]:
-    """Keep executable bodies and bounded policy, never recursive guide copies."""
+    """Keep the current executable bodies, never every lifecycle duplicate."""
 
     scalar_or_bounded_keys = (
         "schema_version",
@@ -29639,13 +29775,10 @@ def _runtime_context_worker_guide_bounded_actionable_payloads(
         "target_project_root",
         "route_identity",
         "route_token_ref",
-        "copy_safe_route_token_scope",
         "session_token_ref",
         "session_token_ref_available",
         "fence_token_ref",
         "fence_token_hash",
-        "worker_session_lifecycle_policy",
-        "write_authorization_policy",
         "raw_session_token_exposed",
         "raw_fence_token_exposed",
         "raw_route_token_exposed",
@@ -29656,7 +29789,9 @@ def _runtime_context_worker_guide_bounded_actionable_payloads(
         if key in actionable
     }
 
-    def bounded_submission(source: Any) -> dict[str, Any]:
+    paged_sections: dict[str, Any] = {}
+
+    def bounded_submission(source: Any, *, field: str) -> dict[str, Any]:
         if not isinstance(source, Mapping):
             return {}
         bounded = {
@@ -29670,12 +29805,22 @@ def _runtime_context_worker_guide_bounded_actionable_payloads(
                 "path",
                 "body_source",
                 "copy_safe_body",
-                "successful_response",
                 "security_boundary",
                 "required_response_handling",
             )
             if key in source
         }
+        for diagnostic_key in ("security_boundary", "required_response_handling"):
+            if diagnostic_key not in bounded:
+                continue
+            compact_value, page = _runtime_context_worker_guide_paged_value(
+                bounded[diagnostic_key],
+                field=f"{field}.{diagnostic_key}",
+                detail_ref=detail_ref,
+            )
+            bounded[diagnostic_key] = compact_value
+            if page:
+                paged_sections[page["field"]] = page
         eligibility = source.get("eligibility")
         if isinstance(eligibility, Mapping):
             bounded_eligibility = {
@@ -29685,39 +29830,103 @@ def _runtime_context_worker_guide_bounded_actionable_payloads(
                     "eligible",
                     "mode",
                     "context_status",
-                    "blockers",
                     "required_response_handling",
                     "post_receipt_pre_startup_recovery",
                     "pre_receipt_safe_ref_loss_replacement",
                 )
                 if key in eligibility
             }
+            blockers, blocker_page = _runtime_context_worker_guide_paged_value(
+                eligibility.get("blockers") or [],
+                field=f"{field}.eligibility.blockers",
+                detail_ref=detail_ref,
+            )
+            if blockers:
+                bounded_eligibility["blockers"] = blockers
+            if blocker_page:
+                paged_sections[blocker_page["field"]] = blocker_page
             nested_reissue = eligibility.get("session_token_reissue_submission")
             if isinstance(nested_reissue, Mapping):
                 bounded_eligibility["session_token_reissue_submission"] = (
-                    bounded_submission(nested_reissue)
+                    bounded_submission(
+                        nested_reissue,
+                        field=f"{field}.eligibility.session_token_reissue_submission",
+                    )
                 )
             bounded["eligibility"] = bounded_eligibility
         return bounded
 
-    for key in (
-        "session_token_initial_join_submission",
-        "session_token_reissue_submission",
-        "session_token_rejoin_submission",
-        "read_receipt_facade_payload_skeleton",
-        "startup_facade_payload_skeleton",
-        "implementation_evidence_facade_payload_skeleton",
-        "scope_insufficiency_request_facade_payload_skeleton",
-        "worker_commit_facade_payload_skeleton",
-        "finish_time_worker_attestation_submission",
-        "finish_time_worker_attestation_facade_payload_skeleton",
-        "finish_time_worker_self_attestation_facade_payload_skeleton",
-        "finish_time_attestation_facade_payload_skeleton",
-        "finish_gate_facade_payload_skeleton",
-    ):
-        bounded = bounded_submission(actionable.get(key))
+    action_signal = str(next_legal_action or "").strip().lower()
+    selected_keys: set[str] = set()
+    if current_stage == "join":
+        if "initial_join" in action_signal:
+            selected_keys.add("session_token_initial_join_submission")
+        elif "reissue" in action_signal:
+            selected_keys.add("session_token_reissue_submission")
+        else:
+            selected_keys.add("session_token_rejoin_submission")
+    selected_keys.update(
+        {
+            "receipt": {"read_receipt_facade_payload_skeleton"},
+            "startup": {"startup_facade_payload_skeleton"},
+            "implementation": {
+                "implementation_evidence_facade_payload_skeleton",
+                "scope_insufficiency_request_facade_payload_skeleton",
+            },
+            "commit": {"worker_commit_facade_payload_skeleton"},
+            "attestation": {
+                "finish_time_worker_attestation_submission",
+                "finish_time_worker_attestation_facade_payload_skeleton",
+            },
+            "finish": {"finish_gate_facade_payload_skeleton"},
+        }.get(current_stage, set())
+    )
+    rejoin = actionable.get("session_token_rejoin_submission")
+    if isinstance(rejoin, Mapping):
+        eligibility = rejoin.get("eligibility")
+        if isinstance(eligibility, Mapping) and isinstance(
+            eligibility.get("session_token_reissue_submission"), Mapping
+        ):
+            selected_keys.add("session_token_rejoin_submission")
+
+    for key in sorted(selected_keys):
+        bounded = bounded_submission(actionable.get(key), field=key)
         if bounded:
             result[key] = bounded
+    omitted_keys = sorted(
+        key
+        for key in (
+            "session_token_initial_join_submission",
+            "session_token_reissue_submission",
+            "session_token_rejoin_submission",
+            "read_receipt_facade_payload_skeleton",
+            "startup_facade_payload_skeleton",
+            "implementation_evidence_facade_payload_skeleton",
+            "scope_insufficiency_request_facade_payload_skeleton",
+            "worker_commit_facade_payload_skeleton",
+            "finish_time_worker_attestation_submission",
+            "finish_time_worker_attestation_facade_payload_skeleton",
+            "finish_time_worker_self_attestation_facade_payload_skeleton",
+            "finish_time_attestation_facade_payload_skeleton",
+            "finish_gate_facade_payload_skeleton",
+        )
+        if key in actionable and key not in selected_keys
+    )
+    if omitted_keys:
+        result["paged_lifecycle_payloads"] = {
+            "schema_version": (
+                "runtime_context.worker_guide_paged_lifecycle_payloads.v1"
+            ),
+            "detail_ref": detail_ref,
+            "detail_cursor": "recovery",
+            "keys": omitted_keys,
+            "source_hash": _stable_public_hash(
+                {key: actionable.get(key) for key in omitted_keys}
+            ),
+            "semantic_truncation_performed": False,
+        }
+    if paged_sections:
+        result["paged_sections"] = paged_sections
     return result
 
 
@@ -29731,8 +29940,29 @@ def _runtime_context_worker_guide_compact_response(
     nested = nested if isinstance(nested, Mapping) else {}
     actionable = full.get("actionable_payloads")
     actionable = actionable if isinstance(actionable, Mapping) else {}
-    compact_actionable = (
-        _runtime_context_worker_guide_bounded_actionable_payloads(actionable)
+    current_stage = _runtime_context_worker_guide_current_stage(full)
+    detail_continuation = full.get("detail_continuation")
+    detail_continuation = (
+        detail_continuation
+        if isinstance(detail_continuation, Mapping)
+        else {}
+    )
+    detail_ref = str(detail_continuation.get("detail_ref") or "").strip()
+    if not detail_ref:
+        detail_ref = "worker-guide-detail:" + _stable_public_hash(
+            {
+                "project_id": full.get("project_id"),
+                "runtime_context_id": full.get("runtime_context_id"),
+                "task_id": full.get("task_id"),
+                "parent_task_id": full.get("parent_task_id"),
+                "session_token_ref": full.get("session_token_ref"),
+            }
+        )
+    compact_actionable = _runtime_context_worker_guide_bounded_actionable_payloads(
+        actionable,
+        current_stage=current_stage,
+        next_legal_action=str(full.get("next_legal_action") or ""),
+        detail_ref=detail_ref,
     )
     contract_state = full.get("contract_runtime_current_state")
     contract_state = contract_state if isinstance(contract_state, Mapping) else {}
@@ -29745,7 +29975,6 @@ def _runtime_context_worker_guide_compact_response(
     executable_actions = (
         executable_actions if isinstance(executable_actions, Mapping) else {}
     )
-    current_stage = _runtime_context_worker_guide_current_stage(full)
     current_action = (
         deepcopy(executable_actions.get(current_stage))
         if current_stage and isinstance(executable_actions.get(current_stage), Mapping)
@@ -29768,6 +29997,62 @@ def _runtime_context_worker_guide_compact_response(
         if isinstance(worker_execution_safety, Mapping)
         else {}
     )
+    paged_sections: dict[str, Any] = {}
+
+    def paged(field: str, value: Any) -> Any:
+        compact_value, page = _runtime_context_worker_guide_paged_value(
+            value,
+            field=field,
+            detail_ref=detail_ref,
+        )
+        if page:
+            paged_sections[field] = page
+        return compact_value
+
+    target_root_projection = paged(
+        "target_project_root_projection",
+        full.get("target_project_root_projection") or {},
+    )
+    if "next_legal_action" in compact_contract_state:
+        compact_contract_state["next_legal_action"] = paged(
+            "contract_runtime_current_state.next_legal_action",
+            compact_contract_state.get("next_legal_action") or {},
+        )
+    contract_next_legal_action = paged(
+        "contract_runtime_next_legal_action",
+        full.get("contract_runtime_next_legal_action") or {},
+    )
+    execution_resolution = paged(
+        "contract_runtime_execution_resolution",
+        full.get("contract_runtime_execution_resolution") or {},
+    )
+    next_required_evidence = paged(
+        "next_required_evidence",
+        full.get("next_required_evidence") or [],
+    )
+    missing_evidence = paged(
+        "missing_evidence",
+        full.get("missing_evidence") or [],
+    )
+    blocking_reasons = paged(
+        "blocking_reasons",
+        full.get("blocking_reasons") or [],
+    )
+    if not detail_continuation:
+        detail_continuation = {
+            "schema_version": (
+                "runtime_context.worker_guide_detail_continuation.v1"
+            ),
+            "detail_ref": detail_ref,
+            "mode": "bounded_source_pages",
+            "sections": ["identity", "contract_runtime", "recovery", "evidence"],
+            "page_size": 1,
+            "next_cursor": "identity",
+            "semantic_truncation_performed": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        }
     compact = {
         "ok": bool(full.get("ok")),
         "schema_version": "runtime_context.worker_guide_compact_response.v1",
@@ -29802,19 +30087,10 @@ def _runtime_context_worker_guide_compact_response(
         "graph_query_identity": deepcopy(dict(graph_query_identity)),
         "session_token_lease": deepcopy(dict(session_token_lease)),
         "worker_execution_safety": deepcopy(dict(worker_execution_safety)),
-        "target_project_root_projection": deepcopy(
-            full.get("target_project_root_projection") or {}
-        ),
-        "corrected_request_shapes": deepcopy(
-            full.get("corrected_request_shapes") or {}
-        ),
-        "contract_runtime_execution_resolution": deepcopy(
-            full.get("contract_runtime_execution_resolution") or {}
-        ),
+        "target_project_root_projection": target_root_projection,
+        "contract_runtime_execution_resolution": execution_resolution,
         "contract_runtime_current_state": compact_contract_state,
-        "contract_runtime_next_legal_action": deepcopy(
-            full.get("contract_runtime_next_legal_action") or {}
-        ),
+        "contract_runtime_next_legal_action": contract_next_legal_action,
         "contract_runtime_authority_decision_source": full.get(
             "contract_runtime_authority_decision_source"
         ),
@@ -29825,24 +30101,22 @@ def _runtime_context_worker_guide_compact_response(
         "next_legal_action_decision_source": full.get(
             "next_legal_action_decision_source"
         ),
-        "next_required_evidence": deepcopy(full.get("next_required_evidence") or []),
-        "missing_evidence": deepcopy(full.get("missing_evidence") or []),
-        "blocking_reasons": deepcopy(full.get("blocking_reasons") or []),
+        "next_required_evidence": next_required_evidence,
+        "missing_evidence": missing_evidence,
+        "blocking_reasons": blocking_reasons,
         "canonical_executable_action": current_action,
-        "canonical_executable_actions": (
-            {current_stage: deepcopy(current_action)} if current_action else {}
-        ),
         "actionable_payloads": compact_actionable,
         "source_refs": deepcopy(full.get("source_refs") or {}),
         "privacy_boundary": deepcopy(full.get("privacy_boundary") or {}),
-        "detail_continuation": deepcopy(
-            full.get("detail_continuation") or {}
-        ),
+        "detail_continuation": deepcopy(dict(detail_continuation)),
+        "paged_sections": paged_sections,
         "omitted_recursive_sections": [
             "worker_guide",
             "executable_contract",
             "guide_to_facade_coverage",
             "duplicate_top_level_payload_skeletons",
+            "corrected_request_shapes",
+            "inactive_canonical_executable_actions",
         ],
     }
     for _ in range(3):
@@ -29851,9 +30125,19 @@ def _runtime_context_worker_guide_compact_response(
         )
     serialized_bytes = _runtime_context_worker_guide_serialized_bytes(compact)
     if serialized_bytes > _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES:
+        largest_fields = sorted(
+            (
+                (_runtime_context_worker_guide_serialized_bytes(value), key)
+                for key, value in compact.items()
+            ),
+            reverse=True,
+        )[:3]
         raise GovernanceError(
             "runtime_context_worker_guide_compact_response_too_large",
-            "bounded Worker Guide projection exceeds the managed response limit",
+            (
+                "bounded Worker Guide projection exceeds the managed response "
+                f"limit ({serialized_bytes} bytes; largest={largest_fields})"
+            ),
             503,
             {
                 "response_view": "compact",
@@ -29993,6 +30277,11 @@ def _runtime_context_worker_guide_detail_page(
             "next_legal_action_decision_source": compact.get(
                 "next_legal_action_decision_source"
             ),
+            "paged_sections": {
+                key: deepcopy(value)
+                for key, value in dict(compact.get("paged_sections") or {}).items()
+                if value.get("detail_cursor") == "contract_runtime"
+            },
         },
         "recovery": {
             "session_token_lease": deepcopy(
@@ -30004,6 +30293,11 @@ def _runtime_context_worker_guide_detail_page(
             "actionable_payloads": deepcopy(
                 compact.get("actionable_payloads") or {}
             ),
+            "paged_sections": {
+                key: deepcopy(value)
+                for key, value in dict(compact.get("paged_sections") or {}).items()
+                if value.get("detail_cursor") == "recovery"
+            },
         },
         "evidence": {
             "next_required_evidence": deepcopy(
@@ -30012,6 +30306,11 @@ def _runtime_context_worker_guide_detail_page(
             "missing_evidence": deepcopy(compact.get("missing_evidence") or []),
             "blocking_reasons": deepcopy(compact.get("blocking_reasons") or []),
             "source_refs": deepcopy(compact.get("source_refs") or {}),
+            "paged_sections": {
+                key: deepcopy(value)
+                for key, value in dict(compact.get("paged_sections") or {}).items()
+                if value.get("detail_cursor") == "evidence"
+            },
         },
     }
     index = sections.index(cursor)

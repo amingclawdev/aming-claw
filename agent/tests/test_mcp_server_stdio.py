@@ -364,6 +364,184 @@ def _run_mcp_probe(
     return responses, stderr, returncode
 
 
+def test_worker_guide_readline_host_is_bounded_and_oversize_fails_same_id():
+    route = {
+        "route_id": "route-readline-guide",
+        "route_context_hash": "sha256:" + ("1" * 64),
+        "prompt_contract_id": "rprompt-readline-guide",
+        "prompt_contract_hash": "sha256:" + ("2" * 64),
+        "route_token_ref": "rtok-readline-guide",
+        "visible_injection_manifest_hash": "sha256:" + ("3" * 64),
+    }
+    guide = {
+        "ok": True,
+        "schema_version": "runtime_context.worker_guide_compact_response.v1",
+        "response_view": "compact",
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-readline-guide",
+        "task_id": "worker-readline-guide",
+        "parent_task_id": "cex-readline-guide",
+        "session_token_ref": "wstok-readline-guide",
+        "next_legal_action": "reissue_runtime_session_token",
+        "route_identity": route,
+        "actionable_payloads": {
+            "session_token_rejoin_submission": {
+                "eligibility": {
+                    "eligible": True,
+                    "session_token_reissue_submission": {
+                        "action": "runtime_context_session_token_reissue",
+                        "copy_safe_body": {
+                            "project_id": "aming-claw",
+                            "runtime_context_id": "mfrctx-readline-guide",
+                            "task_id": "worker-readline-guide",
+                            "session_token_ref": "wstok-readline-guide",
+                            **route,
+                        },
+                    },
+                },
+            },
+        },
+        "blocking_reasons": [],
+        "paged_sections": {
+            "live_large_world": {
+                "detail_ref": "worker-guide-detail:readline-guide",
+                "source_hash": "sha256:" + ("4" * 64),
+                "safe_fixture": "x" * 24_000,
+                "semantic_truncation_performed": False,
+            },
+        },
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    guide["serialized_bytes"] = len(
+        json.dumps(guide, ensure_ascii=False, separators=(",", ":")).encode()
+    )
+    oversized = {"ok": True, "synthetic_oversized_response": "z" * 80_000}
+
+    class Handler(BaseHTTPRequestHandler):
+        calls = 0
+
+        def log_message(self, *_args):
+            return None
+
+        def do_GET(self):
+            self.__class__.calls += 1
+            payload = guide if self.__class__.calls == 1 else oversized
+            encoded = json.dumps(payload, separators=(",", ":")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "agent.mcp.server",
+            "--project",
+            "aming-claw",
+            "--workers",
+            "0",
+            "--governance-url",
+            f"http://127.0.0.1:{server.server_address[1]}",
+        ],
+        cwd=ROOT,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+
+    def read_line_with_deadline() -> str:
+        lines: list[str] = []
+        reader = threading.Thread(
+            target=lambda: lines.append(proc.stdout.readline()),
+            daemon=True,
+        )
+        reader.start()
+        reader.join(timeout=10)
+        assert not reader.is_alive(), "readline-only MCP host exceeded deadline"
+        assert lines and lines[0]
+        return lines[0]
+
+    args = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-readline-guide",
+        "task_id": "worker-readline-guide",
+        "parent_task_id": "cex-readline-guide",
+        "target_project_root": str(ROOT),
+        "session_token_ref": "wstok-readline-guide",
+        **route,
+    }
+    try:
+        for message in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "runtime_context_worker_guide",
+                    "arguments": args,
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "runtime_context_worker_guide",
+                    "arguments": args,
+                },
+            },
+        ):
+            proc.stdin.write(json.dumps(message) + "\n")
+            proc.stdin.flush()
+            line = read_line_with_deadline()
+            response = json.loads(line)
+            assert response["id"] == message["id"]
+            if message["id"] == 2:
+                assert len(line.encode()) <= (
+                    plugin_mcp_server.MCP_WORKER_GUIDE_FRAME_TARGET_BYTES
+                )
+                payload = json.loads(response["result"]["content"][0]["text"])
+                assert payload["runtime_context_id"] == args["runtime_context_id"]
+                assert payload["route_identity"] == route
+                assert payload["actionable_payloads"][
+                    "session_token_rejoin_submission"
+                ]["eligibility"]["session_token_reissue_submission"][
+                    "copy_safe_body"
+                ]["session_token_ref"] == args["session_token_ref"]
+            elif message["id"] == 3:
+                assert response["error"]["message"] == (
+                    "mcp_response_frame_too_large"
+                )
+                data = response["error"]["data"]
+                assert data["writes_performed"] is False
+                assert data["semantic_truncation_performed"] is False
+                assert data["detail_ref"].startswith(
+                    "mcp-response-frame:sha256:"
+                )
+                assert len(line.encode()) < 2_048
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=10)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+    assert proc.returncode == 0
+    assert Handler.calls == 2
+    stderr = proc.stderr.read() if proc.stderr else ""
+    assert stderr == ""
+
+
 def test_mcp_stdio_initialize_and_health_survive_missing_governance():
     responses, stderr, returncode = _run_mcp_probe([
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},

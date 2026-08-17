@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -111,6 +112,8 @@ def _resource_path_candidates(spec: ResourcePathSpec) -> tuple[str, ...]:
 PARSE_ERROR = -32700
 METHOD_NOT_FOUND = -32601
 INTERNAL_ERROR = -32603
+MCP_RESPONSE_FRAME_MAX_BYTES = 256 * 1024
+MCP_WORKER_GUIDE_FRAME_TARGET_BYTES = 48 * 1024
 
 # ---------------------------------------------------------------------------
 # Thread-safe stdio transport
@@ -145,15 +148,55 @@ def _git_status(workspace: str) -> dict:
     return result
 
 
-def _write(msg: dict) -> None:
+def _write(
+    msg: dict,
+    *,
+    max_serialized_bytes: int = MCP_RESPONSE_FRAME_MAX_BYTES,
+) -> None:
     line = json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
+    serialized_bytes = len(line.encode("utf-8"))
+    if serialized_bytes > max_serialized_bytes:
+        source_hash = hashlib.sha256(line.encode("utf-8")).hexdigest()
+        req_id = msg.get("id") if isinstance(msg, dict) else None
+        bounded_error = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": INTERNAL_ERROR,
+                "message": "mcp_response_frame_too_large",
+                "data": {
+                    "error": "mcp_response_frame_too_large",
+                    "serialized_bytes": serialized_bytes,
+                    "max_serialized_bytes": max_serialized_bytes,
+                    "detail_ref": f"mcp-response-frame:sha256:{source_hash}",
+                    "page_ref": f"mcp-response-frame:sha256:{source_hash}",
+                    "writes_performed": False,
+                    "semantic_truncation_performed": False,
+                    "raw_secret_exposed": False,
+                },
+            },
+        }
+        line = json.dumps(
+            bounded_error,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     with _stdout_lock:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
 
-def _response(req_id: Any, result: Any) -> None:
-    _write({"jsonrpc": "2.0", "id": req_id, "result": result})
+def _response(
+    req_id: Any,
+    result: Any,
+    *,
+    max_serialized_bytes: int = MCP_RESPONSE_FRAME_MAX_BYTES,
+) -> None:
+    message = {"jsonrpc": "2.0", "id": req_id, "result": result}
+    if max_serialized_bytes == MCP_RESPONSE_FRAME_MAX_BYTES:
+        _write(message)
+        return
+    _write(message, max_serialized_bytes=max_serialized_bytes)
 
 
 def _error_response(req_id: Any, code: int, message: str, data: Any = None) -> None:
@@ -759,11 +802,26 @@ class AmingClawMCP:
             tool_args = params.get("arguments") or {}
             try:
                 result = self.dispatcher.dispatch(tool_name, tool_args)
-                _response(req_id, {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)},
-                    ],
-                })
+                compact_worker_guide = tool_name == "runtime_context_worker_guide"
+                result_text = json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    separators=(",", ":") if compact_worker_guide else None,
+                    indent=None if compact_worker_guide else 2,
+                )
+                _response(
+                    req_id,
+                    {
+                        "content": [
+                            {"type": "text", "text": result_text},
+                        ],
+                    },
+                    max_serialized_bytes=(
+                        MCP_WORKER_GUIDE_FRAME_TARGET_BYTES
+                        if compact_worker_guide
+                        else MCP_RESPONSE_FRAME_MAX_BYTES
+                    ),
+                )
             except ValueError as exc:
                 _error_response(req_id, METHOD_NOT_FOUND, str(exc))
             except Exception as exc:

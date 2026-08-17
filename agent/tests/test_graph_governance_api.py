@@ -164241,6 +164241,89 @@ def test_worker_guide_compact_projection_is_bounded_and_semantically_complete():
     assert "merge_gate_evidence_payloads" not in compact["actionable_payloads"]
 
 
+def test_worker_guide_compact_pages_large_diagnostics_and_fits_desktop_frame():
+    full = _representative_oversized_worker_guide()
+    expected_reissue = full["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]["eligibility"]["session_token_reissue_submission"]["copy_safe_body"]
+    full["next_legal_action"] = "reissue_runtime_session_token"
+    full["canonical_executable_actions"]["join"] = {
+        "mcp_tool": "runtime_context_session_token_reissue",
+        "copy_safe_body": copy.deepcopy(expected_reissue),
+    }
+    full["target_project_root_projection"] = {
+        "status": "verified",
+        "source": "runtime_context.current_values",
+        "recursive_diagnostics": "r" * 80_000,
+    }
+    full["contract_runtime_execution_resolution"] = {
+        "status": "resolved",
+        "source": "contract_runtime",
+        "candidate_diagnostics": "c" * 80_000,
+    }
+    full["next_required_evidence"] = [
+        {
+            "id": f"evidence-{index}",
+            "status": "required",
+            "producer": "runtime_context_service",
+            "diagnostics": "e" * 4_000,
+        }
+        for index in range(24)
+    ]
+    full["blocking_reasons"] = [
+        {
+            "id": f"blocker-{index}",
+            "status": "blocked",
+            "code": "live_large_world_diagnostic",
+            "diagnostics": "b" * 4_000,
+        }
+        for index in range(24)
+    ]
+    full["actionable_payloads"]["startup_facade_payload_skeleton"] = {
+        "action": "record_mf_subagent_startup",
+        "copy_safe_body": {"inactive_duplicate": "s" * 80_000},
+    }
+
+    compact = server._runtime_context_worker_guide_compact_response(full)
+    result_text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    frame = {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "result": {"content": [{"type": "text", "text": result_text}]},
+    }
+    frame_bytes = len(
+        json.dumps(frame, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+
+    assert compact["serialized_bytes"] <= (
+        server._RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+    )
+    assert frame_bytes <= 48 * 1024
+    assert compact["target_project_root_projection"] == {
+        "status": "verified",
+        "source": "runtime_context.current_values",
+    }
+    assert compact["blocking_reasons"][0]["id"] == "blocker-0"
+    assert compact["paged_sections"]["blocking_reasons"][
+        "semantic_truncation_performed"
+    ] is False
+    assert compact["paged_sections"]["blocking_reasons"]["remaining_count"] == 16
+    assert compact["actionable_payloads"]["paged_lifecycle_payloads"][
+        "detail_cursor"
+    ] == "recovery"
+    projected_reissue = compact["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]["eligibility"]["session_token_reissue_submission"]["copy_safe_body"]
+    assert projected_reissue == expected_reissue
+    assert compact["canonical_executable_action"]["mcp_tool"] == (
+        "runtime_context_session_token_reissue"
+    )
+    assert compact["route_identity"] == full["worker_guide"]["route_identity"]
+    assert compact["next_legal_action"] == full["next_legal_action"]
+
+
 def test_worker_guide_compact_projection_fails_closed_instead_of_truncating():
     full = _representative_oversized_worker_guide()
     full["actionable_payloads"]["session_token_rejoin_submission"][
