@@ -35661,7 +35661,11 @@ def _runtime_context_worker_recovery_details(
                 recovery_action_id = (
                     "request_runtime_context_safe_ref_prestartup_reissue"
                 )
-            elif missing_worker_lineage and not pre_lineage_bootstrap_recovery:
+            elif (
+                missing_worker_lineage
+                and not pre_lineage_bootstrap_recovery
+                and not safe_ref_prestartup_reissue
+            ):
                 next_legal_action = "request_runtime_context_initial_join_host_envelope"
                 recovery_action_id = "request_runtime_context_initial_join_host_envelope"
                 session_token_initial_join_submission = {
@@ -35982,6 +35986,15 @@ def _runtime_context_worker_recovery_details(
             else {}
         )
         if projected_prestartup_reissue:
+            # The source-backed safe-ref authority is the only executable host
+            # recovery in this world.  Do not leave the generic missing-lineage
+            # initial-join projection beside it: that join belongs to the
+            # original generation boundary and cannot replace a lost reissue
+            # envelope for the already joined current generation.
+            actionable_payloads.pop(
+                "session_token_initial_join_submission",
+                None,
+            )
             actionable_payloads["session_token_reissue_submission"] = (
                 deepcopy(dict(projected_prestartup_reissue))
             )
@@ -35989,9 +36002,14 @@ def _runtime_context_worker_recovery_details(
                 "session_renewal_hints"
             )
             if isinstance(renewal_hints, dict):
+                renewal_hints.pop("initial_join", None)
                 renewal_hints["reissue"] = deepcopy(
                     dict(projected_prestartup_reissue)
                 )
+                renewal_hints["preferred_for_live_worker"] = (
+                    "session_token_reissue_submission"
+                )
+                renewal_hints["reissue_available"] = True
         if session_token_initial_join_submission:
             # A copy-safe ref exists as soon as allocation persists a session
             # verifier, but it is not a recovery authority before the server
@@ -51283,12 +51301,25 @@ def _runtime_context_session_rejoin_guidance_eligibility(
     # it independently revalidates the single initial join, canonical worker /
     # CEX / route binding, current ContractRuntime startup line, stage
     # checkpoint and active-or-expired lease before rotating credentials.
-    if (
+    last_recovery_action = str(
+        getattr(context, "last_recovery_action", "") or ""
+    ).strip()
+    post_receipt_prestartup_reissue = bool(
         effective_read_receipt_ref
         and not effective_startup_ref
-        and status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
-        and str(getattr(context, "last_recovery_action", "") or "").strip()
-        == "mf_subagent_initial_join_issued"
+        and last_recovery_action == "mf_subagent_initial_join_issued"
+    )
+    pre_receipt_loss_replacement_reissue = bool(
+        not effective_read_receipt_ref
+        and not effective_startup_ref
+        and last_recovery_action == "mf_subagent_session_token_reissued"
+    )
+    if (
+        status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
+        and (
+            post_receipt_prestartup_reissue
+            or pre_receipt_loss_replacement_reissue
+        )
     ):
         route_identity = (
             dict(route_identity_override)
@@ -51452,7 +51483,12 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                     "safe_ref_session_authority_source": dict(
                         session_authority_source
                     ),
-                    "post_receipt_pre_startup_recovery": True,
+                    "post_receipt_pre_startup_recovery": (
+                        post_receipt_prestartup_reissue
+                    ),
+                    "pre_receipt_safe_ref_loss_replacement": (
+                        pre_receipt_loss_replacement_reissue
+                    ),
                     "session_token_reissue_submission": deepcopy(
                         dict(reissue_submission)
                     ),
@@ -51461,7 +51497,19 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                         "parse_mcp_content_text_in_same_call": True,
                         "inject_host_envelope_env_process_locally": True,
                         "submit_only_server_projected_reissue_body": True,
-                        "continue_directly_to_worker_startup": True,
+                        "continue_directly_to_worker_startup": bool(
+                            effective_read_receipt_ref
+                        ),
+                        **(
+                            {}
+                            if effective_read_receipt_ref
+                            else {
+                                "next_protected_worker_write": (
+                                    "runtime_context_read_receipt"
+                                ),
+                                "continue_directly_to_worker_read_receipt": True,
+                            }
+                        ),
                         "if_envelope_lost": (
                             "stop_and_report_safe_ref_prestartup_reissue_loss"
                         ),

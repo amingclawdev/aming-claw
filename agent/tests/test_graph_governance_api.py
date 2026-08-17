@@ -42335,28 +42335,63 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         fresh_task_id,
     )
     assert current_after_first_delivery is not None
-    repeat_payloads = server._runtime_context_worker_recovery_payloads(
-        project_id=PID,
-        runtime_context_id=current_after_first_delivery.runtime_context_id,
-        task_id=fresh_task_id,
-        parent_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
-        worker_id=fresh_worker_id,
-        worker_slot_id=fresh_worker_id,
-        target_project_root=str(world.root),
-        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
-        agent_id=fresh_worker_id,
-        allocation_owner=fresh_worker_id,
-        actual_host_worker_id=fresh_worker_id,
-        worker_session_id=fresh_worker_session_id,
-        host_startup_id=fresh_host_startup_id,
-        host_session_id=fresh_worker_session_id,
-        route_identity=route_identity,
-        session_token_ref=first_reissued["session_token_ref"],
-        contract_execution_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+    with pytest.raises(GovernanceError) as lost_envelope_guide:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": (
+                        current_after_first_delivery.runtime_context_id
+                    ),
+                },
+                "mf_sub",
+                query={
+                    "task_id": fresh_task_id,
+                    "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                    "worker_id": fresh_worker_id,
+                    "worker_slot_id": fresh_worker_id,
+                    "session_token_ref": first_reissued[
+                        "session_token_ref"
+                    ],
+                    "target_project_root": str(world.root),
+                    **route_identity,
+                },
+            )
+        )
+    assert lost_envelope_guide.value.code == "fence_invalidated_or_unknown"
+    lost_envelope_details = lost_envelope_guide.value.details
+    assert lost_envelope_details["next_legal_action"] == (
+        "reissue_runtime_session_token"
+    )
+    guide_eligibility = lost_envelope_details["diagnostics"][
+        "session_token_rejoin_eligibility"
+    ]
+    assert guide_eligibility["eligible"] is True
+    assert guide_eligibility["mode"] == "safe_ref_prestartup_reissue"
+    assert guide_eligibility["pre_receipt_safe_ref_loss_replacement"] is True
+    assert guide_eligibility["post_receipt_pre_startup_recovery"] is False
+    response_handling = guide_eligibility["required_response_handling"]
+    assert response_handling["next_protected_worker_write"] == (
+        "runtime_context_read_receipt"
+    )
+    assert response_handling["continue_directly_to_worker_read_receipt"] is True
+    assert response_handling["continue_directly_to_worker_startup"] is False
+    assert "session_token_initial_join_submission" not in (
+        lost_envelope_details["actionable_payloads"]
+    )
+    repeat_payloads = lost_envelope_details["actionable_payloads"]
+    assert repeat_payloads["session_renewal_hints"]["reissue"] == (
+        repeat_payloads["session_token_reissue_submission"]
     )
     repeat_body = copy.deepcopy(
         repeat_payloads["session_token_reissue_submission"]["copy_safe_body"]
     )
+    assert repeat_body["session_token_ref"] == first_reissued[
+        "session_token_ref"
+    ]
+    assert {
+        field: repeat_body[field] for field in route_identity
+    } == route_identity
     repeat_body["reason"] = (
         "replace the expired undelivered envelope in the same generation"
     )
@@ -42392,6 +42427,33 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         )
     assert competing_retry.value.code == "fence_invalidated_or_unknown"
     assert "\n".join(conn.iterdump()) == before_competing_retry
+    with pytest.raises(GovernanceError) as exhausted_guide:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "task_id": fresh_task_id,
+                    "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                    "worker_id": fresh_worker_id,
+                    "worker_slot_id": fresh_worker_id,
+                    "session_token_ref": joined["session_token_ref"],
+                    "target_project_root": str(world.root),
+                    **route_identity,
+                },
+            )
+        )
+    assert exhausted_guide.value.code == "fence_invalidated_or_unknown"
+    exhausted_details = exhausted_guide.value.details
+    assert exhausted_details["diagnostics"][
+        "session_token_rejoin_eligibility"
+    ]["eligible"] is False
+    assert "session_token_reissue_submission" not in exhausted_details[
+        "actionable_payloads"
+    ]
 
     # Prepare the same-current-ref request while it is still a valid pre-read
     # world.  After receipt/startup consume the envelope, this byte-identical
