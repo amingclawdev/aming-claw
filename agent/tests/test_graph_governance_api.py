@@ -41943,6 +41943,7 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
                     "host_startup_id": fresh_host_startup_id,
                     "host_session_id": fresh_worker_session_id,
                     "reason": "fresh timeline-backed failed-QA rework",
+                    "now_iso": "2020-01-01T00:00:00Z",
                     **route_identity,
                 },
             )
@@ -41950,6 +41951,44 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     )
     assert joined["ok"] is True
     assert joined["runtime_context_id"] == fresh_context.runtime_context_id
+    first_joined = joined
+    joined = (
+        server.handle_graph_governance_runtime_context_session_token_initial_join(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": fresh_context.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body={
+                    "task_id": fresh_task_id,
+                    "parent_task_id": _BATCH_QA_CHILD_EXECUTIONS[index],
+                    "contract_execution_id": (
+                        _BATCH_QA_CHILD_EXECUTIONS[index]
+                    ),
+                    "target_project_root": str(world.root),
+                    "worker_id": fresh_worker_id,
+                    "worker_slot_id": fresh_worker_id,
+                    "agent_id": fresh_worker_id,
+                    "actual_host_worker_id": fresh_worker_id,
+                    "worker_session_id": fresh_worker_session_id,
+                    "host_startup_id": fresh_host_startup_id,
+                    "host_session_id": fresh_worker_session_id,
+                    "reason": (
+                        "replace the expired first envelope for the same "
+                        "timeline-backed failed-QA worker"
+                    ),
+                    "now_iso": "2021-01-01T00:00:00Z",
+                    **route_identity,
+                },
+            )
+        )
+    )
+    assert joined["ok"] is True
+    assert joined["audit_event_ref"] != first_joined["audit_event_ref"]
+    second_joined = joined
+    pinned_initial_join_ref = joined["audit_event_ref"]
 
     # The fresh successor owns an append-only dispatch plus an audited
     # initial-join/identity-anchor pair.  Those three persisted authorities,
@@ -41981,22 +42020,24 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
         "dispatch_source_ref"
     ] == revision["source_ref"]
 
-    initial_join_event = next(
+    initial_join_events = [
         event
         for event in fresh_events
         if str((event.get("payload") or {}).get("action") or "")
         == "runtime_context_session_token_initial_join"
         and str(event.get("task_id") or "") == fresh_task_id
+    ]
+    assert len(initial_join_events) == 2
+    initial_join_event = next(
+        event
+        for event in initial_join_events
+        if f"timeline:{event.get('id', '')}" == joined["audit_event_ref"]
     )
     identity_anchor_event = next(
         event
         for event in fresh_events
-        if str((event.get("payload") or {}).get("action") or "")
-        == (
-            "runtime_context_session_token_initial_join_"
-            "identity_binding_anchor"
-        )
-        and str(event.get("task_id") or "") == fresh_task_id
+        if f"timeline:{event.get('id', '')}"
+        == joined["canonical_identity_binding_anchor_ref"]
     )
     wrong_identity_events = copy.deepcopy(fresh_events)
     wrong_initial_join = next(
@@ -42039,6 +42080,248 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
             runtime_context_id=fresh_context.runtime_context_id,
             timeline_events=invalid_events,
         ) == {}
+
+    fresh_context = get_branch_context(conn, PID, fresh_task_id)
+    assert fresh_context is not None
+    recovery_payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        runtime_context_id=fresh_context.runtime_context_id,
+        task_id=fresh_task_id,
+        parent_task_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+        worker_id=fresh_worker_id,
+        worker_slot_id=fresh_worker_id,
+        target_project_root=str(world.root),
+        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        agent_id=fresh_worker_id,
+        allocation_owner=fresh_worker_id,
+        actual_host_worker_id=fresh_worker_id,
+        worker_session_id=fresh_worker_session_id,
+        host_startup_id=fresh_host_startup_id,
+        host_session_id=fresh_worker_session_id,
+        route_identity=route_identity,
+        session_token_ref=joined["session_token_ref"],
+        contract_execution_id=_BATCH_QA_CHILD_EXECUTIONS[index],
+    )
+    recovery_body = copy.deepcopy(
+        recovery_payloads["session_token_reissue_submission"][
+            "copy_safe_body"
+        ]
+    )
+    recovery_body["reason"] = (
+        "recover the pinned latest failed-QA replacement initial join"
+    )
+    before_reissue = "\n".join(conn.iterdump())
+    authority_ctx = _ctx_with_role(
+        {
+            "project_id": PID,
+            "runtime_context_id": fresh_context.runtime_context_id,
+        },
+        "mf_sub",
+        method="POST",
+        body=recovery_body,
+    )
+
+    original_local_setup = (
+        server._runtime_context_failed_qa_context_local_setup_next_action
+    )
+
+    def projected_with(**overrides):
+        def project(*args, **kwargs):
+            result = original_local_setup(*args, **kwargs)
+            return {**result, **overrides}
+
+        return project
+
+    negative_cases = (
+        (
+            "missing_pin",
+            projected_with(initial_join_event_ref=""),
+            recovery_body,
+        ),
+        (
+            "wrong_pin",
+            projected_with(initial_join_event_ref="timeline:999999"),
+            recovery_body,
+        ),
+        (
+            "noncurrent_pin",
+            projected_with(
+                initial_join_event_ref=first_joined["audit_event_ref"]
+            ),
+            recovery_body,
+        ),
+        (
+            "noncurrent_projection",
+            projected_with(
+                failed_qa_replacement_context_local_setup_projection=False
+            ),
+            recovery_body,
+        ),
+        (
+            "cross_identity",
+            original_local_setup,
+            {**recovery_body, "worker_id": "sibling-worker"},
+        ),
+    )
+    for _case, local_setup, rejected_body in negative_cases:
+        with monkeypatch.context() as scoped_patch:
+            scoped_patch.setattr(
+                server,
+                "_runtime_context_failed_qa_context_local_setup_next_action",
+                local_setup,
+            )
+            with pytest.raises(BranchRuntimeFenceError):
+                server._runtime_context_safe_ref_prestartup_reissue_authority(
+                    authority_ctx,
+                    conn,
+                    project_id=PID,
+                    runtime_context_id=fresh_context.runtime_context_id,
+                    body=rejected_body,
+                    now_iso="2026-01-01T00:00:00Z",
+                )
+        assert "\n".join(conn.iterdump()) == before_reissue
+
+    competing_events = copy.deepcopy(fresh_events)
+    competing_join = copy.deepcopy(initial_join_event)
+    competing_join["id"] = max(
+        int(event.get("id") or 0) for event in competing_events
+    ) + 1
+    competing_events.append(competing_join)
+    with monkeypatch.context() as scoped_patch:
+        scoped_patch.setattr(
+            server,
+            "_runtime_context_service_timeline_events",
+            lambda *_args, **_kwargs: competing_events,
+        )
+        with pytest.raises(BranchRuntimeFenceError):
+            server._runtime_context_safe_ref_prestartup_reissue_authority(
+                authority_ctx,
+                conn,
+                project_id=PID,
+                runtime_context_id=fresh_context.runtime_context_id,
+                body=recovery_body,
+                now_iso="2026-01-01T00:00:00Z",
+            )
+    assert "\n".join(conn.iterdump()) == before_reissue
+
+    joined = (
+        server.handle_graph_governance_runtime_context_session_token_reissue(
+            authority_ctx
+        )
+    )
+    assert joined["safe_ref_reissue_authority"][
+        "initial_join_event_ref"
+    ] == pinned_initial_join_ref
+    assert joined["safe_ref_reissue_authority"][
+        "pre_read_pinned_replacement_authority"
+    ] is True
+    assert joined["safe_ref_session_authority_source"]["source_kind"] == (
+        "initial_join"
+    )
+    current_after_reissue = get_branch_context(conn, PID, fresh_task_id)
+    assert current_after_reissue is not None
+    events_after_reissue = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+        limit=1000,
+    )
+    marker_after_reissue = (
+        server._runtime_context_failed_qa_revision_rejoin_marker(
+            conn=conn,
+            context=current_after_reissue,
+            runtime_context_id=current_after_reissue.runtime_context_id,
+            timeline_events=events_after_reissue,
+        )
+    )
+    reissue_event = events_after_reissue[-1]
+    reissue_payload = reissue_event["payload"]
+    reissue_authority = reissue_payload["safe_ref_reissue_authority"]
+    reissue_source = reissue_payload["safe_ref_session_authority_source"]
+    bridge_checks = {
+        "order": int(reissue_event["id"]) > int(initial_join_event["id"]),
+        "event_type": reissue_event["event_type"]
+        == "mf_subagent.session_token_reissue",
+        "event_kind": reissue_event["event_kind"]
+        == "mf_subagent_session_token_reissue",
+        "phase": reissue_event["phase"] == "runtime_context_recovery",
+        "status": reissue_event["status"] == "accepted",
+        "task": reissue_event["task_id"] == fresh_task_id,
+        "backlog": reissue_event["backlog_id"]
+        == _BATCH_QA_CHILD_BACKLOGS[index],
+        "runtime": reissue_payload["runtime_context_id"]
+        == current_after_reissue.runtime_context_id,
+        "contract": reissue_payload["contract_execution_id"]
+        == _BATCH_QA_CHILD_EXECUTIONS[index],
+        "session_ref": reissue_payload["session_token_ref"]
+        == runtime_context_session_token_ref(current_after_reissue),
+        "fence": reissue_payload["fence_token_hash"]
+        == runtime_context_fence_token_verifier(current_after_reissue),
+        "authorization": reissue_payload["authorization_source"]
+        == "safe_ref_prestartup_reissue_authority",
+        "route": reissue_payload["route_identity"] == route_identity,
+        "pinned": reissue_authority["initial_join_event_ref"]
+        == pinned_initial_join_ref,
+        "source_ref": reissue_authority["session_authority_event_ref"]
+        == pinned_initial_join_ref,
+        "kind": reissue_authority["session_authority_kind"]
+        == "initial_join",
+        "replacement": reissue_authority[
+            "pre_read_pinned_replacement_authority"
+        ]
+        is True,
+        "not_special": reissue_authority["pre_read_special_authority"]
+        is False,
+        "checkpoint": reissue_authority[
+            "stage_checkpoint_server_verified"
+        ]
+        is True,
+        "source_event": reissue_source["event_ref"]
+        == pinned_initial_join_ref,
+        "source_kind": reissue_source["source_kind"] == "initial_join",
+        "normalized_kind": reissue_source["normalized_capability_kind"]
+        == "initial_join",
+    }
+    assert all(bridge_checks.values()), bridge_checks
+    assert marker_after_reissue, {
+        "current_ref": runtime_context_session_token_ref(
+            current_after_reissue
+        ),
+        "current_fence": runtime_context_fence_token_verifier(
+            current_after_reissue
+        ),
+        "reissue": {
+            key: (events_after_reissue[-1].get("payload") or {}).get(key)
+            for key in (
+                "runtime_context_id",
+                "contract_execution_id",
+                "task_id",
+                "session_token_ref",
+                "fence_token_hash",
+                "authorization_source",
+                "session_token_persisted",
+                "raw_session_token_persisted",
+                "raw_fence_token_persisted",
+                "raw_fence_token_persisted_to_timeline",
+                "route_identity",
+                "safe_ref_reissue_authority",
+                "safe_ref_session_authority_source",
+            )
+        },
+        "latest_join": {
+            key: initial_join_event["payload"].get(key)
+            for key in (
+                "runtime_context_id",
+                "contract_execution_id",
+                "task_id",
+                "session_token_ref",
+                "fence_token_hash",
+            )
+        },
+    }
+    assert marker_after_reissue["revision_event_ref"] == (
+        pinned_initial_join_ref
+    )
 
     stored_before_receipt = copy.deepcopy(
         actual_runtime.store.get(_BATCH_QA_CHILD_EXECUTIONS[index])
@@ -42291,6 +42574,25 @@ def test_batch_child_authenticated_postmerge_failure_persists_rework_boundary(
     assert actual_runtime.store.get(
         _BATCH_QA_CHILD_EXECUTIONS[index]
     ) == stored_before_receipt
+
+    serialized_events = json.dumps(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=_BATCH_QA_CHILD_BACKLOGS[index],
+            limit=1000,
+        ),
+        sort_keys=True,
+    )
+    for raw_secret in (
+        first_joined["session_token"],
+        first_joined["fence_token"],
+        second_joined["session_token"],
+        second_joined["fence_token"],
+        joined["session_token"],
+        joined["fence_token"],
+    ):
+        assert raw_secret not in serialized_events
 
     guide_after_startup = replacement_worker_guide()
     assert guide_after_startup["next_legal_action"] not in {

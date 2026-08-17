@@ -6395,6 +6395,121 @@ def test_runtime_session_token_lease_view_reports_remaining_ttl_without_raw_toke
     assert lease["raw_session_token_persisted"] is False
 
 
+def test_safe_ref_prestartup_reissue_authority_accepts_only_pinned_replacement_join(
+    tmp_path,
+) -> None:
+    conn = _runtime_conn()
+    target_root = tmp_path / "safe-ref-pinned-replacement"
+    target_root.mkdir()
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            governance_project_id=PROJECT_ID,
+            target_project_id=PROJECT_ID,
+            target_project_root=str(target_root),
+            task_id="mf-sub-safe-ref-pinned-replacement",
+            parent_task_id="cex-safe-ref-pinned-replacement",
+            root_task_id="cex-safe-ref-pinned-replacement",
+            backlog_id="BUG-SAFE-REF-PINNED-REPLACEMENT",
+            worker_id="worker-safe-ref-pinned-replacement",
+            worker_slot_id="worker-safe-ref-pinned-replacement",
+            allocation_owner="worker-safe-ref-pinned-replacement",
+            actual_host_worker_id="worker-safe-ref-pinned-replacement",
+            host_session_id="desktop-safe-ref-pinned-replacement",
+            branch_ref="refs/heads/codex/mf-sub-safe-ref-pinned-replacement",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-safe-ref-pinned-replacement",
+            session_token_hash=mf_subagent_session_token_hash(
+                "joined-safe-ref-pinned-replacement"
+            ),
+            lease_id="lease-safe-ref-pinned-replacement",
+            lease_expires_at="2999-01-01T01:00:00Z",
+            last_recovery_action="mf_subagent_initial_join_issued",
+        ),
+        now_iso="2999-01-01T00:00:00Z",
+    )
+    stage_checkpoint_id = "sha256:" + "a" * 64
+    authority = build_safe_ref_prestartup_reissue_authority(
+        context,
+        contract_execution_id="cex-safe-ref-pinned-replacement",
+        read_receipt_ref="",
+        initial_join_event_ref="timeline:84",
+        session_authority_event_ref="timeline:84",
+        session_authority_kind="initial_join",
+        route_identity_hash="sha256:pinned-replacement-route",
+        stage_checkpoint_id=stage_checkpoint_id,
+        pre_read_pinned_replacement_authority=True,
+        now_iso="2999-01-01T00:01:00Z",
+    )
+    assert authority.pre_read_special_authority is False
+    assert authority.pre_read_pinned_replacement_authority is True
+
+    result = reissue_mf_subagent_runtime_session_token(
+        conn,
+        project_id=PROJECT_ID,
+        runtime_context_id=context.runtime_context_id,
+        contract_execution_id="cex-safe-ref-pinned-replacement",
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=str(target_root),
+        worker_id=context.worker_id,
+        worker_slot_id=context.worker_slot_id,
+        agent_id=context.worker_id,
+        allocation_owner=context.allocation_owner,
+        actual_host_worker_id=context.actual_host_worker_id,
+        worker_session_id=context.host_session_id,
+        host_session_id=context.host_session_id,
+        session_token_ref=runtime_context_session_token_ref(context),
+        safe_ref_authority=authority,
+        now_iso="2999-01-01T00:02:00Z",
+    )
+    assert result["ok"] is True
+    assert result["delivery"] == "worker_host_envelope"
+
+    invalid_builds = (
+        {},
+        {
+            "pre_read_pinned_replacement_authority": True,
+            "session_authority_event_ref": "timeline:83",
+        },
+        {
+            "pre_read_special_authority": True,
+            "pre_read_pinned_replacement_authority": True,
+            "session_authority_kind": "ordinary_initial_rejoin",
+            "session_authority_event_ref": "timeline:83",
+        },
+    )
+    for overrides in invalid_builds:
+        with pytest.raises(BranchRuntimeFenceError) as rejected:
+            build_safe_ref_prestartup_reissue_authority(
+                context,
+                contract_execution_id="cex-safe-ref-pinned-replacement",
+                read_receipt_ref="",
+                initial_join_event_ref="timeline:84",
+                session_authority_event_ref=overrides.get(
+                    "session_authority_event_ref",
+                    "timeline:84",
+                ),
+                session_authority_kind=overrides.get(
+                    "session_authority_kind",
+                    "initial_join",
+                ),
+                route_identity_hash="sha256:pinned-replacement-route",
+                stage_checkpoint_id=stage_checkpoint_id,
+                pre_read_special_authority=overrides.get(
+                    "pre_read_special_authority",
+                    False,
+                ),
+                pre_read_pinned_replacement_authority=overrides.get(
+                    "pre_read_pinned_replacement_authority",
+                    False,
+                ),
+                now_iso="2999-01-01T00:01:00Z",
+            )
+        assert str(rejected.value) == "fence_invalidated_or_unknown"
+
+
 def test_startup_bridges_launch_text_hash_read_receipt_without_close_satisfying(
     tmp_path,
 ) -> None:

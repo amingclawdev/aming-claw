@@ -1548,7 +1548,9 @@ class SafeRefPrestartupReissueAuthority:
     server has already bound it to an active lease, the exact source-backed
     ContractRuntime lane checkpoint, and the original initial-join audit
     record.  Before the read line exists, only a validated one-shot special
-    pre-lineage authority may set ``pre_read_special_authority``.
+    pre-lineage authority may set ``pre_read_special_authority``.  A failed-QA
+    replacement may instead set ``pre_read_pinned_replacement_authority``
+    when ContractRuntime pins the exact current initial-join audit record.
     """
 
     project_id: str
@@ -1581,6 +1583,7 @@ class SafeRefPrestartupReissueAuthority:
     lease_status_at_authorization: str = ""
     latest_ref_identifier_only: bool = False
     pre_read_special_authority: bool = False
+    pre_read_pinned_replacement_authority: bool = False
     schema_version: str = (
         "runtime_context.safe_ref_prestartup_reissue_authority.v2"
     )
@@ -11469,6 +11472,7 @@ def build_safe_ref_prestartup_reissue_authority(
     session_authority_kind: str = "initial_join",
     stage_checkpoint_id: str = "",
     pre_read_special_authority: bool = False,
+    pre_read_pinned_replacement_authority: bool = False,
     now_iso: str = "",
 ) -> SafeRefPrestartupReissueAuthority:
     """Bind server-verified pre-startup lineage to the latest opaque ref.
@@ -11492,6 +11496,9 @@ def build_safe_ref_prestartup_reissue_authority(
     checkpoint_id = str(stage_checkpoint_id or "").strip()
     checkpoint_server_verified = bool(checkpoint_id)
     pre_read_special = bool(pre_read_special_authority)
+    pre_read_pinned_replacement = bool(
+        pre_read_pinned_replacement_authority
+    )
     worker_id = str(context.worker_id or "").strip()
     worker_slot_id = str(context.worker_slot_id or worker_id).strip()
     actual_host_worker_id = str(context.actual_host_worker_id or "").strip()
@@ -11530,13 +11537,23 @@ def build_safe_ref_prestartup_reissue_authority(
             )
         )
         or (read_ref and pre_read_special)
+        or (read_ref and pre_read_pinned_replacement)
+        or (pre_read_special and pre_read_pinned_replacement)
         or (
             not read_ref
             and not (
-                pre_read_special
-                and checkpoint_server_verified
-                and session_authority_ref != join_ref
-                and session_authority_type == "ordinary_initial_rejoin"
+                (
+                    pre_read_special
+                    and checkpoint_server_verified
+                    and session_authority_ref != join_ref
+                    and session_authority_type == "ordinary_initial_rejoin"
+                )
+                or (
+                    pre_read_pinned_replacement
+                    and checkpoint_server_verified
+                    and session_authority_ref == join_ref
+                    and session_authority_type == "initial_join"
+                )
             )
         )
         or not join_ref.startswith("timeline:")
@@ -11614,6 +11631,9 @@ def build_safe_ref_prestartup_reissue_authority(
         lease_status_at_authorization=lease_status,
         latest_ref_identifier_only=latest_ref_identifier_only,
         pre_read_special_authority=pre_read_special,
+        pre_read_pinned_replacement_authority=(
+            pre_read_pinned_replacement
+        ),
     )
     payload = asdict(authority)
     payload.pop("authority_hash", None)
@@ -11800,15 +11820,32 @@ def reissue_mf_subagent_runtime_session_token(
             or (
                 not authority.read_receipt_ref
                 and not (
-                    authority.pre_read_special_authority is True
-                    and authority.session_authority_kind
-                    == "ordinary_initial_rejoin"
-                    and authority.stage_checkpoint_server_verified is True
+                    (
+                        authority.pre_read_special_authority is True
+                        and authority.pre_read_pinned_replacement_authority
+                        is False
+                        and authority.session_authority_kind
+                        == "ordinary_initial_rejoin"
+                        and authority.session_authority_event_ref
+                        != authority.initial_join_event_ref
+                        and authority.stage_checkpoint_server_verified is True
+                    )
+                    or (
+                        authority.pre_read_pinned_replacement_authority is True
+                        and authority.pre_read_special_authority is False
+                        and authority.session_authority_kind == "initial_join"
+                        and authority.session_authority_event_ref
+                        == authority.initial_join_event_ref
+                        and authority.stage_checkpoint_server_verified is True
+                    )
                 )
             )
             or (
                 authority.read_receipt_ref
-                and authority.pre_read_special_authority is True
+                and (
+                    authority.pre_read_special_authority is True
+                    or authority.pre_read_pinned_replacement_authority is True
+                )
             )
             or not authority.initial_join_event_ref.startswith("timeline:")
             or not authority.session_authority_event_ref.startswith(

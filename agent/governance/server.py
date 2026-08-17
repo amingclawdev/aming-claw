@@ -41301,15 +41301,34 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         != presented_contract_execution_id
     ):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    source_record = record
+    projected_record, context_projection = (
+        _contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=project_id,
+            record=source_record,
+            actor_role="mf_sub",
+        )
+    )
+    projected_guide = (
+        projected_record.get("runtime_guide")
+        if isinstance(projected_record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    projected_next_action = _runtime_next_action_from_guide(
+        projected_guide,
+        source="contract_runtime_current_state",
+    )
+    next_action = _runtime_context_failed_qa_context_local_setup_next_action(
+        projected_next_action,
+        record=projected_record,
+        projection=context_projection,
+        context=context,
+    )
     sequence = _runtime_context_contract_runtime_worker_sequence_evidence(
         conn,
         project_id=project_id,
         context=context,
-    )
-    next_action = (
-        record.get("runtime_guide", {}).get("next_legal_action", {})
-        if isinstance(record.get("runtime_guide"), Mapping)
-        else {}
     )
     next_line_id = str(next_action.get("line_id") or "").strip()
     read_receipt_ref = str(sequence.get("read_receipt_ref") or "").strip()
@@ -41331,6 +41350,41 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         and verified_dispatch
         and next_runtime_context_id in {"", expected_runtime_id}
         and next_task_id in {"", expected_task_id}
+    )
+    pinned_replacement_initial_join_ref = str(
+        next_action.get("initial_join_event_ref") or ""
+    ).strip()
+    pre_read_pinned_replacement_stage = bool(
+        pre_read_special_stage
+        and next_action.get(
+            "failed_qa_replacement_context_local_setup_projection"
+        )
+        is True
+        and str(next_action.get("source") or "").strip()
+        == "contract_runtime_failed_qa_context_local_setup_projection"
+        and str(next_action.get("source_of_authority") or "").strip()
+        == "server_verified_failed_qa_replacement_dispatch"
+        and str(next_action.get("authority_decision_source") or "").strip()
+        == "server_verified_failed_qa_replacement_dispatch"
+        and str(next_action.get("precedence") or "").strip()
+        == "server_verified_failed_qa_replacement_context_local_setup"
+        and str(next_action.get("contract_execution_id") or "").strip()
+        == presented_contract_execution_id
+        and str(next_action.get("parent_task_id") or "").strip()
+        == expected_parent_task_id
+        and str(next_action.get("worker_id") or "").strip()
+        == expected_worker_id
+        and str(next_action.get("worker_slot_id") or "").strip()
+        == expected_worker_slot_id
+        and str(next_action.get("line_instance_id") or "").strip()
+        == f"runtime_context:{expected_runtime_id}"
+        and str(next_action.get("dispatch_source_ref") or "").strip()
+        == str(dispatch_match.get("source_ref") or "").strip()
+        and re.fullmatch(
+            r"timeline:[1-9][0-9]*",
+            pinned_replacement_initial_join_ref,
+        )
+        is not None
     )
     post_read_prestartup_stage = bool(
         str(sequence.get("contract_execution_id") or "").strip()
@@ -41568,8 +41622,21 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         if len(source_matches) == 1:
             prior_safe_ref_reissue_event = candidate_event
             matching_session_authorities = source_matches
-    if len(matching_initial_joins) != 1:
-        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+    selected_initial_join: Mapping[str, Any]
+    if pre_read_pinned_replacement_stage:
+        pinned_initial_joins = [
+            event
+            for event in matching_initial_joins
+            if f"timeline:{event.get('id', '')}"
+            == pinned_replacement_initial_join_ref
+        ]
+        if len(pinned_initial_joins) != 1:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        selected_initial_join = pinned_initial_joins[0]
+    else:
+        if len(matching_initial_joins) != 1:
+            raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
+        selected_initial_join = matching_initial_joins[0]
     if len(matching_session_authorities) != 1:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     (
@@ -41579,7 +41646,16 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
     ) = matching_session_authorities[0]
     if (
         pre_read_special_stage
+        and not pre_read_pinned_replacement_stage
         and session_authority_source_kind != "special_authority_rejoin"
+    ) or (
+        pre_read_pinned_replacement_stage
+        and (
+            session_authority_source_kind != "initial_join"
+            or session_authority_kind != "initial_join"
+            or f"timeline:{session_authority_event.get('id', '')}"
+            != pinned_replacement_initial_join_ref
+        )
     ):
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
 
@@ -41758,7 +41834,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             or str(prior_authority.get("read_receipt_ref") or "").strip()
             != str(sequence.get("read_receipt_ref") or "").strip()
             or str(prior_authority.get("initial_join_event_ref") or "").strip()
-            != f"timeline:{matching_initial_joins[0].get('id', '')}"
+            != f"timeline:{selected_initial_join.get('id', '')}"
             or str(
                 prior_authority.get("session_authority_event_ref") or ""
             ).strip()
@@ -41801,14 +41877,20 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         context,
         contract_execution_id=presented_contract_execution_id,
         read_receipt_ref=read_receipt_ref,
-        initial_join_event_ref=f"timeline:{matching_initial_joins[0].get('id', '')}",
+        initial_join_event_ref=f"timeline:{selected_initial_join.get('id', '')}",
         session_authority_event_ref=(
             f"timeline:{session_authority_event.get('id', '')}"
         ),
         session_authority_kind=session_authority_kind,
         route_identity_hash=route_identity_hash,
         stage_checkpoint_id=stage_checkpoint_id,
-        pre_read_special_authority=pre_read_special_stage,
+        pre_read_special_authority=(
+            pre_read_special_stage
+            and not pre_read_pinned_replacement_stage
+        ),
+        pre_read_pinned_replacement_authority=(
+            pre_read_pinned_replacement_stage
+        ),
         now_iso=now_iso,
     )
     source_authority = {
@@ -41997,6 +42079,10 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                     ),
                     "pre_read_special_authority": (
                         safe_ref_authority.pre_read_special_authority
+                    ),
+                    "pre_read_pinned_replacement_authority": (
+                        safe_ref_authority
+                        .pre_read_pinned_replacement_authority
                     ),
                     "server_derived": True,
                     "caller_claims_trusted": False,
@@ -44161,6 +44247,7 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
     expected_attempt = int(getattr(context, "attempt", 0) or 0)
     expected_retry_round = int(getattr(context, "retry_round", 0) or 0)
     from .parallel_branch_runtime import (
+        runtime_context_fence_token_verifier,
         runtime_context_secret_hash,
         runtime_context_session_token_ref,
     )
@@ -44175,9 +44262,7 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
     expected_target_project_root = _runtime_context_effective_target_project_root(
         context
     )
-    expected_fence_token_hash = runtime_context_secret_hash(
-        str(getattr(context, "fence_token", "") or "")
-    )
+    expected_fence_token_hash = runtime_context_fence_token_verifier(context)
     successor_contract_evidence = (
         _runtime_context_failed_qa_revision_contract_runtime_evidence(
             conn,
@@ -44216,6 +44301,14 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
         route_identity_hash = _stable_public_hash(expected_route_identity)
         initial_join_candidates: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
         identity_anchor_candidates: list[Mapping[str, Any]] = []
+        safe_ref_reissue_candidates = [
+            event
+            for event in timeline_events
+            if isinstance(event, Mapping)
+            and isinstance(event.get("payload"), Mapping)
+            and str(event["payload"].get("action") or "").strip()
+            == "runtime_context_session_token_reissue"
+        ]
         for event in timeline_events:
             if not isinstance(event, Mapping):
                 continue
@@ -44235,6 +44328,8 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
             }:
                 continue
             action = str(event_payload.get("action") or "").strip()
+            if action == "runtime_context_session_token_reissue":
+                continue
             if action == (
                 "runtime_context_session_token_initial_join_identity_binding_anchor"
             ):
@@ -44270,6 +44365,151 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
                 )
                 else {}
             )
+            initial_join_event_ref = f"timeline:{event.get('id', '')}"
+            initial_join_session_ref = str(
+                event_payload.get("session_token_ref") or ""
+            ).strip()
+            initial_join_fence_hash = str(
+                event_payload.get("fence_token_hash") or ""
+            ).strip()
+            current_initial_join_binding = bool(
+                initial_join_session_ref == active_session_token_ref
+                and initial_join_fence_hash == expected_fence_token_hash
+            )
+            pinned_reissue_matches = []
+            if not current_initial_join_binding:
+                for reissue_event in safe_ref_reissue_candidates:
+                    reissue_payload = (
+                        reissue_event.get("payload")
+                        if isinstance(reissue_event.get("payload"), Mapping)
+                        else {}
+                    )
+                    reissue_authority = (
+                        reissue_payload.get("safe_ref_reissue_authority")
+                        if isinstance(
+                            reissue_payload.get("safe_ref_reissue_authority"),
+                            Mapping,
+                        )
+                        else {}
+                    )
+                    reissue_source = (
+                        reissue_payload.get(
+                            "safe_ref_session_authority_source"
+                        )
+                        if isinstance(
+                            reissue_payload.get(
+                                "safe_ref_session_authority_source"
+                            ),
+                            Mapping,
+                        )
+                        else {}
+                    )
+                    if (
+                        int(reissue_event.get("id") or 0)
+                        > int(event.get("id") or 0)
+                        and str(
+                            reissue_event.get("status") or ""
+                        ).strip().lower()
+                        in {
+                            "accepted",
+                            "ok",
+                            "pass",
+                            "passed",
+                            "success",
+                            "succeeded",
+                        }
+                        and str(reissue_event.get("event_type") or "").strip()
+                        == "mf_subagent.session_token_reissue"
+                        and str(reissue_event.get("event_kind") or "").strip()
+                        == "mf_subagent_session_token_reissue"
+                        and str(reissue_event.get("phase") or "").strip()
+                        == "runtime_context_recovery"
+                        and str(reissue_event.get("task_id") or "").strip()
+                        == task_id
+                        and str(reissue_event.get("backlog_id") or "").strip()
+                        == backlog_id
+                        and str(
+                            reissue_payload.get("runtime_context_id") or ""
+                        ).strip()
+                        == runtime_context_id
+                        and str(
+                            reissue_payload.get("contract_execution_id") or ""
+                        ).strip()
+                        == str(
+                            successor_contract_evidence.get(
+                                "contract_execution_id"
+                            )
+                            or ""
+                        ).strip()
+                        and str(
+                            reissue_payload.get("session_token_ref") or ""
+                        ).strip()
+                        == active_session_token_ref
+                        and str(
+                            reissue_payload.get("fence_token_hash") or ""
+                        ).strip()
+                        == expected_fence_token_hash
+                        and str(
+                            reissue_payload.get("authorization_source") or ""
+                        ).strip()
+                        == "safe_ref_prestartup_reissue_authority"
+                        and reissue_payload.get("session_token_persisted") is False
+                        and reissue_payload.get("raw_session_token_persisted")
+                        is False
+                        and reissue_payload.get("raw_fence_token_persisted")
+                        is False
+                        and reissue_payload.get(
+                            "raw_fence_token_persisted_to_timeline"
+                        )
+                        is False
+                        and dict(reissue_payload.get("route_identity") or {})
+                        == expected_route_identity
+                        and str(
+                            reissue_authority.get("initial_join_event_ref")
+                            or ""
+                        ).strip()
+                        == initial_join_event_ref
+                        and str(
+                            reissue_authority.get(
+                                "session_authority_event_ref"
+                            )
+                            or ""
+                        ).strip()
+                        == initial_join_event_ref
+                        and str(
+                            reissue_authority.get("session_authority_kind")
+                            or ""
+                        ).strip()
+                        == "initial_join"
+                        and reissue_authority.get(
+                            "pre_read_pinned_replacement_authority"
+                        )
+                        is True
+                        and reissue_authority.get("pre_read_special_authority")
+                        is False
+                        and reissue_authority.get(
+                            "stage_checkpoint_server_verified"
+                        )
+                        is True
+                        and re.fullmatch(
+                            r"sha256:[0-9a-f]{64}",
+                            str(
+                                reissue_authority.get("authority_hash") or ""
+                            ).strip(),
+                        )
+                        and str(reissue_source.get("event_ref") or "").strip()
+                        == initial_join_event_ref
+                        and str(
+                            reissue_source.get("source_kind") or ""
+                        ).strip()
+                        == "initial_join"
+                        and str(
+                            reissue_source.get("normalized_capability_kind")
+                            or ""
+                        ).strip()
+                        == "initial_join"
+                    ):
+                        pinned_reissue_matches.append(reissue_event)
             expected_values = {
                 "project_id": str(
                     getattr(context, "project_id", "") or ""
@@ -44284,7 +44524,6 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
                 "backlog_id": backlog_id,
                 "worker_id": expected_worker_id,
                 "worker_slot_id": expected_worker_slot_id,
-                "session_token_ref": active_session_token_ref,
                 "target_project_root": expected_target_project_root,
             }
             if (
@@ -44296,8 +44535,12 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
                     for field, expected in expected_values.items()
                     if field != "target_project_root"
                 )
-                or str(event_payload.get("fence_token_hash") or "").strip()
-                != expected_fence_token_hash
+                or not (
+                    current_initial_join_binding
+                    or len(pinned_reissue_matches) == 1
+                )
+                or not initial_join_session_ref
+                or not initial_join_fence_hash
                 or event_payload.get("raw_session_token_persisted") is not False
                 or event_payload.get("raw_fence_token_persisted_to_timeline")
                 is not False
@@ -44312,6 +44555,10 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
                     != expected
                     for field, expected in expected_values.items()
                 )
+                or str(
+                    canonical_binding.get("session_token_ref") or ""
+                ).strip()
+                != initial_join_session_ref
                 or str(canonical_binding.get("governed_worker_id") or "").strip()
                 != expected_worker_id
                 or str(canonical_binding.get("agent_id") or "").strip()
@@ -44430,7 +44677,12 @@ def _runtime_context_failed_qa_revision_rejoin_marker(
                     ).strip()
                     != str(canonical_binding.get("binding_hash") or "").strip()
                     or str(event_payload.get("session_token_ref") or "").strip()
-                    != active_session_token_ref
+                    != str(
+                        initial_join_event.get("payload", {}).get(
+                            "session_token_ref"
+                        )
+                        or ""
+                    ).strip()
                     or str(event_payload.get("route_identity_hash") or "").strip()
                     != route_identity_hash
                     or str(event_payload.get("anchor_hash") or "").strip()
@@ -58831,7 +59083,7 @@ def _runtime_context_context_local_setup_authority(
         return {}
 
     from .parallel_branch_runtime import (
-        runtime_context_secret_hash,
+        runtime_context_fence_token_verifier,
         runtime_context_session_token_ref,
     )
 
@@ -58846,7 +59098,7 @@ def _runtime_context_context_local_setup_authority(
             getattr(context, "actual_host_worker_id", "") or ""
         ).strip(),
         "fence_token_present": bool(
-            str(getattr(context, "fence_token", "") or "").strip()
+            runtime_context_fence_token_verifier(context)
         ),
         "session_token_hash_present": bool(
             str(getattr(context, "session_token_hash", "") or "").strip()
@@ -59002,8 +59254,8 @@ def _runtime_context_context_local_setup_authority(
         expected_session_token_ref = str(
             active_worker_proof["session_token_ref"] or ""
         ).strip()
-        expected_fence_token_hash = runtime_context_secret_hash(
-            str(getattr(context, "fence_token", "") or "")
+        expected_fence_token_hash = runtime_context_fence_token_verifier(
+            context
         )
         timeline_events = _runtime_context_service_timeline_events(
             conn,
