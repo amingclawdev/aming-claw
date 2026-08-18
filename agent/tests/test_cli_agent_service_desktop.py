@@ -641,6 +641,7 @@ def _runtime_context_host_guide() -> dict[str, object]:
                 "legacy_tool": "parallel_branch_startup",
                 "copy_safe_body": {
                     # The real startup guide likewise relies on adapter injection.
+                    "contract_execution_id": "cex-host",
                     "runtime_context_id": "mfrctx-host",
                     "task_id": "host-worker",
                     "parent_task_id": "cex-host",
@@ -793,6 +794,9 @@ def test_runtime_context_host_orchestration_is_uninterrupted_and_private() -> No
         assert body["host_session_id"] == "codex-thread-42"
         assert body["host_startup_id"] == "startup-thread-42"
         assert body["observer_command_id"] == "observer-desktop-1"
+        assert body["contract_execution_id"] == "cex-host"
+        assert body["target_project_root"] == "/tmp/host-worker"
+        assert body["worker_slot_id"] == "governed-slot"
         assert body["owned_files"] == [
             "src/reminders.js",
             "tests/reminders.test.mjs",
@@ -801,7 +805,6 @@ def test_runtime_context_host_orchestration_is_uninterrupted_and_private() -> No
         assert "worker_transcript_path" not in body
         assert body["worker_transcript_ref"] == "codex:codex-thread-42"
         assert "worker_session_lifecycle_policy" not in body
-        assert "worker_slot_id" not in body
         return {"ok": True, "status": "passed", "startup_event_ref": "timeline:90211"}
 
     result = orchestrate_runtime_context_host_startup(
@@ -1644,6 +1647,9 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
         assert body["session_token"] == raw_session
         assert body["fence_token"] == raw_fence
         assert body["read_receipt_event_id"] == "timeline:live-receipt"
+        assert body["contract_execution_id"] == startup_body["contract_execution_id"]
+        assert body["target_project_root"] == startup_body["target_project_root"]
+        assert body["worker_slot_id"] == startup_body["worker_slot_id"]
         assert body["owned_files"] == [
             "src/reminders.js",
             "tests/reminders.test.mjs",
@@ -1682,6 +1688,80 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
     assert raw_fence not in json.dumps(result, sort_keys=True)
     assert all(raw_session not in json.dumps(body) for _name, body in calls)
     assert all(raw_fence not in json.dumps(body) for _name, body in calls)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["contract_execution_id", "target_project_root", "worker_slot_id"],
+)
+@pytest.mark.parametrize("failure_mode", ["missing", "wrong", "cross_scope"])
+def test_host_orchestration_rejects_invalid_refreshed_startup_scope_before_http(
+    field_name, failure_mode
+) -> None:
+    guide, receipt_body, startup_body = _live_refreshing_host_startup_inputs()
+    if failure_mode == "missing":
+        guide.pop(field_name, None)
+        guide["host_precursor_action"]["copy_safe_body"].pop(field_name, None)
+        receipt_body.pop(field_name, None)
+        startup_body.pop(field_name, None)
+    else:
+        startup_body[field_name] = (
+            "foreign-scope" if failure_mode == "cross_scope" else "wrong-value"
+        )
+    raw_session = "raw-invalid-startup-scope-session"
+    raw_fence = "raw-invalid-startup-scope-fence"
+    calls = []
+    refresh_count = 0
+
+    def call_tool(name, body):
+        nonlocal refresh_count
+        calls.append(name)
+        if name == "runtime_context_session_token_rejoin":
+            return {
+                "ok": True,
+                "worker_session_token_ref": "wstok-live-after",
+                "host_envelope": {
+                    "session_token_ref": "wstok-live-after",
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": raw_session,
+                        "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                    },
+                },
+            }
+        if name == "onboard_route_guide":
+            refresh_count += 1
+            action = {
+                "mcp_tool": (
+                    "runtime_context_read_receipt"
+                    if refresh_count == 1
+                    else "parallel_branch_startup"
+                ),
+                "copy_safe_body": (
+                    receipt_body if refresh_count == 1 else startup_body
+                ),
+            }
+            return {"structuredContent": {"canonical_executable_action": action}}
+        if name == "runtime_context_read_receipt":
+            return {
+                "ok": True,
+                "read_receipt_hash": body["read_receipt_hash"],
+                "read_receipt_event_id": "timeline:invalid-startup-scope",
+            }
+        pytest.fail("invalid startup scope reached the startup HTTP tool")
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=call_tool,
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+                "launch_text_hash": "sha256:" + "a" * 64,
+            },
+        )
+
+    assert "parallel_branch_startup" not in calls
 
 
 def test_host_orchestration_post_receipt_reissue_continues_directly_to_startup(

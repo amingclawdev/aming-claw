@@ -54,7 +54,8 @@ _READ_RECEIPT_TOOL_FIELDS = frozenset(
     trace_id commit_sha now_iso""".split()
 )
 _STARTUP_TOOL_FIELDS = frozenset(
-    """project_id actual_cwd actual_git_root actual_host_worker_id agent_id
+    """project_id contract_execution_id target_project_root worker_slot_id
+    actual_cwd actual_git_root actual_host_worker_id agent_id
     base_commit branch branch_head branch_ref fence_token filer_principal harness_type
     head_commit host_session_id host_startup_id launch_text_hash merge_queue_id now_iso
     observer_command_id owned_files parent_task_id prompt_contract_hash
@@ -119,14 +120,16 @@ _RECEIPT_REQUIRED_FIELDS = tuple(
     session_token_ref read_receipt_hash""".split()
 )
 _STARTUP_FORCE_FIELDS = frozenset(
-    """project_id session_token fence_token session_token_ref agent_id
+    """project_id contract_execution_id target_project_root worker_slot_id
+    session_token fence_token session_token_ref agent_id
     actual_host_worker_id worker_session_id worker_transcript_ref
     worker_transcript_path filer_principal host_session_id host_startup_id head_commit
     read_receipt_hash read_receipt_event_id now_iso actual_cwd actual_git_root
     harness_type observer_command_id""".split()
 )
 _STARTUP_REQUIRED_FIELDS = tuple(
-    """project_id runtime_context_id task_id parent_task_id session_token fence_token
+    """project_id contract_execution_id target_project_root worker_slot_id
+    runtime_context_id task_id parent_task_id session_token fence_token
     session_token_ref agent_id actual_host_worker_id worker_session_id filer_principal
     host_session_id host_startup_id head_commit read_receipt_hash
     read_receipt_event_id owned_files""".split()
@@ -1622,6 +1625,7 @@ def _assert_host_action_scope(
         "runtime_context_id",
         "task_id",
         "parent_task_id",
+        "worker_slot_id",
         "target_project_root",
         "route_id",
         "route_context_hash",
