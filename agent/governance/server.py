@@ -131335,6 +131335,71 @@ def _mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
     }
 
 
+def _onboard_guide_irreversible_runtime_terminal_selection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    role: str,
+    work_type: str,
+    current_projection: Mapping[str, Any],
+    direct_main_failed_qa_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rebuild the canonical terminal Guide selection for mint and fetch."""
+
+    if (
+        direct_main_failed_qa_state
+        or str(role or "").strip() != "observer"
+        or str(
+            _backlog_row_status_for_onboard_route(conn, backlog_id) or ""
+        ).strip().upper()
+        in _BACKLOG_CLOSED_STATUSES
+        or str(work_type or "").strip()
+        not in {"continue_contract_chain", "rollback_or_recover_contract"}
+    ):
+        return {}
+    terminal_execution_id = str(
+        current_projection.get("current_contract_execution_id")
+        or current_projection.get("contract_execution_id")
+        or ""
+    ).strip()
+    try:
+        terminal_record = _contract_runtime_store(conn).get(
+            terminal_execution_id
+        )
+    except ContractRuntimeError:
+        terminal_record = {}
+    return (
+        _mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            preferred_record=terminal_record,
+        )
+    )
+
+
+def _onboard_guide_apply_irreversible_runtime_terminal_selection(
+    current_projection: Mapping[str, Any],
+    terminal_action: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Overlay one server-selected terminal action without mutating history."""
+
+    if not terminal_action:
+        return dict(current_projection)
+    action = dict(terminal_action)
+    return {
+        **dict(current_projection),
+        "readiness_state": "irreversible_runtime_audit_terminal_ready",
+        "next_legal_action": action,
+        "scheduler_eligible": False,
+        "resume_eligible": False,
+        "irreversible_runtime_audit_terminal_authority": dict(
+            action.get("irreversible_runtime_audit_terminal_authority") or {}
+        ),
+    }
+
+
 def _direct_main_cross_contract_transition_input(
     body: Mapping[str, Any],
     metadata: Mapping[str, Any],
@@ -135518,6 +135583,11 @@ def _onboard_guide_capsule_scope_identity(
         or runtime_resume.get("terminal") is True
         or next_action.get("terminal") is True
     )
+    terminal_action_hash = str(
+        current_identity.get("terminal_action_hash") or ""
+    ).strip()
+    if not terminal_action_hash and next_action.get("terminal") is True:
+        terminal_action_hash = contract_chain_projection_hash(next_action)
     selected_task_id = str(
         requested_task_id or next_action.get("task_id") or ""
     ).strip()
@@ -135538,6 +135608,7 @@ def _onboard_guide_capsule_scope_identity(
             )
         ),
         "terminal": terminal,
+        "terminal_action_hash": terminal_action_hash,
     }
 
 
@@ -135586,6 +135657,11 @@ def _onboard_guide_capsule_projection_identity(
             projection.get("terminal") is True
             or next_action.get("terminal") is True
         ),
+        "terminal_action_hash": (
+            contract_chain_projection_hash(next_action)
+            if next_action.get("terminal") is True
+            else ""
+        ),
     }
 
 
@@ -135602,6 +135678,7 @@ def _onboard_guide_capsule_cache_key(
         str(identity.get("projection_hash") or ""),
         str(identity.get("runtime_context_auth_generation") or 0),
         str(identity.get("selected_task_id") or ""),
+        str(identity.get("terminal_action_hash") or ""),
     )
 
 
@@ -136264,6 +136341,26 @@ def _onboard_guide_capsule_validate_current_projection(
     )
     if not current:
         return None
+    direct_main_failed_qa_state = (
+        _onboard_parentless_direct_main_failed_qa_state(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    )
+    terminal_action = _onboard_guide_irreversible_runtime_terminal_selection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        role=str(identity.get("selected_role") or ""),
+        work_type=str(identity.get("selected_work_type") or ""),
+        current_projection=current,
+        direct_main_failed_qa_state=direct_main_failed_qa_state,
+    )
+    current = _onboard_guide_apply_irreversible_runtime_terminal_selection(
+        current,
+        terminal_action,
+    )
     current_identity = _onboard_guide_capsule_projection_identity(current)
     mismatches: list[str] = []
     if stored_auth_generation != current_auth_generation:
@@ -136301,6 +136398,10 @@ def _onboard_guide_capsule_validate_current_projection(
         identity.get("terminal") is True
     ):
         mismatches.append("terminal")
+    if str(current_identity.get("terminal_action_hash") or "") != str(
+        identity.get("terminal_action_hash") or ""
+    ):
+        mismatches.append("terminal_action_hash")
     if not mismatches:
         return None
     with _ONBOARD_GUIDE_CAPSULE_LOCK:
@@ -140256,51 +140357,25 @@ def _onboard_route_guide_service_response(
                 direct_main_failed_qa_state
             ),
         }
-    irreversible_runtime_terminal_action: dict[str, Any] = {}
-    if (
-        not direct_main_failed_qa_state
-        and str(role or "").strip() == "observer"
-        and str(backlog_row_status or "").strip().upper()
-        not in _BACKLOG_CLOSED_STATUSES
-        and str(work_type or "").strip()
-        in {"continue_contract_chain", "rollback_or_recover_contract"}
-    ):
-        terminal_execution_id = (
-            _onboard_route_guide_target_contract_execution_id(
-                next_action=next_action,
-                current_projection=current_projection,
-                runtime_resume=runtime_resume,
-            )
+    irreversible_runtime_terminal_action = (
+        _onboard_guide_irreversible_runtime_terminal_selection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            role=role,
+            work_type=work_type,
+            current_projection=current_projection,
+            direct_main_failed_qa_state=direct_main_failed_qa_state,
         )
-        try:
-            terminal_record = _contract_runtime_store(conn).get(
-                terminal_execution_id
-            )
-        except ContractRuntimeError:
-            terminal_record = {}
-        irreversible_runtime_terminal_action = (
-            _mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
-                conn,
-                project_id=project_id,
-                backlog_id=backlog_id,
-                preferred_record=terminal_record,
-            )
-        )
+    )
     if irreversible_runtime_terminal_action:
         next_action = dict(irreversible_runtime_terminal_action)
-        current_projection = {
-            **dict(current_projection),
-            "readiness_state": "irreversible_runtime_audit_terminal_ready",
-            "next_legal_action": dict(next_action),
-            "scheduler_eligible": False,
-            "resume_eligible": False,
-            "irreversible_runtime_audit_terminal_authority": dict(
-                next_action.get(
-                    "irreversible_runtime_audit_terminal_authority"
-                )
-                or {}
-            ),
-        }
+        current_projection = (
+            _onboard_guide_apply_irreversible_runtime_terminal_selection(
+                current_projection,
+                next_action,
+            )
+        )
         runtime_resume = {
             **dict(runtime_resume),
             "status": "irreversible_runtime_audit_terminal_ready",

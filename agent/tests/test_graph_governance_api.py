@@ -132131,10 +132131,31 @@ def test_irreversible_runtime_audit_terminal_capsule_fetch_uses_nested_terminal_
         backlog_id=context.backlog_id,
         record=record,
     )
-    current_projection = {
+    base_current_projection = {
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
         "current_contract_execution_id": context.parent_task_id,
-        "next_legal_action": action,
+        "execution_state_revision": 12,
+        "projection_hash": _fake_sha(
+            "irreversible-runtime-audit-terminal-current"
+        ),
     }
+    current_projection = (
+        server._onboard_guide_apply_irreversible_runtime_terminal_selection(
+            base_current_projection,
+            action,
+        )
+    )
+    # Warm lazy read stores before taking the immutable-history baseline.
+    server._onboard_guide_irreversible_runtime_terminal_selection(
+        conn,
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        current_projection=base_current_projection,
+        direct_main_failed_qa_state={},
+    )
     before_changes = conn.total_changes
     before_dump = "\n".join(conn.iterdump())
 
@@ -132154,10 +132175,22 @@ def test_irreversible_runtime_audit_terminal_capsule_fetch_uses_nested_terminal_
     assert server._onboard_guide_capsule_projection_identity(
         current_projection
     )["terminal"] is True
+    terminal_action_hash = (
+        server._onboard_guide_capsule_projection_identity(
+            current_projection
+        )["terminal_action_hash"]
+    )
+    assert terminal_action_hash.startswith("sha256:")
+    selected_action = {"value": copy.deepcopy(action)}
     monkeypatch.setattr(
         server,
         "_onboard_guide_capsule_current_projection",
-        lambda *_args, **_kwargs: copy.deepcopy(current_projection),
+        lambda *_args, **_kwargs: copy.deepcopy(base_current_projection),
+    )
+    monkeypatch.setattr(
+        server,
+        "_mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage",
+        lambda *_args, **_kwargs: copy.deepcopy(selected_action["value"]),
     )
 
     fetched = server.handle_project_onboard_route_guide_capsule(
@@ -132185,16 +132218,10 @@ def test_irreversible_runtime_audit_terminal_capsule_fetch_uses_nested_terminal_
     assert fetched["satisfies_gate"] is False
     assert fetched["synthesizes_pass"] is False
 
-    transitioned = copy.deepcopy(current_projection)
-    transitioned["next_legal_action"] = {
-        **transitioned["next_legal_action"],
-        "terminal": False,
+    selected_action["value"] = {
+        **copy.deepcopy(action),
+        "reason": "server_verified_terminal_selection_changed",
     }
-    monkeypatch.setattr(
-        server,
-        "_onboard_guide_capsule_current_projection",
-        lambda *_args, **_kwargs: copy.deepcopy(transitioned),
-    )
     stale = server._onboard_guide_capsule_validate_current_projection(
         conn,
         project_id=PID,
@@ -132202,7 +132229,7 @@ def test_irreversible_runtime_audit_terminal_capsule_fetch_uses_nested_terminal_
     )
     assert stale["status"] == "refresh_required"
     assert stale["reason"] == "guide_capsule_stale_runtime_transition"
-    assert "terminal" in stale["mismatched_fields"]
+    assert stale["mismatched_fields"] == ["terminal_action_hash"]
     assert conn.total_changes == before_changes
     assert "\n".join(conn.iterdump()) == before_dump
 
