@@ -158810,6 +158810,39 @@ def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_
     assert proof["audit_only"] is False
     assert proof["close_satisfying"] is True
 
+    # Warranty the durable public-path projection, not only the facade return.
+    # A later serializer/normalizer must not silently drop the parent-only
+    # fixed set after the scoped QA event has passed review-context validation.
+    persisted_verification = next(
+        event
+        for event in reversed(
+            task_timeline.list_events(
+                conn,
+                PID,
+                backlog_id=backlog_id,
+                task_id=lineage["task_id"],
+                limit=1000,
+            )
+        )
+        if event["event_kind"] == "independent_verification"
+    )
+    persisted_ledger = persisted_verification["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]
+    assert persisted_ledger == ledger
+    assert persisted_ledger["base_failure_identities"] == sorted(
+        ["test_fixed_on_candidate", "test_inherited_non_green"]
+    )
+    assert persisted_ledger["candidate_failure_identities"] == [
+        "test_inherited_non_green"
+    ]
+    assert persisted_ledger["fixed_base_failure_identities"] == [
+        "test_fixed_on_candidate"
+    ]
+    assert persisted_verification["payload"][
+        "source_backed_contract_gate_authority"
+    ]["qa_session_proof"]["comparison_base_commit_sha"] == base_commit
+
     original_root_identity = copy.deepcopy(trace["root_identity"])
     for mutation, expected_actual in (
         ("forged", "caller.claimed_direct_main_lineage"),
