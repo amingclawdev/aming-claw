@@ -132008,6 +132008,109 @@ def test_irreversible_runtime_audit_terminal_selects_unique_current_lineage(
     assert "\n".join(conn.iterdump()) == before_dump
 
 
+def test_irreversible_runtime_audit_terminal_unique_current_lineage_survives_compact_guide(
+    conn,
+    monkeypatch,
+):
+    record, context, _route_identity, _state, _eligibility, _failed_qa = (
+        _irreversible_runtime_audit_terminal_fixture(monkeypatch)
+    )
+    contract_chain_id = "cchain-irreversible-runtime-audit-terminal-warranty"
+    record.update(
+        {
+            "contract_chain_id": contract_chain_id,
+            "root_contract_execution_id": context.parent_task_id,
+            "execution_state_revision": 12,
+            "metadata": {},
+        }
+    )
+    historical = {
+        **copy.deepcopy(record),
+        "contract_execution_id": "cex-historical-irreversible-runtime-warranty",
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_chain_current_projection",
+        lambda *_args, **_kwargs: {
+            "project_id": PID,
+            "backlog_id": context.backlog_id,
+            "contract_chain_id": contract_chain_id,
+            "current_contract_execution_id": record[
+                "contract_execution_id"
+            ],
+            "active_chain": {
+                "execution_ids": [record["contract_execution_id"]],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(
+            list_by_backlog=lambda **_kwargs: [
+                copy.deepcopy(historical),
+                copy.deepcopy(record),
+            ]
+        ),
+    )
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    action = (
+        server._mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
+            conn,
+            project_id=PID,
+            backlog_id=context.backlog_id,
+            preferred_record=historical,
+        )
+    )
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        record=record,
+        next_action=action,
+        current_projection={
+            "current_contract_execution_id": context.parent_task_id,
+            "next_legal_action": action,
+        },
+        runtime_resume={"next_legal_action": action},
+        target_files=list(context.owned_files),
+        projection_degraded=False,
+    )
+    fetched = server._onboard_guide_capsule_fetch(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        task_id=str(compact.get("selected_task_id") or ""),
+        guide_capsule_ref=compact["guide_capsule_ref"],
+        sections=["action_input"],
+    )
+
+    selection = action["current_lineage_selection"]
+    assert selection["selected_contract_execution_id"] == (
+        record["contract_execution_id"]
+    )
+    assert selection["historical_runtime_contexts_ignored"] is True
+    assert compact["status"] == "compact_action_input_continuation_required"
+    assert compact["required_sections"] == ["action_input"]
+    executable = fetched["sections"]["action_input"][
+        "canonical_executable_action"
+    ]
+    assert executable["mcp_tool"] == "backlog_audit_archive"
+    assert executable["copy_safe_body"] == action["copy_safe_body"]
+    assert action["normal_close"] is False
+    assert executable["copy_safe_body"]["qa_acceptance"]["passed"] is False
+    assert executable["copy_safe_body"]["route_token_ref"].startswith(
+        "<copy "
+    )
+    assert fetched["authorizes_write"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
