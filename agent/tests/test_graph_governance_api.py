@@ -129742,6 +129742,83 @@ def _context_local_post_read_safe_ref_fixture(monkeypatch):
     return context, route_identity, sequence, events
 
 
+def _append_context_local_post_read_safe_ref_reissue(
+    context,
+    route_identity,
+    sequence,
+    events,
+):
+    context.session_token_hash = _fake_sha(
+        "context-local-post-read-safe-ref-second-session"
+    )
+    context.fence_token_verifier = _fake_sha(
+        "context-local-post-read-safe-ref-second-fence"
+    )
+    context.lease_id = "mfrlease-context-local-post-read-second"
+    context.lease_expires_at = "2026-08-18T04:22:25Z"
+    context.last_recovery_action = "mf_subagent_session_token_reissued"
+    current_ref = runtime_context_session_token_ref(context)
+    assert current_ref != sequence["receipt_session_token_ref"]
+    source_core = {
+        "schema_version": (
+            "runtime_context.safe_ref_session_authority_source.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "context_local_receipt": True,
+        "context_local_read_receipt_event_ref": sequence["read_receipt_ref"],
+        "context_local_read_receipt_hash": sequence["read_receipt_hash"],
+        "contract_runtime_prior_read_receipt_ref": sequence[
+            "contract_runtime_prior_read_receipt_ref"
+        ],
+        "contract_runtime_mutated": False,
+    }
+    events.append(
+        {
+            "id": 55,
+            "status": "accepted",
+            "task_id": context.task_id,
+            "payload": {
+                "action": "runtime_context_session_token_reissue",
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "authorization_source": (
+                    "safe_ref_prestartup_reissue_authority"
+                ),
+                "session_token_ref": current_ref,
+                "route_identity": dict(route_identity),
+                "session_token_persisted": False,
+                "raw_session_token_persisted": False,
+                "raw_fence_token_persisted": False,
+                "safe_ref_reissue_authority": {
+                    "schema_version": (
+                        "runtime_context.safe_ref_prestartup_reissue_authority.v2"
+                    ),
+                    "server_derived": True,
+                    "caller_claims_trusted": False,
+                    "read_receipt_ref": sequence[
+                        "contract_runtime_prior_read_receipt_ref"
+                    ],
+                    "session_authority_kind": (
+                        "bounded_replacement_rejoin"
+                    ),
+                    "session_authority_event_ref": "timeline:53",
+                    "initial_join_event_ref": "timeline:45",
+                    "stage_checkpoint_server_verified": True,
+                    "authority_hash": _fake_sha(
+                        "context-local-post-read-safe-ref-authority"
+                    ),
+                },
+                "safe_ref_session_authority_source": {
+                    **source_core,
+                    "authority_hash": server._stable_public_hash(source_core),
+                },
+            },
+        }
+    )
+    return current_ref
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -129824,6 +129901,275 @@ def test_context_local_post_read_safe_ref_authority_is_exact_and_fail_closed(
         session_token_ref=runtime_context_session_token_ref(context),
         route_identity=route_identity,
     ) is True
+
+
+def test_context_local_post_read_second_loss_compact_guide_stops_without_auth_action(
+    conn,
+    monkeypatch,
+):
+    context, route_identity, sequence, events = (
+        _context_local_post_read_safe_ref_fixture(monkeypatch)
+    )
+    current_ref = _append_context_local_post_read_safe_ref_reissue(
+        context,
+        route_identity,
+        sequence,
+        events,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_context_local_worker_sequence_evidence",
+        lambda *args, **kwargs: copy.deepcopy(sequence),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_contract_runtime_worker_sequence_evidence",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda *args, **kwargs: copy.deepcopy(route_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_projected_route_identity",
+        lambda *args, **kwargs: copy.deepcopy(route_identity),
+    )
+    revision_payload = {
+        "revision_id": "crev-context-local-post-read-safe-ref-second-loss",
+        "contract_execution_id": sequence["contract_execution_id"],
+        "launch_text_hash": _fake_sha(
+            "context-local-post-read-safe-ref-launch"
+        ),
+        "route_identity": copy.deepcopy(route_identity),
+        **route_identity,
+    }
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_contract_revision_payload",
+        lambda *args, **kwargs: copy.deepcopy(revision_payload),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_resolve_contract_execution_identity",
+        lambda *args, **kwargs: (
+            {"contract_execution_id": sequence["contract_execution_id"]},
+            {"status": "resolved", "fail_closed": False},
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_contract_runtime_worker_projection",
+        lambda *args, **kwargs: {
+            "contract_runtime_current_state": {
+                "schema_version": "contract_runtime.current_state.v1",
+                "contract_execution_id": sequence["contract_execution_id"],
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "next_legal_action": {
+                    "stage_id": "worker_startup",
+                    "line_id": "worker_startup",
+                },
+            },
+            "contract_runtime_next_legal_action": {
+                "action": "record_mf_subagent_startup",
+                "stage_id": "worker_startup",
+                "line_id": "worker_startup",
+            },
+            "authority_decision_source": "contract_runtime_current_state",
+        },
+    )
+    authority = server._runtime_context_post_read_startup_receipt_authority(
+        conn,
+        project_id=PID,
+        context=context,
+        route_identity=route_identity,
+    )
+    assert authority["event_ref"] == "timeline:54"
+    assert authority["safe_ref_reissue_event_ref"] == "timeline:55"
+    assert authority["session_authority_kind"] == (
+        "safe_ref_prestartup_reissue"
+    )
+    assert authority["current_session_token_ref"] == current_ref
+
+    SQLiteContractExecutionStore(conn).ensure_schema()
+    before_dump = "\n".join(conn.iterdump())
+    eligibility = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=context,
+        route_identity_override=route_identity,
+    )
+    assert eligibility["eligible"] is False
+    assert eligibility["mode"] == "safe_ref_prestartup_reissue_exhausted"
+    assert eligibility["one_time_post_read_reissue_consumed"] is True
+    assert eligibility["required_response_handling"] == {
+        "actionable": False,
+        "stop_without_initial_join": True,
+        "stop_without_rejoin": True,
+        "stop_without_reissue": True,
+        "refresh_does_not_authorize_recovery": True,
+        "next_action": "stop_runtime_context_safe_ref_recovery_exhausted",
+    }
+    assert "session_token_reissue_submission" not in eligibility
+
+    guide_ctx = _ctx_with_role(
+        {
+            "project_id": PID,
+            "runtime_context_id": context.runtime_context_id,
+        },
+        "mf_sub",
+        query={
+            "view": "compact",
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id,
+            "target_project_root": context.target_project_root,
+            **route_identity,
+        },
+    )
+    recovery = server._runtime_context_worker_recovery_details(
+        guide_ctx,
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        target_project_root=context.target_project_root,
+        route_identity=route_identity,
+        reason="runtime_context_sequence_check",
+        context=context,
+        include_full_finish_projection=False,
+    )
+    assert recovery["next_legal_action"] == (
+        "stop_runtime_context_safe_ref_recovery_exhausted"
+    )
+    assert recovery["recovery_actions"] == [
+        {
+            "id": "safe_ref_prestartup_reissue_recovery_exhausted",
+            "action": "stop_runtime_context_safe_ref_recovery_exhausted",
+            "actionable": False,
+            "description": (
+                "Stop: the unique post-read safe-ref recovery was already "
+                "consumed; no further host-envelope action is authorized."
+            ),
+        }
+    ]
+    payloads = recovery["actionable_payloads"]
+    assert payloads["recovery_exhaustion"]["actionable"] is False
+    for key in (
+        "session_token_initial_join_submission",
+        "session_token_rejoin_submission",
+        "session_token_reissue_submission",
+        "session_renewal_hints",
+    ):
+        assert key not in payloads
+
+    compact = server._runtime_context_worker_guide_early_compact_response(
+        guide_ctx,
+        conn,
+        project_id=PID,
+        context=context,
+        role="mf_sub",
+    )
+    assert compact["next_legal_action"] == (
+        "stop_runtime_context_safe_ref_recovery_exhausted"
+    )
+    assert compact["next_legal_action_decision_source"] == (
+        "runtime_context_recovery_authority"
+    )
+    assert compact["contract_runtime_next_action_took_precedence"] is False
+    assert compact["canonical_executable_action"] == {}
+    assert compact["actionable_payloads"]["recovery_exhaustion"] == (
+        payloads["recovery_exhaustion"]
+    )
+    assert "safe_ref_prestartup_reissue_already_consumed" in compact[
+        "blocking_reasons"
+    ]
+    assert compact["serialized_bytes"] <= compact["max_serialized_bytes"]
+    assert compact["raw_session_token_exposed"] is False
+    assert compact["raw_fence_token_exposed"] is False
+    assert compact["raw_route_token_exposed"] is False
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_event55",
+        "ambiguous_event55",
+        "wrong_runtime",
+        "wrong_task",
+        "wrong_route",
+        "wrong_ref",
+        "active_lease",
+        "startup_consumed",
+    ],
+)
+def test_context_local_post_read_exhaustion_controls_are_zero_write(
+    conn,
+    monkeypatch,
+    mutation,
+):
+    context, route_identity, sequence, events = (
+        _context_local_post_read_safe_ref_fixture(monkeypatch)
+    )
+    _append_context_local_post_read_safe_ref_reissue(
+        context,
+        route_identity,
+        sequence,
+        events,
+    )
+    if mutation == "missing_event55":
+        events.pop()
+    elif mutation == "ambiguous_event55":
+        duplicate = copy.deepcopy(events[-1])
+        duplicate["id"] = 56
+        events.append(duplicate)
+    elif mutation == "wrong_runtime":
+        events[-1]["payload"]["runtime_context_id"] = (
+            "mfrctx-cross-scope"
+        )
+    elif mutation == "wrong_task":
+        events[-1]["payload"]["task_id"] = "cross-scope-task"
+    elif mutation == "wrong_route":
+        events[-1]["payload"]["route_identity"]["route_token_ref"] = (
+            "rtok-cross-scope"
+        )
+    elif mutation == "wrong_ref":
+        events[-1]["payload"]["session_token_ref"] = "wstok-cross-scope"
+    elif mutation == "active_lease":
+        context.lease_expires_at = "2099-08-18T04:22:25Z"
+    elif mutation == "startup_consumed":
+        sequence["startup_ref"] = "timeline:56"
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_context_local_worker_sequence_evidence",
+        lambda *args, **kwargs: copy.deepcopy(sequence),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_contract_runtime_worker_sequence_evidence",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda *args, **kwargs: copy.deepcopy(route_identity),
+    )
+    before_dump = "\n".join(conn.iterdump())
+    eligibility = server._runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=PID,
+        context=context,
+        route_identity_override=route_identity,
+    )
+    assert eligibility.get("mode") != (
+        "safe_ref_prestartup_reissue_exhausted"
+    )
+    assert "\n".join(conn.iterdump()) == before_dump
 
 
 def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resubmitting_contract(

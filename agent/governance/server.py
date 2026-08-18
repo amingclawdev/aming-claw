@@ -30668,6 +30668,7 @@ def _runtime_context_worker_guide_bounded_actionable_payloads(
         "raw_session_token_exposed",
         "raw_fence_token_exposed",
         "raw_route_token_exposed",
+        "recovery_exhaustion",
     )
     result = {
         key: deepcopy(actionable[key])
@@ -31533,6 +31534,7 @@ def _runtime_context_worker_guide_early_compact_response(
         "verify_runtime_context_identity",
         "retry_with_matching_runtime_context_identity",
         "retry_with_target_project_root",
+        "stop_runtime_context_safe_ref_recovery_exhausted",
     }
     contract_action = str(contract_next_action.get("action") or "").strip()
     if recovery_must_precede_worker_write:
@@ -38046,6 +38048,17 @@ def _runtime_context_worker_recovery_details(
                 context=context,
             )
         )
+        context_local_worker_sequence = (
+            _runtime_context_context_local_worker_sequence_evidence(
+                conn,
+                project_id=getattr(context, "project_id", project_id),
+                context=context,
+                route_identity=expected_route_identity,
+            )
+        )
+        effective_worker_sequence = (
+            contract_runtime_sequence or context_local_worker_sequence
+        )
         latest_revision_payload = _runtime_context_latest_contract_revision_payload(
             conn,
             context,
@@ -38078,6 +38091,9 @@ def _runtime_context_worker_recovery_details(
         diagnostics["contract_runtime_worker_sequence"] = dict(
             contract_runtime_sequence
         )
+        diagnostics["context_local_worker_sequence"] = dict(
+            context_local_worker_sequence
+        )
         session_token_rejoin_eligibility = (
             _runtime_context_session_rejoin_guidance_eligibility(
                 conn,
@@ -38091,12 +38107,12 @@ def _runtime_context_worker_recovery_details(
         )
         effective_read_receipt_ref = str(
             timeline_refs.get("read_receipt_event_ref")
-            or contract_runtime_sequence.get("read_receipt_ref")
+            or effective_worker_sequence.get("read_receipt_ref")
             or ""
         )
         effective_startup_ref = str(
             timeline_refs.get("startup_event_ref")
-            or contract_runtime_sequence.get("startup_ref")
+            or effective_worker_sequence.get("startup_ref")
             or ""
         )
         missing_worker_lineage = [
@@ -38131,7 +38147,7 @@ def _runtime_context_worker_recovery_details(
         session_token_initial_join_submission: dict[str, Any] = {}
         session_token_rejoin_submission: dict[str, Any] = {}
         rejoin_contract_execution_id = str(
-            contract_runtime_sequence.get("contract_execution_id") or ""
+            effective_worker_sequence.get("contract_execution_id") or ""
         ).strip()
         if not rejoin_contract_execution_id:
             rejoin_authority = (
@@ -38203,6 +38219,18 @@ def _runtime_context_worker_recovery_details(
             and session_token_rejoin_eligibility.get("mode")
             == "safe_ref_prestartup_reissue"
         )
+        safe_ref_prestartup_reissue_exhausted = bool(
+            session_token_rejoin_eligibility.get("eligible") is not True
+            and session_token_rejoin_eligibility.get("mode")
+            == "safe_ref_prestartup_reissue_exhausted"
+            and isinstance(
+                session_token_rejoin_eligibility.get("authority"), Mapping
+            )
+            and session_token_rejoin_eligibility["authority"].get(
+                "one_time_post_read_reissue_consumed"
+            )
+            is True
+        )
         verifier_backed_recovery_exhausted = bool(
             session_token_rejoin_eligibility.get("eligible") is not True
             and session_token_rejoin_eligibility.get("mode")
@@ -38223,7 +38251,17 @@ def _runtime_context_worker_recovery_details(
                 if lease_view.get("expired") is True
                 else "worker_auth_authorization_invalid"
             )
-            if safe_ref_prestartup_reissue:
+            if safe_ref_prestartup_reissue_exhausted:
+                diagnostics["reason"] = (
+                    "safe_ref_prestartup_reissue_recovery_exhausted"
+                )
+                next_legal_action = (
+                    "stop_runtime_context_safe_ref_recovery_exhausted"
+                )
+                recovery_action_id = (
+                    "safe_ref_prestartup_reissue_recovery_exhausted"
+                )
+            elif safe_ref_prestartup_reissue:
                 next_legal_action = "reissue_runtime_session_token"
                 recovery_action_id = (
                     "request_runtime_context_safe_ref_prestartup_reissue"
@@ -38525,7 +38563,7 @@ def _runtime_context_worker_recovery_details(
             fence_token_hash=fence_token_hash,
             session_token_ref=runtime_context_session_token_ref(context),
             launch_text_hash=source_backed_launch_text_hash,
-            read_receipt_event_ref=str(timeline_refs.get("read_receipt_event_ref") or ""),
+            read_receipt_event_ref=effective_read_receipt_ref,
             read_receipt_authority=(
                 _runtime_context_post_read_startup_receipt_authority(
                     conn,
@@ -38558,6 +38596,32 @@ def _runtime_context_worker_recovery_details(
                 session_token_rejoin_eligibility
             ),
         )
+        if safe_ref_prestartup_reissue_exhausted:
+            for key in (
+                "session_token_initial_join_submission",
+                "session_token_reissue_submission",
+                "session_token_rejoin_submission",
+                "session_renewal_hints",
+            ):
+                actionable_payloads.pop(key, None)
+            actionable_payloads["recovery_exhaustion"] = {
+                "schema_version": (
+                    "runtime_context.worker_recovery_exhaustion.v1"
+                ),
+                "status": "safe_ref_prestartup_reissue_exhausted",
+                "actionable": False,
+                "next_action": (
+                    "stop_runtime_context_safe_ref_recovery_exhausted"
+                ),
+                "canonical_action_available": False,
+                "initial_join_available": False,
+                "rejoin_available": False,
+                "reissue_available": False,
+                "one_time_post_read_reissue_consumed": True,
+                "raw_session_token_exposed": False,
+                "raw_fence_token_exposed": False,
+                "raw_route_token_exposed": False,
+            }
         projected_prestartup_reissue = (
             session_token_rejoin_eligibility.get(
                 "session_token_reissue_submission"
@@ -38708,18 +38772,38 @@ def _runtime_context_worker_recovery_details(
                 ),
                 "access_audit_recorded": False,
             }
-    recovery_actions = [
-        {
-            "id": recovery_action_id,
-            "action": next_legal_action,
-            "description": "Perform the next legal runtime-context worker step, then retry.",
-        },
-        {
-            "id": "refresh_worker_guide",
-            "action": "read_runtime_context_worker_guide",
-            "description": "Refresh current-state/worker-guide and copy the projected identity fields.",
-        },
-    ]
+    recovery_actions = (
+        [
+            {
+                "id": recovery_action_id,
+                "action": next_legal_action,
+                "actionable": False,
+                "description": (
+                    "Stop: the unique post-read safe-ref recovery was already "
+                    "consumed; no further host-envelope action is authorized."
+                ),
+            }
+        ]
+        if next_legal_action
+        == "stop_runtime_context_safe_ref_recovery_exhausted"
+        else [
+            {
+                "id": recovery_action_id,
+                "action": next_legal_action,
+                "description": (
+                    "Perform the next legal runtime-context worker step, then retry."
+                ),
+            },
+            {
+                "id": "refresh_worker_guide",
+                "action": "read_runtime_context_worker_guide",
+                "description": (
+                    "Refresh current-state/worker-guide and copy the projected "
+                    "identity fields."
+                ),
+            },
+        ]
+    )
     read_receipt_skeleton = actionable_payloads.get(
         "read_receipt_facade_payload_skeleton",
         {},
@@ -54898,6 +54982,7 @@ def _runtime_context_session_rejoin_guidance_eligibility(
     from .parallel_branch_runtime import (
         ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
         BranchRuntimeFenceError,
+        runtime_context_session_token_lease_view,
         runtime_context_session_token_ref,
     )
 
@@ -54979,6 +55064,126 @@ def _runtime_context_session_rejoin_guidance_eligibility(
     last_recovery_action = str(
         getattr(context, "last_recovery_action", "") or ""
     ).strip()
+    current_session_token_ref = runtime_context_session_token_ref(context)
+    post_read_receipt_authority: dict[str, Any] = {}
+    post_read_safe_ref_reissue_exhausted = False
+    if (
+        status in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES
+        and str(prestartup_sequence.get("source") or "")
+        == "task_timeline_context_local_receipt"
+        and effective_read_receipt_ref
+        and not effective_startup_ref
+        and last_recovery_action == "mf_subagent_session_token_reissued"
+    ):
+        post_read_receipt_authority = (
+            _runtime_context_post_read_startup_receipt_authority(
+                conn,
+                project_id=project_id,
+                context=context,
+                route_identity=recovery_route_identity,
+            )
+        )
+        post_read_safe_ref_reissue_exhausted = bool(
+            _runtime_context_post_read_startup_receipt_authority_is_exact(
+                post_read_receipt_authority,
+                project_id=project_id,
+                backlog_id=str(getattr(context, "backlog_id", "") or "").strip(),
+                contract_execution_id=str(
+                    prestartup_sequence.get("contract_execution_id") or ""
+                ).strip(),
+                runtime_context_id=str(
+                    getattr(context, "runtime_context_id", "") or ""
+                ).strip(),
+                task_id=str(getattr(context, "task_id", "") or "").strip(),
+                parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
+                worker_id=str(getattr(context, "worker_id", "") or "").strip(),
+                worker_slot_id=str(
+                    getattr(context, "worker_slot_id", "")
+                    or getattr(context, "worker_id", "")
+                    or ""
+                ).strip(),
+                target_project_root=(
+                    _runtime_context_effective_target_project_root(context)
+                ),
+                session_token_ref=current_session_token_ref,
+                route_identity=recovery_route_identity,
+            )
+            and str(
+                post_read_receipt_authority.get("session_authority_kind") or ""
+            ).strip()
+            == "safe_ref_prestartup_reissue"
+            and bool(
+                str(
+                    post_read_receipt_authority.get(
+                        "safe_ref_reissue_event_ref"
+                    )
+                    or ""
+                ).strip()
+            )
+            and runtime_context_session_token_lease_view(context).get(
+                "authorization_valid"
+            )
+            is not True
+        )
+    if post_read_safe_ref_reissue_exhausted:
+        exhaustion_core = {
+            "schema_version": (
+                "runtime_context.safe_ref_prestartup_reissue_exhaustion.v1"
+            ),
+            "server_derived": True,
+            "caller_claims_trusted": False,
+            "applicable": True,
+            "eligible": False,
+            "mode": "safe_ref_prestartup_reissue_exhausted",
+            "runtime_context_id": str(
+                getattr(context, "runtime_context_id", "") or ""
+            ).strip(),
+            "task_id": str(getattr(context, "task_id", "") or "").strip(),
+            "contract_execution_id": str(
+                prestartup_sequence.get("contract_execution_id") or ""
+            ).strip(),
+            "read_receipt_event_ref": effective_read_receipt_ref,
+            "safe_ref_reissue_event_ref": str(
+                post_read_receipt_authority.get("safe_ref_reissue_event_ref")
+                or ""
+            ).strip(),
+            "current_session_token_ref": current_session_token_ref,
+            "route_identity": dict(recovery_route_identity),
+            "one_time_post_read_reissue_consumed": True,
+            "startup_absent": True,
+            "historical_events_mutated": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        }
+        projection.update(
+            {
+                "eligible": False,
+                "mode": "safe_ref_prestartup_reissue_exhausted",
+                "authority": {
+                    **exhaustion_core,
+                    "authority_hash": _stable_public_hash(exhaustion_core),
+                },
+                "post_receipt_pre_startup_recovery": True,
+                "context_local_post_receipt_recovery": True,
+                "one_time_post_read_reissue_consumed": True,
+                "blockers": [
+                    "safe_ref_prestartup_reissue_already_consumed",
+                    "runtime_context_recovery_exhausted_stop",
+                ],
+                "required_response_handling": {
+                    "actionable": False,
+                    "stop_without_initial_join": True,
+                    "stop_without_rejoin": True,
+                    "stop_without_reissue": True,
+                    "refresh_does_not_authorize_recovery": True,
+                    "next_action": (
+                        "stop_runtime_context_safe_ref_recovery_exhausted"
+                    ),
+                },
+            }
+        )
+        return projection
     context_local_post_receipt_replacement = bool(
         str(prestartup_sequence.get("source") or "")
         == "task_timeline_context_local_receipt"
@@ -55089,7 +55294,7 @@ def _runtime_context_session_rejoin_guidance_eligibility(
             fence_token_hash=str(
                 getattr(context, "fence_token_verifier", "") or ""
             ).strip(),
-            session_token_ref=runtime_context_session_token_ref(context),
+            session_token_ref=current_session_token_ref,
             read_receipt_event_ref=effective_read_receipt_ref,
             read_receipt_authority=(
                 _runtime_context_post_read_startup_receipt_authority(
@@ -55104,7 +55309,7 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                     timeline_events,
                     runtime_context_id=runtime_context_id,
                     task_id=task_id,
-                    session_token_ref=runtime_context_session_token_ref(context),
+                    session_token_ref=current_session_token_ref,
                 )
             ),
             contract_execution_id=sequence_execution_id,
