@@ -6585,7 +6585,9 @@ def _live_worker_commit_after_implementation_bypass_case(
             "worker_id": context.worker_id,
             "worker_slot_id": context.worker_slot_id,
             "worker_role": "mf_sub",
-            "target_project_root": context.target_project_root,
+            "target_project_root": (
+                server._runtime_context_effective_target_project_root(context)
+            ),
             "worktree_path": context.worktree_path,
             "branch_ref": context.branch_ref,
             "base_commit": context.base_commit,
@@ -129527,6 +129529,260 @@ def _context_local_rework_receipt_fixture():
     return context, record, marker, command, route_identity
 
 
+def _context_local_post_read_safe_ref_fixture(monkeypatch):
+    contract_execution_id = "cex-context-local-post-read-safe-ref"
+    runtime_context_id = "mfrctx-context-local-post-read-safe-ref"
+    task_id = "context-local-post-read-safe-ref-worker"
+    worker_id = "context-local-post-read-safe-ref-worker"
+    target_root = "/tmp/context-local-post-read-safe-ref"
+    route_identity = {
+        "route_id": "route-context-local-post-read-safe-ref",
+        "route_context_hash": _fake_sha("context-local-post-read-route"),
+        "prompt_contract_id": "rprompt-context-local-post-read-safe-ref",
+        "prompt_contract_hash": _fake_sha("context-local-post-read-prompt"),
+        "route_token_ref": "rtok-context-local-post-read-safe-ref",
+        "visible_injection_manifest_hash": _fake_sha(
+            "context-local-post-read-visible"
+        ),
+    }
+    context = SimpleNamespace(
+        project_id=PID,
+        governance_project_id=PID,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=contract_execution_id,
+        root_task_id=contract_execution_id,
+        backlog_id="AC-CONTEXT-LOCAL-POST-READ-SAFE-REF",
+        status=STATE_WORKTREE_READY,
+        worker_id=worker_id,
+        worker_slot_id=worker_id,
+        actual_host_worker_id=worker_id,
+        target_project_root=target_root,
+        worktree_path=target_root,
+        fence_token="",
+        fence_token_verifier=_fake_sha("context-local-post-read-fence"),
+        session_token_hash=_fake_sha("context-local-post-read-session"),
+        lease_id="mfrlease-context-local-post-read",
+        lease_expires_at="2026-08-17T00:00:00Z",
+    )
+    current_ref = runtime_context_session_token_ref(context)
+    initial_join_ref = "timeline:45"
+    identity_anchor_ref = "timeline:46"
+    source_rejoin_ref = "timeline:51"
+    replacement_ref = "timeline:53"
+    receipt_ref = "timeline:54"
+    events = [
+        {
+            "id": 45,
+            "status": "accepted",
+            "task_id": task_id,
+            "payload": {
+                "action": "runtime_context_session_token_initial_join",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": contract_execution_id,
+                "contract_execution_id": contract_execution_id,
+                "worker_id": worker_id,
+                "worker_slot_id": worker_id,
+                "actual_host_worker_id": worker_id,
+                "worker_session_id": "codex:context-local-post-read",
+                "host_envelope_returned": True,
+                "raw_session_token_persisted": False,
+                "raw_fence_token_persisted_to_timeline": False,
+            },
+        },
+        {
+            "id": 46,
+            "status": "accepted",
+            "task_id": task_id,
+            "payload": {
+                "action": (
+                    "runtime_context_session_token_initial_join_"
+                    "identity_binding_anchor"
+                ),
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "initial_join_event_ref": initial_join_ref,
+                "canonical_binding_hash": _fake_sha(
+                    "context-local-post-read-binding"
+                ),
+            },
+        },
+        {
+            "id": 51,
+            "status": "accepted",
+            "task_id": task_id,
+            "payload": {
+                "action": "runtime_context_session_token_rejoin",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "bounded_rejoin_kind": "special_authority_rejoin",
+                "pre_lineage_rejoin_authority": {
+                    "server_derived": True,
+                    "eligible": True,
+                    "caller_claims_trusted": False,
+                    "initial_join_event_ref": initial_join_ref,
+                    "canonical_identity_binding_anchor_ref": (
+                        identity_anchor_ref
+                    ),
+                    "canonical_identity_binding_valid": True,
+                    "current_reissue_route_binding": {
+                        "valid": True,
+                        "registry_verified": True,
+                        "exact_scope_verified": True,
+                        "scope_actions_files_verified": True,
+                        "historical_event_rewritten": False,
+                        "canonical_route_identity": dict(route_identity),
+                    },
+                },
+            },
+        },
+        {
+            "id": 53,
+            "status": "accepted",
+            "task_id": task_id,
+            "payload": {
+                "action": "runtime_context_session_token_rejoin",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "parent_task_id": contract_execution_id,
+                "worker_id": worker_id,
+                "worker_slot_id": worker_id,
+                "session_token_ref": current_ref,
+                "bounded_rejoin_kind": "bounded_replacement_rejoin",
+                "bounded_replacement_rejoin": True,
+                "bounded_replacement_rejoin_authority": {
+                    "source_event_ref": source_rejoin_ref,
+                    "actual_worker_write_baseline": {
+                        "contract_execution_id": contract_execution_id,
+                    },
+                },
+                "route_identity": dict(route_identity),
+                "raw_session_token_persisted": False,
+                "raw_fence_token_persisted_to_timeline": False,
+            },
+        },
+    ]
+    sequence = {
+        "source": "task_timeline_context_local_receipt",
+        "contract_execution_id": contract_execution_id,
+        "read_receipt_ref": receipt_ref,
+        "contract_runtime_prior_read_receipt_ref": (
+            f"contract_runtime:{contract_execution_id}:completed_lines:2"
+        ),
+        "read_receipt_hash": _fake_sha("context-local-post-read-receipt"),
+        "receipt_session_token_ref": current_ref,
+        "startup_ref": "",
+        "contract_runtime_mutated": False,
+    }
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_events",
+        lambda *args, **kwargs: copy.deepcopy(events),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_bounded_replacement_rejoin_authority",
+        lambda *args, **kwargs: {
+            "mode": "next_stage_checkpoint_issuance",
+            "server_derived": True,
+            "caller_claims_trusted": False,
+            "next_checkpoint_issuance_allowed": True,
+            "errors": [],
+            "identity_mismatches": [],
+            "historical_advanced_checkpoint_event_refs": [
+                source_rejoin_ref,
+                replacement_ref,
+            ],
+        },
+    )
+    return context, route_identity, sequence, events
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "canonical",
+        "wrong_contract",
+        "wrong_runtime",
+        "wrong_task",
+        "wrong_parent",
+        "wrong_worker",
+        "wrong_slot",
+        "wrong_route",
+        "wrong_ref",
+        "duplicate_replacement",
+        "startup_consumed",
+    ],
+)
+def test_context_local_post_read_safe_ref_authority_is_exact_and_fail_closed(
+    conn,
+    monkeypatch,
+    mutation,
+):
+    context, route_identity, sequence, events = (
+        _context_local_post_read_safe_ref_fixture(monkeypatch)
+    )
+    replacement = events[-1]["payload"]
+    if mutation == "wrong_contract":
+        replacement["bounded_replacement_rejoin_authority"][
+            "actual_worker_write_baseline"
+        ]["contract_execution_id"] = "cex-cross-scope"
+    elif mutation == "wrong_runtime":
+        replacement["runtime_context_id"] = "mfrctx-cross-scope"
+    elif mutation == "wrong_task":
+        replacement["task_id"] = "cross-scope-task"
+    elif mutation == "wrong_parent":
+        replacement["parent_task_id"] = "cex-cross-parent"
+    elif mutation == "wrong_worker":
+        replacement["worker_id"] = "cross-scope-worker"
+    elif mutation == "wrong_slot":
+        replacement["worker_slot_id"] = "cross-scope-slot"
+    elif mutation == "wrong_route":
+        replacement["route_identity"]["route_token_ref"] = "rtok-cross-scope"
+    elif mutation == "wrong_ref":
+        replacement["session_token_ref"] = "wstok-cross-scope"
+    elif mutation == "duplicate_replacement":
+        duplicate = copy.deepcopy(events[-1])
+        duplicate["id"] = 55
+        events.append(duplicate)
+    elif mutation == "startup_consumed":
+        sequence["startup_ref"] = "timeline:55"
+
+    authority = (
+        server._runtime_context_context_local_post_read_startup_receipt_authority(
+            conn,
+            project_id=PID,
+            context=context,
+            route_identity=route_identity,
+            sequence=sequence,
+        )
+    )
+    if mutation != "canonical":
+        assert authority == {}
+        return
+    assert authority["status"] == "unique_exact_prestartup_receipt"
+    assert authority["event_ref"] == "timeline:54"
+    assert authority["session_authority_event_ref"] == "timeline:53"
+    assert authority["session_authority_kind"] == "bounded_replacement_rejoin"
+    assert authority["context_local_receipt"] is True
+    assert authority["contract_runtime_mutated"] is False
+    assert server._runtime_context_post_read_startup_receipt_authority_is_exact(
+        authority,
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        contract_execution_id=sequence["contract_execution_id"],
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        worker_id=context.worker_id,
+        worker_slot_id=context.worker_slot_id,
+        target_project_root=context.target_project_root,
+        session_token_ref=runtime_context_session_token_ref(context),
+        route_identity=route_identity,
+    ) is True
+
+
 def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resubmitting_contract(
     conn,
     monkeypatch,
@@ -129811,6 +130067,7 @@ def test_context_local_rework_receipt_rejects_noncanonical_backfill(
     ("mutation", "expected_event_id"),
     [
         ("canonical", 701),
+        ("safe_ref_rotated", 701),
         ("wrong_event_kind", 0),
         ("wrong_event_type", 0),
         ("stale_session_ref", 0),
@@ -129874,7 +130131,76 @@ def test_context_local_rework_startup_requires_exact_canonical_receipt_identity(
         "payload": event_payload,
     }
     events = [event]
-    if mutation == "wrong_event_kind":
+    if mutation == "safe_ref_rotated":
+        event_payload["read_receipt_hash"] = _fake_sha(
+            "context-local-safe-ref-rotated-receipt"
+        )
+        context.target_project_root = "/tmp/context-local-safe-ref-rotated"
+        context.worktree_path = context.target_project_root
+        context.session_token_hash = _fake_sha(
+            "context-local-safe-ref-rotated-session"
+        )
+        context.fence_token = ""
+        context.fence_token_verifier = _fake_sha(
+            "context-local-safe-ref-rotated-fence"
+        )
+        current_session_ref = runtime_context_session_token_ref(context)
+        authority_core = {
+            "schema_version": (
+                "runtime_context.post_read_startup_receipt_authority.v1"
+            ),
+            "source": (
+                "task_timeline.context_local_read_receipt+"
+                "ContractRuntime.failed_qa_replacement_dispatch+"
+                "runtime_context_session_authority"
+            ),
+            "server_derived": True,
+            "status": "unique_exact_prestartup_receipt",
+            "actionable": True,
+            "candidate_count": 1,
+            "project_id": PID,
+            "backlog_id": context.backlog_id,
+            "contract_execution_id": record["contract_execution_id"],
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.parent_task_id,
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id,
+            "target_project_root": (
+                server._runtime_context_effective_target_project_root(context)
+            ),
+            "event_id": "701",
+            "event_ref": "timeline:701",
+            "read_receipt_hash": event_payload["read_receipt_hash"],
+            "contract_runtime_read_receipt_ref": "timeline:701",
+            "initial_join_event_ref": "timeline:45",
+            "identity_anchor_event_ref": "timeline:46",
+            "safe_ref_reissue_event_ref": "timeline:704",
+            "session_authority_event_ref": "timeline:704",
+            "session_authority_kind": "safe_ref_prestartup_reissue",
+            "receipt_session_token_ref": session_ref,
+            "current_session_token_ref": current_session_ref,
+            "route_identity": dict(route_identity),
+            "startup_absent": True,
+            "timeline_backfill_performed": False,
+            "contract_runtime_backfill_performed": False,
+            "contract_runtime_mutated": False,
+            "context_local_receipt": True,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+            "caller_claims_trusted": False,
+        }
+        safe_ref_authority = {
+            **authority_core,
+            "authority_hash": server._stable_public_hash(authority_core),
+        }
+        monkeypatch.setattr(
+            server,
+            "_runtime_context_post_read_startup_receipt_authority",
+            lambda *args, **kwargs: copy.deepcopy(safe_ref_authority),
+        )
+    elif mutation == "wrong_event_kind":
         event["event_kind"] = "worker_progress"
     elif mutation == "wrong_event_type":
         event["event_type"] = "contract_context_read_receipt"
@@ -129950,7 +130276,9 @@ def test_context_local_rework_startup_requires_exact_canonical_receipt_identity(
     )
     assert result["local_read_receipt"]["event_id"] == expected_event_id
     assert result["local_read_receipt"]["source"] == (
-        "task_timeline.contract_context_read_receipt"
+        "runtime_context.post_read_startup_receipt_authority"
+        if mutation == "safe_ref_rotated"
+        else "task_timeline.contract_context_read_receipt"
     )
 
 
@@ -130314,7 +130642,6 @@ def test_fresh_failed_qa_context_read_receipt_persists_and_startup_discovers_it(
     assert fresh_read_events[0]["payload"]["contract_runtime_canonical_line"][
         "status"
     ] == "context_local_receipt_after_prior_contract_line"
-
     startup_response = server.handle_graph_governance_runtime_context_startup(
         _ctx_with_role(
             {
