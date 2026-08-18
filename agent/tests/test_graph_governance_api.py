@@ -124507,8 +124507,21 @@ def test_mf_parallel_dispatch_ticket_authority_projects_failed_qa_replacement():
     ]
     record = {
         "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "revision": "rev9",
         "contract_execution_id": "cex-failed-qa-dispatch-ticket",
         "completed_lines": completed_lines,
+        "runtime_guide": {
+            "next_legal_action": {
+                "id": "worker_read_runtime_guide",
+                "action": "record_read_receipt",
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "owner_role": "mf_sub",
+                "runtime_context_id": "mfrctx-old-dispatch",
+                "task_id": "old-dispatch-worker",
+                "parent_task_id": "cex-failed-qa-dispatch-ticket",
+            }
+        },
     }
 
     authority = server._contract_runtime_dispatch_ticket_authority(
@@ -124524,6 +124537,44 @@ def test_mf_parallel_dispatch_ticket_authority_projects_failed_qa_replacement():
     assert authority["next_legal_action"]["task_id"] == (
         "current-dispatch-worker"
     )
+    current = server._runtime_current_state_from_record(record)
+    current_next = current["next_legal_action"]
+    assert current_next["line_id"] == "worker_read_runtime_guide"
+    assert current_next["action"] == "record_read_receipt"
+    assert current_next["runtime_context_id"] == "mfrctx-current-dispatch"
+    assert current_next["task_id"] == "current-dispatch-worker"
+    assert current_next["parent_task_id"] == (
+        "cex-failed-qa-dispatch-ticket"
+    )
+    assert current_next["worker_slot_id"] == "current-dispatch-worker"
+    assert current_next["lane_id"] == "current-dispatch-worker"
+    assert current_next["line_instance_id"] == (
+        "runtime_context:mfrctx-current-dispatch"
+    )
+    assert current["accepted_dispatch_authority"] == {
+        "schema_version": (
+            "contract_runtime.failed_qa_replacement_dispatch_authority.v1"
+        ),
+        "status": "projected",
+        "source": "server_verified_failed_qa_replacement_dispatch",
+        "server_derived": True,
+        "failed_qa_completed_line_index": 4,
+        "dispatch_completed_line_index": 5,
+        "source_ref": (
+            "contract_runtime:cex-failed-qa-dispatch-ticket:"
+            "completed_lines:5"
+        ),
+        "runtime_context_id": "mfrctx-current-dispatch",
+        "task_id": "current-dispatch-worker",
+        "parent_task_id": "cex-failed-qa-dispatch-ticket",
+        "worker_id": "current-dispatch-worker",
+        "worker_slot_id": "current-dispatch-worker",
+        "lane_id": "current-dispatch-worker",
+        "line_instance_id": "runtime_context:mfrctx-current-dispatch",
+    }
+    assert current_next["accepted_dispatch_authority"] == current[
+        "accepted_dispatch_authority"
+    ]
     qa_authority = server._contract_runtime_qa_ticket_authority(
         record,
         {
@@ -124557,6 +124608,43 @@ def test_mf_parallel_dispatch_ticket_authority_projects_failed_qa_replacement():
         "status": "invalid",
         "error": "canonical ContractRuntime dispatch authority is ambiguous",
     }
+
+    invalid_records = []
+    no_current_replacement = copy.deepcopy(record)
+    no_current_replacement["completed_lines"] = completed_lines[:-1]
+    invalid_records.append(no_current_replacement)
+    missing_marker = copy.deepcopy(record)
+    missing_marker["completed_lines"][5]["payload"].pop(
+        "failed_qa_rework_dispatch_revision_authority"
+    )
+    invalid_records.append(missing_marker)
+    forged_runtime = copy.deepcopy(record)
+    forged_runtime["completed_lines"][5]["payload"][
+        "failed_qa_rework_dispatch_revision_authority"
+    ]["runtime_context_id"] = "mfrctx-forged-dispatch"
+    invalid_records.append(forged_runtime)
+    wrong_contract = copy.deepcopy(record)
+    wrong_contract["completed_lines"][5]["payload"][
+        "failed_qa_rework_dispatch_revision_authority"
+    ]["contract_execution_id"] = "cex-cross-contract"
+    invalid_records.append(wrong_contract)
+    ambiguous_current = copy.deepcopy(record)
+    ambiguous_current["completed_lines"].append(
+        copy.deepcopy(current_replacement)
+    )
+    invalid_records.append(ambiguous_current)
+
+    for invalid_record in invalid_records:
+        rejected_current = server._runtime_current_state_from_record(
+            invalid_record
+        )
+        assert rejected_current["readiness_state"] == (
+            "failed_qa_worker_fix_required"
+        )
+        assert rejected_current["next_legal_action"]["id"] == (
+            "allocate_bounded_worker_fix"
+        )
+        assert "accepted_dispatch_authority" not in rejected_current
 
 
 def test_mf_parallel_dispatch_ticket_authority_rejects_conflicting_route_identity():
@@ -131899,6 +131987,41 @@ def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_sta
     assert resolved_dispatch["runtime_context_id"] == fresh_context_id
     assert resolved_dispatch["source_ref"] == revision["source_ref"]
 
+    live_replacement_record = copy.deepcopy(after_allocate)
+    live_replacement_record["revision"] = "rev9"
+    selected_replacement_dispatch = (
+        server._contract_runtime_current_dispatch_authority_line(
+            live_replacement_record
+        )
+    )
+    replacement_ticket = server._contract_runtime_dispatch_ticket_authority(
+        live_replacement_record,
+        {
+            "next_legal_action": server._runtime_next_action_from_guide(
+                live_replacement_record["runtime_guide"]
+            )
+        },
+    )
+    assert replacement_ticket["status"] == "projected", {
+        "selected": selected_replacement_dispatch,
+        "ticket": replacement_ticket,
+    }
+    direct_current = server._runtime_current_state_from_record(
+        live_replacement_record
+    )
+    assert direct_current.get("accepted_dispatch_authority"), direct_current
+    replacement_next = direct_current["next_legal_action"]
+    assert replacement_next["line_id"] == "worker_read_runtime_guide"
+    assert replacement_next["runtime_context_id"] == fresh_context_id
+    assert replacement_next["task_id"] == fresh_task_id
+    assert replacement_next["parent_task_id"] == contract_execution_id
+    assert direct_current["accepted_dispatch_authority"][
+        "source_ref"
+    ] == revision["source_ref"]
+    assert direct_current["accepted_dispatch_authority"][
+        "server_derived"
+    ] is True
+
     before_rejected_join_record = copy.deepcopy(
         server._contract_runtime_store(conn).get(contract_execution_id)
     )
@@ -131995,6 +132118,58 @@ def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_sta
     fresh_token = joined["session_token"]
     fresh_fence = joined["fence_token"]
     fresh_session_ref = joined["session_token_ref"]
+
+    live_replacement_record = copy.deepcopy(
+        server._contract_runtime_store(conn).get(contract_execution_id)
+    )
+    live_replacement_record["revision"] = "rev9"
+    before_compact_changes = conn.total_changes
+    before_compact_dump = "\n".join(conn.iterdump())
+
+    class StaticReplacementStore:
+        def get(self, execution_id):
+            assert execution_id == contract_execution_id
+            return copy.deepcopy(live_replacement_record)
+
+    with monkeypatch.context() as compact_patch:
+        compact_patch.setattr(
+            server,
+            "_contract_runtime_store",
+            lambda _conn: StaticReplacementStore(),
+        )
+        compact_after_replacement_dispatch = _compact_worker_read_guide(
+            conn,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+        )
+    compact_projection = compact_after_replacement_dispatch[
+        "worker_read_runtime_facade_projection"
+    ]
+    assert compact_projection["status"] == "blocked", compact_projection
+    assert compact_projection["blocker_id"] == (
+        "runtime_context_worktree_not_live"
+    )
+    assert compact_projection["reason"] == (
+        "runtime_context_not_worktree_ready"
+    )
+    assert compact_projection["runtime_context_id"] == fresh_context_id
+    assert compact_projection["task_id"] == fresh_task_id
+    compact_next = compact_after_replacement_dispatch["next_legal_action"]
+    assert compact_next["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+    assert compact_next["action"] == (
+        "record_read_receipt"
+    )
+    assert compact_next["accepted_dispatch_authority"] == direct_current[
+        "accepted_dispatch_authority"
+    ]
+    assert (
+        compact_after_replacement_dispatch["canonical_executable_action"]
+        == {}
+    )
+    assert conn.total_changes == before_compact_changes
+    assert "\n".join(conn.iterdump()) == before_compact_dump
 
     receipt_hash = _fake_sha("failed-qa-fresh-dispatch-read")
     read_response = server.handle_graph_governance_runtime_context_read_receipt(

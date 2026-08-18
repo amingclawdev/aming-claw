@@ -99932,6 +99932,129 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
             failed_index = int(
                 failed_qa_line.get("_completed_line_index") or 0
             )
+            current_next = (
+                current_state.get("next_legal_action")
+                if isinstance(
+                    current_state.get("next_legal_action"), Mapping
+                )
+                else {}
+            )
+            current_next_line = str(
+                current_next.get("line_id")
+                or current_next.get("id")
+                or ""
+            ).strip()
+            selected_dispatch = (
+                _contract_runtime_current_dispatch_authority_line(record)
+            )
+            selected_dispatch_index = int(
+                selected_dispatch.get("completed_line_index")
+                if selected_dispatch.get("completed_line_index") is not None
+                else -1
+            )
+            replacement_dispatch = (
+                _contract_runtime_dispatch_ticket_authority(
+                    record,
+                    current_state,
+                    allow_post_read_startup=(
+                        current_next_line == "worker_startup"
+                    ),
+                    allow_post_startup_graph=(
+                        current_next_line == "worker_graph_context"
+                    ),
+                )
+                if (
+                    selected_dispatch.get("status") == "selected"
+                    and selected_dispatch_index > failed_index
+                )
+                else {}
+            )
+            replacement_dispatch_ready = (
+                replacement_dispatch.get("status") == "projected"
+            )
+            if replacement_dispatch_ready:
+                dispatch_action = (
+                    replacement_dispatch.get("next_legal_action")
+                    if isinstance(
+                        replacement_dispatch.get("next_legal_action"),
+                        Mapping,
+                    )
+                    else {}
+                )
+                rebound_next = dict(current_next)
+                for field in (
+                    "runtime_context_id",
+                    "task_id",
+                    "parent_task_id",
+                    "worker_id",
+                    "worker_slot_id",
+                    "observer_command_id",
+                    "worker_role",
+                    "target_project_root",
+                    "worktree_path",
+                    "branch_ref",
+                    "base_commit",
+                    "target_head_commit",
+                    "merge_queue_id",
+                    "owned_files",
+                    *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
+                ):
+                    value = dispatch_action.get(field)
+                    if value:
+                        rebound_next[field] = (
+                            list(value)
+                            if isinstance(value, tuple)
+                            else value
+                        )
+                replacement_runtime_context_id = str(
+                    dispatch_action.get("runtime_context_id") or ""
+                ).strip()
+                replacement_worker_slot_id = str(
+                    dispatch_action.get("worker_slot_id")
+                    or dispatch_action.get("worker_id")
+                    or ""
+                ).strip()
+                if replacement_runtime_context_id:
+                    rebound_next["line_instance_id"] = (
+                        f"runtime_context:{replacement_runtime_context_id}"
+                    )
+                if replacement_worker_slot_id:
+                    rebound_next["lane_id"] = replacement_worker_slot_id
+                accepted_dispatch_authority = {
+                    "schema_version": (
+                        "contract_runtime.failed_qa_replacement_dispatch_authority.v1"
+                    ),
+                    "status": "projected",
+                    "source": "server_verified_failed_qa_replacement_dispatch",
+                    "server_derived": True,
+                    "failed_qa_completed_line_index": failed_index,
+                    "dispatch_completed_line_index": selected_dispatch_index,
+                    "source_ref": str(
+                        replacement_dispatch.get("source_ref") or ""
+                    ),
+                    "runtime_context_id": str(
+                        dispatch_action.get("runtime_context_id") or ""
+                    ),
+                    "task_id": str(dispatch_action.get("task_id") or ""),
+                    "parent_task_id": str(
+                        dispatch_action.get("parent_task_id") or ""
+                    ),
+                    "worker_id": str(
+                        dispatch_action.get("worker_id") or ""
+                    ),
+                    "worker_slot_id": replacement_worker_slot_id,
+                    "lane_id": replacement_worker_slot_id,
+                    "line_instance_id": str(
+                        rebound_next.get("line_instance_id") or ""
+                    ),
+                }
+                rebound_next["accepted_dispatch_authority"] = dict(
+                    accepted_dispatch_authority
+                )
+                current_state["next_legal_action"] = rebound_next
+                current_state["accepted_dispatch_authority"] = dict(
+                    accepted_dispatch_authority
+                )
             failed_source_ref = (
                 f"contract_runtime:{record.get('contract_execution_id', '')}:"
                 f"completed_lines:{failed_index}"
@@ -99939,6 +100062,8 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
             bounded_worker_fix = (
                 str(record.get("revision") or "").strip() == "rev9"
             )
+            if replacement_dispatch_ready:
+                return current_state
             current_state.update(
                 {
                     "status": "blocked",
@@ -134685,9 +134810,10 @@ def _onboard_worker_read_runtime_facade_projection(
         if startup_selected or graph_selected
         else ""
     )
+    dispatch_current_state = _runtime_current_state_from_record(record)
     dispatch = _contract_runtime_dispatch_ticket_authority(
         record,
-        _runtime_current_state_from_record(record),
+        dispatch_current_state,
         requested_runtime_context_id=(
             "" if explicit_task_id else startup_runtime_context_id
         ),
@@ -134712,6 +134838,18 @@ def _onboard_worker_read_runtime_facade_projection(
         return blocked(
             dispatch_error,
             ["accepted_dispatch_authority"],
+        )
+    accepted_dispatch_authority = (
+        dict(dispatch_current_state.get("accepted_dispatch_authority"))
+        if isinstance(
+            dispatch_current_state.get("accepted_dispatch_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    if accepted_dispatch_authority:
+        projected["accepted_dispatch_authority"] = (
+            accepted_dispatch_authority
         )
     dispatch_action = (
         dispatch.get("next_legal_action")
@@ -136447,6 +136585,13 @@ def _onboard_route_guide_compact_service_response(
                 dict(next_action.get("server_derived_authority"))
                 if isinstance(
                     next_action.get("server_derived_authority"), Mapping
+                )
+                else {}
+            ),
+            "accepted_dispatch_authority": (
+                dict(next_action.get("accepted_dispatch_authority"))
+                if isinstance(
+                    next_action.get("accepted_dispatch_authority"), Mapping
                 )
                 else {}
             ),
