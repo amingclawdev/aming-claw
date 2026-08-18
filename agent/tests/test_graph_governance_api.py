@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, fields, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import errno
@@ -130158,6 +130158,304 @@ def _append_context_local_post_read_safe_ref_reissue(
         }
     )
     return current_ref
+
+
+def _context_local_post_read_renewed_route_fixture(conn, monkeypatch):
+    context, route_identity, sequence, events = (
+        _context_local_post_read_safe_ref_fixture(monkeypatch)
+    )
+    now = datetime.now(timezone.utc)
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        task_id=context.parent_task_id,
+        target_files=[
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+        allowed_actions=[
+            "runtime_context_read_receipt",
+            "parallel_branch_startup",
+            "task_timeline_append",
+        ],
+        ttl_hours=48.0,
+        now=now,
+        evidence_refs=["test:context-local-post-read-renewed-route"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=issued["route_token_ref"],
+        token=issued["route_token"],
+    )
+    historical_route = {
+        field: str(
+            issued.get(field)
+            or issued["route_token"].get(field)
+            or ""
+        )
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    historical_route["route_token_ref"] = issued["route_token_ref"]
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=historical_route["route_token_ref"],
+        backlog_id=context.backlog_id,
+        task_id=context.parent_task_id,
+        caller_role="observer",
+        allowed_actions=[
+            "runtime_context_read_receipt",
+            "parallel_branch_startup",
+            "task_timeline_append",
+        ],
+        target_files=[
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+        owned_files=[
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+        ttl_hours=48.0,
+        now=now + timedelta(seconds=1),
+        evidence_refs=["test:context-local-post-read-renewed-route-current"],
+    )
+    current_route = {
+        field: str(renewed["route_identity"].get(field) or "")
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    binding = server._runtime_context_current_reissue_route_binding(
+        conn,
+        project_id=PID,
+        historical_route_identity=historical_route,
+        canonical_route_identity=current_route,
+    )
+    assert binding["valid"] is True
+    route_identity.clear()
+    route_identity.update(current_route)
+    source = events[2]["payload"]
+    source["route_identity"] = copy.deepcopy(current_route)
+    source["pre_lineage_rejoin_authority"][
+        "current_reissue_route_binding"
+    ] = copy.deepcopy(binding)
+    events[3]["payload"]["route_identity"] = copy.deepcopy(current_route)
+    _append_context_local_post_read_safe_ref_reissue(
+        context,
+        current_route,
+        sequence,
+        events,
+    )
+    marker = {
+        "schema_version": (
+            "contract_runtime.failed_qa_revision_rejoin_marker.v1"
+        ),
+        "source": "accepted_runtime_context_rejoin_event",
+        "revision_event_ref": "timeline:53",
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "backlog_id": context.backlog_id,
+        "current_reissue_route_binding": copy.deepcopy(binding),
+    }
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_failed_qa_revision_rejoin_marker",
+        lambda **_kwargs: copy.deepcopy(marker),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_contract_revision_payload",
+        lambda *_args, **_kwargs: {
+            "revision_id": _fake_sha("post-read-renewed-route-revision"),
+            "route_identity": copy.deepcopy(current_route),
+            **copy.deepcopy(current_route),
+        },
+    )
+    return (
+        context,
+        sequence,
+        events,
+        historical_route,
+        current_route,
+        binding,
+        marker,
+    )
+
+
+def test_context_local_post_read_renewed_route_projects_one_startup_body_zero_write(
+    conn,
+    monkeypatch,
+):
+    (
+        context,
+        sequence,
+        _events,
+        historical_route,
+        current_route,
+        _binding,
+        _marker,
+    ) = _context_local_post_read_renewed_route_fixture(conn, monkeypatch)
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    authority_route, source = server._runtime_context_current_route_authority(
+        conn,
+        context,
+        historical_route,
+    )
+    receipt_authority = (
+        server._runtime_context_context_local_post_read_startup_receipt_authority(
+            conn,
+            project_id=PID,
+            context=context,
+            route_identity=authority_route,
+            sequence=sequence,
+        )
+    )
+    payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        contract_execution_id=context.parent_task_id,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        worker_id=context.worker_id,
+        worker_slot_id=context.worker_slot_id,
+        target_project_root=context.target_project_root,
+        worktree_path=context.worktree_path,
+        session_token_ref=runtime_context_session_token_ref(context),
+        route_identity=authority_route,
+        read_receipt_event_ref=sequence["read_receipt_ref"],
+        read_receipt_authority=receipt_authority,
+        read_receipt_authority_required=True,
+        authority_revision={
+            "active_owned_files": ["agent/governance/server.py"],
+        },
+    )
+    startup = payloads["startup_facade_payload_skeleton"]
+
+    assert source == "failed_qa_post_read_route_successor"
+    assert authority_route == current_route
+    assert receipt_authority["event_ref"] == "timeline:54"
+    assert receipt_authority["safe_ref_reissue_event_ref"] == "timeline:55"
+    assert receipt_authority["route_identity"] == current_route
+    assert startup["actionable"] is True
+    assert startup["status"] == "actionable_unique_durable_read_receipt"
+    assert startup["copy_safe_body"]["task_id"] == context.task_id
+    assert startup["copy_safe_body"]["parent_task_id"] == context.parent_task_id
+    assert startup["copy_safe_body"]["read_receipt_event_id"] == "54"
+    assert {
+        field: startup["copy_safe_body"][field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == current_route
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "cex_as_task",
+        "old_route",
+        "wrong_route",
+        "cross_scope",
+        "ambiguous",
+        "unproven",
+        "revoked",
+        "expired",
+        "wrong_identity",
+        "wrong_order",
+    ],
+)
+def test_context_local_post_read_renewed_route_controls_fail_closed_zero_write(
+    conn,
+    monkeypatch,
+    mutation,
+):
+    (
+        context,
+        sequence,
+        events,
+        historical_route,
+        current_route,
+        binding,
+        marker,
+    ) = _context_local_post_read_renewed_route_fixture(conn, monkeypatch)
+    candidate_dispatch = copy.deepcopy(historical_route)
+    candidate_revision = copy.deepcopy(current_route)
+    if mutation == "cex_as_task":
+        marker["task_id"] = context.parent_task_id
+    elif mutation == "old_route":
+        candidate_revision = copy.deepcopy(historical_route)
+    elif mutation == "wrong_route":
+        marker["current_reissue_route_binding"]["canonical_route_identity"][
+            "route_id"
+        ] = "route-cross-scope"
+    elif mutation == "cross_scope":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET backlog_id = ? "
+            "WHERE project_id = ? AND route_token_ref = ?",
+            ("AC-CROSS-SCOPE", PID, current_route["route_token_ref"]),
+        )
+        conn.commit()
+    elif mutation == "ambiguous":
+        marker["current_reissue_route_binding"][
+            "route_token_ref_chain"
+        ] = [
+            *binding["route_token_ref_chain"],
+            current_route["route_token_ref"],
+        ]
+    elif mutation == "unproven":
+        marker["current_reissue_route_binding"]["registry_verified"] = False
+    elif mutation == "revoked":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status = ? "
+            "WHERE project_id = ? AND route_token_ref = ?",
+            ("revoked", PID, current_route["route_token_ref"]),
+        )
+        conn.commit()
+    elif mutation == "expired":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET expires_at = ? "
+            "WHERE project_id = ? AND route_token_ref = ?",
+            ("2000-01-01T00:00:00Z", PID, current_route["route_token_ref"]),
+        )
+        conn.commit()
+    elif mutation == "wrong_identity":
+        marker["runtime_context_id"] = "mfrctx-cross-scope"
+    elif mutation == "wrong_order":
+        events[3]["id"] = 50
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_failed_qa_revision_rejoin_marker",
+        lambda **_kwargs: copy.deepcopy(marker),
+    )
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+    route_successor = server._runtime_context_verified_post_read_route_successor(
+        conn,
+        context,
+        dispatch_identity=candidate_dispatch,
+        revision_identity=candidate_revision,
+    )
+    if mutation == "wrong_order":
+        assert route_successor == current_route
+        receipt_authority = (
+            server._runtime_context_context_local_post_read_startup_receipt_authority(
+                conn,
+                project_id=PID,
+                context=context,
+                route_identity=current_route,
+                sequence=sequence,
+            )
+        )
+        assert receipt_authority == {}
+    else:
+        assert route_successor == {}
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
 
 
 @pytest.mark.parametrize(

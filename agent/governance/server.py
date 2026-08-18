@@ -39551,6 +39551,182 @@ def _runtime_context_verified_allocation_route_successor(
     return resolved_identity
 
 
+def _runtime_context_verified_post_read_route_successor(
+    conn,
+    context,
+    *,
+    dispatch_identity: Mapping[str, Any],
+    revision_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return one exact current route proven by the failed-QA rejoin chain.
+
+    A context-local failed-QA replacement may finish its read receipt after the
+    immutable ContractRuntime dispatch route was renewed.  The accepted rejoin
+    marker already binds that old dispatch to the current route, but route
+    selection historically stopped at the allocation-revision proof and
+    rejected this later, still server-registered, renewal.  Recompute the
+    stored binding against the registry and accept it only when the marker,
+    RuntimeContext, dispatch, latest revision, and active route scope all agree.
+    This is a read-time projection only; it never rewrites historical events.
+    """
+
+    project_id = str(getattr(context, "project_id", "") or "").strip()
+    runtime_context_id = str(
+        getattr(context, "runtime_context_id", "") or ""
+    ).strip()
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    historical = {
+        field: str(dispatch_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    canonical = {
+        field: str(revision_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if (
+        not all(
+            (
+                project_id,
+                runtime_context_id,
+                task_id,
+                backlog_id,
+                parent_task_id,
+                *historical.values(),
+                *canonical.values(),
+            )
+        )
+        or historical == canonical
+    ):
+        return {}
+
+    timeline_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+    marker = _runtime_context_failed_qa_revision_rejoin_marker(
+        conn=conn,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        timeline_events=timeline_events,
+    )
+    binding = (
+        marker.get("current_reissue_route_binding")
+        if isinstance(marker.get("current_reissue_route_binding"), Mapping)
+        else {}
+    )
+    recorded_historical_source = (
+        binding.get("historical_route_identity")
+        if isinstance(binding.get("historical_route_identity"), Mapping)
+        else {}
+    )
+    recorded_canonical_source = (
+        binding.get("canonical_route_identity")
+        if isinstance(binding.get("canonical_route_identity"), Mapping)
+        else {}
+    )
+    recorded_historical = {
+        field: str(
+            recorded_historical_source.get(field) or ""
+        ).strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    recorded_canonical = {
+        field: str(
+            recorded_canonical_source.get(field) or ""
+        ).strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not (
+        str(marker.get("schema_version") or "")
+        == "contract_runtime.failed_qa_revision_rejoin_marker.v1"
+        and str(marker.get("source") or "")
+        == "accepted_runtime_context_rejoin_event"
+        and str(marker.get("runtime_context_id") or "") == runtime_context_id
+        and str(marker.get("task_id") or "") == task_id
+        and str(marker.get("parent_task_id") or "") == parent_task_id
+        and str(marker.get("backlog_id") or "") == backlog_id
+        and re.fullmatch(
+            r"timeline:[1-9][0-9]*",
+            str(marker.get("revision_event_ref") or ""),
+        )
+        and binding.get("valid") is True
+        and binding.get("registry_verified") is True
+        and binding.get("exact_scope_verified") is True
+        and binding.get("scope_actions_files_verified") is True
+        and binding.get("historical_event_rewritten") is False
+        and recorded_historical == historical
+        and recorded_canonical == canonical
+    ):
+        return {}
+
+    recomputed = _runtime_context_current_reissue_route_binding(
+        conn,
+        project_id=project_id,
+        historical_route_identity=historical,
+        canonical_route_identity=canonical,
+    )
+    if not (
+        recomputed.get("valid") is True
+        and recomputed.get("registry_verified") is True
+        and recomputed.get("exact_scope_verified") is True
+        and recomputed.get("scope_actions_files_verified") is True
+        and recomputed.get("historical_event_rewritten") is False
+        and dict(recomputed.get("historical_route_identity") or {}) == historical
+        and dict(recomputed.get("canonical_route_identity") or {}) == canonical
+        and list(recomputed.get("route_token_ref_chain") or [])
+        == list(binding.get("route_token_ref_chain") or [])
+    ):
+        return {}
+
+    from . import observer_route_context
+
+    try:
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=canonical["route_token_ref"],
+            route_id=canonical["route_id"],
+            route_context_hash=canonical["route_context_hash"],
+            prompt_contract_id=canonical["prompt_contract_id"],
+            task_id=parent_task_id,
+            backlog_id=backlog_id,
+        )
+    except (observer_route_context.RouteTokenRefError, sqlite3.Error, ValueError):
+        return {}
+    if not isinstance(resolved, Mapping):
+        return {}
+    resolved_scope = (
+        resolved.get("scope") if isinstance(resolved.get("scope"), Mapping) else {}
+    )
+    resolved_identity = _parallel_branch_runtime_contract_route_identity(resolved)
+    if not (
+        resolved.get("resolved_from_ref") is True
+        and str(resolved.get("status") or "") == "active"
+        and str(resolved.get("caller_role") or "") == "observer"
+        and {
+            "project_id": str(resolved_scope.get("project_id") or ""),
+            "backlog_id": str(resolved_scope.get("backlog_id") or ""),
+            "task_id": str(resolved_scope.get("task_id") or ""),
+        }
+        == {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": parent_task_id,
+        }
+        and {
+            field: str(resolved_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+        == canonical
+    ):
+        return {}
+    return canonical
+
+
 def _runtime_context_current_route_authority(
     conn,
     context,
@@ -39572,6 +39748,14 @@ def _runtime_context_current_route_authority(
             )
             if successor:
                 return successor, "branch_contract_revision_successor"
+            successor = _runtime_context_verified_post_read_route_successor(
+                conn,
+                context,
+                dispatch_identity=dispatch_identity,
+                revision_identity=revision_identity,
+            )
+            if successor:
+                return successor, "failed_qa_post_read_route_successor"
             raise GovernanceError(
                 "runtime_context_initial_join_route_authority_conflict",
                 "runtime-context route contract revision conflicts with the accepted ContractRuntime dispatch",
