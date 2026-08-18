@@ -11566,6 +11566,30 @@ _QA_EXTERNAL_NO_PASS_COMPARISON_PAYLOAD_SCHEMAS = {
 _QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_SCHEMA = (
     "contract_runtime.external_no_pass_baseline_ledger.v2"
 )
+_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS = {
+    "schema_version",
+    "base_commit_sha",
+    "candidate_commit_sha",
+    "base_failure_identities",
+    "candidate_failure_identities",
+    "base_reproduction",
+    "candidate_suite_counts",
+    "candidate_new_failures",
+    "candidate_specific_issues",
+    "no_pass_claim",
+    "overall_release_pass_claimed",
+    "refs",
+}
+_QA_EXTERNAL_NO_PASS_BASE_REPRODUCTION_REQUIRED_KEYS = {
+    "reproduced",
+    "total",
+    "failure_identities",
+}
+_QA_EXTERNAL_NO_PASS_CANDIDATE_COUNTS_REQUIRED_KEYS = {
+    "passed",
+    "failed",
+    "baseline_known_non_green",
+}
 _QA_EXTERNAL_NO_PASS_COMPARISON_PATHS = {
     ("payload",),
     ("artifact_refs", "external_no_pass_baseline_ledger"),
@@ -11731,6 +11755,15 @@ def _qa_external_no_pass_comparison_tuple(
             if isinstance(ledger.get("candidate_suite_counts"), Mapping)
             else {}
         )
+        if not (
+            _QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS
+            <= set(ledger)
+            and _QA_EXTERNAL_NO_PASS_BASE_REPRODUCTION_REQUIRED_KEYS
+            <= set(base_reproduction)
+            and _QA_EXTERNAL_NO_PASS_CANDIDATE_COUNTS_REQUIRED_KEYS
+            <= set(candidate_counts)
+        ):
+            return {}
 
         def _failure_identities(value: Any) -> list[str]:
             if not isinstance(value, (list, tuple)):
@@ -11746,11 +11779,14 @@ def _qa_external_no_pass_comparison_tuple(
 
         base_failures = _failure_identities(
             ledger.get("base_failure_identities")
-            or base_reproduction.get("failure_identities")
+        )
+        reproduced_failures = _failure_identities(
+            base_reproduction.get("failure_identities")
         )
         candidate_failures = _failure_identities(
             ledger.get("candidate_failure_identities")
         )
+        refs = _failure_identities(ledger.get("refs"))
         reproduced = base_reproduction.get("reproduced")
         total = base_reproduction.get("total")
         failed_count = candidate_counts.get("failed")
@@ -11770,7 +11806,7 @@ def _qa_external_no_pass_comparison_tuple(
                 for claim in candidate_claims
             )
             and base_failures
-            and base_failures == candidate_failures
+            and base_failures == reproduced_failures == candidate_failures
             and isinstance(reproduced, int)
             and not isinstance(reproduced, bool)
             and isinstance(total, int)
@@ -11784,7 +11820,7 @@ def _qa_external_no_pass_comparison_tuple(
             and isinstance(passed_count, int)
             and not isinstance(passed_count, bool)
             and passed_count > 0
-            and list(ledger.get("refs") or [])
+            and refs
         ):
             return {}
     elif not (

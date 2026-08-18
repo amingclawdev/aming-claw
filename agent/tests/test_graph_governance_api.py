@@ -137742,6 +137742,68 @@ def test_qa_review_claims_accept_exact_no_pass_comparison_namespace():
         review_context,
     )
 
+    required_ledger_keys = (
+        "schema_version",
+        "base_commit_sha",
+        "candidate_commit_sha",
+        "base_failure_identities",
+        "candidate_failure_identities",
+        "base_reproduction",
+        "candidate_suite_counts",
+        "candidate_new_failures",
+        "candidate_specific_issues",
+        "no_pass_claim",
+        "overall_release_pass_claimed",
+        "refs",
+    )
+    for field in required_ledger_keys:
+        missing_required_key = json.loads(json.dumps(scoped_passing_status))
+        missing_required_key["artifact_refs"][
+            "external_no_pass_baseline_ledger"
+        ].pop(field)
+        with pytest.raises(GovernanceError) as missing_key_rejected:
+            server._qa_validate_candidate_review_claims(
+                missing_required_key,
+                review_context,
+            )
+        assert missing_key_rejected.value.code == (
+            "qa_graph_review_context_mismatch"
+        )
+
+    for container_key, field in (
+        ("base_reproduction", "failure_identities"),
+        ("base_reproduction", "reproduced"),
+        ("base_reproduction", "total"),
+        ("candidate_suite_counts", "passed"),
+        ("candidate_suite_counts", "failed"),
+        ("candidate_suite_counts", "baseline_known_non_green"),
+    ):
+        missing_nested_key = json.loads(json.dumps(scoped_passing_status))
+        missing_nested_key["artifact_refs"][
+            "external_no_pass_baseline_ledger"
+        ][container_key].pop(field)
+        with pytest.raises(GovernanceError) as missing_nested_rejected:
+            server._qa_validate_candidate_review_claims(
+                missing_nested_key,
+                review_context,
+            )
+        assert missing_nested_rejected.value.code == (
+            "qa_graph_review_context_mismatch"
+        )
+
+    inconsistent_reproduction = json.loads(json.dumps(scoped_passing_status))
+    inconsistent_reproduction["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]["base_reproduction"]["failure_identities"] = ["inherited::other"]
+    with pytest.raises(GovernanceError) as inconsistent_rejected:
+        server._qa_validate_candidate_review_claims(
+            inconsistent_reproduction,
+            review_context,
+        )
+    assert inconsistent_rejected.value.code == (
+        "qa_graph_review_context_mismatch"
+    )
+
     for field in ("targeted_scope_only", "used_as_pass"):
         unscoped = json.loads(json.dumps(scoped_passing_status))
         if field == "targeted_scope_only":
