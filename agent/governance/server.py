@@ -11687,21 +11687,90 @@ def _qa_external_no_pass_comparison_tuple(
     payload_candidate = str(
         payload.get("candidate_commit_sha") or ""
     ).strip().lower()
+    body_candidate = str(body.get("commit_sha") or "").strip().lower()
     ledger_base = str(ledger.get("base_commit_sha") or "").strip().lower()
     ledger_candidate = str(
         ledger.get("candidate_commit_sha") or ""
     ).strip().lower()
-    if not (
-        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", payload_base)
-        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", payload_candidate)
+    full_commit = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+    if targeted_scope_pass:
+        base_reproduction = (
+            ledger.get("base_reproduction")
+            if isinstance(ledger.get("base_reproduction"), Mapping)
+            else {}
+        )
+        candidate_counts = (
+            ledger.get("candidate_suite_counts")
+            if isinstance(ledger.get("candidate_suite_counts"), Mapping)
+            else {}
+        )
+
+        def _failure_identities(value: Any) -> list[str]:
+            if not isinstance(value, (list, tuple)):
+                return []
+            identities = [str(item or "").strip() for item in value]
+            if (
+                not identities
+                or any(not item for item in identities)
+                or len(set(identities)) != len(identities)
+            ):
+                return []
+            return sorted(identities)
+
+        base_failures = _failure_identities(
+            ledger.get("base_failure_identities")
+            or base_reproduction.get("failure_identities")
+        )
+        candidate_failures = _failure_identities(
+            ledger.get("candidate_failure_identities")
+        )
+        reproduced = base_reproduction.get("reproduced")
+        total = base_reproduction.get("total")
+        failed_count = candidate_counts.get("failed")
+        passed_count = candidate_counts.get("passed")
+        candidate_claims = [
+            claim for claim in (payload_candidate, body_candidate) if claim
+        ]
+        if not (
+            full_commit.fullmatch(ledger_base)
+            and full_commit.fullmatch(ledger_candidate)
+            and ledger_base != ledger_candidate
+            and (not payload_base or payload_base == ledger_base)
+            and candidate_claims
+            and all(
+                full_commit.fullmatch(claim)
+                and claim == ledger_candidate
+                for claim in candidate_claims
+            )
+            and base_failures
+            and base_failures == candidate_failures
+            and isinstance(reproduced, int)
+            and not isinstance(reproduced, bool)
+            and isinstance(total, int)
+            and not isinstance(total, bool)
+            and reproduced == total == len(base_failures)
+            and candidate_counts.get("baseline_known_non_green")
+            == len(base_failures)
+            and isinstance(failed_count, int)
+            and not isinstance(failed_count, bool)
+            and failed_count == len(candidate_failures)
+            and isinstance(passed_count, int)
+            and not isinstance(passed_count, bool)
+            and passed_count > 0
+            and list(ledger.get("refs") or [])
+        ):
+            return {}
+    elif not (
+        full_commit.fullmatch(payload_base)
+        and full_commit.fullmatch(payload_candidate)
         and payload_base == ledger_base
         and payload_candidate == ledger_candidate
         and payload_base != payload_candidate
     ):
         return {}
     return {
-        "base_commit_sha": payload_base,
-        "candidate_commit_sha": payload_candidate,
+        "base_commit_sha": ledger_base,
+        "candidate_commit_sha": ledger_candidate,
     }
 
 
@@ -11712,6 +11781,27 @@ def _qa_validate_candidate_review_claims(
     containers = _qa_review_claim_containers(body)
     mismatches: list[dict[str, Any]] = []
     comparison_tuple = _qa_external_no_pass_comparison_tuple(body)
+    artifact_refs = (
+        body.get("artifact_refs")
+        if isinstance(body.get("artifact_refs"), Mapping)
+        else {}
+    )
+    comparison_ledger = artifact_refs.get(
+        "external_no_pass_baseline_ledger"
+    )
+    if isinstance(comparison_ledger, Mapping) and not comparison_tuple:
+        mismatches.append(
+            {
+                "field": "external_no_pass_baseline_ledger",
+                "expected": (
+                    "canonical server-bound comparison tuple, identical "
+                    "failure identities and counts, candidate_new_failures=0, "
+                    "and no overall PASS claim"
+                ),
+                "actual": "invalid_or_incomplete_comparison_ledger",
+                "claim_namespace": "external_no_pass_baseline_comparison",
+            }
+        )
     comparison_base = str(
         comparison_tuple.get("base_commit_sha") or ""
     ).strip().lower()

@@ -157555,7 +157555,10 @@ def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_
         "payload": {
             "schema_version": "qa_independent_verification.v1",
             "graph_trace_ids": [queried["trace_id"]],
-            "base_commit_sha": base_commit,
+            # Exact-candidate graph base remains the candidate.  The immutable
+            # comparison parent is authoritative only inside the external
+            # no-PASS ledger and must not be reintroduced as a graph-base
+            # claim in the QA payload.
             "candidate_commit_sha": candidate_commit,
             "full_suite_claim": "not_claimed",
             "row_scoped_qa_pass": True,
@@ -157631,6 +157634,8 @@ def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_
     assert accepted["payload"]["targeted_scope_only"] is True
     assert accepted["payload"]["used_as_pass"] is False
     assert accepted["payload"]["overall_release_pass_claimed"] is False
+    assert "base_commit_sha" not in no_pass_body["payload"]
+    assert proof["base_commit_sha"] == candidate_commit
     assert proof["audit_only"] is False
     assert proof["close_satisfying"] is True
 
@@ -157732,6 +157737,61 @@ def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_
         (PID, backlog_id, lineage["task_id"]),
     ).fetchone()[0] == before_count
     assert conn.total_changes == before_total_changes
+
+    for mutation in (
+        "wrong_candidate",
+        "candidate_specific_issue",
+        "failure_identity_mismatch",
+        "failure_count_mismatch",
+        "overall_pass_claim",
+        "missing_comparison_base",
+    ):
+        malformed_body = json.loads(json.dumps(no_pass_body))
+        malformed_ledger = malformed_body["artifact_refs"][
+            "external_no_pass_baseline_ledger"
+        ]
+        if mutation == "wrong_candidate":
+            malformed_ledger["candidate_commit_sha"] = "e" * 40
+        elif mutation == "candidate_specific_issue":
+            malformed_body["payload"]["candidate_specific_issues"] = [
+                "candidate-only regression"
+            ]
+        elif mutation == "failure_identity_mismatch":
+            malformed_ledger["candidate_failure_identities"] = [
+                "test_candidate_only_non_green"
+            ]
+        elif mutation == "failure_count_mismatch":
+            malformed_ledger["candidate_suite_counts"]["failed"] = 2
+        elif mutation == "overall_pass_claim":
+            malformed_body["payload"][
+                "overall_release_pass_claimed"
+            ] = True
+        else:
+            malformed_ledger.pop("base_commit_sha")
+        malformed_ctx = _ctx_with_role(
+            {"project_id": PID},
+            "qa",
+            method="POST",
+            body=malformed_body,
+        )
+        malformed_ctx._session = dict(query_ctx._session)
+        malformed_before_count = conn.execute(
+            """SELECT COUNT(*) FROM task_timeline_events
+               WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+            (PID, backlog_id, lineage["task_id"]),
+        ).fetchone()[0]
+        malformed_before_changes = conn.total_changes
+        with pytest.raises(GovernanceError) as malformed_rejected:
+            server.handle_task_timeline_append(malformed_ctx)
+        assert malformed_rejected.value.code == (
+            "qa_graph_review_context_mismatch"
+        )
+        assert conn.execute(
+            """SELECT COUNT(*) FROM task_timeline_events
+               WHERE project_id = ? AND backlog_id = ? AND task_id = ?""",
+            (PID, backlog_id, lineage["task_id"]),
+        ).fetchone()[0] == malformed_before_count
+        assert conn.total_changes == malformed_before_changes
 
     _record_parentless_direct_main_failed_qa_route_lineage(
         conn,
