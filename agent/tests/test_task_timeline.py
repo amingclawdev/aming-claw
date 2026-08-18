@@ -20516,6 +20516,106 @@ def test_repair_summary_names_finish_time_fields_for_demoted_startup_graph_gap()
     )
 
 
+def test_irreversible_runtime_exhaustion_projects_canonical_audit_terminal_body():
+    from agent.governance import task_timeline
+
+    archive_body = {
+        "project_id": "project-runtime-terminal",
+        "bug_id": "BUG-RUNTIME-TERMINAL",
+        "commit": "a" * 40,
+        "route_token_ref": "<copy backlog_audit_archive route_token_ref>",
+    }
+    proof = {
+        "verified": True,
+        "actionable": True,
+        "terminal_disposition": (
+            "mf_batch_irreversible_runtime_exhaustion_terminal"
+        ),
+        "project_id": "project-runtime-terminal",
+        "backlog_id": "BUG-RUNTIME-TERMINAL",
+        "contract_execution_id": "cex-runtime-terminal",
+        "runtime_context_id": "mfrctx-runtime-terminal",
+        "task_id": "worker-runtime-terminal",
+        "parent_task_id": "cex-runtime-terminal",
+        "worker_id": "worker-id-runtime-terminal",
+        "worker_slot_id": "worker-slot-runtime-terminal",
+        "route_identity": {
+            "route_id": "route-runtime-terminal",
+            "route_context_hash": "sha256:route-runtime-terminal",
+            "prompt_contract_id": "rprompt-runtime-terminal",
+            "prompt_contract_hash": "sha256:prompt-runtime-terminal",
+            "route_token_ref": "rtok-runtime-terminal",
+            "visible_injection_manifest_hash": "sha256:visible-runtime-terminal",
+        },
+        "recovery_mode": "safe_ref_prestartup_reissue_exhausted",
+        "recovery_next_action": (
+            "stop_runtime_context_safe_ref_recovery_exhausted"
+        ),
+        "one_time_post_read_reissue_consumed": True,
+        "startup_absent": True,
+        "read_receipt_event_ref": "timeline:54",
+        "safe_ref_reissue_event_ref": "timeline:55",
+        "implementation_event_ref": "timeline:21",
+        "failed_qa_event_ref": "timeline:41",
+        "implementation_commit": "a" * 40,
+        "graph_snapshot_id": "full-runtime-terminal",
+        "qa_reviewer": "qa:runtime-terminal",
+        "qa_tests": ["pytest -q exact-runtime-terminal"],
+        "normal_close": False,
+        "can_close": False,
+        "close_ready": False,
+        "historical_events_mutated": False,
+        "archive_action_input": archive_body,
+    }
+    authority = (
+        task_timeline.source_backed_irreversible_runtime_audit_terminal_authority(
+            proof
+        )
+    )
+    repair = task_timeline.repair_gate_summary(
+        {
+            "passed": False,
+            "can_close": False,
+            "missing_event_kinds": ["close_ready"],
+            "checks": {},
+            "cross_ref_gate": {
+                "passed": False,
+                "rejected_cross_ref_evidence": [
+                    {
+                        "id": 42,
+                        "mismatches": {"task_id": True},
+                    }
+                ],
+            },
+            "irreversible_runtime_audit_terminal_authority": authority,
+        },
+        request_id="req-runtime-terminal",
+    )
+    decision = repair["exceptional_archive_recovery"]
+    assert decision["available"] is True
+    assert decision["irreversible_runtime_terminal"] is True
+    assert decision["recoverable_canonical_lineage_repair"] is False
+    recovery = repair["audit_archive_recovery"]
+    assert recovery["canonical_actionable"] is True
+    assert recovery["copy_safe_body"] == archive_body
+    assert recovery["row_status"] == "WAIVED"
+    assert recovery["normal_close_gate_can_close"] is False
+
+    forged = copy.deepcopy(authority)
+    forged["task_id"] = "cross-scope-worker"
+    quarantined = task_timeline.repair_gate_summary(
+        {
+            "passed": False,
+            "can_close": False,
+            "missing_event_kinds": ["close_ready"],
+            "checks": {},
+            "irreversible_runtime_audit_terminal_authority": forged,
+        }
+    )
+    assert quarantined["exceptional_archive_recovery"]["available"] is False
+    assert "audit_archive_recovery" not in quarantined
+
+
 def test_close_gate_startup_gate_consumes_canonical_finish_gate_projection():
     from agent.governance import task_timeline
 

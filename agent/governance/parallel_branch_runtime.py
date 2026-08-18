@@ -8657,7 +8657,10 @@ def _runtime_context_audit_archive_action(
     *,
     values: Mapping[str, Any],
     close_blocker_explanation: Mapping[str, Any],
+    irreversible_runtime_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from . import task_timeline
+
     explanations = [
         item for item in close_blocker_explanation.get("explanations") or []
         if isinstance(item, Mapping)
@@ -8665,15 +8668,39 @@ def _runtime_context_audit_archive_action(
     has_close_blocker = bool(explanations) and not bool(
         close_blocker_explanation.get("ready")
     )
+    terminal_authority = (
+        dict(irreversible_runtime_authority)
+        if isinstance(irreversible_runtime_authority, Mapping)
+        else {}
+    )
+    terminal_ready = bool(
+        task_timeline._irreversible_runtime_audit_terminal_authority_valid(
+            terminal_authority
+        )
+        and isinstance(terminal_authority.get("archive_action_input"), Mapping)
+        and terminal_authority.get("archive_action_input")
+    )
     return {
         "schema_version": "runtime_context.audit_archive_action.v1",
-        "status": "candidate_requires_observer_historical_classification"
-        if has_close_blocker
-        else "not_applicable",
-        "next_action": "classify_historical_non_reconstructable"
-        if has_close_blocker
-        else "none",
-        "archive_action": "backlog_audit_archive" if has_close_blocker else "none",
+        "status": (
+            "ready_irreversible_runtime_exhaustion"
+            if terminal_ready
+            else "candidate_requires_observer_historical_classification"
+            if has_close_blocker
+            else "not_applicable"
+        ),
+        "next_action": (
+            "backlog_audit_archive"
+            if terminal_ready
+            else "classify_historical_non_reconstructable"
+            if has_close_blocker
+            else "none"
+        ),
+        "archive_action": (
+            "backlog_audit_archive"
+            if terminal_ready or has_close_blocker
+            else "none"
+        ),
         "ordinary_close_gate_claimed": False,
         "normal_close_gate_passed": False,
         "close_ready_emitted": False,
@@ -8703,7 +8730,10 @@ def _runtime_context_audit_archive_action(
             },
         },
         "operator_instruction": (
-            "Treat this as a candidate only. First classify the close blocker "
+            "Copy the server-projected audit-terminal body exactly and archive "
+            "the row as WAIVED; do not emit close_ready or claim normal close."
+            if terminal_ready
+            else "Treat this as a candidate only. First classify the close blocker "
             "as historical and non-reconstructable, then use audit archive with "
             "timeline_precheck, verification, and graph_snapshot evidence. It "
             "must not emit close_ready or can_close=true."
@@ -8715,6 +8745,15 @@ def _runtime_context_audit_archive_action(
             for item in explanations
             if item.get("code")
         ],
+        "canonical_actionable": terminal_ready,
+        "irreversible_runtime_audit_terminal_authority": (
+            terminal_authority if terminal_ready else {}
+        ),
+        "copy_safe_body": (
+            dict(terminal_authority.get("archive_action_input") or {})
+            if terminal_ready
+            else {}
+        ),
     }
 
 
@@ -9880,6 +9919,14 @@ def build_runtime_context_action_plan_view(
     audit_archive_action = _runtime_context_audit_archive_action(
         values={**values, "runtime_context_id": current_view.get("runtime_context_id", "")},
         close_blocker_explanation=close_blocker_explanation,
+        irreversible_runtime_authority=(
+            current_view.get("irreversible_runtime_audit_terminal_authority")
+            if isinstance(
+                current_view.get("irreversible_runtime_audit_terminal_authority"),
+                Mapping,
+            )
+            else {}
+        ),
     )
     merge_dependency_projection = _runtime_context_merge_dependency_projection(
         values=values,

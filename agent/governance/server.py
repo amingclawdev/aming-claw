@@ -130440,6 +130440,507 @@ def _onboard_parentless_direct_main_failed_qa_next_action(
     }
 
 
+_MF_BATCH_IRREVERSIBLE_RUNTIME_TERMINAL_DISPOSITION = (
+    "mf_batch_irreversible_runtime_exhaustion_terminal"
+)
+
+
+def _mf_batch_irreversible_runtime_event_values(
+    event: Mapping[str, Any],
+    field: str,
+) -> list[str]:
+    values: list[str] = []
+    for container in (
+        event,
+        event.get("payload") if isinstance(event.get("payload"), Mapping) else {},
+        event.get("verification")
+        if isinstance(event.get("verification"), Mapping)
+        else {},
+        event.get("artifact_refs")
+        if isinstance(event.get("artifact_refs"), Mapping)
+        else {},
+    ):
+        raw = container.get(field) if isinstance(container, Mapping) else None
+        candidates = raw if isinstance(raw, list) else [raw]
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if text and text not in values:
+                values.append(text)
+    return values
+
+
+def _mf_batch_irreversible_runtime_failed_qa_event(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve one authenticated failed QA line after worker implementation."""
+
+    from . import task_timeline
+
+    events = task_timeline.list_backlog_gate_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )
+    implementation_events = [
+        dict(event)
+        for event in events
+        if isinstance(event, Mapping)
+        and str(event.get("status") or event.get("decision") or "").lower()
+        in {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+        and "worker_implementation_evidence"
+        in task_timeline.canonical_contract_evidence_ids_from_event(dict(event))
+    ]
+    if not implementation_events:
+        return {}, {}
+    implementation = max(
+        implementation_events,
+        key=lambda event: int(event.get("id") or 0),
+    )
+    implementation_id = int(implementation.get("id") or 0)
+    failed_qa_events: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        event_id = int(event.get("id") or 0)
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        authority = (
+            payload.get("source_backed_contract_gate_authority")
+            if isinstance(
+                payload.get("source_backed_contract_gate_authority"), Mapping
+            )
+            else {}
+        )
+        proof = (
+            authority.get("qa_session_proof")
+            if isinstance(authority.get("qa_session_proof"), Mapping)
+            else {}
+        )
+        status = str(event.get("status") or event.get("decision") or "").lower()
+        if (
+            event_id <= implementation_id
+            or str(event.get("event_kind") or "")
+            not in {"independent_verification", "qa_verification"}
+            or status not in {"blocked", "error", "fail", "failed", "rejected"}
+            or str(event.get("task_id") or "") != contract_execution_id
+            or not task_timeline._source_backed_qa_session_authority_valid(
+                authority,
+                conn=conn,
+            )
+            or str(proof.get("project_id") or "") != project_id
+            or str(proof.get("backlog_id") or "") != backlog_id
+            or str(proof.get("task_id") or "") != contract_execution_id
+            or proof.get("audit_only") is not True
+            or proof.get("close_satisfying") is not False
+        ):
+            continue
+        failed_qa_events.append(dict(event))
+    if len(failed_qa_events) != 1:
+        return {}, {}
+    return implementation, failed_qa_events[0]
+
+
+def _mf_batch_irreversible_runtime_audit_terminal_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive one copy-safe WAIVED-only action from an exact exhausted STOP."""
+
+    from . import task_timeline
+    from .parallel_branch_runtime import get_branch_context_by_runtime_context_id
+
+    if (
+        str(record.get("project_id") or "") != project_id
+        or str(record.get("backlog_id") or "") != backlog_id
+        or not _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+    ):
+        return {}
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    try:
+        projected_record, context_projection = (
+            _contract_runtime_apply_mf_parallel_context_projection(
+                conn,
+                project_id=project_id,
+                record=record,
+                actor_role="observer",
+            )
+        )
+    except (
+        ContractRuntimeError,
+        StalePinnedContractExecutionError,
+        sqlite3.Error,
+    ):
+        return {}
+    if (
+        not isinstance(context_projection, Mapping)
+        or str(context_projection.get("status") or "") != "projected"
+        or (
+            context_projection.get("persistence")
+            if isinstance(context_projection.get("persistence"), Mapping)
+            else {}
+        ).get("mutates_contract_runtime_completed_lines")
+        is not False
+    ):
+        return {}
+    current_state = _runtime_current_state_from_record(projected_record)
+    next_action = (
+        current_state.get("next_legal_action")
+        if isinstance(current_state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    accepted_dispatch = (
+        current_state.get("accepted_dispatch_authority")
+        if isinstance(
+            current_state.get("accepted_dispatch_authority"), Mapping
+        )
+        else next_action.get("accepted_dispatch_authority")
+        if isinstance(next_action.get("accepted_dispatch_authority"), Mapping)
+        else {}
+    )
+    if (
+        str(next_action.get("line_id") or "") != "worker_startup"
+        or accepted_dispatch.get("server_derived") is not True
+        or str(accepted_dispatch.get("source") or "")
+        != "server_verified_failed_qa_replacement_dispatch"
+    ):
+        return {}
+    runtime_context_id = str(
+        next_action.get("runtime_context_id")
+        or accepted_dispatch.get("runtime_context_id")
+        or ""
+    ).strip()
+    context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        runtime_context_id,
+    )
+    if context is None:
+        return {}
+    task_id = str(getattr(context, "task_id", "") or "").strip()
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    worker_id = str(getattr(context, "worker_id", "") or "").strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    identity_mismatches = [
+        field
+        for field, expected, actual in (
+            ("project_id", project_id, str(getattr(context, "project_id", "") or "")),
+            ("backlog_id", backlog_id, str(getattr(context, "backlog_id", "") or "")),
+            ("runtime_context_id", runtime_context_id, str(getattr(context, "runtime_context_id", "") or "")),
+            ("task_id", task_id, str(next_action.get("task_id") or "")),
+            ("parent_task_id", contract_execution_id, parent_task_id),
+            ("worker_id", worker_id, str(next_action.get("worker_id") or "")),
+            ("worker_slot_id", worker_slot_id, str(next_action.get("worker_slot_id") or "")),
+        )
+        if not expected or expected != actual
+    ]
+    if identity_mismatches:
+        return {}
+    route_identity = _runtime_context_latest_route_identity(conn, context)
+    if any(
+        not _runtime_context_non_placeholder_text(route_identity.get(field))
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ):
+        return {}
+    eligibility = _runtime_context_session_rejoin_guidance_eligibility(
+        conn,
+        project_id=project_id,
+        context=context,
+        route_identity_override=route_identity,
+    )
+    eligibility_authority = (
+        eligibility.get("authority")
+        if isinstance(eligibility.get("authority"), Mapping)
+        else {}
+    )
+    required_handling = (
+        eligibility.get("required_response_handling")
+        if isinstance(
+            eligibility.get("required_response_handling"), Mapping
+        )
+        else {}
+    )
+    if (
+        eligibility.get("server_derived") is not True
+        or eligibility.get("eligible") is not False
+        or str(eligibility.get("mode") or "")
+        != "safe_ref_prestartup_reissue_exhausted"
+        or required_handling.get("actionable") is not False
+        or str(required_handling.get("next_action") or "")
+        != "stop_runtime_context_safe_ref_recovery_exhausted"
+        or eligibility.get("one_time_post_read_reissue_consumed") is not True
+        or eligibility_authority.get("startup_absent") is not True
+        or eligibility_authority.get("route_identity") != route_identity
+    ):
+        return {}
+    implementation, failed_qa = (
+        _mf_batch_irreversible_runtime_failed_qa_event(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+        )
+    )
+    if not implementation or not failed_qa:
+        return {}
+    failed_qa_id = int(failed_qa.get("id") or 0)
+    implementation_id = int(implementation.get("id") or 0)
+    failed_payload = (
+        failed_qa.get("payload")
+        if isinstance(failed_qa.get("payload"), Mapping)
+        else {}
+    )
+    failed_verification = (
+        failed_qa.get("verification")
+        if isinstance(failed_qa.get("verification"), Mapping)
+        else {}
+    )
+    failed_artifacts = (
+        failed_qa.get("artifact_refs")
+        if isinstance(failed_qa.get("artifact_refs"), Mapping)
+        else {}
+    )
+    implementation_commit = str(
+        failed_qa.get("commit_sha")
+        or failed_payload.get("candidate_commit_sha")
+        or ""
+    ).strip()
+    graph_snapshot_id = str(
+        failed_payload.get("graph_snapshot_id")
+        or failed_artifacts.get("graph_snapshot_id")
+        or ""
+    ).strip()
+    qa_reviewer = str(
+        failed_qa.get("actor")
+        or failed_payload.get("qa_principal")
+        or ""
+    ).strip()
+    qa_tests = _mf_batch_irreversible_runtime_event_values(
+        failed_qa,
+        "tests_run",
+    )
+    graph_trace_ids = _mf_batch_irreversible_runtime_event_values(
+        failed_qa,
+        "graph_trace_ids",
+    )
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", implementation_commit)
+        or not graph_snapshot_id
+        or not qa_reviewer
+        or not qa_tests
+        or not graph_trace_ids
+        or failed_verification.get("overall_release_pass_claimed") is not False
+    ):
+        return {}
+    failed_qa_ref = f"timeline:{failed_qa_id}"
+    implementation_ref = f"timeline:{implementation_id}"
+    read_receipt_ref = str(
+        eligibility_authority.get("read_receipt_event_ref") or ""
+    ).strip()
+    safe_ref_reissue_ref = str(
+        eligibility_authority.get("safe_ref_reissue_event_ref") or ""
+    ).strip()
+    artifact_refs = [
+        failed_qa_ref,
+        implementation_ref,
+        read_receipt_ref,
+        safe_ref_reissue_ref,
+        *graph_trace_ids,
+    ]
+    artifact_refs = list(dict.fromkeys(item for item in artifact_refs if item))
+    non_reconstructable_reason = (
+        "The exact failed-QA replacement worker reached a server-verified "
+        "post-read/pre-startup STOP after its one permitted safe-ref reissue "
+        "was consumed; startup and close_ready cannot be backfilled without "
+        "fabricating append-only evidence."
+    )
+    archive_action_input = {
+        "project_id": project_id,
+        "bug_id": backlog_id,
+        "source_backlog_id": backlog_id,
+        "source_runtime_context_id": runtime_context_id,
+        "commit": implementation_commit,
+        "reason": non_reconstructable_reason,
+        "non_reconstructable_evidence_reason": non_reconstructable_reason,
+        "timeline_precheck": {
+            "can_close": False,
+            "failed_gates": [
+                "runtime_context_irreversible_recovery_exhausted"
+            ],
+        },
+        "failure_audit": {
+            "what_happened": (
+                "The replacement RuntimeContext exhausted its single safe-ref "
+                "recovery after the accepted read receipt and before startup."
+            ),
+            "non_reconstructable_evidence_reason": non_reconstructable_reason,
+            "historical_evidence_reconstructed": False,
+            "startup_or_close_ready_backfilled": False,
+        },
+        "qa_acceptance": {
+            "terminal_disposition": (
+                _MF_BATCH_IRREVERSIBLE_RUNTIME_TERMINAL_DISPOSITION
+            ),
+            "passed": False,
+            "status": "failed",
+            "reviewer": qa_reviewer,
+            "reviewer_role": "qa",
+            "tests": qa_tests,
+            "artifacts": artifact_refs,
+            "source_backlog_id": backlog_id,
+            "source_task_id": task_id,
+            "contract_execution_id": contract_execution_id,
+            "runtime_context_id": runtime_context_id,
+            "implementation_event_ref": implementation_ref,
+            "failed_qa_source_ref": failed_qa_ref,
+            "implementation_commit": implementation_commit,
+        },
+        "verification": {
+            "status": "failed",
+            "tests": qa_tests,
+            "artifacts": artifact_refs,
+            "used_as_pass": False,
+            "overall_release_pass_claimed": False,
+        },
+        "graph_snapshot": {
+            "snapshot_id": graph_snapshot_id,
+            "commit_sha": implementation_commit,
+        },
+        "runtime_context": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "read_receipt_event_ref": read_receipt_ref,
+            "safe_ref_reissue_event_ref": safe_ref_reissue_ref,
+            "route_identity": dict(route_identity),
+            "recovery_next_action": (
+                "stop_runtime_context_safe_ref_recovery_exhausted"
+            ),
+        },
+        "references": artifact_refs,
+        "actor": "observer",
+        "route_token_ref": "<copy backlog_audit_archive route_token_ref>",
+    }
+    proof = {
+        "verified": True,
+        "actionable": True,
+        "terminal_disposition": (
+            _MF_BATCH_IRREVERSIBLE_RUNTIME_TERMINAL_DISPOSITION
+        ),
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "route_identity": dict(route_identity),
+        "recovery_mode": "safe_ref_prestartup_reissue_exhausted",
+        "recovery_next_action": (
+            "stop_runtime_context_safe_ref_recovery_exhausted"
+        ),
+        "one_time_post_read_reissue_consumed": True,
+        "startup_absent": True,
+        "read_receipt_event_ref": read_receipt_ref,
+        "safe_ref_reissue_event_ref": safe_ref_reissue_ref,
+        "implementation_event_ref": implementation_ref,
+        "failed_qa_event_ref": failed_qa_ref,
+        "implementation_commit": implementation_commit,
+        "graph_snapshot_id": graph_snapshot_id,
+        "qa_reviewer": qa_reviewer,
+        "qa_tests": qa_tests,
+        "graph_trace_ids": graph_trace_ids,
+        "normal_close": False,
+        "can_close": False,
+        "close_ready": False,
+        "historical_events_mutated": False,
+        "archive_action_input": archive_action_input,
+        "source": (
+            "ContractRuntime.failed_qa_replacement_dispatch+"
+            "RuntimeContext.safe_ref_prestartup_reissue_exhaustion+"
+            "authenticated_qa_session"
+        ),
+    }
+    authority = (
+        task_timeline.source_backed_irreversible_runtime_audit_terminal_authority(
+            proof
+        )
+    )
+    return {
+        "schema_version": "onboard_route_guide.next_action.v1",
+        "id": "archive_irreversible_runtime_context_exhaustion",
+        "action": "backlog_audit_archive",
+        "interface": "backlog_audit_archive",
+        "mcp_tool": "backlog_audit_archive",
+        "method": "POST",
+        "path": "/api/backlog/{project_id}/{bug_id}/audit-archive",
+        "owner_role": "observer",
+        "requires_role": "observer",
+        "requires_active_observer_session": True,
+        "requires_route_token_ref": True,
+        "actionable": True,
+        "terminal": True,
+        "normal_close": False,
+        "can_close": False,
+        "close_ready": False,
+        "row_status_after_action": "WAIVED",
+        "copy_safe_body": dict(archive_action_input),
+        "archive_action_input": dict(archive_action_input),
+        "archive_action_input_path": "next_legal_action.archive_action_input",
+        "host_realization": {
+            "required_replacement_paths": [
+                "copy_safe_body.route_token_ref"
+            ],
+            "replacement_source": "observer_route_context_issue.route_token_ref",
+            "authority_inference_allowed": False,
+            "refresh_after_route_issue": False,
+        },
+        "observer_route_context_issue": {
+            "required": True,
+            "mcp_tool": "observer_route_context_issue",
+            "copy_safe_body": {
+                "project_id": project_id,
+                "caller_role": "observer",
+                "backlog_id": backlog_id,
+                "task_id": contract_execution_id,
+                "target_files": _runtime_context_public_file_values(
+                    getattr(context, "owned_files", ()) or ()
+                ),
+                "owned_files": _runtime_context_public_file_values(
+                    getattr(context, "owned_files", ()) or ()
+                ),
+                "allowed_actions": ["backlog_audit_archive"],
+                "evidence_refs": artifact_refs,
+            },
+            "bind_response_field": "route_token_ref",
+        },
+        "irreversible_runtime_audit_terminal_authority": authority,
+        "source_of_authority": str(authority.get("source") or ""),
+        "historical_contract_runtime_mutated": False,
+        "historical_timeline_mutated": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+
+
 def _direct_main_cross_contract_transition_input(
     body: Mapping[str, Any],
     metadata: Mapping[str, Any],
@@ -137878,6 +138379,20 @@ def _onboard_route_guide_compact_service_response(
             "runtime_context_recovery_authority": dict(
                 runtime_context_recovery_authority
             ),
+            "irreversible_runtime_audit_terminal_authority": (
+                dict(
+                    next_action.get(
+                        "irreversible_runtime_audit_terminal_authority"
+                    )
+                )
+                if isinstance(
+                    next_action.get(
+                        "irreversible_runtime_audit_terminal_authority"
+                    ),
+                    Mapping,
+                )
+                else {}
+            ),
             "observer_route_context_issue": (
                 dict(next_action.get("observer_route_context_issue"))
                 if isinstance(
@@ -138398,8 +138913,21 @@ def _onboard_route_guide_compact_service_response(
         and isinstance(action_input_section.get("source_binding"), Mapping)
         else {}
     )
+    from . import task_timeline
+
+    observer_irreversible_terminal_continuation = bool(
+        selected_role_key == "observer"
+        and str(continuation_action.get("mcp_tool") or "")
+        == "backlog_audit_archive"
+        and task_timeline._irreversible_runtime_audit_terminal_authority_valid(
+            next_action.get("irreversible_runtime_audit_terminal_authority")
+        )
+    )
     continuation_ready = bool(
-        selected_role_key == "worker"
+        (
+            selected_role_key == "worker"
+            or observer_irreversible_terminal_continuation
+        )
         and not host_precursor_required
         and isinstance(action_input_section, Mapping)
         and action_input_section.get("continuation_complete") is True
@@ -138413,10 +138941,10 @@ def _onboard_route_guide_compact_service_response(
     )
     if continuation_ready:
         # The public host orchestrator already knows how to fetch this exact
-        # bounded section.  Keep the compact read successful so it can reach
-        # that fallback after an auth transition instead of treating response
-        # size as a terminal worker failure.  The opaque capsule ref remains
-        # scope-, revision-, projection-, and auth-generation-fenced by fetch.
+        # bounded section. Keep the compact read successful for worker
+        # continuation and for the one server-signed irreversible-runtime
+        # observer terminal action. The opaque capsule ref remains scope-,
+        # revision-, projection-, and auth-generation-fenced by fetch.
         return {
             "schema_version": _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION,
             "ok": True,
@@ -139324,6 +139852,66 @@ def _onboard_route_guide_service_response(
             "resume_eligible": False,
             "direct_main_failed_qa_rework": dict(
                 direct_main_failed_qa_state
+            ),
+        }
+    irreversible_runtime_terminal_action: dict[str, Any] = {}
+    if (
+        not direct_main_failed_qa_state
+        and str(role or "").strip() == "observer"
+        and str(backlog_row_status or "").strip().upper()
+        not in _BACKLOG_CLOSED_STATUSES
+        and str(work_type or "").strip()
+        in {"continue_contract_chain", "rollback_or_recover_contract"}
+    ):
+        terminal_execution_id = (
+            _onboard_route_guide_target_contract_execution_id(
+                next_action=next_action,
+                current_projection=current_projection,
+                runtime_resume=runtime_resume,
+            )
+        )
+        try:
+            terminal_record = _contract_runtime_store(conn).get(
+                terminal_execution_id
+            )
+        except ContractRuntimeError:
+            terminal_record = {}
+        if terminal_record:
+            irreversible_runtime_terminal_action = (
+                _mf_batch_irreversible_runtime_audit_terminal_authority(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    record=terminal_record,
+                )
+            )
+    if irreversible_runtime_terminal_action:
+        next_action = dict(irreversible_runtime_terminal_action)
+        current_projection = {
+            **dict(current_projection),
+            "readiness_state": "irreversible_runtime_audit_terminal_ready",
+            "next_legal_action": dict(next_action),
+            "scheduler_eligible": False,
+            "resume_eligible": False,
+            "irreversible_runtime_audit_terminal_authority": dict(
+                next_action.get(
+                    "irreversible_runtime_audit_terminal_authority"
+                )
+                or {}
+            ),
+        }
+        runtime_resume = {
+            **dict(runtime_resume),
+            "status": "irreversible_runtime_audit_terminal_ready",
+            "readiness_state": "irreversible_runtime_audit_terminal_ready",
+            "next_legal_action": dict(next_action),
+            "scheduler_eligible": False,
+            "resume_eligible": False,
+            "irreversible_runtime_audit_terminal_authority": dict(
+                next_action.get(
+                    "irreversible_runtime_audit_terminal_authority"
+                )
+                or {}
             ),
         }
     qa_runtime_record: Mapping[str, Any] | None = None
@@ -173286,6 +173874,58 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
                     "has_close_ready": False,
                 },
             }
+        if applicable["is_mf"] and not verification.get("passed"):
+            terminal_execution_id = str(
+                runtime_projection.get("contract_execution_id")
+                or runtime_projection.get("current_contract_execution_id")
+                or contract.get("contract_execution_id")
+                or ""
+            ).strip()
+            if not terminal_execution_id:
+                chain_current = _contract_chain_current_projection(
+                    conn,
+                    project_id=pid,
+                    backlog_id=bug_id,
+                    rebuild_if_missing=False,
+                )
+                terminal_execution_id = str(
+                    chain_current.get("current_contract_execution_id") or ""
+                ).strip()
+            try:
+                terminal_record = _contract_runtime_store(conn).get(
+                    terminal_execution_id
+                )
+            except ContractRuntimeError:
+                terminal_record = {}
+            terminal_action = (
+                _mf_batch_irreversible_runtime_audit_terminal_authority(
+                    conn,
+                    project_id=pid,
+                    backlog_id=bug_id,
+                    record=terminal_record,
+                )
+                if terminal_record
+                else {}
+            )
+            terminal_authority = (
+                terminal_action.get(
+                    "irreversible_runtime_audit_terminal_authority"
+                )
+                if isinstance(
+                    terminal_action.get(
+                        "irreversible_runtime_audit_terminal_authority"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            if terminal_authority:
+                verification = {
+                    **dict(verification),
+                    "irreversible_runtime_audit_terminal_authority": dict(
+                        terminal_authority
+                    ),
+                }
         can_close = bool(applicable["is_mf"] and verification.get("passed"))
         audit_archive = _backlog_row_audit_archive(row)
         if audit_archive:
@@ -174035,12 +174675,183 @@ def _validate_backlog_audit_direct_main_failed_qa_terminal(
     }
 
 
+def _validate_backlog_audit_irreversible_runtime_terminal(
+    *,
+    qa_acceptance: Mapping[str, Any],
+    body: Mapping[str, Any],
+    authority_action: Mapping[str, Any],
+    bug_id: str,
+    commit_sha: str,
+) -> dict[str, Any]:
+    """Validate the exact DB-backed exhausted STOP terminal disposition."""
+
+    from . import task_timeline
+
+    authority = (
+        authority_action.get("irreversible_runtime_audit_terminal_authority")
+        if isinstance(
+            authority_action.get(
+                "irreversible_runtime_audit_terminal_authority"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    canonical_body = (
+        authority_action.get("archive_action_input")
+        if isinstance(authority_action.get("archive_action_input"), Mapping)
+        else {}
+    )
+    canonical_qa = (
+        canonical_body.get("qa_acceptance")
+        if isinstance(canonical_body.get("qa_acceptance"), Mapping)
+        else {}
+    )
+    if (
+        not authority
+        or not task_timeline._irreversible_runtime_audit_terminal_authority_valid(
+            authority
+        )
+        or str(authority_action.get("action") or "")
+        != "backlog_audit_archive"
+        or authority_action.get("actionable") is not True
+        or authority.get("verified") is not True
+        or authority.get("actionable") is not True
+        or str(authority.get("terminal_disposition") or "")
+        != _MF_BATCH_IRREVERSIBLE_RUNTIME_TERMINAL_DISPOSITION
+    ):
+        _raise_audit_archive_field_mismatch(
+            field="irreversible_runtime_audit_terminal_authority",
+            expected="server_verified_exhausted_stop",
+            actual="missing_or_invalid",
+            message=(
+                "audit archive irreversible RuntimeContext terminal requires "
+                "current DB-verified exhaustion authority"
+            ),
+        )
+    actual_body = dict(body)
+    expected_body = dict(canonical_body)
+    actual_body.pop("route_token_ref", None)
+    expected_body.pop("route_token_ref", None)
+    if actual_body != expected_body:
+        _raise_audit_archive_field_mismatch(
+            field="archive_body",
+            expected=expected_body,
+            actual=actual_body,
+            message=(
+                "audit archive irreversible RuntimeContext terminal must "
+                "copy the server-projected body exactly"
+            ),
+        )
+    exact_scalars = {
+        "bug_id": (bug_id, str(authority.get("backlog_id") or "")),
+        "commit": (
+            commit_sha,
+            str(authority.get("implementation_commit") or ""),
+        ),
+        "qa_acceptance.terminal_disposition": (
+            str(qa_acceptance.get("terminal_disposition") or ""),
+            _MF_BATCH_IRREVERSIBLE_RUNTIME_TERMINAL_DISPOSITION,
+        ),
+    }
+    for field, (actual, expected) in exact_scalars.items():
+        if actual != expected:
+            _raise_audit_archive_field_mismatch(
+                field=field,
+                expected=expected,
+                actual=actual,
+                message=(
+                    "audit archive irreversible RuntimeContext terminal identity mismatch"
+                ),
+            )
+    for field in (
+        "source_backlog_id",
+        "source_task_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "implementation_event_ref",
+        "failed_qa_source_ref",
+        "implementation_commit",
+        "reviewer",
+        "reviewer_role",
+        "status",
+    ):
+        actual = str(qa_acceptance.get(field) or "").strip()
+        expected = str(canonical_qa.get(field) or "").strip()
+        if actual != expected:
+            _raise_audit_archive_field_mismatch(
+                field=f"qa_acceptance.{field}",
+                expected=expected,
+                actual=actual,
+                message=(
+                    "audit archive irreversible RuntimeContext QA evidence "
+                    "does not match server authority"
+                ),
+            )
+    if qa_acceptance.get("passed") is not False:
+        _raise_audit_archive_field_mismatch(
+            field="qa_acceptance.passed",
+            expected=False,
+            actual=qa_acceptance.get("passed"),
+            message=(
+                "audit archive irreversible RuntimeContext terminal must "
+                "preserve failed QA without synthesizing PASS"
+            ),
+        )
+    tests = _audit_archive_list_field(
+        qa_acceptance.get("tests"),
+        qa_acceptance.get("test_commands"),
+    )
+    artifacts = _audit_archive_list_field(
+        qa_acceptance.get("artifacts"),
+        qa_acceptance.get("artifact_refs"),
+        qa_acceptance.get("evidence_refs"),
+    )
+    expected_tests = _audit_archive_list_field(canonical_qa.get("tests"))
+    expected_artifacts = _audit_archive_list_field(
+        canonical_qa.get("artifacts")
+    )
+    if tests != expected_tests or artifacts != expected_artifacts:
+        _raise_audit_archive_field_mismatch(
+            field="qa_acceptance.tests_or_artifacts",
+            expected={"tests": expected_tests, "artifacts": expected_artifacts},
+            actual={"tests": tests, "artifacts": artifacts},
+            message=(
+                "audit archive irreversible RuntimeContext terminal evidence "
+                "must copy the server-projected failed QA exactly"
+            ),
+        )
+    return {
+        **dict(qa_acceptance),
+        "schema_version": "audit_close_irreversible_runtime_terminal.v1",
+        "terminal_disposition": (
+            _MF_BATCH_IRREVERSIBLE_RUNTIME_TERMINAL_DISPOSITION
+        ),
+        "passed": False,
+        "status": "failed",
+        "tests": tests,
+        "artifacts": artifacts,
+        "independent_reviewer": True,
+        "rejected_candidate": True,
+        "authenticated_failed_qa_terminal": True,
+        "authenticated_irreversible_runtime_terminal": True,
+        "close_satisfying": False,
+        "audit_only": True,
+        "source_generation_terminal": True,
+        "same_row_resume_allowed": False,
+        "startup_or_close_ready_reconstructed": False,
+        "source_of_authority": str(authority.get("source") or ""),
+        "authority_hash": str(authority.get("authority_hash") or ""),
+    }
+
+
 def _validate_backlog_audit_qa_acceptance(
     *,
     qa_acceptance: Mapping[str, Any],
     body: Mapping[str, Any],
     failure_audit: Mapping[str, Any],
     direct_main_failed_qa_state: Mapping[str, Any] | None = None,
+    irreversible_runtime_authority_action: Mapping[str, Any] | None = None,
     bug_id: str = "",
     commit_sha: str = "",
 ) -> dict[str, Any]:
@@ -174049,6 +174860,16 @@ def _validate_backlog_audit_qa_acceptance(
     terminal_disposition = str(
         qa_acceptance.get("terminal_disposition") or ""
     ).strip()
+    if terminal_disposition == (
+        _MF_BATCH_IRREVERSIBLE_RUNTIME_TERMINAL_DISPOSITION
+    ):
+        return _validate_backlog_audit_irreversible_runtime_terminal(
+            qa_acceptance=qa_acceptance,
+            body=body,
+            authority_action=irreversible_runtime_authority_action or {},
+            bug_id=bug_id,
+            commit_sha=commit_sha,
+        )
     if terminal_disposition:
         return _validate_backlog_audit_direct_main_failed_qa_terminal(
             qa_acceptance=qa_acceptance,
@@ -174251,6 +175072,7 @@ def _build_backlog_audit_archive_payload(
     row: Mapping[str, Any],
     archived_at: str,
     direct_main_failed_qa_state: Mapping[str, Any] | None = None,
+    irreversible_runtime_authority_action: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     reason = str(body.get("reason") or body.get("human_reason") or "").strip()
     if not reason:
@@ -174283,6 +175105,9 @@ def _build_backlog_audit_archive_payload(
         body=body,
         failure_audit=failure_audit,
         direct_main_failed_qa_state=direct_main_failed_qa_state or {},
+        irreversible_runtime_authority_action=(
+            irreversible_runtime_authority_action or {}
+        ),
         bug_id=bug_id,
         commit_sha=commit_sha,
     )
@@ -174365,6 +175190,32 @@ def handle_backlog_audit_archive(ctx: RequestContext):
                 backlog_id=bug_id,
             )
         )
+        irreversible_runtime_authority_action: dict[str, Any] = {}
+        if not direct_main_failed_qa_state:
+            current_chain = _contract_chain_current_projection(
+                conn,
+                project_id=pid,
+                backlog_id=bug_id,
+                rebuild_if_missing=False,
+            )
+            current_execution_id = str(
+                current_chain.get("current_contract_execution_id") or ""
+            ).strip()
+            try:
+                current_record = _contract_runtime_store(conn).get(
+                    current_execution_id
+                )
+            except ContractRuntimeError:
+                current_record = {}
+            if current_record:
+                irreversible_runtime_authority_action = (
+                    _mf_batch_irreversible_runtime_audit_terminal_authority(
+                        conn,
+                        project_id=pid,
+                        backlog_id=bug_id,
+                        record=current_record,
+                    )
+                )
         payload = _build_backlog_audit_archive_payload(
             project_id=pid,
             bug_id=bug_id,
@@ -174372,6 +175223,9 @@ def handle_backlog_audit_archive(ctx: RequestContext):
             row=row,
             archived_at=now,
             direct_main_failed_qa_state=direct_main_failed_qa_state,
+            irreversible_runtime_authority_action=(
+                irreversible_runtime_authority_action
+            ),
         )
         route_gate = _require_route_token_mutation_gate(
             ctx,

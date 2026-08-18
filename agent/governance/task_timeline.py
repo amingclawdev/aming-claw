@@ -13800,6 +13800,109 @@ def _archive_recovery_has_non_reconstructable_signal(value: Any) -> bool:
     return False
 
 
+_IRREVERSIBLE_RUNTIME_AUDIT_TERMINAL_AUTHORITY_SCHEMA = (
+    "mf_batch.irreversible_runtime_audit_terminal_authority.v1"
+)
+
+
+def source_backed_irreversible_runtime_audit_terminal_authority(
+    proof: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal one public-safe, server-derived irreversible runtime proof."""
+
+    envelope = {
+        "schema_version": _IRREVERSIBLE_RUNTIME_AUDIT_TERMINAL_AUTHORITY_SCHEMA,
+        **dict(proof),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+    }
+    envelope["authority_hash"] = _canonical_contract_hash(
+        {
+            key: value
+            for key, value in envelope.items()
+            if key != "authority_hash"
+        }
+    )
+    return envelope
+
+
+def _irreversible_runtime_audit_terminal_authority_valid(
+    authority: Mapping[str, Any],
+) -> bool:
+    """Accept only the sealed STOP/exhaustion authority projected by server.py."""
+
+    if (
+        _text(authority.get("schema_version"))
+        != _IRREVERSIBLE_RUNTIME_AUDIT_TERMINAL_AUTHORITY_SCHEMA
+        or authority.get("server_derived") is not True
+        or authority.get("caller_claims_trusted") is not False
+        or authority.get("verified") is not True
+        or authority.get("actionable") is not True
+        or _text(authority.get("terminal_disposition"))
+        != "mf_batch_irreversible_runtime_exhaustion_terminal"
+        or _text(authority.get("recovery_mode"))
+        != "safe_ref_prestartup_reissue_exhausted"
+        or _text(authority.get("recovery_next_action"))
+        != "stop_runtime_context_safe_ref_recovery_exhausted"
+        or authority.get("one_time_post_read_reissue_consumed") is not True
+        or authority.get("startup_absent") is not True
+        or authority.get("normal_close") is not False
+        or authority.get("can_close") is not False
+        or authority.get("close_ready") is not False
+        or authority.get("historical_events_mutated") is not False
+    ):
+        return False
+    authority_hash = _text(authority.get("authority_hash"))
+    expected_hash = _canonical_contract_hash(
+        {
+            key: value
+            for key, value in dict(authority).items()
+            if key != "authority_hash"
+        }
+    )
+    if not authority_hash or authority_hash != expected_hash:
+        return False
+    required = (
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_id",
+        "worker_slot_id",
+        "read_receipt_event_ref",
+        "safe_ref_reissue_event_ref",
+        "implementation_event_ref",
+        "failed_qa_event_ref",
+        "implementation_commit",
+        "graph_snapshot_id",
+        "qa_reviewer",
+    )
+    if any(not _text(authority.get(field)) for field in required):
+        return False
+    tests = [
+        _text(item)
+        for item in _list(authority.get("qa_tests"))
+        if _text(item)
+    ]
+    route_identity = _mapping(authority.get("route_identity"))
+    return bool(
+        tests
+        and all(
+            _text(route_identity.get(field))
+            for field in (
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "route_token_ref",
+                "visible_injection_manifest_hash",
+            )
+        )
+    )
+
+
 def _audit_archive_explicit_recovery_mode(full_result: dict[str, Any]) -> bool:
     for key in (
         "audit_archive_recovery_mode",
@@ -13894,6 +13997,22 @@ def _audit_archive_recovery_decision(full_result: dict[str, Any]) -> dict[str, A
     recoverable_canonical_lineage = _audit_archive_has_recoverable_canonical_lineage(
         full_result
     )
+    irreversible_runtime_authority = _mapping(
+        full_result.get("irreversible_runtime_audit_terminal_authority")
+    )
+    irreversible_runtime_terminal = (
+        _irreversible_runtime_audit_terminal_authority_valid(
+            irreversible_runtime_authority
+        )
+    )
+    if irreversible_runtime_terminal:
+        has_implementation = True
+        has_verification = True
+        has_independent_qa = True
+        non_reconstructable_signal = True
+        # The sealed STOP proves that the only legal recovery was consumed.
+        # Generic route-lineage diagnostics cannot revive worker recovery.
+        recoverable_canonical_lineage = False
 
     missing_prerequisites: list[str] = []
     if not has_implementation:
@@ -13907,7 +14026,11 @@ def _audit_archive_recovery_decision(full_result: dict[str, Any]) -> dict[str, A
     if recoverable_canonical_lineage:
         missing_prerequisites.append("canonical_runtime_context_lineage_repair")
 
-    available = explicit_recovery_mode or not missing_prerequisites
+    available = (
+        irreversible_runtime_terminal
+        or explicit_recovery_mode
+        or not missing_prerequisites
+    )
     decision: dict[str, Any] = {
         "schema_version": "mf_audit_archive_recovery_decision.v1",
         "available": available,
@@ -13919,12 +14042,17 @@ def _audit_archive_recovery_decision(full_result: dict[str, Any]) -> dict[str, A
         "independent_qa": has_independent_qa,
         "non_reconstructable_evidence": non_reconstructable_signal,
         "recoverable_canonical_lineage_repair": recoverable_canonical_lineage,
+        "irreversible_runtime_terminal": irreversible_runtime_terminal,
     }
     if available:
         decision["reason"] = (
-            "explicit_recovery_archive_mode"
-            if explicit_recovery_mode
-            else "accepted_implementation_independent_qa_non_reconstructable"
+            "server_verified_irreversible_runtime_exhaustion"
+            if irreversible_runtime_terminal
+            else (
+                "explicit_recovery_archive_mode"
+                if explicit_recovery_mode
+                else "accepted_implementation_independent_qa_non_reconstructable"
+            )
         )
     else:
         reason = (
@@ -13981,7 +14109,7 @@ def _audit_archive_recovery_summary(
     if request_id:
         timeline_precheck["request_id"] = request_id
 
-    return {
+    result = {
         "schema_version": "mf_audit_archive_recovery.v1",
         "recommended_legal_action": (
             "When the implementation is accepted but the normal MF close evidence is "
@@ -14037,6 +14165,24 @@ def _audit_archive_recovery_summary(
             "actor": "observer",
         },
     }
+    authority = _mapping(
+        full_result.get("irreversible_runtime_audit_terminal_authority")
+    )
+    canonical_body = (
+        _mapping(authority.get("archive_action_input"))
+        if _irreversible_runtime_audit_terminal_authority_valid(authority)
+        else {}
+    )
+    if canonical_body:
+        result.update(
+            {
+                "canonical_actionable": True,
+                "body_source": "server_verified_irreversible_runtime_authority",
+                "copy_safe_body": dict(canonical_body),
+                "authority": dict(authority),
+            }
+        )
+    return result
 
 
 def _compact_append_payload_hint(skeleton: dict[str, Any]) -> dict[str, Any]:

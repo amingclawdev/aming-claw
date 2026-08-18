@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import copy
 from dataclasses import replace
 import hashlib
 import json
@@ -18,7 +19,7 @@ from agent.tests.fixtures.parallel_project import (
     create_pb001_restart_fixture_project,
 )
 from agent.governance.db import SCHEMA_VERSION, _ensure_schema
-from agent.governance import graph_query_trace, parallel_branch_runtime
+from agent.governance import graph_query_trace, parallel_branch_runtime, task_timeline
 from agent.governance.contract_state_runtime import build_contract_state_projection
 from agent.governance.mf_subagent_contract import (
     MfSubagentContractError,
@@ -4877,6 +4878,91 @@ def test_runtime_context_action_plan_links_audit_archive_for_historical_close_bl
     assert "BUG-RUNTIME-CONTEXT" == audit_action["entrypoint"]["request_template"]["bug_id"]
     assert control_plane["audit_archive_action"] == audit_action
     assert action_plan["next_legal_action"] != "backlog_audit_archive"
+
+
+def test_runtime_context_action_plan_promotes_only_server_verified_exhausted_stop() -> None:
+    context = _runtime_projection_context(
+        runtime_context_id="mfrctx-runtime-context",
+        parent_task_id="parent-runtime-context",
+    )
+    route_identity = {
+        "route_id": "route-runtime-context",
+        "route_context_hash": "sha256:route-runtime-context",
+        "prompt_contract_id": "rprompt-runtime-context",
+        "prompt_contract_hash": "sha256:prompt-runtime-context",
+        "route_token_ref": "rtok-runtime-context",
+        "visible_injection_manifest_hash": "sha256:visible-runtime-context",
+    }
+    projection = build_runtime_context_projection(
+        context,
+        route_identity=route_identity,
+        generated_at=NOW,
+    ).to_dict()
+    current_view = copy.deepcopy(projection["views"]["current"])
+    canonical_body = {
+        "project_id": "PROJECT-RUNTIME-CONTEXT",
+        "bug_id": "BUG-RUNTIME-CONTEXT",
+        "commit": "a" * 40,
+    }
+    current_view["irreversible_runtime_audit_terminal_authority"] = (
+        task_timeline.source_backed_irreversible_runtime_audit_terminal_authority(
+            {
+                "verified": True,
+                "actionable": True,
+                "terminal_disposition": (
+                    "mf_batch_irreversible_runtime_exhaustion_terminal"
+                ),
+                "project_id": context.project_id,
+                "backlog_id": context.backlog_id,
+                "contract_execution_id": context.parent_task_id,
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": context.parent_task_id,
+                "worker_id": context.worker_id,
+                "worker_slot_id": context.worker_slot_id,
+                "route_identity": route_identity,
+                "recovery_mode": "safe_ref_prestartup_reissue_exhausted",
+                "recovery_next_action": (
+                    "stop_runtime_context_safe_ref_recovery_exhausted"
+                ),
+                "one_time_post_read_reissue_consumed": True,
+                "startup_absent": True,
+                "read_receipt_event_ref": "timeline:54",
+                "safe_ref_reissue_event_ref": "timeline:55",
+                "implementation_event_ref": "timeline:24",
+                "failed_qa_event_ref": "timeline:41",
+                "implementation_commit": "a" * 40,
+                "graph_snapshot_id": "full-audit-terminal",
+                "qa_reviewer": "qa:audit-terminal",
+                "qa_tests": ["pytest -q -k audit_terminal"],
+                "normal_close": False,
+                "can_close": False,
+                "close_ready": False,
+                "historical_events_mutated": False,
+                "archive_action_input": canonical_body,
+            }
+        )
+    )
+    action_plan = parallel_branch_runtime.build_runtime_context_action_plan_view(
+        current_view
+    )
+    audit_action = action_plan["audit_archive_action"]
+    assert audit_action["status"] == "ready_irreversible_runtime_exhaustion"
+    assert audit_action["next_action"] == "backlog_audit_archive"
+    assert audit_action["canonical_actionable"] is True
+    assert audit_action["copy_safe_body"] == canonical_body
+    assert audit_action["normal_close_gate_passed"] is False
+    assert audit_action["close_ready_emitted"] is False
+
+    forged = copy.deepcopy(current_view)
+    forged["irreversible_runtime_audit_terminal_authority"][
+        "caller_claims_trusted"
+    ] = True
+    blocked = parallel_branch_runtime.build_runtime_context_action_plan_view(forged)[
+        "audit_archive_action"
+    ]
+    assert blocked["canonical_actionable"] is False
+    assert blocked["next_action"] != "backlog_audit_archive"
 
 
 def test_runtime_context_action_plan_defers_permission_tree_hardening() -> None:

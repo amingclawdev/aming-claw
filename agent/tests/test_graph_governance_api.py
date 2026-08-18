@@ -131566,6 +131566,334 @@ def test_context_local_post_read_exhaustion_controls_are_zero_write(
     assert "\n".join(conn.iterdump()) == before_dump
 
 
+def _irreversible_runtime_audit_terminal_fixture(monkeypatch):
+    backlog_id = "AC-IRREVERSIBLE-RUNTIME-AUDIT-TERMINAL"
+    contract_execution_id = "cex-irreversible-runtime-audit-terminal"
+    context = SimpleNamespace(
+        project_id=PID,
+        governance_project_id=PID,
+        backlog_id=backlog_id,
+        runtime_context_id="mfrctx-irreversible-runtime-audit-terminal",
+        task_id="irreversible-runtime-replacement-worker",
+        parent_task_id=contract_execution_id,
+        root_task_id=contract_execution_id,
+        worker_id="irreversible-runtime-worker",
+        worker_slot_id="irreversible-runtime-worker",
+        owned_files=(
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ),
+    )
+    route_identity = {
+        "route_id": "route-irreversible-runtime-audit-terminal",
+        "route_context_hash": _fake_sha(
+            "irreversible-runtime-audit-terminal-route"
+        ),
+        "prompt_contract_id": (
+            "rprompt-irreversible-runtime-audit-terminal"
+        ),
+        "prompt_contract_hash": _fake_sha(
+            "irreversible-runtime-audit-terminal-prompt"
+        ),
+        "route_token_ref": "rtok-irreversible-runtime-audit-terminal",
+        "visible_injection_manifest_hash": _fake_sha(
+            "irreversible-runtime-audit-terminal-visible"
+        ),
+    }
+    accepted_dispatch = {
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "source": "server_verified_failed_qa_replacement_dispatch",
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+    }
+    current_state = {
+        "next_legal_action": {
+            "stage_id": "worker_startup",
+            "line_id": "worker_startup",
+            **accepted_dispatch,
+        },
+        "accepted_dispatch_authority": copy.deepcopy(accepted_dispatch),
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": "mf_parallel.v2",
+        "contract_execution_id": contract_execution_id,
+    }
+    eligibility = {
+        "server_derived": True,
+        "eligible": False,
+        "mode": "safe_ref_prestartup_reissue_exhausted",
+        "one_time_post_read_reissue_consumed": True,
+        "required_response_handling": {
+            "actionable": False,
+            "next_action": (
+                "stop_runtime_context_safe_ref_recovery_exhausted"
+            ),
+        },
+        "authority": {
+            "startup_absent": True,
+            "route_identity": copy.deepcopy(route_identity),
+            "read_receipt_event_ref": "timeline:54",
+            "safe_ref_reissue_event_ref": "timeline:55",
+        },
+    }
+    implementation = {"id": 21, "status": "passed"}
+    failed_qa = {
+        "id": 41,
+        "event_kind": "independent_verification",
+        "status": "failed",
+        "task_id": contract_execution_id,
+        "actor": "qa:irreversible-runtime-audit-terminal",
+        "commit_sha": "a" * 40,
+        "payload": {
+            "graph_snapshot_id": "full-irreversible-runtime-audit-terminal",
+        },
+        "verification": {
+            "tests_run": [
+                "pytest -q agent/tests/test_graph_governance_api.py "
+                "-k irreversible_runtime_audit_terminal"
+            ],
+            "graph_trace_ids": ["gqt-irreversible-runtime-audit-terminal"],
+            "overall_release_pass_claimed": False,
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_runtime_current_state_from_record",
+        lambda _record: copy.deepcopy(current_state),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda _conn, **kwargs: (
+            copy.deepcopy(kwargs["record"]),
+            {
+                "status": "projected",
+                "persistence": {
+                    "mutates_contract_runtime_completed_lines": False,
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_branch_context_by_runtime_context_id",
+        lambda *_args, **_kwargs: context,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_route_identity",
+        lambda *_args, **_kwargs: copy.deepcopy(route_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_session_rejoin_guidance_eligibility",
+        lambda *_args, **_kwargs: copy.deepcopy(eligibility),
+    )
+    monkeypatch.setattr(
+        server,
+        "_mf_batch_irreversible_runtime_failed_qa_event",
+        lambda *_args, **_kwargs: (
+            copy.deepcopy(implementation),
+            copy.deepcopy(failed_qa),
+        ),
+    )
+    return record, context, route_identity, current_state, eligibility, failed_qa
+
+
+def test_irreversible_runtime_audit_terminal_projects_one_copy_safe_waive_body(
+    conn,
+    monkeypatch,
+):
+    record, context, route_identity, _state, _eligibility, _failed_qa = (
+        _irreversible_runtime_audit_terminal_fixture(monkeypatch)
+    )
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    action = server._mf_batch_irreversible_runtime_audit_terminal_authority(
+        conn,
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        record=record,
+    )
+
+    assert action["action"] == "backlog_audit_archive"
+    assert action["actionable"] is True
+    assert action["terminal"] is True
+    assert action["normal_close"] is False
+    assert action["can_close"] is False
+    assert action["close_ready"] is False
+    assert action["row_status_after_action"] == "WAIVED"
+    assert action["observer_route_context_issue"]["copy_safe_body"][
+        "allowed_actions"
+    ] == ["backlog_audit_archive"]
+    body = action["copy_safe_body"]
+    assert body["qa_acceptance"]["passed"] is False
+    assert body["qa_acceptance"]["status"] == "failed"
+    assert body["qa_acceptance"]["terminal_disposition"] == (
+        "mf_batch_irreversible_runtime_exhaustion_terminal"
+    )
+    assert body["qa_acceptance"]["runtime_context_id"] == (
+        context.runtime_context_id
+    )
+    assert body["qa_acceptance"]["tests"]
+    assert body["qa_acceptance"]["artifacts"]
+    assert body["runtime_context"]["route_identity"] == route_identity
+    assert body["runtime_context"]["read_receipt_event_ref"] == "timeline:54"
+    assert body["runtime_context"]["safe_ref_reissue_event_ref"] == (
+        "timeline:55"
+    )
+    assert body["route_token_ref"].startswith("<copy ")
+    assert task_timeline._irreversible_runtime_audit_terminal_authority_valid(
+        action["irreversible_runtime_audit_terminal_authority"]
+    ) is True
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        record={
+            **record,
+            "root_contract_execution_id": context.parent_task_id,
+            "contract_chain_id": "cchain-irreversible-runtime-terminal",
+            "execution_state_revision": 12,
+            "metadata": {},
+        },
+        next_action=action,
+        current_projection={
+            "current_contract_execution_id": context.parent_task_id,
+            "next_legal_action": action,
+        },
+        runtime_resume={"next_legal_action": action},
+        target_files=list(context.owned_files),
+        projection_degraded=False,
+    )
+    assert compact["ok"] is True
+    assert compact["status"] == "compact_action_input_continuation_required"
+    assert compact["required_sections"] == ["action_input"]
+    assert compact["raw_route_token_exposed"] is False
+    fetched = server._onboard_guide_capsule_fetch(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        task_id=str(compact.get("selected_task_id") or ""),
+        guide_capsule_ref=compact["guide_capsule_ref"],
+        sections=["action_input"],
+    )
+    executable = fetched["sections"]["action_input"][
+        "canonical_executable_action"
+    ]
+    assert executable["mcp_tool"] == "backlog_audit_archive"
+    assert executable["copy_safe_body"] == body
+    assert fetched["authorizes_write"] is False
+    validated = server._validate_backlog_audit_irreversible_runtime_terminal(
+        qa_acceptance=body["qa_acceptance"],
+        body=body,
+        authority_action=action,
+        bug_id=context.backlog_id,
+        commit_sha="a" * 40,
+    )
+    assert validated["authenticated_irreversible_runtime_terminal"] is True
+    assert validated["close_satisfying"] is False
+    assert validated["audit_only"] is True
+    tampered = copy.deepcopy(body)
+    tampered["failure_audit"]["what_happened"] = (
+        "caller-authored historical reconstruction"
+    )
+    with pytest.raises(
+        ValidationError,
+        match="copy the server-projected body exactly",
+    ):
+        server._validate_backlog_audit_irreversible_runtime_terminal(
+            qa_acceptance=tampered["qa_acceptance"],
+            body=tampered,
+            authority_action=action,
+            bug_id=context.backlog_id,
+            commit_sha="a" * 40,
+        )
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "active",
+        "recoverable",
+        "ambiguous_failed_qa",
+        "wrong_task",
+        "wrong_route",
+        "startup_present",
+        "missing_qa_trace",
+    ],
+)
+def test_irreversible_runtime_audit_terminal_controls_fail_closed_zero_write(
+    conn,
+    monkeypatch,
+    mutation,
+):
+    record, context, route_identity, state, eligibility, failed_qa = (
+        _irreversible_runtime_audit_terminal_fixture(monkeypatch)
+    )
+    if mutation == "active":
+        eligibility["eligible"] = True
+    elif mutation == "recoverable":
+        eligibility["mode"] = "safe_ref_prestartup_reissue"
+    elif mutation == "ambiguous_failed_qa":
+        monkeypatch.setattr(
+            server,
+            "_mf_batch_irreversible_runtime_failed_qa_event",
+            lambda *_args, **_kwargs: ({}, {}),
+        )
+    elif mutation == "wrong_task":
+        state["next_legal_action"]["task_id"] = "cross-scope-task"
+    elif mutation == "wrong_route":
+        eligibility["authority"]["route_identity"]["route_token_ref"] = (
+            "rtok-cross-scope"
+        )
+    elif mutation == "startup_present":
+        eligibility["authority"]["startup_absent"] = False
+    elif mutation == "missing_qa_trace":
+        failed_qa["verification"]["graph_trace_ids"] = []
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_current_state_from_record",
+        lambda _record: copy.deepcopy(state),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_session_rejoin_guidance_eligibility",
+        lambda *_args, **_kwargs: copy.deepcopy(eligibility),
+    )
+    if mutation == "missing_qa_trace":
+        monkeypatch.setattr(
+            server,
+            "_mf_batch_irreversible_runtime_failed_qa_event",
+            lambda *_args, **_kwargs: (
+                {"id": 21, "status": "passed"},
+                copy.deepcopy(failed_qa),
+            ),
+        )
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+    assert server._mf_batch_irreversible_runtime_audit_terminal_authority(
+        conn,
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        record=record,
+    ) == {}
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 def test_fresh_failed_qa_rework_receipt_uses_context_local_timeline_without_resubmitting_contract(
     conn,
     monkeypatch,
