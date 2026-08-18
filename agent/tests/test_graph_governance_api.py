@@ -61515,9 +61515,15 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         (read.get("timeline_event") or {}).get("id") or ""
     )
     assert startup_skeleton["copy_safe_body"]["read_receipt_hash"] == receipt_hash
+    assert startup_skeleton["copy_safe_body"]["contract_execution_id"] == (
+        contract_execution_id
+    )
     assert startup_skeleton["copy_safe_body"]["owned_files"] == list(
         allocated.owned_files
     )
+    assert startup_skeleton["payload"]["mf_subagent_startup_gate"][
+        "contract_execution_id"
+    ] == contract_execution_id
     assert startup_skeleton["payload"]["mf_subagent_startup_gate"][
         "owned_files"
     ] == list(allocated.owned_files)
@@ -61543,9 +61549,15 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         },
     )["startup_facade_payload_skeleton"]
     assert compact_startup["actionable"] is True
+    assert compact_startup["copy_safe_body"]["contract_execution_id"] == (
+        contract_execution_id
+    )
     assert compact_startup["copy_safe_body"]["owned_files"] == list(
         allocated.owned_files
     )
+    assert compact_startup["payload"]["mf_subagent_startup_gate"][
+        "contract_execution_id"
+    ] == contract_execution_id
     assert compact_startup["payload"]["mf_subagent_startup_gate"][
         "owned_files"
     ] == list(allocated.owned_files)
@@ -165734,6 +165746,9 @@ def test_worker_guide_receipt_requires_prepare_then_projects_eight_hashes(
     startup_body = copy.deepcopy(
         startup_guide["canonical_executable_action"]["copy_safe_body"]
     )
+    assert startup_body["contract_execution_id"] == successor[
+        "contract_execution_id"
+    ]
     assert startup_guide["serialized_bytes"] < 32 * 1024
     assert startup_guide["canonical_executable_action"][
         "omitted_optional_body_metadata"

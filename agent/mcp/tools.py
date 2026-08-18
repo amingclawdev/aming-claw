@@ -3994,6 +3994,7 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
+                "contract_execution_id": {"type": "string"},
                 "task_id": {"type": "string"},
                 "parent_task_id": {"type": "string"},
                 "worker_role": {"type": "string", "description": "Must be mf_sub."},

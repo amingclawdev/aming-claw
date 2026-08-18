@@ -105,6 +105,10 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
                 return
             assert body["session_token"] == raw_session
             assert body["fence_token"] == raw_fence
+            if self.path.endswith("/parallel-branches/startup"):
+                assert body["contract_execution_id"] == identity[
+                    "contract_execution_id"
+                ]
             self._send(
                 {
                     "ok": True,
@@ -170,12 +174,41 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
                     "method": "tools/call",
                     "params": {
                         "name": "parallel_branch_startup",
-                        "arguments": {**identity, "worker_role": "mf_sub"},
+                        "arguments": {
+                            **{
+                                key: value
+                                for key, value in identity.items()
+                                if key != "contract_execution_id"
+                            },
+                            "worker_role": "mf_sub",
+                        },
                     },
                 },
                 {
                     "jsonrpc": "2.0",
                     "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "parallel_branch_startup",
+                        "arguments": {
+                            **identity,
+                            "contract_execution_id": "cex-cross-stdio-managed",
+                            "worker_role": "mf_sub",
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "parallel_branch_startup",
+                        "arguments": {**identity, "worker_role": "mf_sub"},
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 8,
                     "method": "tools/call",
                     "params": {
                         "name": "runtime_context_read_receipt",
@@ -201,8 +234,18 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
     ]
     assert payloads[0]["auth_loaded"] is True
     assert payloads[0]["managed_host_envelope"]["process_local"] is True
-    assert payloads[3]["managed_host_envelope_consumed"] is True
-    assert payloads[4]["error"] == "managed_host_envelope_not_loaded"
+    assert payloads[3]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[3]["missing_fields"] == [
+        "contract_execution_id"
+    ]
+    assert payloads[3]["http_request_performed"] is False
+    assert payloads[4]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[4]["mismatched_fields"] == [
+        "contract_execution_id"
+    ]
+    assert payloads[4]["http_request_performed"] is False
+    assert payloads[5]["managed_host_envelope_consumed"] is True
+    assert payloads[6]["error"] == "managed_host_envelope_not_loaded"
     assert len(Handler.calls) == 4
     serialized = json.dumps(responses, sort_keys=True) + stderr
     assert raw_session not in serialized
@@ -315,6 +358,29 @@ def test_governance_stdio_mirror_manages_same_host_envelope_flow(monkeypatch):
     assert governance_mcp_server._dispatch_tool(
         "runtime_context_read_receipt", current_identity
     )["ok"] is True
+    call_count = len(calls)
+    missing_execution = dict(current_identity)
+    missing_execution.pop("contract_execution_id")
+    missing = governance_mcp_server._dispatch_tool(
+        "parallel_branch_startup",
+        {**missing_execution, "worker_role": "mf_sub"},
+    )
+    assert missing["error"] == "managed_host_envelope_scope_mismatch"
+    assert missing["missing_fields"] == ["contract_execution_id"]
+    assert missing["http_request_performed"] is False
+    wrong = governance_mcp_server._dispatch_tool(
+        "parallel_branch_startup",
+        {
+            **current_identity,
+            "contract_execution_id": "cex-cross-mirror-managed",
+            "worker_role": "mf_sub",
+        },
+    )
+    assert wrong["error"] == "managed_host_envelope_scope_mismatch"
+    assert wrong["mismatched_fields"] == ["contract_execution_id"]
+    assert wrong["http_request_performed"] is False
+    assert len(calls) == call_count
+    assert continuity.pending_count() == 1
     startup = governance_mcp_server._dispatch_tool(
         "parallel_branch_startup", {**current_identity, "worker_role": "mf_sub"}
     )
@@ -2137,6 +2203,7 @@ def test_mcp_stdio_parallel_branch_startup_schema_exposes_read_receipt_bridge_fi
         "worker_transcript_path",
         "harness_type",
         "filer_principal",
+        "contract_execution_id",
         "route_token_ref",
         "read_receipt_hash",
         "read_receipt_event_id",

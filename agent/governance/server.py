@@ -35400,6 +35400,7 @@ def _runtime_context_worker_recovery_payloads(
     ]
     startup_body = {
         "project_id": project_id,
+        "contract_execution_id": contract_execution_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -35466,6 +35467,7 @@ def _runtime_context_worker_recovery_payloads(
     }
     startup_payload = {
         "mf_subagent_startup_gate": {
+            "contract_execution_id": contract_execution_id,
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
@@ -132948,7 +132950,8 @@ def _contract_runtime_dead_initial_join_recovery_projection(
 _ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS = frozenset(
     """project_id actual_cwd actual_git_root actual_host_worker_id agent_id
     base_commit branch branch_head branch_ref fence_token filer_principal
-    harness_type head_commit host_session_id host_startup_id launch_text_hash
+    contract_execution_id harness_type head_commit host_session_id
+    host_startup_id launch_text_hash
     merge_queue_id now_iso observer_command_id owned_files parent_task_id
     prompt_contract_hash prompt_contract_id read_receipt_event_id
     read_receipt_hash role route_context_hash route_id route_token_ref
@@ -133694,6 +133697,7 @@ def _onboard_worker_read_runtime_facade_projection(
         )
         expected_body = {
             "project_id": project_id,
+            "contract_execution_id": execution_id,
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,

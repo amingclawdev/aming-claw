@@ -90,7 +90,14 @@ def test_managed_mcp_host_envelope_stages_injects_and_acks_startup():
             query = parsed.parse_qs(parsed.urlparse(path).query)
             assert query["session_token"] == [raw_session]
             assert query["fence_token"] == [raw_fence]
-            return {"ok": True, "status": "worker_guide_ready"}
+            return {
+                "ok": True,
+                "status": "worker_guide_ready",
+                "canonical_executable_action": {
+                    "mcp_tool": "parallel_branch_startup",
+                    "copy_safe_body": {**identity, "worker_role": "mf_sub"},
+                },
+            }
         assert data is not None
         assert data["session_token"] == raw_session
         assert data["fence_token"] == raw_fence
@@ -116,7 +123,7 @@ def test_managed_mcp_host_envelope_stages_injects_and_acks_startup():
     assert raw_fence not in serialized
     assert dispatcher._host_envelope_continuity.pending_count() == 1
 
-    assert dispatcher.dispatch(
+    guide = dispatcher.dispatch(
         "runtime_context_worker_guide",
         {
             "project_id": identity["project_id"],
@@ -127,14 +134,52 @@ def test_managed_mcp_host_envelope_stages_injects_and_acks_startup():
                 if key in identity
             },
         },
-    )["ok"] is True
+    )
+    assert guide["ok"] is True
+    guide_startup_body = dict(
+        guide["canonical_executable_action"]["copy_safe_body"]
+    )
+    assert guide_startup_body["contract_execution_id"] == identity[
+        "contract_execution_id"
+    ]
+    assert raw_session not in json.dumps(guide_startup_body, sort_keys=True)
+    assert raw_fence not in json.dumps(guide_startup_body, sort_keys=True)
     receipt = dispatcher.dispatch("runtime_context_read_receipt", dict(identity))
     assert receipt["ok"] is True
     assert dispatcher._host_envelope_continuity.pending_count() == 1
 
+    call_count = len(calls)
+    missing_execution = dict(guide_startup_body)
+    missing_execution.pop("contract_execution_id")
+    missing = dispatcher.dispatch(
+        "parallel_branch_startup",
+        {**missing_execution, "worker_role": "mf_sub"},
+    )
+    assert missing["error"] == "managed_host_envelope_scope_mismatch"
+    assert missing["missing_fields"] == ["contract_execution_id"]
+    assert missing["mismatched_fields"] == []
+    assert missing["http_request_performed"] is False
+    assert len(calls) == call_count
+    assert dispatcher._host_envelope_continuity.pending_count() == 1
+
+    wrong = dispatcher.dispatch(
+        "parallel_branch_startup",
+        {
+            **guide_startup_body,
+            "contract_execution_id": "cex-cross-managed-continuity",
+            "worker_role": "mf_sub",
+        },
+    )
+    assert wrong["error"] == "managed_host_envelope_scope_mismatch"
+    assert wrong["missing_fields"] == []
+    assert wrong["mismatched_fields"] == ["contract_execution_id"]
+    assert wrong["http_request_performed"] is False
+    assert len(calls) == call_count
+    assert dispatcher._host_envelope_continuity.pending_count() == 1
+
     startup = dispatcher.dispatch(
         "parallel_branch_startup",
-        {**identity, "worker_role": "mf_sub"},
+        guide_startup_body,
     )
     assert startup["managed_host_envelope_consumed"] is True
     assert dispatcher._host_envelope_continuity.pending_count() == 0
@@ -4349,6 +4394,7 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
     )
     assert startup["inputSchema"]["required"] == ["project_id", "task_id"]
     for key in (
+        "contract_execution_id",
         "parent_task_id",
         "worker_role",
         "worker_id",
@@ -4381,6 +4427,15 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         "visible_injection_manifest_hash",
     ):
         assert key in startup_props
+    mirror_startup = next(
+        tool
+        for tool in governance_mcp_server.TOOLS
+        if tool.get("name") == "parallel_branch_startup"
+    )
+    mirror_startup_props = mirror_startup["inputSchema"]["properties"]
+    assert startup_props["contract_execution_id"] == mirror_startup_props[
+        "contract_execution_id"
+    ]
 
     assert checkpoint["inputSchema"]["required"] == [
         "project_id",
