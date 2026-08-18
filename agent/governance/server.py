@@ -135548,6 +135548,11 @@ def _onboard_guide_capsule_projection_identity(
 
     if not projection:
         return {}
+    next_action = (
+        projection.get("next_legal_action")
+        if isinstance(projection.get("next_legal_action"), Mapping)
+        else {}
+    )
     current_state = (
         projection.get("contract_runtime_current_state")
         if isinstance(
@@ -135577,7 +135582,10 @@ def _onboard_guide_capsule_projection_identity(
             or projection.get("execution_state_hash")
             or contract_chain_projection_hash(projection)
         ).strip(),
-        "terminal": bool(projection.get("terminal") is True),
+        "terminal": bool(
+            projection.get("terminal") is True
+            or next_action.get("terminal") is True
+        ),
     }
 
 
@@ -136289,7 +136297,7 @@ def _onboard_guide_capsule_validate_current_projection(
             revision_mismatch = True
         if revision_mismatch:
             mismatches.append("execution_state_revision")
-    if bool(current.get("terminal") is True) != bool(
+    if bool(current_identity.get("terminal") is True) != bool(
         identity.get("terminal") is True
     ):
         mismatches.append("terminal")

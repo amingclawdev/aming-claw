@@ -132111,6 +132111,102 @@ def test_irreversible_runtime_audit_terminal_unique_current_lineage_survives_com
     assert "\n".join(conn.iterdump()) == before_dump
 
 
+def test_irreversible_runtime_audit_terminal_capsule_fetch_uses_nested_terminal_identity(
+    conn,
+    monkeypatch,
+):
+    record, context, _route_identity, _state, _eligibility, _failed_qa = (
+        _irreversible_runtime_audit_terminal_fixture(monkeypatch)
+    )
+    record.update(
+        {
+            "root_contract_execution_id": context.parent_task_id,
+            "execution_state_revision": 12,
+            "metadata": {},
+        }
+    )
+    action = server._mf_batch_irreversible_runtime_audit_terminal_authority(
+        conn,
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        record=record,
+    )
+    current_projection = {
+        "current_contract_execution_id": context.parent_task_id,
+        "next_legal_action": action,
+    }
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        record=record,
+        next_action=action,
+        current_projection=current_projection,
+        runtime_resume={"next_legal_action": action},
+        target_files=list(context.owned_files),
+        projection_degraded=False,
+    )
+    assert compact["status"] == "compact_action_input_continuation_required"
+    assert server._onboard_guide_capsule_projection_identity(
+        current_projection
+    )["terminal"] is True
+    monkeypatch.setattr(
+        server,
+        "_onboard_guide_capsule_current_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(current_projection),
+    )
+
+    fetched = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": compact["guide_capsule_ref"],
+                "sections": ["action_input"],
+                "backlog_id": context.backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "task_id": str(compact.get("selected_task_id") or ""),
+            },
+        )
+    )
+
+    assert fetched["ok"] is True, fetched
+    executable = fetched["sections"]["action_input"][
+        "canonical_executable_action"
+    ]
+    assert executable["mcp_tool"] == "backlog_audit_archive"
+    assert executable["copy_safe_body"] == action["copy_safe_body"]
+    assert fetched["authorizes_write"] is False
+    assert fetched["satisfies_gate"] is False
+    assert fetched["synthesizes_pass"] is False
+
+    transitioned = copy.deepcopy(current_projection)
+    transitioned["next_legal_action"] = {
+        **transitioned["next_legal_action"],
+        "terminal": False,
+    }
+    monkeypatch.setattr(
+        server,
+        "_onboard_guide_capsule_current_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(transitioned),
+    )
+    stale = server._onboard_guide_capsule_validate_current_projection(
+        conn,
+        project_id=PID,
+        guide_capsule_ref=compact["guide_capsule_ref"],
+    )
+    assert stale["status"] == "refresh_required"
+    assert stale["reason"] == "guide_capsule_stale_runtime_transition"
+    assert "terminal" in stale["mismatched_fields"]
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
