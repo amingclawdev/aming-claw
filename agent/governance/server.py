@@ -131149,6 +131149,160 @@ def _mf_batch_irreversible_runtime_audit_terminal_authority(
     }
 
 
+def _mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    preferred_record: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Select the one current MF runtime before projecting audit terminal."""
+
+    from . import task_timeline
+
+    current_projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    current_execution_id = str(
+        current_projection.get("current_contract_execution_id") or ""
+    ).strip()
+    contract_chain_id = str(
+        current_projection.get("contract_chain_id") or ""
+    ).strip()
+    active_chain = (
+        current_projection.get("active_chain")
+        if isinstance(current_projection.get("active_chain"), Mapping)
+        else {}
+    )
+    active_execution_ids = [
+        str(item or "").strip()
+        for item in active_chain.get("execution_ids") or []
+        if str(item or "").strip()
+    ]
+    if (
+        str(current_projection.get("project_id") or "") != project_id
+        or str(current_projection.get("backlog_id") or "") != backlog_id
+        or not current_execution_id
+        or not contract_chain_id
+        or current_execution_id not in active_execution_ids
+        or active_execution_ids.count(current_execution_id) != 1
+    ):
+        return {}
+
+    try:
+        records = _contract_runtime_store(conn).list_by_backlog(
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    except ContractRuntimeError:
+        return {}
+    current_records = [
+        dict(record)
+        for record in records
+        if isinstance(record, Mapping)
+        and str(record.get("project_id") or "") == project_id
+        and str(record.get("backlog_id") or "") == backlog_id
+        and str(record.get("contract_execution_id") or "").strip()
+        == current_execution_id
+        and str(record.get("contract_chain_id") or "").strip()
+        == contract_chain_id
+        and _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+    ]
+    if len(current_records) != 1:
+        candidate = (
+            dict(preferred_record)
+            if isinstance(preferred_record, Mapping)
+            else {}
+        )
+        if (
+            len(current_records) == 0
+            and str(candidate.get("project_id") or "") == project_id
+            and str(candidate.get("backlog_id") or "") == backlog_id
+            and str(candidate.get("contract_execution_id") or "").strip()
+            == current_execution_id
+            and str(candidate.get("contract_chain_id") or "").strip()
+            == contract_chain_id
+            and _is_mf_parallel_record_contract_id(
+                str(candidate.get("contract_id") or "")
+            )
+        ):
+            current_records = [candidate]
+        else:
+            return {}
+
+    action = _mf_batch_irreversible_runtime_audit_terminal_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        record=current_records[0],
+    )
+    authority = (
+        action.get("irreversible_runtime_audit_terminal_authority")
+        if isinstance(
+            action.get("irreversible_runtime_audit_terminal_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    if not action or not authority:
+        return {}
+    if str(authority.get("contract_execution_id") or "") != (
+        current_execution_id
+    ):
+        return {}
+
+    selection_authority = {
+        "schema_version": (
+            "mf_batch.irreversible_runtime_current_lineage_selection.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_chain_id": contract_chain_id,
+        "current_contract_execution_id": current_execution_id,
+        "selected_contract_execution_id": current_execution_id,
+        "selected_runtime_context_id": str(
+            authority.get("runtime_context_id") or ""
+        ),
+        "runtime_record_count": len(records),
+        "current_runtime_record_count": len(current_records),
+        "selection_source": "backlog_contract_chain_current+ContractRuntime",
+        "unique": True,
+        "historical_runtime_contexts_ignored": True,
+    }
+    resealed_authority = (
+        task_timeline.source_backed_irreversible_runtime_audit_terminal_authority(
+            {
+                key: value
+                for key, value in authority.items()
+                if key
+                not in {
+                    "schema_version",
+                    "server_derived",
+                    "caller_claims_trusted",
+                    "authority_hash",
+                }
+            }
+            | {"current_lineage_selection": selection_authority}
+        )
+    )
+    if not task_timeline._irreversible_runtime_audit_terminal_authority_valid(
+        resealed_authority
+    ):
+        return {}
+    return {
+        **dict(action),
+        "irreversible_runtime_audit_terminal_authority": resealed_authority,
+        "current_lineage_selection": selection_authority,
+    }
+
+
 def _direct_main_cross_contract_transition_input(
     body: Mapping[str, Any],
     metadata: Mapping[str, Any],
@@ -140084,15 +140238,14 @@ def _onboard_route_guide_service_response(
             )
         except ContractRuntimeError:
             terminal_record = {}
-        if terminal_record:
-            irreversible_runtime_terminal_action = (
-                _mf_batch_irreversible_runtime_audit_terminal_authority(
-                    conn,
-                    project_id=project_id,
-                    backlog_id=backlog_id,
-                    record=terminal_record,
-                )
+        irreversible_runtime_terminal_action = (
+            _mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                preferred_record=terminal_record,
             )
+        )
     if irreversible_runtime_terminal_action:
         next_action = dict(irreversible_runtime_terminal_action)
         current_projection = {
@@ -174254,14 +174407,12 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
             except ContractRuntimeError:
                 terminal_record = {}
             terminal_action = (
-                _mf_batch_irreversible_runtime_audit_terminal_authority(
+                _mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
                     conn,
                     project_id=pid,
                     backlog_id=bug_id,
-                    record=terminal_record,
+                    preferred_record=terminal_record,
                 )
-                if terminal_record
-                else {}
             )
             terminal_authority = (
                 terminal_action.get(
@@ -175563,15 +175714,14 @@ def handle_backlog_audit_archive(ctx: RequestContext):
                 )
             except ContractRuntimeError:
                 current_record = {}
-            if current_record:
-                irreversible_runtime_authority_action = (
-                    _mf_batch_irreversible_runtime_audit_terminal_authority(
-                        conn,
-                        project_id=pid,
-                        backlog_id=bug_id,
-                        record=current_record,
-                    )
+            irreversible_runtime_authority_action = (
+                _mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
+                    conn,
+                    project_id=pid,
+                    backlog_id=bug_id,
+                    preferred_record=current_record,
                 )
+            )
         payload = _build_backlog_audit_archive_payload(
             project_id=pid,
             bug_id=bug_id,

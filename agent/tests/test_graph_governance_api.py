@@ -131933,6 +131933,151 @@ def test_irreversible_runtime_audit_terminal_projects_one_copy_safe_waive_body(
     assert "\n".join(conn.iterdump()) == before_dump
 
 
+def test_irreversible_runtime_audit_terminal_selects_unique_current_lineage(
+    conn,
+    monkeypatch,
+):
+    record, context, _route_identity, _state, _eligibility, _failed_qa = (
+        _irreversible_runtime_audit_terminal_fixture(monkeypatch)
+    )
+    contract_chain_id = "cchain-irreversible-runtime-audit-terminal"
+    record["contract_chain_id"] = contract_chain_id
+    historical = {
+        **copy.deepcopy(record),
+        "contract_execution_id": "cex-historical-irreversible-runtime",
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_chain_current_projection",
+        lambda *_args, **_kwargs: {
+            "project_id": PID,
+            "backlog_id": context.backlog_id,
+            "contract_chain_id": contract_chain_id,
+            "current_contract_execution_id": record[
+                "contract_execution_id"
+            ],
+            "active_chain": {
+                "execution_ids": [record["contract_execution_id"]],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(
+            list_by_backlog=lambda **_kwargs: [
+                copy.deepcopy(historical),
+                copy.deepcopy(record),
+            ]
+        ),
+    )
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    action = (
+        server._mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
+            conn,
+            project_id=PID,
+            backlog_id=context.backlog_id,
+            preferred_record=historical,
+        )
+    )
+
+    assert action["action"] == "backlog_audit_archive"
+    selection = action["current_lineage_selection"]
+    assert selection["server_derived"] is True
+    assert selection["caller_claims_trusted"] is False
+    assert selection["contract_chain_id"] == contract_chain_id
+    assert selection["current_contract_execution_id"] == (
+        record["contract_execution_id"]
+    )
+    assert selection["selected_contract_execution_id"] == (
+        record["contract_execution_id"]
+    )
+    assert selection["runtime_record_count"] == 2
+    assert selection["current_runtime_record_count"] == 1
+    assert selection["historical_runtime_contexts_ignored"] is True
+    authority = action[
+        "irreversible_runtime_audit_terminal_authority"
+    ]
+    assert authority["current_lineage_selection"] == selection
+    assert task_timeline._irreversible_runtime_audit_terminal_authority_valid(
+        authority
+    ) is True
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_current",
+        "duplicate_active_identity",
+        "ambiguous_current_record",
+        "wrong_chain",
+        "wrong_backlog",
+    ],
+)
+def test_irreversible_runtime_audit_terminal_current_lineage_controls_fail_closed(
+    conn,
+    monkeypatch,
+    mutation,
+):
+    record, context, _route_identity, _state, _eligibility, _failed_qa = (
+        _irreversible_runtime_audit_terminal_fixture(monkeypatch)
+    )
+    contract_chain_id = "cchain-irreversible-runtime-audit-terminal"
+    record["contract_chain_id"] = contract_chain_id
+    projection = {
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "contract_chain_id": contract_chain_id,
+        "current_contract_execution_id": record["contract_execution_id"],
+        "active_chain": {
+            "execution_ids": [record["contract_execution_id"]],
+        },
+    }
+    records = [copy.deepcopy(record)]
+    if mutation == "missing_current":
+        projection["current_contract_execution_id"] = ""
+    elif mutation == "duplicate_active_identity":
+        projection["active_chain"]["execution_ids"].append(
+            record["contract_execution_id"]
+        )
+    elif mutation == "ambiguous_current_record":
+        records.append(copy.deepcopy(record))
+    elif mutation == "wrong_chain":
+        records[0]["contract_chain_id"] = "cchain-cross-scope"
+    elif mutation == "wrong_backlog":
+        projection["backlog_id"] = "AC-CROSS-SCOPE"
+    monkeypatch.setattr(
+        server,
+        "_contract_chain_current_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(projection),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(
+            list_by_backlog=lambda **_kwargs: copy.deepcopy(records)
+        ),
+    )
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    assert (
+        server._mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
+            conn,
+            project_id=PID,
+            backlog_id=context.backlog_id,
+            preferred_record={},
+        )
+        == {}
+    )
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
