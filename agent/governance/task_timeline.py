@@ -10783,6 +10783,13 @@ def _cross_ref_merge_public_route_scope(
     return merged
 
 
+def _cross_ref_complete_route_scope(identity: Mapping[str, Any]) -> bool:
+    return all(
+        str(identity.get(field) or "").strip()
+        for field in MF_CROSS_REF_ROUTE_SCOPE_FIELDS
+    )
+
+
 def _cross_ref_live_parent_route_filters(
     route_context_gate: Mapping[str, Any],
 ) -> list[dict[str, str]]:
@@ -10878,11 +10885,76 @@ def _cross_ref_server_projected_parent_route_scope(
         parent_scope = _cross_ref_public_route_scope(
             accepted_lineage.get("parent_route_identity") or parent_identity
         )
-        if not any(
+        direct_parent_match = any(
             _route_identity_matches_filter(parent_scope, parent_filter)
             for parent_filter in trusted_parent_filters
-        ):
-            continue
+        )
+        if not direct_parent_match:
+            renewal = _mapping(lineage.get("route_token_ref_renewal_chain"))
+            predecessor = _cross_ref_public_route_scope(
+                renewal.get("canonical_predecessor_route_identity") or {}
+            )
+            current = _cross_ref_public_route_scope(
+                renewal.get("current_route_identity") or {}
+            )
+            common_parent = _cross_ref_public_route_scope(
+                renewal.get("common_parent_route_identity") or {}
+            )
+            chain_refs = [
+                str(item or "").strip()
+                for item in (renewal.get("route_token_ref_chain") or [])
+                if str(item or "").strip()
+            ]
+            edge_types = [
+                str(item or "").strip()
+                for item in (renewal.get("edge_types") or [])
+                if str(item or "").strip()
+            ]
+            source = _route_marker(renewal.get("source"))
+            predecessor_matches_filter = any(
+                _route_identity_matches_filter(predecessor, parent_filter)
+                for parent_filter in trusted_parent_filters
+            )
+            renewal_valid = bool(
+                renewal.get("schema_version")
+                == "server_route_action_scope_renewal_chain.v1"
+                and _truthy(renewal.get("accepted"))
+                and _truthy(renewal.get("server_projected"))
+                and _truthy(renewal.get("registry_verified"))
+                and _truthy(renewal.get("exact_scope_verified"))
+                and _truthy(renewal.get("same_parent_verified"))
+                and _truthy(renewal.get("authority_unchanged"))
+                and renewal.get("historical_event_rewritten") is False
+                and renewal.get("writes_performed") is False
+                and renewal.get("raw_route_token_exposed") is False
+                and source == "server_timeline_precheck_registry_renewal_chain"
+                and _cross_ref_complete_route_scope(predecessor)
+                and _cross_ref_complete_route_scope(current)
+                and _cross_ref_complete_route_scope(common_parent)
+                and _route_identity_matches_filter(
+                    predecessor,
+                    accepted_lineage.get("child_route_identity") or {},
+                )
+                and _route_identity_matches_filter(
+                    common_parent,
+                    accepted_lineage.get("parent_route_identity") or {},
+                )
+                and predecessor_matches_filter
+                and current
+                and len(chain_refs) >= 2
+                and chain_refs[0] == route_token_ref
+                and chain_refs[0] == predecessor.get("route_token_ref")
+                and chain_refs[-1] == current.get("route_token_ref")
+                and str(renewal.get("requested_route_token_ref") or "").strip()
+                == chain_refs[0]
+                and str(renewal.get("resolved_route_token_ref") or "").strip()
+                == chain_refs[-1]
+                and len(edge_types) == len(chain_refs) - 1
+                and all(edge == "renewal" for edge in edge_types)
+            )
+            if not renewal_valid:
+                continue
+            parent_scope = common_parent
         selected = parent_scope
     return selected
 

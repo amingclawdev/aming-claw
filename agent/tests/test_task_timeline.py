@@ -19260,6 +19260,202 @@ def test_cross_ref_accepts_registry_backed_route_token_child_lineage_without_bri
     ]
 
 
+def _attach_server_renewal_chain(
+    event,
+    *,
+    predecessor,
+    current,
+    common_parent,
+    tamper=None,
+):
+    event = _attach_server_action_scope_route_token_lineage(
+        copy.deepcopy(event),
+        predecessor,
+        parent_identity=common_parent,
+        route_token_ref=predecessor["route_token_ref"],
+        acceptance_source="server_route_token_action_scope",
+    )
+    renewal = {
+        "schema_version": "server_route_action_scope_renewal_chain.v1",
+        "accepted": True,
+        "status": "accepted",
+        "source": "server_timeline_precheck_registry_renewal_chain",
+        "projected_by": "server_timeline_precheck_enrichment",
+        "server_projected": True,
+        "registry_verified": True,
+        "exact_scope_verified": True,
+        "same_parent_verified": True,
+        "authority_unchanged": True,
+        "historical_event_rewritten": False,
+        "writes_performed": False,
+        "raw_route_token_exposed": False,
+        "requested_route_token_ref": predecessor["route_token_ref"],
+        "resolved_route_token_ref": current["route_token_ref"],
+        "route_token_ref_chain": [
+            predecessor["route_token_ref"],
+            current["route_token_ref"],
+        ],
+        "edge_types": ["renewal"],
+        "canonical_predecessor_route_identity": predecessor,
+        "current_route_identity": current,
+        "common_parent_route_identity": common_parent,
+        "scope": {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-ROUTE-TOKEN-CHILD",
+            "task_id": "worker-a-task",
+        },
+        "caller_role": "observer",
+        "allowed_actions": ["task_timeline_append"],
+        "target_files": ["agent/governance/server.py"],
+        "owned_files": ["agent/governance/server.py"],
+    }
+    if tamper:
+        tamper(renewal)
+    event["payload"]["route_action_scope_lineage"][
+        "projected_by"
+    ] = "server_timeline_precheck_enrichment"
+    event["payload"]["route_action_scope_lineage"][
+        "route_token_ref_renewal_chain"
+    ] = renewal
+    return event
+
+
+def test_cross_ref_accepts_server_projected_registry_renewal_common_parent():
+    from agent.governance import task_timeline
+
+    row_identity, route_context_gate, _cleanup, _root_close, worker = (
+        _cross_ref_unproven_child_route_fixture()
+    )
+    predecessor = {
+        field: worker["payload"][field]
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+            "route_token_ref",
+        )
+    }
+    current = {
+        "route_id": "route-worker-a-current",
+        "route_context_hash": _fake_sha("worker-a-current-route-context"),
+        "prompt_contract_id": "rprompt-worker-a-current",
+        "prompt_contract_hash": _fake_sha("worker-a-current-prompt"),
+        "visible_injection_manifest_hash": _fake_sha("worker-a-current-visible"),
+        "route_token_ref": "rtok-worker-a-current",
+    }
+    common_parent = {
+        "route_id": "route-worker-common-parent",
+        "route_context_hash": _fake_sha("worker-common-parent-context"),
+        "prompt_contract_id": "rprompt-worker-common-parent",
+        "prompt_contract_hash": _fake_sha("worker-common-parent-prompt"),
+        "visible_injection_manifest_hash": _fake_sha("worker-common-parent-visible"),
+        "route_token_ref": "rtok-worker-common-parent",
+    }
+    route_context_gate["route_identity"] = predecessor
+    worker = _attach_server_renewal_chain(
+        worker,
+        predecessor=predecessor,
+        current=current,
+        common_parent=common_parent,
+    )
+    raw_fence = worker["payload"].pop("fence_token")
+    worker["payload"]["fence_token_hash"] = _fake_sha(raw_fence)
+    worker["payload"]["fence_token_redacted"] = True
+
+    parent_scope = task_timeline._cross_ref_server_projected_parent_route_scope(
+        [worker],
+        route_context_gate,
+        row_anchor=row_identity,
+    )
+    diagnosis = task_timeline._cross_ref_route_token_child_lineage_diagnosis(
+        worker,
+        {
+            **row_identity,
+            "command": "cmd-root-route",
+        },
+        parent_scope,
+    )
+
+    assert parent_scope == common_parent
+    assert diagnosis["accepted"] is True
+    assert diagnosis["registry_verified"] is True
+    assert diagnosis["missing_fields"] == []
+    assert task_timeline._route_identity_matches_filter(
+        common_parent,
+        diagnosis["server_lineage"]["parent_route_identity"],
+    )
+    assert task_timeline._route_identity_matches_filter(
+        predecessor,
+        diagnosis["server_lineage"]["child_route_identity"],
+    )
+
+
+def test_cross_ref_rejects_forged_or_mismatched_registry_renewal_chain():
+    tampers = [
+        lambda proof: proof.update(server_projected=False),
+        lambda proof: proof.update(registry_verified=False),
+        lambda proof: proof.update(authority_unchanged=False),
+        lambda proof: proof.update(writes_performed=True),
+        lambda proof: proof.update(edge_types=["same_scope_reissue"]),
+        lambda proof: proof["canonical_predecessor_route_identity"].update(
+            route_context_hash=_fake_sha("forged-predecessor")
+        ),
+        lambda proof: proof["common_parent_route_identity"].update(
+            route_context_hash=_fake_sha("wrong-common-parent")
+        ),
+        lambda proof: proof.update(route_token_ref_chain=["rtok-forged"]),
+    ]
+    from agent.governance import task_timeline
+
+    for tamper in tampers:
+        row_identity, route_context_gate, _cleanup, _root_close, worker = (
+            _cross_ref_unproven_child_route_fixture()
+        )
+        predecessor = {
+            field: worker["payload"][field]
+            for field in (
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "visible_injection_manifest_hash",
+                "route_token_ref",
+            )
+        }
+        current = {
+            **predecessor,
+            "route_id": "route-worker-a-current-negative",
+            "route_context_hash": _fake_sha("worker-a-current-negative"),
+            "prompt_contract_id": "rprompt-worker-a-current-negative",
+            "route_token_ref": "rtok-worker-a-current-negative",
+        }
+        common_parent = {
+            **predecessor,
+            "route_id": "route-worker-common-parent-negative",
+            "route_context_hash": _fake_sha("worker-common-parent-negative"),
+            "prompt_contract_id": "rprompt-worker-common-parent-negative",
+            "route_token_ref": "rtok-worker-common-parent-negative",
+        }
+        route_context_gate["route_identity"] = predecessor
+        worker = _attach_server_renewal_chain(
+            worker,
+            predecessor=predecessor,
+            current=current,
+            common_parent=common_parent,
+            tamper=tamper,
+        )
+
+        parent_scope = task_timeline._cross_ref_server_projected_parent_route_scope(
+            [worker],
+            route_context_gate,
+            row_anchor=row_identity,
+        )
+
+        assert parent_scope == {}
+
+
 def test_cross_ref_accepts_registry_child_lineage_with_observer_parent_task_scope():
     from agent.governance import task_timeline
 

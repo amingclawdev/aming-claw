@@ -180797,6 +180797,231 @@ def _route_lineage_enrichment_event_ref(event: Mapping[str, Any]) -> dict[str, A
     }
 
 
+_ROUTE_REGISTRY_IDENTITY_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+
+
+def _route_registry_json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _route_registry_row_identity(row: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        field: str(row.get(field) or "").strip()
+        for field in _ROUTE_REGISTRY_IDENTITY_FIELDS
+    }
+
+
+def _route_registry_identity_exact(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    return all(
+        str(actual.get(field) or "").strip()
+        and str(actual.get(field) or "").strip()
+        == str(expected.get(field) or "").strip()
+        for field in _ROUTE_REGISTRY_IDENTITY_FIELDS
+    )
+
+
+def _route_registry_renewal_chain_projection(
+    conn,
+    *,
+    project_id: str,
+    event: Mapping[str, Any],
+    requested_route_token_ref: str,
+    resolved: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bind a strict renewal descendant to its immutable predecessor event.
+
+    The existing registry resolver proves the unique active descendant and the
+    exact role/action/file/scope fence.  This read-only companion verifies that
+    every registry row also keeps one byte-equivalent public parent identity,
+    then projects the historical predecessor together with the current child.
+    It never rewrites the persisted timeline event or route-token registry.
+    """
+
+    renewal = (
+        dict(resolved.get("renewal_resolution") or {})
+        if isinstance(resolved.get("renewal_resolution"), Mapping)
+        else {}
+    )
+    chain_refs = [
+        str(item or "").strip()
+        for item in (renewal.get("route_token_ref_chain") or [])
+        if str(item or "").strip()
+    ]
+    edge_types = [
+        str(item or "").strip()
+        for item in (renewal.get("edge_types") or [])
+        if str(item or "").strip()
+    ]
+    current_ref = str(renewal.get("resolved_route_token_ref") or "").strip()
+    if not (
+        renewal.get("schema_version")
+        == "route_token_ref_exact_renewal_descendant_resolution.v1"
+        and renewal.get("status") == "resolved_active_descendant"
+        and renewal.get("registry_verified") is True
+        and renewal.get("exact_scope_verified") is True
+        and renewal.get("writes_performed") is False
+        and renewal.get("raw_route_token_exposed") is False
+        and len(chain_refs) >= 2
+        and chain_refs[0] == requested_route_token_ref
+        and chain_refs[-1] == current_ref
+        and len(edge_types) == len(chain_refs) - 1
+        and all(edge == "renewal" for edge in edge_types)
+    ):
+        return {}, {}
+
+    placeholders = ",".join("?" for _ in chain_refs)
+    registry_rows = conn.execute(
+        f"""
+        SELECT project_id, route_token_ref, route_id, route_context_hash,
+               prompt_contract_id, prompt_contract_hash,
+               visible_injection_manifest_hash, backlog_id, task_id,
+               caller_role, allowed_actions_json, target_files_json,
+               owned_files_json, scope_json, parent_route_lineage_json,
+               child_route_lineage_json, status
+          FROM observer_route_token_refs
+         WHERE project_id=? AND route_token_ref IN ({placeholders})
+        """,
+        (project_id, *chain_refs),
+    ).fetchall()
+    rows_by_ref = {
+        str(dict(row).get("route_token_ref") or "").strip(): dict(row)
+        for row in registry_rows
+    }
+    if set(rows_by_ref) != set(chain_refs):
+        return {}, {}
+    ordered_rows = [rows_by_ref[route_ref] for route_ref in chain_refs]
+    if any(
+        str(row.get("status") or "").strip()
+        != ("active" if index == len(ordered_rows) - 1 else "superseded")
+        for index, row in enumerate(ordered_rows)
+    ):
+        return {}, {}
+
+    predecessor_identity = _route_registry_row_identity(ordered_rows[0])
+    current_identity = _route_registry_row_identity(ordered_rows[-1])
+    requested_resolution_identity = renewal.get("requested_route_identity")
+    current_resolution_identity = renewal.get("resolved_route_identity")
+    if not (
+        isinstance(requested_resolution_identity, Mapping)
+        and isinstance(current_resolution_identity, Mapping)
+        and _route_registry_identity_exact(
+            requested_resolution_identity,
+            predecessor_identity,
+        )
+        and _route_registry_identity_exact(
+            current_resolution_identity,
+            current_identity,
+        )
+    ):
+        return {}, {}
+
+    event_identity = {
+        field: (
+            requested_route_token_ref
+            if field == "route_token_ref"
+            else _route_request_identity_value(event, field)
+        )
+        for field in _ROUTE_REGISTRY_IDENTITY_FIELDS
+    }
+    if not _route_registry_identity_exact(event_identity, predecessor_identity):
+        return {}, {}
+
+    parent_identities: list[dict[str, Any]] = []
+    child_identities: list[dict[str, Any]] = []
+    for row in ordered_rows:
+        parent = _route_registry_json_mapping(row.get("parent_route_lineage_json"))
+        child = _route_registry_json_mapping(row.get("child_route_lineage_json"))
+        row_identity = _route_registry_row_identity(row)
+        if not parent or not child or not _route_registry_identity_exact(
+            child,
+            row_identity,
+        ):
+            return {}, {}
+        parent_identities.append(parent)
+        child_identities.append(child)
+    common_parent = _route_identity_public_summary(parent_identities[0])
+    if not common_parent or any(
+        not _route_registry_identity_exact(parent, common_parent)
+        for parent in parent_identities
+    ):
+        return {}, {}
+
+    active_parent = resolved.get("parent_route_lineage")
+    active_child = resolved.get("child_route_lineage")
+    if not (
+        isinstance(active_parent, Mapping)
+        and isinstance(active_child, Mapping)
+        and _route_registry_identity_exact(active_parent, common_parent)
+        and _route_registry_identity_exact(active_child, current_identity)
+    ):
+        return {}, {}
+
+    def string_list(row: Mapping[str, Any], field: str) -> list[str]:
+        try:
+            parsed = json.loads(str(row.get(field) or "[]"))
+        except (TypeError, ValueError):
+            parsed = []
+        return sorted(
+            {
+                str(item or "").strip()
+                for item in (parsed if isinstance(parsed, list) else [])
+                if str(item or "").strip()
+            }
+        )
+
+    projection = {
+        "schema_version": "server_route_action_scope_renewal_chain.v1",
+        "accepted": True,
+        "status": "accepted",
+        "source": "server_timeline_precheck_registry_renewal_chain",
+        "projected_by": "server_timeline_precheck_enrichment",
+        "server_projected": True,
+        "registry_verified": True,
+        "exact_scope_verified": True,
+        "same_parent_verified": True,
+        "authority_unchanged": True,
+        "historical_event_rewritten": False,
+        "writes_performed": False,
+        "raw_route_token_exposed": False,
+        "requested_route_token_ref": requested_route_token_ref,
+        "resolved_route_token_ref": current_ref,
+        "route_token_ref_chain": chain_refs,
+        "edge_types": edge_types,
+        "canonical_predecessor_route_identity": predecessor_identity,
+        "current_route_identity": current_identity,
+        "common_parent_route_identity": common_parent,
+        "scope": dict(renewal.get("scope") or {}),
+        "caller_role": str(ordered_rows[-1].get("caller_role") or "").strip(),
+        "allowed_actions": string_list(ordered_rows[-1], "allowed_actions_json"),
+        "target_files": string_list(ordered_rows[-1], "target_files_json"),
+        "owned_files": string_list(ordered_rows[-1], "owned_files_json"),
+    }
+    predecessor_resolved = dict(resolved)
+    predecessor_resolved.update(predecessor_identity)
+    predecessor_resolved["parent_route_lineage"] = dict(parent_identities[0])
+    predecessor_resolved["child_route_lineage"] = dict(child_identities[0])
+    predecessor_resolved["route_token_ref_renewal_chain"] = projection
+    return predecessor_resolved, projection
+
+
 def _enrich_timeline_events_with_route_token_lineage(
     conn,
     *,
@@ -180865,16 +181090,42 @@ def _enrich_timeline_events_with_route_token_lineage(
             })
             enriched_rows.append(event)
             continue
+        renewal_projection: dict[str, Any] = {}
         try:
-            resolved = _orc.resolve_route_token_ref(
+            resolved = _orc.resolve_route_token_ref_renewal_descendant(
                 conn,
                 project_id=project_id,
                 route_token_ref=route_token_ref,
-                backlog_id=str(event.get("backlog_id") or ""),
-                route_id=route_id,
-                route_context_hash=route_context_hash,
-                prompt_contract_id=prompt_contract_id,
             )
+            renewal = (
+                resolved.get("renewal_resolution")
+                if isinstance(resolved, Mapping)
+                else None
+            )
+            if isinstance(renewal, Mapping):
+                resolved, renewal_projection = (
+                    _route_registry_renewal_chain_projection(
+                        conn,
+                        project_id=project_id,
+                        event=event,
+                        requested_route_token_ref=route_token_ref,
+                        resolved=resolved,
+                    )
+                )
+                if not resolved or not renewal_projection:
+                    raise _orc.RouteTokenRefError(
+                        "route-token renewal registry parent chain is not canonical"
+                    )
+            elif resolved:
+                resolved = _orc.resolve_route_token_ref(
+                    conn,
+                    project_id=project_id,
+                    route_token_ref=route_token_ref,
+                    backlog_id=str(event.get("backlog_id") or ""),
+                    route_id=route_id,
+                    route_context_hash=route_context_hash,
+                    prompt_contract_id=prompt_contract_id,
+                )
         except _orc.RouteTokenRefError as exc:
             payload["route_action_scope_lineage_resolution"] = {
                 "schema_version": "server_route_lineage_resolution.v1",
@@ -180953,11 +181204,18 @@ def _enrich_timeline_events_with_route_token_lineage(
         if lineage:
             lineage = dict(lineage)
             lineage["projected_by"] = "server_timeline_precheck_enrichment"
+            if renewal_projection:
+                lineage["route_token_ref_renewal_chain"] = renewal_projection
             payload["route_action_scope_lineage"] = lineage
             payload["route_action_scope_lineage_resolution"] = {
                 "schema_version": "server_route_lineage_resolution.v1",
                 "status": "passed",
                 "route_token_ref": route_token_ref,
+                **(
+                    {"route_token_ref_renewal_chain": renewal_projection}
+                    if renewal_projection
+                    else {}
+                ),
             }
             event["payload"] = payload
             enriched_events.append({

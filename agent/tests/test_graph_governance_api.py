@@ -120204,6 +120204,259 @@ def test_server_route_token_ref_enrichment_rejects_route_id_mismatch(conn):
     assert payload["route_action_scope_lineage_resolution"]["status"] == "failed"
 
 
+def test_timeline_precheck_enriches_superseded_child_with_exact_renewal_chain(conn):
+    from agent.governance import observer_route_context
+
+    backlog_id = "AC-PRECHECK-SUPERSEDED-CHILD-RENEWAL"
+    task_id = "precheck-superseded-child-task"
+    parent_issue, child_issue, parent_identity, child_identity = (
+        _issue_parent_child_route_refs(
+            conn,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    )
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_issue["route_token_ref"],
+        backlog_id=backlog_id,
+        task_id=task_id,
+        caller_role="observer",
+        allowed_actions=["task_timeline_append"],
+        target_files=["agent/governance/server.py"],
+        owned_files=["agent/governance/server.py"],
+        evidence_refs=["test:precheck-superseded-child-renewal"],
+        now=datetime(2098, 1, 1, tzinfo=timezone.utc),
+    )
+    current_identity = dict(renewed["route_identity"])
+    event = {
+        "id": 42,
+        "event_type": "implementation",
+        "event_kind": "implementation",
+        "phase": "implementation",
+        "status": "passed",
+        "backlog_id": backlog_id,
+        "project_id": PID,
+        "task_id": task_id,
+        "payload": {
+            **child_identity,
+            "parent_task_id": backlog_id,
+            "runtime_context_id": f"mfrctx-{task_id}",
+            "worker_slot_id": f"slot-{task_id}",
+            "fence_token_hash": _fake_sha(f"fence-{task_id}"),
+            "fence_token_redacted": True,
+            "observer_command_id": f"cmd-{backlog_id}",
+            "allowed_action": "task_timeline_append",
+        },
+    }
+    current_event = copy.deepcopy(event)
+    current_event["id"] = 52
+    current_event["payload"].update(current_identity)
+    registry_before = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=? ORDER BY route_token_ref",
+            (PID,),
+        ).fetchall()
+    ]
+    total_changes_before = conn.total_changes
+
+    enriched, report = server._enrich_timeline_events_with_route_token_lineage(
+        conn,
+        project_id=PID,
+        events=[event, current_event],
+    )
+
+    assert report["enriched_event_count"] == 2
+    assert report["failed_event_count"] == 0
+    lineage = enriched[0]["payload"]["route_action_scope_lineage"]
+    assert lineage["parent_route_identity"]["route_token_ref"] == (
+        parent_issue["route_token_ref"]
+    )
+    assert lineage["child_route_identity"] == child_identity
+    proof = lineage["route_token_ref_renewal_chain"]
+    assert proof["canonical_predecessor_route_identity"] == child_identity
+    assert proof["current_route_identity"] == current_identity
+    assert proof["common_parent_route_identity"] == parent_identity
+    assert proof["route_token_ref_chain"] == [
+        child_issue["route_token_ref"],
+        renewed["route_token_ref"],
+    ]
+    assert proof["edge_types"] == ["renewal"]
+    assert proof["authority_unchanged"] is True
+    assert proof["historical_event_rewritten"] is False
+    assert proof["writes_performed"] is False
+    assert proof["raw_route_token_exposed"] is False
+    current_lineage = enriched[1]["payload"]["route_action_scope_lineage"]
+    assert "route_token_ref_renewal_chain" not in current_lineage
+    assert current_lineage["parent_route_identity"] == parent_identity
+    assert current_lineage["child_route_identity"] == current_identity
+    route_context_gate = {"passed": True, "route_identity": child_identity}
+    parent_scope = task_timeline._cross_ref_server_projected_parent_route_scope(
+        enriched,
+        route_context_gate,
+        row_anchor={"backlog_id": backlog_id, "project_id": PID},
+    )
+    assert parent_scope == parent_identity
+    diagnoses = [
+        task_timeline._cross_ref_route_token_child_lineage_diagnosis(
+            enriched_event,
+            {
+                "backlog_id": backlog_id,
+                "project_id": PID,
+                "command": f"cmd-{backlog_id}",
+            },
+            parent_scope,
+        )
+        for enriched_event in enriched
+    ]
+    assert [diagnosis["accepted"] for diagnosis in diagnoses] == [True, True]
+    assert event["payload"] == {
+        **child_identity,
+        "parent_task_id": backlog_id,
+        "runtime_context_id": f"mfrctx-{task_id}",
+        "worker_slot_id": f"slot-{task_id}",
+        "fence_token_hash": _fake_sha(f"fence-{task_id}"),
+        "fence_token_redacted": True,
+        "observer_command_id": f"cmd-{backlog_id}",
+        "allowed_action": "task_timeline_append",
+    }
+    assert conn.total_changes == total_changes_before
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=? ORDER BY route_token_ref",
+            (PID,),
+        ).fetchall()
+    ] == registry_before
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "wrong_common_parent",
+        "missing_active_descendant",
+        "ambiguous_active_descendant",
+    ],
+)
+def test_timeline_precheck_superseded_child_renewal_fails_closed(conn, tamper):
+    from agent.governance import observer_route_context
+
+    backlog_id = f"AC-PRECHECK-RENEWAL-FAIL-{tamper.upper()}"
+    task_id = f"precheck-renewal-fail-{tamper}"
+    _, child_issue, _, child_identity = _issue_parent_child_route_refs(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=child_issue["route_token_ref"],
+        backlog_id=backlog_id,
+        task_id=task_id,
+        caller_role="observer",
+        allowed_actions=["task_timeline_append"],
+        target_files=["agent/governance/server.py"],
+        owned_files=["agent/governance/server.py"],
+        now=datetime(2098, 1, 1, tzinfo=timezone.utc),
+    )
+    if tamper == "wrong_common_parent":
+        row = conn.execute(
+            "SELECT parent_route_lineage_json FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=?",
+            (PID, renewed["route_token_ref"]),
+        ).fetchone()
+        wrong_parent = json.loads(row["parent_route_lineage_json"])
+        wrong_parent["route_context_hash"] = _fake_sha("wrong-common-parent")
+        conn.execute(
+            "UPDATE observer_route_token_refs SET parent_route_lineage_json=? "
+            "WHERE project_id=? AND route_token_ref=?",
+            (json.dumps(wrong_parent), PID, renewed["route_token_ref"]),
+        )
+    elif tamper == "missing_active_descendant":
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status='revoked' "
+            "WHERE project_id=? AND route_token_ref=?",
+            (PID, renewed["route_token_ref"]),
+        )
+    else:
+        current = conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+            (PID, renewed["route_token_ref"]),
+        ).fetchone()
+        clone = dict(current)
+        clone_ref = "rtok-ambiguous-renewal-descendant"
+        clone["route_token_ref"] = clone_ref
+        clone["route_id"] = "route-ambiguous-renewal-descendant"
+        clone["route_context_hash"] = _fake_sha("ambiguous-renewal-descendant")
+        clone["prompt_contract_id"] = "rprompt-ambiguous-renewal-descendant"
+        clone["prompt_contract_hash"] = _fake_sha("ambiguous-renewal-prompt")
+        clone["visible_injection_manifest_hash"] = _fake_sha("ambiguous-renewal-visible")
+        route_lineage = json.loads(clone["route_lineage_json"])
+        route_lineage["renewal_proof"]["route_token_ref"] = clone_ref
+        route_lineage["renewal_proof"]["route_identity"] = {
+            field: clone[field]
+            for field in (
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "visible_injection_manifest_hash",
+                "route_token_ref",
+            )
+        }
+        clone["route_lineage_json"] = json.dumps(route_lineage)
+        columns = list(clone)
+        conn.execute(
+            f"INSERT INTO observer_route_token_refs ({','.join(columns)}) "
+            f"VALUES ({','.join('?' for _ in columns)})",
+            tuple(clone[column] for column in columns),
+        )
+    conn.commit()
+    event = {
+        "id": 42,
+        "event_type": "implementation",
+        "event_kind": "implementation",
+        "phase": "implementation",
+        "status": "passed",
+        "backlog_id": backlog_id,
+        "project_id": PID,
+        "task_id": task_id,
+        "payload": {
+            **child_identity,
+            "parent_task_id": backlog_id,
+            "runtime_context_id": f"mfrctx-{task_id}",
+            "worker_slot_id": f"slot-{task_id}",
+            "fence_token_hash": _fake_sha(f"fence-{task_id}"),
+            "fence_token_redacted": True,
+            "observer_command_id": f"cmd-{backlog_id}",
+        },
+    }
+    rows_before = conn.execute(
+        "SELECT COUNT(*) AS count FROM task_timeline_events"
+    ).fetchone()["count"]
+    total_changes_before = conn.total_changes
+
+    enriched, report = server._enrich_timeline_events_with_route_token_lineage(
+        conn,
+        project_id=PID,
+        events=[event],
+    )
+
+    assert report["enriched_event_count"] == 0
+    assert report["failed_event_count"] == 1
+    assert "route_action_scope_lineage" not in enriched[0]["payload"]
+    assert enriched[0]["payload"]["route_action_scope_lineage_resolution"][
+        "status"
+    ] == "failed"
+    assert conn.total_changes == total_changes_before
+    assert conn.execute(
+        "SELECT COUNT(*) AS count FROM task_timeline_events"
+    ).fetchone()["count"] == rows_before
+
+
 def test_timeline_append_meta_contract_allows_observer_on_behalf_worker_evidence(conn):
     backlog_id = "AC-META-CONTRACT-OBSERVER-ON-BEHALF"
     _insert_simple_mf_close_backlog(conn, backlog_id)
