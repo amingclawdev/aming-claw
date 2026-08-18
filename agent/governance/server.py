@@ -129677,6 +129677,22 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         expected_commit=commit_sha,
         field="implementation.payload.test_results",
     )
+    commit_prewrite_authority = (
+        payload.get("direct_main_implementation_commit_prewrite_authority")
+        if isinstance(
+            payload.get("direct_main_implementation_commit_prewrite_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    commit_prewrite_authority_hash = str(
+        commit_prewrite_authority.get("authority_hash") or ""
+    ).strip()
+    unsigned_commit_prewrite_authority = {
+        key: value
+        for key, value in commit_prewrite_authority.items()
+        if key != "authority_hash"
+    }
     direct_event_id = int(
         direct_event.get("id") or direct_event.get("event_id") or 0
     )
@@ -129712,6 +129728,45 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         and scope_changed_files == changed_files
         and (not scope_allowed_files or scope_allowed_files == declared_files)
         and test_results.get("passed") is True
+        and str(commit_prewrite_authority.get("schema_version") or "").strip()
+        == "parentless_direct_main.implementation_commit_prewrite_authority.v1"
+        and commit_prewrite_authority.get("server_derived") is True
+        and commit_prewrite_authority.get("passed") is True
+        and str(commit_prewrite_authority.get("status") or "").strip()
+        == "passed"
+        and str(commit_prewrite_authority.get("project_id") or "").strip()
+        == project_id
+        and str(commit_prewrite_authority.get("backlog_id") or "").strip()
+        == backlog_id
+        and str(commit_prewrite_authority.get("task_id") or "").strip()
+        == task_id
+        and str(commit_prewrite_authority.get("commit_sha") or "")
+        .strip()
+        .lower()
+        == commit_sha
+        and str(
+            commit_prewrite_authority.get("resolved_commit_sha") or ""
+        ).strip().lower()
+        == commit_sha
+        and str(
+            commit_prewrite_authority.get("canonical_head_commit") or ""
+        ).strip().lower()
+        == commit_sha
+        and commit_prewrite_authority.get("repository_root_exact") is True
+        and commit_prewrite_authority.get("git_object_exists") is True
+        and commit_prewrite_authority.get("worktree_clean") is True
+        and commit_prewrite_authority.get("route_scope_exact") is True
+        and commit_prewrite_authority.get("direct_route_identity_exact") is True
+        and int(
+            commit_prewrite_authority.get("direct_pre_mutation_event_count")
+            or 0
+        )
+        == 1
+        and str(commit_prewrite_authority.get("route_token_ref") or "").strip()
+        == str(implementation_identity.get("route_token_ref") or "").strip()
+        and commit_prewrite_authority_hash
+        and commit_prewrite_authority_hash
+        == stable_sha256(unsigned_commit_prewrite_authority)
         and _observer_root_route_identity_complete(direct_identity)
         and _observer_root_route_identity_complete(implementation_identity)
         and decision.get("ok") is True
@@ -129749,22 +129804,47 @@ def _qa_exact_candidate_direct_main_implementation_is_authoritative(
 ) -> bool:
     """Preserve worker authority and add canonical observer Direct Main authority."""
 
-    del conn  # The authority is entirely persisted and source-backed.
-    return bool(
-        _onboard_parentless_direct_main_worker_implementation_is_authoritative(
-            event,
-            direct_event=direct_event,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
+    if _onboard_parentless_direct_main_worker_implementation_is_authoritative(
+        event,
+        direct_event=direct_event,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    ):
+        return True
+
+    observer_event: Mapping[str, Any] = event
+    payload = (
+        event.get("payload")
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    if "direct_main_implementation_commit_prewrite_authority" not in payload:
+        bootstrap_gate = (
+            _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
+                conn,
+                project_id=project_id,
+                body=dict(event),
+                event_kind=str(event.get("event_kind") or "").strip(),
+                normalized_status=str(event.get("status") or "").strip(),
+                normalized_payload=dict(payload),
+            )
         )
-        or _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
-            event,
-            direct_event=direct_event,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
-        )
+        if bootstrap_gate.get("passed") is True:
+            bootstrap_payload = dict(payload)
+            bootstrap_payload[
+                "direct_main_implementation_commit_prewrite_authority"
+            ] = dict(
+                bootstrap_gate.get("commit_prewrite_authority") or {}
+            )
+            observer_event = {**dict(event), "payload": bootstrap_payload}
+
+    return _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
+        observer_event,
+        direct_event=direct_event,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
     )
 
 
@@ -156464,6 +156544,196 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
     ]
     if not direct_events:
         return {}
+    commit_sha = str(body.get("commit_sha") or "").strip().lower()
+    route_token_ref = str(
+        body.get("route_token_ref")
+        or normalized_payload.get("route_token_ref")
+        or ""
+    ).strip()
+    commit_missing: list[str] = []
+    commit_mismatches: list[dict[str, Any]] = []
+    canonical_project_root = ""
+    resolved_commit = ""
+    canonical_head_commit = ""
+    worktree_clean = False
+    repository_root_exact = False
+    route_scope_exact = False
+    direct_route_identity_exact = False
+
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha):
+        commit_missing.append("implementation_commit_full_object_id")
+    try:
+        project_root = project_service.resolve_project_root(
+            project_id,
+            None,
+            fallback_self=True,
+        )
+    except Exception:
+        project_root = None
+    if project_root is None:
+        commit_missing.append("registered_project_root")
+    else:
+        root = Path(project_root).resolve()
+        canonical_project_root = str(root)
+        try:
+            top_level = _qa_git_bytes(
+                root,
+                ["rev-parse", "--show-toplevel"],
+            )
+            repository_root_exact = (
+                top_level.returncode == 0
+                and Path(
+                    top_level.stdout.decode(
+                        "utf-8", errors="surrogateescape"
+                    ).strip()
+                ).resolve()
+                == root
+            )
+        except (OSError, ValueError, _QACandidateOverlayError):
+            repository_root_exact = False
+        if not repository_root_exact:
+            commit_missing.append("registered_project_git_root_exact")
+        if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha):
+            try:
+                resolved = _qa_git_bytes(
+                    root,
+                    ["rev-parse", "--verify", f"{commit_sha}^{{commit}}"],
+                )
+                resolved_commit = resolved.stdout.decode(
+                    "ascii", errors="ignore"
+                ).strip().lower()
+            except _QACandidateOverlayError:
+                resolved_commit = ""
+            if resolved_commit != commit_sha:
+                commit_missing.append("implementation_commit_object_exists")
+                commit_mismatches.append(
+                    {
+                        "field": "commit_sha",
+                        "expected": "full commit object in registered repository",
+                        "actual": commit_sha,
+                    }
+                )
+        try:
+            head = _qa_git_bytes(
+                root,
+                ["rev-parse", "--verify", "HEAD^{commit}"],
+            )
+            canonical_head_commit = head.stdout.decode(
+                "ascii", errors="ignore"
+            ).strip().lower()
+        except _QACandidateOverlayError:
+            canonical_head_commit = ""
+        if not canonical_head_commit:
+            commit_missing.append("canonical_head_commit_available")
+        elif commit_sha != canonical_head_commit:
+            commit_missing.append("implementation_commit_equals_canonical_head")
+            commit_mismatches.append(
+                {
+                    "field": "commit_sha",
+                    "expected": canonical_head_commit,
+                    "actual": commit_sha,
+                }
+            )
+        try:
+            status = _qa_git_bytes(
+                root,
+                ["status", "--porcelain=v1", "--untracked-files=all"],
+            )
+            worktree_clean = status.returncode == 0 and not status.stdout
+        except _QACandidateOverlayError:
+            worktree_clean = False
+        if not worktree_clean:
+            commit_missing.append("canonical_worktree_clean")
+
+    direct_identity = (
+        _observer_root_route_identity_from_event(direct_events[0])
+        if len(direct_events) == 1
+        else {}
+    )
+    direct_route_identity_exact = bool(
+        len(direct_events) == 1
+        and route_token_ref
+        and route_token_ref
+        == str(direct_identity.get("route_token_ref") or "").strip()
+        and _observer_root_route_identity_complete(direct_identity)
+    )
+    if len(direct_events) != 1:
+        commit_missing.append("unique_direct_main_pre_mutation_event")
+    if not direct_route_identity_exact:
+        commit_missing.append("implementation_route_matches_pre_mutation")
+
+    route_row = None
+    if route_token_ref:
+        route_row = conn.execute(
+            """
+            SELECT backlog_id, task_id, caller_role, allowed_actions_json,
+                   scope_json, status
+              FROM observer_route_token_refs
+             WHERE project_id = ? AND route_token_ref = ?
+            """,
+            (project_id, route_token_ref),
+        ).fetchone()
+    try:
+        registered_actions = set(
+            json.loads(route_row["allowed_actions_json"] or "[]")
+        )
+        registered_scope = json.loads(route_row["scope_json"] or "{}")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        registered_actions = set()
+        registered_scope = {}
+    route_scope_exact = bool(
+        route_row
+        and str(route_row["status"] or "").strip() == "active"
+        and str(route_row["caller_role"] or "").strip() == "observer"
+        and str(route_row["backlog_id"] or "").strip() == backlog_id
+        and str(route_row["task_id"] or "").strip() == task_id
+        and "task_timeline_append" in registered_actions
+        and isinstance(registered_scope, Mapping)
+        and {
+            key: str(registered_scope.get(key) or "").strip()
+            for key in ("project_id", "backlog_id", "task_id")
+        }
+        == {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        }
+    )
+    if not route_scope_exact:
+        commit_missing.append("implementation_route_registry_scope_exact")
+
+    commit_missing = list(dict.fromkeys(commit_missing))
+    commit_authority = {
+        "schema_version": (
+            "parentless_direct_main.implementation_commit_prewrite_authority.v1"
+        ),
+        "server_derived": True,
+        "source": (
+            "server.handle_task_timeline_append."
+            "parentless_direct_main_implementation_prewrite_gate"
+        ),
+        "passed": not commit_missing,
+        "status": "passed" if not commit_missing else "failed",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "commit_sha": commit_sha,
+        "resolved_commit_sha": resolved_commit,
+        "canonical_head_commit": canonical_head_commit,
+        "canonical_project_root": canonical_project_root,
+        "repository_root_exact": repository_root_exact,
+        "git_object_exists": bool(resolved_commit and resolved_commit == commit_sha),
+        "worktree_clean": worktree_clean,
+        "route_token_ref": route_token_ref,
+        "route_scope_exact": route_scope_exact,
+        "direct_route_identity_exact": direct_route_identity_exact,
+        "direct_pre_mutation_event_count": len(direct_events),
+        "missing_requirement_ids": commit_missing,
+        "identity_mismatches": commit_mismatches,
+        "zero_write_on_failure": True,
+        "historical_backfill_allowed": False,
+    }
+    commit_authority["authority_hash"] = stable_sha256(commit_authority)
     alias_fields = []
     for container_name, container in (
         ("top_level", body),
@@ -156488,10 +156758,15 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         field="implementation.payload.test_results",
     )
     missing = list(test_results_gate.get("missing_requirement_ids") or [])
+    missing.extend(commit_missing)
     if alias_fields:
         missing.append("canonical_test_results_payload_only")
     missing = list(dict.fromkeys(missing))
-    passed = test_results_gate.get("passed") is True and not alias_fields
+    passed = bool(
+        test_results_gate.get("passed") is True
+        and commit_authority.get("passed") is True
+        and not alias_fields
+    )
     return {
         "schema_version": (
             "parentless_direct_main.implementation_prewrite_gate.v1"
@@ -156503,6 +156778,7 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         "backlog_id": backlog_id,
         "contract_execution_id": task_id,
         "test_results_gate": test_results_gate,
+        "commit_prewrite_authority": commit_authority,
         "non_satisfying_alias_fields": alias_fields,
         "missing_requirement_ids": missing,
         "selected_scope": selected_scope,
@@ -162746,6 +163022,15 @@ def handle_task_timeline_append(ctx: RequestContext):
                     "persisted_as_accepted": False,
                     "historical_backfill_allowed": False,
                 },
+            )
+        if direct_main_implementation_prewrite_gate.get("passed") is True:
+            norm_payload[
+                "direct_main_implementation_commit_prewrite_authority"
+            ] = dict(
+                direct_main_implementation_prewrite_gate.get(
+                    "commit_prewrite_authority"
+                )
+                or {}
             )
         direct_main_close_ready_prewrite_gate = (
             _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
