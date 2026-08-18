@@ -395,7 +395,12 @@ def test_exact_candidate_post_merge_qa_accepts_parentless_direct_main_without_ru
 ):
     backlog_id = "AC-DIRECT-MAIN-POSTMERGE-EXACT-QA"
     project_root = tmp_path / "direct-main-postmerge-exact-qa"
-    candidate_commit = _init_test_git_repo(project_root)
+    _init_test_git_repo(project_root)
+    candidate_commit = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message="direct main exact candidate",
+    )
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -86913,24 +86918,11 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
     backlog_id = "AC-DIRECT-MAIN-IMPLEMENTATION-COMMIT-PREWRITE"
     project_root = tmp_path / "implementation-prewrite"
     stale_commit = _init_test_git_repo(project_root)
-    (project_root / "candidate.txt").write_text(
-        "candidate two\n", encoding="utf-8"
+    candidate_commit = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message="candidate",
     )
-    subprocess.run(
-        ["git", "add", "candidate.txt"],
-        cwd=project_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "candidate"],
-        cwd=project_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    candidate_commit = batch_jobs.git_commit(project_root)
     cross_root = tmp_path / "implementation-prewrite-cross"
     _init_test_git_repo(cross_root)
     (cross_root / "cross.txt").write_text("cross\n", encoding="utf-8")
@@ -87110,18 +87102,87 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
     )
     assert conn.total_changes == changes_before
 
+    for mutation in (
+        "missing_changed_files",
+        "duplicate_changed_files",
+        "extra_changed_file",
+        "mismatched_scope_claim",
+    ):
+        invalid_scope_body = _canonical_parentless_direct_main_implementation_body(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            route_token_ref=route_token_ref,
+            route_identity=route_identity,
+            commit_sha=candidate_commit,
+        )
+        if mutation == "missing_changed_files":
+            invalid_scope_body["payload"].pop("changed_files")
+        elif mutation == "duplicate_changed_files":
+            invalid_scope_body["payload"]["changed_files"] = [
+                "agent/governance/server.py",
+                "agent/governance/server.py",
+            ]
+        elif mutation == "extra_changed_file":
+            invalid_scope_body["payload"]["changed_files"] = [
+                "agent/governance/server.py",
+                "outside.py",
+            ]
+        else:
+            invalid_scope_body["payload"]["dirty_scope_check"][
+                "changed_files"
+            ] = ["agent/tests/test_graph_governance_api.py"]
+        events_before = len(
+            task_timeline.list_events(
+                conn,
+                PID,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                limit=1000,
+            )
+        )
+        changes_before = conn.total_changes
+        with pytest.raises(GovernanceError) as scope_rejected:
+            server.handle_task_timeline_append(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body=invalid_scope_body,
+                )
+            )
+        assert scope_rejected.value.code == (
+            "parentless_direct_main_implementation_test_evidence_incomplete"
+        )
+        assert scope_rejected.value.details["dirty_scope_gate"][
+            "passed"
+        ] is False
+        assert scope_rejected.value.details["zero_write_rejection"] is True
+        assert scope_rejected.value.details["writes_performed"] is False
+        assert conn.total_changes == changes_before
+        assert len(
+            task_timeline.list_events(
+                conn,
+                PID,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                limit=1000,
+            )
+        ) == events_before
+
+    accepted_body = _canonical_parentless_direct_main_implementation_body(
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=route_token_ref,
+        route_identity=route_identity,
+        commit_sha=candidate_commit,
+    )
+    accepted_body["payload"].pop("dirty_scope_check")
     accepted = server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
             method="POST",
-            body=_canonical_parentless_direct_main_implementation_body(
-                backlog_id=backlog_id,
-                task_id=task_id,
-                route_token_ref=route_token_ref,
-                route_identity=route_identity,
-                commit_sha=candidate_commit,
-            ),
+            body=accepted_body,
         )
     )
     authority = accepted["payload"][
@@ -87136,6 +87197,51 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
     assert authority["authority_hash"] == server.stable_sha256(
         {key: value for key, value in authority.items() if key != "authority_hash"}
     )
+    dirty_scope = accepted["payload"]["dirty_scope_check"]
+    assert dirty_scope == {
+        "schema_version": (
+            "parentless_direct_main.implementation_dirty_scope_authority.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "source": (
+            "server.handle_task_timeline_append."
+            "parentless_direct_main_implementation_prewrite_gate"
+        ),
+        "changed_files_source": (
+            "server_git_single_parent_to_implementation_diff_name_status_z_m"
+        ),
+        "allowed_files": ["agent/governance/server.py"],
+        "changed_files": ["agent/governance/server.py"],
+        "unexpected_files": [],
+        "exact_match": True,
+        "authority_hash": dirty_scope["authority_hash"],
+    }
+    assert dirty_scope["authority_hash"] == server.stable_sha256(
+        {
+            key: value
+            for key, value in dirty_scope.items()
+            if key != "authority_hash"
+        }
+    )
+
+    changes_before = conn.total_changes
+    with pytest.raises(GovernanceError) as duplicate_rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=accepted_body,
+            )
+        )
+    assert "unique_direct_main_implementation_event" in (
+        duplicate_rejected.value.details["commit_prewrite_authority"]
+        ["missing_requirement_ids"]
+    )
+    assert duplicate_rejected.value.details["zero_write_rejection"] is True
+    assert duplicate_rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == changes_before
 
     direct_event = task_timeline.list_events(
         conn,
@@ -87440,7 +87546,12 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
 ):
     backlog_id = "AC-DIRECT-MAIN-CLOSE-READY-PREWRITE-ALIASES"
     project_root = tmp_path / "direct-main-close-ready-aliases"
-    commit_sha = _init_test_git_repo(project_root)
+    _init_test_git_repo(project_root)
+    commit_sha = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message="direct main close ready candidate",
+    )
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",

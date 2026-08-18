@@ -129819,6 +129819,256 @@ def _onboard_parentless_direct_main_worker_implementation_is_authoritative(
     )
 
 
+_DIRECT_MAIN_DIRTY_SCOPE_AUTHORITY_SCHEMA = (
+    "parentless_direct_main.implementation_dirty_scope_authority.v1"
+)
+
+
+def _contract_runtime_parentless_direct_main_dirty_scope_authority(
+    payload: Mapping[str, Any],
+    *,
+    row_declared_files: Sequence[str],
+    verified_changed_files: Sequence[str] | None = None,
+    verified_changed_files_source: str = "",
+) -> dict[str, Any]:
+    """Normalize one server-verified Direct Main implementation file scope."""
+
+    missing: list[str] = []
+    mismatches: list[dict[str, Any]] = []
+
+    def canonical_paths(
+        value: Any,
+        *,
+        field: str,
+        required: bool,
+    ) -> list[str]:
+        if not isinstance(value, list):
+            if required:
+                missing.append(field)
+            elif value not in (None, ""):
+                mismatches.append(
+                    {
+                        "field": field,
+                        "expected": "canonical file list",
+                        "actual": type(value).__name__,
+                    }
+                )
+            return []
+        result: list[str] = []
+        for raw_path in value:
+            if not isinstance(raw_path, str) or raw_path != raw_path.strip():
+                mismatches.append(
+                    {
+                        "field": field,
+                        "expected": "trimmed repository-relative paths",
+                        "actual": raw_path,
+                    }
+                )
+                continue
+            try:
+                normalized = _qa_overlay_normalize_path(raw_path)
+            except _QACandidateOverlayError:
+                normalized = ""
+            if not normalized or normalized != raw_path:
+                mismatches.append(
+                    {
+                        "field": field,
+                        "expected": "canonical repository-relative path",
+                        "actual": raw_path,
+                    }
+                )
+                continue
+            if normalized in result:
+                mismatches.append(
+                    {
+                        "field": field,
+                        "expected": "unique canonical paths",
+                        "actual": normalized,
+                    }
+                )
+                continue
+            result.append(normalized)
+        if required and not result:
+            missing.append(field)
+        return result
+
+    declared_files = canonical_paths(
+        list(row_declared_files),
+        field="row_declared_files",
+        required=True,
+    )
+    caller_changed_files = canonical_paths(
+        payload.get("changed_files"),
+        field="payload.changed_files",
+        required=True,
+    )
+    changed_files = caller_changed_files
+    if verified_changed_files is not None:
+        changed_files = canonical_paths(
+            list(verified_changed_files),
+            field="server_verified_changed_files",
+            required=True,
+        )
+        if caller_changed_files != changed_files:
+            mismatches.append(
+                {
+                    "field": "payload.changed_files",
+                    "expected": changed_files,
+                    "actual": caller_changed_files,
+                    "source": verified_changed_files_source,
+                }
+            )
+    declared_file_set = set(declared_files)
+    unexpected_files = [
+        path for path in changed_files if path not in declared_file_set
+    ]
+    if unexpected_files:
+        mismatches.append(
+            {
+                "field": "payload.changed_files",
+                "expected": declared_files,
+                "actual": changed_files,
+                "unexpected_files": unexpected_files,
+            }
+        )
+
+    caller_scope_fields: list[str] = []
+    for field in ("dirty_scope_check", "diff_check"):
+        if field not in payload:
+            continue
+        caller_scope_fields.append(field)
+        candidate = payload.get(field)
+        if not isinstance(candidate, Mapping):
+            mismatches.append(
+                {
+                    "field": f"payload.{field}",
+                    "expected": "object",
+                    "actual": type(candidate).__name__,
+                }
+            )
+            continue
+        if candidate.get("exact_match") is not True:
+            mismatches.append(
+                {
+                    "field": f"payload.{field}.exact_match",
+                    "expected": True,
+                    "actual": candidate.get("exact_match"),
+                }
+            )
+        claimed_unexpected = list(candidate.get("unexpected_files") or [])
+        if claimed_unexpected:
+            mismatches.append(
+                {
+                    "field": f"payload.{field}.unexpected_files",
+                    "expected": [],
+                    "actual": claimed_unexpected,
+                }
+            )
+        claimed_changed = canonical_paths(
+            candidate.get("changed_files"),
+            field=f"payload.{field}.changed_files",
+            required=True,
+        )
+        if claimed_changed != changed_files:
+            mismatches.append(
+                {
+                    "field": f"payload.{field}.changed_files",
+                    "expected": changed_files,
+                    "actual": claimed_changed,
+                }
+            )
+        if "allowed_files" in candidate:
+            claimed_allowed = canonical_paths(
+                candidate.get("allowed_files"),
+                field=f"payload.{field}.allowed_files",
+                required=True,
+            )
+            if claimed_allowed != declared_files:
+                mismatches.append(
+                    {
+                        "field": f"payload.{field}.allowed_files",
+                        "expected": declared_files,
+                        "actual": claimed_allowed,
+                    }
+                )
+
+    persisted_scope = (
+        payload.get("dirty_scope_check")
+        if isinstance(payload.get("dirty_scope_check"), Mapping)
+        else {}
+    )
+    persisted_hash = str(persisted_scope.get("authority_hash") or "").strip()
+    if persisted_hash or persisted_scope.get("server_derived") is True:
+        unsigned_persisted = {
+            key: value
+            for key, value in persisted_scope.items()
+            if key != "authority_hash"
+        }
+        if (
+            str(persisted_scope.get("schema_version") or "").strip()
+            != _DIRECT_MAIN_DIRTY_SCOPE_AUTHORITY_SCHEMA
+            or persisted_scope.get("server_derived") is not True
+            or persisted_scope.get("caller_claims_trusted") is not False
+            or not persisted_hash
+            or persisted_hash != stable_sha256(unsigned_persisted)
+        ):
+            mismatches.append(
+                {
+                    "field": "payload.dirty_scope_check.authority_hash",
+                    "expected": "valid server-derived dirty-scope authority",
+                    "actual": persisted_hash,
+                }
+            )
+
+    missing = list(dict.fromkeys(missing))
+    passed = bool(
+        declared_files
+        and changed_files
+        and not missing
+        and not mismatches
+        and not unexpected_files
+    )
+    canonical_scope = {
+        "schema_version": _DIRECT_MAIN_DIRTY_SCOPE_AUTHORITY_SCHEMA,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "source": (
+            "server.handle_task_timeline_append."
+            "parentless_direct_main_implementation_prewrite_gate"
+        ),
+        "changed_files_source": (
+            verified_changed_files_source
+            or "validated_persisted_implementation_scope"
+        ),
+        "allowed_files": declared_files,
+        "changed_files": changed_files,
+        "changed_files_source": (
+            verified_changed_files_source
+            or "validated_persisted_implementation_scope"
+        ),
+        "unexpected_files": unexpected_files,
+        "exact_match": passed,
+    }
+    canonical_scope["authority_hash"] = stable_sha256(canonical_scope)
+    return {
+        "schema_version": (
+            "parentless_direct_main.implementation_dirty_scope_gate.v1"
+        ),
+        "applicable": True,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "row_declared_files": declared_files,
+        "changed_files": changed_files,
+        "unexpected_files": unexpected_files,
+        "caller_scope_fields": caller_scope_fields,
+        "missing_requirement_ids": missing,
+        "identity_mismatches": mismatches,
+        "canonical_dirty_scope_check": canonical_scope,
+        "zero_write_on_failure": True,
+        "historical_backfill_allowed": False,
+    }
+
+
 def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
     event: Mapping[str, Any],
     *,
@@ -129862,47 +130112,11 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
             )
         ]
     )
-    raw_changed_files = payload.get("changed_files")
-    changed_files = _runtime_context_service_dedupe(
-        [
-            str(path or "").strip()
-            for path in (
-                raw_changed_files if isinstance(raw_changed_files, list) else []
-            )
-        ]
-    )
-    scope_check = next(
-        (
-            candidate
-            for candidate in (
-                payload.get("dirty_scope_check"),
-                payload.get("diff_check"),
-            )
-            if isinstance(candidate, Mapping)
-        ),
-        {},
-    )
-    raw_scope_changed_files = scope_check.get("changed_files")
-    scope_changed_files = _runtime_context_service_dedupe(
-        [
-            str(path or "").strip()
-            for path in (
-                raw_scope_changed_files
-                if isinstance(raw_scope_changed_files, list)
-                else []
-            )
-        ]
-    )
-    raw_scope_allowed_files = scope_check.get("allowed_files")
-    scope_allowed_files = _runtime_context_service_dedupe(
-        [
-            str(path or "").strip()
-            for path in (
-                raw_scope_allowed_files
-                if isinstance(raw_scope_allowed_files, list)
-                else []
-            )
-        ]
+    dirty_scope_authority = (
+        _contract_runtime_parentless_direct_main_dirty_scope_authority(
+            payload,
+            row_declared_files=declared_files,
+        )
     )
     commit_sha = str(event.get("commit_sha") or "").strip().lower()
     decision = (
@@ -129977,14 +130191,8 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         and str(direct_authority.get("projection_source") or "").strip()
         == "task_timeline_append_pre_persistence_gate"
         and declared_files
-        and changed_files
-        and isinstance(raw_changed_files, list)
-        and len(changed_files) == len(raw_changed_files)
-        and set(changed_files).issubset(set(declared_files))
-        and scope_check.get("exact_match") is True
-        and not list(scope_check.get("unexpected_files") or [])
-        and scope_changed_files == changed_files
-        and (not scope_allowed_files or scope_allowed_files == declared_files)
+        and isinstance(payload.get("dirty_scope_check"), Mapping)
+        and dirty_scope_authority.get("passed") is True
         and test_results.get("passed") is True
         and str(commit_prewrite_authority.get("schema_version") or "").strip()
         == "parentless_direct_main.implementation_commit_prewrite_authority.v1"
@@ -157388,8 +157596,43 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         ).strip()
         == "task_timeline_append_pre_persistence_gate"
     ]
+    prospective_event_id = int(
+        body.get("id") or body.get("event_id") or 0
+    )
+    prior_implementation_events = [
+        event
+        for event in events
+        if task_timeline._close_event_key(event) == "implementation"
+        and task_timeline._event_passed(event)
+        and (
+            prospective_event_id <= 0
+            or int(event.get("id") or event.get("event_id") or 0)
+            != prospective_event_id
+        )
+    ]
     if not direct_events:
         return {}
+    direct_authority = (
+        direct_events[0]["payload"].get(
+            "observer_direct_pre_mutation_authority"
+        )
+        if len(direct_events) == 1
+        and isinstance(direct_events[0].get("payload"), Mapping)
+        and isinstance(
+            direct_events[0]["payload"].get(
+                "observer_direct_pre_mutation_authority"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    current_row_files = _backlog_declared_direct_file_scope(conn, backlog_id)
+    direct_row_files = _runtime_context_service_dedupe(
+        [
+            str(path or "").strip()
+            for path in list(direct_authority.get("row_declared_files") or [])
+        ]
+    )
     commit_sha = str(body.get("commit_sha") or "").strip().lower()
     route_token_ref = str(
         body.get("route_token_ref")
@@ -157405,9 +157648,16 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
     repository_root_exact = False
     route_scope_exact = False
     direct_route_identity_exact = False
+    implementation_parent_commit = ""
+    verified_changed_files: list[str] = []
+    verified_changed_files_source = (
+        "server_git_single_parent_to_implementation_diff_name_status_z_m"
+    )
 
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha):
         commit_missing.append("implementation_commit_full_object_id")
+    if prior_implementation_events:
+        commit_missing.append("unique_direct_main_implementation_event")
     try:
         project_root = project_service.resolve_project_root(
             project_id,
@@ -157459,6 +157709,61 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
                         "actual": commit_sha,
                     }
                 )
+            else:
+                parent_line = _qa_git_bytes(
+                    root,
+                    ["rev-list", "--parents", "-n", "1", commit_sha],
+                )
+                parent_tokens = parent_line.stdout.decode(
+                    "ascii", errors="ignore"
+                ).strip().lower().split()
+                if (
+                    parent_line.returncode != 0
+                    or len(parent_tokens) != 2
+                    or parent_tokens[0] != commit_sha
+                ):
+                    commit_missing.append("implementation_commit_single_parent")
+                else:
+                    implementation_parent_commit = parent_tokens[1]
+                    changed = _qa_git_bytes(
+                        root,
+                        [
+                            "diff",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--name-status",
+                            "-z",
+                            "-M",
+                            f"{implementation_parent_commit}..{commit_sha}",
+                            "--",
+                            ".",
+                        ],
+                    )
+                    if changed.returncode != 0:
+                        commit_missing.append(
+                            "implementation_changed_files_server_verified"
+                        )
+                    else:
+                        for item in _qa_parse_name_status_z(changed.stdout):
+                            for candidate_path in (
+                                item.get("old_path"),
+                                item.get("path"),
+                            ):
+                                normalized_path = str(
+                                    candidate_path or ""
+                                ).strip()
+                                if (
+                                    normalized_path
+                                    and normalized_path
+                                    not in verified_changed_files
+                                ):
+                                    verified_changed_files.append(
+                                        normalized_path
+                                    )
+                        if not verified_changed_files:
+                            commit_missing.append(
+                                "implementation_changed_files_server_verified"
+                            )
         try:
             head = _qa_git_bytes(
                 root,
@@ -157490,6 +157795,34 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
             worktree_clean = False
         if not worktree_clean:
             commit_missing.append("canonical_worktree_clean")
+
+    dirty_scope_gate = (
+        _contract_runtime_parentless_direct_main_dirty_scope_authority(
+            normalized_payload,
+            row_declared_files=current_row_files,
+            verified_changed_files=verified_changed_files,
+            verified_changed_files_source=verified_changed_files_source,
+        )
+    )
+    if direct_row_files != current_row_files:
+        dirty_scope_gate = dict(dirty_scope_gate)
+        dirty_scope_mismatches = list(
+            dirty_scope_gate.get("identity_mismatches") or []
+        )
+        dirty_scope_mismatches.append(
+            {
+                "field": "row_declared_files",
+                "expected": direct_row_files,
+                "actual": current_row_files,
+            }
+        )
+        dirty_scope_gate.update(
+            {
+                "passed": False,
+                "status": "failed",
+                "identity_mismatches": dirty_scope_mismatches,
+            }
+        )
 
     direct_identity = (
         _observer_root_route_identity_from_event(direct_events[0])
@@ -157566,14 +157899,20 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         "commit_sha": commit_sha,
         "resolved_commit_sha": resolved_commit,
         "canonical_head_commit": canonical_head_commit,
+        "implementation_parent_commit": implementation_parent_commit,
         "canonical_project_root": canonical_project_root,
         "repository_root_exact": repository_root_exact,
         "git_object_exists": bool(resolved_commit and resolved_commit == commit_sha),
         "worktree_clean": worktree_clean,
+        "verified_changed_files": verified_changed_files,
+        "verified_changed_files_source": verified_changed_files_source,
         "route_token_ref": route_token_ref,
         "route_scope_exact": route_scope_exact,
         "direct_route_identity_exact": direct_route_identity_exact,
         "direct_pre_mutation_event_count": len(direct_events),
+        "prior_implementation_event_count": len(
+            prior_implementation_events
+        ),
         "missing_requirement_ids": commit_missing,
         "identity_mismatches": commit_mismatches,
         "zero_write_on_failure": True,
@@ -157605,12 +157944,16 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
     )
     missing = list(test_results_gate.get("missing_requirement_ids") or [])
     missing.extend(commit_missing)
+    missing.extend(dirty_scope_gate.get("missing_requirement_ids") or [])
+    if dirty_scope_gate.get("identity_mismatches"):
+        missing.append("canonical_implementation_dirty_scope")
     if alias_fields:
         missing.append("canonical_test_results_payload_only")
     missing = list(dict.fromkeys(missing))
     passed = bool(
         test_results_gate.get("passed") is True
         and commit_authority.get("passed") is True
+        and dirty_scope_gate.get("passed") is True
         and not alias_fields
     )
     return {
@@ -157624,6 +157967,7 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         "backlog_id": backlog_id,
         "contract_execution_id": task_id,
         "test_results_gate": test_results_gate,
+        "dirty_scope_gate": dirty_scope_gate,
         "commit_prewrite_authority": commit_authority,
         "non_satisfying_alias_fields": alias_fields,
         "missing_requirement_ids": missing,
@@ -163870,6 +164214,18 @@ def handle_task_timeline_append(ctx: RequestContext):
                 },
             )
         if direct_main_implementation_prewrite_gate.get("passed") is True:
+            dirty_scope_gate = dict(
+                direct_main_implementation_prewrite_gate.get(
+                    "dirty_scope_gate"
+                )
+                or {}
+            )
+            norm_payload["changed_files"] = list(
+                dirty_scope_gate.get("changed_files") or []
+            )
+            norm_payload["dirty_scope_check"] = dict(
+                dirty_scope_gate.get("canonical_dirty_scope_check") or {}
+            )
             norm_payload[
                 "direct_main_implementation_commit_prewrite_authority"
             ] = dict(
