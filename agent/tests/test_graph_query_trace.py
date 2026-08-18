@@ -947,6 +947,10 @@ def test_bounded_qa_trace_binds_base_graph_candidate_diff_tuple(conn, tmp_path):
             "changed_files",
             "candidate_diff_hash",
             "changed_files_source",
+            "comparison_authority_required",
+            "comparison_base_commit_sha",
+            "comparison_base_commit_source",
+            "comparison_base_commit_lineage_source",
             "candidate_overlay_hash",
             "root_identity_hash",
             "query_root_identity_hash",
@@ -1224,6 +1228,118 @@ def test_exact_candidate_trace_requires_and_persists_root_identity(conn, tmp_pat
     assert trace["root_identity"]["query_root_tree_sha"] == "4" * 40
     assert trace["candidate_overlay"] == {}
     assert trace["candidate_overlay_hash"] == ""
+    assert trace["graph_query_identity"]["comparison_authority_required"] is False
+    assert trace["graph_query_identity"]["comparison_base_commit_sha"] == ""
+
+
+@pytest.mark.parametrize(
+    "comparison_lineage_source",
+    [
+        "",
+        (
+            "task_timeline.accepted_direct_main_worker_implementation+"
+            "git.single_parent"
+        ),
+    ],
+    ids=("worker", "direct_main"),
+)
+def test_exact_candidate_trace_projects_validated_comparison_authority(
+    conn,
+    tmp_path,
+    comparison_lineage_source,
+):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    candidate_commit = "a" * 40
+    comparison_base_commit = "b" * 40
+    comparison_base_source = (
+        "ContractRuntime.completed_lines.worker_commit+"
+        "parallel_branch_runtime_context.base_commit"
+    )
+    root_identity = {
+        "schema_version": "qa_review_graph.root_identity.v1",
+        "base_commit_sha": candidate_commit,
+        "candidate_commit_sha": candidate_commit,
+        "query_root": str(project_root),
+        "query_root_head_commit": candidate_commit,
+        "query_root_identity_hash": "sha256:" + "1" * 64,
+        "query_root_clean": True,
+        "query_root_status_hash": "sha256:" + hashlib.sha256(b"").hexdigest(),
+        "query_root_tree_sha": "4" * 40,
+        "query_root_untracked_files_checked": True,
+        "canonical_project_root": str(project_root),
+        "canonical_head_commit": candidate_commit,
+        "canonical_project_identity_hash": "sha256:" + "2" * 64,
+        "repository_identity_hash": "sha256:" + "3" * 64,
+        "repository_identity_match": True,
+        "comparison_authority_required": True,
+        "comparison_base_commit_sha": comparison_base_commit,
+        "comparison_base_commit_source": comparison_base_source,
+    }
+    if comparison_lineage_source:
+        root_identity["comparison_base_commit_lineage_source"] = (
+            comparison_lineage_source
+        )
+    trace = graph_query_trace.start_trace(
+        conn,
+        PID,
+        snapshot_id,
+        actor="qa:direct-main-comparison",
+        query_source="qa",
+        query_purpose="independent_verification",
+        task_id="qa-direct-main-comparison",
+        backlog_id="AC-QA-DIRECT-MAIN-COMPARISON",
+        commit_sha=candidate_commit,
+        graph_basis="exact_candidate_snapshot",
+        canonical_base_snapshot_id=snapshot_id,
+        base_commit_sha=candidate_commit,
+        candidate_commit_sha=candidate_commit,
+        changed_files=["agent/governance/graph_query_trace.py"],
+        candidate_diff_hash="sha256:" + "4" * 64,
+        changed_files_source=(
+            "server_runtime_context_base_to_exact_candidate_diff"
+        ),
+        root_identity=root_identity,
+        root_identity_hash=stable_sha256(root_identity),
+        query_root_identity_hash=root_identity["query_root_identity_hash"],
+        canonical_project_identity_hash=root_identity[
+            "canonical_project_identity_hash"
+        ],
+        repository_identity_hash=root_identity["repository_identity_hash"],
+        qa_session_id="ses-qa-direct-main-comparison",
+        qa_scope_binding_ref="qa_scope:sha256:direct-main-comparison",
+    )["trace"]
+
+    identity = trace["graph_query_identity"]
+    assert identity["comparison_authority_required"] is True
+    assert identity["comparison_base_commit_sha"] == comparison_base_commit
+    assert identity["comparison_base_commit_source"] == comparison_base_source
+    assert (
+        identity["comparison_base_commit_lineage_source"]
+        == comparison_lineage_source
+    )
+    assert identity["candidate_review_context"] == {
+        key: identity[key]
+        for key in (
+            "graph_basis",
+            "graph_basis_decision",
+            "graph_basis_decision_hash",
+            "canonical_base_snapshot_id",
+            "base_commit_sha",
+            "candidate_commit_sha",
+            "changed_files",
+            "candidate_diff_hash",
+            "changed_files_source",
+            "comparison_authority_required",
+            "comparison_base_commit_sha",
+            "comparison_base_commit_source",
+            "comparison_base_commit_lineage_source",
+            "candidate_overlay_hash",
+            "root_identity_hash",
+            "query_root_identity_hash",
+            "canonical_project_identity_hash",
+            "repository_identity_hash",
+        )
+    }
 
 
 @pytest.mark.parametrize(

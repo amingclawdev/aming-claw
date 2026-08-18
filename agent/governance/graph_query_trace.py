@@ -369,6 +369,10 @@ GRAPH_QUERY_IDENTITY_FIELDS = (
     "changed_files",
     "candidate_diff_hash",
     "changed_files_source",
+    "comparison_authority_required",
+    "comparison_base_commit_sha",
+    "comparison_base_commit_source",
+    "comparison_base_commit_lineage_source",
     "candidate_overlay_hash",
     "root_identity_hash",
     "query_root_identity_hash",
@@ -1012,6 +1016,16 @@ def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
     """Return the Runtime Context projection identity for one graph query trace."""
 
     source = trace or {}
+    # Comparison authority is not a caller-owned graph-query field.  The QA
+    # handler derives it into the validated root identity before the trace is
+    # inserted, and trace reads reconstruct that persisted root verbatim.  Keep
+    # the public projection limited to the four copy-safe authority fields
+    # instead of exposing the complete checkout identity.
+    root_identity = (
+        dict(source.get("root_identity"))
+        if isinstance(source.get("root_identity"), Mapping)
+        else {}
+    )
     candidate_context = {
         "graph_basis": str(source.get("graph_basis") or ""),
         "canonical_base_snapshot_id": str(
@@ -1022,6 +1036,18 @@ def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
         "changed_files": _candidate_changed_files(source),
         "candidate_diff_hash": str(source.get("candidate_diff_hash") or ""),
         "changed_files_source": str(source.get("changed_files_source") or ""),
+        "comparison_authority_required": (
+            root_identity.get("comparison_authority_required") is True
+        ),
+        "comparison_base_commit_sha": str(
+            root_identity.get("comparison_base_commit_sha") or ""
+        ),
+        "comparison_base_commit_source": str(
+            root_identity.get("comparison_base_commit_source") or ""
+        ),
+        "comparison_base_commit_lineage_source": str(
+            root_identity.get("comparison_base_commit_lineage_source") or ""
+        ),
         "candidate_overlay_hash": str(source.get("candidate_overlay_hash") or ""),
         "root_identity_hash": str(source.get("root_identity_hash") or ""),
         "query_root_identity_hash": str(

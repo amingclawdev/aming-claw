@@ -157013,6 +157013,29 @@ def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_
     assert trace["root_identity"][
         "comparison_base_commit_lineage_source"
     ] == server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+    assert queried["graph_query_identity"][
+        "comparison_authority_required"
+    ] is True
+    assert queried["graph_query_identity"][
+        "comparison_base_commit_sha"
+    ] == base_commit
+    assert queried["graph_query_identity"][
+        "comparison_base_commit_source"
+    ] == server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
+    assert queried["graph_query_identity"][
+        "comparison_base_commit_lineage_source"
+    ] == server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+    assert queried["graph_query_identity"]["candidate_review_context"][
+        "comparison_base_commit_sha"
+    ] == base_commit
+    assert identity["comparison_authority_required"] is True
+    assert identity["comparison_base_commit_sha"] == base_commit
+    assert identity["comparison_base_commit_source"] == (
+        server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
+    )
+    assert identity["comparison_base_commit_lineage_source"] == (
+        server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+    )
     assert identity["changed_files"] == ["agent/governance/server.py"]
     assert identity["changed_files_source"] == (
         "server_runtime_context_base_to_exact_candidate_diff"
