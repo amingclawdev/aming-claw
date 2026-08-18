@@ -137229,6 +137229,37 @@ def test_qa_review_claims_accept_exact_no_pass_comparison_namespace():
         == "qa_graph_review_context_mismatch"
     )
 
+    scoped_passing_status = json.loads(json.dumps(body))
+    scoped_passing_status["status"] = "passed"
+    scoped_passing_status["payload"].update(
+        {
+            "row_scoped_qa_pass": True,
+            "targeted_scope_only": True,
+            "used_as_pass": False,
+            "qa_acceptance": {
+                "passed": True,
+                "targeted_scope_only": True,
+                "used_as_pass": False,
+            },
+        }
+    )
+    server._qa_validate_candidate_review_claims(
+        scoped_passing_status,
+        review_context,
+    )
+
+    for field in ("targeted_scope_only", "used_as_pass"):
+        unscoped = json.loads(json.dumps(scoped_passing_status))
+        unscoped["payload"].pop(field)
+        with pytest.raises(GovernanceError) as unscoped_rejected:
+            server._qa_validate_candidate_review_claims(
+                unscoped,
+                review_context,
+            )
+        assert unscoped_rejected.value.code == (
+            "qa_graph_review_context_mismatch"
+        )
+
 
 def test_qa_review_claims_keep_ordinary_comparison_forgeries_fail_closed():
     candidate_commit = "8b093d2de879edfa04d45398743102ba0f092ea9"
@@ -156550,9 +156581,11 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
     prepare_backlog: bool = True,
     record_failed_qa: bool = True,
     worker_owned_implementation: bool = False,
+    observer_authoritative_implementation: bool = False,
     implementation_commit_sha: str = "a" * 40,
     worker_actor: str = "worker:/root/direct-main-worker",
     worker_claim_overrides: Mapping[str, Any] | None = None,
+    observer_claim_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     if prepare_backlog:
         _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -156579,6 +156612,11 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
         "binding_source": "observer_route_token_refs",
         "route_id": f"route-{backlog_id.lower()}",
         "route_context_hash": _fake_sha(f"route-{backlog_id.lower()}"),
+        "prompt_contract_id": f"rprompt-{backlog_id.lower()}",
+        "prompt_contract_hash": _fake_sha(f"prompt-{backlog_id.lower()}"),
+        "visible_injection_manifest_hash": _fake_sha(
+            f"visible-{backlog_id.lower()}"
+        ),
         "scope": {
             "project_id": PID,
             "backlog_id": backlog_id,
@@ -156610,6 +156648,10 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
                 "projection_source": (
                     "task_timeline_append_pre_persistence_gate"
                 ),
+                "row_declared_files": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_graph_governance_api.py",
+                ],
             }
         },
     )
@@ -156624,6 +156666,57 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
     }
     implementation_actor = "observer"
     implementation_event_type = "observer.implementation"
+    if observer_authoritative_implementation:
+        meta_gate = {
+            "schema_version": "meta_contract_timeline_event_gate.v1",
+            "allowed": True,
+            "status": "passed",
+            "role": "observer",
+            "action": "implementation",
+            "on_behalf": False,
+            "self_attesting": False,
+            "observer_worker_transport": False,
+        }
+        contract_gate_decision = {
+            "schema_version": "contract_gate_decision.v1",
+            "ok": True,
+            "decision": "allow",
+            "action": "task_timeline_append",
+            "required_role": "observer",
+            "actor_role": "observer",
+            "source_of_authority": "route_token_gate",
+            "primary_decision_source": True,
+            "meta_contract_gate_decision_source": False,
+            "meta_contract_gate": meta_gate,
+        }
+        contract_gate_decision["decision_hash"] = server.stable_sha256(
+            contract_gate_decision
+        )
+        implementation_payload.update(
+            {
+                "contract_gate_decision": contract_gate_decision,
+                "test_results": _canonical_parentless_direct_main_test_results(
+                    commit_sha,
+                    command=(
+                        "pytest -q agent/tests/test_graph_governance_api.py "
+                        "-k direct_main"
+                    ),
+                ),
+                "dirty_scope_check": {
+                    "allowed_files": [
+                        "agent/governance/server.py",
+                        "agent/tests/test_graph_governance_api.py",
+                    ],
+                    "changed_files": [
+                        "agent/governance/server.py",
+                        "agent/tests/test_graph_governance_api.py",
+                    ],
+                    "unexpected_files": [],
+                    "exact_match": True,
+                },
+            }
+        )
+        implementation_payload.update(dict(observer_claim_overrides or {}))
     if worker_owned_implementation:
         implementation_actor = worker_actor
         implementation_event_type = "worker.implementation"
@@ -156810,7 +156903,7 @@ def test_exact_candidate_direct_main_runtime_comparison_base_uses_server_lineage
     assert exact_context["candidate_diff_hash"].startswith("sha256:")
 
 
-def test_exact_candidate_direct_main_qa_persists_truthful_no_pass_and_rejects_forged_base(
+def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_and_rejects_forged_base(
     conn,
     monkeypatch,
     tmp_path,
@@ -156850,7 +156943,7 @@ def test_exact_candidate_direct_main_qa_persists_truthful_no_pass_and_rejects_fo
         conn,
         backlog_id=backlog_id,
         record_failed_qa=False,
-        worker_owned_implementation=True,
+        observer_authoritative_implementation=True,
         implementation_commit_sha=candidate_commit,
     )
     monkeypatch.setattr(
@@ -156932,7 +157025,7 @@ def test_exact_candidate_direct_main_qa_persists_truthful_no_pass_and_rejects_fo
         "event_kind": "independent_verification",
         "phase": "verification",
         "actor": "qa:direct-main-exact-no-pass",
-        "status": "failed",
+        "status": "passed",
         "commit_sha": candidate_commit,
         "payload": {
             "schema_version": "qa_independent_verification.v1",
@@ -156940,6 +157033,14 @@ def test_exact_candidate_direct_main_qa_persists_truthful_no_pass_and_rejects_fo
             "base_commit_sha": base_commit,
             "candidate_commit_sha": candidate_commit,
             "full_suite_claim": "not_claimed",
+            "row_scoped_qa_pass": True,
+            "targeted_scope_only": True,
+            "used_as_pass": False,
+            "qa_acceptance": {
+                "passed": True,
+                "targeted_scope_only": True,
+                "used_as_pass": False,
+            },
             "candidate_new_failures": 0,
             "candidate_specific_issues": [],
             "no_pass_claim": True,
@@ -156953,10 +157054,25 @@ def test_exact_candidate_direct_main_qa_persists_truthful_no_pass_and_rejects_fo
                 ),
                 "base_commit_sha": base_commit,
                 "candidate_commit_sha": candidate_commit,
+                "base_failure_identities": ["test_inherited_non_green"],
+                "candidate_failure_identities": [
+                    "test_inherited_non_green"
+                ],
+                "base_reproduction": {
+                    "reproduced": 1,
+                    "total": 1,
+                    "failure_identities": ["test_inherited_non_green"],
+                },
+                "candidate_suite_counts": {
+                    "baseline_known_non_green": 1,
+                    "failed": 1,
+                    "passed": 11,
+                },
                 "candidate_new_failures": 0,
                 "candidate_specific_issues": [],
                 "no_pass_claim": True,
                 "overall_release_pass_claimed": False,
+                "refs": [queried["trace_id"]],
             }
         },
     }
@@ -156975,13 +157091,23 @@ def test_exact_candidate_direct_main_qa_persists_truthful_no_pass_and_rejects_fo
     assert ledger["base_commit_sha"] == base_commit
     assert ledger["candidate_commit_sha"] == candidate_commit
     assert ledger["candidate_new_failures"] == 0
+    assert ledger["base_failure_identities"] == [
+        "test_inherited_non_green"
+    ]
+    assert ledger["candidate_failure_identities"] == [
+        "test_inherited_non_green"
+    ]
     assert ledger["overall_release_pass_claimed"] is False
     assert proof["comparison_base_commit_sha"] == base_commit
     assert proof["comparison_base_commit_lineage_source"] == (
         server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
     )
-    assert proof["audit_only"] is True
-    assert proof["close_satisfying"] is False
+    assert accepted["payload"]["row_scoped_qa_pass"] is True
+    assert accepted["payload"]["targeted_scope_only"] is True
+    assert accepted["payload"]["used_as_pass"] is False
+    assert accepted["payload"]["overall_release_pass_claimed"] is False
+    assert proof["audit_only"] is False
+    assert proof["close_satisfying"] is True
 
     original_root_identity = copy.deepcopy(trace["root_identity"])
     for mutation, expected_actual in (
@@ -157376,6 +157502,98 @@ def test_exact_candidate_direct_main_comparison_authority_rejects_untrusted_line
             "actual": unrelated_commit,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "forged_authority_hash",
+        "wrong_route_scope",
+        "wrong_actor",
+        "wrong_event_type",
+        "wrong_order",
+        "wrong_commit_binding",
+        "cross_file_scope",
+        "missing_scope_check",
+    ],
+)
+def test_exact_candidate_observer_direct_main_comparison_authority_fails_closed(
+    conn,
+    mutation,
+):
+    backlog_id = (
+        "AC-DIRECT-MAIN-EXACT-OBSERVER-FAIL-CLOSED-"
+        + mutation.upper().replace("_", "-")
+    )
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+        record_failed_qa=False,
+        observer_authoritative_implementation=True,
+    )
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=lineage["task_id"],
+        limit=100,
+    )
+    direct_event = next(
+        event
+        for event in events
+        if event["event_kind"] == "observer_direct_implementation_exception"
+    )
+    implementation = next(
+        event for event in events if event["event_kind"] == "implementation"
+    )
+    assert server._qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
+        implementation,
+        direct_event=direct_event,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=lineage["task_id"],
+    )
+
+    candidate = copy.deepcopy(implementation)
+    if mutation == "forged_authority_hash":
+        candidate["payload"]["source_backed_contract_gate_authority"][
+            "authority_hash"
+        ] = "sha256:" + "f" * 64
+    elif mutation == "wrong_route_scope":
+        authority = candidate["payload"][
+            "source_backed_contract_gate_authority"
+        ]
+        authority["route_token_gate"]["scope"]["task_id"] = "cross-task"
+        authority["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in authority.items()
+                if key != "authority_hash"
+            }
+        )
+    elif mutation == "wrong_actor":
+        candidate["actor"] = "worker:/root/forged"
+    elif mutation == "wrong_event_type":
+        candidate["event_type"] = "worker.implementation"
+    elif mutation == "wrong_order":
+        candidate["id"] = direct_event["id"]
+    elif mutation == "wrong_commit_binding":
+        candidate["payload"]["test_results"]["commit_sha"] = "f" * 40
+    elif mutation == "cross_file_scope":
+        candidate["payload"]["changed_files"] = ["outside.py"]
+        candidate["payload"]["dirty_scope_check"]["changed_files"] = [
+            "outside.py"
+        ]
+    elif mutation == "missing_scope_check":
+        candidate["payload"].pop("dirty_scope_check")
+
+    assert not server._qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
+        candidate,
+        direct_event=direct_event,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=lineage["task_id"],
+    )
 
 
 def test_direct_main_failed_qa_accepts_route_bound_worker_owned_implementation(

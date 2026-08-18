@@ -10793,7 +10793,8 @@ def _qa_exact_candidate_direct_main_comparison_authority(
     authoritative_events = [
         event
         for event in implementation_events
-        if _onboard_parentless_direct_main_worker_implementation_is_authoritative(
+        if _qa_exact_candidate_direct_main_implementation_is_authoritative(
+            conn,
             event,
             direct_event=direct_event,
             project_id=project_id,
@@ -11004,44 +11005,12 @@ def _qa_exact_candidate_comparison_authority_required(
         backlog_id=backlog_id,
         task_id=task_id,
     )
-    if not direct_events:
-        return False
-    direct_event_id = int(
-        direct_events[0].get("id")
-        or direct_events[0].get("event_id")
-        or 0
-    )
-    implementation_events = (
-        _onboard_parentless_direct_main_timeline_events(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
-            event_kind="implementation",
-            after_event_id=direct_event_id,
-        )
-    )
-    for event in implementation_events:
-        payload = (
-            event.get("payload")
-            if isinstance(event.get("payload"), Mapping)
-            else {}
-        )
-        materialized_from = (
-            payload.get("materialized_from")
-            if isinstance(payload.get("materialized_from"), Mapping)
-            else {}
-        )
-        if any(
-            str(value or "").strip().startswith("worker:")
-            for value in (
-                event.get("actor"),
-                payload.get("evidence_owner"),
-                payload.get("authored_by"),
-            )
-        ) or str(materialized_from.get("worker_task") or "").strip():
-            return True
-    return False
+    # Once an accepted Direct Main pre-mutation boundary exists, exact-candidate
+    # QA must resolve its unique commit-bound implementation lineage.  Treating
+    # a missing, forged, or ambiguous implementation as "authority optional"
+    # would silently collapse the immutable parent comparison back to the
+    # candidate snapshot commit.
+    return bool(direct_events)
 
 
 def _qa_exact_candidate_context(
@@ -11676,11 +11645,28 @@ def _qa_external_no_pass_comparison_tuple(
     ledger_schema = str(ledger.get("schema_version") or "").strip()
     payload_issue_claims = payload.get("candidate_specific_issues")
     ledger_issue_claims = ledger.get("candidate_specific_issues")
+    body_status = str(body.get("status") or "").strip().lower()
+    qa_acceptance = (
+        payload.get("qa_acceptance")
+        if isinstance(payload.get("qa_acceptance"), Mapping)
+        else {}
+    )
+    targeted_scope_pass = bool(
+        body_status in {"accepted", "ok", "pass", "passed", "success"}
+        and payload.get("row_scoped_qa_pass") is True
+        and payload.get("targeted_scope_only") is True
+        and payload.get("used_as_pass") is False
+        and qa_acceptance.get("passed") is True
+        and qa_acceptance.get("targeted_scope_only") is True
+        and qa_acceptance.get("used_as_pass") is False
+    )
     if (
         payload_schema not in _QA_EXTERNAL_NO_PASS_COMPARISON_PAYLOAD_SCHEMAS
         or ledger_schema != _QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_SCHEMA
-        or str(body.get("status") or "").strip().lower()
-        not in {"failed", "fail", "rejected", "blocked"}
+        or (
+            body_status not in {"failed", "fail", "rejected", "blocked"}
+            and not targeted_scope_pass
+        )
         or payload.get("no_pass_claim") is not True
         or payload.get("overall_release_pass_claimed") is not False
         or str(payload.get("full_suite_claim") or "").strip()
@@ -129572,6 +129558,213 @@ def _onboard_parentless_direct_main_worker_implementation_is_authoritative(
         and str(route_scope.get("backlog_id") or "").strip() == backlog_id
         and str(route_scope.get("task_id") or "").strip() == task_id
         and route_identity_matches
+    )
+
+
+def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
+    event: Mapping[str, Any],
+    *,
+    direct_event: Mapping[str, Any],
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+) -> bool:
+    """Accept one canonical, server-gated observer Direct Main implementation."""
+
+    payload = (
+        event.get("payload")
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    direct_payload = (
+        direct_event.get("payload")
+        if isinstance(direct_event.get("payload"), Mapping)
+        else {}
+    )
+    direct_authority = (
+        direct_payload.get("observer_direct_pre_mutation_authority")
+        if isinstance(
+            direct_payload.get("observer_direct_pre_mutation_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    acceptance_scope = (
+        direct_payload.get("acceptance_scope_closure")
+        if isinstance(direct_payload.get("acceptance_scope_closure"), Mapping)
+        else {}
+    )
+    declared_files = _runtime_context_service_dedupe(
+        [
+            str(path or "").strip()
+            for path in (
+                direct_authority.get("row_declared_files")
+                or acceptance_scope.get("allowed_files")
+                or []
+            )
+        ]
+    )
+    raw_changed_files = payload.get("changed_files")
+    changed_files = _runtime_context_service_dedupe(
+        [
+            str(path or "").strip()
+            for path in (
+                raw_changed_files if isinstance(raw_changed_files, list) else []
+            )
+        ]
+    )
+    scope_check = next(
+        (
+            candidate
+            for candidate in (
+                payload.get("dirty_scope_check"),
+                payload.get("diff_check"),
+            )
+            if isinstance(candidate, Mapping)
+        ),
+        {},
+    )
+    raw_scope_changed_files = scope_check.get("changed_files")
+    scope_changed_files = _runtime_context_service_dedupe(
+        [
+            str(path or "").strip()
+            for path in (
+                raw_scope_changed_files
+                if isinstance(raw_scope_changed_files, list)
+                else []
+            )
+        ]
+    )
+    raw_scope_allowed_files = scope_check.get("allowed_files")
+    scope_allowed_files = _runtime_context_service_dedupe(
+        [
+            str(path or "").strip()
+            for path in (
+                raw_scope_allowed_files
+                if isinstance(raw_scope_allowed_files, list)
+                else []
+            )
+        ]
+    )
+    commit_sha = str(event.get("commit_sha") or "").strip().lower()
+    decision = (
+        payload.get("contract_gate_decision")
+        if isinstance(payload.get("contract_gate_decision"), Mapping)
+        else {}
+    )
+    decision_hash = str(decision.get("decision_hash") or "").strip()
+    unsigned_decision = {
+        key: value for key, value in decision.items() if key != "decision_hash"
+    }
+    authority = _contract_runtime_close_authority_first_deep_mapping(
+        event,
+        "source_backed_contract_gate_authority",
+    )
+    route_gate = (
+        authority.get("route_token_gate")
+        if isinstance(authority.get("route_token_gate"), Mapping)
+        else {}
+    )
+    route_scope = (
+        route_gate.get("scope")
+        if isinstance(route_gate.get("scope"), Mapping)
+        else {}
+    )
+    direct_identity = _observer_root_route_identity_from_event(direct_event)
+    implementation_identity = _observer_root_route_identity_from_event(event)
+    test_results = _contract_runtime_parentless_direct_main_test_results_gate(
+        payload.get("test_results"),
+        expected_commit=commit_sha,
+        field="implementation.payload.test_results",
+    )
+    direct_event_id = int(
+        direct_event.get("id") or direct_event.get("event_id") or 0
+    )
+    implementation_event_id = int(
+        event.get("id") or event.get("event_id") or 0
+    )
+
+    return bool(
+        direct_event_id > 0
+        and implementation_event_id > direct_event_id
+        and str(event.get("project_id") or "").strip() == project_id
+        and str(event.get("backlog_id") or "").strip() == backlog_id
+        and str(event.get("task_id") or "").strip() == task_id
+        and str(event.get("event_type") or "").strip()
+        == "observer.implementation"
+        and str(event.get("event_kind") or "").strip() == "implementation"
+        and str(event.get("phase") or "").strip() == "implementation"
+        and str(event.get("status") or "").strip().lower() == "passed"
+        and str(event.get("actor") or "").strip() == "observer"
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha)
+        and not _qa_request_has_impersonation_claim(event)
+        and direct_authority.get("accepted") is True
+        and direct_authority.get("server_projected") is True
+        and str(direct_authority.get("projection_source") or "").strip()
+        == "task_timeline_append_pre_persistence_gate"
+        and declared_files
+        and changed_files
+        and isinstance(raw_changed_files, list)
+        and len(changed_files) == len(raw_changed_files)
+        and set(changed_files).issubset(set(declared_files))
+        and scope_check.get("exact_match") is True
+        and not list(scope_check.get("unexpected_files") or [])
+        and scope_changed_files == changed_files
+        and (not scope_allowed_files or scope_allowed_files == declared_files)
+        and test_results.get("passed") is True
+        and _observer_root_route_identity_complete(direct_identity)
+        and _observer_root_route_identity_complete(implementation_identity)
+        and decision.get("ok") is True
+        and str(decision.get("decision") or "").strip() in {"allow", "warn"}
+        and str(decision.get("action") or "").strip()
+        == "task_timeline_append"
+        and str(decision.get("actor_role") or "").strip() == "observer"
+        and str(decision.get("source_of_authority") or "").strip()
+        == "route_token_gate"
+        and decision.get("primary_decision_source") is True
+        and decision.get("meta_contract_gate_decision_source") is False
+        and decision_hash
+        and decision_hash == stable_sha256(unsigned_decision)
+        and _contract_runtime_close_authority_route_token_backed_event(
+            event,
+            implementation_identity,
+            require_source_backed_authority=True,
+        )
+        and str(route_gate.get("action") or "").strip()
+        == "task_timeline_append"
+        and str(route_scope.get("project_id") or "").strip() == project_id
+        and str(route_scope.get("backlog_id") or "").strip() == backlog_id
+        and str(route_scope.get("task_id") or "").strip() == task_id
+    )
+
+
+def _qa_exact_candidate_direct_main_implementation_is_authoritative(
+    conn,
+    event: Mapping[str, Any],
+    *,
+    direct_event: Mapping[str, Any],
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+) -> bool:
+    """Preserve worker authority and add canonical observer Direct Main authority."""
+
+    del conn  # The authority is entirely persisted and source-backed.
+    return bool(
+        _onboard_parentless_direct_main_worker_implementation_is_authoritative(
+            event,
+            direct_event=direct_event,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+        or _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
+            event,
+            direct_event=direct_event,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
     )
 
 
