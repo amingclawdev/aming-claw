@@ -293,6 +293,62 @@ def test_host_envelope_store_is_single_use_ttl_bound_and_zeroizes_replacements()
     assert store.pending_count() == 0
 
 
+def test_host_envelope_store_synchronizes_exact_expiry_without_a_raw_read():
+    import pytest
+
+    from cli_agent_service.launchers import HostEnvelopeError, HostEnvelopeStore
+
+    clock = [200.0]
+    store = HostEnvelopeStore(monotonic_clock=lambda: clock[0])
+    session_token, fence_token = _auth_values()
+    staged = store.stage(
+        "run-synchronized-expiry",
+        _host_envelope(session_token, fence_token, suffix="synchronized-expiry"),
+        lease_owner_id=LEASE_OWNER,
+        ttl_seconds=2,
+    )
+    expected = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-secure-envelope-synchronized-expiry",
+        "task_id": "worker-secure-envelope-synchronized-expiry",
+        "session_token_ref": staged["session_token_ref"],
+    }
+    buffers = tuple(
+        store._entries["run-synchronized-expiry"].environment.values()
+    )
+
+    assert store.synchronize(
+        "run-synchronized-expiry",
+        lease_owner_id=LEASE_OWNER,
+        envelope_ref=staged["envelope_ref"],
+        expected_public_refs=expected,
+    ) == "active"
+    with pytest.raises(HostEnvelopeError, match="public identity"):
+        store.synchronize(
+            "run-synchronized-expiry",
+            lease_owner_id=LEASE_OWNER,
+            envelope_ref=staged["envelope_ref"],
+            expected_public_refs={**expected, "task_id": "foreign-task"},
+        )
+
+    clock[0] += 3
+    assert store.synchronize(
+        "run-synchronized-expiry",
+        lease_owner_id=LEASE_OWNER,
+        envelope_ref=staged["envelope_ref"],
+        expected_public_refs=expected,
+    ) == "expired"
+    assert all(not value for value in buffers)
+    assert store.synchronize(
+        "run-synchronized-expiry",
+        lease_owner_id=LEASE_OWNER,
+        envelope_ref=staged["envelope_ref"],
+        expected_public_refs=expected,
+    ) == "unavailable"
+    public = json.dumps(staged, sort_keys=True)
+    _assert_raw_absent(public, session_token, fence_token)
+
+
 def test_host_envelope_delivery_can_be_revoked_and_never_has_a_raw_read_api():
     import pytest
 

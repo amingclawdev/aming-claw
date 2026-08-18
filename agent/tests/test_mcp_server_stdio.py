@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -252,6 +253,148 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
     assert raw_fence not in serialized
 
 
+def test_real_stdio_expired_managed_entry_allows_no_ref_recovery_guide(tmp_path):
+    raw_session = "stdio-expiry-session-secret"
+    raw_fence = "stdio-expiry-fence-secret"
+    route = {
+        "route_id": "route-stdio-expiry",
+        "route_context_hash": "sha256:" + ("a" * 64),
+        "prompt_contract_id": "rprompt-stdio-expiry",
+        "prompt_contract_hash": "sha256:" + ("b" * 64),
+        "route_token_ref": "rtok-stdio-expiry",
+        "visible_injection_manifest_hash": "sha256:" + ("c" * 64),
+    }
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-stdio-expiry",
+        "task_id": "worker-stdio-expiry",
+        "parent_task_id": "cex-stdio-expiry",
+        "target_project_root": str(tmp_path),
+        "session_token_ref": "wstok-stdio-expiry",
+        **route,
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        calls = []
+
+        def log_message(self, *_args):
+            return None
+
+        def _send(self, payload):
+            encoded = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def do_POST(self):
+            size = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(size) or b"{}")
+            self.__class__.calls.append(("POST", self.path, body))
+            self._send(
+                {
+                    "ok": True,
+                    "status": "session_token_reissued",
+                    "delivery": "worker_host_envelope",
+                    "ttl_seconds": 0.05,
+                    **identity,
+                    "session_token": raw_session,
+                    "fence_token": raw_fence,
+                    "host_envelope": {
+                        **identity,
+                        "env": {
+                            "AMING_WORKER_SESSION_TOKEN": raw_session,
+                            "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                        },
+                    },
+                }
+            )
+
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            assert "session_token" not in query
+            assert "fence_token" not in query
+            self.__class__.calls.append(("GET", self.path, None))
+            self._send({"ok": True, "status": "recovery_guide_ready"})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "agent.mcp.server",
+            "--project",
+            "aming-claw",
+            "--workers",
+            "0",
+            "--governance-url",
+            f"http://127.0.0.1:{server.server_address[1]}",
+        ],
+        cwd=ROOT,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+
+    def rpc(message):
+        proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+        return json.loads(proc.stdout.readline())
+
+    try:
+        rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        issued_response = rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "runtime_context_session_token_reissue",
+                    "arguments": identity,
+                },
+            }
+        )
+        time.sleep(0.1)
+        no_ref = {
+            key: value for key, value in identity.items() if key != "session_token_ref"
+        }
+        guide_response = rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "runtime_context_worker_guide",
+                    "arguments": no_ref,
+                },
+            }
+        )
+    finally:
+        proc.stdin.close()
+        stderr = proc.stderr.read() if proc.stderr else ""
+        returncode = proc.wait(timeout=10)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    issued = json.loads(issued_response["result"]["content"][0]["text"])
+    guide = json.loads(guide_response["result"]["content"][0]["text"])
+    assert returncode == 0
+    assert stderr == ""
+    assert issued["auth_loaded"] is True
+    assert guide == {"ok": True, "status": "recovery_guide_ready"}
+    assert len(Handler.calls) == 2
+    serialized = json.dumps([issued_response, guide_response], sort_keys=True) + stderr
+    assert raw_session not in serialized
+    assert raw_fence not in serialized
+
+
 def test_governance_stdio_mirror_manages_same_host_envelope_flow(monkeypatch):
     continuity = runtime_mcp_tool_module.ManagedHostEnvelopeContinuity()
     monkeypatch.setattr(
@@ -387,6 +530,76 @@ def test_governance_stdio_mirror_manages_same_host_envelope_flow(monkeypatch):
     assert startup["managed_host_envelope_consumed"] is True
     assert continuity.pending_count() == 0
     assert len(calls) == 4
+
+
+def test_governance_stdio_mirror_forwards_no_ref_guide_after_exact_expiry(
+    monkeypatch,
+):
+    from agent.cli_agent_service.launchers import HostEnvelopeStore
+
+    clock = [400.0]
+    continuity = runtime_mcp_tool_module.ManagedHostEnvelopeContinuity(
+        store=HostEnvelopeStore(monotonic_clock=lambda: clock[0])
+    )
+    monkeypatch.setattr(governance_mcp_server, "_HOST_ENVELOPE_CONTINUITY", continuity)
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-mirror-expiry",
+        "task_id": "worker-mirror-expiry",
+        "parent_task_id": "cex-mirror-expiry",
+        "target_project_root": "/tmp/mirror-expiry",
+        "session_token_ref": "wstok-mirror-expiry",
+        "route_id": "route-mirror-expiry",
+        "route_context_hash": "sha256:" + ("7" * 64),
+        "prompt_contract_id": "rprompt-mirror-expiry",
+        "prompt_contract_hash": "sha256:" + ("8" * 64),
+        "route_token_ref": "rtok-mirror-expiry",
+        "visible_injection_manifest_hash": "sha256:" + ("9" * 64),
+    }
+    raw_session = "mirror-expiry-session-secret"
+    raw_fence = "mirror-expiry-fence-secret"
+    calls = []
+
+    def fake_http(method, path, body=None, *args, **kwargs):
+        calls.append((method, path, body))
+        if path.endswith("/session-token/reissue"):
+            return {
+                "ok": True,
+                "status": "session_token_reissued",
+                "delivery": "worker_host_envelope",
+                "ttl_seconds": 2,
+                **identity,
+                "session_token": raw_session,
+                "fence_token": raw_fence,
+                "host_envelope": {
+                    **identity,
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": raw_session,
+                        "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                    },
+                },
+            }
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        assert "session_token" not in query
+        assert "fence_token" not in query
+        return {"ok": True, "status": "recovery_guide_ready"}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    issued = governance_mcp_server._dispatch_tool(
+        "runtime_context_session_token_reissue", identity
+    )
+    assert issued["auth_loaded"] is True
+    clock[0] += 3
+    no_ref = {key: value for key, value in identity.items() if key != "session_token_ref"}
+    guide = governance_mcp_server._dispatch_tool(
+        "runtime_context_worker_guide", no_ref
+    )
+    assert guide == {"ok": True, "status": "recovery_guide_ready"}
+    assert len(calls) == 2
+    assert continuity.pending_count() == 0
+    serialized = json.dumps([issued, guide, calls], sort_keys=True)
+    assert raw_session not in serialized
+    assert raw_fence not in serialized
 
 
 def _run_mcp_probe(

@@ -176,6 +176,7 @@ class _ManagedEnvelope:
     run_id: str
     envelope_ref: str
     binding: dict[str, str]
+    expired: bool = False
 
 
 class ManagedHostEnvelopeContinuity:
@@ -419,6 +420,8 @@ class ManagedHostEnvelopeContinuity:
         tool_name: str,
         args: Mapping[str, Any],
         entry: _ManagedEnvelope,
+        *,
+        require_session_token_ref: bool = True,
     ) -> dict[str, Any] | None:
         if any(_text(args.get(field)) for field in _RAW_RESPONSE_FIELDS):
             return _local_error(
@@ -431,9 +434,10 @@ class ManagedHostEnvelopeContinuity:
             "task_id",
             "parent_task_id",
             "target_project_root",
-            "session_token_ref",
             *_ROUTE_FIELDS,
         ]
+        if require_session_token_ref:
+            required.append("session_token_ref")
         if tool_name == "runtime_context_read_receipt":
             required.extend(
                 ("contract_execution_id", "worker_id", "worker_slot_id")
@@ -484,6 +488,17 @@ class ManagedHostEnvelopeContinuity:
 
         entry = self._entry_for(request_args)
         if entry is None:
+            candidate_binding = {
+                field: _text(request_args.get(field))
+                for field in ("project_id", "runtime_context_id", "task_id")
+            }
+            if all(candidate_binding.values()):
+                with self._lock:
+                    if _run_id(candidate_binding) in self._in_flight:
+                        return _local_error(
+                            "managed_host_envelope_concurrent_use",
+                            "The exact process-local host envelope already has an in-flight continuation.",
+                        )
             if (
                 tool_name == "runtime_context_worker_guide"
                 or not _text(request_args.get("session_token_ref"))
@@ -493,17 +508,77 @@ class ManagedHostEnvelopeContinuity:
                 "managed_host_envelope_not_loaded",
                 "This MCP process has no exact staged worker host envelope.",
             )
-        rejection = self._validate_continuation(tool_name, request_args, entry)
-        if rejection is not None:
-            return rejection
-
         with self._lock:
             if entry.run_id in self._in_flight:
                 return _local_error(
                     "managed_host_envelope_concurrent_use",
                     "The exact process-local host envelope already has an in-flight continuation.",
                 )
-            self._in_flight.add(entry.run_id)
+            if entry.expired:
+                store_state = "expired"
+            else:
+                try:
+                    store_state = self._store.synchronize(
+                        entry.run_id,
+                        lease_owner_id=_OWNER_ID,
+                        envelope_ref=entry.envelope_ref,
+                        expected_public_refs=entry.binding,
+                    )
+                except HostEnvelopeError:
+                    return _local_error(
+                        "managed_host_envelope_unavailable",
+                        "The process-local worker host envelope is unavailable.",
+                    )
+            if store_state == "unavailable":
+                return _local_error(
+                    "managed_host_envelope_unavailable",
+                    "The process-local worker host envelope is unavailable.",
+                )
+            if store_state == "expired":
+                if not entry.expired:
+                    entry = _ManagedEnvelope(
+                        run_id=entry.run_id,
+                        envelope_ref=entry.envelope_ref,
+                        binding=entry.binding,
+                        expired=True,
+                    )
+                    self._entries[entry.run_id] = entry
+                recovery_rejection = self._validate_continuation(
+                    tool_name,
+                    request_args,
+                    entry,
+                    require_session_token_ref=False,
+                )
+                if recovery_rejection is not None:
+                    return recovery_rejection
+                if (
+                    tool_name != "runtime_context_worker_guide"
+                    or _text(request_args.get("session_token_ref"))
+                ):
+                    return _local_error(
+                        "managed_host_envelope_unavailable",
+                        "The process-local worker host envelope is absent or expired.",
+                    )
+                self._entries.pop(entry.run_id, None)
+                self._in_flight.add(entry.run_id)
+                expired_recovery = True
+            else:
+                rejection = self._validate_continuation(
+                    tool_name,
+                    request_args,
+                    entry,
+                )
+                if rejection is not None:
+                    return rejection
+                self._in_flight.add(entry.run_id)
+                expired_recovery = False
+
+        if expired_recovery:
+            try:
+                return send(request_args)
+            finally:
+                with self._lock:
+                    self._in_flight.discard(entry.run_id)
 
         try:
             delivery = self._store.borrow(

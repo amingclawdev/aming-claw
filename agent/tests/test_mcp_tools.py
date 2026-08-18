@@ -381,6 +381,155 @@ def test_managed_mcp_host_envelope_cross_scope_is_zero_http():
     assert calls == []
 
 
+def test_managed_mcp_host_envelope_expiry_sync_allows_one_no_ref_recovery():
+    from agent.cli_agent_service.launchers import HostEnvelopeStore
+
+    clock = [300.0]
+    store = HostEnvelopeStore(monotonic_clock=lambda: clock[0])
+    continuity = mcp_tools.ManagedHostEnvelopeContinuity(store=store)
+    route = {
+        "route_id": "route-expiry-sync",
+        "route_context_hash": "sha256:" + ("a" * 64),
+        "prompt_contract_id": "rprompt-expiry-sync",
+        "prompt_contract_hash": "sha256:" + ("b" * 64),
+        "route_token_ref": "rtok-expiry-sync",
+        "visible_injection_manifest_hash": "sha256:" + ("c" * 64),
+    }
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-expiry-sync",
+        "task_id": "worker-expiry-sync",
+        "parent_task_id": "cex-expiry-sync",
+        "contract_execution_id": "cex-expiry-sync",
+        "target_project_root": "/tmp/expiry-sync",
+        "worker_id": "worker-expiry-sync",
+        "worker_slot_id": "worker-expiry-sync",
+        "actual_host_worker_id": "worker-expiry-sync",
+        "worker_session_id": "desktop-expiry-sync",
+        "session_token_ref": "wstok-expiry-sync",
+        **route,
+    }
+    raw_session = "expiry-sync-session-secret"
+    raw_fence = "expiry-sync-fence-secret"
+    issued = continuity.dispatch(
+        "runtime_context_session_token_reissue",
+        identity,
+        lambda _args: {
+            "ok": True,
+            "status": "session_token_reissued",
+            "delivery": "worker_host_envelope",
+            "ttl_seconds": 2,
+            **identity,
+            "session_token": raw_session,
+            "fence_token": raw_fence,
+            "host_envelope": {
+                **identity,
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": raw_session,
+                    "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                },
+            },
+        },
+    )
+    assert issued["auth_loaded"] is True
+    run_id = next(iter(store._entries))
+    buffers = tuple(store._entries[run_id].environment.values())
+    no_ref = {key: value for key, value in identity.items() if key != "session_token_ref"}
+    calls = []
+
+    active = continuity.dispatch(
+        "runtime_context_worker_guide",
+        no_ref,
+        lambda args: calls.append(dict(args)),
+    )
+    assert active["error"] == "managed_host_envelope_scope_mismatch"
+    assert active["missing_fields"] == ["session_token_ref"]
+    assert active["http_request_performed"] is False
+    assert calls == []
+
+    clock[0] += 3
+    wrong_scope = continuity.dispatch(
+        "runtime_context_worker_guide",
+        {**no_ref, "route_id": "route-expiry-sync-foreign"},
+        lambda args: calls.append(dict(args)),
+    )
+    assert wrong_scope["error"] == "managed_host_envelope_scope_mismatch"
+    assert wrong_scope["mismatched_fields"] == ["route_id"]
+    assert wrong_scope["http_request_performed"] is False
+    assert all(not value for value in buffers)
+    assert calls == []
+
+    recovered = continuity.dispatch(
+        "runtime_context_worker_guide",
+        no_ref,
+        lambda args: calls.append(dict(args))
+        or {"ok": True, "status": "recovery_guide_ready"},
+    )
+    assert recovered == {"ok": True, "status": "recovery_guide_ready"}
+    assert calls == [no_ref]
+    assert continuity.pending_count() == 0
+    serialized = json.dumps([issued, recovered, calls], sort_keys=True)
+    assert raw_session not in serialized
+    assert raw_fence not in serialized
+
+
+def test_managed_mcp_host_envelope_revoked_store_stays_zero_http():
+    from agent.cli_agent_service.launchers import HostEnvelopeStore
+
+    store = HostEnvelopeStore()
+    continuity = mcp_tools.ManagedHostEnvelopeContinuity(store=store)
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-revoked-sync",
+        "task_id": "worker-revoked-sync",
+        "parent_task_id": "cex-revoked-sync",
+        "target_project_root": "/tmp/revoked-sync",
+        "session_token_ref": "wstok-revoked-sync",
+        "route_id": "route-revoked-sync",
+        "route_context_hash": "sha256:" + ("d" * 64),
+        "prompt_contract_id": "rprompt-revoked-sync",
+        "prompt_contract_hash": "sha256:" + ("e" * 64),
+        "route_token_ref": "rtok-revoked-sync",
+        "visible_injection_manifest_hash": "sha256:" + ("f" * 64),
+    }
+    continuity.dispatch(
+        "runtime_context_session_token_reissue",
+        identity,
+        lambda _args: {
+            "ok": True,
+            "status": "session_token_reissued",
+            "delivery": "worker_host_envelope",
+            **identity,
+            "session_token": "revoked-sync-session",
+            "fence_token": "revoked-sync-fence",
+            "host_envelope": {
+                **identity,
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": "revoked-sync-session",
+                    "AMING_WORKER_FENCE_TOKEN": "revoked-sync-fence",
+                },
+            },
+        },
+    )
+    entry = continuity._entry_for(identity)
+    assert entry is not None
+    store.revoke(
+        entry.run_id,
+        envelope_ref=entry.envelope_ref,
+        lease_owner_id="mcp-host-envelope-continuity",
+    )
+    calls = []
+    no_ref = {key: value for key, value in identity.items() if key != "session_token_ref"}
+    rejected = continuity.dispatch(
+        "runtime_context_worker_guide",
+        no_ref,
+        lambda args: calls.append(args),
+    )
+    assert rejected["error"] == "managed_host_envelope_unavailable"
+    assert rejected["http_request_performed"] is False
+    assert calls == []
+
+
 def test_managed_mcp_host_envelope_concurrent_continuation_fails_closed():
     continuity = mcp_tools.ManagedHostEnvelopeContinuity()
     route = {

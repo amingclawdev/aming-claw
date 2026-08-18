@@ -416,6 +416,52 @@ class HostEnvelopeStore:
             }
         return HostEnvelopeDelivery(copied)
 
+    def synchronize(
+        self,
+        run_id: str,
+        *,
+        lease_owner_id: str,
+        envelope_ref: str,
+        expected_public_refs: Mapping[str, Any],
+    ) -> str:
+        """Synchronize one exact metadata binding with its stored envelope.
+
+        The result is process-local control flow only; it is never a public
+        status/read surface.  An exact expired entry is removed and wiped
+        atomically so a managed host can discard its matching metadata before
+        asking governance for recovery.  Missing, revoked, or mismatched
+        entries remain distinguishable from expiry and therefore fail closed.
+        """
+
+        normalized_run_id = str(run_id or "").strip()
+        normalized_owner_id = str(lease_owner_id or "").strip()
+        normalized_envelope_ref = str(envelope_ref or "").strip()
+        with self._lock:
+            entry = self._entries.get(normalized_run_id)
+            if entry is None:
+                return "unavailable"
+            if entry.lease_owner_id != normalized_owner_id:
+                raise HostEnvelopeError("host envelope lease owner does not match")
+            if entry.envelope_ref != normalized_envelope_ref:
+                raise HostEnvelopeError(
+                    "host envelope ref does not match delivery scope"
+                )
+            expected = {
+                str(key): str(value or "").strip()
+                for key, value in expected_public_refs.items()
+                if str(value or "").strip()
+            }
+            if any(
+                str(entry.public_refs.get(key) or "").strip() != value
+                for key, value in expected.items()
+            ):
+                raise HostEnvelopeError("host envelope public identity does not match")
+            if entry.expires_monotonic > self._monotonic_clock():
+                return "active"
+            self._entries.pop(normalized_run_id)
+            entry.wipe()
+            return "expired"
+
     def acknowledge(
         self,
         run_id: str,
