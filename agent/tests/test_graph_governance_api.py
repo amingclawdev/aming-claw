@@ -129965,17 +129965,28 @@ def test_context_local_post_read_second_loss_compact_guide_stops_without_auth_ac
             "contract_runtime_current_state": {
                 "schema_version": "contract_runtime.current_state.v1",
                 "contract_execution_id": sequence["contract_execution_id"],
-                "runtime_context_id": context.runtime_context_id,
-                "task_id": context.task_id,
+                "runtime_context_id": (
+                    "mfrctx-context-local-predecessor-worker-read"
+                ),
+                "task_id": f"{context.parent_task_id}:row:1",
                 "next_legal_action": {
-                    "stage_id": "worker_startup",
-                    "line_id": "worker_startup",
+                    "action": "record_read_receipt",
+                    "stage_id": "worker_read",
+                    "line_id": "worker_read_runtime_guide",
                 },
             },
             "contract_runtime_next_legal_action": {
-                "action": "record_mf_subagent_startup",
-                "stage_id": "worker_startup",
-                "line_id": "worker_startup",
+                "action": "record_read_receipt",
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "contract_execution_id": sequence[
+                    "contract_execution_id"
+                ],
+                "runtime_context_id": (
+                    "mfrctx-context-local-predecessor-worker-read"
+                ),
+                "task_id": f"{context.parent_task_id}:row:1",
+                "parent_task_id": context.parent_task_id,
             },
             "authority_decision_source": "contract_runtime_current_state",
         },
@@ -130081,10 +130092,36 @@ def test_context_local_post_read_second_loss_compact_guide_stops_without_auth_ac
         "runtime_context_recovery_authority"
     )
     assert compact["contract_runtime_next_action_took_precedence"] is False
+    assert compact["contract_runtime_next_legal_action"]["action"] == (
+        "record_read_receipt"
+    )
+    assert compact["contract_runtime_next_legal_action"]["stage_id"] == (
+        "worker_read"
+    )
     assert compact["canonical_executable_action"] == {}
     assert compact["actionable_payloads"]["recovery_exhaustion"] == (
         payloads["recovery_exhaustion"]
     )
+    for key in (
+        "session_token_initial_join_submission",
+        "session_token_rejoin_submission",
+        "session_token_reissue_submission",
+        "read_receipt_facade_payload_skeleton",
+        "startup_facade_payload_skeleton",
+    ):
+        assert key not in compact["actionable_payloads"]
+    paged_lifecycle_payloads = compact["actionable_payloads"][
+        "paged_lifecycle_payloads"
+    ]
+    assert {
+        "read_receipt_facade_payload_skeleton",
+        "startup_facade_payload_skeleton",
+    }.issubset(paged_lifecycle_payloads["keys"])
+    assert not {
+        "session_token_initial_join_submission",
+        "session_token_rejoin_submission",
+        "session_token_reissue_submission",
+    }.intersection(paged_lifecycle_payloads["keys"])
     assert "safe_ref_prestartup_reissue_already_consumed" in compact[
         "blocking_reasons"
     ]

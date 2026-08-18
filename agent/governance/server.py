@@ -30578,6 +30578,14 @@ def _runtime_context_worker_guide_paged_value(
 def _runtime_context_worker_guide_current_stage(
     response: Mapping[str, Any],
 ) -> str:
+    explicit_next_action = str(
+        response.get("next_legal_action") or ""
+    ).strip().lower()
+    if (
+        explicit_next_action
+        == "stop_runtime_context_safe_ref_recovery_exhausted"
+    ):
+        return ""
     next_action = response.get("contract_runtime_next_legal_action")
     next_action = next_action if isinstance(next_action, Mapping) else {}
     stage_markers = (
@@ -30612,7 +30620,7 @@ def _runtime_context_worker_guide_current_stage(
         ),
     )
     signals = (
-        str(response.get("next_legal_action") or "").strip().lower(),
+        explicit_next_action,
         " ".join(
             str(value or "").strip().lower()
             for value in (
