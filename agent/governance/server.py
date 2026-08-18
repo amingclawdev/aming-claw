@@ -99520,6 +99520,14 @@ def _runtime_next_action_from_guide(
         "dispatch_copy_safe_body_source",
         "effective_worker_cardinality_policy",
         "effective_allocation_precheck_policy",
+        "source_of_authority",
+        "authority_decision_source",
+        "accepted_dispatch_authority",
+        "dispatch_source_ref",
+        "read_receipt_event_ref",
+        "contract_runtime_mutated",
+        "global_contract_line_already_completed",
+        "failed_qa_replacement_post_read_startup_projection",
     ):
         if key in next_line:
             result[key] = next_line[key]
@@ -99613,10 +99621,33 @@ def _runtime_next_action_from_guide(
                 "submit_unchanged": True,
                 "source_spelunking_required": False,
             }
+    post_read_startup = (
+        guide.get("failed_qa_replacement_post_read_startup_projection")
+        if isinstance(
+            guide.get(
+                "failed_qa_replacement_post_read_startup_projection"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    replacement_startup_facade_ready = bool(
+        line_id == "worker_startup"
+        and next_line.get(
+            "failed_qa_replacement_post_read_startup_projection"
+        )
+        is True
+        and post_read_startup.get("status") == "projected"
+        and post_read_startup.get("server_derived") is True
+        and isinstance(next_line.get("accepted_dispatch_authority"), Mapping)
+        and next_line["accepted_dispatch_authority"].get("server_derived")
+        is True
+    )
     bridge_guidance = (
         {}
         if route_action_scope_blocked
         or persisted_allocation_authority_blocked
+        or replacement_startup_facade_ready
         else _contract_runtime_mf_sub_host_bridge_guidance(guide)
     )
     if bridge_guidance:
@@ -99921,6 +99952,71 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
     comparison_base_verdict = _contract_runtime_comparison_base_verdict(record)
     if comparison_base_verdict:
         current_state["comparison_base_verdict"] = comparison_base_verdict
+    post_read_startup_projection = (
+        record.get("failed_qa_replacement_post_read_startup_projection")
+        if isinstance(
+            record.get(
+                "failed_qa_replacement_post_read_startup_projection"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    post_read_next = (
+        current_state.get("next_legal_action")
+        if isinstance(current_state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    post_read_dispatch = (
+        post_read_next.get("accepted_dispatch_authority")
+        if isinstance(
+            post_read_next.get("accepted_dispatch_authority"), Mapping
+        )
+        else {}
+    )
+    if (
+        post_read_startup_projection.get("status") == "projected"
+        and post_read_startup_projection.get("server_derived") is True
+        and post_read_startup_projection.get("contract_runtime_mutated")
+        is False
+        and post_read_startup_projection.get(
+            "append_only_history_preserved"
+        )
+        is True
+        and str(post_read_next.get("line_id") or "").strip()
+        == "worker_startup"
+        and post_read_dispatch.get("status") == "projected"
+        and post_read_dispatch.get("server_derived") is True
+        and all(
+            str(post_read_startup_projection.get(field) or "").strip()
+            == str(post_read_dispatch.get(field) or "").strip()
+            == str(post_read_next.get(field) or "").strip()
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_id",
+                "worker_slot_id",
+            )
+        )
+        and int(
+            post_read_startup_projection.get(
+                "dispatch_completed_line_index", -1
+            )
+        )
+        == int(post_read_dispatch.get("dispatch_completed_line_index", -2))
+        and str(
+            post_read_startup_projection.get("dispatch_source_ref") or ""
+        ).strip()
+        == str(post_read_dispatch.get("source_ref") or "").strip()
+    ):
+        current_state["accepted_dispatch_authority"] = dict(
+            post_read_dispatch
+        )
+        current_state[
+            "failed_qa_replacement_post_read_startup_projection"
+        ] = dict(post_read_startup_projection)
+        current_state.pop("mf_sub_host_bridge_guidance", None)
     if (
         _is_mf_parallel_record_contract_id(
             str(record.get("contract_id") or "")
@@ -102283,6 +102379,13 @@ def _contract_runtime_compact_cli_next_action(
         "route_token_ref",
         "blocked_by_failed_qa",
         "meta_contract_gate_decision_source",
+        "source_of_authority",
+        "authority_decision_source",
+        "dispatch_source_ref",
+        "read_receipt_event_ref",
+        "contract_runtime_mutated",
+        "global_contract_line_already_completed",
+        "failed_qa_replacement_post_read_startup_projection",
     ):
         if key in projected:
             compact[key] = projected[key]
@@ -102293,6 +102396,7 @@ def _contract_runtime_compact_cli_next_action(
         "worker_graph_runtime_facade_projection",
         "failed_qa_blocker",
         "canonical_executable_action",
+        "accepted_dispatch_authority",
     ):
         value = projected.get(key)
         if isinstance(value, Mapping):
@@ -103115,6 +103219,335 @@ _MF_PARALLEL_CONTEXT_PROJECTED_WORKER_LINES = (
 )
 
 
+def _contract_runtime_apply_failed_qa_post_read_startup_projection(
+    record: Mapping[str, Any],
+    projected_record: Mapping[str, Any],
+    projection: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Advance one exact replacement receipt to its context-local startup.
+
+    The global mf_parallel worker-read line can already belong to the failed
+    worker while a replacement RuntimeContext records its own read receipt on
+    the timeline.  ``runtime.projected_record`` intentionally keeps the
+    append-only ContractRuntime lines immutable, so its failed-QA guide can
+    otherwise remain pinned to the predecessor's worker-read identity.  This
+    read-only overlay accepts only the one server-built replacement line that
+    is downstream of the selected replacement dispatch and advances the
+    effective guide to the replacement's startup facade.
+
+    No caller evidence is trusted here: dispatch selection is the existing
+    server-verified selector and the receipt must be the exact source-backed
+    line/ref produced by the RuntimeContext projection.  Ambiguity or any
+    identity/order mismatch leaves the projected record byte-for-byte
+    equivalent to its input.
+    """
+
+    result = dict(projected_record)
+    persistence = (
+        projection.get("persistence")
+        if isinstance(projection, Mapping)
+        and isinstance(projection.get("persistence"), Mapping)
+        else {}
+    )
+    if not (
+        isinstance(record, Mapping)
+        and isinstance(projected_record, Mapping)
+        and isinstance(projection, Mapping)
+        and _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        and _is_mf_parallel_postmerge_revision(record)
+        and str(projection.get("status") or "").strip() == "projected"
+        and str(projection.get("source") or "").strip()
+        == "runtime_context_worker_evidence"
+        and persistence.get(
+            "mutates_contract_runtime_completed_lines"
+        )
+        is False
+    ):
+        return result, {}
+
+    direct_current = _runtime_current_state_from_record(record)
+    accepted_dispatch = (
+        direct_current.get("accepted_dispatch_authority")
+        if isinstance(
+            direct_current.get("accepted_dispatch_authority"), Mapping
+        )
+        else {}
+    )
+    replacement_next = (
+        direct_current.get("next_legal_action")
+        if isinstance(direct_current.get("next_legal_action"), Mapping)
+        else {}
+    )
+    failed_index = int(
+        accepted_dispatch.get("failed_qa_completed_line_index")
+        if accepted_dispatch.get("failed_qa_completed_line_index") is not None
+        else -1
+    )
+    dispatch_index = int(
+        accepted_dispatch.get("dispatch_completed_line_index")
+        if accepted_dispatch.get("dispatch_completed_line_index") is not None
+        else -1
+    )
+    identity = {
+        "runtime_context_id": str(
+            replacement_next.get("runtime_context_id") or ""
+        ).strip(),
+        "task_id": str(replacement_next.get("task_id") or "").strip(),
+        "parent_task_id": str(
+            replacement_next.get("parent_task_id") or ""
+        ).strip(),
+        "worker_id": str(replacement_next.get("worker_id") or "").strip(),
+        "worker_slot_id": str(
+            replacement_next.get("worker_slot_id") or ""
+        ).strip(),
+    }
+    if not (
+        accepted_dispatch.get("status") == "projected"
+        and accepted_dispatch.get("server_derived") is True
+        and str(accepted_dispatch.get("source") or "").strip()
+        == "server_verified_failed_qa_replacement_dispatch"
+        and failed_index >= 0
+        and dispatch_index > failed_index
+        and str(replacement_next.get("line_id") or "").strip()
+        == "worker_read_runtime_guide"
+        and all(identity.values())
+        and str(replacement_next.get("line_instance_id") or "").strip()
+        == f"runtime_context:{identity['runtime_context_id']}"
+        and str(replacement_next.get("lane_id") or "").strip()
+        == identity["worker_slot_id"]
+    ):
+        return result, {}
+
+    projected_refs = [
+        dict(item)
+        for item in projection.get("projected_line_refs") or []
+        if isinstance(item, Mapping)
+        and str(item.get("stage_id") or "").strip() == "worker_read"
+        and str(item.get("line_id") or "").strip()
+        == "worker_read_runtime_guide"
+        and str(item.get("evidence_kind") or "").strip() == "read_receipt"
+        and str(item.get("line_instance_id") or "").strip()
+        == f"runtime_context:{identity['runtime_context_id']}"
+        and re.fullmatch(
+            r"timeline:[1-9][0-9]*",
+            str(item.get("source_ref") or "").strip(),
+        )
+    ]
+    if len(projected_refs) != 1:
+        return result, {}
+    receipt_ref = str(projected_refs[0]["source_ref"]).strip()
+
+    completed_lines = projected_record.get("completed_lines")
+    if not isinstance(completed_lines, list):
+        return result, {}
+
+    def exact_identity(line: Mapping[str, Any]) -> bool:
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        return all(
+            str(line.get(field) or "").strip() == expected
+            and str(payload.get(field) or "").strip() == expected
+            for field, expected in identity.items()
+        ) and str(line.get("line_instance_id") or "").strip() == (
+            f"runtime_context:{identity['runtime_context_id']}"
+        )
+
+    exact_receipts: list[tuple[int, Mapping[str, Any]]] = []
+    exact_startups: list[tuple[int, Mapping[str, Any]]] = []
+    for index, line in enumerate(completed_lines):
+        if not isinstance(line, Mapping) or not exact_identity(line):
+            continue
+        line_id = str(line.get("line_id") or "").strip()
+        if line_id == "worker_startup":
+            exact_startups.append((index, line))
+            continue
+        if line_id != "worker_read_runtime_guide":
+            continue
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        artifacts = (
+            line.get("artifact_refs")
+            if isinstance(line.get("artifact_refs"), Mapping)
+            else {}
+        )
+        if (
+            index > dispatch_index
+            and str(line.get("stage_id") or "").strip() == "worker_read"
+            and str(line.get("evidence_kind") or "").strip()
+            == "read_receipt"
+            and str(line.get("actor_role") or "").strip() == "mf_sub"
+            and str(payload.get("schema_version") or "").strip()
+            == "mf_parallel.runtime_context_worker_line_projection.v1"
+            and str(payload.get("source") or "").strip()
+            == "runtime_context_worker_evidence"
+            and payload.get("source_backed") is True
+            and payload.get("projection_persists_completed_line") is False
+            and str(payload.get("source_ref") or "").strip() == receipt_ref
+            and str(artifacts.get("source") or "").strip()
+            == "runtime_context_worker_evidence"
+            and str(artifacts.get("source_ref") or "").strip()
+            == receipt_ref
+            and str(artifacts.get("timeline_event_ref") or "").strip()
+            == receipt_ref
+        ):
+            exact_receipts.append((index, line))
+    if len(exact_receipts) != 1 or exact_startups:
+        return result, {}
+
+    guide = (
+        dict(projected_record.get("runtime_guide") or {})
+        if isinstance(projected_record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    canonical_next = _runtime_next_action_from_guide(guide)
+    if str(canonical_next.get("line_id") or "").strip() not in {
+        "worker_read_runtime_guide",
+        "worker_startup",
+    }:
+        return result, {}
+
+    source_ref = str(accepted_dispatch.get("source_ref") or "").strip()
+    if not source_ref:
+        return result, {}
+    reader_hash = stable_sha256(
+        {
+            "schema_version": (
+                "contract_runtime.failed_qa_post_read_startup_reader.v1"
+            ),
+            "canonical_runtime_guide_hash": str(
+                guide.get("runtime_guide_hash") or ""
+            ).strip(),
+            "contract_execution_id": str(
+                record.get("contract_execution_id") or ""
+            ).strip(),
+            **identity,
+            "failed_qa_completed_line_index": failed_index,
+            "dispatch_completed_line_index": dispatch_index,
+            "dispatch_source_ref": source_ref,
+            "read_receipt_event_ref": receipt_ref,
+        }
+    )
+    startup_next = dict(canonical_next)
+    for unsafe_key in (
+        "action_input",
+        "writer_role_safe_copy_payload",
+        "mf_sub_host_bridge_guidance",
+    ):
+        startup_next.pop(unsafe_key, None)
+    for field in (
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_id",
+        "worker_slot_id",
+        "observer_command_id",
+        "worker_role",
+        "target_project_root",
+        "worktree_path",
+        "branch_ref",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "owned_files",
+        *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
+    ):
+        value = replacement_next.get(field)
+        if value:
+            startup_next[field] = (
+                list(value) if isinstance(value, tuple) else value
+            )
+    startup_next.update(
+        {
+            "schema_version": "contract_runtime_next_legal_action.v1",
+            "id": "worker_startup",
+            "action": "record_mf_subagent_startup",
+            "stage_id": "worker_startup",
+            "line_id": "worker_startup",
+            "evidence_kind": "mf_subagent_startup",
+            "owner_role": "mf_sub",
+            "allowed_writer_roles": ["mf_sub"],
+            "required": True,
+            "runtime_guide_hash": reader_hash,
+            "line_instance_id": (
+                f"runtime_context:{identity['runtime_context_id']}"
+            ),
+            "lane_id": identity["worker_slot_id"],
+            "source": (
+                "contract_runtime_failed_qa_replacement_post_read_projection"
+            ),
+            "source_of_authority": (
+                "server_verified_failed_qa_replacement_dispatch+"
+                "runtime_context_worker_evidence"
+            ),
+            "authority_decision_source": (
+                "server_verified_failed_qa_replacement_post_read_startup"
+            ),
+            "precedence": (
+                "server_verified_failed_qa_replacement_post_read_startup"
+            ),
+            "accepted_dispatch_authority": dict(accepted_dispatch),
+            "failed_qa_replacement_post_read_startup_projection": True,
+            "dispatch_source_ref": source_ref,
+            "read_receipt_event_ref": receipt_ref,
+            "contract_runtime_mutated": False,
+            "global_contract_line_already_completed": True,
+            "submit_line_guidance": {
+                "schema_version": (
+                    "contract_runtime.failed_qa_post_read_startup_guidance.v1"
+                ),
+                "generic_contract_runtime_submit_line_allowed": False,
+                "runtime_context_facade_required": True,
+                "runtime_context_facade": "runtime_context_startup",
+                "contract_runtime_completed_lines_mutated": False,
+                "message": (
+                    "Use the exact replacement RuntimeContext startup facade; "
+                    "the replacement read receipt is already accepted."
+                ),
+            },
+        }
+    )
+    marker = {
+        "schema_version": (
+            "contract_runtime.failed_qa_post_read_startup_projection.v1"
+        ),
+        "status": "projected",
+        "source": "runtime_context_worker_evidence",
+        "server_derived": True,
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ).strip(),
+        **identity,
+        "failed_qa_completed_line_index": failed_index,
+        "dispatch_completed_line_index": dispatch_index,
+        "dispatch_source_ref": source_ref,
+        "read_receipt_completed_line_index": exact_receipts[0][0],
+        "read_receipt_event_ref": receipt_ref,
+        "contract_runtime_mutated": False,
+        "append_only_history_preserved": True,
+    }
+    guide.pop("writer_role_safe_copy_payload", None)
+    guide.pop("mf_sub_host_bridge_guidance", None)
+    guide.pop("line_bypass_guidance", None)
+    guide["runtime_guide_hash"] = reader_hash
+    guide["next_legal_action"] = startup_next
+    guide["failed_qa_replacement_post_read_startup_projection"] = dict(
+        marker
+    )
+    result["runtime_guide"] = guide
+    result["failed_qa_replacement_post_read_startup_projection"] = dict(
+        marker
+    )
+    return result, marker
+
+
 def _contract_runtime_apply_mf_parallel_context_projection(
     conn,
     *,
@@ -103137,6 +103570,18 @@ def _contract_runtime_apply_mf_parallel_context_projection(
         completed_lines=projection["projected_completed_lines"],
         projection=projection,
     )
+    projected, post_read_startup = (
+        _contract_runtime_apply_failed_qa_post_read_startup_projection(
+            record,
+            projected,
+            projection,
+        )
+    )
+    if post_read_startup:
+        projection = dict(projection)
+        projection["failed_qa_replacement_post_read_startup_projection"] = (
+            dict(post_read_startup)
+        )
     recovery = projection.get("same_lane_worker_commit_recovery")
     if isinstance(recovery, Mapping):
         projected["same_lane_worker_commit_recovery"] = dict(recovery)
@@ -134670,7 +135115,7 @@ _ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS = frozenset(
     runtime_context_id session_token session_token_ref session_token_surrogate
     startup_source target_head_commit target_project_root task_id
     visible_injection_manifest_hash
-    worker_id worker_role worker_session_id worker_transcript_path
+    worker_id worker_role worker_slot_id worker_session_id worker_transcript_path
     worker_transcript_ref""".split()
 )
 
@@ -134991,6 +135436,22 @@ def _onboard_worker_read_runtime_facade_projection(
             list(dict.fromkeys([*identity_mismatches, *missing])),
         )
 
+    # From this point onward the replacement identity is derived from one
+    # accepted dispatch and one matching RuntimeContext.  Bind it before
+    # liveness/facade checks so both the actionable and fail-closed compact
+    # Guide shapes name the same replacement lane atomically.
+    projected.update(
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
+            "lane_id": worker_slot_id,
+        }
+    )
+
     worktree_liveness = _runtime_context_worker_worktree_liveness(
         project_id,
         context,
@@ -135022,6 +135483,9 @@ def _onboard_worker_read_runtime_facade_projection(
             ),
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "worker_id": worker_id,
+            "worker_slot_id": worker_slot_id,
             "selected_contract_line": selected_line,
             "worker_actionable": False,
             "observer_recovery_actionable": bool(recovery),

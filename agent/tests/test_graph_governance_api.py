@@ -132202,6 +132202,259 @@ def test_failed_qa_fresh_allocate_appends_dispatch_then_initial_join_receipt_sta
     )
     assert len(read_events) == 1
 
+    contract_after_read = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    dump_after_read = "\n".join(conn.iterdump())
+    total_changes_after_read = conn.total_changes
+    projected_after_read, post_read_projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=live_replacement_record,
+            actor_role="observer",
+        )
+    )
+    post_read_marker = projected_after_read.get(
+        "failed_qa_replacement_post_read_startup_projection"
+    )
+    direct_post_read_authority = server._runtime_current_state_from_record(
+        live_replacement_record
+    )
+    assert post_read_marker, {
+        "projection_status": post_read_projection.get("status"),
+        "projected_line_refs": post_read_projection.get(
+            "projected_line_refs"
+        ),
+        "projected_guide_line": server._runtime_next_action_from_guide(
+            projected_after_read.get("runtime_guide", {})
+        ).get("line_id"),
+        "direct_next": {
+            key: direct_post_read_authority.get(
+                "next_legal_action", {}
+            ).get(key)
+            for key in (
+                "line_id",
+                "runtime_context_id",
+                "task_id",
+                "worker_slot_id",
+            )
+        },
+    }
+    assert post_read_marker["status"] == "projected"
+    assert post_read_marker["runtime_context_id"] == fresh_context_id
+    assert post_read_marker["task_id"] == fresh_task_id
+    assert post_read_marker["worker_slot_id"] == fresh_context.worker_slot_id
+    assert post_read_marker["read_receipt_event_ref"] == (
+        f"timeline:{read_events[0]['id']}"
+    )
+    assert post_read_marker["contract_runtime_mutated"] is False
+    assert post_read_marker["append_only_history_preserved"] is True
+    assert post_read_projection[
+        "failed_qa_replacement_post_read_startup_projection"
+    ] == post_read_marker
+
+    post_read_current = server._runtime_current_state_from_record(
+        projected_after_read
+    )
+    post_read_next = post_read_current["next_legal_action"]
+    assert post_read_next["line_id"] == "worker_startup"
+    assert post_read_next["action"] == "record_mf_subagent_startup"
+    assert post_read_next["runtime_context_id"] == fresh_context_id
+    assert post_read_next["task_id"] == fresh_task_id
+    assert post_read_next["parent_task_id"] == contract_execution_id
+    assert post_read_next["worker_slot_id"] == fresh_context.worker_slot_id
+    assert post_read_next["read_receipt_event_ref"] == (
+        f"timeline:{read_events[0]['id']}"
+    )
+    assert post_read_next["accepted_dispatch_authority"] == (
+        post_read_current["accepted_dispatch_authority"]
+    )
+    assert post_read_current["accepted_dispatch_authority"][
+        "source_ref"
+    ] == revision["source_ref"]
+    assert projected_after_read["runtime_guide"].get(
+        "writer_role_safe_copy_payload"
+    ) is None
+
+    compact_post_read = server._contract_runtime_response(
+        projected_after_read,
+        actor_role="observer",
+        response_view="cli_guide",
+        request_id="req-failed-qa-post-read-startup",
+    )
+    assert compact_post_read["next_legal_action"]["line_id"] == (
+        "worker_startup"
+    )
+    assert compact_post_read["next_legal_action"]["runtime_context_id"] == (
+        fresh_context_id
+    )
+    assert "runtime_guide" in compact_post_read, {
+        "keys": sorted(compact_post_read),
+        "size": len(json.dumps(compact_post_read).encode()),
+        "compact_projection": compact_post_read.get("compact_projection"),
+    }
+    assert compact_post_read["runtime_guide"]["next_legal_action"][
+        "line_id"
+    ] == "worker_startup"
+    assert len(json.dumps(compact_post_read).encode()) < 16_384
+    assert compact_post_read["next_legal_action"][
+        "read_receipt_event_ref"
+    ] == f"timeline:{read_events[0]['id']}"
+    assert compact_post_read["next_legal_action"][
+        "accepted_dispatch_authority"
+    ] == post_read_current["accepted_dispatch_authority"]
+    assert "mf_sub_host_bridge_guidance" not in compact_post_read
+    assert "mf_sub_host_bridge_guidance" not in compact_post_read[
+        "next_legal_action"
+    ]
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+            "zero_write_projection": True,
+            "writes_performed": False,
+        },
+    )
+    before_startup_guide_changes = conn.total_changes
+    before_startup_guide_dump = "\n".join(conn.iterdump())
+    compact_startup_guide = _compact_worker_read_guide(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+    )
+    assert compact_startup_guide["status"] == (
+        "compact_action_input_continuation_required"
+    )
+    assert compact_startup_guide["required_sections"] == ["action_input"]
+    startup_section = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": compact_startup_guide[
+                    "guide_capsule_ref"
+                ],
+                "sections": ["action_input"],
+                "backlog_id": backlog_id,
+                "role": "mf_sub",
+                "work_type": "parallel_worker",
+            },
+        )
+    )["sections"]["action_input"]
+    assert startup_section.get("host_precursor_action") in (None, {})
+    startup_action = startup_section["canonical_executable_action"]
+    assert startup_action["action"] == "record_mf_subagent_startup"
+    assert startup_action["mcp_tool"] == "parallel_branch_startup"
+    startup_body = startup_action["copy_safe_body"]
+    assert startup_body["runtime_context_id"] == fresh_context_id
+    assert startup_body["task_id"] == fresh_task_id
+    assert startup_body["parent_task_id"] == contract_execution_id
+    assert startup_body["worker_slot_id"] == fresh_context.worker_slot_id
+    assert startup_body["read_receipt_event_id"] == str(
+        read_events[0]["id"]
+    )
+    assert compact_startup_guide.get(
+        "worker_read_runtime_facade_projection"
+    ) in (None, {})
+    assert conn.total_changes == before_startup_guide_changes
+    assert "\n".join(conn.iterdump()) == before_startup_guide_dump
+
+    # The overlay is deliberately strict.  Every malformed projected receipt
+    # leaves the original projected guide unchanged and performs no writes.
+    runtime = server._contract_runtime(conn)
+    raw_context_projection = (
+        server._contract_runtime_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=live_replacement_record,
+            actor_role="observer",
+        )
+    )
+    raw_projected = runtime.projected_record(
+        contract_execution_id,
+        actor_role="observer",
+        completed_lines=raw_context_projection["projected_completed_lines"],
+        projection=raw_context_projection,
+    )
+    raw_projected["revision"] = "rev9"
+    raw_guide = copy.deepcopy(raw_projected["runtime_guide"])
+    dispatch_index = post_read_marker["dispatch_completed_line_index"]
+    for mutation in (
+        "missing_receipt_ref",
+        "ambiguous_receipt_ref",
+        "wrong_runtime",
+        "wrong_task",
+        "wrong_parent",
+        "wrong_worker",
+        "wrong_slot",
+        "wrong_order",
+        "startup_already_present",
+    ):
+        candidate_record = copy.deepcopy(raw_projected)
+        candidate_projection = copy.deepcopy(raw_context_projection)
+        if mutation == "missing_receipt_ref":
+            candidate_projection["projected_line_refs"] = []
+        elif mutation == "ambiguous_receipt_ref":
+            candidate_projection["projected_line_refs"].append(
+                copy.deepcopy(
+                    candidate_projection["projected_line_refs"][-1]
+                )
+            )
+        elif mutation.startswith("wrong_") and mutation != "wrong_order":
+            field = {
+                "wrong_runtime": "runtime_context_id",
+                "wrong_task": "task_id",
+                "wrong_parent": "parent_task_id",
+                "wrong_worker": "worker_id",
+                "wrong_slot": "worker_slot_id",
+            }[mutation]
+            candidate_record["completed_lines"][-1][field] = (
+                f"cross-scope-{field}"
+            )
+            candidate_record["completed_lines"][-1]["payload"][field] = (
+                f"cross-scope-{field}"
+            )
+        elif mutation == "wrong_order":
+            receipt_line = candidate_record["completed_lines"].pop()
+            candidate_record["completed_lines"].insert(
+                max(0, dispatch_index - 1),
+                receipt_line,
+            )
+        elif mutation == "startup_already_present":
+            startup_line = copy.deepcopy(
+                candidate_record["completed_lines"][-1]
+            )
+            startup_line.update(
+                {
+                    "stage_id": "worker_startup",
+                    "line_id": "worker_startup",
+                    "evidence_kind": "mf_subagent_startup",
+                }
+            )
+            candidate_record["completed_lines"].append(startup_line)
+
+        rejected_projection, rejected_marker = (
+            server._contract_runtime_apply_failed_qa_post_read_startup_projection(
+                live_replacement_record,
+                candidate_record,
+                candidate_projection,
+            )
+        )
+        assert rejected_marker == {}, mutation
+        assert rejected_projection["runtime_guide"] == raw_guide, mutation
+
+    assert server._contract_runtime_store(conn).get(contract_execution_id) == (
+        contract_after_read
+    )
+    assert conn.total_changes == total_changes_after_read
+    assert "\n".join(conn.iterdump()) == dump_after_read
+
     startup = server.handle_graph_governance_runtime_context_startup(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": fresh_context_id},
