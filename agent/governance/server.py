@@ -102055,12 +102055,306 @@ def _contract_runtime_compact_exact_dispatch_bridge(
     return compact
 
 
+_CONTRACT_RUNTIME_COMPACT_CLI_MAX_BYTES = 16 * 1024
+_CONTRACT_RUNTIME_COMPACT_CLI_NEXT_ACTION_MAX_BYTES = 8 * 1024
+
+
+def _contract_runtime_compact_cli_serialized_bytes(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _contract_runtime_compact_cli_terminal_successor(
+    next_action: Mapping[str, Any],
+) -> dict[str, Any]:
+    if next_action.get("actionable") is not False:
+        return {}
+    for key in (
+        "worker_read_runtime_facade_projection",
+        "worker_startup_runtime_facade_projection",
+        "worker_graph_runtime_facade_projection",
+    ):
+        projection = next_action.get(key)
+        if not isinstance(projection, Mapping):
+            continue
+        blocker_id = str(projection.get("blocker_id") or "").strip()
+        status = str(projection.get("status") or "").strip()
+        if not blocker_id or status not in {
+            "blocked",
+            "recovery_required",
+            "unavailable",
+            "exhausted",
+        }:
+            continue
+        return {
+            "schema_version": (
+                "contract_runtime.compact_terminal_successor.v1"
+            ),
+            "id": blocker_id,
+            "status": status,
+            "terminal": True,
+            "actionable": False,
+            "reason": str(projection.get("reason") or ""),
+            "required_facade": str(
+                projection.get("required_facade") or ""
+            ),
+            "selected_contract_line": str(
+                projection.get("selected_contract_line") or ""
+            ),
+            "source_path": key,
+            "source_of_authority": "ContractRuntime+RuntimeContext",
+            "writes_performed": False,
+        }
+    return {}
+
+
+def _contract_runtime_compact_cli_next_action(
+    next_action: Mapping[str, Any],
+) -> dict[str, Any]:
+    projected = dict(next_action)
+    terminal_successor = _contract_runtime_compact_cli_terminal_successor(
+        projected
+    )
+    if terminal_successor:
+        projected["terminal_successor"] = terminal_successor
+    if (
+        _contract_runtime_compact_cli_serialized_bytes(projected)
+        <= _CONTRACT_RUNTIME_COMPACT_CLI_NEXT_ACTION_MAX_BYTES
+    ):
+        return projected
+
+    compact: dict[str, Any] = {}
+    for key in (
+        "schema_version",
+        "id",
+        "action",
+        "semantic_next_action",
+        "stage_id",
+        "line_id",
+        "line_instance_id",
+        "owner_role",
+        "allowed_writer_roles",
+        "evidence_kind",
+        "required",
+        "actionable",
+        "source",
+        "precedence",
+        "contract_execution_id",
+        "parent_task_id",
+        "task_id",
+        "lane_id",
+        "worker_slot_id",
+        "worker_index",
+        "worker_role",
+        "runtime_context_id",
+        "execution_state_revision",
+        "execution_state_hash",
+        "runtime_guide_hash",
+        "route_token_ref",
+        "blocked_by_failed_qa",
+        "meta_contract_gate_decision_source",
+    ):
+        if key in projected:
+            compact[key] = projected[key]
+
+    for key in (
+        "worker_read_runtime_facade_projection",
+        "worker_startup_runtime_facade_projection",
+        "worker_graph_runtime_facade_projection",
+        "failed_qa_blocker",
+        "canonical_executable_action",
+    ):
+        value = projected.get(key)
+        if isinstance(value, Mapping):
+            compact[key] = dict(value)
+
+    bridge = projected.get("mf_sub_host_bridge_guidance")
+    if isinstance(bridge, Mapping):
+        compact_bridge = {
+            key: dict(value) if isinstance(value, Mapping) else value
+            for key, value in bridge.items()
+            if key
+            in {
+                "schema_version",
+                "status",
+                "contract_execution_id",
+                "contract_id",
+                "next_action",
+                "next_line",
+                "post_dispatch_runtime_identity",
+                "copy_safe_bridge_payload",
+                "compact_projection",
+            }
+        }
+        host_handoff = bridge.get("worker_host_envelope_handoff")
+        if isinstance(host_handoff, Mapping):
+            compact_bridge["worker_host_envelope_handoff"] = {
+                key: dict(value) if isinstance(value, Mapping) else value
+                for key, value in host_handoff.items()
+                if key
+                in {
+                    "schema_version",
+                    "delivery",
+                    "purpose",
+                    "initial_join",
+                    "session_token_ref_policy",
+                }
+            }
+        compact["mf_sub_host_bridge_guidance"] = compact_bridge
+
+    writer_payload = projected.get("writer_role_safe_copy_payload")
+    if isinstance(writer_payload, Mapping):
+        compact_writer = {
+            key: dict(value) if isinstance(value, Mapping) else value
+            for key, value in writer_payload.items()
+            if key in {"schema_version", "tool", "copy_payload"}
+        }
+        compact["writer_role_safe_copy_payload"] = compact_writer
+
+    terminal_successor = _contract_runtime_compact_cli_terminal_successor(
+        projected
+    )
+    if terminal_successor:
+        compact["terminal_successor"] = terminal_successor
+    compact["compact_projection"] = {
+        "schema_version": (
+            "contract_runtime.next_action.compact_projection.v1"
+        ),
+        "source_of_authority": "ContractRuntime",
+        "source_addressed": True,
+        "semantic_truncation_performed": False,
+        "omitted_diagnostic_sections": [
+            "duplicate_submit_line_guidance",
+            "worker_host_envelope_handoff",
+            "route_issue_diagnostics",
+        ],
+    }
+    return compact
+
+
+def _contract_runtime_compact_cli_submit_line_guidance(
+    guidance: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        key: guidance[key]
+        for key in (
+            "schema_version",
+            "required_runtime_guide_hash_source",
+            "target_writer_line_runtime_guide_hash_source",
+            "every_line_must_copy_current_writer_hash",
+            "hash_may_change_after_each_accepted_line",
+            "writer_hash_may_change_after_each_accepted_line",
+            "top_level_runtime_guide_hash_is_reader_hash",
+            "copy_payload_available",
+            "current_required_runtime_guide_hash",
+            "completed_lines_projection_present",
+            "re_read_contract_runtime_current_after_projection",
+            "skip_duplicate_submit_line_when_projected_or_complete",
+            "skip_duplicate_submit_line_when_target_line_projected_or_complete",
+            "duplicate_submit_line_required",
+            "projected_completed_lines_count",
+            "projected_line_ids",
+        )
+        if key in guidance
+    }
+
+
+def _contract_runtime_compact_cli_runtime_guide(
+    guide: Mapping[str, Any],
+    *,
+    next_action: Mapping[str, Any],
+) -> dict[str, Any]:
+    compact = {
+        key: dict(value) if isinstance(value, Mapping) else value
+        for key, value in guide.items()
+        if key
+        in {
+            "schema_version",
+            "runtime_guide_hash",
+            "contract",
+            "execution",
+            "failed_qa_rework",
+            "line_bypass_guidance",
+            "completed_lines_summary",
+        }
+    }
+    action_identity = {
+        key: next_action[key]
+        for key in (
+            "schema_version",
+            "id",
+            "action",
+            "semantic_next_action",
+            "stage_id",
+            "line_id",
+            "line_instance_id",
+            "owner_role",
+            "evidence_kind",
+            "required",
+            "actionable",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "terminal_successor",
+        )
+        if key in next_action
+    }
+    compact["next_legal_action"] = action_identity
+
+    writer_payload = guide.get("writer_role_safe_copy_payload")
+    if isinstance(writer_payload, Mapping):
+        compact["writer_role_safe_copy_payload"] = {
+            key: dict(value) if isinstance(value, Mapping) else value
+            for key, value in writer_payload.items()
+            if key in {"schema_version", "tool", "copy_payload"}
+        }
+
+    completed_projection = guide.get("completed_lines_projection")
+    if isinstance(completed_projection, Mapping):
+        compact["completed_lines_projection_summary"] = {
+            key: value
+            for key, value in completed_projection.items()
+            if key != "projected_completed_lines"
+        }
+        compact["completed_lines_projection_summary"].update(
+            {
+                "projected_completed_lines_omitted": True,
+                "projected_completed_lines_source_path": (
+                    "ContractRuntime.runtime_guide."
+                    "completed_lines_projection.projected_completed_lines"
+                ),
+            }
+        )
+    compact["compact_projection"] = {
+        "schema_version": (
+            "contract_runtime.runtime_guide.compact_projection.v1"
+        ),
+        "source_of_authority": "ContractRuntime",
+        "source_addressed": True,
+        "semantic_truncation_performed": False,
+        "omitted_sections": [
+            "completed_lines",
+            "completed_lines_projection.projected_completed_lines",
+            "instructions",
+            "precheck_decision",
+            "post_projection_submit_line_guidance",
+        ],
+    }
+    return compact
+
+
 def _contract_runtime_response(
     record: Mapping[str, Any],
     *,
     actor_role: str = "",
     response_view: str = "",
     request_id: str = "",
+    compact_next_action_projection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     guide = _contract_runtime_guide_for_response(
         record,
@@ -102164,7 +102458,10 @@ def _contract_runtime_response(
     response.pop("contract_runtime_current_state", None)
     response.pop("runtime_guide", None)
     next_legal_action = (
-        dict(response.get("next_legal_action"))
+        dict(compact_next_action_projection)
+        if isinstance(compact_next_action_projection, Mapping)
+        and compact_next_action_projection
+        else dict(response.get("next_legal_action"))
         if isinstance(response.get("next_legal_action"), Mapping)
         else {}
     )
@@ -102180,7 +102477,17 @@ def _contract_runtime_response(
         next_legal_action["mf_sub_host_bridge_guidance"] = (
             _contract_runtime_compact_exact_dispatch_bridge(bridge)
         )
-        response["next_legal_action"] = next_legal_action
+    next_legal_action = _contract_runtime_compact_cli_next_action(
+        next_legal_action
+    )
+    response["next_legal_action"] = next_legal_action
+    response["submit_line_guidance"] = (
+        _contract_runtime_compact_cli_submit_line_guidance(
+            response.get("submit_line_guidance")
+            if isinstance(response.get("submit_line_guidance"), Mapping)
+            else {}
+        )
+    )
     response.update(
         {
             "schema_version": "contract_runtime.compact_cli_response.v1",
@@ -102192,15 +102499,36 @@ def _contract_runtime_response(
     )
     if response_view == "cli_guide":
         completed_lines = guide.get("completed_lines")
-        compact_guide = {
-            key: value for key, value in guide.items() if key != "completed_lines"
-        }
+        compact_guide = _contract_runtime_compact_cli_runtime_guide(
+            guide,
+            next_action=next_legal_action,
+        )
         compact_guide["completed_lines_summary"] = {
             "count": len(completed_lines) if isinstance(completed_lines, list) else 0,
             "omitted_from_cli_projection": True,
             "source_of_authority": "ContractRuntime",
         }
         response["runtime_guide"] = compact_guide
+    response["compact_projection"] = {
+        "schema_version": "contract_runtime.compact_cli_projection.v2",
+        "max_serialized_bytes": _CONTRACT_RUNTIME_COMPACT_CLI_MAX_BYTES,
+        "source_of_authority": "ContractRuntime",
+        "source_addressed": True,
+        "semantic_truncation_performed": False,
+        "raw_completed_line_bodies_omitted": True,
+    }
+    if (
+        _contract_runtime_compact_cli_serialized_bytes(response)
+        > _CONTRACT_RUNTIME_COMPACT_CLI_MAX_BYTES
+    ):
+        response.pop("runtime_guide", None)
+        response["compact_projection"].update(
+            {
+                "status": "bounded_fail_closed",
+                "runtime_guide_omitted": True,
+                "runtime_guide_source_path": "ContractRuntime.runtime_guide",
+            }
+        )
     return response
 
 
@@ -178012,6 +178340,8 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
     active_epoch_resume: dict[str, Any] = {}
     active_epoch_backlog_scope = ""
     runtime_context_projection: dict[str, Any] = {}
+    compact_next_action_projection: dict[str, Any] = {}
+    response_view = str(ctx.query.get("response_view") or "").strip()
     with DBContext(project_id) as conn:
         record = _contract_runtime_store(conn).get(contract_execution_id)
         actor_role = _contract_runtime_effective_actor_role(
@@ -178050,6 +178380,39 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
                 record=record,
             )
         )
+        if response_view in {"cli_current", "cli_guide"}:
+            runtime_guide = (
+                record.get("runtime_guide")
+                if isinstance(record.get("runtime_guide"), Mapping)
+                else {}
+            )
+            facade_projection = _onboard_worker_read_runtime_facade_projection(
+                conn,
+                project_id=project_id,
+                backlog_id=str(record.get("backlog_id") or ""),
+                next_action=(
+                    runtime_guide.get("next_legal_action")
+                    if isinstance(
+                        runtime_guide.get("next_legal_action"),
+                        Mapping,
+                    )
+                    else {}
+                ),
+                current_projection={
+                    "contract_execution_id": contract_execution_id,
+                },
+                runtime_resume={},
+                requested_route_token_ref=_contract_runtime_ref_value(
+                    ctx,
+                    "route_token_ref",
+                    "observer_route_token_ref",
+                ),
+            )
+            if (
+                facade_projection.get("actionable") is False
+                and facade_projection.get("blocked_by_failed_qa") is True
+            ):
+                compact_next_action_projection = facade_projection
         from .parallel_branch_runtime import (
             integration_epoch_resume_payload,
             integration_epoch_to_dict,
@@ -178072,8 +178435,9 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
     response = _contract_runtime_response(
         record,
         actor_role=actor_role,
-        response_view=str(ctx.query.get("response_view") or "").strip(),
+        response_view=response_view,
         request_id=ctx.request_id,
+        compact_next_action_projection=compact_next_action_projection,
     )
     response["actor_role"] = actor_role
     if runtime_context_projection:

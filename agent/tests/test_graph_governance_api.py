@@ -141273,6 +141273,171 @@ def test_contract_runtime_cli_views_are_compact_and_role_actionable():
         assert "runtime_guide_hash" not in coordinator_bypass[key]
 
 
+def test_contract_runtime_cli_guide_bounds_live_worker_read_projection_and_stops_on_incomplete_facade():
+    reader_hash = "sha256:" + "1" * 64
+    writer_hash = "sha256:" + "2" * 64
+    execution_hash = "sha256:" + "3" * 64
+    projected_line = {
+        "line_id": "worker_read_runtime_guide",
+        "payload": {"large_durable_evidence": "x" * 300_000},
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-CONTRACT-RUNTIME-COMPACT-WORKER-READ",
+        "contract_execution_id": "cex-contract-runtime-compact-worker-read",
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "revision": "rev9",
+        "definition_hash": "sha256:" + "4" * 64,
+        "execution_state_revision": 12,
+        "execution_state": {"execution_state_hash": execution_hash},
+        "route_token_ref": "rtok-contract-runtime-compact-worker-read",
+        "runtime_guide": {
+            "schema_version": "contract_runtime_guide.v1",
+            "runtime_guide_hash": reader_hash,
+            "next_legal_action": {
+                "action": "record_read_receipt",
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "line_instance_id": "runtime_context:mfrctx-compact-worker-read",
+                "owner_role": "mf_sub",
+                "allowed_writer_roles": ["mf_sub"],
+                "evidence_kind": "read_receipt",
+                "required": True,
+                "runtime_context_id": "mfrctx-compact-worker-read",
+                "task_id": "compact-worker-read",
+                "parent_task_id": "cex-contract-runtime-compact-worker-read",
+                "mf_sub_host_bridge_guidance": {
+                    "schema_version": "contract_runtime.mf_sub_host_bridge.v1",
+                    "status": "exact_completed_dispatch",
+                    "copy_safe_bridge_payload": {
+                        "runtime_context_worker_guide": {
+                            "project_id": PID,
+                            "runtime_context_id": "mfrctx-compact-worker-read",
+                            "session_token_ref": "<copy-safe worker session_token_ref>",
+                        }
+                    },
+                    "worker_host_envelope_handoff": {
+                        "large_duplicate_diagnostics": "y" * 40_000,
+                    },
+                },
+            },
+            "writer_role_safe_copy_payload": {
+                "schema_version": (
+                    "contract_runtime.writer_role_safe_copy_payload.v1"
+                ),
+                "tool": "contract_runtime_submit_line",
+                "copy_payload": {
+                    "project_id": PID,
+                    "contract_execution_id": (
+                        "cex-contract-runtime-compact-worker-read"
+                    ),
+                    "execution_state_revision": 12,
+                    "runtime_guide_hash": writer_hash,
+                    "stage_id": "worker_read",
+                    "line_id": "worker_read_runtime_guide",
+                    "actor_role": "mf_sub",
+                    "evidence_kind": "read_receipt",
+                },
+            },
+            "completed_lines": [projected_line],
+            "completed_lines_projection": {
+                "schema_version": (
+                    "contract_runtime.completed_lines_projection.v1"
+                ),
+                "status": "authoritative",
+                "projected_line_count": 1,
+                "projected_line_refs": [
+                    "worker_read:worker_read_runtime_guide"
+                ],
+                "projected_completed_lines": [projected_line],
+                "source_of_authority": "ContractRuntime.completed_lines",
+            },
+        },
+    }
+    blocked_worker_read = {
+        "stage_id": "worker_read",
+        "line_id": "worker_read_runtime_guide",
+        "line_instance_id": "runtime_context:mfrctx-compact-worker-read",
+        "owner_role": "mf_sub",
+        "allowed_writer_roles": ["mf_sub"],
+        "evidence_kind": "read_receipt",
+        "required": True,
+        "runtime_context_id": "mfrctx-compact-worker-read",
+        "task_id": "compact-worker-read",
+        "parent_task_id": "cex-contract-runtime-compact-worker-read",
+        "actionable": False,
+        "worker_read_runtime_facade_projection": {
+            "schema_version": (
+                "onboard_route_guide."
+                "worker_read_runtime_facade_projection.v1"
+            ),
+            "status": "blocked",
+            "blocker_id": "worker_read_runtime_guide_projection_incomplete",
+            "reason": "accepted_dispatch_authority_unavailable",
+            "selected_contract_line": "worker_read_runtime_guide",
+            "required_facade": "runtime_context_read_receipt",
+            "fail_closed": True,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+        },
+    }
+
+    full = server._contract_runtime_response(record, actor_role="observer")
+    current = server._contract_runtime_response(
+        record,
+        actor_role="observer",
+        response_view="cli_current",
+        request_id="req-live-worker-read-current",
+        compact_next_action_projection=blocked_worker_read,
+    )
+    guide = server._contract_runtime_response(
+        record,
+        actor_role="observer",
+        response_view="cli_guide",
+        request_id="req-live-worker-read-guide",
+        compact_next_action_projection=blocked_worker_read,
+    )
+
+    assert len(json.dumps(full).encode()) > 300_000
+    for response in (current, guide):
+        assert len(json.dumps(response).encode()) < 16_384
+        assert response["source_of_authority"] == "ContractRuntime"
+        assert response["contract_revision_id"] == "rev9"
+        assert response["execution_state_revision"] == 12
+        action = response["next_legal_action"]
+        assert action["line_id"] == "worker_read_runtime_guide"
+        assert action["runtime_context_id"] == "mfrctx-compact-worker-read"
+        assert action["actionable"] is False
+        assert action["worker_read_runtime_facade_projection"][
+            "blocker_id"
+        ] == "worker_read_runtime_guide_projection_incomplete"
+        assert action["terminal_successor"] == {
+            "schema_version": (
+                "contract_runtime.compact_terminal_successor.v1"
+            ),
+            "id": "worker_read_runtime_guide_projection_incomplete",
+            "status": "blocked",
+            "terminal": True,
+            "actionable": False,
+            "reason": "accepted_dispatch_authority_unavailable",
+            "required_facade": "runtime_context_read_receipt",
+            "selected_contract_line": "worker_read_runtime_guide",
+            "source_path": "worker_read_runtime_facade_projection",
+            "source_of_authority": "ContractRuntime+RuntimeContext",
+            "writes_performed": False,
+        }
+        assert response["compact_projection"][
+            "semantic_truncation_performed"
+        ] is False
+    assert "runtime_guide" not in current
+    projection_summary = guide["runtime_guide"][
+        "completed_lines_projection_summary"
+    ]
+    assert "projected_completed_lines" not in projection_summary
+    assert projection_summary["projected_completed_lines_omitted"] is True
+    assert "large_durable_evidence" not in json.dumps(guide)
+
+
 def test_contract_runtime_write_uses_exact_writer_line_hash_without_mutating_reader_guide():
     reader_hash = "sha256:" + "1" * 64
     writer_hash = "sha256:" + "2" * 64
