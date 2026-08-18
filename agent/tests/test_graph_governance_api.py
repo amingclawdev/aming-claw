@@ -137694,20 +137694,49 @@ def test_qa_review_claims_accept_exact_no_pass_comparison_namespace():
         == "qa_graph_review_context_mismatch"
     )
 
-    scoped_passing_status = json.loads(json.dumps(body))
-    scoped_passing_status["status"] = "passed"
-    scoped_passing_status["payload"].update(
-        {
+    scoped_passing_status = {
+        "status": "passed",
+        "commit_sha": candidate_commit,
+        "payload": {
+            "schema_version": "qa_postdeploy_targeted_verification.v1",
+            "candidate_commit_sha": candidate_commit,
+            "full_suite_claim": "not_claimed",
+            "overall_release_pass_claimed": False,
             "row_scoped_qa_pass": True,
-            "targeted_scope_only": True,
             "used_as_pass": False,
             "qa_acceptance": {
                 "passed": True,
                 "targeted_scope_only": True,
                 "used_as_pass": False,
             },
-        }
-    )
+        },
+        "artifact_refs": {
+            "external_no_pass_baseline_ledger": {
+                "schema_version": (
+                    "contract_runtime.external_no_pass_baseline_ledger.v2"
+                ),
+                "base_commit_sha": comparison_base_commit,
+                "candidate_commit_sha": candidate_commit,
+                "base_failure_identities": ["inherited::one"],
+                "candidate_failure_identities": ["inherited::one"],
+                "base_reproduction": {
+                    "reproduced": 1,
+                    "total": 1,
+                    "failure_identities": ["inherited::one"],
+                },
+                "candidate_suite_counts": {
+                    "passed": 11,
+                    "failed": 1,
+                    "baseline_known_non_green": 1,
+                },
+                "candidate_new_failures": 0,
+                "candidate_specific_issues": [],
+                "no_pass_claim": True,
+                "overall_release_pass_claimed": False,
+                "refs": ["timeline:scoped-pass"],
+            }
+        },
+    }
     server._qa_validate_candidate_review_claims(
         scoped_passing_status,
         review_context,
@@ -137715,7 +137744,22 @@ def test_qa_review_claims_accept_exact_no_pass_comparison_namespace():
 
     for field in ("targeted_scope_only", "used_as_pass"):
         unscoped = json.loads(json.dumps(scoped_passing_status))
-        unscoped["payload"].pop(field)
+        if field == "targeted_scope_only":
+            unscoped["payload"]["qa_acceptance"].pop(field)
+        else:
+            unscoped["payload"].pop(field)
+        with pytest.raises(GovernanceError) as unscoped_rejected:
+            server._qa_validate_candidate_review_claims(
+                unscoped,
+                review_context,
+            )
+        assert unscoped_rejected.value.code == (
+            "qa_graph_review_context_mismatch"
+        )
+
+    for invalid_targeted_scope in (False, 1):
+        unscoped = json.loads(json.dumps(scoped_passing_status))
+        unscoped["payload"]["targeted_scope_only"] = invalid_targeted_scope
         with pytest.raises(GovernanceError) as unscoped_rejected:
             server._qa_validate_candidate_review_claims(
                 unscoped,

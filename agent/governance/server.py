@@ -11561,6 +11561,7 @@ _QA_IMMUTABLE_EXTERNAL_AUDIT_SCOPES = {
 _QA_EXTERNAL_NO_PASS_COMPARISON_PAYLOAD_SCHEMAS = {
     "mf_parallel.qa_independent_verification.v1",
     "qa_independent_verification.v1",
+    "qa_postdeploy_targeted_verification.v1",
 }
 _QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_SCHEMA = (
     "contract_runtime.external_no_pass_baseline_ledger.v2"
@@ -11651,15 +11652,43 @@ def _qa_external_no_pass_comparison_tuple(
         if isinstance(payload.get("qa_acceptance"), Mapping)
         else {}
     )
+    payload_targeted_scope_only = payload.get("targeted_scope_only")
     targeted_scope_pass = bool(
         body_status in {"accepted", "ok", "pass", "passed", "success"}
         and payload.get("row_scoped_qa_pass") is True
-        and payload.get("targeted_scope_only") is True
+        and (
+            payload_targeted_scope_only is None
+            or payload_targeted_scope_only is True
+        )
         and payload.get("used_as_pass") is False
         and qa_acceptance.get("passed") is True
         and qa_acceptance.get("targeted_scope_only") is True
         and qa_acceptance.get("used_as_pass") is False
     )
+    payload_candidate_new = payload.get("candidate_new_failures")
+    if targeted_scope_pass:
+        payload_candidate_new_valid = payload_candidate_new is None or (
+            type(payload_candidate_new) is int
+            and payload_candidate_new == 0
+        )
+        payload_issue_claims_valid = payload_issue_claims is None or (
+            isinstance(payload_issue_claims, list)
+            and not payload_issue_claims
+        )
+        payload_no_pass_valid = (
+            payload.get("no_pass_claim") is None
+            or payload.get("no_pass_claim") is True
+        )
+    else:
+        payload_candidate_new_valid = (
+            type(payload_candidate_new) is int
+            and payload_candidate_new == 0
+        )
+        payload_issue_claims_valid = (
+            isinstance(payload_issue_claims, list)
+            and not payload_issue_claims
+        )
+        payload_no_pass_valid = payload.get("no_pass_claim") is True
     if (
         payload_schema not in _QA_EXTERNAL_NO_PASS_COMPARISON_PAYLOAD_SCHEMAS
         or ledger_schema != _QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_SCHEMA
@@ -11667,14 +11696,12 @@ def _qa_external_no_pass_comparison_tuple(
             body_status not in {"failed", "fail", "rejected", "blocked"}
             and not targeted_scope_pass
         )
-        or payload.get("no_pass_claim") is not True
+        or not payload_no_pass_valid
         or payload.get("overall_release_pass_claimed") is not False
         or str(payload.get("full_suite_claim") or "").strip()
         != "not_claimed"
-        or type(payload.get("candidate_new_failures")) is not int
-        or payload.get("candidate_new_failures") != 0
-        or not isinstance(payload_issue_claims, list)
-        or bool(payload_issue_claims)
+        or not payload_candidate_new_valid
+        or not payload_issue_claims_valid
         or ledger.get("no_pass_claim") is not True
         or ledger.get("overall_release_pass_claimed") is not False
         or type(ledger.get("candidate_new_failures")) is not int
