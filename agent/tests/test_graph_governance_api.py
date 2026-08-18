@@ -130818,6 +130818,259 @@ def test_context_local_post_read_renewed_route_projects_one_startup_body_zero_wr
     assert "\n".join(conn.iterdump()) == before_dump
 
 
+def test_context_local_post_read_renewed_route_projects_startup_after_marker_ref_rotates(
+    conn,
+    monkeypatch,
+):
+    (
+        context,
+        sequence,
+        _events,
+        historical_route,
+        current_route,
+        _binding,
+        _marker,
+    ) = _context_local_post_read_renewed_route_fixture(conn, monkeypatch)
+    # Mirror the live post-read world: event 55 rotates the safe ref, so the
+    # general rejoin marker no longer matches the active session.  The durable
+    # receipt authority and route registry remain exact and are the only legal
+    # source for the startup projection.
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_failed_qa_revision_rejoin_marker",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_context_local_worker_sequence_evidence",
+        lambda *_args, **_kwargs: copy.deepcopy(sequence),
+    )
+    # The production read path never initializes governance schema.  Establish
+    # the fixture's ContractRuntime schema before the zero-write baseline.
+    server._contract_runtime_store(conn)
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    authority_route, source = server._runtime_context_current_route_authority(
+        conn,
+        context,
+        historical_route,
+    )
+    receipt_authority = (
+        server._runtime_context_context_local_post_read_startup_receipt_authority(
+            conn,
+            project_id=PID,
+            context=context,
+            route_identity=authority_route,
+            sequence=sequence,
+        )
+    )
+    payloads = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        contract_execution_id=context.parent_task_id,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=context.parent_task_id,
+        worker_id=context.worker_id,
+        worker_slot_id=context.worker_slot_id,
+        target_project_root=context.target_project_root,
+        worktree_path=context.worktree_path,
+        session_token_ref=runtime_context_session_token_ref(context),
+        route_identity=authority_route,
+        read_receipt_event_ref=sequence["read_receipt_ref"],
+        read_receipt_authority=receipt_authority,
+        read_receipt_authority_required=True,
+        authority_revision={
+            "active_owned_files": ["agent/governance/server.py"],
+        },
+    )
+    startup = payloads["startup_facade_payload_skeleton"]
+
+    assert source == "failed_qa_post_read_route_successor"
+    assert authority_route == current_route
+    assert receipt_authority["event_ref"] == "timeline:54"
+    assert receipt_authority["safe_ref_reissue_event_ref"] == "timeline:55"
+    assert startup["actionable"] is True
+    assert startup["status"] == "actionable_unique_durable_read_receipt"
+    assert startup["copy_safe_body"]["task_id"] == context.task_id
+    assert startup["copy_safe_body"]["parent_task_id"] == context.parent_task_id
+    assert startup["copy_safe_body"]["read_receipt_event_id"] == "54"
+    assert {
+        field: startup["copy_safe_body"][field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == current_route
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+def test_compact_startup_facade_uses_context_local_post_read_renewed_route(
+    conn,
+    monkeypatch,
+):
+    (
+        context,
+        sequence,
+        _events,
+        historical_route,
+        current_route,
+        _binding,
+        _marker,
+    ) = _context_local_post_read_renewed_route_fixture(conn, monkeypatch)
+    context.owned_files = ("agent/governance/server.py",)
+    context.branch_ref = "refs/heads/codex/context-local-post-read"
+    context.base_commit = "a" * 40
+    context.target_head_commit = "a" * 40
+    context.merge_queue_id = "mq-context-local-post-read"
+    execution_id = context.parent_task_id
+    record = {
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_chain_id": "cchain-context-local-post-read",
+        "parent_contract_execution_id": "onboard-context-local-post-read",
+    }
+    dispatch_action = {
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.parent_task_id,
+        "worker_id": context.worker_id,
+        "worker_slot_id": context.worker_slot_id,
+        **historical_route,
+    }
+    # Establish the fixture schema before installing the read-only store stub.
+    server._contract_runtime_store(conn)
+    monkeypatch.setattr(
+        server,
+        "_onboard_route_guide_target_contract_execution_id",
+        lambda **_kwargs: execution_id,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(get=lambda _execution_id: record),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dead_initial_join_recovery_authority",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dead_initial_join_recovery_projection",
+        lambda _authority: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_current_state_from_record",
+        lambda _record: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_ticket_authority",
+        lambda *_args, **_kwargs: {
+            "status": "projected",
+            "next_legal_action": copy.deepcopy(dispatch_action),
+        },
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_branch_context_by_runtime_context_id",
+        lambda *_args, **_kwargs: context,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_pre_lineage_legacy_dispatch_identity_anchor",
+        lambda *_args, **_kwargs: {
+            "route_identity": copy.deepcopy(historical_route),
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_failed_qa_revision_rejoin_marker",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_context_local_worker_sequence_evidence",
+        lambda *_args, **_kwargs: copy.deepcopy(sequence),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_prestartup_worker_sequence_evidence",
+        lambda *_args, **_kwargs: copy.deepcopy(sequence),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_refs",
+        lambda *_args, **_kwargs: (
+            {
+                "read_receipt_event_ref": sequence["read_receipt_ref"],
+                "read_receipt_hash": sequence["read_receipt_hash"],
+            },
+            {},
+            {},
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_worktree_liveness",
+        lambda *_args, **_kwargs: {
+            "schema_version": "runtime_context.worker_worktree_liveness.v1",
+            "status": "ready",
+            "valid": True,
+            "reason_code": "worktree_ready",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_identity_resolution",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "reconstructable": True,
+            "observer_command_id": "cmd-context-local-post-read",
+        },
+    )
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    projected = server._onboard_worker_read_runtime_facade_projection(
+        conn,
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        next_action={
+            "stage_id": "worker_startup",
+            "line_id": "worker_startup",
+            **dispatch_action,
+        },
+        current_projection={"contract_execution_id": execution_id},
+        runtime_resume={},
+        requested_task_id=context.task_id,
+        requested_route_token_ref=current_route["route_token_ref"],
+    )
+
+    assert projected["actionable"] is True
+    assert projected["mcp_tool"] == "parallel_branch_startup"
+    assert projected["worker_startup_runtime_facade_projection"]["status"] == (
+        "ready"
+    )
+    assert projected["worker_startup_runtime_facade_projection"][
+        "route_authority_source"
+    ] == "failed_qa_post_read_route_successor"
+    body = projected["copy_safe_body"]
+    assert body["runtime_context_id"] == context.runtime_context_id
+    assert body["task_id"] == context.task_id
+    assert body["parent_task_id"] == context.parent_task_id
+    assert body["read_receipt_event_id"] == "54"
+    assert {
+        field: body[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == current_route
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

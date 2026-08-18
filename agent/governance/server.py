@@ -39740,6 +39740,111 @@ def _runtime_context_verified_post_read_route_successor(
     ):
         return {}
 
+    # A context-local replacement can consume its bounded rejoin, record the
+    # worker-owned read receipt, and then rotate only the copy-safe session ref
+    # before startup.  In that state the general failed-QA rejoin marker is no
+    # longer current: its session ref intentionally predates the post-read
+    # reissue.  Do not make the stale marker authoritative again.  Instead,
+    # join the immutable replacement dispatch route to the current revision
+    # only when both independent server proofs agree:
+    #
+    # * the route registry resolves the historical dispatch ref to exactly one
+    #   active, same-scope descendant; and
+    # * the context-local receipt authority proves the accepted read receipt
+    #   plus the current safe-ref reissue for the same runtime/task/worker/CEX.
+    #
+    # This is a read-time projection.  It neither rewrites the ContractRuntime
+    # dispatch nor backfills timeline evidence.
+    route_binding = _runtime_context_current_reissue_route_binding(
+        conn,
+        project_id=project_id,
+        historical_route_identity=historical,
+        canonical_route_identity=canonical,
+    )
+    contract_runtime_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'contract_runtime_executions'"
+    ).fetchone()
+    context_local_sequence = (
+        _runtime_context_context_local_worker_sequence_evidence(
+            conn,
+            project_id=project_id,
+            context=context,
+            route_identity=canonical,
+        )
+        if contract_runtime_table_exists
+        else {}
+    )
+    context_local_receipt_authority = (
+        _runtime_context_context_local_post_read_startup_receipt_authority(
+            conn,
+            project_id=project_id,
+            context=context,
+            route_identity=canonical,
+            sequence=context_local_sequence,
+        )
+        if context_local_sequence
+        else {}
+    )
+    contract_execution_id = str(
+        context_local_sequence.get("contract_execution_id") or ""
+    ).strip()
+    receipt_event_ref = str(
+        context_local_receipt_authority.get("event_ref") or ""
+    ).strip()
+    reissue_event_ref = str(
+        context_local_receipt_authority.get("safe_ref_reissue_event_ref") or ""
+    ).strip()
+    receipt_event_id = receipt_event_ref.removeprefix("timeline:")
+    reissue_event_id = reissue_event_ref.removeprefix("timeline:")
+    if (
+        route_binding.get("valid") is True
+        and route_binding.get("registry_verified") is True
+        and route_binding.get("exact_scope_verified") is True
+        and route_binding.get("scope_actions_files_verified") is True
+        and route_binding.get("historical_event_rewritten") is False
+        and dict(route_binding.get("historical_route_identity") or {})
+        == historical
+        and dict(route_binding.get("canonical_route_identity") or {})
+        == canonical
+        and contract_execution_id == parent_task_id
+        and str(context_local_sequence.get("source") or "")
+        == "task_timeline_context_local_receipt"
+        and not context_local_sequence.get("startup_ref")
+        and context_local_receipt_authority.get("context_local_receipt") is True
+        and str(
+            context_local_receipt_authority.get("session_authority_kind") or ""
+        )
+        == "safe_ref_prestartup_reissue"
+        and receipt_event_id.isdigit()
+        and reissue_event_id.isdigit()
+        and int(receipt_event_id) > 0
+        and int(reissue_event_id) > int(receipt_event_id)
+    ):
+        from .parallel_branch_runtime import runtime_context_session_token_ref
+
+        if _runtime_context_post_read_startup_receipt_authority_is_exact(
+            context_local_receipt_authority,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            worker_id=str(getattr(context, "worker_id", "") or "").strip(),
+            worker_slot_id=str(
+                getattr(context, "worker_slot_id", "")
+                or getattr(context, "worker_id", "")
+                or ""
+            ).strip(),
+            target_project_root=(
+                _runtime_context_effective_target_project_root(context)
+            ),
+            session_token_ref=runtime_context_session_token_ref(context),
+            route_identity=canonical,
+        ):
+            return canonical
+
     timeline_events = _runtime_context_service_timeline_events(
         conn,
         project_id=project_id,
