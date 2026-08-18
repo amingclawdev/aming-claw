@@ -147734,6 +147734,76 @@ def test_mf_parallel_runtime_context_worker_projection_accepts_qa_evidence(
     assert canonical_ledger["overall_release_pass_claimed"] is False
     assert _line_status_allows_contract_completion(qa_line) is True
 
+    # Timeline QA and ContractRuntime share the same exact parent-only fixed
+    # failure rule.  A candidate may remove baseline failures without turning
+    # them into candidate-new failures, but the complete set difference must
+    # be explicit and server-normalizable.
+    fixed_base_line = json.loads(json.dumps(qa_line))
+    fixed_base_ledger = fixed_base_line["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ]
+    fixed_base_ledger["base_failure_identities"] = [
+        "test_inherited_non_green",
+        "test_fixed_on_candidate",
+    ]
+    fixed_base_ledger["fixed_base_failure_identities"] = [
+        "test_fixed_on_candidate"
+    ]
+    fixed_base_ledger["base_reproduction"] = {
+        "reproduced": 2,
+        "total": 2,
+        "failure_identities": [
+            "test_fixed_on_candidate",
+            "test_inherited_non_green",
+        ],
+    }
+    fixed_base_ledger["candidate_suite_counts"].update(
+        {"baseline_known_non_green": 2, "failed": 1}
+    )
+    fixed_base_authority = server._contract_runtime_qa_no_pass_ledger_authority(
+        fixed_base_line,
+        record=stored_after_qa,
+    )
+    assert fixed_base_authority["base_failure_identities"] == [
+        "test_fixed_on_candidate",
+        "test_inherited_non_green",
+    ]
+    assert fixed_base_authority["candidate_failure_identities"] == [
+        "test_inherited_non_green"
+    ]
+    assert fixed_base_authority["fixed_base_failure_identities"] == [
+        "test_fixed_on_candidate"
+    ]
+    assert server._contract_runtime_candidate_scoped_no_pass_line(
+        fixed_base_line,
+        record=stored_after_qa,
+    ) is True
+
+    for mutation in (
+        "missing_fixed",
+        "wrong_fixed",
+        "candidate_only_failure",
+    ):
+        malformed_fixed_line = json.loads(json.dumps(fixed_base_line))
+        malformed_fixed_ledger = malformed_fixed_line["artifact_refs"][
+            "external_no_pass_baseline_ledger"
+        ]
+        if mutation == "missing_fixed":
+            malformed_fixed_ledger.pop("fixed_base_failure_identities")
+        elif mutation == "wrong_fixed":
+            malformed_fixed_ledger["fixed_base_failure_identities"] = [
+                "test_wrong_fixed_identity"
+            ]
+        else:
+            malformed_fixed_ledger["candidate_failure_identities"].append(
+                "test_candidate_only_failure"
+            )
+            malformed_fixed_ledger["candidate_suite_counts"]["failed"] = 2
+        assert not server._contract_runtime_qa_no_pass_ledger_authority(
+            malformed_fixed_line,
+            record=stored_after_qa,
+        )
+
     # Current server-normalized authority lives in the canonical ledger.  The
     # QA caller may omit the redundant payload commit tuple without turning an
     # accepted no-PASS line into failed QA in the source-runtime projection.
@@ -158348,6 +158418,151 @@ def test_exact_candidate_direct_main_runtime_comparison_base_uses_server_lineage
     assert exact_context["candidate_diff_hash"].startswith("sha256:")
 
 
+def test_fixed_base_failures_share_timeline_and_contract_runtime_authority(
+    monkeypatch,
+):
+    base_commit = "a" * 40
+    candidate_commit = "b" * 40
+    ledger = {
+        "schema_version": "contract_runtime.external_no_pass_baseline_ledger.v2",
+        "base_commit_sha": base_commit,
+        "candidate_commit_sha": candidate_commit,
+        "base_failure_identities": [
+            "test_fixed_on_candidate",
+            "test_inherited_non_green",
+        ],
+        "candidate_failure_identities": ["test_inherited_non_green"],
+        "fixed_base_failure_identities": ["test_fixed_on_candidate"],
+        "base_reproduction": {
+            "reproduced": 2,
+            "total": 2,
+            "failure_identities": [
+                "test_inherited_non_green",
+                "test_fixed_on_candidate",
+            ],
+        },
+        "candidate_suite_counts": {
+            "baseline_known_non_green": 2,
+            "failed": 1,
+            "passed": 17,
+        },
+        "candidate_new_failures": 0,
+        "candidate_specific_issues": [],
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+        "refs": ["gqt-fixed-base-authority"],
+    }
+    payload = {
+        "schema_version": "qa_independent_verification.v1",
+        "candidate_commit_sha": candidate_commit,
+        "acceptance_scope": "candidate_regression_and_acceptance_criteria",
+        "row_scoped_qa_pass": True,
+        "targeted_scope_only": True,
+        "used_as_pass": False,
+        "qa_acceptance": {
+            "passed": True,
+            "targeted_scope_only": True,
+            "used_as_pass": False,
+        },
+        "verdict": "accepted",
+        "full_suite_claim": "not_claimed",
+        "candidate_new_failures": 0,
+        "candidate_specific_issues": [],
+        "no_pass_claim": True,
+        "overall_release_pass_claimed": False,
+    }
+    timeline_body = {
+        "status": "passed",
+        "commit_sha": candidate_commit,
+        "payload": payload,
+        "artifact_refs": {"external_no_pass_baseline_ledger": ledger},
+    }
+    assert server._qa_external_no_pass_comparison_tuple(timeline_body) == {
+        "base_commit_sha": base_commit,
+        "candidate_commit_sha": candidate_commit,
+    }
+
+    provenance = {
+        "schema_version": "qa_evidence_provenance.v1",
+        "source": "contract_runtime_qa_independent_verification_binding",
+        "server_derived": True,
+        "authorization_source": "qa_session_token_ref",
+        "evidence_owner_role": "qa",
+        "observer_impersonation": False,
+        "parent_materialization_authorized": False,
+        "authenticated_qa_binding": {
+            "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+            "server_derived": True,
+            "qa_principal": "qa:fixed-base-authority",
+            "qa_session_id": "ses-fixed-base-authority",
+            "independent_verification_session_matched": True,
+        },
+    }
+    runtime_line = {
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "accepted",
+        "commit_sha": candidate_commit,
+        "authorization_source": "qa_session_token_ref",
+        "observer_impersonation": False,
+        "qa_evidence_provenance": provenance,
+        "payload": payload,
+        "test_results": {
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+            "passed": False,
+        },
+        "verification": {
+            "verdict": "accepted",
+            "candidate_new_failures": 0,
+            "candidate_specific_issues": [],
+            "no_pass_claim": True,
+            "overall_release_pass_claimed": False,
+        },
+        "artifact_refs": {"external_no_pass_baseline_ledger": ledger},
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_no_pass_graph_scope",
+        lambda _record: {
+            "base_commit_sha": base_commit,
+            "candidate_commit_sha": candidate_commit,
+            "graph_trace_ids": ["gqt-fixed-base-authority"],
+        },
+    )
+    runtime_authority = server._contract_runtime_qa_no_pass_ledger_authority(
+        runtime_line,
+        record={"completed_lines": []},
+    )
+    assert runtime_authority["base_failure_identities"] == [
+        "test_fixed_on_candidate",
+        "test_inherited_non_green",
+    ]
+    assert runtime_authority["candidate_failure_identities"] == [
+        "test_inherited_non_green"
+    ]
+    assert runtime_authority["fixed_base_failure_identities"] == [
+        "test_fixed_on_candidate"
+    ]
+
+    missing_fixed = json.loads(json.dumps(timeline_body))
+    missing_fixed["artifact_refs"]["external_no_pass_baseline_ledger"].pop(
+        "fixed_base_failure_identities"
+    )
+    assert not server._qa_external_no_pass_comparison_tuple(missing_fixed)
+    malformed_runtime = json.loads(json.dumps(runtime_line))
+    malformed_runtime["artifact_refs"][
+        "external_no_pass_baseline_ledger"
+    ].pop("fixed_base_failure_identities")
+    assert not server._contract_runtime_qa_no_pass_ledger_authority(
+        malformed_runtime,
+        record={"completed_lines": []},
+    )
+
+
 def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_and_rejects_forged_base(
     conn,
     monkeypatch,
@@ -158525,17 +158740,26 @@ def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_
                 ),
                 "base_commit_sha": base_commit,
                 "candidate_commit_sha": candidate_commit,
-                "base_failure_identities": ["test_inherited_non_green"],
+                "base_failure_identities": [
+                    "test_fixed_on_candidate",
+                    "test_inherited_non_green",
+                ],
                 "candidate_failure_identities": [
                     "test_inherited_non_green"
                 ],
+                "fixed_base_failure_identities": [
+                    "test_fixed_on_candidate"
+                ],
                 "base_reproduction": {
-                    "reproduced": 1,
-                    "total": 1,
-                    "failure_identities": ["test_inherited_non_green"],
+                    "reproduced": 2,
+                    "total": 2,
+                    "failure_identities": [
+                        "test_inherited_non_green",
+                        "test_fixed_on_candidate",
+                    ],
                 },
                 "candidate_suite_counts": {
-                    "baseline_known_non_green": 1,
+                    "baseline_known_non_green": 2,
                     "failed": 1,
                     "passed": 11,
                 },
@@ -158563,10 +158787,14 @@ def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_
     assert ledger["candidate_commit_sha"] == candidate_commit
     assert ledger["candidate_new_failures"] == 0
     assert ledger["base_failure_identities"] == [
+        "test_fixed_on_candidate",
         "test_inherited_non_green"
     ]
     assert ledger["candidate_failure_identities"] == [
         "test_inherited_non_green"
+    ]
+    assert ledger["fixed_base_failure_identities"] == [
+        "test_fixed_on_candidate"
     ]
     assert ledger["overall_release_pass_claimed"] is False
     assert proof["comparison_base_commit_sha"] == base_commit
@@ -158685,6 +158913,10 @@ def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_
         "wrong_candidate",
         "candidate_specific_issue",
         "failure_identity_mismatch",
+        "missing_fixed_base_failures",
+        "incomplete_fixed_base_failures",
+        "overlapping_fixed_base_failures",
+        "duplicate_fixed_base_failures",
         "failure_count_mismatch",
         "overall_pass_claim",
         "missing_comparison_base",
@@ -158702,6 +158934,36 @@ def test_exact_candidate_observer_direct_main_scoped_pass_binds_parent_baseline_
         elif mutation == "failure_identity_mismatch":
             malformed_ledger["candidate_failure_identities"] = [
                 "test_candidate_only_non_green"
+            ]
+        elif mutation == "missing_fixed_base_failures":
+            malformed_ledger.pop("fixed_base_failure_identities")
+        elif mutation == "incomplete_fixed_base_failures":
+            malformed_ledger["base_failure_identities"].append(
+                "test_second_fixed_on_candidate"
+            )
+            malformed_ledger["base_reproduction"].update(
+                {
+                    "reproduced": 3,
+                    "total": 3,
+                    "failure_identities": [
+                        *malformed_ledger["base_reproduction"][
+                            "failure_identities"
+                        ],
+                        "test_second_fixed_on_candidate",
+                    ],
+                }
+            )
+            malformed_ledger["candidate_suite_counts"][
+                "baseline_known_non_green"
+            ] = 3
+        elif mutation == "overlapping_fixed_base_failures":
+            malformed_ledger["fixed_base_failure_identities"] = [
+                "test_inherited_non_green"
+            ]
+        elif mutation == "duplicate_fixed_base_failures":
+            malformed_ledger["fixed_base_failure_identities"] = [
+                "test_fixed_on_candidate",
+                "test_fixed_on_candidate",
             ]
         elif mutation == "failure_count_mismatch":
             malformed_ledger["candidate_suite_counts"]["failed"] = 2

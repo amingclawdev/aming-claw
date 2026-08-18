@@ -11596,6 +11596,126 @@ _QA_EXTERNAL_NO_PASS_COMPARISON_PATHS = {
 }
 
 
+def _qa_external_no_pass_failure_set_authority(
+    ledger: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate identical or exact parent-only fixed no-PASS failures.
+
+    The immutable baseline may contain failures that the candidate fixed.  In
+    that case the caller must name the exact parent-only difference in
+    ``fixed_base_failure_identities``.  Candidate-only failures remain
+    ineligible because they are candidate-new by definition.  Keeping this
+    predicate shared prevents the timeline QA facade and ContractRuntime from
+    drifting on the same strict-v2 ledger.
+    """
+
+    if not isinstance(ledger, Mapping):
+        return {}
+    base_reproduction = (
+        ledger.get("base_reproduction")
+        if isinstance(ledger.get("base_reproduction"), Mapping)
+        else {}
+    )
+    candidate_counts = (
+        ledger.get("candidate_suite_counts")
+        if isinstance(ledger.get("candidate_suite_counts"), Mapping)
+        else {}
+    )
+    if not (
+        _QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS <= set(ledger)
+        and _QA_EXTERNAL_NO_PASS_BASE_REPRODUCTION_REQUIRED_KEYS
+        <= set(base_reproduction)
+        and _QA_EXTERNAL_NO_PASS_CANDIDATE_COUNTS_REQUIRED_KEYS
+        <= set(candidate_counts)
+    ):
+        return {}
+
+    def _failure_identities(value: Any) -> list[str]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        identities = [str(item or "").strip() for item in value]
+        if (
+            not identities
+            or any(not item for item in identities)
+            or len(set(identities)) != len(identities)
+        ):
+            return []
+        return sorted(identities)
+
+    base_failures = _failure_identities(
+        ledger.get("base_failure_identities")
+    )
+    reproduced_failures = _failure_identities(
+        base_reproduction.get("failure_identities")
+    )
+    candidate_failures = _failure_identities(
+        ledger.get("candidate_failure_identities")
+    )
+    fixed_field_present = "fixed_base_failure_identities" in ledger
+    fixed_base_failures = (
+        _failure_identities(ledger.get("fixed_base_failure_identities"))
+        if fixed_field_present
+        else []
+    )
+    refs = _failure_identities(ledger.get("refs"))
+    reproduced = base_reproduction.get("reproduced")
+    total = base_reproduction.get("total")
+    failed_count = candidate_counts.get("failed")
+    passed_count = candidate_counts.get("passed")
+    expected_fixed_base_failures = sorted(
+        set(base_failures) - set(candidate_failures)
+    )
+    failure_sets_valid = bool(
+        base_failures
+        and candidate_failures
+        and base_failures == reproduced_failures
+        and (
+            (
+                fixed_field_present
+                and fixed_base_failures
+                and not (set(fixed_base_failures) & set(candidate_failures))
+                and fixed_base_failures == expected_fixed_base_failures
+                and base_failures
+                == sorted([*candidate_failures, *fixed_base_failures])
+            )
+            or (
+                not fixed_field_present
+                and not expected_fixed_base_failures
+                and base_failures == candidate_failures
+            )
+        )
+    )
+    if not (
+        failure_sets_valid
+        and isinstance(reproduced, int)
+        and not isinstance(reproduced, bool)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and reproduced == total == len(base_failures)
+        and candidate_counts.get("baseline_known_non_green")
+        == len(base_failures)
+        and isinstance(failed_count, int)
+        and not isinstance(failed_count, bool)
+        and failed_count == len(candidate_failures)
+        and isinstance(passed_count, int)
+        and not isinstance(passed_count, bool)
+        and passed_count > 0
+        and refs
+    ):
+        return {}
+    return {
+        "base_failure_identities": base_failures,
+        "candidate_failure_identities": candidate_failures,
+        "fixed_base_failure_identities": fixed_base_failures,
+        "base_reproduction": {
+            **dict(base_reproduction),
+            "failure_identities": reproduced_failures,
+        },
+        "candidate_suite_counts": dict(candidate_counts),
+        "refs": refs,
+    }
+
+
 def _qa_is_immutable_external_audit_subtree(
     path: tuple[str, ...],
     value: Any,
@@ -11745,52 +11865,9 @@ def _qa_external_no_pass_comparison_tuple(
     ).strip().lower()
     full_commit = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
     if targeted_scope_pass:
-        base_reproduction = (
-            ledger.get("base_reproduction")
-            if isinstance(ledger.get("base_reproduction"), Mapping)
-            else {}
+        failure_set_authority = _qa_external_no_pass_failure_set_authority(
+            ledger
         )
-        candidate_counts = (
-            ledger.get("candidate_suite_counts")
-            if isinstance(ledger.get("candidate_suite_counts"), Mapping)
-            else {}
-        )
-        if not (
-            _QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS
-            <= set(ledger)
-            and _QA_EXTERNAL_NO_PASS_BASE_REPRODUCTION_REQUIRED_KEYS
-            <= set(base_reproduction)
-            and _QA_EXTERNAL_NO_PASS_CANDIDATE_COUNTS_REQUIRED_KEYS
-            <= set(candidate_counts)
-        ):
-            return {}
-
-        def _failure_identities(value: Any) -> list[str]:
-            if not isinstance(value, (list, tuple)):
-                return []
-            identities = [str(item or "").strip() for item in value]
-            if (
-                not identities
-                or any(not item for item in identities)
-                or len(set(identities)) != len(identities)
-            ):
-                return []
-            return sorted(identities)
-
-        base_failures = _failure_identities(
-            ledger.get("base_failure_identities")
-        )
-        reproduced_failures = _failure_identities(
-            base_reproduction.get("failure_identities")
-        )
-        candidate_failures = _failure_identities(
-            ledger.get("candidate_failure_identities")
-        )
-        refs = _failure_identities(ledger.get("refs"))
-        reproduced = base_reproduction.get("reproduced")
-        total = base_reproduction.get("total")
-        failed_count = candidate_counts.get("failed")
-        passed_count = candidate_counts.get("passed")
         candidate_claims = [
             claim for claim in (payload_candidate, body_candidate) if claim
         ]
@@ -11805,22 +11882,7 @@ def _qa_external_no_pass_comparison_tuple(
                 and claim == ledger_candidate
                 for claim in candidate_claims
             )
-            and base_failures
-            and base_failures == reproduced_failures == candidate_failures
-            and isinstance(reproduced, int)
-            and not isinstance(reproduced, bool)
-            and isinstance(total, int)
-            and not isinstance(total, bool)
-            and reproduced == total == len(base_failures)
-            and candidate_counts.get("baseline_known_non_green")
-            == len(base_failures)
-            and isinstance(failed_count, int)
-            and not isinstance(failed_count, bool)
-            and failed_count == len(candidate_failures)
-            and isinstance(passed_count, int)
-            and not isinstance(passed_count, bool)
-            and passed_count > 0
-            and refs
+            and failure_set_authority
         ):
             return {}
     elif not (
@@ -11858,7 +11920,8 @@ def _qa_validate_candidate_review_claims(
                 "field": "external_no_pass_baseline_ledger",
                 "expected": (
                     "canonical server-bound comparison tuple, identical "
-                    "failure identities and counts, candidate_new_failures=0, "
+                    "failures or an exact declared parent-only fixed-base "
+                    "difference, matching counts, candidate_new_failures=0, "
                     "and no overall PASS claim"
                 ),
                 "actual": "invalid_or_incomplete_comparison_ledger",
@@ -115203,27 +115266,9 @@ def _contract_runtime_qa_no_pass_ledger_authority(
         else {}
     )
     if ledger:
-        base_reproduction = (
-            ledger.get("base_reproduction")
-            if isinstance(ledger.get("base_reproduction"), Mapping)
-            else {}
+        failure_set_authority = _qa_external_no_pass_failure_set_authority(
+            ledger
         )
-        candidate_counts = (
-            ledger.get("candidate_suite_counts")
-            if isinstance(ledger.get("candidate_suite_counts"), Mapping)
-            else {}
-        )
-        base_failures = _contract_runtime_failure_identities(
-            ledger.get("base_failure_identities")
-            or base_reproduction.get("failure_identities")
-        )
-        candidate_failures = _contract_runtime_failure_identities(
-            ledger.get("candidate_failure_identities")
-        )
-        failed_count = candidate_counts.get("failed")
-        passed_count = candidate_counts.get("passed")
-        reproduced = base_reproduction.get("reproduced")
-        total = base_reproduction.get("total")
         if not (
             str(ledger.get("schema_version") or "")
             == _CONTRACT_RUNTIME_NO_PASS_LEDGER_SCHEMA_VERSION
@@ -115231,19 +115276,7 @@ def _contract_runtime_qa_no_pass_ledger_authority(
             == base_commit
             and str(ledger.get("candidate_commit_sha") or "").strip().lower()
             == candidate_commit
-            and base_failures
-            and base_failures == candidate_failures
-            and isinstance(reproduced, int)
-            and not isinstance(reproduced, bool)
-            and isinstance(total, int)
-            and not isinstance(total, bool)
-            and reproduced == total == len(base_failures)
-            and candidate_counts.get("baseline_known_non_green")
-            == len(base_failures)
-            and failed_count == len(candidate_failures)
-            and isinstance(passed_count, int)
-            and not isinstance(passed_count, bool)
-            and passed_count > 0
+            and failure_set_authority
             and ledger.get("candidate_new_failures") == 0
             and not list(ledger.get("candidate_specific_issues") or [])
             and ledger.get("no_pass_claim") is True
@@ -115251,16 +115284,14 @@ def _contract_runtime_qa_no_pass_ledger_authority(
             and list(ledger.get("refs") or [])
         ):
             return {}
-        return {
+        normalized = {
             **dict(ledger),
             "server_normalized": True,
-            "base_failure_identities": base_failures,
-            "candidate_failure_identities": candidate_failures,
-            "base_reproduction": {
-                **dict(base_reproduction),
-                "failure_identities": base_failures,
-            },
+            **failure_set_authority,
         }
+        if not failure_set_authority["fixed_base_failure_identities"]:
+            normalized.pop("fixed_base_failure_identities", None)
+        return normalized
 
     if not allow_immutable_legacy:
         return {}
@@ -115363,8 +115394,9 @@ def _contract_runtime_bind_qa_no_pass_ledger_authority(
             "contract_runtime_qa_no_pass_authority_shape_invalid",
             (
                 "no-PASS QA requires authenticated exact base/candidate commits, "
-                "identical non-green failure identities, zero candidate-new "
-                "failures, and no overall PASS claim"
+                "identical non-green failures or an exact declared parent-only "
+                "fixed-base difference, zero candidate-new failures, and no "
+                "overall PASS claim"
             ),
             409,
             {
