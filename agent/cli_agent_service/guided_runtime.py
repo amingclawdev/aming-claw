@@ -83,7 +83,7 @@ _HOST_REPLACEMENT_FIELDS_BY_SOURCE = {
         """backlog_id contract_execution_id contract_hash context_hash
         runtime_context_id task_id agent_id
         actual_host_worker_id worker_id worker_slot_id parent_task_id
-        target_project_root branch branch_ref base_commit target_head_commit
+        target_project_root worktree_path branch branch_ref base_commit target_head_commit
         merge_queue_id observer_command_id route_id route_context_hash
         prompt_contract_id prompt_contract_hash route_token_ref
         visible_injection_manifest_hash""".split()
@@ -867,6 +867,34 @@ def _host_runtime_values(
     transcript_ref = _text(supplied.get("worker_transcript_ref"))
     if not (transcript_ref or transcript_path):
         transcript_ref = "codex:{}".format(worker_session)
+    assigned_worktree = _first_deep_text(guide, "worktree_path")
+    if not assigned_worktree:
+        startup_skeleton = _first_named_mapping(
+            guide, "startup_facade_payload_skeleton"
+        )
+        startup_template = (
+            dict(startup_skeleton.get("copy_safe_body") or {})
+            if isinstance(startup_skeleton.get("copy_safe_body"), Mapping)
+            else {}
+        )
+        # A legacy error-path guide may carry a deliberately empty,
+        # non-executable startup skeleton.  It can still surface an earlier
+        # join/read-receipt server error without ever constructing or sending
+        # a startup request.  Every executable startup packet remains strict.
+        if not startup_skeleton or startup_template:
+            raise GuidedRuntimeDispatchError(
+                "runtime context host orchestration requires worktree_path",
+                status="invalid_host_orchestration",
+            )
+    for field_name in ("actual_cwd", "actual_git_root"):
+        supplied_path = _text(supplied.get(field_name))
+        if supplied_path and supplied_path != assigned_worktree:
+            raise GuidedRuntimeDispatchError(
+                "runtime context host identity conflicts at {}".format(
+                    field_name
+                ),
+                status="invalid_host_orchestration",
+            )
     values = {
         **supplied,
         "project_id": project,
@@ -885,10 +913,8 @@ def _host_runtime_values(
         "receipt_hash": receipt_hash,
         "launch_text_hash": _text(supplied.get("launch_text_hash")) or receipt_hash,
         "head_commit": _text(supplied.get("head_commit")),
-        "actual_cwd": _text(supplied.get("actual_cwd"))
-        or _first_deep_text(guide, "target_project_root"),
-        "actual_git_root": _text(supplied.get("actual_git_root"))
-        or _first_deep_text(guide, "target_project_root"),
+        "actual_cwd": assigned_worktree,
+        "actual_git_root": assigned_worktree,
         "harness_type": _text(supplied.get("harness_type")) or "codex",
     }
     for field_name in _HOST_REPLACEMENT_FIELDS_BY_SOURCE["worker_guide"]:

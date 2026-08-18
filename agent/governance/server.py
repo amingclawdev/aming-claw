@@ -25295,6 +25295,7 @@ def _runtime_context_projection_response(
         worker_id=worker_summary_id,
         worker_slot_id=worker_summary_slot_id,
         target_project_root=target_project_root,
+        worktree_path=str(getattr(context, "worktree_path", "") or ""),
         agent_id=str(
             worker_view_for_summary.get("agent_id")
             or getattr(context, "agent_id", "")
@@ -33585,6 +33586,13 @@ def _runtime_context_worker_guide_response(
         worker_id=worker_id,
         worker_slot_id=worker_slot_id,
         target_project_root=target_project_root,
+        worktree_path=str(
+            graph_identity.get("worktree_path")
+            or task.get("worktree_path")
+            or worker_view.get("worktree_path")
+            or branch_view.get("worktree_path")
+            or ""
+        ),
         agent_id=str(
             graph_identity.get("agent_id")
             or task.get("agent_id")
@@ -35221,7 +35229,7 @@ def _runtime_context_worker_recovery_payloads(
     worker_id: str,
     worker_slot_id: str,
     target_project_root: str,
-    worktree_path: str = "",
+    worktree_path: str | None = None,
     backlog_id: str = "",
     agent_id: str = "",
     allocation_owner: str = "",
@@ -35325,6 +35333,15 @@ def _runtime_context_worker_recovery_payloads(
             "never retry owned_files permutations after implementation."
         ),
     }
+    # Omitting worktree_path is the legacy same-root helper shape.  A live
+    # RuntimeContext that explicitly supplies an empty/placeholder path must
+    # not be widened back to the project root.
+    normalized_worktree_path = str(
+        target_project_root if worktree_path is None else worktree_path
+    ).strip()
+    worktree_authority_ready = _runtime_context_non_placeholder_text(
+        normalized_worktree_path
+    )
     raw_active_owned_files = (authority_revision or {}).get(
         "active_owned_files"
     )
@@ -35356,6 +35373,7 @@ def _runtime_context_worker_recovery_payloads(
             or not strict_read_receipt_authority_required
         )
         and (active_owned_files_ready or not startup_receipt_ready)
+        and worktree_authority_ready
     )
     writer_copy_container = (
         writer_role_safe_copy_payload
@@ -35505,9 +35523,6 @@ def _runtime_context_worker_recovery_payloads(
     normalized_base_commit = str(base_commit or "").strip()
     normalized_target_head_commit = str(target_head_commit or "").strip()
     normalized_merge_queue_id = str(merge_queue_id or "").strip()
-    normalized_worktree_path = str(
-        worktree_path or target_project_root or ""
-    ).strip()
     normalized_backlog_id = str(backlog_id or "").strip()
     capacity_fallback_guidance = _mf_sub_capacity_fallback_guidance(
         runtime_context_id=runtime_context_id,
@@ -36260,6 +36275,7 @@ def _runtime_context_worker_recovery_payloads(
         ),
         **canonical_dispatch_fields,
         "target_project_root": target_project_root,
+        "worktree_path": normalized_worktree_path,
         "session_token": session_token_placeholder,
         "session_token_ref": session_token_ref_placeholder,
         "fence_token": fence_token_placeholder,
@@ -36283,8 +36299,8 @@ def _runtime_context_worker_recovery_payloads(
         ),
         "host_startup_id": normalized_host_startup_id or "<host startup event/thread id>",
         "host_session_id": normalized_host_session_id or "<host session id>",
-        "actual_cwd": target_project_root,
-        "actual_git_root": target_project_root,
+        "actual_cwd": normalized_worktree_path,
+        "actual_git_root": normalized_worktree_path,
         "head_commit": "<worker worktree HEAD after launch>",
         "read_receipt_hash": (
             trusted_read_receipt_hash or "<accepted-read-receipt-hash>"
@@ -36330,6 +36346,7 @@ def _runtime_context_worker_recovery_payloads(
                 else {}
             ),
             "target_project_root": target_project_root,
+            "worktree_path": normalized_worktree_path,
             "session_token_env": session_token_env,
             "session_token_ref": session_token_ref_placeholder,
             "session_token_ref_present": bool(context_session_token_ref),
@@ -36829,6 +36846,7 @@ def _runtime_context_worker_recovery_payloads(
         "target_head_commit": normalized_target_head_commit,
         "merge_queue_id": normalized_merge_queue_id,
         "target_project_root": target_project_root,
+        "worktree_path": normalized_worktree_path,
         "route_identity": present_route_identity,
         "route_token_ref": safe_route_identity.get("route_token_ref", ""),
         "copy_safe_route_token_scope": copy_safe_route_token_scope,
@@ -37064,10 +37082,14 @@ def _runtime_context_worker_recovery_payloads(
             ],
             "required_real_worker_identity_fields": startup_identity_required_fields,
             "actionable": bool(
-                active_owned_files_ready and startup_receipt_ready
+                active_owned_files_ready
+                and startup_receipt_ready
+                and worktree_authority_ready
             ),
             "status": (
-                "blocked_missing_or_invalid_active_owned_files"
+                "blocked_missing_or_invalid_assigned_worktree"
+                if not worktree_authority_ready
+                else "blocked_missing_or_invalid_active_owned_files"
                 if not active_owned_files_ready and startup_receipt_ready
                 else "actionable_unique_durable_read_receipt"
                 if trusted_read_receipt_authority
@@ -55038,6 +55060,9 @@ def _runtime_context_session_rejoin_guidance_eligibility(
             target_project_root=(
                 _runtime_context_effective_target_project_root(context)
             ),
+            worktree_path=str(
+                getattr(context, "worktree_path", "") or ""
+            ).strip(),
             agent_id=str(getattr(context, "agent_id", "") or "").strip(),
             allocation_owner=str(
                 getattr(context, "allocation_owner", "") or ""
@@ -134619,6 +134644,9 @@ def _onboard_worker_read_runtime_facade_projection(
             worker_id=worker_id,
             worker_slot_id=worker_slot_id,
             target_project_root=target_project_root,
+            worktree_path=str(
+                getattr(context, "worktree_path", "") or ""
+            ),
             backlog_id=backlog_id,
             agent_id=str(getattr(context, "agent_id", "") or ""),
             allocation_owner=str(
@@ -134925,6 +134953,7 @@ def _onboard_worker_read_runtime_facade_projection(
         worker_id=worker_id,
         worker_slot_id=worker_slot_id,
         target_project_root=target_project_root,
+        worktree_path=str(getattr(context, "worktree_path", "") or ""),
         backlog_id=backlog_id,
         agent_id=str(getattr(context, "agent_id", "") or ""),
         allocation_owner=str(getattr(context, "allocation_owner", "") or ""),

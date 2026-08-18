@@ -61205,6 +61205,7 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     worker_task_id = "safe-ref-prestartup-worker"
     target_root = tmp_path / worker_task_id
     head_commit = _init_test_git_repo(target_root)
+    assigned_worktree = target_root / ".worktrees" / worker_task_id
     successor, allocated = _setup_mf_parallel_contract_runtime_worker_dispatch(
         conn,
         backlog_id=backlog_id,
@@ -61212,7 +61213,7 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         worker_task_id=worker_task_id,
         fence_token="fence-safe-ref-prestartup",
         token="",
-        worktree_path=str(target_root),
+        worktree_path=str(assigned_worktree),
         target_project_root=str(target_root),
         base_commit=head_commit,
         parent_task_is_contract_execution=True,
@@ -61520,6 +61521,15 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     assert startup_skeleton["copy_safe_body"]["contract_execution_id"] == (
         contract_execution_id
     )
+    assert startup_skeleton["copy_safe_body"]["target_project_root"] == str(
+        target_root
+    )
+    assert startup_skeleton["copy_safe_body"]["actual_cwd"] == str(
+        assigned_worktree
+    )
+    assert startup_skeleton["copy_safe_body"]["actual_git_root"] == str(
+        assigned_worktree
+    )
     assert startup_skeleton["copy_safe_body"]["owned_files"] == list(
         allocated.owned_files
     )
@@ -61541,6 +61551,7 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         worker_id=allocated.worker_id,
         worker_slot_id=allocated.worker_slot_id,
         target_project_root=str(target_root),
+        worktree_path=str(assigned_worktree),
         session_token_ref=reissued["session_token_ref"],
         route_identity=route_identity,
         read_receipt_event_ref=durable_authority["event_ref"],
@@ -61554,6 +61565,12 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     assert compact_startup["copy_safe_body"]["contract_execution_id"] == (
         contract_execution_id
     )
+    assert compact_startup["copy_safe_body"]["actual_cwd"] == str(
+        assigned_worktree
+    )
+    assert compact_startup["copy_safe_body"]["actual_git_root"] == str(
+        assigned_worktree
+    )
     assert compact_startup["copy_safe_body"]["owned_files"] == list(
         allocated.owned_files
     )
@@ -61564,6 +61581,32 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         "owned_files"
     ] == list(allocated.owned_files)
     assert "owned_files" in compact_startup["required_fields"]
+
+    missing_worktree_startup = server._runtime_context_worker_recovery_payloads(
+        project_id=PID,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=allocated.runtime_context_id,
+        task_id=allocated.task_id,
+        parent_task_id=contract_execution_id,
+        worker_id=allocated.worker_id,
+        worker_slot_id=allocated.worker_slot_id,
+        target_project_root=str(target_root),
+        worktree_path="",
+        session_token_ref=reissued["session_token_ref"],
+        route_identity=route_identity,
+        read_receipt_event_ref=durable_authority["event_ref"],
+        read_receipt_authority=durable_authority,
+        read_receipt_authority_required=True,
+        authority_revision={
+            "active_owned_files": list(allocated.owned_files),
+        },
+    )["startup_facade_payload_skeleton"]
+    assert missing_worktree_startup["actionable"] is False
+    assert missing_worktree_startup["status"] == (
+        "blocked_missing_or_invalid_assigned_worktree"
+    )
+    assert missing_worktree_startup["copy_safe_body"] == {}
 
     for invalid_authority_revision in (
         {},
@@ -61739,8 +61782,8 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         "worker_transcript_ref": "codex:safe-ref-prestartup-worker",
         "harness_type": "codex",
         "filer_principal": desktop_session_id,
-        "actual_cwd": str(target_root),
-        "actual_git_root": str(target_root),
+        "actual_cwd": str(assigned_worktree),
+        "actual_git_root": str(assigned_worktree),
         "branch": allocated.branch_ref,
         "branch_ref": allocated.branch_ref,
         "head_commit": head_commit,

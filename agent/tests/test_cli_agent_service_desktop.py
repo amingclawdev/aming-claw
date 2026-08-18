@@ -612,6 +612,7 @@ def _runtime_context_host_guide() -> dict[str, object]:
         "project_id": "aming-claw",
         "runtime_context_id": "mfrctx-host",
         "task_id": "host-worker",
+        "worktree_path": "/tmp/host-worker/.worktrees/assigned",
         "actionable_payloads": {
             "session_token_initial_join_submission": {
                 "mcp_tool": "runtime_context_session_token_initial_join",
@@ -796,6 +797,8 @@ def test_runtime_context_host_orchestration_is_uninterrupted_and_private() -> No
         assert body["observer_command_id"] == "observer-desktop-1"
         assert body["contract_execution_id"] == "cex-host"
         assert body["target_project_root"] == "/tmp/host-worker"
+        assert body["actual_cwd"] == "/tmp/host-worker/.worktrees/assigned"
+        assert body["actual_git_root"] == "/tmp/host-worker/.worktrees/assigned"
         assert body["worker_slot_id"] == "governed-slot"
         assert body["owned_files"] == [
             "src/reminders.js",
@@ -855,6 +858,55 @@ def test_runtime_context_host_orchestration_rejects_host_identity_override(
                 "observer_command_id": "observer-desktop-1",
                 field_name: "caller-guessed-worker",
                 "head_commit": "b" * 40,
+            },
+        )
+
+    assert calls == []
+
+
+def test_runtime_context_host_orchestration_requires_assigned_worktree_authority(
+) -> None:
+    guide = _runtime_context_host_guide()
+    application = json.loads(guide["content"][0]["text"])
+    application.pop("worktree_path")
+    guide["content"][0]["text"] = json.dumps(application)
+    calls = []
+
+    with pytest.raises(
+        GuidedRuntimeDispatchError,
+        match="requires worktree_path",
+    ):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "codex-thread-42",
+                "observer_command_id": "observer-desktop-1",
+                "head_commit": "b" * 40,
+            },
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("field_name", ["actual_cwd", "actual_git_root"])
+def test_runtime_context_host_orchestration_rejects_cross_worktree_override(
+    field_name,
+) -> None:
+    calls = []
+
+    with pytest.raises(
+        GuidedRuntimeDispatchError,
+        match="host identity conflicts at {}".format(field_name),
+    ):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=_runtime_context_host_guide(),
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "codex-thread-42",
+                "observer_command_id": "observer-desktop-1",
+                "head_commit": "b" * 40,
+                field_name: "/tmp/foreign-worker",
             },
         )
 
@@ -1066,6 +1118,7 @@ def _live_refreshing_host_startup_inputs(
         "task_id": "live-host-continuation-worker",
         "parent_task_id": "cex-live-host-continuation",
         "target_project_root": "/tmp/live-host-continuation",
+        "worktree_path": "/tmp/live-host-continuation",
         "worker_id": "live-host-continuation-worker",
         "worker_slot_id": "live-host-continuation-worker",
         "agent_id": "live-host-continuation-worker",
