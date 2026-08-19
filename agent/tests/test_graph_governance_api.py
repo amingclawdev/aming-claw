@@ -23901,6 +23901,7 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
             query={
                 "parent_task_id": "AC-ALLOCATE-CONTRACT",
                 "fence_token": "fence-allocate-contract",
+                "view": "all",
             },
         )
     )
@@ -23919,6 +23920,7 @@ def test_parallel_branch_allocate_persists_route_owned_contract_revision_for_wor
             query={
                 "parent_task_id": "AC-ALLOCATE-CONTRACT",
                 "fence_token": "fence-allocate-contract",
+                "view": "all",
             },
         )
     )
@@ -79170,7 +79172,7 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
     current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
         _ctx(
             {"project_id": PID, "runtime_context_id": context.runtime_context_id},
-            query=query_without_target_root,
+            query={**query_without_target_root, "view": "all"},
         )
     )
 
@@ -79220,7 +79222,7 @@ def test_runtime_context_worker_guide_projects_worktree_root_for_allocated_conte
     guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
         _ctx(
             {"project_id": PID, "runtime_context_id": context.runtime_context_id},
-            query=query_without_target_root,
+            query={**query_without_target_root, "view": "all"},
         )
     )
 
@@ -112053,6 +112055,7 @@ def test_worker_guide_does_not_use_dispatch_queue_when_runtime_queue_is_missing(
                     runtime_context
                 ),
                 "target_project_root": str(worktree),
+                "view": "all",
             },
         )
     )
@@ -127838,6 +127841,7 @@ def test_runtime_context_worker_guide_projects_canonical_worker_commit_after_imp
         "session_token": worker_token,
         "session_token_ref": runtime_context_session_token_ref(runtime_context),
         "target_project_root": str(worker_root),
+        "view": "all",
     }
     current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
         _ctx(
@@ -130715,6 +130719,7 @@ def test_runtime_context_worker_guide_ambiguous_resolution_does_not_override(
                     runtime_context
                 ),
                 "target_project_root": str(worker_root),
+                "view": "all",
             },
         )
     )
@@ -136521,6 +136526,7 @@ def test_worker_guide_projects_only_test_worker_results_into_accepted_body(
         "session_token": worker_token,
         "session_token_ref": runtime_context_session_token_ref(runtime_context),
         "target_project_root": str(worker_root),
+        "view": "all",
     }
 
     guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
@@ -137046,6 +137052,7 @@ def test_r12s16_source_backed_worker_results_drive_guide_and_finish_facade(
         "session_token": worker_token,
         "session_token_ref": runtime_context_session_token_ref(runtime_context),
         "target_project_root": str(worker_root),
+        "view": "all",
     }
 
     def worker_guide() -> dict[str, Any]:
@@ -137344,6 +137351,7 @@ def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
         "session_token": worker_token,
         "session_token_ref": runtime_context_session_token_ref(runtime_context),
         "target_project_root": str(worker_root),
+        "view": "all",
     }
 
     def worker_guide() -> dict[str, Any]:
@@ -170947,7 +170955,7 @@ def test_worker_guide_compact_has_one_full_current_action_in_post_auth_world():
     assert compact["semantic_truncation_performed"] is False
 
 
-def test_worker_guide_handler_honors_compact_view_without_forcing_all(monkeypatch):
+def test_worker_guide_handler_defaults_and_legacy_aliases_to_compact(monkeypatch):
     full = _representative_oversized_worker_guide()
     captured = {}
 
@@ -171003,16 +171011,57 @@ def test_worker_guide_handler_honors_compact_view_without_forcing_all(monkeypatc
     assert captured["closed"] is True
     assert compact["response_view"] == "compact"
 
-    full_result = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
-        _ctx(
-            {
-                "project_id": PID,
-                "runtime_context_id": "mfrctx-compact-guide",
-            }
+    for legacy_view in (None, "auto", "worker_view"):
+        query = {} if legacy_view is None else {"view": legacy_view}
+        bounded = (
+            server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+                _ctx(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": "mfrctx-compact-guide",
+                    },
+                    query=query,
+                )
+            )
+        )
+        assert captured["view"] == "compact"
+        assert bounded["response_view"] == "compact"
+
+    full_result = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": "mfrctx-compact-guide",
+                },
+                query={"view": "all"},
+            )
         )
     )
     assert full_result["response_view"] == "all"
     assert "worker_guide" in full_result
+
+
+def test_worker_guide_handler_rejects_invalid_view_before_context_read(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: calls.append("get_connection"),
+    )
+
+    with pytest.raises(ValidationError, match="declared Worker Guide"):
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": "mfrctx-invalid-guide-view",
+                },
+                query={"view": "forged"},
+            )
+        )
+
+    assert calls == []
 
 
 def test_worker_guide_compact_builds_directly_from_bounded_authority(

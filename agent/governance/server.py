@@ -44214,9 +44214,35 @@ def handle_graph_governance_parallel_branch_runtime_context_current_state(ctx: R
 def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: RequestContext):
     """Return public-safe instructions for a worker to consume runtime context."""
     query = dict(ctx.query or {})
-    requested_view = str(query.get("view") or "all").strip().lower()
-    compact = requested_view == "compact"
+    requested_view = str(query.get("view") or "compact").strip().lower()
+    allowed_views = {
+        "auto",
+        "compact",
+        "current",
+        "gate_inputs",
+        "worker_view",
+        "close_gate_view",
+        "all",
+        "full",
+    }
+    if requested_view not in allowed_views:
+        raise ValidationError(
+            "view must be a declared Worker Guide response view"
+        )
+    compact = requested_view not in {"all", "full"}
     if compact:
+        query["view"] = "compact"
+        compact_ctx = RequestContext(
+            ctx.handler,
+            ctx.method,
+            dict(ctx.path_params or {}),
+            query,
+            dict(ctx.body or {}),
+            ctx.request_id,
+            ctx.token,
+            ctx.idem_key,
+        )
+        compact_ctx._session = ctx._session
         project_id = ctx.get_project_id()
         runtime_context_id = str(
             ctx.path_params.get("runtime_context_id")
@@ -44228,7 +44254,7 @@ def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: Re
         conn = get_connection(project_id)
         try:
             context, role, _session = _runtime_context_mf_sub_read_context(
-                ctx,
+                compact_ctx,
                 conn,
                 action=(
                     "graph-governance.parallel-branches."
@@ -44238,7 +44264,7 @@ def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: Re
                 bounded_worker_guide=True,
             )
             response = _runtime_context_worker_guide_early_compact_response(
-                ctx,
+                compact_ctx,
                 conn,
                 project_id=project_id,
                 context=context,

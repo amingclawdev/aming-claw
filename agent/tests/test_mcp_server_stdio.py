@@ -3165,6 +3165,77 @@ def test_governance_mcp_runtime_context_worker_guide_tool_is_read_only(monkeypat
     ]
 
 
+@pytest.mark.parametrize(
+    ("requested_view", "forwarded_view"),
+    [
+        (None, "compact"),
+        ("auto", "compact"),
+        ("compact", "compact"),
+        ("current", "compact"),
+        ("gate_inputs", "compact"),
+        ("worker_view", "worker_view"),
+        ("close_gate_view", "compact"),
+    ],
+)
+def test_runtime_context_worker_guide_normalizes_bounded_views_before_http(
+    requested_view,
+    forwarded_view,
+):
+    calls = []
+
+    def fake_api(method: str, path: str, body: dict | None = None):
+        calls.append((method, path, body))
+        return {"ok": True, "response_view": "compact"}
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    args = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-bounded-alias",
+    }
+    if requested_view is not None:
+        args["view"] = requested_view
+
+    result = dispatcher.dispatch(
+        "runtime_context_worker_guide",
+        args,
+    )
+
+    assert result == {"ok": True, "response_view": "compact"}
+    assert len(calls) == 1
+    assert f"view={forwarded_view}" in calls[0][1]
+
+
+def test_runtime_context_worker_guide_invalid_view_is_local_zero_http():
+    calls = []
+    dispatcher = ToolDispatcher(
+        api_fn=lambda *args, **kwargs: calls.append((args, kwargs)),
+        worker_pool=None,
+        manager_api_fn=lambda *args, **kwargs: calls.append((args, kwargs)),
+        workspace=str(ROOT),
+    )
+
+    result = dispatcher.dispatch(
+        "runtime_context_worker_guide",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-invalid-view",
+            "view": "forged",
+        },
+    )
+
+    assert result["error"] == (
+        "runtime_context_worker_guide_response_view_invalid"
+    )
+    assert result["writes_performed"] is False
+    assert result["http_request_performed"] is False
+    assert calls == []
+
+
 def test_runtime_context_worker_guide_schema_matches_both_stdio_adapters():
     expected = {
         "task_id",

@@ -6717,7 +6717,38 @@ class ToolDispatcher:
             runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
             request_args = _worker_auth_from_env(args)
             if name == "runtime_context_worker_guide":
-                request_args.setdefault("view", "compact")
+                requested_view = str(
+                    request_args.get("view") or "compact"
+                ).strip().lower()
+                allowed_views = {
+                    "auto",
+                    "compact",
+                    "current",
+                    "gate_inputs",
+                    "worker_view",
+                    "close_gate_view",
+                    "all",
+                    "full",
+                }
+                if requested_view not in allowed_views:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "runtime_context_worker_guide_response_view_invalid"
+                        ),
+                        "message": (
+                            "view must be a declared Worker Guide response view"
+                        ),
+                        "response_view": requested_view,
+                        "writes_performed": False,
+                        "http_request_performed": False,
+                        "semantic_truncation_performed": False,
+                    }
+                request_args["view"] = (
+                    requested_view
+                    if requested_view in {"worker_view", "all", "full"}
+                    else "compact"
+                )
             query = _runtime_context_query(request_args)
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             suffix = "current-state" if name == "runtime_context_current" else "worker-guide"
