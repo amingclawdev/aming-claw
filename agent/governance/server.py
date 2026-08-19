@@ -82690,6 +82690,29 @@ def _current_full_reconcile_runtime_context_scope(
     claimed_runtime_context_id = (
         next(iter(runtime_context_claims)) if runtime_context_claims else ""
     )
+    parent_task_claims = {
+        str(candidate.get("parent_task_id") or "").strip()
+        for candidate in (
+            body,
+            body.get("evidence")
+            if isinstance(body.get("evidence"), Mapping)
+            else {},
+        )
+        if str(candidate.get("parent_task_id") or "").strip()
+    }
+    if len(parent_task_claims) > 1:
+        raise GovernanceError(
+            "current_full_reconcile_parent_task_scope_conflict",
+            "current-full reconcile received conflicting parent_task_id claims",
+            422,
+            {
+                "parent_task_id_claim_count": len(parent_task_claims),
+                "fail_closed": True,
+            },
+        )
+    claimed_parent_task_id = (
+        next(iter(parent_task_claims)) if parent_task_claims else ""
+    )
     merge_queue_id = str(body.get("merge_queue_id") or "").strip()
     route_allowed_actions = {
         str(action or "").strip().lower().replace("-", "_").replace(".", "_")
@@ -82999,6 +83022,7 @@ def _current_full_reconcile_runtime_context_scope(
     mismatches: dict[str, dict[str, str]] = {}
     requested_values = {
         "backlog_id": backlog_id,
+        "parent_task_id": claimed_parent_task_id,
         "runtime_context_id": claimed_runtime_context_id,
         "merge_queue_id": merge_queue_id,
     }
@@ -83927,6 +83951,7 @@ def _current_full_reconcile_existing_snapshot_identity(
             "resume_tuple": resume_tuple,
         }
     last_terminal_tuple: Mapping[str, Any] = {}
+    parent_terminal_matches: list[dict[str, Any]] = []
     if status == "active":
         complete_rows = conn.execute(
             """
@@ -83969,6 +83994,72 @@ def _current_full_reconcile_existing_snapshot_identity(
                         "terminal_tuple": terminal_tuple,
                     },
                 }
+            parent_resume_authority = (
+                _current_full_reconcile_parent_terminal_resume_authority(
+                    conn,
+                    project_id=project_id,
+                    target_commit_sha=target_commit_sha,
+                    snapshot_id=snapshot_id,
+                    expected_scope=_current_full_reconcile_idempotency_scope(
+                        route_evidence
+                    ),
+                    stored_scope=(
+                        terminal_tuple.get("stored_scope")
+                        if isinstance(
+                            terminal_tuple.get("stored_scope"), Mapping
+                        )
+                        else {}
+                    ),
+                )
+            )
+            if parent_resume_authority.get("valid") is True:
+                parent_scope = parent_resume_authority["terminal_parent_scope"]
+                parent_terminal_tuple = store.current_full_active_terminal_tuple(
+                    conn,
+                    project_id=project_id,
+                    run_id=origin_run_id,
+                    target_commit_sha=target_commit_sha,
+                    expected_scope=parent_scope,
+                    snapshot_id=snapshot_id,
+                )
+                if parent_terminal_tuple.get("valid"):
+                    parent_terminal_matches.append(
+                        {
+                            "origin_run_id": origin_run_id,
+                            "terminal_tuple": parent_terminal_tuple,
+                            "resume_authority": parent_resume_authority,
+                        }
+                    )
+        if len(parent_terminal_matches) == 1:
+            match = parent_terminal_matches[0]
+            terminal_tuple = match["terminal_tuple"]
+            return {
+                "status": "complete",
+                "run_id": run_id,
+                "snapshot_id": snapshot_id,
+                "canonical_parent_snapshot_resume": True,
+                "parent_snapshot_resume_authority": match["resume_authority"],
+                "terminal": {
+                    "status": "complete",
+                    "run_id": match["origin_run_id"],
+                    "snapshot": terminal_tuple["snapshot"],
+                    "snapshot_id": snapshot_id,
+                    "metric": terminal_tuple["metric"],
+                    "metric_evidence": terminal_tuple["metric_evidence"],
+                    "provenance": terminal_tuple["provenance"],
+                    "timeline_event": terminal_tuple["timeline_event"],
+                    "terminal_tuple": terminal_tuple,
+                },
+            }
+        if len(parent_terminal_matches) > 1:
+            return {
+                "status": "conflict",
+                "reason": "current_full_parent_terminal_resume_ambiguous",
+                "run_id": run_id,
+                "snapshot_id": snapshot_id,
+                "parent_terminal_match_count": len(parent_terminal_matches),
+                "fail_closed": True,
+            }
     active_ref = conn.execute(
         "SELECT snapshot_id FROM graph_snapshot_refs "
         "WHERE project_id = ? AND ref_name = 'active'",
@@ -83982,6 +84073,202 @@ def _current_full_reconcile_existing_snapshot_identity(
         "snapshot_status": status,
         "active_snapshot_id": str(active_ref["snapshot_id"] if active_ref else ""),
         "terminal_tuple": last_terminal_tuple,
+    }
+
+
+def _current_full_reconcile_parent_terminal_resume_authority(
+    conn,
+    *,
+    project_id: str,
+    target_commit_sha: str,
+    snapshot_id: str,
+    expected_scope: Mapping[str, Any],
+    stored_scope: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove that a child route selects its batch parent's terminal snapshot.
+
+    Older batch-parent reconciles correctly persisted the coordination backlog
+    and batch task as the terminal route scope.  A later worker-scoped receipt
+    has a richer RuntimeContext scope, including the ContractRuntime parent id.
+    Treating those two scopes as interchangeable is unsafe, but rejecting the
+    already-reconciled snapshot forever is also wrong.  This pure-read bridge
+    accepts only the unique persisted child -> merge item -> closed integration
+    epoch -> parent terminal chain.  It never backfills or normalizes history.
+    """
+
+    current_scope = {
+        key: str(value or "").strip()
+        for key, value in dict(expected_scope).items()
+        if str(value or "").strip()
+    }
+    historical_scope = {
+        key: str(value or "").strip()
+        for key, value in dict(stored_scope).items()
+        if str(value or "").strip()
+    }
+    required_current = (
+        "project_id",
+        "backlog_id",
+        "task_id",
+        "parent_task_id",
+        "runtime_context_id",
+        "merge_queue_id",
+    )
+    if any(not current_scope.get(key) for key in required_current):
+        return {"valid": False, "reason": "current_scope_incomplete"}
+    if current_scope["project_id"] != project_id:
+        return {"valid": False, "reason": "current_scope_project_mismatch"}
+
+    try:
+        context_rows = conn.execute(
+            """
+            SELECT project_id, task_id, runtime_context_id, batch_id,
+                   backlog_id, parent_task_id, root_task_id, merge_queue_id,
+                   status, target_head_commit, snapshot_id
+            FROM parallel_branch_runtime_contexts
+            WHERE project_id = ? AND task_id = ? AND runtime_context_id = ?
+              AND backlog_id = ? AND merge_queue_id = ?
+            """,
+            (
+                project_id,
+                current_scope["task_id"],
+                current_scope["runtime_context_id"],
+                current_scope["backlog_id"],
+                current_scope["merge_queue_id"],
+            ),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {"valid": False, "reason": "runtime_lineage_tables_missing"}
+    if len(context_rows) != 1:
+        return {
+            "valid": False,
+            "reason": "runtime_context_identity_not_unique",
+            "runtime_context_match_count": len(context_rows),
+        }
+    context = dict(context_rows[0])
+    persisted_parent_task_id = str(context.get("parent_task_id") or "").strip()
+    persisted_root_task_id = str(context.get("root_task_id") or "").strip()
+    runtime_parent_task_id = persisted_parent_task_id
+    batch_task_id = str(context.get("batch_id") or "").strip()
+    if (
+        not runtime_parent_task_id
+        or (
+            persisted_parent_task_id
+            and persisted_root_task_id
+            and persisted_parent_task_id != persisted_root_task_id
+        )
+        or runtime_parent_task_id != current_scope["parent_task_id"]
+        or not batch_task_id
+        or str(context.get("status") or "").strip() != "merged"
+        or str(context.get("target_head_commit") or "").strip()
+        != target_commit_sha
+        or str(context.get("snapshot_id") or "").strip() != snapshot_id
+    ):
+        return {"valid": False, "reason": "runtime_context_lineage_mismatch"}
+
+    try:
+        epoch_rows = conn.execute(
+            """
+            SELECT batch_id, coordination_backlog_id, merge_queue_id,
+                   reconcile_state, status, snapshot_id, reconciled_target_head
+            FROM parallel_branch_integration_epochs
+            WHERE project_id = ? AND batch_id = ? AND merge_queue_id = ?
+            """,
+            (project_id, batch_task_id, current_scope["merge_queue_id"]),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {"valid": False, "reason": "runtime_lineage_tables_missing"}
+    if len(epoch_rows) != 1:
+        return {
+            "valid": False,
+            "reason": "integration_epoch_identity_not_unique",
+            "integration_epoch_match_count": len(epoch_rows),
+        }
+    epoch = dict(epoch_rows[0])
+    coordination_backlog_id = str(
+        epoch.get("coordination_backlog_id") or ""
+    ).strip()
+    if (
+        not coordination_backlog_id
+        or str(epoch.get("status") or "").strip() != "closed"
+        or str(epoch.get("reconcile_state") or "").strip() != "reconciled"
+        or str(epoch.get("snapshot_id") or "").strip() != snapshot_id
+        or str(epoch.get("reconciled_target_head") or "").strip()
+        != target_commit_sha
+    ):
+        return {"valid": False, "reason": "integration_epoch_lineage_mismatch"}
+
+    try:
+        queue_rows = conn.execute(
+            """
+            SELECT queue_item_id, task_id, backlog_id, status, snapshot_id,
+                   merge_commit, target_head_after_merge
+            FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND task_id = ?
+              AND backlog_id = ?
+            """,
+            (
+                project_id,
+                current_scope["merge_queue_id"],
+                current_scope["task_id"],
+                current_scope["backlog_id"],
+            ),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {"valid": False, "reason": "runtime_lineage_tables_missing"}
+    if len(queue_rows) != 1:
+        return {
+            "valid": False,
+            "reason": "merge_queue_child_identity_not_unique",
+            "merge_queue_child_match_count": len(queue_rows),
+        }
+    queue_item = dict(queue_rows[0])
+    if (
+        str(queue_item.get("status") or "").strip() != "merged"
+        or str(queue_item.get("snapshot_id") or "").strip() != snapshot_id
+        or str(queue_item.get("merge_commit") or "").strip()
+        != target_commit_sha
+        or str(queue_item.get("target_head_after_merge") or "").strip()
+        != target_commit_sha
+    ):
+        return {"valid": False, "reason": "merge_queue_child_lineage_mismatch"}
+
+    canonical_parent_scope = {
+        "project_id": project_id,
+        "backlog_id": coordination_backlog_id,
+        "task_id": batch_task_id,
+    }
+    if historical_scope.get("merge_queue_id"):
+        canonical_parent_scope["merge_queue_id"] = current_scope[
+            "merge_queue_id"
+        ]
+    if historical_scope.get("parent_task_id"):
+        canonical_parent_scope["parent_task_id"] = batch_task_id
+    if historical_scope != canonical_parent_scope:
+        return {"valid": False, "reason": "terminal_parent_scope_mismatch"}
+
+    return {
+        "valid": True,
+        "schema_version": (
+            "graph_current_full_reconcile.parent_terminal_resume_authority.v1"
+        ),
+        "server_derived": True,
+        "source": (
+            "parallel_branch_runtime_contexts+"
+            "parallel_branch_merge_queue_items+"
+            "parallel_branch_integration_epochs+terminal_tuple"
+        ),
+        "terminal_parent_scope": canonical_parent_scope,
+        "runtime_parent_task_id": runtime_parent_task_id,
+        "canonical_parent_task_id": batch_task_id,
+        "runtime_context_id": current_scope["runtime_context_id"],
+        "child_task_id": current_scope["task_id"],
+        "child_backlog_id": current_scope["backlog_id"],
+        "merge_queue_id": current_scope["merge_queue_id"],
+        "queue_item_id": str(queue_item.get("queue_item_id") or "").strip(),
+        "snapshot_id": snapshot_id,
+        "target_commit_sha": target_commit_sha,
+        "history_rewritten": False,
     }
 
 
@@ -84425,6 +84712,16 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             )
             response["requested_run_id"] = run_id
             response["fresh_run_snapshot_resume"] = True
+            if snapshot_existing.get("canonical_parent_snapshot_resume") is True:
+                response["canonical_parent_snapshot_resume"] = True
+                response["parent_snapshot_resume_authority"] = dict(
+                    snapshot_existing.get("parent_snapshot_resume_authority")
+                    if isinstance(
+                        snapshot_existing.get("parent_snapshot_resume_authority"),
+                        Mapping,
+                    )
+                    else {}
+                )
             response["historical_terminal_projection_replay"] = bool(
                 target_commit != head_commit
             )

@@ -14808,6 +14808,310 @@ def _current_full_parallel_route_without_merge_authority_fixture(
     return observer_session_id
 
 
+def _current_full_parent_terminal_resume_fixture(monkeypatch, tmp_path, suffix):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    db_path = tmp_path / f"parent-terminal-resume-{suffix}.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+    wrapped = _CountingNoCloseConn(connection)
+    monkeypatch.setattr(
+        "agent.governance.db._governance_root", lambda: tmp_path / "state"
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+
+    batch_id = f"batch-parent-terminal-{suffix}"
+    parent_backlog_id = f"AC-PARENT-TERMINAL-{suffix.upper()}"
+    parent_route_ref = f"rtok-parent-terminal-{suffix}"
+    parent_session_id = f"obs-parent-terminal-{suffix}"
+    _insert_active_observer_session_ref(connection, session_id=parent_session_id)
+    _persist_contract_runtime_observer_route_ref(
+        connection,
+        backlog_id=parent_backlog_id,
+        contract_execution_id=batch_id,
+        route_token_ref=parent_route_ref,
+        allowed_actions=["graph_current_full_reconcile"],
+    )
+    connection.commit()
+    first_status, first = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "run_id": f"parent-terminal-origin-{suffix}",
+                "activate": True,
+                "semantic_enrich": False,
+                "backlog_id": parent_backlog_id,
+                "task_id": batch_id,
+                "observer_session_id": parent_session_id,
+                "observer_route_token_ref": parent_route_ref,
+            },
+        )
+    )
+    assert first_status == 201
+    snapshot_id = first["snapshot_id"]
+
+    child_task_id = f"{batch_id}:row:2"
+    child_backlog_id = f"AC-CHILD-TERMINAL-{suffix.upper()}"
+    runtime_context_id = f"mfrctx-parent-terminal-{suffix}"
+    runtime_parent_task_id = f"cex-parent-terminal-{suffix}"
+    merge_queue_id = f"mq-parent-terminal-{suffix}"
+    queue_item_id = f"mqitem-parent-terminal-{suffix}"
+    upsert_branch_context(
+        connection,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id=child_task_id,
+            runtime_context_id=runtime_context_id,
+            batch_id=batch_id,
+            backlog_id=child_backlog_id,
+            parent_task_id=runtime_parent_task_id,
+            root_task_id=runtime_parent_task_id,
+            branch_ref=f"refs/heads/codex/{child_task_id}",
+            status=STATE_MERGED,
+            target_head_commit=head,
+            snapshot_id=snapshot_id,
+            merge_queue_id=merge_queue_id,
+        ),
+    )
+    upsert_merge_queue_item(
+        connection,
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=queue_item_id,
+            task_id=child_task_id,
+            backlog_id=child_backlog_id,
+            branch_ref=f"refs/heads/codex/{child_task_id}",
+            queue_index=2,
+            status=STATE_MERGED,
+            snapshot_id=snapshot_id,
+            merge_commit=head,
+            target_head_after_merge=head,
+        ),
+    )
+    upsert_integration_epoch(
+        connection,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id=batch_id,
+            epoch_id=f"epoch-parent-terminal-{suffix}",
+            coordination_backlog_id=parent_backlog_id,
+            target_ref="refs/heads/main",
+            base_head="b" * 40,
+            current_head=head,
+            merge_queue_id=merge_queue_id,
+            merge_cursor=2,
+            reconcile_state="reconciled",
+            status=parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED,
+            snapshot_id=snapshot_id,
+            reconciled_target_head=head,
+            closed_at="2026-08-19T00:00:00Z",
+        ),
+    )
+    child_route_ref = f"rtok-child-terminal-{suffix}"
+    child_session_id = parent_session_id
+    _persist_contract_runtime_observer_route_ref(
+        connection,
+        backlog_id=child_backlog_id,
+        contract_execution_id=child_task_id,
+        route_token_ref=child_route_ref,
+        allowed_actions=["graph_current_full_reconcile"],
+    )
+    connection.commit()
+    body = {
+        "target_commit_sha": head,
+        "snapshot_id": snapshot_id,
+        "run_id": f"parent-terminal-child-{suffix}",
+        "activate": True,
+        "semantic_enrich": False,
+        "backlog_id": child_backlog_id,
+        "task_id": child_task_id,
+        "parent_task_id": runtime_parent_task_id,
+        "runtime_context_id": runtime_context_id,
+        "merge_queue_id": merge_queue_id,
+        "observer_session_id": child_session_id,
+        "observer_route_token_ref": child_route_ref,
+    }
+    return {
+        "connection": connection,
+        "wrapped": wrapped,
+        "db_path": db_path,
+        "calls": calls,
+        "head": head,
+        "snapshot_id": snapshot_id,
+        "body": body,
+        "batch_id": batch_id,
+        "parent_backlog_id": parent_backlog_id,
+        "child_task_id": child_task_id,
+        "child_backlog_id": child_backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "runtime_parent_task_id": runtime_parent_task_id,
+        "merge_queue_id": merge_queue_id,
+        "queue_item_id": queue_item_id,
+    }
+
+
+def test_current_full_existing_snapshot_resumes_from_canonical_batch_parent_read_only(
+    monkeypatch,
+    tmp_path,
+):
+    fixture = _current_full_parent_terminal_resume_fixture(
+        monkeypatch, tmp_path, "canonical"
+    )
+    connection = fixture["connection"]
+    wrapped = fixture["wrapped"]
+    try:
+        before_changes = connection.total_changes
+        before_commits = wrapped.commit_calls
+        before_bytes = fixture["db_path"].read_bytes()
+        status, result = server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=fixture["body"],
+            )
+        )
+
+        assert status == 200
+        assert result["fresh_run_snapshot_resume"] is True
+        assert result["canonical_parent_snapshot_resume"] is True
+        assert result["rebuild_skipped"] is True
+        authority = result["parent_snapshot_resume_authority"]
+        assert authority["server_derived"] is True
+        assert authority["runtime_parent_task_id"] == fixture[
+            "runtime_parent_task_id"
+        ]
+        assert authority["canonical_parent_task_id"] == fixture["batch_id"]
+        assert authority["terminal_parent_scope"] == {
+            "project_id": PID,
+            "backlog_id": fixture["parent_backlog_id"],
+            "task_id": fixture["batch_id"],
+        }
+        assert authority["history_rewritten"] is False
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commits
+        assert fixture["db_path"].read_bytes() == before_bytes
+        assert len(fixture["calls"]) == 1
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_parent_claim",
+        "missing_parent",
+        "missing_parent_column",
+        "parent_root_mismatch",
+        "cross_epoch",
+        "wrong_queue_snapshot",
+        "ambiguous_queue_child",
+    ],
+)
+def test_current_full_parent_snapshot_resume_wrong_or_ambiguous_lineage_is_read_only(
+    monkeypatch,
+    tmp_path,
+    mutation,
+):
+    fixture = _current_full_parent_terminal_resume_fixture(
+        monkeypatch, tmp_path, mutation
+    )
+    connection = fixture["connection"]
+    wrapped = fixture["wrapped"]
+    body = dict(fixture["body"])
+    try:
+        if mutation == "wrong_parent_claim":
+            body["parent_task_id"] = "cex-foreign-parent"
+        elif mutation == "missing_parent":
+            body.pop("parent_task_id")
+            connection.execute(
+                "UPDATE parallel_branch_runtime_contexts "
+                "SET parent_task_id = '', root_task_id = '' "
+                "WHERE project_id = ? AND runtime_context_id = ?",
+                (PID, fixture["runtime_context_id"]),
+            )
+        elif mutation == "missing_parent_column":
+            connection.execute(
+                "UPDATE parallel_branch_runtime_contexts "
+                "SET parent_task_id = '' "
+                "WHERE project_id = ? AND runtime_context_id = ?",
+                (PID, fixture["runtime_context_id"]),
+            )
+        elif mutation == "parent_root_mismatch":
+            connection.execute(
+                "UPDATE parallel_branch_runtime_contexts "
+                "SET root_task_id = 'cex-foreign-root' "
+                "WHERE project_id = ? AND runtime_context_id = ?",
+                (PID, fixture["runtime_context_id"]),
+            )
+        elif mutation == "cross_epoch":
+            connection.execute(
+                "UPDATE parallel_branch_integration_epochs "
+                "SET coordination_backlog_id = ? "
+                "WHERE project_id = ? AND batch_id = ?",
+                ("AC-FOREIGN-PARENT", PID, fixture["batch_id"]),
+            )
+        elif mutation == "wrong_queue_snapshot":
+            connection.execute(
+                "UPDATE parallel_branch_merge_queue_items "
+                "SET snapshot_id = 'full-foreign' "
+                "WHERE project_id = ? AND merge_queue_id = ?",
+                (PID, fixture["merge_queue_id"]),
+            )
+        else:
+            upsert_merge_queue_item(
+                connection,
+                MergeQueueItem(
+                    project_id=PID,
+                    merge_queue_id=fixture["merge_queue_id"],
+                    queue_item_id=fixture["queue_item_id"] + "-duplicate",
+                    task_id=fixture["child_task_id"],
+                    backlog_id=fixture["child_backlog_id"],
+                    branch_ref=f"refs/heads/codex/{fixture['child_task_id']}",
+                    queue_index=3,
+                    status=STATE_MERGED,
+                    snapshot_id=fixture["snapshot_id"],
+                    merge_commit=fixture["head"],
+                    target_head_after_merge=fixture["head"],
+                ),
+            )
+        connection.commit()
+        before_changes = connection.total_changes
+        before_commits = wrapped.commit_calls
+        before_bytes = fixture["db_path"].read_bytes()
+
+        if mutation == "wrong_parent_claim":
+            with pytest.raises(GovernanceError) as exc_info:
+                server.handle_graph_governance_current_full_reconcile(
+                    _ctx({"project_id": PID}, method="POST", body=body)
+                )
+            assert exc_info.value.status == 409
+            assert exc_info.value.code == (
+                "current_full_reconcile_runtime_context_scope_mismatch"
+            )
+            assert exc_info.value.details["fail_closed"] is True
+        else:
+            status, result = server.handle_graph_governance_current_full_reconcile(
+                _ctx({"project_id": PID}, method="POST", body=body)
+            )
+            assert status == 409
+            assert result["error"] == (
+                "current_full_snapshot_identity_exists_not_resumable"
+            )
+            assert result["rebuild_started"] is False
+            assert result["fail_closed"] is True
+        assert connection.total_changes == before_changes
+        assert wrapped.commit_calls == before_commits
+        assert fixture["db_path"].read_bytes() == before_bytes
+        assert len(fixture["calls"]) == 1
+    finally:
+        connection.close()
+
+
 def test_current_full_reconcile_atomic_finalization_rolls_back_activation_and_timeline(
     conn,
     monkeypatch,

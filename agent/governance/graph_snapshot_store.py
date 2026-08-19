@@ -3941,6 +3941,13 @@ def current_full_active_terminal_tuple(
         "valid": not errors,
         "errors": errors,
         "route_bound": route_bound,
+        # Keep the exact server-authored terminal scope available to the
+        # current-full facade.  A fresh child route may legitimately encounter
+        # a snapshot finalized by its canonical batch parent; the facade still
+        # has to prove that parent/child relationship before it can reuse this
+        # scope.  Returning the decoded value here avoids reconstructing it
+        # from caller claims and never rewrites historical evidence.
+        "stored_scope": dict(stored_scope or {}),
         "run_id": run_id,
         "snapshot_id": snapshot_id,
         "metric_evidence_canonical": evidence_canonical,
