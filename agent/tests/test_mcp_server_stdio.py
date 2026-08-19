@@ -4324,6 +4324,130 @@ def test_mcp_observer_runtime_text_prepare_schema_exposes_response_view():
     assert response_view["default"] == "compact"
 
 
+def test_mcp_observer_runtime_text_prepare_bounded_truthfulness_warranty():
+    calls = []
+    response = {"ok": True, "status": "prepared"}
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return response
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    base = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-RUNTIME-TEXT-BOUNDED-WARRANTY",
+        "observer_command_id": "cmd-runtime-text-bounded-warranty",
+        "route_context_hash": "sha256:warranty-route",
+        "prompt_contract_id": "rprompt-runtime-text-bounded-warranty",
+    }
+
+    # Small/default responses remain byte-for-byte compatible and the local
+    # response-view selector is never forwarded to governance.
+    assert dispatcher.dispatch("observer_runtime_text_prepare", base) == response
+    assert "response_view" not in calls[-1][2]
+
+    launch_text = "runtime-launch-warranty:" + ("0123456789abcdef" * 105_000)
+    response = {
+        "ok": True,
+        "status": "prepared",
+        "project_id": "aming-claw",
+        "backlog_id": base["backlog_id"],
+        "runtime_context_id": "mfrctx-runtime-text-warranty",
+        "task_id": "worker-runtime-text-warranty",
+        "contract_execution_id": "cex-runtime-text-warranty",
+        "launch_text": launch_text,
+        "launch_text_hash": "sha256:launch-text-warranty",
+        "full_payload_path": "/tmp/runtime-text-warranty.json",
+        "full_payload_sha256": "sha256:full-payload-warranty",
+        "request_id": "req-runtime-text-warranty",
+        "session_token": "raw-session-warranty-must-not-escape",
+        "fence_token": "raw-fence-warranty-must-not-escape",
+        "persistent_evidence": {
+            "contract_revision_persisted": True,
+            "bounded_worker_dispatch_event_recorded": True,
+        },
+        "runtime_contract_revision": {
+            "revision_id": "revision-runtime-text-warranty",
+            "status": "recorded",
+            "execution_state_revision": 9,
+        },
+        "dispatch_timeline_event": {
+            "id": 71,
+            "status": "recorded",
+            "event_type": "observer.runtime_text_prepared",
+            "diagnostic": "d" * 300_000,
+        },
+        "local_runtime_context_bridge": {
+            "ok": True,
+            "status": "written",
+            "runtime_context_id": "mfrctx-runtime-text-warranty",
+            "written": True,
+            "private": "p" * 300_000,
+        },
+    }
+
+    compact = dispatcher.dispatch("observer_runtime_text_prepare", base)
+    compact_json = json.dumps(compact, sort_keys=True, separators=(",", ":"))
+    assert len(compact_json.encode()) < 256 * 1024
+    assert compact["prepare_state_advanced"] is True
+    assert compact["http_request_performed"] is True
+    assert compact["writes_performed"] is True
+    assert compact["mutation_performed"] is True
+    assert compact["dispatch_timeline_event"]["id"] == 71
+    assert compact["runtime_contract_revision"]["revision_id"] == (
+        "revision-runtime-text-warranty"
+    )
+    assert compact["lossless_continuation_available"] is True
+    assert compact["semantic_truncation_performed"] is False
+    assert compact["launch_text_omitted"] is True
+    assert "launch_text" not in compact
+    assert "session_token" not in compact
+    assert "fence_token" not in compact
+    assert "raw-session-warranty-must-not-escape" not in compact_json
+    assert "raw-fence-warranty-must-not-escape" not in compact_json
+
+    continuation = compact["encoded_launch_text"]
+    padding = "=" * (-len(continuation["payload"]) % 4)
+    compressed = base64.urlsafe_b64decode(continuation["payload"] + padding)
+    decoded = zlib.decompress(compressed)
+    assert decoded.decode() == launch_text
+    assert continuation["uncompressed_bytes"] == len(decoded)
+    assert continuation["compressed_bytes"] == len(compressed)
+    assert continuation["uncompressed_sha256"] == (
+        "sha256:" + hashlib.sha256(decoded).hexdigest()
+    )
+    assert continuation["compressed_sha256"] == (
+        "sha256:" + hashlib.sha256(compressed).hexdigest()
+    )
+
+    # Full remains an explicit compatibility view, and invalid views are
+    # rejected before any HTTP request or mutation.
+    assert dispatcher.dispatch(
+        "observer_runtime_text_prepare",
+        {**base, "response_view": "full"},
+    ) == response
+    assert "response_view" not in calls[-1][2]
+
+    call_count = len(calls)
+    rejected = dispatcher.dispatch(
+        "observer_runtime_text_prepare",
+        {**base, "response_view": "forged"},
+    )
+    assert rejected["error"] == (
+        "observer_runtime_text_prepare_response_view_invalid"
+    )
+    assert rejected["http_request_performed"] is False
+    assert rejected["zero_write_rejection"] is True
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert len(calls) == call_count
+
+
 def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
     tool_by_name = {tool["name"]: tool for tool in governance_mcp_server.TOOLS}
 
