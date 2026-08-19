@@ -132439,6 +132439,192 @@ def test_irreversible_runtime_audit_terminal_unique_current_lineage_survives_com
     assert "\n".join(conn.iterdump()) == before_dump
 
 
+def test_irreversible_runtime_audit_terminal_unique_current_lineage_survives_public_continuation(
+    conn,
+    monkeypatch,
+):
+    record, context, _route_identity, _state, _eligibility, _failed_qa = (
+        _irreversible_runtime_audit_terminal_fixture(monkeypatch)
+    )
+    contract_chain_id = (
+        "cchain-irreversible-runtime-audit-terminal-public-continuation"
+    )
+    record.update(
+        {
+            "contract_chain_id": contract_chain_id,
+            "root_contract_execution_id": context.parent_task_id,
+            "execution_state_revision": 12,
+            "metadata": {},
+        }
+    )
+    historical = {
+        **copy.deepcopy(record),
+        "contract_execution_id": (
+            "cex-historical-irreversible-runtime-public-continuation"
+        ),
+    }
+    base_current_projection = {
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "contract_chain_id": contract_chain_id,
+        "current_contract_execution_id": record["contract_execution_id"],
+        "execution_state_revision": 12,
+        "projection_hash": _fake_sha(
+            "irreversible-runtime-unique-current-public-continuation"
+        ),
+        "active_chain": {
+            "execution_ids": [record["contract_execution_id"]],
+        },
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_chain_current_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(base_current_projection),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(
+            get=lambda execution_id: copy.deepcopy(record)
+            if execution_id == record["contract_execution_id"]
+            else None,
+            list_by_backlog=lambda **_kwargs: [
+                copy.deepcopy(historical),
+                copy.deepcopy(record),
+            ]
+        ),
+    )
+
+    action = (
+        server._mf_batch_irreversible_runtime_audit_terminal_authority_for_current_lineage(
+            conn,
+            project_id=PID,
+            backlog_id=context.backlog_id,
+            preferred_record=historical,
+        )
+    )
+    selection = action["current_lineage_selection"]
+    assert selection["selected_contract_execution_id"] == (
+        record["contract_execution_id"]
+    )
+    assert selection["runtime_record_count"] == 2
+    assert selection["current_runtime_record_count"] == 1
+    assert selection["historical_runtime_contexts_ignored"] is True
+
+    action["copy_safe_body"]["qa_acceptance"]["tests"] = [
+        f"pytest unique current public continuation {index:02d} "
+        + ("historical-runtime-context-ignored-" * 40)
+        for index in range(32)
+    ]
+    action["archive_action_input"] = copy.deepcopy(action["copy_safe_body"])
+    authority_proof = {
+        key: copy.deepcopy(value)
+        for key, value in action[
+            "irreversible_runtime_audit_terminal_authority"
+        ].items()
+        if key
+        not in {
+            "schema_version",
+            "server_derived",
+            "caller_claims_trusted",
+            "authority_hash",
+        }
+    }
+    authority_proof["archive_action_input"] = copy.deepcopy(
+        action["copy_safe_body"]
+    )
+    action["irreversible_runtime_audit_terminal_authority"] = (
+        task_timeline.source_backed_irreversible_runtime_audit_terminal_authority(
+            authority_proof
+        )
+    )
+    current_projection = (
+        server._onboard_guide_apply_irreversible_runtime_terminal_selection(
+            base_current_projection,
+            action,
+        )
+    )
+    monkeypatch.setattr(
+        server,
+        "_onboard_guide_capsule_current_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(base_current_projection),
+    )
+    monkeypatch.setattr(
+        server,
+        (
+            "_mf_batch_irreversible_runtime_audit_terminal_authority_"
+            "for_current_lineage"
+        ),
+        lambda *_args, **_kwargs: copy.deepcopy(action),
+    )
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        record=record,
+        next_action=action,
+        current_projection=current_projection,
+        runtime_resume={"next_legal_action": action},
+        target_files=list(context.owned_files),
+        projection_degraded=False,
+    )
+    fetched = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": compact["guide_capsule_ref"],
+                "sections": ["action_input"],
+                "backlog_id": context.backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+                "task_id": str(compact.get("selected_task_id") or ""),
+            },
+        )
+    )
+
+    assert compact["status"] == "compact_action_input_continuation_required"
+    assert fetched["ok"] is True, fetched
+    section = fetched["sections"]["action_input"]
+    assert section["schema_version"] == (
+        "onboard_route_guide.action_input_encoded_continuation.v1"
+    )
+    assert section["continuation_complete"] is True
+    assert section["lossless"] is True
+    executable = section["canonical_executable_action"]
+    assert executable["mcp_tool"] == "backlog_audit_archive"
+    encoded = executable["encoded_copy_safe_body"]
+    padding = "=" * (-len(encoded["payload"]) % 4)
+    compressed = base64.urlsafe_b64decode(encoded["payload"] + padding)
+    canonical_json = zlib.decompress(compressed)
+    decoded = json.loads(canonical_json)
+    expected, replacement_paths = server._guide_executable_action_safe_body(
+        action["copy_safe_body"]
+    )
+    assert decoded == expected
+    assert decoded["qa_acceptance"]["contract_execution_id"] == (
+        record["contract_execution_id"]
+    )
+    assert decoded["qa_acceptance"]["passed"] is False
+    assert action["normal_close"] is False
+    assert encoded["required_replacement_paths"] == replacement_paths
+    assert encoded["uncompressed_sha256"] == (
+        "sha256:" + hashlib.sha256(canonical_json).hexdigest()
+    )
+    assert encoded["compressed_sha256"] == (
+        "sha256:" + hashlib.sha256(compressed).hexdigest()
+    )
+    assert fetched["authorizes_write"] is False
+    assert fetched["satisfies_gate"] is False
+    assert fetched["synthesizes_pass"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 def test_irreversible_runtime_audit_terminal_capsule_fetch_uses_nested_terminal_identity(
     conn,
     monkeypatch,
