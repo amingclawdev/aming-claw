@@ -77,7 +77,32 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
             assert query["session_token"] == [raw_session]
             assert query["fence_token"] == [raw_fence]
             self.__class__.calls.append(("GET", self.path, None))
-            self._send({"ok": True, "status": "worker_guide_ready"})
+            self._send(
+                {
+                    "ok": True,
+                    "status": "worker_guide_ready",
+                    "schema_version": (
+                        "runtime_context.worker_guide_compact_response.v1"
+                    ),
+                    "response_view": "compact",
+                    "project_id": identity["project_id"],
+                    "runtime_context_id": identity["runtime_context_id"],
+                    "task_id": identity["task_id"],
+                    "parent_task_id": identity["parent_task_id"],
+                    "session_token_ref": identity["session_token_ref"],
+                    "route_identity": route,
+                    "next_legal_action": "record_read_receipt",
+                    "actionable_payloads": {
+                        "read_receipt_submission": {
+                            "action": "runtime_context_read_receipt",
+                            "copy_safe_body": identity,
+                        },
+                    },
+                    "raw_session_token_exposed": False,
+                    "raw_fence_token_exposed": False,
+                    "raw_route_token_exposed": False,
+                }
+            )
 
         def do_POST(self):
             size = int(self.headers.get("Content-Length") or 0)
@@ -332,6 +357,7 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
     ]
     assert payloads[0]["auth_loaded"] is True
     assert payloads[0]["managed_host_envelope"]["process_local"] is True
+    assert "view" not in guide_args
     guide_query = urllib.parse.parse_qs(
         urllib.parse.urlparse(Handler.calls[1][1]).query
     )
@@ -340,6 +366,21 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
     assert guide_query["route_token_ref"] == [identity["route_token_ref"]]
     assert guide_query["session_token"] == [raw_session]
     assert guide_query["fence_token"] == [raw_fence]
+    guide = payloads[1]
+    assert guide["response_view"] == "compact"
+    assert guide["next_legal_action"] == "record_read_receipt"
+    assert guide["runtime_context_id"] == identity["runtime_context_id"]
+    assert guide["task_id"] == identity["task_id"]
+    assert guide["parent_task_id"] == identity["parent_task_id"]
+    assert guide["session_token_ref"] == identity["session_token_ref"]
+    assert guide["route_identity"] == route
+    assert guide["actionable_payloads"]["read_receipt_submission"][
+        "copy_safe_body"
+    ]["runtime_context_id"] == identity["runtime_context_id"]
+    assert len(json.dumps(responses[2], sort_keys=True).encode()) < 262_144
+    assert guide["raw_session_token_exposed"] is False
+    assert guide["raw_fence_token_exposed"] is False
+    assert guide["raw_route_token_exposed"] is False
     assert payloads[2]["error"] == "managed_host_envelope_scope_mismatch"
     assert payloads[2]["mismatched_fields"] == ["session_token_ref"]
     assert payloads[2]["http_request_performed"] is False
