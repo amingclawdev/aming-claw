@@ -44,6 +44,7 @@ _CONTRACT_RUNTIME_MCP_TIMEOUT_ENV_KEYS = (
     "AMING_CONTRACT_RUNTIME_MCP_TIMEOUT_SECONDS",
 )
 _WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES = 256 * 1024
+_PARALLEL_BRANCH_STARTUP_COMPACT_TRIGGER_BYTES = 64 * 1024
 _WORKER_AUTH_ENV_FIELDS = {
     "session_token": "AMING_WORKER_SESSION_TOKEN",
     "fence_token": "AMING_WORKER_FENCE_TOKEN",
@@ -93,6 +94,213 @@ def _bounded_worker_guide_result(value: Any) -> Any:
         "semantic_truncation_performed": False,
         "retry_with_view_all_allowed_for_managed_transport": False,
     }
+
+
+def _parallel_branch_startup_public_fields(
+    value: Any,
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    """Project bounded copy-safe scalars from one trusted startup mapping."""
+
+    if not isinstance(value, dict):
+        return {}
+    projected: dict[str, Any] = {}
+    for field in fields:
+        item = value.get(field)
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            if isinstance(item, str) and len(item.encode("utf-8")) > 2_048:
+                continue
+            if item not in (None, ""):
+                projected[field] = item
+    return projected
+
+
+_PARALLEL_BRANCH_STARTUP_GATE_FIELDS = (
+    "schema_version",
+    "gate_kind",
+    "status",
+    "ok",
+    "allowed",
+    "bounded",
+    "started",
+    "startup_complete",
+    "actual_startup_recorded",
+    "close_satisfying",
+    "source",
+    "source_of_authority",
+    "contract_execution_id",
+    "contract_runtime_source_ref",
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "worker_role",
+    "worker_id",
+    "worker_slot_id",
+    "agent_id",
+    "actual_host_worker_id",
+    "session_token_evidence_type",
+    "session_token_ref",
+    "session_token_ref_present",
+    "server_issued_session_token_verified",
+    "fence_token_hash",
+    "fence_token_present",
+    "worktree_path",
+    "branch_ref",
+    "head_commit",
+    "worker_session_id",
+    "filer_principal",
+    "worker_transcript_ref",
+    "harness_type",
+    "read_receipt_hash",
+    "read_receipt_event_id",
+    "observer_impersonation",
+    "startup_event_id",
+    "startup_event_kind",
+    "startup_event_status",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+
+
+def _parallel_branch_startup_compact_result(value: Any) -> Any:
+    """Bound oversized successful startup responses after the exact HTTP call.
+
+    Small responses remain byte-shape compatible. Oversized responses retain
+    only durable startup identity, gate, and event refs, so a known persisted
+    startup can never be rewritten by the generic stdio frame guard as a
+    zero-write failure.
+    """
+
+    if not isinstance(value, dict):
+        return value
+    try:
+        serialized_bytes = len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception:
+        return value
+    if serialized_bytes <= _PARALLEL_BRANCH_STARTUP_COMPACT_TRIGGER_BYTES:
+        return value
+
+    startup_gate = _parallel_branch_startup_public_fields(
+        value.get("startup_gate"),
+        _PARALLEL_BRANCH_STARTUP_GATE_FIELDS,
+    )
+    context = _parallel_branch_startup_public_fields(
+        value.get("context"),
+        (
+            "schema_version",
+            "project_id",
+            "backlog_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "root_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "status",
+            "worktree_path",
+            "branch_ref",
+            "head_commit",
+            "base_commit",
+            "target_head_commit",
+            "merge_queue_id",
+        ),
+    )
+    timeline_event = _parallel_branch_startup_public_fields(
+        value.get("timeline_event_recorded") or value.get("timeline_event"),
+        (
+            "id",
+            "event_id",
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "event_type",
+            "event_kind",
+            "phase",
+            "status",
+            "actor",
+            "commit_sha",
+        ),
+    )
+    canonical_line = _parallel_branch_startup_public_fields(
+        value.get("contract_runtime_canonical_line"),
+        (
+            "schema_version",
+            "accepted",
+            "canonical",
+            "status",
+            "source_of_authority",
+            "contract_execution_id",
+            "runtime_context_id",
+            "task_id",
+            "stage_id",
+            "line_id",
+            "evidence_kind",
+            "line_instance_id",
+            "execution_state_revision",
+            "execution_state_hash",
+            "contract_runtime_mutated",
+        ),
+    )
+    durable_startup_recorded = bool(
+        timeline_event.get("id")
+        or timeline_event.get("event_id")
+        or startup_gate.get("actual_startup_recorded") is True
+        or startup_gate.get("startup_event_id")
+        or canonical_line.get("accepted") is True
+    )
+    compact = {
+        "schema_version": "parallel_branch_startup.compact_response.v1",
+        "response_view": "compact",
+        "bounded_response": True,
+        "source_serialized_bytes": serialized_bytes,
+        **_parallel_branch_startup_public_fields(
+            value,
+            (
+                "ok",
+                "status",
+                "project_id",
+                "backlog_id",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "contract_execution_id",
+                "request_id",
+                "error",
+                "message",
+                "zero_write_rejection",
+                "http_request_performed",
+            ),
+        ),
+        "startup_event_recorded": durable_startup_recorded,
+        "writes_performed": bool(value.get("writes_performed"))
+        or durable_startup_recorded,
+        "mutation_performed": bool(value.get("mutation_performed"))
+        or durable_startup_recorded,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_worker_auth_exposed": False,
+    }
+    if startup_gate:
+        compact["startup_gate"] = startup_gate
+    if context:
+        compact["context"] = context
+    if timeline_event:
+        compact["timeline_event_recorded"] = timeline_event
+    if canonical_line:
+        compact["contract_runtime_canonical_line"] = canonical_line
+    return compact
 
 _ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES = [
     "",
@@ -4073,6 +4281,17 @@ TOOLS: list[dict] = [
                 "launch_text_hash": {"type": "string"},
                 "startup_source": {"type": "string"},
                 "now_iso": {"type": "string"},
+                "response_view": {
+                    "type": "string",
+                    "enum": ["compact", "full"],
+                    "default": "compact",
+                    "description": (
+                        "Managed MCP response selector. Compact is the default "
+                        "and projects oversized successful startup responses "
+                        "after the unchanged startup write; full preserves the "
+                        "legacy response for explicit diagnostics."
+                    ),
+                },
             },
             "required": ["project_id", "task_id"],
         },
@@ -6368,16 +6587,35 @@ class ToolDispatcher:
 
         if name == "parallel_branch_startup":
             pid = args["project_id"]
-            request_args = _worker_auth_from_env(args)
+            response_view = str(args.get("response_view") or "compact").strip()
+            if response_view not in {"compact", "full"}:
+                return {
+                    "ok": False,
+                    "error": "parallel_branch_startup_response_view_invalid",
+                    "message": "response_view must be compact or full",
+                    "response_view": response_view,
+                    "http_request_performed": False,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                }
+            request_args = _worker_auth_from_env(
+                {key: value for key, value in args.items() if key != "response_view"}
+            )
             body = {
                 key: value
                 for key, value in request_args.items()
                 if key != "project_id" and value is not None
             }
-            return self._api(
+            result = self._api(
                 "POST",
                 f"/api/graph-governance/{pid}/parallel-branches/startup",
                 body,
+            )
+            return (
+                result
+                if response_view == "full"
+                else _parallel_branch_startup_compact_result(result)
             )
 
         if name == "parallel_branch_checkpoint":

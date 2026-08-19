@@ -110,6 +110,76 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
                 assert body["contract_execution_id"] == identity[
                     "contract_execution_id"
                 ]
+                self._send(
+                    {
+                        "ok": True,
+                        "status": "startup_recorded",
+                        "project_id": identity["project_id"],
+                        "runtime_context_id": identity["runtime_context_id"],
+                        "task_id": identity["task_id"],
+                        "parent_task_id": identity["parent_task_id"],
+                        "contract_execution_id": identity[
+                            "contract_execution_id"
+                        ],
+                        "startup_gate": {
+                            "schema_version": "mf_subagent_startup_gate.v1",
+                            "status": "passed",
+                            "ok": True,
+                            "actual_startup_recorded": True,
+                            "runtime_context_id": identity[
+                                "runtime_context_id"
+                            ],
+                            "task_id": identity["task_id"],
+                            "parent_task_id": identity["parent_task_id"],
+                            "contract_execution_id": identity[
+                                "contract_execution_id"
+                            ],
+                            "worker_role": "mf_sub",
+                            "startup_event_id": "timeline:65",
+                            "startup_event_status": "passed",
+                            "session_token_ref": identity[
+                                "session_token_ref"
+                            ],
+                            "fence_token_hash": "sha256:fence",
+                        },
+                        "context": {
+                            **identity,
+                            "status": "running",
+                            "recursive_runtime_payload": {
+                                "session_token": raw_session,
+                                "fence_token": raw_fence,
+                                "padding": "x" * 280_000,
+                            },
+                        },
+                        "timeline_event_recorded": {
+                            "id": 65,
+                            "event_id": 65,
+                            "project_id": identity["project_id"],
+                            "task_id": identity["task_id"],
+                            "event_type": "mf_subagent.startup",
+                            "event_kind": "mf_subagent_startup",
+                            "phase": "startup_gate",
+                            "status": "passed",
+                        },
+                        "contract_runtime_canonical_line": {
+                            "accepted": True,
+                            "canonical": True,
+                            "status": "completed",
+                            "contract_execution_id": identity[
+                                "contract_execution_id"
+                            ],
+                            "runtime_context_id": identity[
+                                "runtime_context_id"
+                            ],
+                            "task_id": identity["task_id"],
+                            "stage_id": "worker_startup",
+                            "line_id": "worker_startup",
+                            "evidence_kind": "mf_subagent_startup",
+                            "contract_runtime_mutated": True,
+                        },
+                    }
+                )
+                return
             self._send(
                 {
                     "ok": True,
@@ -246,6 +316,16 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
     ]
     assert payloads[4]["http_request_performed"] is False
     assert payloads[5]["managed_host_envelope_consumed"] is True
+    assert payloads[5]["schema_version"] == (
+        "parallel_branch_startup.compact_response.v1"
+    )
+    assert payloads[5]["source_serialized_bytes"] > 262_144
+    assert payloads[5]["writes_performed"] is True
+    assert payloads[5]["mutation_performed"] is True
+    assert payloads[5]["startup_event_recorded"] is True
+    assert payloads[5]["timeline_event_recorded"]["id"] == 65
+    assert payloads[5]["startup_gate"]["startup_event_id"] == "timeline:65"
+    assert len(json.dumps(payloads[5]).encode()) < 64 * 1024
     assert payloads[6]["error"] == "managed_host_envelope_not_loaded"
     assert len(Handler.calls) == 4
     serialized = json.dumps(responses, sort_keys=True) + stderr
@@ -2421,6 +2501,8 @@ def test_mcp_stdio_parallel_branch_startup_schema_exposes_read_receipt_bridge_fi
         "read_receipt_hash",
         "read_receipt_event_id",
     }.issubset(properties)
+    assert properties["response_view"]["enum"] == ["compact", "full"]
+    assert properties["response_view"]["default"] == "compact"
 
 
 def test_mcp_stdio_initial_join_schema_exposes_actual_host_identity_fields():
@@ -4039,6 +4121,73 @@ def test_mcp_parallel_branch_startup_forwards_read_receipt_bridge_fields():
             },
         )
     ]
+
+
+def test_mcp_parallel_branch_startup_response_view_is_local_and_fail_closed():
+    calls = []
+    response = {"ok": True, "status": "startup_recorded"}
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return response
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    base = {
+        "project_id": "aming-claw",
+        "task_id": "AC-STARTUP-RESPONSE-VIEW",
+        "worker_role": "mf_sub",
+    }
+
+    assert dispatcher.dispatch("parallel_branch_startup", base) == response
+    assert calls[-1][2] == {
+        "task_id": "AC-STARTUP-RESPONSE-VIEW",
+        "worker_role": "mf_sub",
+    }
+
+    response = {
+        "ok": True,
+        "status": "startup_recorded",
+        "diagnostic": "x" * 80_000,
+    }
+    assert dispatcher.dispatch(
+        "parallel_branch_startup",
+        {**base, "response_view": "full"},
+    ) == response
+    assert "response_view" not in calls[-1][2]
+
+    response = {
+        "ok": False,
+        "status": "rejected",
+        "error": "runtime_context_identity_mismatch",
+        "message": "identity did not match",
+        "zero_write_rejection": True,
+        "http_request_performed": True,
+        "diagnostic": "x" * 80_000,
+    }
+    compact_rejection = dispatcher.dispatch("parallel_branch_startup", base)
+    assert compact_rejection["error"] == "runtime_context_identity_mismatch"
+    assert compact_rejection["zero_write_rejection"] is True
+    assert compact_rejection["http_request_performed"] is True
+    assert compact_rejection["writes_performed"] is False
+    assert compact_rejection["mutation_performed"] is False
+
+    call_count = len(calls)
+    rejected = dispatcher.dispatch(
+        "parallel_branch_startup",
+        {**base, "response_view": "invalid"},
+    )
+    assert rejected["error"] == (
+        "parallel_branch_startup_response_view_invalid"
+    )
+    assert rejected["http_request_performed"] is False
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert len(calls) == call_count
 
 
 def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
