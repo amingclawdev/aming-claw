@@ -2577,6 +2577,94 @@ def test_backlog_audit_archive_adapters_preserve_canonical_guide_body_and_route_
     assert canonical_body["route_token_ref"] == "rtok-copy-safe-archive"
 
 
+def test_backlog_audit_archive_adapters_preserve_full_signed_waived_only_body(
+    monkeypatch,
+):
+    canonical_body = {
+        "project_id": "daily-planner-lite-20260816180518-8858affd",
+        "bug_id": "AC-DEMO-R4-BATCH-FOCUS-8858AFFD",
+        "commit": "5be0f67b9469a54cd4afaa5595b84f58ec4f8c68",
+        "reason": "The accepted runtime recovery lineage is irreversibly exhausted.",
+        "timeline_precheck": {
+            "can_close": False,
+            "missing_event_kinds": ["route_action_precheck"],
+            "failed_gates": ["route_context_gate"],
+        },
+        "failure_audit": {
+            "schema_version": "mf_batch_irreversible_runtime_audit.v1",
+            "what_happened": "The one-time post-read safe-ref reissue was consumed.",
+            "non_reconstructable_evidence_reason": (
+                "No canonical startup can be reconstructed after the accepted receipt."
+            ),
+            "terminal_authority": {
+                "status": "runtime_recovery_exhausted",
+                "waived_only": True,
+            },
+        },
+        "qa_acceptance": {
+            "passed": False,
+            "status": "failed",
+            "targeted_scope_only": True,
+            "used_as_pass": False,
+            "overall_release_pass_claimed": False,
+            "full_suite_claim": "not_claimed",
+            "reviewer": "qa:runtime-audit-terminal-authority",
+            "reviewer_role": "qa",
+            "tests": ["runtime recovery exhaustion selector"],
+            "evidence_refs": ["timeline:54", "timeline:55"],
+        },
+        "audit_close_gate": {
+            "allowed": True,
+            "passed": True,
+            "normal_close_gate": {
+                "can_close": False,
+                "close_ready": False,
+            },
+            "terminal_disposition": "WAIVED",
+        },
+        "verification": {
+            "current_lineage_unique": True,
+            "archive_body_signed": True,
+            "historical_evidence_reconstructed": False,
+        },
+        "route_token_ref": "rtok-copy-safe-focus-archive",
+    }
+    original_body_json = json.dumps(canonical_body, sort_keys=True, separators=(",", ":"))
+    expected_call = (
+        "POST",
+        (
+            "/api/backlog/daily-planner-lite-20260816180518-8858affd/"
+            "AC-DEMO-R4-BATCH-FOCUS-8858AFFD/audit-archive"
+        ),
+        canonical_body,
+    )
+
+    recorder = _Recorder()
+    primary = _dispatcher(recorder).dispatch(
+        "backlog_audit_archive",
+        json.loads(original_body_json),
+    )
+
+    mirror_calls = []
+
+    def fake_http(method, path, data=None, **_kwargs):
+        mirror_calls.append((method, path, data))
+        return {"ok": True, "method": method, "path": path, "data": data}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    mirror = governance_mcp_server._dispatch_tool(
+        "backlog_audit_archive",
+        json.loads(original_body_json),
+    )
+
+    assert recorder.calls == [expected_call]
+    assert mirror_calls == [expected_call]
+    assert json.dumps(primary["data"], sort_keys=True, separators=(",", ":")) == original_body_json
+    assert json.dumps(mirror["data"], sort_keys=True, separators=(",", ":")) == original_body_json
+    assert primary["data"]["qa_acceptance"]["passed"] is False
+    assert mirror["data"]["audit_close_gate"]["terminal_disposition"] == "WAIVED"
+
+
 @pytest.mark.parametrize("missing_field", ["project_id", "bug_id"])
 def test_backlog_audit_archive_adapters_require_routing_identity_before_http(
     monkeypatch,
