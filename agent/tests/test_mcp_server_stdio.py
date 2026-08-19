@@ -197,19 +197,19 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    # Reproduce the stale managed schema used by the R4 worker: the public
+    # request has no task/route fields and omits view. The process-local
+    # envelope must supply canonical identity while the adapter forces the
+    # bounded default before issuing the GET.
     guide_args = {
-        key: value
-        for key, value in identity.items()
-        if key
-        in {
+        key: identity[key]
+        for key in (
             "project_id",
             "runtime_context_id",
-            "task_id",
             "parent_task_id",
             "target_project_root",
             "session_token_ref",
-            *route,
-        }
+        )
     }
     try:
         responses, stderr, returncode = _run_mcp_probe(
@@ -231,6 +231,30 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
                     "params": {
                         "name": "runtime_context_worker_guide",
                         "arguments": guide_args,
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "runtime_context_worker_guide",
+                        "arguments": {
+                            **guide_args,
+                            "session_token_ref": "wstok-cross-managed",
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "runtime_context_worker_guide",
+                        "arguments": {
+                            **guide_args,
+                            "task_id": "worker-cross-managed",
+                        },
                     },
                 },
                 {
@@ -308,28 +332,42 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
     ]
     assert payloads[0]["auth_loaded"] is True
     assert payloads[0]["managed_host_envelope"]["process_local"] is True
+    guide_query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(Handler.calls[1][1]).query
+    )
+    assert guide_query["view"] == ["compact"]
+    assert guide_query["task_id"] == [identity["task_id"]]
+    assert guide_query["route_token_ref"] == [identity["route_token_ref"]]
+    assert guide_query["session_token"] == [raw_session]
+    assert guide_query["fence_token"] == [raw_fence]
+    assert payloads[2]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[2]["mismatched_fields"] == ["session_token_ref"]
+    assert payloads[2]["http_request_performed"] is False
     assert payloads[3]["error"] == "managed_host_envelope_scope_mismatch"
-    assert payloads[3]["missing_fields"] == [
-        "contract_execution_id"
-    ]
+    assert payloads[3]["mismatched_fields"] == ["task_id"]
     assert payloads[3]["http_request_performed"] is False
-    assert payloads[4]["error"] == "managed_host_envelope_scope_mismatch"
-    assert payloads[4]["mismatched_fields"] == [
+    assert payloads[5]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[5]["missing_fields"] == [
         "contract_execution_id"
     ]
-    assert payloads[4]["http_request_performed"] is False
-    assert payloads[5]["managed_host_envelope_consumed"] is True
-    assert payloads[5]["schema_version"] == (
+    assert payloads[5]["http_request_performed"] is False
+    assert payloads[6]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[6]["mismatched_fields"] == [
+        "contract_execution_id"
+    ]
+    assert payloads[6]["http_request_performed"] is False
+    assert payloads[7]["managed_host_envelope_consumed"] is True
+    assert payloads[7]["schema_version"] == (
         "parallel_branch_startup.compact_response.v1"
     )
-    assert payloads[5]["source_serialized_bytes"] > 262_144
-    assert payloads[5]["writes_performed"] is True
-    assert payloads[5]["mutation_performed"] is True
-    assert payloads[5]["startup_event_recorded"] is True
-    assert payloads[5]["timeline_event_recorded"]["id"] == 65
-    assert payloads[5]["startup_gate"]["startup_event_id"] == "timeline:65"
-    assert len(json.dumps(payloads[5]).encode()) < 64 * 1024
-    assert payloads[6]["error"] == "managed_host_envelope_not_loaded"
+    assert payloads[7]["source_serialized_bytes"] > 262_144
+    assert payloads[7]["writes_performed"] is True
+    assert payloads[7]["mutation_performed"] is True
+    assert payloads[7]["startup_event_recorded"] is True
+    assert payloads[7]["timeline_event_recorded"]["id"] == 65
+    assert payloads[7]["startup_gate"]["startup_event_id"] == "timeline:65"
+    assert len(json.dumps(payloads[7]).encode()) < 64 * 1024
+    assert payloads[8]["error"] == "managed_host_envelope_not_loaded"
     assert len(Handler.calls) == 4
     serialized = json.dumps(responses, sort_keys=True) + stderr
     assert raw_session not in serialized

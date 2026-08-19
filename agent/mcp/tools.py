@@ -62,6 +62,106 @@ WORKER_MCP_HOST_ONLY_TOOLS = frozenset(
     }
 )
 
+_MANAGED_WORKER_GUIDE_PUBLIC_BINDING_FIELDS = (
+    "task_id",
+    "parent_task_id",
+    "target_project_root",
+    "session_token_ref",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+
+
+def _managed_worker_guide_staged_identity_args(
+    continuity: ManagedHostEnvelopeContinuity,
+    args: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Fill stale-schema Guide identity from one exact staged envelope.
+
+    Older managed MCP schemas did not expose ``task_id`` or the copy-safe
+    route fields on ``runtime_context_worker_guide``. After an accepted join
+    that made continuity skip the staged envelope and send an unauthenticated
+    Guide request. Resolve only one process-local project/runtime entry,
+    verify every supplied public field, and project missing copy-safe identity
+    without ever exposing borrowed raw auth.
+    """
+
+    request_args = dict(args)
+    project_id = str(request_args.get("project_id") or "").strip()
+    runtime_context_id = str(
+        request_args.get("runtime_context_id") or ""
+    ).strip()
+    if not project_id or not runtime_context_id:
+        return request_args, None
+
+    lock = getattr(continuity, "_lock", None)
+    entries = getattr(continuity, "_entries", None)
+    if lock is None or not isinstance(entries, dict):
+        return request_args, None
+    with lock:
+        bindings = [
+            dict(entry.binding)
+            for entry in entries.values()
+            if str(entry.binding.get("project_id") or "").strip() == project_id
+            and str(entry.binding.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+        ]
+    if not bindings:
+        return request_args, None
+    if len(bindings) != 1:
+        return request_args, {
+            "ok": False,
+            "error": "managed_host_envelope_identity_ambiguous",
+            "message": (
+                "Old-schema Worker Guide identity matches more than one "
+                "process-local managed host envelope."
+            ),
+            "source": "mcp_host_envelope_continuity",
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "http_request_performed": False,
+            "raw_worker_auth_exposed": False,
+        }
+
+    binding = bindings[0]
+    mismatched = [
+        field
+        for field in _MANAGED_WORKER_GUIDE_PUBLIC_BINDING_FIELDS
+        if str(request_args.get(field) or "").strip()
+        and str(request_args.get(field) or "").strip()
+        != str(binding.get(field) or "").strip()
+    ]
+    if mismatched:
+        return request_args, {
+            "ok": False,
+            "error": "managed_host_envelope_scope_mismatch",
+            "message": (
+                "Managed host envelope scope does not match this "
+                "old-schema Worker Guide request."
+            ),
+            "source": "mcp_host_envelope_continuity",
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "http_request_performed": False,
+            "raw_worker_auth_exposed": False,
+            "mismatched_fields": sorted(mismatched),
+        }
+    for field in _MANAGED_WORKER_GUIDE_PUBLIC_BINDING_FIELDS:
+        if field == "session_token_ref":
+            # An intentionally omitted ref is the canonical expired-entry
+            # recovery shape. Keep that absence so continuity can distinguish
+            # recovery from an active same-generation borrow.
+            continue
+        if not str(request_args.get(field) or "").strip() and str(
+            binding.get(field) or ""
+        ).strip():
+            request_args[field] = binding[field]
+    return request_args, None
+
 
 def _bounded_worker_guide_result(value: Any) -> Any:
     """Fail closed before an oversized Worker Guide reaches stdio/Desktop."""
@@ -5669,6 +5769,40 @@ class ToolDispatcher:
         continuity_bypass = bool(
             args.pop("__aming_managed_host_envelope_continuity_bypass", False)
         )
+        if name == "runtime_context_worker_guide":
+            requested_view = str(args.get("view") or "compact").strip().lower()
+            allowed_views = {
+                "auto",
+                "compact",
+                "current",
+                "gate_inputs",
+                "worker_view",
+                "close_gate_view",
+                "all",
+                "full",
+            }
+            if requested_view not in allowed_views:
+                return {
+                    "ok": False,
+                    "error": "runtime_context_worker_guide_response_view_invalid",
+                    "message": "view must be a declared Worker Guide response view",
+                    "response_view": requested_view,
+                    "writes_performed": False,
+                    "http_request_performed": False,
+                    "semantic_truncation_performed": False,
+                }
+            args["view"] = (
+                requested_view
+                if requested_view in {"worker_view", "all", "full"}
+                else "compact"
+            )
+            if not continuity_bypass:
+                args, identity_error = _managed_worker_guide_staged_identity_args(
+                    self._host_envelope_continuity,
+                    args,
+                )
+                if identity_error is not None:
+                    return identity_error
         if (
             not continuity_bypass
             and self._host_envelope_continuity.handles(name)
@@ -6716,39 +6850,6 @@ class ToolDispatcher:
             pid = args["project_id"]
             runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
             request_args = _worker_auth_from_env(args)
-            if name == "runtime_context_worker_guide":
-                requested_view = str(
-                    request_args.get("view") or "compact"
-                ).strip().lower()
-                allowed_views = {
-                    "auto",
-                    "compact",
-                    "current",
-                    "gate_inputs",
-                    "worker_view",
-                    "close_gate_view",
-                    "all",
-                    "full",
-                }
-                if requested_view not in allowed_views:
-                    return {
-                        "ok": False,
-                        "error": (
-                            "runtime_context_worker_guide_response_view_invalid"
-                        ),
-                        "message": (
-                            "view must be a declared Worker Guide response view"
-                        ),
-                        "response_view": requested_view,
-                        "writes_performed": False,
-                        "http_request_performed": False,
-                        "semantic_truncation_performed": False,
-                    }
-                request_args["view"] = (
-                    requested_view
-                    if requested_view in {"worker_view", "all", "full"}
-                    else "compact"
-                )
             query = _runtime_context_query(request_args)
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             suffix = "current-state" if name == "runtime_context_current" else "worker-guide"
