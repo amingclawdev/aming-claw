@@ -2665,6 +2665,60 @@ def test_backlog_audit_archive_adapters_preserve_full_signed_waived_only_body(
     assert mirror["data"]["audit_close_gate"]["terminal_disposition"] == "WAIVED"
 
 
+def test_backlog_audit_archive_public_contract_keeps_routing_fields_in_body_and_path(
+    monkeypatch,
+):
+    tool = next(tool for tool in TOOLS if tool.get("name") == "backlog_audit_archive")
+    assert set(tool["inputSchema"]["required"]) >= {"project_id", "bug_id"}
+
+    body = {
+        "project_id": "aming-claw",
+        "bug_id": "BUG/PARITY-WARRANTY-R2",
+        "commit": "9cdee4b4cecc7a4e57556ca0a33cb8e84d5b3118",
+        "reason": "Canonical signed archive-body parity warranty.",
+        "qa_acceptance": {
+            "passed": False,
+            "used_as_pass": False,
+            "overall_release_pass_claimed": False,
+        },
+        "audit_close_gate": {
+            "allowed": True,
+            "normal_close_gate": {"can_close": False},
+            "terminal_disposition": "WAIVED",
+        },
+        "route_token_ref": "rtok-copy-safe-parity-warranty-r2",
+    }
+    expected_body_json = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    expected_path = "/api/backlog/aming-claw/BUG%2FPARITY-WARRANTY-R2/audit-archive"
+
+    recorder = _Recorder()
+    primary = _dispatcher(recorder).dispatch(
+        "backlog_audit_archive",
+        json.loads(expected_body_json),
+    )
+
+    mirror_calls = []
+
+    def fake_http(method, path, data=None, **_kwargs):
+        mirror_calls.append((method, path, data))
+        return {"ok": True, "method": method, "path": path, "data": data}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    mirror = governance_mcp_server._dispatch_tool(
+        "backlog_audit_archive",
+        json.loads(expected_body_json),
+    )
+
+    assert recorder.calls == [("POST", expected_path, body)]
+    assert mirror_calls == [("POST", expected_path, body)]
+    for result in (primary, mirror):
+        assert result["data"]["project_id"] == "aming-claw"
+        assert result["data"]["bug_id"] == "BUG/PARITY-WARRANTY-R2"
+        assert json.dumps(result["data"], sort_keys=True, separators=(",", ":")) == (
+            expected_body_json
+        )
+
+
 @pytest.mark.parametrize("missing_field", ["project_id", "bug_id"])
 def test_backlog_audit_archive_adapters_require_routing_identity_before_http(
     monkeypatch,
