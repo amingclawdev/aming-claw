@@ -131622,6 +131622,31 @@ def _onboard_parentless_direct_main_post_mutation_event_guidance(
             "copy_safe_post_mutation_events.v1"
         ),
         "immutable_allowed_files": allowed_files,
+        "implementation_commit_trailer_contract": {
+            "required_before_implementation_append": True,
+            "source": (
+                "server.handle_task_timeline_append."
+                "parentless_direct_main_implementation_prewrite_gate"
+            ),
+            "git_source": "commit_trailers_only_unfolded",
+            "expected_exact_values": {
+                "Chain-Source-Task": str(task_id or "").strip(),
+                "Chain-Source-Contract-Execution": str(task_id or "").strip(),
+                "Chain-Source-Stage": "implementation",
+                "Chain-Task": str(task_id or "").strip(),
+                "Chain-Bug-Id": str(backlog_id or "").strip(),
+                "Chain-Backlog": str(backlog_id or "").strip(),
+                "Chain-Route": "operator_supervised_direct_main",
+                "Chain-Parent": (
+                    "<replace with the exact single parent of the "
+                    "implementation commit>"
+                ),
+            },
+            "exactly_one_value_per_key": True,
+            "caller_claims_trusted": False,
+            "zero_write_on_mismatch": True,
+            "historical_backfill_allowed": False,
+        },
         "changed_files_rule": (
             "replace every changed-files placeholder with the same exact list "
             "of files changed by the implementation commit; that list may be "
@@ -158036,6 +158061,10 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
     direct_route_identity_exact = False
     implementation_parent_commit = ""
     verified_changed_files: list[str] = []
+    canonical_commit_trailers: dict[str, list[str]] = {}
+    expected_commit_trailers: dict[str, str] = {}
+    commit_trailer_mismatches: dict[str, dict[str, Any]] = {}
+    commit_trailers_exact = False
     verified_changed_files_source = (
         "server_git_single_parent_to_implementation_diff_name_status_z_m"
     )
@@ -158111,6 +158140,61 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
                     commit_missing.append("implementation_commit_single_parent")
                 else:
                     implementation_parent_commit = parent_tokens[1]
+                    trailer_result = _qa_git_bytes(
+                        root,
+                        [
+                            "show",
+                            "-s",
+                            "--format=%(trailers:only,unfold=true)",
+                            commit_sha,
+                        ],
+                    )
+                    if trailer_result.returncode == 0:
+                        for line in trailer_result.stdout.decode(
+                            "utf-8", errors="surrogateescape"
+                        ).splitlines():
+                            key, separator, value = line.partition(":")
+                            key = key.strip()
+                            value = value.strip()
+                            if not separator or not key or not value:
+                                continue
+                            canonical_commit_trailers.setdefault(key, []).append(
+                                value
+                            )
+                    expected_commit_trailers = {
+                        "Chain-Source-Task": task_id,
+                        "Chain-Source-Contract-Execution": task_id,
+                        "Chain-Source-Stage": "implementation",
+                        "Chain-Task": task_id,
+                        "Chain-Bug-Id": backlog_id,
+                        "Chain-Backlog": backlog_id,
+                        "Chain-Route": "operator_supervised_direct_main",
+                        "Chain-Parent": implementation_parent_commit,
+                    }
+                    commit_trailer_mismatches = {
+                        key: {
+                            "expected": [expected_value],
+                            "actual": list(canonical_commit_trailers.get(key) or []),
+                        }
+                        for key, expected_value in expected_commit_trailers.items()
+                        if list(canonical_commit_trailers.get(key) or [])
+                        != [expected_value]
+                    }
+                    commit_trailers_exact = bool(
+                        trailer_result.returncode == 0
+                        and not commit_trailer_mismatches
+                    )
+                    if not commit_trailers_exact:
+                        commit_missing.append(
+                            "implementation_commit_chain_trailers_exact"
+                        )
+                        commit_mismatches.append(
+                            {
+                                "field": "implementation_commit_chain_trailers",
+                                "expected": expected_commit_trailers,
+                                "actual": canonical_commit_trailers,
+                            }
+                        )
                     changed = _qa_git_bytes(
                         root,
                         [
@@ -158288,6 +158372,11 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         "resolved_commit_sha": resolved_commit,
         "canonical_head_commit": canonical_head_commit,
         "implementation_parent_commit": implementation_parent_commit,
+        "commit_trailers_exact": commit_trailers_exact,
+        "canonical_commit_trailers": canonical_commit_trailers,
+        "expected_commit_trailers": expected_commit_trailers,
+        "commit_trailer_mismatches": commit_trailer_mismatches,
+        "commit_trailer_source": "server_git_commit_trailers_only_unfolded",
         "canonical_project_root": canonical_project_root,
         "repository_root_exact": repository_root_exact,
         "git_object_exists": bool(resolved_commit and resolved_commit == commit_sha),

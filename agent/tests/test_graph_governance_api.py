@@ -397,12 +397,7 @@ def test_exact_candidate_post_merge_qa_accepts_parentless_direct_main_without_ru
 ):
     backlog_id = "AC-DIRECT-MAIN-POSTMERGE-EXACT-QA"
     project_root = tmp_path / "direct-main-postmerge-exact-qa"
-    _init_test_git_repo(project_root)
-    candidate_commit = _commit_test_git_files(
-        project_root,
-        ["agent/governance/server.py"],
-        message="direct main exact candidate",
-    )
+    parent_commit = _init_test_git_repo(project_root)
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -439,6 +434,15 @@ def test_exact_candidate_post_merge_qa_accepts_parentless_direct_main_without_ru
                 graph_trace_ids=[graph_trace_id],
             ),
         )
+    )
+    candidate_commit = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            parent_commit=parent_commit,
+        ),
     )
     implementation = server.handle_task_timeline_append(
         _ctx_with_role(
@@ -86912,6 +86916,28 @@ def _canonical_parentless_direct_main_implementation_body(
     }
 
 
+def _canonical_parentless_direct_main_commit_message(
+    *,
+    backlog_id: str,
+    task_id: str,
+    parent_commit: str,
+) -> str:
+    return "\n".join(
+        [
+            "parentless Direct Main implementation",
+            "",
+            f"Chain-Source-Task: {task_id}",
+            f"Chain-Source-Contract-Execution: {task_id}",
+            "Chain-Source-Stage: implementation",
+            f"Chain-Task: {task_id}",
+            f"Chain-Bug-Id: {backlog_id}",
+            f"Chain-Backlog: {backlog_id}",
+            "Chain-Route: operator_supervised_direct_main",
+            f"Chain-Parent: {parent_commit}",
+        ]
+    )
+
+
 def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_clean_head(
     conn,
     monkeypatch,
@@ -86920,11 +86946,6 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
     backlog_id = "AC-DIRECT-MAIN-IMPLEMENTATION-COMMIT-PREWRITE"
     project_root = tmp_path / "implementation-prewrite"
     stale_commit = _init_test_git_repo(project_root)
-    candidate_commit = _commit_test_git_files(
-        project_root,
-        ["agent/governance/server.py"],
-        message="candidate",
-    )
     cross_root = tmp_path / "implementation-prewrite-cross"
     _init_test_git_repo(cross_root)
     (cross_root / "cross.txt").write_text("cross\n", encoding="utf-8")
@@ -86979,6 +87000,15 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
                 graph_trace_ids=[graph_trace_id],
             ),
         )
+    )
+    candidate_commit = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_commit=stale_commit,
+        ),
     )
 
     for invalid_commit, missing_requirement in (
@@ -87196,6 +87226,22 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
     assert authority["worktree_clean"] is True
     assert authority["route_scope_exact"] is True
     assert authority["direct_route_identity_exact"] is True
+    assert authority["commit_trailers_exact"] is True
+    assert authority["commit_trailer_mismatches"] == {}
+    assert authority["expected_commit_trailers"] == {
+        "Chain-Source-Task": task_id,
+        "Chain-Source-Contract-Execution": task_id,
+        "Chain-Source-Stage": "implementation",
+        "Chain-Task": task_id,
+        "Chain-Bug-Id": backlog_id,
+        "Chain-Backlog": backlog_id,
+        "Chain-Route": "operator_supervised_direct_main",
+        "Chain-Parent": stale_commit,
+    }
+    assert authority["canonical_commit_trailers"] == {
+        key: [value]
+        for key, value in authority["expected_commit_trailers"].items()
+    }
     assert authority["authority_hash"] == server.stable_sha256(
         {key: value for key, value in authority.items() if key != "authority_hash"}
     )
@@ -87244,6 +87290,7 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
     assert duplicate_rejected.value.details["zero_write_rejection"] is True
     assert duplicate_rejected.value.details["writes_performed"] is False
     assert conn.total_changes == changes_before
+
 
     direct_event = task_timeline.list_events(
         conn,
@@ -87346,6 +87393,165 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
     assert conn.total_changes == changes_before
 
 
+@pytest.mark.parametrize(
+    ("mutation", "mismatch_key"),
+    [
+        ("missing_all", "Chain-Source-Task"),
+        ("duplicate_task", "Chain-Task"),
+        ("wrong_source_task", "Chain-Source-Task"),
+        ("wrong_stage", "Chain-Source-Stage"),
+        ("wrong_backlog", "Chain-Bug-Id"),
+        ("wrong_route", "Chain-Route"),
+        ("wrong_parent", "Chain-Parent"),
+    ],
+)
+def test_parentless_direct_main_implementation_prewrite_rejects_noncanonical_chain_trailers_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    mutation,
+    mismatch_key,
+):
+    backlog_id = f"AC-DIRECT-MAIN-PREWRITE-TRAILERS-{mutation.upper()}"
+    project_root = tmp_path / f"implementation-prewrite-trailers-{mutation}"
+    parent_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    task_id, route_token_ref, route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+        )
+    )
+    graph_trace_id = {
+        "missing_all": "gqt-20260819-a1b2c3d4e5",
+        "duplicate_task": "gqt-20260819-b2c3d4e5f6",
+        "wrong_source_task": "gqt-20260819-c3d4e5f607",
+        "wrong_stage": "gqt-20260819-d4e5f60718",
+        "wrong_backlog": "gqt-20260819-e5f6071829",
+        "wrong_route": "gqt-20260819-f60718293a",
+        "wrong_parent": "gqt-20260819-0718293a4b",
+    }[mutation]
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_identity=route_identity,
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_canonical_parentless_direct_main_pre_mutation_body(
+                append_base={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "route_token_ref": route_token_ref,
+                },
+                route_identity=route_identity,
+                allowed_files=["agent/governance/server.py"],
+                graph_trace_ids=[graph_trace_id],
+            ),
+        )
+    )
+    canonical_lines = _canonical_parentless_direct_main_commit_message(
+        backlog_id=backlog_id,
+        task_id=task_id,
+        parent_commit=parent_commit,
+    ).splitlines()
+    if mutation == "missing_all":
+        commit_message = "parentless Direct Main implementation without trailers"
+    elif mutation == "duplicate_task":
+        commit_message = "\n".join(
+            [*canonical_lines, f"Chain-Task: {task_id}"]
+        )
+    else:
+        replacements = {
+            "wrong_source_task": (
+                f"Chain-Source-Task: {task_id}",
+                "Chain-Source-Task: onboard-service-cross-scope",
+            ),
+            "wrong_stage": (
+                "Chain-Source-Stage: implementation",
+                "Chain-Source-Stage: verification",
+            ),
+            "wrong_backlog": (
+                f"Chain-Bug-Id: {backlog_id}",
+                "Chain-Bug-Id: AC-CROSS-SCOPE-BACKLOG",
+            ),
+            "wrong_route": (
+                "Chain-Route: operator_supervised_direct_main",
+                "Chain-Route: mf_parallel",
+            ),
+            "wrong_parent": (
+                f"Chain-Parent: {parent_commit}",
+                f"Chain-Parent: {'f' * 40}",
+            ),
+        }
+        old, new = replacements[mutation]
+        commit_message = "\n".join(
+            new if line == old else line for line in canonical_lines
+        )
+    candidate_commit = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message=commit_message,
+    )
+    events_before = len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            limit=1000,
+        )
+    )
+    changes_before = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=_canonical_parentless_direct_main_implementation_body(
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                    route_token_ref=route_token_ref,
+                    route_identity=route_identity,
+                    commit_sha=candidate_commit,
+                ),
+            )
+        )
+
+    assert rejected.value.code == (
+        "parentless_direct_main_implementation_test_evidence_incomplete"
+    )
+    authority = rejected.value.details["commit_prewrite_authority"]
+    assert "implementation_commit_chain_trailers_exact" in authority[
+        "missing_requirement_ids"
+    ]
+    assert mismatch_key in authority["commit_trailer_mismatches"]
+    assert authority["commit_trailers_exact"] is False
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == changes_before
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            limit=1000,
+        )
+    ) == events_before
+
+
 def _parentless_direct_main_pre_mutation_graph_scope(
     conn,
     *,
@@ -87437,12 +87643,7 @@ def test_parentless_direct_main_dirty_scope_normalizes_order_as_exact_set(
     test_file = "agent/tests/test_graph_governance_api.py"
     declared_files = [test_file, server_file]
     project_root = tmp_path / "dirty-scope-order"
-    _init_test_git_repo(project_root)
-    candidate_commit = _commit_test_git_files(
-        project_root,
-        [server_file, test_file],
-        message="order-independent dirty scope",
-    )
+    parent_commit = _init_test_git_repo(project_root)
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -87480,6 +87681,15 @@ def test_parentless_direct_main_dirty_scope_normalizes_order_as_exact_set(
                 graph_trace_ids=[graph_trace_id],
             ),
         )
+    )
+    candidate_commit = _commit_test_git_files(
+        project_root,
+        [server_file, test_file],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_commit=parent_commit,
+        ),
     )
 
     implementation = _canonical_parentless_direct_main_implementation_body(
@@ -87684,12 +87894,7 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
 ):
     backlog_id = "AC-DIRECT-MAIN-CLOSE-READY-PREWRITE-ALIASES"
     project_root = tmp_path / "direct-main-close-ready-aliases"
-    _init_test_git_repo(project_root)
-    commit_sha = _commit_test_git_files(
-        project_root,
-        ["agent/governance/server.py"],
-        message="direct main close ready candidate",
-    )
+    parent_commit = _init_test_git_repo(project_root)
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -87726,6 +87931,15 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
                 graph_trace_ids=[graph_trace_id],
             ),
         )
+    )
+    commit_sha = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            parent_commit=parent_commit,
+        ),
     )
     canonical_test_results = {
         "schema_version": "parentless_direct_main.test_results.v1",
@@ -98736,14 +98950,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
 ):
     backlog_id = "AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN"
     project_root = tmp_path / "parentless-direct-main"
-    _init_test_git_repo(project_root)
-    close_commit = _commit_test_git_files(
-        project_root,
-        [
-            "agent/governance/server.py",
-            "agent/tests/test_graph_governance_api.py",
-        ],
-    )
+    parent_commit = _init_test_git_repo(project_root)
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -98920,6 +99127,18 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         "agent/governance/server.py",
         "agent/tests/test_graph_governance_api.py",
     ]
+    close_commit = _commit_test_git_files(
+        project_root,
+        [
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            parent_commit=parent_commit,
+        ),
+    )
     implementation_event = server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
@@ -100680,11 +100899,7 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
 ):
     backlog_id = "AC-PARENTLESS-DIRECT-MAIN-GUIDE-SHAPES"
     project_root = tmp_path / "parentless-direct-main-guide-shapes"
-    _init_test_git_repo(project_root)
-    close_commit = _commit_test_git_files(
-        project_root,
-        ["agent/governance/server.py"],
-    )
+    parent_commit = _init_test_git_repo(project_root)
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -100829,6 +101044,31 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "live_regression",
     ]
     post_mutation = direct_main["copy_safe_post_mutation_events"]
+    assert post_mutation["implementation_commit_trailer_contract"] == {
+        "required_before_implementation_append": True,
+        "source": (
+            "server.handle_task_timeline_append."
+            "parentless_direct_main_implementation_prewrite_gate"
+        ),
+        "git_source": "commit_trailers_only_unfolded",
+        "expected_exact_values": {
+            "Chain-Source-Task": parent_execution_id,
+            "Chain-Source-Contract-Execution": parent_execution_id,
+            "Chain-Source-Stage": "implementation",
+            "Chain-Task": parent_execution_id,
+            "Chain-Bug-Id": backlog_id,
+            "Chain-Backlog": backlog_id,
+            "Chain-Route": "operator_supervised_direct_main",
+            "Chain-Parent": (
+                "<replace with the exact single parent of the "
+                "implementation commit>"
+            ),
+        },
+        "exactly_one_value_per_key": True,
+        "caller_claims_trusted": False,
+        "zero_write_on_mismatch": True,
+        "historical_backfill_allowed": False,
+    }
     changed_files_placeholder = post_mutation["implementation"][
         "arguments_template"
     ]["payload"]["changed_files"]
@@ -101021,6 +101261,15 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
             method="POST",
             body=pre_mutation_arguments,
         )
+    )
+    close_commit = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            parent_commit=parent_commit,
+        ),
     )
     forged_close_event = copy.deepcopy(pre_mutation_result)
     forged_close_event["payload"]["route_id"] = "route-forged-after-append"
@@ -101367,14 +101616,7 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
 ):
     backlog_id = "AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN-ACTIVE-CHILD"
     project_root = tmp_path / "parentless-direct-main-active-child"
-    _init_test_git_repo(project_root)
-    close_commit = _commit_test_git_files(
-        project_root,
-        [
-            "agent/governance/server.py",
-            "agent/tests/test_graph_governance_api.py",
-        ],
-    )
+    parent_commit = _init_test_git_repo(project_root)
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -101469,6 +101711,18 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
                 approval_ref="operator-active-child-direct-main",
             ),
         )
+    )
+    close_commit = _commit_test_git_files(
+        project_root,
+        [
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            parent_commit=parent_commit,
+        ),
     )
     server.handle_task_timeline_append(
         _ctx_with_role(
@@ -102359,11 +102613,7 @@ def test_parentless_direct_main_requires_independent_qa_verification(
 ):
     backlog_id = "AC-BACKLOG-CLOSE-PARENTLESS-DIRECT-MAIN-SELF-VERIFY"
     project_root = tmp_path / "parentless-direct-main-self-verify"
-    _init_test_git_repo(project_root)
-    close_commit = _commit_test_git_files(
-        project_root,
-        ["agent/governance/server.py"],
-    )
+    parent_commit = _init_test_git_repo(project_root)
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -102445,6 +102695,15 @@ def test_parentless_direct_main_requires_independent_qa_verification(
                 approval_ref="operator-self-verify-direct-main",
             ),
         )
+    )
+    close_commit = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            parent_commit=parent_commit,
+        ),
     )
     server.handle_task_timeline_append(
         _ctx_with_role(
