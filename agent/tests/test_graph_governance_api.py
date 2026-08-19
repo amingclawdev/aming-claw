@@ -139889,6 +139889,115 @@ def test_qa_review_claims_ignore_only_payload_live_source_tuple():
     assert multiple_details["writes_performed"] is False
 
 
+def test_qa_review_claims_ignore_only_exact_non_authoritative_differential():
+    candidate_commit = "8b093d2de879edfa04d45398743102ba0f092ea9"
+    parent_commit = "c2956b39d4584c22e0f943c8c02bb70e84091017"
+    review_context = {
+        "candidate_commit_sha": candidate_commit,
+        "base_commit_sha": candidate_commit,
+        "graph_basis": "exact_candidate_snapshot",
+    }
+    body = {
+        "status": "passed",
+        "commit_sha": candidate_commit,
+        "payload": {
+            "candidate_commit_sha": candidate_commit,
+            "used_as_pass": False,
+        },
+        "artifact_refs": {
+            "affected_differential": {
+                "classification": (
+                    "external_artifact_only_not_graph_comparison_authority"
+                ),
+                "used_as_pass": False,
+                "graph_comparison_authority_claimed": False,
+                "overall_release_pass_claimed": False,
+                "full_suite_claim": "not_claimed",
+                "no_pass_claim": True,
+                "candidate_new_failures": 0,
+                "base_commit_sha": parent_commit,
+                "candidate_commit_sha": candidate_commit,
+                "parent_candidate_test_overlay": {
+                    "base_commit_sha": parent_commit,
+                    "candidate_commit_sha": candidate_commit,
+                },
+            }
+        },
+    }
+
+    server._qa_validate_candidate_review_claims(body, review_context)
+
+    affected = body["artifact_refs"]["affected_differential"]
+    invalid_variants = []
+    for key, value in (
+        ("classification", "ordinary_graph_comparison"),
+        ("used_as_pass", True),
+        ("graph_comparison_authority_claimed", True),
+        ("overall_release_pass_claimed", True),
+        ("full_suite_claim", "passed"),
+        ("no_pass_claim", False),
+        ("candidate_new_failures", 1),
+        ("candidate_commit_sha", parent_commit),
+    ):
+        variant = json.loads(json.dumps(body))
+        variant["artifact_refs"]["affected_differential"][key] = value
+        invalid_variants.append(variant)
+
+    for key in (
+        "classification",
+        "used_as_pass",
+        "graph_comparison_authority_claimed",
+        "overall_release_pass_claimed",
+        "full_suite_claim",
+        "no_pass_claim",
+        "candidate_new_failures",
+    ):
+        variant = json.loads(json.dumps(body))
+        del variant["artifact_refs"]["affected_differential"][key]
+        invalid_variants.append(variant)
+
+    wrong_path = json.loads(json.dumps(body))
+    wrong_path["payload"]["affected_differential"] = wrong_path[
+        "artifact_refs"
+    ].pop("affected_differential")
+    invalid_variants.append(wrong_path)
+
+    duplicated = json.loads(json.dumps(body))
+    duplicated["artifact_refs"]["affected_differential"] = [
+        json.loads(json.dumps(affected)),
+        json.loads(json.dumps(affected)),
+    ]
+    invalid_variants.append(duplicated)
+
+    protected_ledger = json.loads(json.dumps(body))
+    protected_ledger["artifact_refs"]["affected_differential"][
+        "external_no_pass_baseline_ledger"
+    ] = {"base_commit_sha": parent_commit}
+    invalid_variants.append(protected_ledger)
+
+    cross_session = json.loads(json.dumps(body))
+    cross_session["artifact_refs"]["affected_differential"][
+        "qa_session_id"
+    ] = "ses-other-world"
+    invalid_variants.append(cross_session)
+
+    nested_authority = json.loads(json.dumps(body))
+    nested_authority["artifact_refs"]["affected_differential"][
+        "candidate_review_context"
+    ] = {"base_commit_sha": parent_commit}
+    invalid_variants.append(nested_authority)
+
+    for variant in invalid_variants:
+        with pytest.raises(GovernanceError) as rejected:
+            server._qa_validate_candidate_review_claims(
+                variant,
+                review_context,
+            )
+        assert rejected.value.code == "qa_graph_review_context_mismatch"
+        assert rejected.value.details["zero_write_rejection"] is True
+        assert rejected.value.details["writes_performed"] is False
+
+
 def test_qa_review_claims_accept_exact_no_pass_comparison_namespace():
     candidate_commit = "8b093d2de879edfa04d45398743102ba0f092ea9"
     comparison_base_commit = "c2956b39d4584c22e0f943c8c02bb70e84091017"

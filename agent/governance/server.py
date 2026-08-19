@@ -11560,6 +11560,12 @@ _QA_IMMUTABLE_EXTERNAL_AUDIT_SCOPES = {
     "external_audit_only",
     "immutable_external_audit",
 }
+_QA_NON_AUTHORITATIVE_DIFFERENTIAL_PATHS = {
+    ("artifact_refs", "affected_differential"),
+}
+_QA_NON_AUTHORITATIVE_DIFFERENTIAL_CLASSIFICATION = (
+    "external_artifact_only_not_graph_comparison_authority"
+)
 _QA_EXTERNAL_NO_PASS_COMPARISON_PAYLOAD_SCHEMAS = {
     "mf_parallel.qa_independent_verification.v1",
     "qa_independent_verification.v1",
@@ -11743,10 +11749,82 @@ def _qa_is_immutable_external_audit_subtree(
     )
 
 
+def _qa_is_non_authoritative_differential_subtree(
+    path: tuple[str, ...],
+    value: Any,
+    *,
+    candidate_commit_sha: str,
+) -> bool:
+    """Exclude one explicitly non-authoritative differential namespace.
+
+    This exception is deliberately narrower than a caller-selected authority
+    scope.  Only the exact ``artifact_refs.affected_differential`` mapping is
+    eligible, and it must opt out of both PASS use and graph-comparison
+    authority.  Candidate identity inside the artifact remains bound to the
+    server-derived candidate, while nested authority containers, comparison
+    ledgers, or QA-session identities make the subtree ordinary (and thus
+    subject to the recursive graph-review checks).
+    """
+
+    if (
+        path not in _QA_NON_AUTHORITATIVE_DIFFERENTIAL_PATHS
+        or not isinstance(value, Mapping)
+        or str(value.get("classification") or "").strip().lower()
+        != _QA_NON_AUTHORITATIVE_DIFFERENTIAL_CLASSIFICATION
+        or value.get("used_as_pass") is not False
+        or value.get("graph_comparison_authority_claimed") is not False
+        or value.get("overall_release_pass_claimed") is not False
+        or str(value.get("full_suite_claim") or "").strip().lower()
+        != "not_claimed"
+        or value.get("no_pass_claim") is not True
+        or type(value.get("candidate_new_failures")) is not int
+        or value.get("candidate_new_failures") != 0
+    ):
+        return False
+
+    expected_candidate = str(candidate_commit_sha or "").strip().lower()
+    invalid = False
+
+    def inspect(nested: Any) -> None:
+        nonlocal invalid
+        if invalid:
+            return
+        if isinstance(nested, Mapping):
+            for raw_key, child in nested.items():
+                key = str(raw_key or "").strip().lower()
+                if (
+                    key in _QA_REVIEW_AUTHORITY_CONTAINERS
+                    or key == "external_no_pass_baseline_ledger"
+                    or key in {
+                        "qa_session_id",
+                        "qa_session_token_ref",
+                        "qa_scope_binding_ref",
+                    }
+                ):
+                    invalid = True
+                    return
+                if key in {"candidate_commit", "candidate_commit_sha"}:
+                    actual_candidate = str(child or "").strip().lower()
+                    if (
+                        not expected_candidate
+                        or actual_candidate != expected_candidate
+                    ):
+                        invalid = True
+                        return
+                inspect(child)
+        elif isinstance(nested, (list, tuple)):
+            for child in nested:
+                inspect(child)
+
+    inspect(value)
+    return not invalid
+
+
 def _qa_review_claim_containers(
     value: Any,
     *,
     _path: tuple[str, ...] = (),
+    _candidate_commit_sha: str = "",
 ) -> list[tuple[tuple[str, ...], Mapping[str, Any]]]:
     if isinstance(value, Mapping):
         result: list[tuple[tuple[str, ...], Mapping[str, Any]]] = [
@@ -11756,14 +11834,35 @@ def _qa_review_claim_containers(
             child_path = (*_path, str(key or "").strip())
             if _qa_is_immutable_external_audit_subtree(child_path, child):
                 continue
+            if _qa_is_non_authoritative_differential_subtree(
+                child_path,
+                child,
+                candidate_commit_sha=_candidate_commit_sha,
+            ):
+                continue
             result.extend(
-                _qa_review_claim_containers(child, _path=child_path)
+                _qa_review_claim_containers(
+                    child,
+                    _path=child_path,
+                    _candidate_commit_sha=_candidate_commit_sha,
+                )
             )
         return result
     if isinstance(value, list):
         result = []
-        for child in value:
-            result.extend(_qa_review_claim_containers(child, _path=_path))
+        for index, child in enumerate(value):
+            child_path = (
+                (*_path, f"[{index}]")
+                if _path in _QA_NON_AUTHORITATIVE_DIFFERENTIAL_PATHS
+                else _path
+            )
+            result.extend(
+                _qa_review_claim_containers(
+                    child,
+                    _path=child_path,
+                    _candidate_commit_sha=_candidate_commit_sha,
+                )
+            )
         return result
     return []
 
@@ -11905,7 +12004,12 @@ def _qa_validate_candidate_review_claims(
     body: Mapping[str, Any],
     review_context: Mapping[str, Any],
 ) -> None:
-    containers = _qa_review_claim_containers(body)
+    containers = _qa_review_claim_containers(
+        body,
+        _candidate_commit_sha=str(
+            review_context.get("candidate_commit_sha") or ""
+        ),
+    )
     mismatches: list[dict[str, Any]] = []
     comparison_tuple = _qa_external_no_pass_comparison_tuple(body)
     artifact_refs = (
