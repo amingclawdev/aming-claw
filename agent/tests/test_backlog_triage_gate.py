@@ -21,6 +21,7 @@ class _Py39Fix(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         sys.modules[name] = m; exec(compile(src, self._paths[name], "exec"), m.__dict__); return m
 if sys.version_info < (3, 10): sys.meta_path.insert(0, _Py39Fix())
 
+import json
 from unittest.mock import MagicMock, patch
 import pytest
 from governance.backlog_triage import triage_backlog_insert
@@ -32,8 +33,21 @@ def _conn(rows):
     c = MagicMock()
     def _ex(sql, params=None):
         r = MagicMock()
-        if "SELECT" in str(sql) and "status='OPEN'" in str(sql): r.fetchall.return_value = rows
-        else: r.fetchone.return_value = None; r.fetchall.return_value = []
+        if "SELECT" in str(sql) and "status='OPEN'" in str(sql):
+            r.fetchall.return_value = rows
+        elif "SELECT * FROM backlog_bugs WHERE bug_id" in str(sql):
+            selected_id = (params or [""])[0]
+            matched = next(
+                (dict(row) for row in rows if row.get("bug_id") == selected_id),
+                None,
+            )
+            if matched is not None:
+                matched.setdefault("status", "OPEN")
+                matched.setdefault("bypass_policy_json", "{}")
+            r.fetchone.return_value = matched
+        else:
+            r.fetchone.return_value = None
+            r.fetchall.return_value = []
         return r
     c.execute.side_effect = _ex; return c
 
@@ -88,6 +102,285 @@ def test_confirmed_supersede_marks_old_row_superseded_not_fixed():
         update_sql = [str(call.args[0]) for call in conn.execute.call_args_list]
         assert any("status='SUPERSEDED'" in sql for sql in update_sql)
         assert not any("status='FIXED'" in sql for sql in update_sql)
+        assert r["atomic"] is True
+        update_index = next(
+            index
+            for index, call in enumerate(conn.mock_calls)
+            if call.args and "status='SUPERSEDED'" in str(call.args[0])
+        )
+        commit_index = next(
+            index
+            for index, call in enumerate(conn.mock_calls)
+            if str(call).startswith("call.commit(")
+        )
+        assert update_index < commit_index
+
+
+def test_force_admit_with_triage_decision_rejects_zero_write():
+    connection = _conn(
+        [{"bug_id": "OLD-2", "title": "Diff", "target_files": '["a.py"]'}]
+    )
+    with patch("governance.server.get_connection", return_value=connection), patch(
+        "governance.server.audit_service.record"
+    ) as audit_record:
+        from governance.server import handle_backlog_upsert
+
+        response = handle_backlog_upsert(
+            _ctx(
+                title="New",
+                target_files=["a.py"],
+                force_admit=True,
+                triage_action="supersede",
+                triage_target_bug_id="OLD-2",
+            )
+        )
+
+        assert response[0] == 409
+        assert response[1]["error"] == "force_admit_triage_conflict"
+        assert response[1]["field"] == "force_admit"
+        assert response[1]["zero_write_rejection"] is True
+        assert response[1]["writes_performed"] is False
+        assert not any(
+            call.args and "INSERT INTO backlog_bugs" in str(call.args[0])
+            for call in connection.execute.call_args_list
+        )
+        audit_record.assert_not_called()
+        connection.commit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "body,error",
+    [
+        ({"force_admit": True, "triage_action": ""}, "force_admit_triage_conflict"),
+        ({"triage_target_bug_id": "OLD-2"}, "triage_action_target_shape_invalid"),
+        ({"triage_action": "supersede"}, "triage_action_target_shape_invalid"),
+        (
+            {"triage_action": "admit", "triage_target_bug_id": "OLD-2"},
+            "triage_action_target_shape_invalid",
+        ),
+    ],
+)
+def test_triage_action_target_shape_rejects_zero_write(body, error):
+    connection = _conn(
+        [{"bug_id": "OLD-2", "title": "Diff", "target_files": '["a.py"]'}]
+    )
+    with patch("governance.server.get_connection", return_value=connection), patch(
+        "governance.server.audit_service.record"
+    ) as audit_record:
+        from governance.server import handle_backlog_upsert
+
+        response = handle_backlog_upsert(_ctx(title="New", target_files=["a.py"], **body))
+
+        assert response[0] == 409
+        assert response[1]["error"] == error
+        assert response[1]["zero_write_rejection"] is True
+        assert response[1]["writes_performed"] is False
+        assert not any(
+            call.args and "INSERT INTO backlog_bugs" in str(call.args[0])
+            for call in connection.execute.call_args_list
+        )
+        audit_record.assert_not_called()
+        connection.commit.assert_not_called()
+
+
+def _stored_backlog_row(bug_id, *, status="OPEN", policy=None, **updates):
+    row = {
+        "bug_id": bug_id,
+        "title": "New",
+        "status": status,
+        "priority": "P3",
+        "target_files": '["a.py"]',
+        "test_files": "[]",
+        "acceptance_criteria": "[]",
+        "chain_task_id": "",
+        "commit": "",
+        "discovered_at": "",
+        "fixed_at": "",
+        "details_md": "",
+        "chain_trigger_json": "{}",
+        "required_docs": "[]",
+        "provenance_paths": "[]",
+        "bypass_policy_json": json.dumps(policy or {}),
+        "mf_type": "",
+        "takeover_json": "{}",
+        "created_at": "2026-08-19T00:00:00Z",
+        "updated_at": "2026-08-19T00:00:00Z",
+    }
+    row.update(updates)
+    return row
+
+
+def _exact_retry_rows(*, target_status="SUPERSEDED"):
+    from governance import server
+
+    successor = _stored_backlog_row("NEW-1")
+    identity = server._backlog_triage_successor_identity(
+        bug_id="NEW-1",
+        body={},
+        existing_row=successor,
+    )
+    binding = server._backlog_triage_supersede_binding(
+        bug_id="NEW-1",
+        target_bug_ids=["OLD-2"],
+        successor_identity=identity,
+    )
+    successor["bypass_policy_json"] = json.dumps(
+        {server._BACKLOG_TRIAGE_SUPERSEDE_BINDING_KEY: binding}
+    )
+    target_policy = {}
+    if target_status == "SUPERSEDED":
+        target_policy[server._BACKLOG_TRIAGE_SUPERSEDED_BY_BINDING_KEY] = {
+            **binding,
+            "target_bug_id": "OLD-2",
+        }
+    target = _stored_backlog_row(
+        "OLD-2",
+        title="Old",
+        status=target_status,
+        policy=target_policy,
+    )
+    return successor, target, binding
+
+
+def _retry_connection(successor, target, *, fail_target_update=False):
+    connection = MagicMock()
+
+    def _execute(sql, params=None):
+        text = str(sql)
+        result = MagicMock()
+        if "SELECT * FROM backlog_bugs WHERE bug_id" in text:
+            selected_id = (params or [""])[0]
+            result.fetchone.return_value = (
+                successor if selected_id == "NEW-1" else target
+            )
+            return result
+        if fail_target_update and "status='SUPERSEDED'" in text:
+            raise RuntimeError("injected target update failure")
+        result.fetchone.return_value = None
+        result.fetchall.return_value = []
+        return result
+
+    connection.execute.side_effect = _execute
+    return connection
+
+
+def test_exact_supersede_retry_already_applied_is_read_only():
+    successor, target, binding = _exact_retry_rows()
+    connection = _retry_connection(successor, target)
+    with patch("governance.server.get_connection", return_value=connection), patch(
+        "governance.server.audit_service.record"
+    ) as audit_record:
+        from governance.server import handle_backlog_upsert
+
+        response = handle_backlog_upsert(
+            _ctx(
+                triage_action="supersede",
+                triage_target_bug_id="OLD-2",
+            )
+        )
+
+        assert response["action"] == "superseded"
+        assert response["atomic"] is True
+        assert response["idempotent_retry"] is True
+        assert response["already_applied"] is True
+        assert response["writes_performed"] is False
+        assert response["supersede_binding"] == binding
+        assert not any(
+            call.args
+            and any(token in str(call.args[0]) for token in ("INSERT", "UPDATE"))
+            for call in connection.execute.call_args_list
+        )
+        audit_record.assert_not_called()
+        connection.commit.assert_not_called()
+
+
+def test_exact_supersede_retry_completes_open_target_once():
+    successor, target, binding = _exact_retry_rows(target_status="OPEN")
+    connection = _retry_connection(successor, target)
+    with patch("governance.server.get_connection", return_value=connection), patch(
+        "governance.server.audit_service.record"
+    ):
+        from governance.server import handle_backlog_upsert
+
+        response = handle_backlog_upsert(
+            _ctx(
+                triage_action="supersede",
+                triage_target_bug_id="OLD-2",
+            )
+        )
+
+        assert response["action"] == "superseded"
+        assert response["atomic"] is True
+        assert response["idempotent_retry"] is True
+        assert response["already_applied"] is False
+        assert response["supersede_binding"] == binding
+        assert any(
+            call.args and "status='SUPERSEDED'" in str(call.args[0])
+            for call in connection.execute.call_args_list
+        )
+        connection.commit.assert_called_once_with()
+        connection.rollback.assert_not_called()
+
+
+def test_supersede_retry_rejects_changed_successor_payload_zero_write():
+    successor, target, _ = _exact_retry_rows()
+    connection = _retry_connection(successor, target)
+    with patch("governance.server.get_connection", return_value=connection), patch(
+        "governance.server.audit_service.record"
+    ) as audit_record:
+        from governance.server import handle_backlog_upsert
+
+        response = handle_backlog_upsert(
+            _ctx(
+                title="Forged changed successor",
+                triage_action="supersede",
+                triage_target_bug_id="OLD-2",
+            )
+        )
+
+        assert response[0] == 409
+        assert response[1]["error"] == "triage_supersede_retry_identity_mismatch"
+        assert response[1]["zero_write_rejection"] is True
+        assert not any(
+            call.args
+            and any(token in str(call.args[0]) for token in ("INSERT", "UPDATE"))
+            for call in connection.execute.call_args_list
+        )
+        audit_record.assert_not_called()
+        connection.commit.assert_not_called()
+
+
+def test_supersede_insert_and_target_update_roll_back_together():
+    connection = _conn(
+        [{"bug_id": "OLD-2", "title": "Diff", "target_files": '["a.py"]'}]
+    )
+    original_execute = connection.execute.side_effect
+
+    def _execute(sql, params=None):
+        if "status='SUPERSEDED'" in str(sql):
+            raise RuntimeError("injected target update failure")
+        return original_execute(sql, params)
+
+    connection.execute.side_effect = _execute
+    with patch("governance.server.get_connection", return_value=connection), patch(
+        "governance.server.audit_service.record"
+    ) as audit_record:
+        from governance.server import handle_backlog_upsert
+
+        with pytest.raises(RuntimeError, match="injected target update failure"):
+            handle_backlog_upsert(
+                _ctx(
+                    title="New",
+                    target_files=["a.py"],
+                    triage_action="supersede",
+                    triage_target_bug_id="OLD-2",
+                    actor="observer",
+                )
+            )
+
+        connection.rollback.assert_called_once_with()
+        connection.commit.assert_not_called()
+        audit_record.assert_not_called()
 
 def test_reject_dup_returns_409():
     connection = _conn([{"bug_id": "OLD-1", "title": "Dup Bug", "target_files": "[]"}])

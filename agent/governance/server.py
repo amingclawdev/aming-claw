@@ -176084,6 +176084,85 @@ def _backlog_triage_zero_write_rejection(
     return result
 
 
+_BACKLOG_TRIAGE_SUCCESSOR_SCALAR_FIELDS = (
+    "title",
+    "status",
+    "priority",
+    "chain_task_id",
+    "commit",
+    "discovered_at",
+    "fixed_at",
+    "details_md",
+    "mf_type",
+)
+_BACKLOG_TRIAGE_SUCCESSOR_JSON_FIELDS = (
+    "target_files",
+    "test_files",
+    "acceptance_criteria",
+    "chain_trigger_json",
+    "required_docs",
+    "provenance_paths",
+)
+_BACKLOG_TRIAGE_SUPERSEDE_BINDING_KEY = "backlog_triage_supersede"
+_BACKLOG_TRIAGE_SUPERSEDED_BY_BINDING_KEY = "backlog_triage_superseded_by"
+
+
+def _backlog_triage_successor_identity(
+    *,
+    bug_id: str,
+    body: Mapping[str, Any],
+    existing_row: Any | None,
+) -> dict[str, Any]:
+    """Return the stable row identity used by exact supersede retries."""
+
+    def _value(key: str, default: Any = "") -> Any:
+        if key in body:
+            return body.get(key)
+        if existing_row is not None:
+            return _row_get(existing_row, key, default)
+        return default
+
+    identity: dict[str, Any] = {
+        "schema_version": "backlog_triage.successor_identity.v1",
+        "bug_id": str(bug_id or "").strip(),
+    }
+    for key in _BACKLOG_TRIAGE_SUCCESSOR_SCALAR_FIELDS:
+        default = "OPEN" if key == "status" else ("P3" if key == "priority" else "")
+        identity[key] = str(_value(key, default) or "")
+    for key in _BACKLOG_TRIAGE_SUCCESSOR_JSON_FIELDS:
+        default: Any = {} if key == "chain_trigger_json" else []
+        value = _value(key, default)
+        if isinstance(value, str):
+            value = _json_loads(value, default)
+        identity[key] = value if isinstance(value, type(default)) else default
+    return identity
+
+
+def _backlog_triage_supersede_binding(
+    *,
+    bug_id: str,
+    target_bug_ids: Sequence[str],
+    successor_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    binding = {
+        "schema_version": "backlog_triage.atomic_supersede_binding.v1",
+        "action": "supersede",
+        "successor_bug_id": str(bug_id or "").strip(),
+        "target_bug_ids": sorted(
+            {
+                str(value or "").strip()
+                for value in target_bug_ids
+                if str(value or "").strip()
+            }
+        ),
+        "successor_identity_hash": stable_sha256(dict(successor_identity)),
+        "atomic": True,
+        "idempotent_retry_allowed": True,
+    }
+    binding["binding_hash"] = stable_sha256(binding)
+    return binding
+
+
 def _backlog_upsert_verified_mf_batch_child_triage_authority(
     conn,
     *,
@@ -176217,6 +176296,62 @@ def handle_backlog_upsert(ctx: RequestContext):
         existing_row = conn.execute(
             "SELECT * FROM backlog_bugs WHERE bug_id = ?", (bug_id,)
         ).fetchone()
+        explicit_triage_action = str(body.get("triage_action") or "").strip()
+        explicit_target_id = str(body.get("triage_target_bug_id") or "").strip()
+        if body.get("force_admit") and (
+            "triage_action" in body or "triage_target_bug_id" in body
+        ):
+            return 409, _backlog_triage_zero_write_rejection(
+                error="force_admit_triage_conflict",
+                field="force_admit",
+                expected=False,
+                actual=True,
+                decision={
+                    "action": explicit_triage_action,
+                    "related_bug_ids": [explicit_target_id]
+                    if explicit_target_id
+                    else [],
+                    "reason": (
+                        "force_admit bypasses backlog triage and cannot be "
+                        "combined with a triage decision"
+                    ),
+                    "confidence": 1.0,
+                },
+                supported_actions=["admit", "merge_into", "supersede", "reject_dup"],
+                recommended_action=(
+                    "remove_force_admit_and_resubmit_exact_triage_decision"
+                ),
+            )
+        triage_actions_requiring_target = {"merge_into", "supersede", "reject_dup"}
+        if (
+            (explicit_target_id and not explicit_triage_action)
+            or (
+                explicit_triage_action in triage_actions_requiring_target
+                and not explicit_target_id
+            )
+            or (explicit_triage_action == "admit" and explicit_target_id)
+        ):
+            return 409, _backlog_triage_zero_write_rejection(
+                error="triage_action_target_shape_invalid",
+                field="triage_target_bug_id",
+                expected=(
+                    "empty_for_admit_and_exact_nonempty_for_merge_supersede_or_reject"
+                ),
+                actual={
+                    "triage_action": explicit_triage_action,
+                    "triage_target_bug_id": explicit_target_id,
+                },
+                decision={
+                    "action": explicit_triage_action,
+                    "related_bug_ids": [explicit_target_id]
+                    if explicit_target_id
+                    else [],
+                    "reason": "triage action and exact target shape are inconsistent",
+                    "confidence": 1.0,
+                },
+                supported_actions=["admit", "merge_into", "supersede", "reject_dup"],
+                recommended_action="supply_the_exact_action_target_pair",
+            )
         route_gate = {}
         if _backlog_upsert_requires_route_gate(body, existing_row):
             route_gate = _require_route_token_mutation_gate(
@@ -176230,8 +176365,6 @@ def handle_backlog_upsert(ctx: RequestContext):
         if existing_row is None and not body.get("force_admit"):
             try:
                 from .backlog_triage import triage_backlog_insert
-                explicit_triage_action = str(body.get("triage_action") or "").strip()
-                explicit_target_id = str(body.get("triage_target_bug_id") or "").strip()
                 open_rows = conn.execute(
                     "SELECT bug_id, title, target_files FROM backlog_bugs WHERE status='OPEN'"
                 ).fetchall()
@@ -176353,28 +176486,176 @@ def handle_backlog_upsert(ctx: RequestContext):
                         supported_actions=["admit", "merge_into", "reject_dup"],
                         recommended_action="merge_into",
                     )
-                # Rejected triage is strictly zero-write.  Audit only an
-                # admitted/explicitly resolved decision after every review
-                # return above has been evaluated.
-                try:
-                    audit_service.record(
-                        conn,
-                        pid,
-                        "backlog_triage",
-                        actor="ai_triage",
-                        bug_id=bug_id,
-                        details=json.dumps(decision),
-                    )
-                    conn.commit()
-                except Exception:
-                    pass
             except Exception:
-                try:
-                    audit_service.record(conn, pid, "backlog_triage_failed", actor="ai_triage", bug_id=bug_id)
-                    conn.commit()
-                except Exception:
-                    pass
                 decision = {"action": "admit", "reason": "agent failure", "related_bug_ids": [], "confidence": 0.0}
+
+        existing_supersede_retry = False
+        supersede_target_rows: dict[str, Any] = {}
+        if existing_row is not None and (
+            explicit_triage_action or explicit_target_id
+        ):
+            if explicit_triage_action != "supersede" or not explicit_target_id:
+                return 409, _backlog_triage_zero_write_rejection(
+                    error="existing_backlog_triage_retry_not_supported",
+                    field="triage_action",
+                    expected=["supersede"],
+                    actual=explicit_triage_action,
+                    decision={
+                        "action": explicit_triage_action,
+                        "related_bug_ids": [explicit_target_id]
+                        if explicit_target_id
+                        else [],
+                        "reason": "existing rows accept only an exact supersede retry",
+                        "confidence": 1.0,
+                    },
+                    supported_actions=["supersede"],
+                    recommended_action="remove_triage_fields_for_an_ordinary_update",
+                )
+            policy = backlog_runtime.parse_json_object(
+                _row_get(existing_row, "bypass_policy_json", "{}")
+            )
+            stored_binding = policy.get(_BACKLOG_TRIAGE_SUPERSEDE_BINDING_KEY)
+            if not isinstance(stored_binding, Mapping):
+                stored_binding = {}
+            successor_identity = _backlog_triage_successor_identity(
+                bug_id=bug_id,
+                body=body,
+                existing_row=existing_row,
+            )
+            expected_binding = _backlog_triage_supersede_binding(
+                bug_id=bug_id,
+                target_bug_ids=[explicit_target_id],
+                successor_identity=successor_identity,
+            )
+            mismatch_fields = [
+                field
+                for field in (
+                    "schema_version",
+                    "action",
+                    "successor_bug_id",
+                    "target_bug_ids",
+                    "successor_identity_hash",
+                    "binding_hash",
+                )
+                if stored_binding.get(field) != expected_binding.get(field)
+            ]
+            if mismatch_fields:
+                return 409, _backlog_triage_zero_write_rejection(
+                    error="triage_supersede_retry_identity_mismatch",
+                    field="triage_supersede_binding",
+                    expected={
+                        field: stored_binding.get(field) for field in mismatch_fields
+                    },
+                    actual={
+                        field: expected_binding.get(field) for field in mismatch_fields
+                    },
+                    decision={
+                        "action": "supersede",
+                        "related_bug_ids": [explicit_target_id],
+                        "reason": "retry does not match the stored atomic supersede binding",
+                        "confidence": 1.0,
+                    },
+                    supported_actions=["supersede"],
+                    recommended_action="retry_the_exact_original_supersede_body",
+                )
+            target_row = conn.execute(
+                "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+                (explicit_target_id,),
+            ).fetchone()
+            target_status = str(_row_get(target_row, "status", "") or "").upper()
+            if (
+                target_row is None
+                or explicit_target_id == bug_id
+                or target_status not in {"OPEN", "SUPERSEDED"}
+            ):
+                return 409, _backlog_triage_zero_write_rejection(
+                    error="triage_supersede_retry_target_invalid",
+                    field="triage_target_bug_id",
+                    expected={"bug_id": explicit_target_id, "status": ["OPEN", "SUPERSEDED"]},
+                    actual={"bug_id": explicit_target_id, "status": target_status},
+                    decision={
+                        "action": "supersede",
+                        "related_bug_ids": [explicit_target_id],
+                        "reason": "retry target is missing, self-referential, or not recoverable",
+                        "confidence": 1.0,
+                    },
+                    supported_actions=["supersede"],
+                    recommended_action="use_the_exact_original_open_or_superseded_target",
+                )
+            if target_status == "SUPERSEDED":
+                target_policy = backlog_runtime.parse_json_object(
+                    _row_get(target_row, "bypass_policy_json", "{}")
+                )
+                target_binding = target_policy.get(
+                    _BACKLOG_TRIAGE_SUPERSEDED_BY_BINDING_KEY
+                )
+                if not isinstance(target_binding, Mapping) or any(
+                    target_binding.get(field) != stored_binding.get(field)
+                    for field in (
+                        "successor_bug_id",
+                        "successor_identity_hash",
+                        "binding_hash",
+                    )
+                ):
+                    return 409, _backlog_triage_zero_write_rejection(
+                        error="triage_supersede_retry_target_lineage_mismatch",
+                        field="triage_target_bug_id",
+                        expected={
+                            "successor_bug_id": bug_id,
+                            "binding_hash": stored_binding.get("binding_hash"),
+                        },
+                        actual=dict(target_binding)
+                        if isinstance(target_binding, Mapping)
+                        else {},
+                        decision={
+                            "action": "supersede",
+                            "related_bug_ids": [explicit_target_id],
+                            "reason": "terminal target belongs to a different supersede lineage",
+                            "confidence": 1.0,
+                        },
+                        supported_actions=["supersede"],
+                        recommended_action="stop_and_review_the_conflicting_supersede_lineage",
+                    )
+            decision = {
+                "action": "supersede",
+                "reason": "exact idempotent atomic supersede retry",
+                "related_bug_ids": [explicit_target_id],
+                "confidence": 1.0,
+                "idempotent_retry": True,
+                "already_applied": target_status == "SUPERSEDED",
+                "binding": dict(stored_binding),
+            }
+            existing_supersede_retry = True
+            supersede_target_rows[explicit_target_id] = target_row
+
+        if (
+            decision
+            and decision.get("action") == "supersede"
+            and not existing_supersede_retry
+        ):
+            for target_id in decision.get("related_bug_ids") or []:
+                target_row = conn.execute(
+                    "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+                    (target_id,),
+                ).fetchone()
+                target_status = str(
+                    _row_get(target_row, "status", "") or ""
+                ).upper()
+                if (
+                    target_row is None
+                    or target_id == bug_id
+                    or target_status != "OPEN"
+                ):
+                    return 409, _backlog_triage_zero_write_rejection(
+                        error="triage_supersede_target_not_open",
+                        field="triage_target_bug_id",
+                        expected={"bug_id": target_id, "status": "OPEN"},
+                        actual={"bug_id": target_id, "status": target_status},
+                        decision=decision,
+                        supported_actions=["supersede"],
+                        recommended_action="refresh_triage_candidates_before_retry",
+                    )
+                supersede_target_rows[target_id] = target_row
 
         def _value(key: str, default: Any = "") -> Any:
             if key in body:
@@ -176392,6 +176673,10 @@ def handle_backlog_upsert(ctx: RequestContext):
 
         bypass_policy = backlog_runtime.parse_json_object(body.get("bypass_policy_json"))
         bypass_policy.update(backlog_runtime.parse_json_object(body.get("bypass_policy")))
+        if existing_row is not None and not bypass_policy:
+            bypass_policy = backlog_runtime.parse_json_object(
+                _row_get(existing_row, "bypass_policy_json", "{}")
+            )
         if body.get("mf_type"):
             bypass_policy["mf_type"] = backlog_runtime.normalize_mf_type(body.get("mf_type"), bypass_policy)
         elif bypass_policy.get("mf_type"):
@@ -176402,6 +176687,33 @@ def handle_backlog_upsert(ctx: RequestContext):
             if body.get("mf_type") or bypass_policy.get("mf_type")
             else ""
         )
+        if decision and decision.get("action") == "supersede":
+            successor_identity = _backlog_triage_successor_identity(
+                bug_id=bug_id,
+                body=body,
+                existing_row=existing_row,
+            )
+            supersede_binding = _backlog_triage_supersede_binding(
+                bug_id=bug_id,
+                target_bug_ids=decision.get("related_bug_ids") or [],
+                successor_identity=successor_identity,
+            )
+            bypass_policy[_BACKLOG_TRIAGE_SUPERSEDE_BINDING_KEY] = (
+                supersede_binding
+            )
+            bypass_policy_raw = backlog_runtime.policy_json(bypass_policy)
+            if existing_supersede_retry and decision.get("already_applied"):
+                return {
+                    "ok": True,
+                    "bug_id": bug_id,
+                    "action": "superseded",
+                    "closed_bugs": decision["related_bug_ids"],
+                    "atomic": True,
+                    "idempotent_retry": True,
+                    "already_applied": True,
+                    "writes_performed": False,
+                    "supersede_binding": supersede_binding,
+                }
         takeover_raw = backlog_runtime.policy_json(backlog_runtime.parse_json_object(body.get("takeover_json")))
         if route_gate:
             _record_route_token_gate_event(
@@ -176470,25 +176782,53 @@ def handle_backlog_upsert(ctx: RequestContext):
                 now,
             ),
         )
-        conn.commit()
-        # Audit: backlog_upsert event
-        try:
-            audit_service.record(
-                conn, pid, "backlog_upsert",
-                actor=body.get("actor", "api"),
-                bug_id=bug_id,
-            )
-            conn.commit()
-        except Exception:
-            pass  # best-effort audit
         # Supersede: close old rows after inserting new one
         if decision and decision.get("action") == "supersede":
             for old_id in decision.get("related_bug_ids", []):
-                conn.execute(
-                    "UPDATE backlog_bugs SET status='SUPERSEDED', updated_at=? WHERE bug_id=?",
-                    (now, old_id),
+                old_row = supersede_target_rows.get(old_id)
+                old_policy = backlog_runtime.parse_json_object(
+                    _row_get(old_row, "bypass_policy_json", "{}")
                 )
+                old_policy[_BACKLOG_TRIAGE_SUPERSEDED_BY_BINDING_KEY] = {
+                    **supersede_binding,
+                    "target_bug_id": old_id,
+                }
+                update_cursor = conn.execute(
+                    "UPDATE backlog_bugs SET status='SUPERSEDED', "
+                    "bypass_policy_json=?, updated_at=? "
+                    "WHERE bug_id=? AND status='OPEN'",
+                    (backlog_runtime.policy_json(old_policy), now, old_id),
+                )
+                rowcount = getattr(update_cursor, "rowcount", None)
+                if isinstance(rowcount, int) and rowcount != 1:
+                    raise GovernanceError(
+                        "triage_supersede_target_changed",
+                        "supersede target changed after server candidate validation",
+                        409,
+                        {
+                            "bug_id": bug_id,
+                            "triage_target_bug_id": old_id,
+                            "zero_write_rejection": True,
+                            "writes_performed": False,
+                            "retry_same_world_allowed": False,
+                        },
+                    )
             try:
+                audit_service.record(
+                    conn,
+                    pid,
+                    "backlog_upsert",
+                    actor=body.get("actor", "api"),
+                    bug_id=bug_id,
+                )
+                audit_service.record(
+                    conn,
+                    pid,
+                    "backlog_triage",
+                    actor="ai_triage",
+                    bug_id=bug_id,
+                    details=json.dumps(decision),
+                )
                 audit_service.record(
                     conn, pid, "backlog_triage_decision",
                     actor=body.get("actor", "observer"),
@@ -176500,14 +176840,52 @@ def handle_backlog_upsert(ctx: RequestContext):
             except Exception:
                 pass
             conn.commit()
-            result = {"ok": True, "bug_id": bug_id, "action": "superseded", "closed_bugs": decision["related_bug_ids"]}
+            result = {
+                "ok": True,
+                "bug_id": bug_id,
+                "action": "superseded",
+                "closed_bugs": decision["related_bug_ids"],
+                "atomic": True,
+                "idempotent_retry": existing_supersede_retry,
+                "already_applied": bool(decision.get("already_applied")),
+                "supersede_binding": supersede_binding,
+            }
             if route_gate:
                 result["route_token_gate"] = route_gate
             return result
+        # Audit ordinary upserts only after all prewrite validation has
+        # completed.  The supersede path records this after the target update
+        # above so a compare-and-swap failure leaves no semantic audit write.
+        try:
+            audit_service.record(
+                conn,
+                pid,
+                "backlog_upsert",
+                actor=body.get("actor", "api"),
+                bug_id=bug_id,
+            )
+        except Exception:
+            pass  # best-effort audit
+        if decision:
+            try:
+                audit_service.record(
+                    conn,
+                    pid,
+                    "backlog_triage",
+                    actor="ai_triage",
+                    bug_id=bug_id,
+                    details=json.dumps(decision),
+                )
+            except Exception:
+                pass
+        conn.commit()
         result = {"ok": True, "bug_id": bug_id, "action": "upserted"}
         if route_gate:
             result["route_token_gate"] = route_gate
         return result
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
