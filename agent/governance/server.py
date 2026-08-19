@@ -160266,6 +160266,168 @@ def _contract_runtime_parentless_direct_main_same_tree_anchor_authority(
     return authority
 
 
+def _contract_runtime_parentless_direct_main_implementation_test_authority(
+    *,
+    timeline_events: Sequence[Mapping[str, Any]],
+    direct_event: Mapping[str, Any],
+    implementation_event: Mapping[str, Any],
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    close_commit: str,
+) -> dict[str, Any]:
+    """Validate one immutable Direct Main implementation test boundary.
+
+    Implementation append already enforces the canonical command-backed test
+    shape.  Close must nevertheless revalidate the persisted shape and its
+    server-derived prewrite authority, because timeline rows are immutable and
+    may predate the current reader.  This projection deliberately rejects a
+    second implementation marker rather than choosing one by recency.
+    """
+
+    from . import task_timeline
+
+    schema_version = (
+        "parentless_direct_main.implementation_test_authority.v1"
+    )
+    normalized_commit = str(close_commit or "").strip().lower()
+    direct_order = _contract_runtime_parentless_direct_main_event_order(
+        direct_event,
+        0,
+    )
+    candidates = [
+        dict(event)
+        for event in timeline_events
+        if isinstance(event, Mapping)
+        and str(event.get("project_id") or "").strip() == project_id
+        and str(event.get("backlog_id") or "").strip() == backlog_id
+        and str(event.get("task_id") or "").strip() == task_id
+        and _contract_runtime_parentless_direct_main_event_order(event, 0)
+        > direct_order
+        and task_timeline._close_event_key(dict(event)) == "implementation"
+    ]
+    selected_id = _contract_runtime_parentless_direct_main_event_order(
+        implementation_event,
+        0,
+    )
+    candidate_ids = sorted(
+        _contract_runtime_parentless_direct_main_event_order(event, 0)
+        for event in candidates
+    )
+    payload = (
+        implementation_event.get("payload")
+        if isinstance(implementation_event.get("payload"), Mapping)
+        else {}
+    )
+    prewrite_authority = (
+        payload.get("direct_main_implementation_commit_prewrite_authority")
+        if isinstance(
+            payload.get("direct_main_implementation_commit_prewrite_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    test_results_gate = _contract_runtime_parentless_direct_main_test_results_gate(
+        payload.get("test_results"),
+        expected_commit=normalized_commit,
+        field="implementation.payload.test_results",
+    )
+    supplied_authority_hash = str(
+        prewrite_authority.get("authority_hash") or ""
+    ).strip()
+    projected_authority_hash = (
+        stable_sha256(
+            {
+                key: value
+                for key, value in prewrite_authority.items()
+                if key != "authority_hash"
+            }
+        )
+        if prewrite_authority
+        else ""
+    )
+    missing: list[str] = []
+    if len(candidates) != 1:
+        missing.append("unique_implementation_event")
+    if not selected_id or candidate_ids != [selected_id]:
+        missing.append("selected_implementation_event_exact")
+    if not task_timeline._event_passed(dict(implementation_event)):
+        missing.append("implementation_event_passing")
+    if str(implementation_event.get("commit_sha") or "").strip().lower() != (
+        normalized_commit
+    ):
+        missing.append("implementation_commit_exact")
+    if test_results_gate.get("passed") is not True:
+        missing.append("canonical_implementation_test_results")
+    if not (
+        str(prewrite_authority.get("schema_version") or "").strip()
+        == "parentless_direct_main.implementation_commit_prewrite_authority.v1"
+        and prewrite_authority.get("server_derived") is True
+        and str(prewrite_authority.get("source") or "").strip()
+        == (
+            "server.handle_task_timeline_append."
+            "parentless_direct_main_implementation_prewrite_gate"
+        )
+        and prewrite_authority.get("passed") is True
+        and str(prewrite_authority.get("status") or "").strip() == "passed"
+        and str(prewrite_authority.get("project_id") or "").strip()
+        == project_id
+        and str(prewrite_authority.get("backlog_id") or "").strip()
+        == backlog_id
+        and str(prewrite_authority.get("task_id") or "").strip() == task_id
+        and str(prewrite_authority.get("commit_sha") or "").strip().lower()
+        == normalized_commit
+        and str(
+            prewrite_authority.get("resolved_commit_sha") or ""
+        ).strip().lower()
+        == normalized_commit
+        and prewrite_authority.get("prior_implementation_event_count") == 0
+        and prewrite_authority.get("direct_pre_mutation_event_count") == 1
+        and not list(prewrite_authority.get("missing_requirement_ids") or [])
+        and not list(prewrite_authority.get("identity_mismatches") or [])
+        and supplied_authority_hash
+        and supplied_authority_hash == projected_authority_hash
+    ):
+        missing.append("server_derived_implementation_prewrite_authority")
+    missing = list(dict.fromkeys(missing))
+    passed = not missing
+    authority = {
+        "schema_version": schema_version,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "server_derived": True,
+        "read_only_projection": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "close_commit": normalized_commit,
+        "implementation_event_ref": (
+            f"timeline:{selected_id}" if selected_id else ""
+        ),
+        "implementation_event_count": len(candidates),
+        "implementation_event_ids": candidate_ids,
+        "canonical_test_results_hash": (
+            stable_sha256(test_results_gate.get("canonical_test_results") or {})
+            if test_results_gate.get("passed") is True
+            else ""
+        ),
+        "test_results_authority_hash": (
+            test_results_gate.get("authority_hash") or ""
+        ),
+        "implementation_prewrite_authority_hash": (
+            supplied_authority_hash
+            if supplied_authority_hash == projected_authority_hash
+            else ""
+        ),
+        "missing_requirement_ids": missing,
+        "zero_write_on_failure": True,
+        "historical_backfill_allowed": False,
+        "persisted_timeline_mutated": False,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _contract_runtime_parentless_direct_main_close_authority_gate(
     *,
     conn=None,
@@ -160786,7 +160948,19 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         direct_gate=direct_gate,
     )
     original_missing_ids = set(direct_gate.get("missing_requirement_ids") or [])
+    original_direct_gate_passed = bool(direct_gate.get("passed"))
     normalized_close_commit = str(close_commit or "").strip().lower()
+    implementation_test_authority = (
+        _contract_runtime_parentless_direct_main_implementation_test_authority(
+            timeline_events=events,
+            direct_event=direct_event,
+            implementation_event=implementation_event,
+            project_id=project_id,
+            backlog_id=bug_id,
+            task_id=requested_execution_id,
+            close_commit=normalized_close_commit,
+        )
+    )
 
     def selected_non_qa_event_passed(field: str, key: str) -> bool:
         summary = direct_gate.get(field) or {}
@@ -160808,10 +160982,8 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         "changed_file_scope_passed": bool(changed_file_scope.get("changed_files"))
         and bool(changed_file_scope.get("allowed_files"))
         and not bool(changed_file_scope.get("unexpected_changed_files")),
-        "test_authority_passed": any(
-            item.get("close_satisfying") is True
-            and task_timeline._event_has_test_evidence(dict(item["event"]))
-            for item in latest_materialized_by_lineage.values()
+        "test_authority_passed": (
+            implementation_test_authority.get("passed") is True
         ),
         "close_ready_authority_passed": selected_non_qa_event_passed(
             "close_ready_event", "close_ready"
@@ -160831,6 +161003,23 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
         })
         and all(fallback_non_qa_checks.values())
     )
+    implementation_test_projection_only = bool(
+        original_missing_ids == {"tests_or_test_results"}
+        and all(fallback_non_qa_checks.values())
+    )
+    if implementation_test_projection_only and not bool(direct_gate.get("passed")):
+        direct_gate = {
+            **direct_gate,
+            "accepted": True,
+            "passed": True,
+            "status": "passed",
+            "missing_requirement_ids": [],
+            "implementation_test_results_authority": (
+                implementation_test_authority
+            ),
+            "server_normalized_requirement_ids": ["tests_or_test_results"],
+            "persisted_timeline_mutated": False,
+        }
     materialized_fallback_gate = {
         "schema_version": "parentless_direct_main.materialized_qa_fallback_isolation_gate.v1",
         "eligible": bool(
@@ -160838,10 +161027,16 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             and not materialized_blocking_event_ids
             and route_incompatibility_only
         ),
-        "original_db_backed_gate_passed": bool(direct_gate.get("passed")),
+        "original_db_backed_gate_passed": original_direct_gate_passed,
         "route_incompatibility_only": route_incompatibility_only,
+        "implementation_test_projection_only": (
+            implementation_test_projection_only
+        ),
         "original_missing_requirement_ids": sorted(original_missing_ids),
         "non_qa_checks": fallback_non_qa_checks,
+        "implementation_test_results_authority": (
+            implementation_test_authority
+        ),
         "conn_none_scope": "exact_materialized_qa_route_incompatibility_only",
     }
     if materialized_fallback_gate["eligible"] and not bool(

@@ -88702,6 +88702,123 @@ def test_parentless_direct_main_test_results_gate_accepts_exact_command_results(
     assert gate["command_count"] == 2
 
 
+def test_parentless_direct_main_implementation_test_authority_is_unique_and_server_backed():
+    backlog_id = "AC-DIRECT-MAIN-IMPLEMENTATION-TEST-AUTHORITY"
+    task_id = "onboard-service-implementation-test-authority"
+    commit_sha = "f" * 40
+    direct_event = {
+        "id": 1,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_kind": "observer_direct_implementation_exception",
+        "status": "accepted",
+    }
+    prewrite_authority = {
+        "schema_version": (
+            "parentless_direct_main.implementation_commit_prewrite_authority.v1"
+        ),
+        "server_derived": True,
+        "source": (
+            "server.handle_task_timeline_append."
+            "parentless_direct_main_implementation_prewrite_gate"
+        ),
+        "passed": True,
+        "status": "passed",
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "commit_sha": commit_sha,
+        "resolved_commit_sha": commit_sha,
+        "prior_implementation_event_count": 0,
+        "direct_pre_mutation_event_count": 1,
+        "missing_requirement_ids": [],
+        "identity_mismatches": [],
+    }
+    prewrite_authority["authority_hash"] = server.stable_sha256(
+        prewrite_authority
+    )
+    implementation_event = {
+        "id": 2,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "event_kind": "implementation",
+        "status": "passed",
+        "commit_sha": commit_sha,
+        "payload": {
+            "test_results": {
+                "schema_version": "parentless_direct_main.test_results.v1",
+                "status": "passed",
+                "passed": True,
+                "commit_sha": commit_sha,
+                "commands": [
+                    {
+                        "command": "pytest -q focused",
+                        "status": "passed",
+                        "exit_code": 0,
+                    }
+                ],
+            },
+            "direct_main_implementation_commit_prewrite_authority": (
+                prewrite_authority
+            ),
+        },
+    }
+
+    def authority(events, selected=implementation_event):
+        return server._contract_runtime_parentless_direct_main_implementation_test_authority(
+            timeline_events=events,
+            direct_event=direct_event,
+            implementation_event=selected,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            close_commit=commit_sha,
+        )
+
+    accepted = authority([direct_event, implementation_event])
+    assert accepted["passed"] is True
+    assert accepted["implementation_event_count"] == 1
+    assert accepted["implementation_event_ref"] == "timeline:2"
+
+    duplicate = copy.deepcopy(implementation_event)
+    duplicate["id"] = 3
+    assert "unique_implementation_event" in authority(
+        [direct_event, implementation_event, duplicate]
+    )["missing_requirement_ids"]
+
+    failed = copy.deepcopy(implementation_event)
+    failed["status"] = "failed"
+    assert "implementation_event_passing" in authority(
+        [direct_event, failed],
+        selected=failed,
+    )["missing_requirement_ids"]
+
+    malformed = copy.deepcopy(implementation_event)
+    malformed["payload"]["test_results"]["commands"][0]["exit_code"] = 1
+    assert "canonical_implementation_test_results" in authority(
+        [direct_event, malformed],
+        selected=malformed,
+    )["missing_requirement_ids"]
+
+    forged = copy.deepcopy(implementation_event)
+    forged["payload"][
+        "direct_main_implementation_commit_prewrite_authority"
+    ]["server_derived"] = False
+    assert "server_derived_implementation_prewrite_authority" in authority(
+        [direct_event, forged],
+        selected=forged,
+    )["missing_requirement_ids"]
+
+    cross_task = copy.deepcopy(implementation_event)
+    cross_task["task_id"] = "onboard-service-foreign"
+    assert authority(
+        [direct_event, cross_task],
+        selected=cross_task,
+    )["passed"] is False
+
+
 def test_task_timeline_append_missing_route_ref_is_complete_zero_write_then_corrects(
     conn,
 ):
@@ -98942,6 +99059,12 @@ def test_playback_compact_hydrates_mf_batch_parent_when_derived_current_cex_is_u
             "",
         ),
         (
+            "observer_materialized_then_unparented_missing_tests",
+            "",
+            True,
+            "",
+        ),
+        (
             "observer_materialized",
             "foreign_session_report",
             False,
@@ -99555,6 +99678,21 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             commit_sha=close_commit,
             snapshot_id="full-parentless-direct-main",
         )
+    if qa_append_mode == "observer_materialized_then_unparented_missing_tests":
+        later_unparented_qa = _append_authenticated_qa_verification(
+            conn,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            commit_sha=close_commit,
+            snapshot_id="full-parentless-direct-main-unparented-post",
+            principal_id="qa:direct-main-unparented-post",
+            verification={
+                "diff_check": {"unexpected_files": []},
+                "live_regression": {"status": "passed"},
+            },
+        )
+        assert later_unparented_qa["parent_event_id"] == 0
+        assert int(later_unparented_qa["id"]) > int(qa_event["id"])
     if tamper:
         qa_payload = copy.deepcopy(qa_event["payload"])
         qa_artifacts = copy.deepcopy(qa_event["artifact_refs"])
@@ -100835,6 +100973,18 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
     assert projection["accepted"] is True
     direct_gate = projection["parentless_direct_main_close_authority_gate"]
     assert direct_gate["passed"] is True
+    if qa_append_mode == "observer_materialized_then_unparented_missing_tests":
+        normalization = direct_gate["checks"][
+            "materialized_qa_fallback_isolation_gate"
+        ]
+        assert normalization["original_db_backed_gate_passed"] is False
+        assert normalization["implementation_test_projection_only"] is True
+        assert normalization["implementation_test_results_authority"][
+            "passed"
+        ] is True
+        assert normalization["implementation_test_results_authority"][
+            "implementation_event_count"
+        ] == 1
     if qa_append_mode.startswith("observer_materialized"):
         materialized_authorities = direct_gate["checks"][
             "materialized_qa_authorities"
