@@ -87351,7 +87351,9 @@ def _parentless_direct_main_pre_mutation_graph_scope(
     *,
     backlog_id: str,
     allowed_actions: list[str] | None = None,
+    row_files: list[str] | None = None,
 ) -> tuple[str, str, dict[str, str]]:
+    declared_files = list(row_files or ["agent/governance/server.py"])
     _insert_simple_mf_close_backlog(conn, backlog_id)
     conn.execute(
         """
@@ -87360,14 +87362,14 @@ def _parentless_direct_main_pre_mutation_graph_scope(
         WHERE bug_id = ?
         """,
         (
-            json.dumps(["agent/governance/server.py"]),
+            json.dumps(declared_files),
             json.dumps(
                 [
                     {
                         "id": "AC-DIRECT-MAIN",
                         "required_scope": {
                             "kind": "files",
-                            "files": ["agent/governance/server.py"],
+                            "files": declared_files,
                         },
                     }
                 ]
@@ -87423,6 +87425,140 @@ def _parentless_direct_main_pre_mutation_graph_scope(
         },
     )
     return parent_execution_id, route_token_ref, route_identity
+
+
+def test_parentless_direct_main_dirty_scope_normalizes_order_as_exact_set(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DIRECT-MAIN-DIRTY-SCOPE-ORDER-NORMALIZATION"
+    server_file = "agent/governance/server.py"
+    test_file = "agent/tests/test_graph_governance_api.py"
+    declared_files = [test_file, server_file]
+    project_root = tmp_path / "dirty-scope-order"
+    _init_test_git_repo(project_root)
+    candidate_commit = _commit_test_git_files(
+        project_root,
+        [server_file, test_file],
+        message="order-independent dirty scope",
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+
+    task_id, route_token_ref, route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+            row_files=declared_files,
+        )
+    )
+    graph_trace_id = "gqt-20260819-d1a7c0ffee"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_identity=route_identity,
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_canonical_parentless_direct_main_pre_mutation_body(
+                append_base={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "route_token_ref": route_token_ref,
+                },
+                route_identity=route_identity,
+                allowed_files=declared_files,
+                graph_trace_ids=[graph_trace_id],
+            ),
+        )
+    )
+
+    implementation = _canonical_parentless_direct_main_implementation_body(
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=route_token_ref,
+        route_identity=route_identity,
+        commit_sha=candidate_commit,
+    )
+    implementation["payload"]["changed_files"] = declared_files
+    implementation["payload"]["dirty_scope_check"] = {
+        "allowed_files": list(reversed(declared_files)),
+        "changed_files": list(reversed(declared_files)),
+        "unexpected_files": [],
+        "exact_match": True,
+    }
+    accepted = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=implementation,
+        )
+    )
+
+    canonical_files = sorted(declared_files)
+    dirty_scope = accepted["payload"]["dirty_scope_check"]
+    assert dirty_scope["allowed_files"] == canonical_files
+    assert dirty_scope["changed_files"] == canonical_files
+    assert accepted["payload"]["changed_files"] == canonical_files
+    assert accepted["payload"][
+        "direct_main_implementation_commit_prewrite_authority"
+    ]["verified_changed_files"] == canonical_files
+    direct_event = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_kind="observer_direct_implementation_exception",
+        limit=10,
+    )[0]
+    assert server._qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
+        accepted,
+        direct_event=direct_event,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    ) is True
+
+    equivalent = server._contract_runtime_parentless_direct_main_dirty_scope_authority(
+        {
+            "changed_files": list(reversed(canonical_files)),
+            "dirty_scope_check": {
+                "allowed_files": list(reversed(canonical_files)),
+                "changed_files": canonical_files,
+                "unexpected_files": [],
+                "exact_match": True,
+            },
+        },
+        row_declared_files=canonical_files,
+        verified_changed_files=list(reversed(canonical_files)),
+        verified_changed_files_source=(
+            "server_git_single_parent_to_implementation_diff_name_status_z_m"
+        ),
+    )
+    assert equivalent["passed"] is True
+    assert equivalent["canonical_dirty_scope_check"] == dirty_scope
+
+    duplicate = server._contract_runtime_parentless_direct_main_dirty_scope_authority(
+        {"changed_files": [server_file, server_file]},
+        row_declared_files=canonical_files,
+        verified_changed_files=canonical_files,
+    )
+    assert duplicate["passed"] is False
+    assert any(
+        mismatch["field"] == "payload.changed_files"
+        and mismatch["expected"] == "unique canonical paths"
+        for mismatch in duplicate["identity_mismatches"]
+    )
 
 
 @pytest.mark.parametrize(

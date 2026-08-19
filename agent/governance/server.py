@@ -129924,7 +129924,11 @@ def _contract_runtime_parentless_direct_main_dirty_scope_authority(
             result.append(normalized)
         if required and not result:
             missing.append(field)
-        return result
+        # File scope is an identity set.  Validate the caller's exact list
+        # shape (including duplicate rejection) before imposing one stable
+        # server order so equivalent row, caller, and Git projections cannot
+        # disagree solely because their enumeration order differs.
+        return sorted(result)
 
     declared_files = canonical_paths(
         list(row_declared_files),
@@ -158002,12 +158006,18 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         )
         else {}
     )
-    current_row_files = _backlog_declared_direct_file_scope(conn, backlog_id)
-    direct_row_files = _runtime_context_service_dedupe(
-        [
-            str(path or "").strip()
-            for path in list(direct_authority.get("row_declared_files") or [])
-        ]
+    current_row_files = sorted(
+        _backlog_declared_direct_file_scope(conn, backlog_id)
+    )
+    direct_row_files = sorted(
+        _runtime_context_service_dedupe(
+            [
+                str(path or "").strip()
+                for path in list(
+                    direct_authority.get("row_declared_files") or []
+                )
+            ]
+        )
     )
     commit_sha = str(body.get("commit_sha") or "").strip().lower()
     route_token_ref = str(
@@ -158140,6 +158150,8 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
                             commit_missing.append(
                                 "implementation_changed_files_server_verified"
                             )
+                        else:
+                            verified_changed_files.sort()
         try:
             head = _qa_git_bytes(
                 root,
