@@ -129873,6 +129873,13 @@ _DIRECT_MAIN_CONTRACT_TRANSITION_MODES = {"revise_scope", "expand_scope"}
 _PARENTLESS_DIRECT_MAIN_TEST_RESULTS_SCHEMA = (
     "parentless_direct_main.test_results.v1"
 )
+_PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE = "observer.implementation"
+_PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE_ALIASES = frozenset(
+    {
+        _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE,
+        "mf.implementation_complete",
+    }
+)
 
 
 def _parentless_direct_main_test_results_template(
@@ -164327,6 +164334,7 @@ def handle_observer_direct_mutation_exception(ctx: RequestContext):
 def handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
     project_id = ctx.get_project_id()
+    persisted_event_type = str(ctx.body.get("event_type") or "")
     from . import task_timeline
     from .mf_subagent_contract import (
         MfSubagentContractError,
@@ -165313,6 +165321,58 @@ def handle_task_timeline_append(ctx: RequestContext):
                 },
             )
         if direct_main_implementation_prewrite_gate.get("passed") is True:
+            supplied_event_type = str(
+                ctx.body.get("event_type") or ""
+            ).strip()
+            if supplied_event_type not in (
+                _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE_ALIASES
+            ):
+                raise GovernanceError(
+                    "parentless_direct_main_implementation_event_type_invalid",
+                    (
+                        "parentless direct-main implementation event type is "
+                        "not a recognized canonical alias"
+                    ),
+                    422,
+                    {
+                        "field": "event_type",
+                        "expected": sorted(
+                            _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE_ALIASES
+                        ),
+                        "actual": supplied_event_type,
+                        "canonical_event_type": (
+                            _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE
+                        ),
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                        "persisted_as_accepted": False,
+                        "historical_backfill_allowed": False,
+                    },
+                )
+            persisted_event_type = (
+                _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE
+            )
+            event_type_authority = {
+                "schema_version": (
+                    "parentless_direct_main."
+                    "implementation_event_type_authority.v1"
+                ),
+                "server_derived": True,
+                "caller_claims_trusted": False,
+                "source": (
+                    "server.handle_task_timeline_append."
+                    "parentless_direct_main_implementation_prewrite_gate"
+                ),
+                "supplied_event_type": supplied_event_type,
+                "canonical_event_type": persisted_event_type,
+                "recognized_alias": True,
+            }
+            event_type_authority["authority_hash"] = stable_sha256(
+                event_type_authority
+            )
+            norm_payload[
+                "direct_main_implementation_event_type_authority"
+            ] = event_type_authority
             dirty_scope_gate = dict(
                 direct_main_implementation_prewrite_gate.get(
                     "dirty_scope_gate"
@@ -165394,7 +165454,7 @@ def handle_task_timeline_append(ctx: RequestContext):
             backlog_id=ctx.body.get("backlog_id", ""),
             mf_id=ctx.body.get("mf_id", ""),
             attempt_num=int(ctx.body.get("attempt_num", 0) or 0),
-            event_type=ctx.body.get("event_type", ""),
+            event_type=persisted_event_type,
             phase=ctx.body.get("phase", ""),
             event_kind=norm_event_kind,
             scenario_id=ctx.body.get("scenario_id", ""),
@@ -165420,7 +165480,7 @@ def handle_task_timeline_append(ctx: RequestContext):
             conn,
             project_id=project_id,
             event_kind=raw_event_kind,
-            event_type=str(ctx.body.get("event_type", "")),
+            event_type=persisted_event_type,
             payload=dict(norm_payload) if isinstance(norm_payload, dict) else {},
         )
         if route_gate:

@@ -452,7 +452,7 @@ def test_exact_candidate_post_merge_qa_accepts_parentless_direct_main_without_ru
             body={
                 "backlog_id": backlog_id,
                 "task_id": parent_execution_id,
-                "event_type": "mf.implementation",
+                "event_type": "mf.implementation_complete",
                 "event_kind": "implementation",
                 "phase": "implementation",
                 "status": "passed",
@@ -87507,6 +87507,52 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
             )
         ) == events_before
 
+    invalid_event_type_body = (
+        _canonical_parentless_direct_main_implementation_body(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            route_token_ref=route_token_ref,
+            route_identity=route_identity,
+            commit_sha=candidate_commit,
+        )
+    )
+    invalid_event_type_body["event_type"] = "forged.implementation"
+    events_before = len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            limit=1000,
+        )
+    )
+    changes_before = conn.total_changes
+    with pytest.raises(GovernanceError) as event_type_rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=invalid_event_type_body,
+            )
+        )
+    assert event_type_rejected.value.code == (
+        "parentless_direct_main_implementation_event_type_invalid"
+    )
+    assert event_type_rejected.value.details["field"] == "event_type"
+    assert event_type_rejected.value.details["zero_write_rejection"] is True
+    assert event_type_rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == changes_before
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            limit=1000,
+        )
+    ) == events_before
+
     accepted_body = _canonical_parentless_direct_main_implementation_body(
         backlog_id=backlog_id,
         task_id=task_id,
@@ -87514,6 +87560,7 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
         route_identity=route_identity,
         commit_sha=candidate_commit,
     )
+    accepted_body["event_type"] = "mf.implementation_complete"
     accepted_body["payload"].pop("dirty_scope_check")
     accepted = server.handle_task_timeline_append(
         _ctx_with_role(
@@ -87522,6 +87569,32 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
             method="POST",
             body=accepted_body,
         )
+    )
+    assert accepted["event_type"] == "observer.implementation"
+    event_type_authority = accepted["payload"][
+        "direct_main_implementation_event_type_authority"
+    ]
+    assert event_type_authority == {
+        "schema_version": (
+            "parentless_direct_main.implementation_event_type_authority.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "source": (
+            "server.handle_task_timeline_append."
+            "parentless_direct_main_implementation_prewrite_gate"
+        ),
+        "supplied_event_type": "mf.implementation_complete",
+        "canonical_event_type": "observer.implementation",
+        "recognized_alias": True,
+        "authority_hash": event_type_authority["authority_hash"],
+    }
+    assert event_type_authority["authority_hash"] == server.stable_sha256(
+        {
+            key: value
+            for key, value in event_type_authority.items()
+            if key != "authority_hash"
+        }
     )
     authority = accepted["payload"][
         "direct_main_implementation_commit_prewrite_authority"
