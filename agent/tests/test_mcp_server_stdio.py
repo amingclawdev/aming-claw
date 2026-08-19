@@ -3854,6 +3854,8 @@ def test_mcp_backlog_audit_archive_forwards_payload():
             "POST",
             "/api/backlog/aming-claw/BUG-ARCHIVE/audit-archive",
             {
+                "project_id": "aming-claw",
+                "bug_id": "BUG-ARCHIVE",
                 "commit": "abc123",
                 "reason": "Historical close evidence cannot be reconstructed.",
                 "timeline_precheck": {"can_close": False},

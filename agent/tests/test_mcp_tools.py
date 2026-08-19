@@ -2527,6 +2527,86 @@ def test_mcp_protected_mutations_forward_route_token_or_waiver():
     )
 
 
+def test_backlog_audit_archive_adapters_preserve_canonical_guide_body_and_route_proof(
+    monkeypatch,
+):
+    canonical_body = {
+        "project_id": "aming-claw",
+        "bug_id": "BUG/ARCHIVE",
+        "commit": "abc1234",
+        "reason": "Irreversible runtime recovery is exhausted.",
+        "qa_acceptance": {
+            "passed": False,
+            "used_as_pass": False,
+            "overall_release_pass_claimed": False,
+        },
+        "audit_close_gate": {
+            "allowed": True,
+            "normal_close_gate": {"can_close": False},
+        },
+        "route_token_ref": "rtok-copy-safe-archive",
+    }
+    expected_call = (
+        "POST",
+        "/api/backlog/aming-claw/BUG%2FARCHIVE/audit-archive",
+        canonical_body,
+    )
+
+    recorder = _Recorder()
+    primary = _dispatcher(recorder).dispatch(
+        "backlog_audit_archive",
+        dict(canonical_body),
+    )
+
+    mirror_calls = []
+
+    def fake_http(method, path, data=None, **_kwargs):
+        mirror_calls.append((method, path, data))
+        return {"ok": True, "method": method, "path": path, "data": data}
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    mirror = governance_mcp_server._dispatch_tool(
+        "backlog_audit_archive",
+        dict(canonical_body),
+    )
+
+    assert recorder.calls == [expected_call]
+    assert mirror_calls == [expected_call]
+    assert primary["data"] == canonical_body
+    assert mirror["data"] == canonical_body
+    assert canonical_body["route_token_ref"] == "rtok-copy-safe-archive"
+
+
+@pytest.mark.parametrize("missing_field", ["project_id", "bug_id"])
+def test_backlog_audit_archive_adapters_require_routing_identity_before_http(
+    monkeypatch,
+    missing_field,
+):
+    body = {
+        "project_id": "aming-claw",
+        "bug_id": "BUG-ARCHIVE",
+        "commit": "abc1234",
+        "reason": "Irreversible runtime recovery is exhausted.",
+        "route_token_ref": "rtok-copy-safe-archive",
+    }
+    body.pop(missing_field)
+
+    recorder = _Recorder()
+    with pytest.raises(KeyError, match=missing_field):
+        _dispatcher(recorder).dispatch("backlog_audit_archive", dict(body))
+    assert recorder.calls == []
+
+    mirror_calls = []
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http",
+        lambda *args, **kwargs: mirror_calls.append((args, kwargs)),
+    )
+    with pytest.raises(KeyError, match=missing_field):
+        governance_mcp_server._dispatch_tool("backlog_audit_archive", dict(body))
+    assert mirror_calls == []
+
+
 def test_mcp_protected_write_schemas_expose_route_gate_payloads():
     for name in ("backlog_upsert", "backlog_close", "backlog_audit_archive", "task_timeline_append"):
         properties = _tool_properties(name)

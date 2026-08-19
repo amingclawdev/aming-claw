@@ -5589,7 +5589,7 @@ class ToolDispatcher:
             body = {
                 key: value
                 for key, value in args.items()
-                if key not in {"project_id", "bug_id"} and value is not None
+                if value is not None
             }
             return self._api("POST", f"/api/backlog/{pid}/{bug_id}/audit-archive", body)
 
