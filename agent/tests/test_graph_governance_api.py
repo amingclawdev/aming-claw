@@ -132055,6 +132055,212 @@ def test_irreversible_runtime_audit_terminal_oversized_body_is_lossless_bounded(
     assert "\n".join(conn.iterdump()) == before_dump
 
 
+def test_irreversible_runtime_audit_terminal_public_continuation_warranty(
+    conn,
+    monkeypatch,
+):
+    record, context, _route_identity, _state, _eligibility, _failed_qa = (
+        _irreversible_runtime_audit_terminal_fixture(monkeypatch)
+    )
+    record.update(
+        {
+            "root_contract_execution_id": context.parent_task_id,
+            "contract_chain_id": (
+                "cchain-irreversible-runtime-public-continuation-warranty"
+            ),
+            "execution_state_revision": 12,
+            "metadata": {},
+        }
+    )
+    action = server._mf_batch_irreversible_runtime_audit_terminal_authority(
+        conn,
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        record=record,
+    )
+    action["copy_safe_body"]["qa_acceptance"]["tests"] = [
+        f"pytest public continuation warranty {index:02d} "
+        + ("terminal-selection-identity-" * 40)
+        for index in range(32)
+    ]
+    action["archive_action_input"] = copy.deepcopy(action["copy_safe_body"])
+    authority_proof = {
+        key: copy.deepcopy(value)
+        for key, value in action[
+            "irreversible_runtime_audit_terminal_authority"
+        ].items()
+        if key
+        not in {
+            "schema_version",
+            "server_derived",
+            "caller_claims_trusted",
+            "authority_hash",
+        }
+    }
+    authority_proof["archive_action_input"] = copy.deepcopy(
+        action["copy_safe_body"]
+    )
+    action["irreversible_runtime_audit_terminal_authority"] = (
+        task_timeline.source_backed_irreversible_runtime_audit_terminal_authority(
+            authority_proof
+        )
+    )
+    base_current_projection = {
+        "project_id": PID,
+        "backlog_id": context.backlog_id,
+        "current_contract_execution_id": context.parent_task_id,
+        "execution_state_revision": 12,
+        "projection_hash": _fake_sha(
+            "irreversible-runtime-public-continuation-warranty"
+        ),
+    }
+    current_projection = (
+        server._onboard_guide_apply_irreversible_runtime_terminal_selection(
+            base_current_projection,
+            action,
+        )
+    )
+    selected_action = {"value": copy.deepcopy(action)}
+    current_holder = {"value": copy.deepcopy(base_current_projection)}
+    monkeypatch.setattr(
+        server,
+        "_onboard_guide_capsule_current_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(current_holder["value"]),
+    )
+    monkeypatch.setattr(
+        server,
+        (
+            "_mf_batch_irreversible_runtime_audit_terminal_authority_"
+            "for_current_lineage"
+        ),
+        lambda *_args, **_kwargs: copy.deepcopy(selected_action["value"]),
+    )
+
+    def mint_capsule():
+        return server._onboard_route_guide_compact_service_response(
+            project_id=PID,
+            backlog_id=context.backlog_id,
+            role="observer",
+            work_type="continue_contract_chain",
+            record=record,
+            next_action=action,
+            current_projection=current_projection,
+            runtime_resume={"next_legal_action": action},
+            target_files=list(context.owned_files),
+            projection_degraded=False,
+        )
+
+    def fetch(capsule, **overrides):
+        body = {
+            "guide_capsule_ref": capsule["guide_capsule_ref"],
+            "sections": ["action_input"],
+            "backlog_id": context.backlog_id,
+            "role": "observer",
+            "work_type": "continue_contract_chain",
+            "task_id": str(capsule.get("selected_task_id") or ""),
+        }
+        body.update(overrides)
+        return server.handle_project_onboard_route_guide_capsule(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    # Warm lazy read stores before taking the immutable-history baseline.
+    server._onboard_guide_irreversible_runtime_terminal_selection(
+        conn,
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        current_projection=base_current_projection,
+        direct_main_failed_qa_state={},
+    )
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+    compact = mint_capsule()
+    identity = server._onboard_guide_capsule_projection_identity(
+        current_projection
+    )
+    assert compact["status"] == "compact_action_input_continuation_required"
+    assert identity["terminal"] is True
+    assert identity["terminal_action_hash"].startswith("sha256:")
+
+    wrong_capsule = fetch(
+        compact,
+        guide_capsule_ref=compact["guide_capsule_ref"] + "-forged",
+    )
+    assert wrong_capsule["ok"] is False
+    assert wrong_capsule["reason"] == "guide_capsule_missing_or_expired"
+    wrong_section = fetch(compact, sections=["not_a_capsule_section"])
+    assert wrong_section["ok"] is False
+    assert wrong_section["status"] == "bounded_section_request_rejected"
+    wrong_scope = fetch(compact, backlog_id="AC-CROSS-SCOPE")
+    assert wrong_scope["ok"] is False
+    assert wrong_scope["reason"] == "guide_capsule_wrong_scope"
+    assert wrong_scope["mismatched_fields"] == ["backlog_id"]
+
+    fetched = fetch(compact)
+    assert fetched["ok"] is True
+    section = fetched["sections"]["action_input"]
+    assert section["schema_version"] == (
+        "onboard_route_guide.action_input_encoded_continuation.v1"
+    )
+    assert section["continuation_complete"] is True
+    assert section["lossless"] is True
+    executable = section["canonical_executable_action"]
+    assert executable["mcp_tool"] == "backlog_audit_archive"
+    encoded = executable["encoded_copy_safe_body"]
+    padding = "=" * (-len(encoded["payload"]) % 4)
+    compressed = base64.urlsafe_b64decode(encoded["payload"] + padding)
+    canonical_json = zlib.decompress(compressed)
+    decoded = json.loads(canonical_json)
+    expected, replacement_paths = server._guide_executable_action_safe_body(
+        action["copy_safe_body"]
+    )
+    assert decoded == expected
+    assert decoded["qa_acceptance"]["contract_execution_id"] == (
+        record["contract_execution_id"]
+    )
+    assert encoded["required_replacement_paths"] == replacement_paths
+    assert encoded["uncompressed_sha256"] == (
+        "sha256:" + hashlib.sha256(canonical_json).hexdigest()
+    )
+    assert encoded["compressed_sha256"] == (
+        "sha256:" + hashlib.sha256(compressed).hexdigest()
+    )
+    forged_compressed = bytearray(compressed)
+    forged_compressed[-1] ^= 1
+    assert (
+        "sha256:" + hashlib.sha256(forged_compressed).hexdigest()
+        != encoded["compressed_sha256"]
+    )
+    assert fetched["authorizes_write"] is False
+    assert fetched["satisfies_gate"] is False
+    assert fetched["synthesizes_pass"] is False
+
+    compact = mint_capsule()
+    selected_action["value"] = copy.deepcopy(action)
+    selected_action["value"]["reason"] = (
+        "forged terminal action with a different authority hash"
+    )
+    stale_hash = fetch(compact)
+    assert stale_hash["ok"] is False
+    assert stale_hash["reason"] == "guide_capsule_stale_runtime_transition"
+    assert "terminal_action_hash" in stale_hash["mismatched_fields"]
+
+    selected_action["value"] = copy.deepcopy(action)
+    compact = mint_capsule()
+    current_holder["value"] = {
+        **copy.deepcopy(base_current_projection),
+        "current_contract_execution_id": "cex-cross-runtime-context",
+    }
+    cross_cex = fetch(compact)
+    assert cross_cex["ok"] is False
+    assert cross_cex["reason"] == "guide_capsule_stale_runtime_transition"
+    assert "contract_execution_id" in cross_cex["mismatched_fields"]
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 def test_irreversible_runtime_audit_terminal_selects_unique_current_lineage(
     conn,
     monkeypatch,
