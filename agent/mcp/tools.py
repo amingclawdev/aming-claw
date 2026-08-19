@@ -460,6 +460,11 @@ def _observer_runtime_text_prepare_compact_result(value: Any) -> Any:
         if isinstance(persistent_evidence.get("local_runtime_context_bridge"), dict)
         else {}
     )
+    dispatch_gate_validation = (
+        value.get("dispatch_gate_validation")
+        if isinstance(value.get("dispatch_gate_validation"), dict)
+        else {}
+    )
     dispatch_event = _parallel_branch_startup_public_fields(
         dispatch_event,
         (
@@ -503,15 +508,32 @@ def _observer_runtime_text_prepare_compact_result(value: Any) -> Any:
             "already_current",
         ),
     )
-    prepare_state_advanced = bool(
+    dispatch_event_recorded_now = (
+        str(dispatch_event.get("status") or "") == "recorded"
+    )
+    runtime_revision_recorded_now = bool(
         persistent_evidence.get("contract_revision_persisted") is True
-        or persistent_evidence.get("bounded_worker_dispatch_event_recorded") is True
-        or runtime_revision.get("id")
-        or runtime_revision.get("revision_id")
-        or dispatch_event.get("id")
-        or dispatch_event.get("event_id")
-        or dispatch_event.get("event_ref")
-        or local_bridge.get("written") is True
+        or str(runtime_revision.get("status") or "") == "recorded"
+    )
+    local_bridge_written_now = bool(
+        local_bridge.get("written") is True
+        and str(local_bridge.get("status") or "") != "already_current"
+        and local_bridge.get("already_current") is not True
+    )
+    request_writes_performed = bool(
+        value.get("writes_performed")
+        or runtime_revision_recorded_now
+        or dispatch_event_recorded_now
+        or local_bridge_written_now
+    )
+    request_mutation_performed = bool(
+        value.get("mutation_performed")
+        or runtime_revision_recorded_now
+        or dispatch_event_recorded_now
+        or local_bridge_written_now
+    )
+    prepare_state_advanced = bool(
+        request_writes_performed or request_mutation_performed
     )
     launch_text = value.get("launch_text")
     encoded_launch_text: dict[str, Any] = {}
@@ -577,10 +599,10 @@ def _observer_runtime_text_prepare_compact_result(value: Any) -> Any:
         ),
         "prepare_state_advanced": prepare_state_advanced,
         "http_request_performed": True,
-        "writes_performed": bool(value.get("writes_performed"))
-        or prepare_state_advanced,
-        "mutation_performed": bool(value.get("mutation_performed"))
-        or prepare_state_advanced,
+        "writes_performed": request_writes_performed,
+        "mutation_performed": request_mutation_performed,
+        "zero_write_rejection": bool(value.get("zero_write_rejection"))
+        or (value.get("ok") is False and not request_writes_performed),
         "launch_text_omitted": True,
         "lossless_continuation_available": continuation_available,
         "semantic_truncation_performed": not continuation_available,
@@ -596,6 +618,20 @@ def _observer_runtime_text_prepare_compact_result(value: Any) -> Any:
         compact["runtime_contract_revision"] = runtime_revision
     if local_bridge:
         compact["local_runtime_context_bridge"] = local_bridge
+    if dispatch_gate_validation:
+        compact["dispatch_gate_validation"] = _parallel_branch_startup_public_fields(
+            dispatch_gate_validation,
+            (
+                "allowed",
+                "status",
+                "error",
+                "reason",
+                "actual_startup_recorded",
+                "actual_startup_required",
+                "close_ready",
+                "startup_intent_event_generated",
+            ),
+        )
     if encoded_launch_text:
         compact["encoded_launch_text"] = encoded_launch_text
     return compact

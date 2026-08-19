@@ -4575,6 +4575,70 @@ def test_mcp_observer_runtime_text_prepare_bounded_truthfulness_warranty():
         "sha256:" + hashlib.sha256(compressed).hexdigest()
     )
 
+    # Rediscovering an older dispatch does not make a rejected prepare a
+    # mutation. Preserve the exact server-side rejection in the bounded view.
+    response = {
+        "ok": False,
+        "status": "rejected",
+        "project_id": "aming-claw",
+        "backlog_id": base["backlog_id"],
+        "runtime_context_id": "mfrctx-runtime-text-warranty",
+        "launch_text": launch_text,
+        "launch_text_hash": "sha256:rejected-launch-text-warranty",
+        "request_id": "req-runtime-text-rejected-warranty",
+        "session_token": "raw-rejected-session-must-not-escape",
+        "fence_token": "raw-rejected-fence-must-not-escape",
+        "persistent_evidence": {
+            "bounded_worker_dispatch_event_recorded": True,
+            "dispatch_timeline_event": {
+                "event_id": 85,
+                "status": "already_recorded",
+            },
+        },
+        "dispatch_timeline_event": {
+            "event_id": 85,
+            "status": "already_recorded",
+        },
+        "local_runtime_context_bridge": {
+            "status": "skipped",
+            "written": False,
+            "reason": "prepare_not_ok",
+        },
+        "dispatch_gate_validation": {
+            "allowed": False,
+            "error": (
+                "same-worktree dispatch is blocked by default for local "
+                "mf_sub workers"
+            ),
+            "actual_startup_recorded": False,
+            "actual_startup_required": False,
+        },
+    }
+    rejected_compact = dispatcher.dispatch("observer_runtime_text_prepare", base)
+    rejected_json = json.dumps(rejected_compact, sort_keys=True)
+    assert rejected_compact["ok"] is False
+    assert rejected_compact["status"] == "rejected"
+    assert rejected_compact["prepare_state_advanced"] is False
+    assert rejected_compact["writes_performed"] is False
+    assert rejected_compact["mutation_performed"] is False
+    assert rejected_compact["zero_write_rejection"] is True
+    assert rejected_compact["dispatch_timeline_event"] == {
+        "event_id": 85,
+        "status": "already_recorded",
+    }
+    assert rejected_compact["dispatch_gate_validation"] == {
+        "allowed": False,
+        "error": (
+            "same-worktree dispatch is blocked by default for local mf_sub "
+            "workers"
+        ),
+        "actual_startup_recorded": False,
+        "actual_startup_required": False,
+    }
+    assert "runtime_contract_revision" not in rejected_compact
+    assert "raw-rejected-session-must-not-escape" not in rejected_json
+    assert "raw-rejected-fence-must-not-escape" not in rejected_json
+
     # Full remains an explicit compatibility view, and invalid views are
     # rejected before any HTTP request or mutation.
     assert dispatcher.dispatch(

@@ -33614,6 +33614,18 @@ def test_observer_runtime_text_prepare_persists_registered_host_identity_for_sta
     assert latest_revision.payload["read_receipt_recorded"] is False
     assert latest_revision.payload["read_receipt_hash"] == ""
     assert latest_revision.payload["read_receipt_event_id"] == ""
+    projection_after_prepare = parallel_branch_runtime.build_runtime_context_projection(
+        runtime_context,
+        contract_revision=latest_revision,
+        route_identity=latest_revision.route_identity,
+    ).to_dict()
+    action_plan_after_prepare = projection_after_prepare["views"]["action_plan"]
+    assert action_plan_after_prepare["read_receipt_hash_action"][
+        "launch_text_hash_valid"
+    ] is True
+    assert action_plan_after_prepare["next_legal_action"] == (
+        "submit_mf_subagent_read_receipt"
+    )
     revision_read_receipt = latest_revision.payload["read_receipt_identity"]
     assert revision_read_receipt["status"] == "supplied_unverified"
     assert revision_read_receipt["recorded"] is False
