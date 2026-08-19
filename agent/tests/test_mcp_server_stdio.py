@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -8,6 +10,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -4188,6 +4191,137 @@ def test_mcp_parallel_branch_startup_response_view_is_local_and_fail_closed():
     assert rejected["writes_performed"] is False
     assert rejected["mutation_performed"] is False
     assert len(calls) == call_count
+
+
+def test_mcp_observer_runtime_text_prepare_response_is_bounded_and_truthful():
+    calls = []
+    response = {"ok": True, "status": "prepared"}
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return response
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    base = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-RUNTIME-TEXT-BOUNDED",
+        "observer_command_id": "cmd-runtime-text-bounded",
+        "route_context_hash": "sha256:route",
+        "prompt_contract_id": "rprompt-runtime-text-bounded",
+    }
+
+    assert dispatcher.dispatch("observer_runtime_text_prepare", base) == response
+    assert "response_view" not in calls[-1][2]
+
+    response = {
+        "ok": True,
+        "status": "prepared",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-RUNTIME-TEXT-BOUNDED",
+        "runtime_context_id": "mfrctx-runtime-text-bounded",
+        "task_id": "worker-runtime-text-bounded",
+        "contract_execution_id": "cex-runtime-text-bounded",
+        "launch_text": "launch-text-" + ("x" * 300_000),
+        "launch_text_hash": "sha256:launch-text",
+        "full_payload_path": "/tmp/runtime-text-bounded.json",
+        "full_payload_sha256": "sha256:full-payload",
+        "request_id": "req-runtime-text-bounded",
+        "session_token": "raw-session-must-not-escape",
+        "fence_token": "raw-fence-must-not-escape",
+        "persistent_evidence": {
+            "contract_revision_persisted": True,
+            "bounded_worker_dispatch_event_recorded": True,
+        },
+        "runtime_contract_revision": {
+            "revision_id": "revision-runtime-text-bounded",
+            "status": "recorded",
+            "execution_state_revision": 4,
+        },
+        "dispatch_timeline_event": {
+            "id": 70,
+            "status": "recorded",
+            "event_type": "observer.runtime_text_prepared",
+            "diagnostic": "y" * 300_000,
+        },
+        "local_runtime_context_bridge": {
+            "ok": True,
+            "status": "written",
+            "runtime_context_id": "mfrctx-runtime-text-bounded",
+            "written": True,
+            "private": "z" * 300_000,
+        },
+    }
+    compact = dispatcher.dispatch("observer_runtime_text_prepare", base)
+    compact_bytes = len(
+        json.dumps(compact, sort_keys=True, separators=(",", ":")).encode()
+    )
+    assert compact_bytes < 256 * 1024
+    assert compact["schema_version"] == (
+        "observer_runtime_text_prepare.compact_response.v1"
+    )
+    assert compact["prepare_state_advanced"] is True
+    assert compact["http_request_performed"] is True
+    assert compact["writes_performed"] is True
+    assert compact["mutation_performed"] is True
+    assert compact["dispatch_timeline_event"]["id"] == 70
+    assert compact["runtime_contract_revision"]["revision_id"] == (
+        "revision-runtime-text-bounded"
+    )
+    assert compact["lossless_continuation_available"] is True
+    assert compact["semantic_truncation_performed"] is False
+    assert compact["full_payload_artifact_available"] is True
+    assert compact["launch_text_omitted"] is True
+    assert "launch_text" not in compact
+    assert "session_token" not in compact
+    assert "fence_token" not in compact
+    assert "raw-session-must-not-escape" not in json.dumps(compact)
+    continuation = compact["encoded_launch_text"]
+    padding = "=" * (-len(continuation["payload"]) % 4)
+    compressed = base64.urlsafe_b64decode(continuation["payload"] + padding)
+    decoded = zlib.decompress(compressed)
+    assert decoded.decode() == response["launch_text"]
+    assert continuation["uncompressed_sha256"] == (
+        "sha256:" + hashlib.sha256(decoded).hexdigest()
+    )
+    assert continuation["compressed_sha256"] == (
+        "sha256:" + hashlib.sha256(compressed).hexdigest()
+    )
+
+    assert dispatcher.dispatch(
+        "observer_runtime_text_prepare",
+        {**base, "response_view": "full"},
+    ) == response
+    assert "response_view" not in calls[-1][2]
+
+    call_count = len(calls)
+    rejected = dispatcher.dispatch(
+        "observer_runtime_text_prepare",
+        {**base, "response_view": "invalid"},
+    )
+    assert rejected["error"] == (
+        "observer_runtime_text_prepare_response_view_invalid"
+    )
+    assert rejected["http_request_performed"] is False
+    assert rejected["zero_write_rejection"] is True
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert len(calls) == call_count
+
+
+def test_mcp_observer_runtime_text_prepare_schema_exposes_response_view():
+    tool = next(
+        item
+        for item in runtime_mcp_tools
+        if item.get("name") == "observer_runtime_text_prepare"
+    )
+    response_view = tool["inputSchema"]["properties"]["response_view"]
+    assert response_view["enum"] == ["compact", "full"]
+    assert response_view["default"] == "compact"
 
 
 def test_mcp_contract_add_tools_expose_thin_guided_facade_only():

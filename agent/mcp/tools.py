@@ -5,6 +5,8 @@ All tools proxy to the governance HTTP API or the in-process worker pool.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +19,7 @@ import threading
 import urllib.parse
 import urllib.request
 import urllib.error
+import zlib
 from datetime import datetime, timezone
 from typing import Any
 
@@ -45,6 +48,8 @@ _CONTRACT_RUNTIME_MCP_TIMEOUT_ENV_KEYS = (
 )
 _WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES = 256 * 1024
 _PARALLEL_BRANCH_STARTUP_COMPACT_TRIGGER_BYTES = 64 * 1024
+_OBSERVER_RUNTIME_TEXT_PREPARE_COMPACT_TRIGGER_BYTES = 64 * 1024
+_OBSERVER_RUNTIME_TEXT_PREPARE_CONTINUATION_MAX_ENCODED_BYTES = 192 * 1024
 _WORKER_AUTH_ENV_FIELDS = {
     "session_token": "AMING_WORKER_SESSION_TOKEN",
     "fence_token": "AMING_WORKER_FENCE_TOKEN",
@@ -300,6 +305,199 @@ def _parallel_branch_startup_compact_result(value: Any) -> Any:
         compact["timeline_event_recorded"] = timeline_event
     if canonical_line:
         compact["contract_runtime_canonical_line"] = canonical_line
+    return compact
+
+
+def _observer_runtime_text_prepare_compact_result(value: Any) -> Any:
+    """Bound oversized runtime-text results without hiding durable writes.
+
+    The governance endpoint persists its contract revision, dispatch event, and
+    local RuntimeContext bridge before returning. A generic stdio frame error
+    must not turn those writes into an apparent zero-write rejection. Compact
+    responses therefore retain copy-safe persistence identities and the full
+    payload ref/hash while intentionally omitting the potentially enormous
+    launch text and any credential-shaped fields.
+    """
+
+    if not isinstance(value, dict):
+        return value
+    try:
+        serialized_bytes = len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception:
+        return value
+    if serialized_bytes <= _OBSERVER_RUNTIME_TEXT_PREPARE_COMPACT_TRIGGER_BYTES:
+        return value
+
+    persistent_evidence = (
+        value.get("persistent_evidence")
+        if isinstance(value.get("persistent_evidence"), dict)
+        else {}
+    )
+    dispatch_event = (
+        value.get("dispatch_timeline_event")
+        if isinstance(value.get("dispatch_timeline_event"), dict)
+        else persistent_evidence.get("dispatch_timeline_event")
+        if isinstance(persistent_evidence.get("dispatch_timeline_event"), dict)
+        else {}
+    )
+    runtime_revision = (
+        value.get("runtime_contract_revision")
+        if isinstance(value.get("runtime_contract_revision"), dict)
+        else {}
+    )
+    local_bridge = (
+        value.get("local_runtime_context_bridge")
+        if isinstance(value.get("local_runtime_context_bridge"), dict)
+        else persistent_evidence.get("local_runtime_context_bridge")
+        if isinstance(persistent_evidence.get("local_runtime_context_bridge"), dict)
+        else {}
+    )
+    dispatch_event = _parallel_branch_startup_public_fields(
+        dispatch_event,
+        (
+            "id",
+            "event_id",
+            "event_ref",
+            "status",
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "event_type",
+            "event_kind",
+            "phase",
+            "request_id",
+        ),
+    )
+    runtime_revision = _parallel_branch_startup_public_fields(
+        runtime_revision,
+        (
+            "id",
+            "revision_id",
+            "revision",
+            "status",
+            "contract_execution_id",
+            "runtime_context_id",
+            "execution_state_revision",
+            "execution_state_hash",
+        ),
+    )
+    local_bridge = _parallel_branch_startup_public_fields(
+        local_bridge,
+        (
+            "ok",
+            "status",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "path",
+            "sha256",
+            "written",
+            "already_current",
+        ),
+    )
+    prepare_state_advanced = bool(
+        persistent_evidence.get("contract_revision_persisted") is True
+        or persistent_evidence.get("bounded_worker_dispatch_event_recorded") is True
+        or runtime_revision.get("id")
+        or runtime_revision.get("revision_id")
+        or dispatch_event.get("id")
+        or dispatch_event.get("event_id")
+        or dispatch_event.get("event_ref")
+        or local_bridge.get("written") is True
+    )
+    launch_text = value.get("launch_text")
+    encoded_launch_text: dict[str, Any] = {}
+    if isinstance(launch_text, str) and launch_text:
+        launch_bytes = launch_text.encode("utf-8")
+        compressed = zlib.compress(launch_bytes, level=9)
+        encoded = base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
+        if (
+            len(encoded.encode("ascii"))
+            <= _OBSERVER_RUNTIME_TEXT_PREPARE_CONTINUATION_MAX_ENCODED_BYTES
+        ):
+            encoded_launch_text = {
+                "schema_version": (
+                    "observer_runtime_text_prepare.encoded_launch_text."
+                    "zlib_base64url.v1"
+                ),
+                "encoding": "zlib+base64url",
+                "content_type": "text/plain; charset=utf-8",
+                "payload": encoded,
+                "uncompressed_sha256": (
+                    "sha256:" + hashlib.sha256(launch_bytes).hexdigest()
+                ),
+                "compressed_sha256": (
+                    "sha256:" + hashlib.sha256(compressed).hexdigest()
+                ),
+                "uncompressed_bytes": len(launch_bytes),
+                "compressed_bytes": len(compressed),
+                "continuation_complete": True,
+                "lossless": True,
+                "copy_safe": True,
+            }
+    continuation_available = bool(encoded_launch_text)
+    full_payload_artifact_available = bool(
+        str(value.get("full_payload_path") or "").strip()
+        and str(value.get("full_payload_sha256") or "").strip()
+    )
+    compact = {
+        "schema_version": "observer_runtime_text_prepare.compact_response.v1",
+        "response_view": "compact",
+        "bounded_response": True,
+        "source_serialized_bytes": serialized_bytes,
+        **_parallel_branch_startup_public_fields(
+            value,
+            (
+                "ok",
+                "status",
+                "project_id",
+                "backlog_id",
+                "runtime_context_id",
+                "observer_command_id",
+                "task_id",
+                "parent_task_id",
+                "contract_execution_id",
+                "launch_text_hash",
+                "full_payload_path",
+                "full_payload_sha256",
+                "request_id",
+                "error",
+                "message",
+                "zero_write_rejection",
+                "http_request_performed",
+            ),
+        ),
+        "prepare_state_advanced": prepare_state_advanced,
+        "http_request_performed": True,
+        "writes_performed": bool(value.get("writes_performed"))
+        or prepare_state_advanced,
+        "mutation_performed": bool(value.get("mutation_performed"))
+        or prepare_state_advanced,
+        "launch_text_omitted": True,
+        "lossless_continuation_available": continuation_available,
+        "semantic_truncation_performed": not continuation_available,
+        "full_payload_artifact_available": full_payload_artifact_available,
+        "raw_launch_text_exposed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    if dispatch_event:
+        compact["dispatch_timeline_event"] = dispatch_event
+    if runtime_revision:
+        compact["runtime_contract_revision"] = runtime_revision
+    if local_bridge:
+        compact["local_runtime_context_bridge"] = local_bridge
+    if encoded_launch_text:
+        compact["encoded_launch_text"] = encoded_launch_text
     return compact
 
 _ONBOARD_ROUTE_GUIDE_WORK_TYPE_VALUES = [
@@ -2203,6 +2401,15 @@ TOOLS: list[dict] = [
                 "retry_policy": {
                     "type": "object",
                     "description": "Bounded retry and successor policy pinned into the ticket.",
+                },
+                "response_view": {
+                    "type": "string",
+                    "enum": ["compact", "full"],
+                    "default": "compact",
+                    "description": (
+                        "Compact is the bounded agent-facing default. Full "
+                        "preserves the legacy response for explicit local audit."
+                    ),
                 },
                 "parent_route_identity": {
                     "type": "object",
@@ -5710,16 +5917,33 @@ class ToolDispatcher:
 
         if name == "observer_runtime_text_prepare":
             pid = args["project_id"]
+            response_view = str(args.get("response_view") or "compact").strip()
+            if response_view not in {"compact", "full"}:
+                return {
+                    "ok": False,
+                    "error": "observer_runtime_text_prepare_response_view_invalid",
+                    "message": "response_view must be compact or full",
+                    "response_view": response_view,
+                    "http_request_performed": False,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                }
             body = {
                 key: value
                 for key, value in args.items()
-                if key != "project_id" and value is not None
+                if key not in {"project_id", "response_view"} and value is not None
             }
             body.setdefault("main_worktree", self._workspace)
-            return self._api(
+            result = self._api(
                 "POST",
                 f"/api/projects/{pid}/observer/runtime-text/prepare",
                 body,
+            )
+            return (
+                result
+                if response_view == "full"
+                else _observer_runtime_text_prepare_compact_result(result)
             )
 
         if name == "task_hold":
