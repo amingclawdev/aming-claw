@@ -6,6 +6,7 @@ Provides routing, middleware (auth, idempotency, request_id, audit), and JSON ha
 from __future__ import annotations
 
 import ast
+import base64
 import hmac
 import json
 import mimetypes
@@ -118,6 +119,7 @@ import subprocess
 import tempfile
 import urllib.error
 import urllib.request
+import zlib
 PORT = int(os.environ.get("GOVERNANCE_PORT", "40000"))
 DASHBOARD_ROUTE_PREFIX = "/dashboard"
 
@@ -135227,6 +135229,18 @@ def _onboard_guide_capsule_bounded_section(
                 <= _ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES
             ):
                 return fallback
+        if section_name == "action_input":
+            encoded_fallback = (
+                _onboard_guide_capsule_encoded_action_input_continuation(
+                    overflow_fallback
+                )
+            )
+            if (
+                encoded_fallback
+                and _onboard_guide_capsule_serialized_bytes(encoded_fallback)
+                <= _ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES
+            ):
+                return encoded_fallback
     return {
         "schema_version": "onboard_route_guide.capsule_section_truncated.v1",
         "section": section_name,
@@ -135237,6 +135251,91 @@ def _onboard_guide_capsule_bounded_section(
             _ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES
         ),
         "available_keys": sorted(str(key) for key in projected)[:64],
+    }
+
+
+def _onboard_guide_capsule_encoded_action_input_continuation(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Losslessly bound one oversized copy-safe action body to its capsule.
+
+    The section cap is a security and latency boundary, so an oversized action
+    must not bypass it.  The canonical action body is already public/copy-safe;
+    sanitize it once more, serialize it canonically, and expose a compressed,
+    hash-bound representation that the host can decode without guessing or
+    reading source.  The capsule ref remains the authority/staleness fence.
+    """
+
+    action = (
+        value.get("canonical_executable_action")
+        if isinstance(value.get("canonical_executable_action"), Mapping)
+        else {}
+    )
+    body = (
+        action.get("copy_safe_body")
+        if isinstance(action.get("copy_safe_body"), Mapping)
+        else {}
+    )
+    mcp_tool = str(action.get("mcp_tool") or "").strip()
+    if (
+        str(action.get("schema_version") or "")
+        != "guide.canonical_executable_action.v1"
+        or not mcp_tool
+        or not body
+    ):
+        return {}
+    copy_safe_body, replacement_paths = _guide_executable_action_safe_body(
+        body
+    )
+    canonical_json = json.dumps(
+        copy_safe_body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    compressed = zlib.compress(canonical_json, level=9)
+    encoded = base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
+    body_sha256 = "sha256:" + hashlib.sha256(canonical_json).hexdigest()
+    compressed_sha256 = "sha256:" + hashlib.sha256(compressed).hexdigest()
+    return {
+        "schema_version": (
+            "onboard_route_guide.action_input_encoded_continuation.v1"
+        ),
+        "source_path": str(value.get("source_path") or ""),
+        "canonical_executable_action": {
+            "schema_version": "guide.canonical_executable_action.v1",
+            "action": str(action.get("action") or ""),
+            "facade": str(action.get("facade") or ""),
+            "mcp_tool": mcp_tool,
+            "method": str(action.get("method") or "POST"),
+            "path": str(action.get("path") or ""),
+            "body_source": "encoded_copy_safe_body",
+            "encoded_copy_safe_body": {
+                "schema_version": (
+                    "guide.encoded_copy_safe_body.zlib_base64url.v1"
+                ),
+                "encoding": "zlib+base64url",
+                "content_type": "application/json",
+                "canonical_json": True,
+                "payload": encoded,
+                "uncompressed_sha256": body_sha256,
+                "compressed_sha256": compressed_sha256,
+                "uncompressed_bytes": len(canonical_json),
+                "compressed_bytes": len(compressed),
+                "required_replacement_paths": replacement_paths,
+                "decoded_object_path": (
+                    "canonical_executable_action.copy_safe_body"
+                ),
+            },
+        },
+        "source_binding": dict(value.get("source_binding") or {}),
+        "continuation_complete": True,
+        "lossless": True,
+        "copy_safe": True,
+        "advisory_only": True,
+        "authorizes_write": False,
+        "satisfies_gate": False,
+        "synthesizes_pass": False,
     }
 
 
@@ -135264,9 +135363,18 @@ def _onboard_guide_capsule_find_action_input(
         for key in candidate_keys:
             candidate = node.get(key)
             if isinstance(candidate, Mapping) and candidate:
-                projected = _onboard_guide_capsule_bounded_section(
-                    candidate,
-                    section_name="action_input",
+                # Preserve the complete copy-safe body until the final capsule
+                # section is built.  Bounding here used to replace an
+                # oversized body with capsule_section_truncated.v1 before the
+                # action-input continuation could encode it losslessly.
+                projected, _replacement_paths = (
+                    _guide_executable_action_safe_body(
+                        candidate,
+                        path=".".join(
+                            item for item in (path, key) if item
+                        )
+                        or "action_input",
+                    )
                 )
                 return projected, ".".join(item for item in (path, key) if item)
         if depth >= 3:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, fields, replace
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+import base64
 import copy
 import errno
 import fcntl
@@ -18,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import zlib
 from threading import Event, Thread, get_ident
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -131929,6 +131931,126 @@ def test_irreversible_runtime_audit_terminal_projects_one_copy_safe_waive_body(
             bug_id=context.backlog_id,
             commit_sha="a" * 40,
         )
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+def test_irreversible_runtime_audit_terminal_oversized_body_is_lossless_bounded(
+    conn,
+    monkeypatch,
+):
+    record, context, _route_identity, _state, _eligibility, _failed_qa = (
+        _irreversible_runtime_audit_terminal_fixture(monkeypatch)
+    )
+    record.update(
+        {
+            "root_contract_execution_id": context.parent_task_id,
+            "contract_chain_id": "cchain-irreversible-runtime-encoded-body",
+            "execution_state_revision": 12,
+            "metadata": {},
+        }
+    )
+    action = server._mf_batch_irreversible_runtime_audit_terminal_authority(
+        conn,
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        record=record,
+    )
+    oversized_tests = [
+        f"pytest evidence {index:02d} " + ("bounded-copy-safe-evidence-" * 40)
+        for index in range(32)
+    ]
+    action["copy_safe_body"]["qa_acceptance"]["tests"] = oversized_tests
+    action["archive_action_input"] = copy.deepcopy(action["copy_safe_body"])
+    authority_proof = {
+        key: copy.deepcopy(value)
+        for key, value in action[
+            "irreversible_runtime_audit_terminal_authority"
+        ].items()
+        if key
+        not in {
+            "schema_version",
+            "server_derived",
+            "caller_claims_trusted",
+            "authority_hash",
+        }
+    }
+    authority_proof["archive_action_input"] = copy.deepcopy(
+        action["copy_safe_body"]
+    )
+    action["irreversible_runtime_audit_terminal_authority"] = (
+        task_timeline.source_backed_irreversible_runtime_audit_terminal_authority(
+            authority_proof
+        )
+    )
+    current_projection = {
+        "current_contract_execution_id": context.parent_task_id,
+        "execution_state_revision": 12,
+        "projection_hash": _fake_sha(
+            "irreversible-runtime-encoded-body-projection"
+        ),
+        "terminal": True,
+        "next_legal_action": copy.deepcopy(action),
+    }
+    before_changes = conn.total_changes
+    before_dump = "\n".join(conn.iterdump())
+
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        record=record,
+        next_action=action,
+        current_projection=current_projection,
+        runtime_resume={"next_legal_action": action},
+        target_files=list(context.owned_files),
+        projection_degraded=False,
+    )
+    assert compact["ok"] is True
+    assert compact["status"] == "compact_action_input_continuation_required"
+    fetched = server._onboard_guide_capsule_fetch(
+        project_id=PID,
+        backlog_id=context.backlog_id,
+        role="observer",
+        work_type="continue_contract_chain",
+        task_id=str(compact.get("selected_task_id") or ""),
+        guide_capsule_ref=compact["guide_capsule_ref"],
+        sections=["action_input"],
+    )
+    section = fetched["sections"]["action_input"]
+    assert section["schema_version"] == (
+        "onboard_route_guide.action_input_encoded_continuation.v1"
+    )
+    assert section["continuation_complete"] is True
+    assert section["lossless"] is True
+    executable = section["canonical_executable_action"]
+    assert executable["mcp_tool"] == "backlog_audit_archive"
+    encoded = executable["encoded_copy_safe_body"]
+    padding = "=" * (-len(encoded["payload"]) % 4)
+    compressed = base64.urlsafe_b64decode(encoded["payload"] + padding)
+    canonical_json = zlib.decompress(compressed)
+    decoded = json.loads(canonical_json)
+    expected, replacement_paths = server._guide_executable_action_safe_body(
+        action["copy_safe_body"]
+    )
+    assert decoded == expected
+    assert encoded["required_replacement_paths"] == replacement_paths
+    assert encoded["uncompressed_sha256"] == (
+        "sha256:" + hashlib.sha256(canonical_json).hexdigest()
+    )
+    assert encoded["compressed_sha256"] == (
+        "sha256:" + hashlib.sha256(compressed).hexdigest()
+    )
+    assert server._onboard_guide_capsule_serialized_bytes(section) <= (
+        server._ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES
+    )
+    assert server._onboard_guide_capsule_serialized_bytes(fetched) <= (
+        server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+    )
+    assert fetched["authorizes_write"] is False
+    assert fetched["satisfies_gate"] is False
+    assert fetched["synthesizes_pass"] is False
     assert conn.total_changes == before_changes
     assert "\n".join(conn.iterdump()) == before_dump
 
