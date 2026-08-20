@@ -56967,6 +56967,45 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 and not pre_lineage_request_binding_errors
             )
             if (
+                expected_post_receipt_startup_binding
+                and not supplied_post_receipt_startup_binding
+                and not pre_lineage_request_binding_errors
+            ):
+                raise GovernanceError(
+                    "runtime_context_post_receipt_startup_rejoin_binding_required",
+                    (
+                        "post-receipt pre-startup rejoin requires the exact "
+                        "server-projected next-stage checkpoint binding"
+                    ),
+                    409,
+                    {
+                        "runtime_context_id": runtime_context_id,
+                        "task_id": context.task_id,
+                        "missing_lineage": missing_lineage,
+                        "post_receipt_startup_binding_valid": False,
+                        "expected_post_receipt_startup_binding": dict(
+                            expected_post_receipt_startup_binding
+                        ),
+                        "supplied_post_receipt_startup_binding": {},
+                        "required_body_patch": {
+                            "server_rejoin_authority_binding": dict(
+                                expected_post_receipt_startup_binding
+                            )
+                        },
+                        "guide": (
+                            "refresh_runtime_context_worker_guide_and_submit_"
+                            "the_exact_server_projected_rejoin_copy_safe_body"
+                        ),
+                        "next_legal_action": (
+                            "refresh_runtime_context_worker_guide_for_"
+                            "post_receipt_startup_rejoin"
+                        ),
+                        "credential_rotated": False,
+                        "mutation_performed": False,
+                        "fail_closed": True,
+                    },
+                )
+            if (
                 pre_lineage_bootstrap_rejoin_authority.get("eligible")
                 is not True
                 and not post_receipt_next_stage_checkpoint_issuance

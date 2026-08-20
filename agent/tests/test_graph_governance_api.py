@@ -68018,6 +68018,41 @@ def test_pre_lineage_rejoin_checkpoint_advances_after_receipt_without_audit_drif
         PID,
         context.runtime_context_id,
     )
+    # Isolate the missing checkpoint binding from the separate legacy host-
+    # session omission compatibility exercised by executable_rejoin_body.
+    missing_checkpoint_binding_body = copy.deepcopy(projected_rejoin_body)
+    missing_checkpoint_binding_body.pop("server_rejoin_authority_binding")
+    with pytest.raises(GovernanceError) as missing_checkpoint_binding:
+        _pre_lineage_rejoin(
+            case,
+            body_override={
+                **missing_checkpoint_binding_body,
+                "reason": (
+                    "refresh the Guide before issuing the post-receipt "
+                    "startup checkpoint"
+                ),
+            },
+        )
+    assert missing_checkpoint_binding.value.code == (
+        "runtime_context_post_receipt_startup_rejoin_binding_required"
+    )
+    assert missing_checkpoint_binding.value.details["next_legal_action"] == (
+        "refresh_runtime_context_worker_guide_for_post_receipt_startup_rejoin"
+    )
+    assert missing_checkpoint_binding.value.details["required_body_patch"] == {
+        "server_rejoin_authority_binding": projected_binding
+    }
+    assert missing_checkpoint_binding.value.details["credential_rotated"] is False
+    assert missing_checkpoint_binding.value.details["mutation_performed"] is False
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        missing_checkpoint_binding.value,
+        before_context=before_ref_only_context,
+        before_events=before_ref_only_events,
+        before_revision=before_ref_only_revision,
+    )
+
     with pytest.raises(GovernanceError) as ref_only:
         _pre_lineage_rejoin(
             case,
