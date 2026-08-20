@@ -10,6 +10,7 @@ the staged credentials.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import threading
 from collections.abc import Callable, Mapping
@@ -176,6 +177,7 @@ class _ManagedEnvelope:
     run_id: str
     envelope_ref: str
     binding: dict[str, str]
+    fence_token_hash: str
     expired: bool = False
 
 
@@ -346,6 +348,9 @@ class ManagedHostEnvelopeContinuity:
                 field="session_token_ref",
             )
         binding["session_token_ref"] = response_refs.pop()
+        # Keep only a verifier for compatibility with managed clients that
+        # still echo the allocation fence on continuation calls.  The raw
+        # fence remains process-local in HostEnvelopeStore.
         required = (
             "project_id",
             "runtime_context_id",
@@ -387,6 +392,7 @@ class ManagedHostEnvelopeContinuity:
             run_id=run_id,
             envelope_ref=_text(receipt.get("envelope_ref")),
             binding=binding,
+            fence_token_hash=_sha256(raw_fence),
         )
         with self._lock:
             self._entries[run_id] = entry
@@ -473,6 +479,37 @@ class ManagedHostEnvelopeContinuity:
             )
         return None
 
+    @staticmethod
+    def _normalize_exact_redundant_fence(
+        args: Mapping[str, Any],
+        entry: _ManagedEnvelope,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Remove only a verifier-matched redundant managed fence.
+
+        Older worker call shapes echo the allocation ``fence_token`` even
+        after a same-process host envelope has been staged.  Treating that
+        exact value as a second auth branch blocks the managed happy path.
+        Compare it to the staged verifier, then let HostEnvelopeStore inject
+        the authoritative credential.  Raw session auth and wrong fences
+        remain local fail-closed rejections.
+        """
+
+        request_args = dict(args)
+        supplied_fence = _text(request_args.get("fence_token"))
+        if not supplied_fence or _text(request_args.get("session_token")):
+            return request_args, None
+        expected_hash = _text(entry.fence_token_hash)
+        if not expected_hash or not hmac.compare_digest(
+            _sha256(supplied_fence), expected_hash
+        ):
+            return request_args, _local_error(
+                "managed_host_envelope_scope_mismatch",
+                "Caller fence does not match the staged managed host envelope.",
+                mismatched_fields=["fence_token"],
+            )
+        request_args.pop("fence_token", None)
+        return request_args, None
+
     def dispatch(
         self,
         tool_name: str,
@@ -508,6 +545,11 @@ class ManagedHostEnvelopeContinuity:
                 "managed_host_envelope_not_loaded",
                 "This MCP process has no exact staged worker host envelope.",
             )
+        request_args, redundant_fence_rejection = (
+            self._normalize_exact_redundant_fence(request_args, entry)
+        )
+        if redundant_fence_rejection is not None:
+            return redundant_fence_rejection
         with self._lock:
             if entry.run_id in self._in_flight:
                 return _local_error(
@@ -540,6 +582,7 @@ class ManagedHostEnvelopeContinuity:
                         run_id=entry.run_id,
                         envelope_ref=entry.envelope_ref,
                         binding=entry.binding,
+                        fence_token_hash=entry.fence_token_hash,
                         expired=True,
                     )
                     self._entries[entry.run_id] = entry

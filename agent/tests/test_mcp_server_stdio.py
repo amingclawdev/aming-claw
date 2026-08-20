@@ -255,7 +255,34 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
                     "method": "tools/call",
                     "params": {
                         "name": "runtime_context_worker_guide",
-                        "arguments": guide_args,
+                        "arguments": {
+                            **guide_args,
+                            "fence_token": raw_fence,
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "runtime_context_worker_guide",
+                        "arguments": {
+                            **guide_args,
+                            "fence_token": "wrong-managed-fence",
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 12,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "runtime_context_worker_guide",
+                        "arguments": {
+                            **guide_args,
+                            "session_token": raw_session,
+                        },
                     },
                 },
                 {
@@ -288,7 +315,10 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
                     "method": "tools/call",
                     "params": {
                         "name": "runtime_context_read_receipt",
-                        "arguments": identity,
+                        "arguments": {
+                            **identity,
+                            "fence_token": raw_fence,
+                        },
                     },
                 },
                 {
@@ -326,7 +356,11 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
                     "method": "tools/call",
                     "params": {
                         "name": "parallel_branch_startup",
-                        "arguments": {**identity, "worker_role": "mf_sub"},
+                        "arguments": {
+                            **identity,
+                            "fence_token": raw_fence,
+                            "worker_role": "mf_sub",
+                        },
                     },
                 },
                 {
@@ -382,33 +416,38 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
     assert guide["raw_fence_token_exposed"] is False
     assert guide["raw_route_token_exposed"] is False
     assert payloads[2]["error"] == "managed_host_envelope_scope_mismatch"
-    assert payloads[2]["mismatched_fields"] == ["session_token_ref"]
+    assert payloads[2]["mismatched_fields"] == ["fence_token"]
     assert payloads[2]["http_request_performed"] is False
-    assert payloads[3]["error"] == "managed_host_envelope_scope_mismatch"
-    assert payloads[3]["mismatched_fields"] == ["task_id"]
+    assert payloads[3]["error"] == "managed_host_envelope_auth_ambiguous"
     assert payloads[3]["http_request_performed"] is False
+    assert payloads[4]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[4]["mismatched_fields"] == ["session_token_ref"]
+    assert payloads[4]["http_request_performed"] is False
     assert payloads[5]["error"] == "managed_host_envelope_scope_mismatch"
-    assert payloads[5]["missing_fields"] == [
-        "contract_execution_id"
-    ]
+    assert payloads[5]["mismatched_fields"] == ["task_id"]
     assert payloads[5]["http_request_performed"] is False
-    assert payloads[6]["error"] == "managed_host_envelope_scope_mismatch"
-    assert payloads[6]["mismatched_fields"] == [
+    assert payloads[7]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[7]["missing_fields"] == [
         "contract_execution_id"
     ]
-    assert payloads[6]["http_request_performed"] is False
-    assert payloads[7]["managed_host_envelope_consumed"] is True
-    assert payloads[7]["schema_version"] == (
+    assert payloads[7]["http_request_performed"] is False
+    assert payloads[8]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[8]["mismatched_fields"] == [
+        "contract_execution_id"
+    ]
+    assert payloads[8]["http_request_performed"] is False
+    assert payloads[9]["managed_host_envelope_consumed"] is True
+    assert payloads[9]["schema_version"] == (
         "parallel_branch_startup.compact_response.v1"
     )
-    assert payloads[7]["source_serialized_bytes"] > 262_144
-    assert payloads[7]["writes_performed"] is True
-    assert payloads[7]["mutation_performed"] is True
-    assert payloads[7]["startup_event_recorded"] is True
-    assert payloads[7]["timeline_event_recorded"]["id"] == 65
-    assert payloads[7]["startup_gate"]["startup_event_id"] == "timeline:65"
-    assert len(json.dumps(payloads[7]).encode()) < 64 * 1024
-    assert payloads[8]["error"] == "managed_host_envelope_not_loaded"
+    assert payloads[9]["source_serialized_bytes"] > 262_144
+    assert payloads[9]["writes_performed"] is True
+    assert payloads[9]["mutation_performed"] is True
+    assert payloads[9]["startup_event_recorded"] is True
+    assert payloads[9]["timeline_event_recorded"]["id"] == 65
+    assert payloads[9]["startup_gate"]["startup_event_id"] == "timeline:65"
+    assert len(json.dumps(payloads[9]).encode()) < 64 * 1024
+    assert payloads[10]["error"] == "managed_host_envelope_not_loaded"
     assert len(Handler.calls) == 4
     serialized = json.dumps(responses, sort_keys=True) + stderr
     assert raw_session not in serialized
@@ -657,11 +696,22 @@ def test_governance_stdio_mirror_manages_same_host_envelope_flow(monkeypatch):
             *route,
         }
     }
+    call_count = len(calls)
+    wrong_fence = governance_mcp_server._dispatch_tool(
+        "runtime_context_worker_guide",
+        {**guide_args, "fence_token": "wrong-mirror-managed-fence"},
+    )
+    assert wrong_fence["error"] == "managed_host_envelope_scope_mismatch"
+    assert wrong_fence["mismatched_fields"] == ["fence_token"]
+    assert wrong_fence["http_request_performed"] is False
+    assert len(calls) == call_count
     assert governance_mcp_server._dispatch_tool(
-        "runtime_context_worker_guide", guide_args
+        "runtime_context_worker_guide",
+        {**guide_args, "fence_token": raw_fence},
     )["ok"] is True
     assert governance_mcp_server._dispatch_tool(
-        "runtime_context_read_receipt", current_identity
+        "runtime_context_read_receipt",
+        {**current_identity, "fence_token": raw_fence},
     )["ok"] is True
     call_count = len(calls)
     missing_execution = dict(current_identity)
@@ -687,7 +737,12 @@ def test_governance_stdio_mirror_manages_same_host_envelope_flow(monkeypatch):
     assert len(calls) == call_count
     assert continuity.pending_count() == 1
     startup = governance_mcp_server._dispatch_tool(
-        "parallel_branch_startup", {**current_identity, "worker_role": "mf_sub"}
+        "parallel_branch_startup",
+        {
+            **current_identity,
+            "fence_token": raw_fence,
+            "worker_role": "mf_sub",
+        },
     )
     assert startup["managed_host_envelope_consumed"] is True
     assert continuity.pending_count() == 0
