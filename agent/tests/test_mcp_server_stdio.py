@@ -317,7 +317,7 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
                         "name": "runtime_context_read_receipt",
                         "arguments": {
                             **identity,
-                            "fence_token": raw_fence,
+                            "fence_token": "env:AMING_WORKER_FENCE_TOKEN",
                         },
                     },
                 },

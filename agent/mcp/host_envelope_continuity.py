@@ -77,6 +77,7 @@ _WORKER_BINDING_FIELDS = (
     "host_session_id",
 )
 _RAW_RESPONSE_FIELDS = ("session_token", "fence_token")
+_MANAGED_FENCE_ENV_REF = "env:AMING_WORKER_FENCE_TOKEN"
 _OWNER_ID = "mcp-host-envelope-continuity"
 _POST_RESPONSE_SAFE_FIELDS = (
     "request_id",
@@ -487,22 +488,31 @@ class ManagedHostEnvelopeContinuity:
 
     @staticmethod
     def _normalize_exact_redundant_fence(
+        tool_name: str,
         args: Mapping[str, Any],
         entry: _ManagedEnvelope,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Remove only a verifier-matched redundant managed fence.
 
-        Older worker call shapes echo the allocation ``fence_token`` even
-        after a same-process host envelope has been staged.  Treating that
-        exact value as a second auth branch blocks the managed happy path.
-        Compare it to the staged verifier, then let HostEnvelopeStore inject
-        the authoritative credential.  Raw session auth and wrong fences
-        remain local fail-closed rejections.
+        Older worker call shapes echo the allocation ``fence_token`` after a
+        same-process host envelope has been staged.  The read-receipt Guide
+        may instead carry its exact process-local environment reference.
+        Neither is a second auth branch: the store must inject the
+        authoritative credential.  Accept the canonical reference only for
+        read receipt, or a verifier-matched redundant fence for other managed
+        continuations.  Raw session auth, arbitrary environment references,
+        and wrong fences remain local fail-closed rejections.
         """
 
         request_args = dict(args)
         supplied_fence = _text(request_args.get("fence_token"))
         if not supplied_fence or _text(request_args.get("session_token")):
+            return request_args, None
+        if (
+            tool_name == "runtime_context_read_receipt"
+            and supplied_fence == _MANAGED_FENCE_ENV_REF
+        ):
+            request_args.pop("fence_token", None)
             return request_args, None
         expected_hash = _text(entry.fence_token_hash)
         if not expected_hash or not hmac.compare_digest(
@@ -552,7 +562,7 @@ class ManagedHostEnvelopeContinuity:
                 "This MCP process has no exact staged worker host envelope.",
             )
         request_args, redundant_fence_rejection = (
-            self._normalize_exact_redundant_fence(request_args, entry)
+            self._normalize_exact_redundant_fence(tool_name, request_args, entry)
         )
         if redundant_fence_rejection is not None:
             return redundant_fence_rejection

@@ -144,7 +144,20 @@ def test_managed_mcp_host_envelope_stages_injects_and_acks_startup():
     ]
     assert raw_session not in json.dumps(guide_startup_body, sort_keys=True)
     assert raw_fence not in json.dumps(guide_startup_body, sort_keys=True)
-    receipt = dispatcher.dispatch("runtime_context_read_receipt", dict(identity))
+    call_count = len(calls)
+    wrong_env_receipt = dispatcher.dispatch(
+        "runtime_context_read_receipt",
+        {**identity, "fence_token": "env:OTHER_WORKER_FENCE_TOKEN"},
+    )
+    assert wrong_env_receipt["error"] == "managed_host_envelope_scope_mismatch"
+    assert wrong_env_receipt["mismatched_fields"] == ["fence_token"]
+    assert wrong_env_receipt["http_request_performed"] is False
+    assert len(calls) == call_count
+
+    receipt = dispatcher.dispatch(
+        "runtime_context_read_receipt",
+        {**identity, "fence_token": "env:AMING_WORKER_FENCE_TOKEN"},
+    )
     assert receipt["ok"] is True
     assert dispatcher._host_envelope_continuity.pending_count() == 1
 
