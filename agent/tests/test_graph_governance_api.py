@@ -159568,6 +159568,11 @@ def test_compact_worker_graph_context_projects_exact_sibling_action_zero_write(
     ]
     assert pinned_body["tool"] == "function_index"
     assert pinned_body["args"] == {"query": "<exact source symbol name>"}
+    assert "session_token" not in pinned_body
+    assert "fence_token" not in pinned_body
+    assert pinned["canonical_executable_action"]["host_realization"][
+        "required_replacement_paths"
+    ] == ["copy_safe_body.args.query"]
     assert pinned["worker_graph_runtime_facade_projection"]["status"] == (
         "ready"
     )
@@ -159615,6 +159620,9 @@ def test_compact_worker_graph_context_projects_exact_sibling_action_zero_write(
     ]
     assert capsule_action["mcp_tool"] == "graph_query"
     assert capsule_action["copy_safe_body"] == pinned_body
+    assert capsule_action["host_realization"][
+        "required_replacement_paths"
+    ] == ["copy_safe_body.args.query"]
 
     from cli_agent_service import guided_runtime
 

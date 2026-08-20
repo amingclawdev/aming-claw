@@ -30864,9 +30864,6 @@ def _runtime_context_graph_copy_safe_body(
             "query_source": "mf_subagent",
             "query_purpose": "subagent_context_build",
             "session_token_ref": session_token_ref,
-            "fence_token": (
-                "<read from env:AMING_WORKER_FENCE_TOKEN at submission time>"
-            ),
             "route_identity": dict(route_identity),
             "raw_session_token_exposed": False,
         }
