@@ -146725,6 +146725,274 @@ def test_active_onboard_skill_uses_canonical_mf_parallel_finish_order():
     )
 
 
+def test_contract_runtime_bounded_line_write_response_preserves_small_and_fails_closed():
+    small = {
+        "schema_version": "contract_runtime.line_write_response.v1",
+        "ok": True,
+        "execution_state_revision": 3,
+        "decision": {"ok": True},
+    }
+    assert server._contract_runtime_bounded_line_write_response(
+        small,
+        record=None,
+        actor_role="observer",
+        request_id="req-small-line-write",
+        request_execution_state_revision=2,
+        db_total_changes_delta=1,
+    ) == small
+
+    rejected = server._contract_runtime_bounded_line_write_response(
+        {
+            "schema_version": "contract_runtime.line_write_response.v1",
+            "ok": False,
+            "error": "stale_execution_state_revision",
+            "execution_state_revision": 7,
+            "decision": {
+                "ok": False,
+                "errors": ["stale execution state revision"],
+            },
+            "oversized_diagnostic": "x" * 350_000,
+        },
+        record=None,
+        actor_role="observer",
+        request_id="req-rejected-line-write",
+        request_execution_state_revision=7,
+        db_total_changes_delta=0,
+    )
+    assert rejected["bounded_response"] is True
+    assert rejected["ok"] is False
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert rejected["zero_write_proven"] is True
+    assert rejected["current_request_mutation_proven"] is False
+    assert rejected["write_disposition"] == "not_written"
+    assert rejected["safe_retry"] is True
+    assert rejected["decision"]["errors"] == [
+        "stale execution state revision"
+    ]
+    assert len(json.dumps(rejected).encode("utf-8")) < 64 * 1024
+
+    ambiguous = server._contract_runtime_bounded_line_write_response(
+        {
+            "schema_version": "contract_runtime.line_write_response.v1",
+            "ok": True,
+            "execution_state_revision": 9,
+            "oversized_diagnostic": "x" * 350_000,
+        },
+        record=None,
+        actor_role="observer",
+        request_id="req-ambiguous-line-write",
+        request_execution_state_revision=9,
+        db_total_changes_delta=0,
+    )
+    assert ambiguous["write_disposition"] == "ambiguous"
+    assert ambiguous["current_request_mutation_proven"] is False
+    assert ambiguous["zero_write_proven"] is False
+    assert ambiguous["safe_retry"] is False
+    assert "writes_performed" not in ambiguous
+    assert "mutation_performed" not in ambiguous
+
+
+def test_contract_runtime_line_write_http_bounds_persisted_dispatch_for_legacy_client(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-CONTRACT-RUNTIME-LEGACY-CLIENT-BOUNDED-DISPATCH"
+    parent_task_id = "contract-runtime-legacy-client-parent"
+    worker_task_id = "contract-runtime-legacy-client-worker"
+    worktree = tmp_path / "contract-runtime-legacy-client-worker"
+    worktree.mkdir()
+    route_identity = {
+        "route_id": "route-contract-runtime-legacy-client",
+        "route_context_hash": "sha256:route-contract-runtime-legacy-client",
+        "prompt_contract_id": "rprompt-contract-runtime-legacy-client",
+        "prompt_contract_hash": "sha256:prompt-contract-runtime-legacy-client",
+        "route_token_ref": "rtok-contract-runtime-legacy-client",
+        "visible_injection_manifest_hash": (
+            "sha256:visible-contract-runtime-legacy-client"
+        ),
+    }
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": route_identity["route_token_ref"],
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    successor = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "actor": "operator",
+                "reason": "Exercise the legacy-client HTTP response boundary.",
+                "backlog_id": backlog_id,
+                "task_id": parent_task_id,
+                "contract_revision": "rev7",
+                "route_token_ref": route_identity["route_token_ref"],
+                "worker_fence": {
+                    "fence_token": "fence-contract-runtime-legacy-client",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                "owned_files": ["agent/governance/server.py"],
+            },
+        )
+    )
+    prefill = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor[
+                    "contract_execution_id"
+                ],
+            },
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "evidence_kind": "contract_binding",
+            },
+        )
+    )
+    assert prefill["ok"] is True
+    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
+        conn,
+        backlog_id=backlog_id,
+        task_id=worker_task_id,
+        fence_token="fence-contract-runtime-legacy-client",
+        token="contract-runtime-legacy-client-token",
+        worktree_path=str(worktree),
+        base_commit="base-contract-runtime-legacy-client",
+        target_head_commit="target-contract-runtime-legacy-client",
+        merge_queue_id="mergeq-contract-runtime-legacy-client",
+        owned_files=("agent/governance/server.py",),
+    )
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=successor["contract_execution_id"],
+        **route_identity,
+    )
+    before = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    before_revision = int(before["execution_state_revision"])
+    before_completed = len(before["completed_lines"])
+    original_response = server._contract_runtime_response
+
+    def oversized_response(record, **kwargs):
+        response = original_response(record, **kwargs)
+        if not kwargs.get("response_view"):
+            response["legacy_client_oversized_padding"] = "x" * 350_000
+            response["legacy_client_raw_auth_probe"] = (
+                "raw-session-must-not-cross-http-boundary"
+            )
+        return response
+
+    monkeypatch.setattr(server, "_contract_runtime_response", oversized_response)
+    worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
+    dispatch = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": successor[
+                    "contract_execution_id"
+                ],
+            },
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "worker_id": worker_identity,
+                "worker_slot_id": worker_identity,
+                "payload": {
+                    "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "worker_role": "mf_sub",
+                    "worker_id": worker_identity,
+                    "worker_slot_id": worker_identity,
+                    "target_project_root": runtime_context.target_project_root,
+                    "worktree_path": runtime_context.worktree_path,
+                    "branch_ref": runtime_context.branch_ref,
+                    "base_commit": "base-contract-runtime-legacy-client",
+                    "target_head_commit": (
+                        "target-contract-runtime-legacy-client"
+                    ),
+                    "merge_queue_id": "mergeq-contract-runtime-legacy-client",
+                    "owned_files": ["agent/governance/server.py"],
+                    "profile_requirements": {
+                        "profile_id": "codex-mf-sub",
+                        "harness": "codex",
+                    },
+                    "retry_policy": {"attempt": 1, "max_attempts": 2},
+                    **route_identity,
+                },
+            },
+        )
+    )
+
+    assert dispatch["schema_version"] == (
+        "contract_runtime.line_write.bounded_response.v1"
+    )
+    assert dispatch["source_response_schema_version"] == (
+        "contract_runtime.runtime_facade_response.v1"
+    )
+    assert dispatch["ok"] is True
+    assert dispatch["bounded_response"] is True
+    assert dispatch["response_view"] == "compact"
+    assert dispatch["writes_performed"] is True
+    assert dispatch["mutation_performed"] is True
+    assert dispatch["current_request_mutation_proven"] is True
+    assert dispatch["write_disposition"] == "written"
+    assert dispatch["safe_retry"] is False
+    assert dispatch["execution_state_revision"] == before_revision + 1
+    assert dispatch["mutation_authority"][
+        "request_execution_state_revision"
+    ] == before_revision
+    assert dispatch["mutation_authority"][
+        "response_execution_state_revision"
+    ] == before_revision + 1
+    assert dispatch["mutation_authority"][
+        "execution_state_revision_advanced"
+    ] is True
+    assert dispatch["mutation_authority"]["db_write_proven"] is True
+    assert dispatch["mutation_authority"]["db_total_changes_delta"] > 0
+    assert dispatch["completed_lines_summary"] == {
+        "count": before_completed + 1,
+        "raw_bodies_omitted": True,
+    }
+    assert dispatch["contract_runtime_dispatch_timeline_event"][
+        "status"
+    ] == "recorded"
+    serialized = json.dumps(dispatch, sort_keys=True)
+    assert len(serialized.encode("utf-8")) < 64 * 1024
+    assert "legacy_client_oversized_padding" not in serialized
+    assert "raw-session-must-not-cross-http-boundary" not in serialized
+
+    after = server._contract_runtime_store(conn).get(
+        successor["contract_execution_id"]
+    )
+    assert after["execution_state_revision"] == before_revision + 1
+    assert len(after["completed_lines"]) == before_completed + 1
+
+
 def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_command(
     conn,
     tmp_path,

@@ -103197,6 +103197,7 @@ def _contract_runtime_compact_exact_dispatch_bridge(
 
 
 _CONTRACT_RUNTIME_COMPACT_CLI_MAX_BYTES = 16 * 1024
+_CONTRACT_RUNTIME_LINE_WRITE_COMPACT_TRIGGER_BYTES = 64 * 1024
 _CONTRACT_RUNTIME_COMPACT_CLI_NEXT_ACTION_MAX_BYTES = 8 * 1024
 
 
@@ -103679,6 +103680,255 @@ def _contract_runtime_response(
             }
         )
     return response
+
+
+def _contract_runtime_bounded_line_write_response(
+    response: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any] | None,
+    actor_role: str,
+    request_id: str,
+    request_execution_state_revision: int | None,
+    db_total_changes_delta: int,
+) -> dict[str, Any]:
+    """Bound a committed line-write response before any MCP adapter sees it.
+
+    Older, already-loaded MCP clients cannot acquire a newly added adapter-side
+    compact projector. The governance HTTP boundary must therefore prevent a
+    refreshed ContractRuntime facade from crossing the MCP frame limit after
+    the write has committed. Small responses retain their historical shape;
+    oversized responses expose compact current authority plus server-owned
+    current-request mutation evidence.
+    """
+
+    source = dict(response)
+    source_serialized_bytes = _contract_runtime_compact_cli_serialized_bytes(
+        source
+    )
+    if (
+        source_serialized_bytes
+        <= _CONTRACT_RUNTIME_LINE_WRITE_COMPACT_TRIGGER_BYTES
+    ):
+        return source
+
+    try:
+        requested_revision = (
+            int(request_execution_state_revision)
+            if request_execution_state_revision is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        requested_revision = None
+    try:
+        response_revision = int(source.get("execution_state_revision"))
+    except (TypeError, ValueError):
+        response_revision = None
+    revision_advanced = bool(
+        requested_revision is not None
+        and response_revision is not None
+        and response_revision > requested_revision
+    )
+    db_write_proven = int(db_total_changes_delta or 0) > 0
+    explicit_write = bool(
+        source.get("writes_performed") is True
+        or source.get("mutation_performed") is True
+    )
+    explicit_zero_write = bool(
+        source.get("zero_write_rejection") is True
+        or source.get("zero_write") is True
+        or (
+            source.get("ok") is False
+            and not db_write_proven
+            and not revision_advanced
+        )
+    )
+    current_request_mutated = bool(
+        db_write_proven or revision_advanced or explicit_write
+    )
+
+    if isinstance(record, Mapping):
+        compact = _contract_runtime_response(
+            record,
+            actor_role=actor_role,
+            response_view="cli_current",
+            request_id=request_id,
+        )
+    else:
+        compact = {
+            key: value
+            for key, value in source.items()
+            if key
+            in {
+                "ok",
+                "status",
+                "error",
+                "code",
+                "message",
+                "project_id",
+                "backlog_id",
+                "contract_execution_id",
+                "contract_id",
+                "contract_revision_id",
+                "contract_hash",
+                "actor_role",
+                "execution_state_revision",
+                "execution_state_hash",
+                "runtime_guide_hash",
+                "route_token_ref",
+                "request_id",
+                "agent_facing_decision_source",
+            }
+            and isinstance(value, (str, int, float, bool, type(None)))
+        }
+
+    compact.update(
+        {
+            "schema_version": (
+                "contract_runtime.line_write.bounded_response.v1"
+            ),
+            "source_response_schema_version": str(
+                source.get("schema_version") or ""
+            ),
+            "response_view": "compact",
+            "bounded_response": True,
+            "source_serialized_bytes": source_serialized_bytes,
+            "max_serialized_bytes": (
+                _CONTRACT_RUNTIME_LINE_WRITE_COMPACT_TRIGGER_BYTES
+            ),
+            "ok": bool(source.get("ok")),
+            "actor_role": actor_role,
+            "request_id": request_id,
+            "http_request_performed": True,
+            "current_request_mutation_proven": current_request_mutated,
+            "zero_write_proven": bool(
+                explicit_zero_write and not current_request_mutated
+            ),
+            "write_disposition": (
+                "written"
+                if current_request_mutated
+                else "not_written"
+                if explicit_zero_write
+                else "ambiguous"
+            ),
+            "safe_retry": bool(
+                source.get("ok") is False
+                and explicit_zero_write
+                and not current_request_mutated
+            ),
+            "semantic_truncation_performed": False,
+            "raw_completed_line_bodies_omitted": True,
+            "raw_route_token_exposed": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_worker_auth_exposed": False,
+            "mutation_authority": {
+                "schema_version": (
+                    "contract_runtime.line_write.mutation_authority.v1"
+                ),
+                "request_execution_state_revision": requested_revision,
+                "response_execution_state_revision": response_revision,
+                "execution_state_revision_advanced": revision_advanced,
+                "db_total_changes_delta": max(
+                    0, int(db_total_changes_delta or 0)
+                ),
+                "db_write_proven": db_write_proven,
+                "explicit_write_flag": explicit_write,
+                "explicit_zero_write_flag": explicit_zero_write,
+                "source": "governance_http_request_connection",
+            },
+        }
+    )
+    if current_request_mutated:
+        compact["writes_performed"] = True
+        compact["mutation_performed"] = True
+    elif explicit_zero_write:
+        compact["writes_performed"] = False
+        compact["mutation_performed"] = False
+
+    decision = source.get("decision")
+    if isinstance(decision, Mapping):
+        compact_decision = {
+            key: value
+            for key, value in decision.items()
+            if key
+            in {
+                "schema_version",
+                "ok",
+                "allowed",
+                "decision",
+                "status",
+                "source",
+                "source_of_authority",
+                "error",
+                "code",
+                "message",
+            }
+            and isinstance(value, (str, int, float, bool, type(None)))
+        }
+        errors = decision.get("errors")
+        if isinstance(errors, list):
+            compact_decision["errors"] = [
+                str(item)[:2_048]
+                for item in errors[:32]
+                if str(item).strip()
+            ]
+        if compact_decision:
+            compact["decision"] = compact_decision
+
+    current_state = source.get("contract_runtime_current_state")
+    if isinstance(current_state, Mapping):
+        compact["contract_runtime_current_state"] = {
+            key: value
+            for key, value in current_state.items()
+            if key
+            in {
+                "schema_version",
+                "execution_state_revision",
+                "execution_state_hash",
+                "runtime_guide_hash",
+                "readiness_state",
+                "terminal",
+                "scheduler_eligible",
+                "current_eligible",
+                "close_eligible",
+                "write_eligible",
+                "status",
+            }
+            and isinstance(value, (str, int, float, bool, type(None)))
+        }
+
+    dispatch_event = source.get("contract_runtime_dispatch_timeline_event")
+    if isinstance(dispatch_event, Mapping):
+        compact["contract_runtime_dispatch_timeline_event"] = {
+            key: value
+            for key, value in dispatch_event.items()
+            if key
+            in {
+                "id",
+                "event_id",
+                "event_ref",
+                "status",
+                "project_id",
+                "backlog_id",
+                "task_id",
+                "event_type",
+                "event_kind",
+                "phase",
+                "request_id",
+            }
+            and isinstance(value, (str, int, float, bool, type(None)))
+        }
+
+    completed_lines = (
+        record.get("completed_lines") if isinstance(record, Mapping) else []
+    )
+    compact["completed_lines_summary"] = {
+        "count": len(completed_lines)
+        if isinstance(completed_lines, list)
+        else 0,
+        "raw_bodies_omitted": True,
+    }
+    return compact
 
 
 def _onboard_service_record(value: Mapping[str, Any] | None) -> bool:
@@ -183338,6 +183588,10 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
     with DBContext(project_id) as conn:
         runtime = _contract_runtime(conn)
         record = runtime.store.get(contract_execution_id)
+        request_execution_state_revision = int(
+            record.get("execution_state_revision") or 0
+        )
+        request_total_changes_before = int(conn.total_changes)
         actor_role = ""
         try:
             actor_role = _contract_runtime_effective_actor_role(
@@ -183578,6 +183832,9 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
             }
             return response
         conn.commit()
+        request_db_total_changes_delta = max(
+            0, int(conn.total_changes) - request_total_changes_before
+        )
         _publish_accepted_contract_runtime_line_write(
             project_id,
             result=result,
@@ -183608,7 +183865,18 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
             "close_authority_precheck"
         ]
     response.update(_contract_runtime_qa_rejection_response_fields(result))
-    return response
+    return _contract_runtime_bounded_line_write_response(
+        response,
+        record=(
+            result.get("record")
+            if isinstance(result.get("record"), Mapping)
+            else None
+        ),
+        actor_role=actor_role,
+        request_id=str(ctx.request_id),
+        request_execution_state_revision=request_execution_state_revision,
+        db_total_changes_delta=request_db_total_changes_delta,
+    )
 
 
 @route("POST", "/api/projects/{project_id}/contract-runtime/{contract_execution_id}/line-bypasses")
