@@ -5623,28 +5623,24 @@ def test_mcp_runtime_status_detects_live_server_tool_schema_upgrade():
     assert "restart_or_refresh_mcp_session" in status["recommended_actions"]
 
 
-def test_current_mcp_schema_bump_marks_prior_client_stale():
-    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-19.1"
-    allocate_properties = _tool_properties("parallel_branch_allocate")
-    assert allocate_properties["profile_requirements"]["type"] == "object"
-    assert allocate_properties["retry_policy"]["type"] == "object"
-    archive_tool = next(
-        tool for tool in TOOLS if tool.get("name") == "backlog_audit_archive"
-    )
-    assert set(archive_tool["inputSchema"]["required"]) >= {
-        "project_id",
-        "bug_id",
-    }
+def test_current_mcp_schema_bump_marks_pre_current_full_view_client_stale():
+    assert MCP_TOOL_SCHEMA_VERSION == "2026-08-20.1"
+    reconcile_properties = _tool_properties("graph_current_full_reconcile")
+    assert reconcile_properties["response_view"]["enum"] == [
+        "compact",
+        "full",
+    ]
+    assert reconcile_properties["response_view"]["default"] == "compact"
 
     compatibility = mcp_tool_schema_compatibility(
-        loaded_schema_version="2026-08-15.1",
+        loaded_schema_version="2026-08-19.1",
         server_schema_version=MCP_TOOL_SCHEMA_VERSION,
         minimum_client_schema_version=MCP_TOOL_SCHEMA_VERSION,
     )
 
-    assert compatibility["loaded_client_tool_schema_version"] == "2026-08-15.1"
-    assert compatibility["server_tool_schema_version"] == "2026-08-19.1"
-    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-19.1"
+    assert compatibility["loaded_client_tool_schema_version"] == "2026-08-19.1"
+    assert compatibility["server_tool_schema_version"] == "2026-08-20.1"
+    assert compatibility["minimum_client_tool_schema_version"] == "2026-08-20.1"
     assert compatibility["client_schema_fresh"] is False
     assert compatibility["stale_client_possible"] is True
 
