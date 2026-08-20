@@ -1322,6 +1322,98 @@ def test_contract_runtime_timeout_schema_bounds_match_across_mcp_entrypoints():
     assert timeout_schemas[0] == timeout_schemas[1]
 
 
+def test_governance_stdio_contract_runtime_submit_line_bounds_persisted_dispatch(
+    monkeypatch,
+):
+    raw_result = {
+        "ok": True,
+        "project_id": "aming-claw",
+        "backlog_id": "AC-STDIO-SUBMIT-LINE-BOUNDED",
+        "contract_execution_id": "cex-stdio-submit-line-bounded",
+        "actor_role": "observer",
+        "execution_state_revision": 8,
+        "execution_state_hash": "sha256:" + ("a" * 64),
+        "runtime_guide_hash": "sha256:" + ("b" * 64),
+        "request_id": "req-stdio-submit-line-bounded",
+        "decision": {"ok": True, "decision": "allow"},
+        "runtime_guide": {
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "evidence_kind": "bounded_worker_dispatch",
+                    "actor_role": "observer",
+                    "payload": {
+                        "oversized": "never-return-full-dispatch-body" * 30_000,
+                        "session_token": "raw-session-must-not-escape",
+                        "fence_token": "raw-fence-must-not-escape",
+                    },
+                }
+            ]
+        },
+        "contract_runtime_current_state": {
+            "execution_state_revision": 8,
+            "execution_state_hash": "sha256:" + ("a" * 64),
+            "runtime_guide_hash": "sha256:" + ("b" * 64),
+        },
+        "next_legal_action": {
+            "id": "worker_read_runtime_guide",
+            "action": "record_read_receipt",
+            "stage_id": "worker_read",
+            "line_id": "worker_read_runtime_guide",
+            "evidence_kind": "read_receipt",
+            "owner_role": "mf_sub",
+            "runtime_context_id": "mfrctx-stdio-submit-line-bounded",
+            "task_id": "worker-stdio-submit-line-bounded",
+        },
+        "contract_runtime_dispatch_timeline_event": {
+            "id": 91,
+            "event_ref": "timeline:91",
+            "status": "recorded",
+            "event_kind": "bounded_implementation_worker_dispatch",
+        },
+    }
+    calls = []
+
+    def fake_http(method, path, body=None, **kwargs):
+        calls.append((method, path, body, kwargs))
+        return raw_result
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    result = governance_mcp_server._dispatch_tool(
+        "contract_runtime_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-stdio-submit-line-bounded",
+            "execution_state_revision": 7,
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "evidence_kind": "bounded_worker_dispatch",
+        },
+    )
+
+    assert result["schema_version"] == (
+        "contract_runtime.submit_line.compact_response.v1"
+    )
+    assert result["bounded_response"] is True
+    assert result["writes_performed"] is True
+    assert result["mutation_performed"] is True
+    assert result["execution_state_revision"] == 8
+    assert result["next_legal_action"]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+    assert result["contract_runtime_dispatch_timeline_event"]["id"] == 91
+    assert len(json.dumps(result).encode()) < 64 * 1024
+    serialized = json.dumps(result, sort_keys=True)
+    assert "never-return-full-dispatch-body" not in serialized
+    assert "raw-session-must-not-escape" not in serialized
+    assert "raw-fence-must-not-escape" not in serialized
+    assert calls[0][0:2] == (
+        "POST",
+        "/api/projects/aming-claw/contract-runtime/cex-stdio-submit-line-bounded/line-writes",
+    )
+
+
 def test_governance_mcp_bypass_schema_and_dispatch_preserve_graph_trace_ids(
     monkeypatch,
 ):

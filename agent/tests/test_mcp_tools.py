@@ -1912,6 +1912,161 @@ def test_mcp_graph_current_full_reconcile_invalid_view_is_local_zero_write(
     assert calls == []
 
 
+def test_mcp_contract_runtime_submit_line_bounds_success_and_preserves_write_truth():
+    raw_result = {
+        "ok": True,
+        "project_id": "aming-claw",
+        "backlog_id": "AC-SUBMIT-LINE-BOUNDED",
+        "contract_execution_id": "cex-submit-line-bounded",
+        "contract_id": "mf_parallel.v2",
+        "contract_revision_id": "rev9",
+        "contract_hash": "sha256:" + ("a" * 64),
+        "actor_role": "observer",
+        "execution_state_revision": 3,
+        "execution_state_hash": "sha256:" + ("b" * 64),
+        "runtime_guide_hash": "sha256:" + ("c" * 64),
+        "route_token_ref": "rtok-submit-line-bounded",
+        "request_id": "req-submit-line-bounded",
+        "decision": {
+            "schema_version": "contract_write_gate_decision.v1",
+            "ok": True,
+            "decision": "allow",
+        },
+        "contract_runtime_current_state": {
+            "schema_version": "contract_runtime.current_state.v1",
+            "execution_state_revision": 3,
+            "execution_state_hash": "sha256:" + ("b" * 64),
+            "runtime_guide_hash": "sha256:" + ("c" * 64),
+            "readiness_state": "in_progress",
+            "raw_state": "raw-current-state-must-not-escape" * 20_000,
+        },
+        "runtime_guide": {
+            "completed_lines": [
+                {
+                    "stage_id": "dispatch",
+                    "line_id": "observer_dispatch_bounded_workers",
+                    "line_instance_id": "dispatch:1",
+                    "evidence_kind": "bounded_worker_dispatch",
+                    "actor_role": "observer",
+                    "payload": {
+                        "raw_body": "raw-completed-line-must-not-escape" * 20_000,
+                    },
+                }
+            ],
+            "instructions": "raw-guide-must-not-escape" * 20_000,
+        },
+        "next_legal_action": {
+            "schema_version": "contract_runtime_next_legal_action.v1",
+            "id": "worker_read_runtime_guide",
+            "action": "record_read_receipt",
+            "stage_id": "worker_read",
+            "line_id": "worker_read_runtime_guide",
+            "evidence_kind": "read_receipt",
+            "owner_role": "mf_sub",
+            "runtime_context_id": "mfrctx-submit-line-bounded",
+            "task_id": "worker-submit-line-bounded",
+            "parent_task_id": "cex-submit-line-bounded",
+            "raw_bridge": "raw-bridge-must-not-escape" * 20_000,
+        },
+        "contract_runtime_dispatch_timeline_event": {
+            "id": 90,
+            "event_ref": "timeline:90",
+            "status": "recorded",
+            "event_kind": "bounded_implementation_worker_dispatch",
+            "task_id": "worker-submit-line-bounded",
+        },
+    }
+
+    class LargeSubmitRecorder(_Recorder):
+        def api(self, method, path, data=None, **_kwargs):
+            self.calls.append((method, path, data))
+            return raw_result
+
+    recorder = LargeSubmitRecorder()
+    result = _dispatcher(recorder).dispatch(
+        "contract_runtime_submit_line",
+        {
+            "project_id": "aming-claw",
+            "contract_execution_id": "cex-submit-line-bounded",
+            "execution_state_revision": 2,
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "evidence_kind": "bounded_worker_dispatch",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["bounded_response"] is True
+    assert result["response_view"] == "compact"
+    assert result["execution_state_revision"] == 3
+    assert result["writes_performed"] is True
+    assert result["mutation_performed"] is True
+    assert result["write_disposition"] == "written"
+    assert result["mutation_authority"] == {
+        "schema_version": "contract_runtime.submit_line.mutation_authority.v1",
+        "request_execution_state_revision": 2,
+        "response_execution_state_revision": 3,
+        "execution_state_revision_advanced": True,
+        "dispatch_event_recorded_now": True,
+        "explicit_write_flag": False,
+        "explicit_zero_write_flag": False,
+    }
+    assert result["next_legal_action"]["line_id"] == (
+        "worker_read_runtime_guide"
+    )
+    assert result["last_completed_line"]["line_id"] == (
+        "observer_dispatch_bounded_workers"
+    )
+    assert result["contract_runtime_dispatch_timeline_event"]["id"] == 90
+    assert len(json.dumps(result).encode()) < 64 * 1024
+    serialized = json.dumps(result, sort_keys=True)
+    assert "raw-completed-line-must-not-escape" not in serialized
+    assert "raw-current-state-must-not-escape" not in serialized
+    assert "raw-guide-must-not-escape" not in serialized
+    assert "raw-bridge-must-not-escape" not in serialized
+
+
+def test_mcp_contract_runtime_submit_line_keeps_small_shape_and_large_rejection_zero_write():
+    small = {
+        "ok": True,
+        "execution_state_revision": 3,
+        "completed_line": {"line_id": "small"},
+    }
+    assert mcp_tools._contract_runtime_submit_line_compact_result(
+        small,
+        request_execution_state_revision=2,
+    ) is small
+
+    rejected = {
+        "ok": False,
+        "error": "contract_runtime_line_rejected",
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "execution_state_revision": 2,
+        "decision": {
+            "ok": False,
+            "decision": "block",
+            "errors": ["line identity mismatch"],
+        },
+        "runtime_guide": {
+            "completed_lines": [],
+            "oversized": "rejected-body" * 30_000,
+        },
+    }
+    compact = mcp_tools._contract_runtime_submit_line_compact_result(
+        rejected,
+        request_execution_state_revision=2,
+    )
+    assert compact["ok"] is False
+    assert compact["writes_performed"] is False
+    assert compact["mutation_performed"] is False
+    assert compact["current_request_mutation_proven"] is False
+    assert compact["write_disposition"] == "not_written"
+    assert compact["safe_retry"] is True
+    assert compact["decision"]["errors"] == ["line identity mismatch"]
+
+
 def test_mcp_graph_current_full_reconcile_uses_reconcile_timeout(monkeypatch):
     monkeypatch.delenv("AMING_GRAPH_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("AMING_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)

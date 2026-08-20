@@ -39,12 +39,18 @@ try:
     from agent.mcp.host_envelope_continuity import (
         default_managed_host_envelope_continuity,
     )
-    from agent.mcp.tools import _current_full_reconcile_compact_result
+    from agent.mcp.tools import (
+        _contract_runtime_submit_line_compact_result,
+        _current_full_reconcile_compact_result,
+    )
 except ModuleNotFoundError:  # Direct ``python agent/governance/mcp_server.py``.
     from mcp.host_envelope_continuity import (
         default_managed_host_envelope_continuity,
     )
-    from mcp.tools import _current_full_reconcile_compact_result
+    from mcp.tools import (
+        _contract_runtime_submit_line_compact_result,
+        _current_full_reconcile_compact_result,
+    )
 
 # ---------------------------------------------------------------------------
 # Ensure the agent package root is on sys.path so relative imports work when
@@ -4007,7 +4013,12 @@ def _dispatch_tool(name: str, args: dict) -> Any:
                 timeout_seconds=timeout_seconds,
                 result=result,
             )
-        return result
+        return _contract_runtime_submit_line_compact_result(
+            result,
+            request_execution_state_revision=args.get(
+                "execution_state_revision"
+            ),
+        )
 
     if name == "contract_runtime_bypass_line":
         pid = args["project_id"]

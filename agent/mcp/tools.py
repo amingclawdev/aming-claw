@@ -48,6 +48,7 @@ _CONTRACT_RUNTIME_MCP_TIMEOUT_LEGACY_SECONDS = 15
 _CONTRACT_RUNTIME_MCP_TIMEOUT_ENV_KEYS = (
     "AMING_CONTRACT_RUNTIME_MCP_TIMEOUT_SECONDS",
 )
+_CONTRACT_RUNTIME_SUBMIT_LINE_COMPACT_TRIGGER_BYTES = 64 * 1024
 _WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES = 256 * 1024
 _PARALLEL_BRANCH_STARTUP_COMPACT_TRIGGER_BYTES = 64 * 1024
 _OBSERVER_RUNTIME_TEXT_PREPARE_COMPACT_TRIGGER_BYTES = 64 * 1024
@@ -220,6 +221,294 @@ def _parallel_branch_startup_public_fields(
             if item not in (None, ""):
                 projected[field] = item
     return projected
+
+
+def _contract_runtime_submit_line_compact_result(
+    value: Any,
+    *,
+    request_execution_state_revision: int | None,
+) -> Any:
+    """Bound a submit-line result without erasing an already-persisted write.
+
+    ContractRuntime line writes return the refreshed full runtime facade. A
+    large completed-line history can therefore exceed the managed MCP frame
+    after the database commit has already succeeded. Project the durable
+    current identity at the adapter boundary so the generic frame guard never
+    rewrites that accepted mutation as a zero-write transport failure.
+
+    Mutation truth is derived only from explicit response flags, a strictly
+    advanced execution revision relative to the caller's pinned revision, or
+    a dispatch event recorded by this request. Missing or ambiguous evidence
+    never synthesizes a write.
+    """
+
+    if not isinstance(value, dict):
+        return value
+    try:
+        serialized_bytes = len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "contract_runtime_submit_line_response_not_serializable",
+            "message": str(exc),
+            "http_request_performed": True,
+            "write_disposition": "ambiguous",
+            "current_request_mutation_proven": False,
+            "safe_retry": False,
+            "raw_route_token_exposed": False,
+            "raw_worker_auth_exposed": False,
+        }
+    if serialized_bytes <= _CONTRACT_RUNTIME_SUBMIT_LINE_COMPACT_TRIGGER_BYTES:
+        return value
+
+    try:
+        requested_revision = (
+            int(request_execution_state_revision)
+            if request_execution_state_revision is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        requested_revision = None
+    try:
+        response_revision = int(value.get("execution_state_revision"))
+    except (TypeError, ValueError):
+        response_revision = None
+
+    dispatch_event = (
+        value.get("contract_runtime_dispatch_timeline_event")
+        if isinstance(
+            value.get("contract_runtime_dispatch_timeline_event"), dict
+        )
+        else {}
+    )
+    dispatch_event = _parallel_branch_startup_public_fields(
+        dispatch_event,
+        (
+            "id",
+            "event_id",
+            "event_ref",
+            "status",
+            "project_id",
+            "backlog_id",
+            "task_id",
+            "event_type",
+            "event_kind",
+            "phase",
+            "request_id",
+        ),
+    )
+    dispatch_recorded_now = bool(
+        (dispatch_event.get("id") or dispatch_event.get("event_id"))
+        and str(dispatch_event.get("status") or "").strip().lower()
+        in {
+            "accepted",
+            "complete",
+            "completed",
+            "created",
+            "passed",
+            "persisted",
+            "recorded",
+            "succeeded",
+            "success",
+        }
+    )
+    revision_advanced = bool(
+        requested_revision is not None
+        and response_revision is not None
+        and response_revision > requested_revision
+    )
+    explicit_write = bool(
+        value.get("writes_performed") is True
+        or value.get("mutation_performed") is True
+    )
+    explicit_zero_write = bool(
+        value.get("zero_write_rejection") is True
+        or (
+            "writes_performed" in value
+            and "mutation_performed" in value
+            and value.get("writes_performed") is False
+            and value.get("mutation_performed") is False
+        )
+    )
+    current_request_mutated = bool(
+        explicit_write or revision_advanced or dispatch_recorded_now
+    )
+    write_disposition = (
+        "written"
+        if current_request_mutated
+        else "not_written"
+        if explicit_zero_write
+        else "ambiguous"
+    )
+
+    next_action = _parallel_branch_startup_public_fields(
+        value.get("next_legal_action"),
+        (
+            "schema_version",
+            "id",
+            "action",
+            "interface",
+            "mcp_tool",
+            "status",
+            "stage_id",
+            "line_id",
+            "evidence_kind",
+            "owner_role",
+            "contract_execution_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "source",
+            "precedence",
+        ),
+    )
+    current_state = _parallel_branch_startup_public_fields(
+        value.get("contract_runtime_current_state"),
+        (
+            "schema_version",
+            "execution_state_revision",
+            "execution_state_hash",
+            "runtime_guide_hash",
+            "readiness_state",
+            "terminal",
+            "scheduler_eligible",
+            "current_eligible",
+            "close_eligible",
+            "write_eligible",
+            "status",
+        ),
+    )
+    runtime_guide = (
+        value.get("runtime_guide")
+        if isinstance(value.get("runtime_guide"), dict)
+        else {}
+    )
+    completed_lines = (
+        runtime_guide.get("completed_lines")
+        if isinstance(runtime_guide.get("completed_lines"), list)
+        else []
+    )
+    last_completed_line = _parallel_branch_startup_public_fields(
+        completed_lines[-1] if completed_lines else {},
+        (
+            "stage_id",
+            "line_id",
+            "line_instance_id",
+            "evidence_kind",
+            "actor_role",
+            "status",
+            "commit_sha",
+        ),
+    )
+    decision = (
+        value.get("decision") if isinstance(value.get("decision"), dict) else {}
+    )
+    compact_decision = _parallel_branch_startup_public_fields(
+        decision,
+        (
+            "schema_version",
+            "ok",
+            "allowed",
+            "decision",
+            "status",
+            "source",
+            "source_of_authority",
+            "error",
+            "code",
+            "message",
+        ),
+    )
+    errors = decision.get("errors")
+    if isinstance(errors, list):
+        compact_errors = [
+            str(item)[:2_048]
+            for item in errors[:32]
+            if str(item).strip()
+        ]
+        if compact_errors:
+            compact_decision["errors"] = compact_errors
+
+    compact: dict[str, Any] = {
+        "schema_version": "contract_runtime.submit_line.compact_response.v1",
+        "response_view": "compact",
+        "bounded_response": True,
+        "source_serialized_bytes": serialized_bytes,
+        **_parallel_branch_startup_public_fields(
+            value,
+            (
+                "ok",
+                "status",
+                "error",
+                "code",
+                "message",
+                "project_id",
+                "backlog_id",
+                "contract_execution_id",
+                "contract_id",
+                "contract_revision_id",
+                "contract_hash",
+                "actor_role",
+                "execution_state_revision",
+                "execution_state_hash",
+                "runtime_guide_hash",
+                "route_token_ref",
+                "request_id",
+                "agent_facing_decision_source",
+                "zero_write_rejection",
+            ),
+        ),
+        "http_request_performed": True,
+        "current_request_mutation_proven": current_request_mutated,
+        "zero_write_proven": explicit_zero_write,
+        "write_disposition": write_disposition,
+        "safe_retry": explicit_zero_write and value.get("ok") is False,
+        "completed_lines_summary": {
+            "count": len(completed_lines),
+            "raw_bodies_omitted": True,
+        },
+        "semantic_truncation_performed": False,
+        "raw_completed_line_bodies_omitted": True,
+        "raw_route_token_exposed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_worker_auth_exposed": False,
+    }
+    if compact_decision:
+        compact["decision"] = compact_decision
+    if current_request_mutated:
+        compact["writes_performed"] = True
+        compact["mutation_performed"] = True
+    elif explicit_zero_write:
+        compact["writes_performed"] = False
+        compact["mutation_performed"] = False
+    if next_action:
+        compact["next_legal_action"] = next_action
+    if current_state:
+        compact["contract_runtime_current_state"] = current_state
+    if last_completed_line:
+        compact["last_completed_line"] = last_completed_line
+    if dispatch_event:
+        compact["contract_runtime_dispatch_timeline_event"] = dispatch_event
+    compact["mutation_authority"] = {
+        "schema_version": "contract_runtime.submit_line.mutation_authority.v1",
+        "request_execution_state_revision": requested_revision,
+        "response_execution_state_revision": response_revision,
+        "execution_state_revision_advanced": revision_advanced,
+        "dispatch_event_recorded_now": dispatch_recorded_now,
+        "explicit_write_flag": explicit_write,
+        "explicit_zero_write_flag": explicit_zero_write,
+    }
+    return compact
 
 
 _PARALLEL_BRANCH_STARTUP_GATE_FIELDS = (
@@ -6872,7 +7161,12 @@ class ToolDispatcher:
                     timeout_seconds=timeout_seconds,
                     result=result,
                 )
-            return result
+            return _contract_runtime_submit_line_compact_result(
+                result,
+                request_execution_state_revision=args.get(
+                    "execution_state_revision"
+                ),
+            )
 
         if name == "contract_runtime_bypass_line":
             pid = args["project_id"]
