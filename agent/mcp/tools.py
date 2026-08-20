@@ -49,6 +49,7 @@ _CONTRACT_RUNTIME_MCP_TIMEOUT_ENV_KEYS = (
     "AMING_CONTRACT_RUNTIME_MCP_TIMEOUT_SECONDS",
 )
 _CONTRACT_RUNTIME_SUBMIT_LINE_COMPACT_TRIGGER_BYTES = 64 * 1024
+_CONTRACT_RUNTIME_PRECHECK_LINE_FULL_MAX_SERIALIZED_BYTES = 256 * 1024
 _WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES = 256 * 1024
 _PARALLEL_BRANCH_STARTUP_COMPACT_TRIGGER_BYTES = 64 * 1024
 _OBSERVER_RUNTIME_TEXT_PREPARE_COMPACT_TRIGGER_BYTES = 64 * 1024
@@ -508,6 +509,327 @@ def _contract_runtime_submit_line_compact_result(
         "explicit_write_flag": explicit_write,
         "explicit_zero_write_flag": explicit_zero_write,
     }
+    return compact
+
+
+def _contract_runtime_precheck_diagnostic_value(value: Any) -> Any:
+    """Return one bounded, copy-safe diagnostic value.
+
+    Precheck failures can contain field-level expected/actual values.  Keep
+    those diagnostics useful without copying arbitrary runtime facades,
+    managed-host envelopes, or raw authorization material into MCP output.
+    """
+
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    if isinstance(value, str):
+        return value[:2_048]
+    if isinstance(value, list):
+        return [
+            _contract_runtime_precheck_diagnostic_value(item)
+            for item in value[:32]
+            if isinstance(item, (str, int, float, bool, dict)) or item is None
+        ]
+    if isinstance(value, dict):
+        allowed = {
+            "actual",
+            "code",
+            "error",
+            "expected",
+            "field",
+            "message",
+            "reason",
+            "requirement_id",
+            "status",
+        }
+        field_name = str(value.get("field") or "").strip().lower()
+        sensitive_field = any(
+            marker in field_name
+            for marker in (
+                "auth",
+                "credential",
+                "envelope",
+                "fence_token",
+                "route_token",
+                "secret",
+                "session_token",
+            )
+        )
+        return {
+            key: _contract_runtime_precheck_diagnostic_value(item)
+            for key, item in value.items()
+            if key in allowed
+            and not (sensitive_field and key in {"actual", "expected"})
+        }
+    return str(value)[:2_048]
+
+
+def _contract_runtime_precheck_contains_unsafe_public_field(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).strip().lower()
+            if normalized in {
+                "fence_token",
+                "host_envelope",
+                "managed_host_envelope",
+                "route_token",
+                "session_token",
+            } or normalized.startswith("raw_"):
+                return True
+            if _contract_runtime_precheck_contains_unsafe_public_field(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(
+            _contract_runtime_precheck_contains_unsafe_public_field(item)
+            for item in value
+        )
+    return False
+
+
+def _contract_runtime_precheck_line_compact_result(
+    value: Any,
+    *,
+    response_view: str,
+) -> Any:
+    """Project one read-only ContractRuntime precheck below the MCP frame cap."""
+
+    if not isinstance(value, dict):
+        return value
+    try:
+        serialized_bytes = len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "contract_runtime_precheck_line_response_not_serializable",
+            "message": str(exc),
+            "response_view": response_view,
+            "http_request_performed": True,
+            "write_disposition": "not_written",
+            "writes_performed": False,
+            "mutation_performed": False,
+            "raw_route_token_exposed": False,
+            "raw_worker_auth_exposed": False,
+        }
+
+    unsafe_full_shape = _contract_runtime_precheck_contains_unsafe_public_field(
+        value
+    )
+    if (
+        response_view == "full"
+        and serialized_bytes
+        <= _CONTRACT_RUNTIME_PRECHECK_LINE_FULL_MAX_SERIALIZED_BYTES
+        and not unsafe_full_shape
+    ):
+        return value
+
+    decision = (
+        value.get("decision")
+        if isinstance(value.get("decision"), dict)
+        else {}
+    )
+    compact_decision = _parallel_branch_startup_public_fields(
+        decision,
+        (
+            "schema_version",
+            "ok",
+            "allowed",
+            "decision",
+            "status",
+            "source",
+            "source_of_authority",
+            "error",
+            "code",
+            "message",
+            "reason",
+        ),
+    )
+    for field in (
+        "errors",
+        "failed_gates",
+        "field_mismatches",
+        "missing_fields",
+        "missing_or_mismatched_fields",
+        "missing_proof_fields",
+        "missing_requirement_ids",
+        "reasons",
+        "required_fields",
+    ):
+        if field in decision:
+            projected = _contract_runtime_precheck_diagnostic_value(decision[field])
+            if projected not in (None, "", [], {}):
+                compact_decision[field] = projected
+
+    compact: dict[str, Any] = {
+        "schema_version": "contract_runtime.precheck_line.compact_response.v1",
+        "response_view": "compact",
+        "bounded_response": True,
+        "source_serialized_bytes": serialized_bytes,
+        **_parallel_branch_startup_public_fields(
+            value,
+            (
+                "ok",
+                "status",
+                "error",
+                "code",
+                "message",
+                "reason",
+                "project_id",
+                "backlog_id",
+                "contract_execution_id",
+                "contract_id",
+                "contract_revision_id",
+                "contract_hash",
+                "actor_role",
+                "execution_state_revision",
+                "execution_state_hash",
+                "runtime_guide_hash",
+                "request_id",
+                "agent_facing_decision_source",
+                "would_mutate_completed_lines",
+                "completed_lines_count",
+                "remediation",
+            ),
+        ),
+        "http_request_performed": True,
+        "current_request_mutation_proven": False,
+        "zero_write_proven": True,
+        "write_disposition": "not_written",
+        "writes_performed": False,
+        "mutation_performed": False,
+        "semantic_truncation_performed": False,
+        "raw_completed_line_bodies_omitted": True,
+        "raw_route_token_exposed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_worker_auth_exposed": False,
+    }
+    if value.get("ok") is False:
+        compact["zero_write_rejection"] = True
+        compact["safe_retry"] = True
+    if compact_decision:
+        compact["decision"] = compact_decision
+
+    for field in (
+        "failed_gates",
+        "field_mismatches",
+        "missing_fields",
+        "missing_or_mismatched_fields",
+        "missing_proof_fields",
+        "missing_requirement_ids",
+        "reasons",
+        "required_fields",
+    ):
+        if field in value:
+            projected = _contract_runtime_precheck_diagnostic_value(value[field])
+            if projected not in (None, "", [], {}):
+                compact[field] = projected
+
+    next_action = value.get("next_legal_action")
+    if isinstance(next_action, dict):
+        projected_next_action = _parallel_branch_startup_public_fields(
+            next_action,
+            (
+                "schema_version",
+                "id",
+                "action",
+                "interface",
+                "mcp_tool",
+                "status",
+                "stage_id",
+                "line_id",
+                "evidence_kind",
+                "owner_role",
+                "contract_execution_id",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "worker_id",
+                "worker_slot_id",
+                "route_id",
+                "route_context_hash",
+                "prompt_contract_id",
+                "prompt_contract_hash",
+                "route_token_ref",
+                "visible_injection_manifest_hash",
+                "target_project_root",
+                "source",
+                "precedence",
+            ),
+        )
+        if projected_next_action:
+            compact["next_legal_action"] = projected_next_action
+    elif isinstance(next_action, str) and next_action.strip():
+        compact["next_legal_action"] = next_action[:2_048]
+
+    current_state = _parallel_branch_startup_public_fields(
+        value.get("contract_runtime_current_state"),
+        (
+            "schema_version",
+            "execution_state_revision",
+            "execution_state_hash",
+            "runtime_guide_hash",
+            "readiness_state",
+            "terminal",
+            "scheduler_eligible",
+            "current_eligible",
+            "close_eligible",
+            "write_eligible",
+            "status",
+        ),
+    )
+    if current_state:
+        compact["contract_runtime_current_state"] = current_state
+
+    if response_view == "full":
+        full_error = (
+            "contract_runtime_precheck_line_full_response_too_large"
+            if serialized_bytes
+            > _CONTRACT_RUNTIME_PRECHECK_LINE_FULL_MAX_SERIALIZED_BYTES
+            else "contract_runtime_precheck_line_full_response_unsafe"
+        )
+        return {
+            "schema_version": (
+                "contract_runtime.precheck_line.full_response_unavailable.v1"
+            ),
+            "ok": False,
+            "error": full_error,
+            "message": (
+                "The explicit full ContractRuntime precheck response is not "
+                "safe for the managed MCP transport; the bounded semantic "
+                "result is included in compact_result."
+                if unsafe_full_shape
+                else (
+                    "The explicit full ContractRuntime precheck response "
+                    "exceeds the managed MCP response limit; the bounded "
+                    "semantic result is included in compact_result."
+                )
+            ),
+            "response_view": "full",
+            "bounded_response": True,
+            "source_serialized_bytes": serialized_bytes,
+            "max_serialized_bytes": (
+                _CONTRACT_RUNTIME_PRECHECK_LINE_FULL_MAX_SERIALIZED_BYTES
+            ),
+            "precheck_ok": value.get("ok") is True,
+            "unsafe_full_shape_detected": unsafe_full_shape,
+            "http_request_performed": True,
+            "write_disposition": "not_written",
+            "writes_performed": False,
+            "mutation_performed": False,
+            "semantic_truncation_performed": False,
+            "raw_route_token_exposed": False,
+            "raw_worker_auth_exposed": False,
+            "compact_result": compact,
+        }
     return compact
 
 
@@ -1891,6 +2213,21 @@ def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
     }
     for key, value in _runtime_context_write_schema_properties().items():
         properties.setdefault(key, value)
+    return properties
+
+
+def _contract_runtime_precheck_line_schema_properties() -> dict[str, Any]:
+    properties = dict(_contract_runtime_submit_line_schema_properties())
+    properties["response_view"] = {
+        "type": "string",
+        "enum": ["compact", "full"],
+        "default": "compact",
+        "description": (
+            "MCP-only response projection. compact is deterministic and "
+            "bounded; full preserves the legacy response only when it fits "
+            "the managed transport. Never forwarded to governance."
+        ),
+    }
     return properties
 
 
@@ -4467,7 +4804,7 @@ TOOLS: list[dict] = [
         "description": "Precheck one role-bound generic ContractRuntime evidence line without appending completed evidence.",
         "inputSchema": {
             "type": "object",
-            "properties": _contract_runtime_submit_line_schema_properties(),
+            "properties": _contract_runtime_precheck_line_schema_properties(),
             "required": ["project_id", "contract_execution_id"],
         },
     },
@@ -7206,6 +7543,18 @@ class ToolDispatcher:
         if name == "contract_runtime_precheck_line":
             pid = args["project_id"]
             execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+            response_view = str(args.get("response_view") or "compact").strip()
+            if response_view not in {"compact", "full"}:
+                return {
+                    "ok": False,
+                    "error": "contract_runtime_precheck_line_response_view_invalid",
+                    "message": "response_view must be compact or full",
+                    "response_view": response_view,
+                    "http_request_performed": False,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                }
             qa_session_token, qa_ref_error = self._qa_role_token_for_scope(
                 args,
                 required_scope_fields=(
@@ -7226,6 +7575,7 @@ class ToolDispatcher:
                     "contract_execution_id",
                     "qa_session_token",
                     "timeout_seconds",
+                    "response_view",
                 }
                 and value is not None
             }
@@ -7250,7 +7600,10 @@ class ToolDispatcher:
                     timeout_seconds=timeout_seconds,
                     result=result,
                 )
-            return result
+            return _contract_runtime_precheck_line_compact_result(
+                result,
+                response_view=response_view,
+            )
 
         if name == "observer_repair_run_plan":
             pid = args["project_id"]

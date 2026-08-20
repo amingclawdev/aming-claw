@@ -2067,6 +2067,156 @@ def test_mcp_contract_runtime_submit_line_keeps_small_shape_and_large_rejection_
     assert compact["decision"]["errors"] == ["line identity mismatch"]
 
 
+def test_mcp_contract_runtime_precheck_line_response_view_is_local_bounded_and_truthful():
+    raw_result = {
+        "ok": False,
+        "status": "rejected",
+        "error": "contract_runtime_line_rejected",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-PRECHECK-BOUNDED",
+        "contract_execution_id": "cex-precheck-bounded",
+        "execution_state_revision": 3,
+        "runtime_guide_hash": "sha256:guide",
+        "would_mutate_completed_lines": False,
+        "decision": {
+            "ok": False,
+            "decision": "block",
+            "errors": ["dispatch identity mismatch"],
+            "field_mismatches": [
+                {
+                    "field": "runtime_context_id",
+                    "expected": "mfrctx-canonical",
+                    "actual": "mfrctx-wrong",
+                },
+                {
+                    "field": "session_token",
+                    "expected": "raw-expected-session-must-not-escape",
+                    "actual": "raw-actual-session-must-not-escape",
+                },
+            ],
+        },
+        "next_legal_action": {
+            "action": "observer_dispatch_bounded_workers",
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "runtime_context_id": "mfrctx-canonical",
+            "task_id": "worker-precheck",
+            "route_token_ref": "rtok-copy-safe",
+            "mf_sub_host_bridge_guidance": {
+                "raw_envelope": "raw-host-envelope-must-not-escape" * 40_000,
+            },
+        },
+        "runtime_guide": {
+            "completed_lines": [
+                {
+                    "payload": {
+                        "session_token": "raw-session-must-not-escape",
+                    }
+                }
+            ],
+            "oversized": "oversized-runtime-guide" * 40_000,
+        },
+    }
+
+    class PrecheckRecorder(_Recorder):
+        def api(self, method, path, data=None, **_kwargs):
+            self.calls.append((method, path, data))
+            return raw_result
+
+    recorder = PrecheckRecorder()
+    dispatcher = _dispatcher(recorder)
+    common = {
+        "project_id": "aming-claw",
+        "contract_execution_id": "cex-precheck-bounded",
+        "execution_state_revision": 3,
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "bounded_worker_dispatch",
+    }
+
+    compact = dispatcher.dispatch(
+        "contract_runtime_precheck_line",
+        dict(common),
+    )
+    assert compact["schema_version"] == (
+        "contract_runtime.precheck_line.compact_response.v1"
+    )
+    assert compact["ok"] is False
+    assert compact["decision"]["errors"] == ["dispatch identity mismatch"]
+    assert compact["decision"]["field_mismatches"] == [
+        {
+            "field": "runtime_context_id",
+            "expected": "mfrctx-canonical",
+            "actual": "mfrctx-wrong",
+        },
+        {"field": "session_token"},
+    ]
+    assert compact["next_legal_action"]["line_id"] == (
+        "observer_dispatch_bounded_workers"
+    )
+    assert compact["writes_performed"] is False
+    assert compact["mutation_performed"] is False
+    assert compact["write_disposition"] == "not_written"
+    assert compact["http_request_performed"] is True
+    assert len(json.dumps(compact).encode()) < 64 * 1024
+    serialized = json.dumps(compact, sort_keys=True)
+    assert "raw-host-envelope-must-not-escape" not in serialized
+    assert "raw-session-must-not-escape" not in serialized
+    assert "raw-expected-session-must-not-escape" not in serialized
+    assert "raw-actual-session-must-not-escape" not in serialized
+    assert "oversized-runtime-guide" not in serialized
+    assert "response_view" not in recorder.calls[-1][2]
+
+    full = dispatcher.dispatch(
+        "contract_runtime_precheck_line",
+        {**common, "response_view": "full"},
+    )
+    assert full["error"] == "contract_runtime_precheck_line_full_response_too_large"
+    assert full["precheck_ok"] is False
+    assert full["compact_result"]["decision"]["errors"] == [
+        "dispatch identity mismatch"
+    ]
+    assert len(json.dumps(full).encode()) < 64 * 1024
+    assert "response_view" not in recorder.calls[-1][2]
+
+    call_count = len(recorder.calls)
+    invalid = dispatcher.dispatch(
+        "contract_runtime_precheck_line",
+        {**common, "response_view": "verbose"},
+    )
+    assert invalid == {
+        "ok": False,
+        "error": "contract_runtime_precheck_line_response_view_invalid",
+        "message": "response_view must be compact or full",
+        "response_view": "verbose",
+        "http_request_performed": False,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+    }
+    assert len(recorder.calls) == call_count
+
+    small = {"ok": True, "decision": {"ok": True}, "value": "small"}
+    assert mcp_tools._contract_runtime_precheck_line_compact_result(
+        small,
+        response_view="full",
+    ) is small
+    unsafe_small = {
+        "ok": True,
+        "decision": {"ok": True},
+        "session_token": "raw-small-session-must-not-escape",
+    }
+    unsafe_full = mcp_tools._contract_runtime_precheck_line_compact_result(
+        unsafe_small,
+        response_view="full",
+    )
+    assert unsafe_full["error"] == (
+        "contract_runtime_precheck_line_full_response_unsafe"
+    )
+    assert unsafe_full["unsafe_full_shape_detected"] is True
+    assert "raw-small-session-must-not-escape" not in json.dumps(unsafe_full)
+
+
 def test_mcp_graph_current_full_reconcile_uses_reconcile_timeout(monkeypatch):
     monkeypatch.delenv("AMING_GRAPH_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("AMING_RECONCILE_MCP_TIMEOUT_SECONDS", raising=False)
@@ -3821,7 +3971,22 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
         "query_purpose",
         "graph_trace_evidence",
     }
-    assert _tool_properties("contract_runtime_precheck_line") == submit_properties
+    precheck_properties = _tool_properties("contract_runtime_precheck_line")
+    assert {
+        key: value
+        for key, value in precheck_properties.items()
+        if key != "response_view"
+    } == submit_properties
+    assert precheck_properties["response_view"] == {
+        "type": "string",
+        "enum": ["compact", "full"],
+        "default": "compact",
+        "description": (
+            "MCP-only response projection. compact is deterministic and "
+            "bounded; full preserves the legacy response only when it fits "
+            "the managed transport. Never forwarded to governance."
+        ),
+    }
     timeout_schema = submit_properties["timeout_seconds"]
     assert timeout_schema["default"] == 120
     assert timeout_schema["minimum"] == 10
@@ -4809,9 +4974,14 @@ def test_active_mcp_contract_tools_expose_onboard_root_with_update_facade():
         "qa_session_token_ref",
         "qa_evidence_provenance",
     }
-    assert _tool_properties("contract_runtime_precheck_line") == _tool_properties(
-        "contract_runtime_submit_line"
-    )
+    precheck_properties = _tool_properties("contract_runtime_precheck_line")
+    submit_properties = _tool_properties("contract_runtime_submit_line")
+    assert {
+        key: value
+        for key, value in precheck_properties.items()
+        if key != "response_view"
+    } == submit_properties
+    assert precheck_properties["response_view"]["enum"] == ["compact", "full"]
 
 
 def test_tool_dispatcher_mf_parallel_enter_rejects_missing_or_blank_project_prewrite():

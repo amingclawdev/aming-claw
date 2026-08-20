@@ -1414,6 +1414,115 @@ def test_governance_stdio_contract_runtime_submit_line_bounds_persisted_dispatch
     )
 
 
+def test_contract_runtime_precheck_line_primary_and_mirror_have_bounded_parity(
+    monkeypatch,
+):
+    raw_result = {
+        "ok": False,
+        "status": "rejected",
+        "error": "runtime_context_initial_join_dispatch_identity_mismatch",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-PRECHECK-PARITY",
+        "contract_execution_id": "cex-precheck-parity",
+        "execution_state_revision": 4,
+        "would_mutate_completed_lines": False,
+        "decision": {
+            "ok": False,
+            "errors": ["dispatch identity mismatch"],
+            "missing_or_mismatched_fields": ["runtime_context_id"],
+        },
+        "next_legal_action": {
+            "action": "observer_dispatch_bounded_workers",
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "runtime_context_id": "mfrctx-parity",
+            "route_token_ref": "rtok-parity",
+            "managed_host_envelope": "raw-envelope-must-not-escape" * 50_000,
+        },
+        "runtime_guide": {
+            "oversized": "oversized-precheck-facade" * 50_000,
+            "session_token": "raw-session-must-not-escape",
+        },
+    }
+    mirror_calls = []
+    primary_calls = []
+
+    def fake_http(method, path, body=None, **_kwargs):
+        mirror_calls.append((method, path, body))
+        return raw_result
+
+    def fake_api(method, path, body=None, **_kwargs):
+        primary_calls.append((method, path, body))
+        return raw_result
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    arguments = {
+        "project_id": "aming-claw",
+        "contract_execution_id": "cex-precheck-parity",
+        "execution_state_revision": 4,
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "bounded_worker_dispatch",
+        "response_view": "compact",
+    }
+
+    mirror = governance_mcp_server._dispatch_tool(
+        "contract_runtime_precheck_line",
+        dict(arguments),
+    )
+    primary = dispatcher.dispatch(
+        "contract_runtime_precheck_line",
+        dict(arguments),
+    )
+
+    assert primary == mirror
+    assert primary["schema_version"] == (
+        "contract_runtime.precheck_line.compact_response.v1"
+    )
+    assert primary["ok"] is False
+    assert primary["decision"]["errors"] == ["dispatch identity mismatch"]
+    assert primary["decision"]["missing_or_mismatched_fields"] == [
+        "runtime_context_id"
+    ]
+    assert primary["next_legal_action"]["line_id"] == (
+        "observer_dispatch_bounded_workers"
+    )
+    assert primary["writes_performed"] is False
+    assert primary["mutation_performed"] is False
+    assert len(json.dumps(primary).encode()) < 64 * 1024
+    serialized = json.dumps(primary, sort_keys=True)
+    assert "raw-envelope-must-not-escape" not in serialized
+    assert "raw-session-must-not-escape" not in serialized
+    assert "oversized-precheck-facade" not in serialized
+    assert "response_view" not in mirror_calls[-1][2]
+    assert "response_view" not in primary_calls[-1][2]
+
+    mirror_call_count = len(mirror_calls)
+    primary_call_count = len(primary_calls)
+    invalid = {**arguments, "response_view": "raw"}
+    mirror_invalid = governance_mcp_server._dispatch_tool(
+        "contract_runtime_precheck_line",
+        dict(invalid),
+    )
+    primary_invalid = dispatcher.dispatch(
+        "contract_runtime_precheck_line",
+        dict(invalid),
+    )
+    assert primary_invalid == mirror_invalid
+    assert primary_invalid["error"] == (
+        "contract_runtime_precheck_line_response_view_invalid"
+    )
+    assert primary_invalid["http_request_performed"] is False
+    assert len(mirror_calls) == mirror_call_count
+    assert len(primary_calls) == primary_call_count
+
+
 def test_governance_mcp_bypass_schema_and_dispatch_preserve_graph_trace_ids(
     monkeypatch,
 ):
@@ -4940,10 +5049,19 @@ def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
         "qa_session_token_ref",
         "qa_evidence_provenance",
     }
-    assert (
-        tool_by_name["contract_runtime_precheck_line"]["inputSchema"]["properties"]
-        == tool_by_name["contract_runtime_submit_line"]["inputSchema"]["properties"]
-    )
+    precheck_properties = tool_by_name["contract_runtime_precheck_line"][
+        "inputSchema"
+    ]["properties"]
+    submit_properties = tool_by_name["contract_runtime_submit_line"]["inputSchema"][
+        "properties"
+    ]
+    assert {
+        key: value
+        for key, value in precheck_properties.items()
+        if key != "response_view"
+    } == submit_properties
+    assert precheck_properties["response_view"]["enum"] == ["compact", "full"]
+    assert precheck_properties["response_view"]["default"] == "compact"
     for tool_name in (
         "onboard_contract_start",
         "onboard_contract_current",

@@ -40,6 +40,7 @@ try:
         default_managed_host_envelope_continuity,
     )
     from agent.mcp.tools import (
+        _contract_runtime_precheck_line_compact_result,
         _contract_runtime_submit_line_compact_result,
         _current_full_reconcile_compact_result,
     )
@@ -48,6 +49,7 @@ except ModuleNotFoundError:  # Direct ``python agent/governance/mcp_server.py``.
         default_managed_host_envelope_continuity,
     )
     from mcp.tools import (
+        _contract_runtime_precheck_line_compact_result,
         _contract_runtime_submit_line_compact_result,
         _current_full_reconcile_compact_result,
     )
@@ -806,6 +808,21 @@ def _contract_runtime_submit_line_schema_properties() -> dict[str, Any]:
     }
     for key, value in _runtime_context_write_schema_properties().items():
         properties.setdefault(key, value)
+    return properties
+
+
+def _contract_runtime_precheck_line_schema_properties() -> dict[str, Any]:
+    properties = dict(_contract_runtime_submit_line_schema_properties())
+    properties["response_view"] = {
+        "type": "string",
+        "enum": ["compact", "full"],
+        "default": "compact",
+        "description": (
+            "MCP-only response projection. compact is deterministic and "
+            "bounded; full preserves the legacy response only when it fits "
+            "the managed transport. Never forwarded to governance."
+        ),
+    }
     return properties
 
 
@@ -2859,7 +2876,7 @@ TOOLS: list[dict] = [
         "description": "Precheck one role-bound generic ContractRuntime evidence line without appending completed evidence.",
         "inputSchema": {
             "type": "object",
-            "properties": _contract_runtime_submit_line_schema_properties(),
+            "properties": _contract_runtime_precheck_line_schema_properties(),
             "required": ["project_id", "contract_execution_id"],
         },
     },
@@ -4042,6 +4059,18 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name == "contract_runtime_precheck_line":
         pid = args["project_id"]
         execution_id = urllib.parse.quote(str(args["contract_execution_id"]), safe="")
+        response_view = str(args.get("response_view") or "compact").strip()
+        if response_view not in {"compact", "full"}:
+            return {
+                "ok": False,
+                "error": "contract_runtime_precheck_line_response_view_invalid",
+                "message": "response_view must be compact or full",
+                "response_view": response_view,
+                "http_request_performed": False,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+            }
         qa_session_token = str(args.get("qa_session_token") or "").strip()
         timeout_seconds = _contract_runtime_mcp_timeout_seconds(args)
         body = {
@@ -4053,6 +4082,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
                 "contract_execution_id",
                 "qa_session_token",
                 "timeout_seconds",
+                "response_view",
             }
             and value is not None
         }
@@ -4069,7 +4099,10 @@ def _dispatch_tool(name: str, args: dict) -> Any:
                 timeout_seconds=timeout_seconds,
                 result=result,
             )
-        return result
+        return _contract_runtime_precheck_line_compact_result(
+            result,
+            response_view=response_view,
+        )
 
     if name == "graph_current_full_reconcile":
         pid = args["project_id"]
