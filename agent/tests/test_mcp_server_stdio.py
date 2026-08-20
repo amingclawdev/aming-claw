@@ -4698,6 +4698,86 @@ def test_mcp_observer_runtime_text_prepare_bounded_truthfulness_warranty():
     assert len(calls) == call_count
 
 
+def test_mcp_observer_runtime_text_prepare_rejection_does_not_inherit_dispatch_write_truth():
+    calls = []
+    response = {
+        "ok": False,
+        "status": "rejected",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-RUNTIME-TEXT-REJECTION-R2",
+        "runtime_context_id": "mfrctx-runtime-text-rejection-r2",
+        "launch_text": "rejected launch text must stay private:" + ("r" * 300_000),
+        "launch_text_hash": "sha256:rejected-launch-text-r2",
+        "session_token": "raw-rejected-session-r2-must-not-escape",
+        "fence_token": "raw-rejected-fence-r2-must-not-escape",
+        "persistent_evidence": {
+            "bounded_worker_dispatch_event_recorded": True,
+            "dispatch_timeline_event": {
+                "event_id": 85,
+                "status": "already_recorded",
+            },
+        },
+        "dispatch_timeline_event": {
+            "event_id": 85,
+            "status": "already_recorded",
+        },
+        "local_runtime_context_bridge": {
+            "status": "skipped",
+            "written": False,
+            "reason": "prepare_not_ok",
+        },
+        "dispatch_gate_validation": {
+            "allowed": False,
+            "error": (
+                "same-worktree dispatch is blocked by default for local "
+                "mf_sub workers"
+            ),
+            "actual_startup_recorded": False,
+            "actual_startup_required": False,
+        },
+    }
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        return response
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    result = dispatcher.dispatch(
+        "observer_runtime_text_prepare",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": response["backlog_id"],
+            "observer_command_id": "cmd-runtime-text-rejection-r2",
+            "route_context_hash": "sha256:runtime-text-rejection-r2-route",
+            "prompt_contract_id": "rprompt-runtime-text-rejection-r2",
+        },
+    )
+
+    serialized = json.dumps(result, sort_keys=True)
+    assert len(calls) == 1
+    assert result["ok"] is False
+    assert result["status"] == "rejected"
+    assert result["prepare_state_advanced"] is False
+    assert result["writes_performed"] is False
+    assert result["mutation_performed"] is False
+    assert result["zero_write_rejection"] is True
+    assert result["dispatch_timeline_event"] == {
+        "event_id": 85,
+        "status": "already_recorded",
+    }
+    assert result["dispatch_gate_validation"] == response[
+        "dispatch_gate_validation"
+    ]
+    assert "runtime_contract_revision" not in result
+    assert "raw-rejected-session-r2-must-not-escape" not in serialized
+    assert "raw-rejected-fence-r2-must-not-escape" not in serialized
+
+
 def test_mcp_contract_add_tools_expose_thin_guided_facade_only():
     tool_by_name = {tool["name"]: tool for tool in governance_mcp_server.TOOLS}
 
