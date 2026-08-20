@@ -160305,6 +160305,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
     worker_actor: str = "worker:/root/direct-main-worker",
     worker_claim_overrides: Mapping[str, Any] | None = None,
     observer_claim_overrides: Mapping[str, Any] | None = None,
+    observer_decision_source: str = "route_token_gate",
 ) -> dict[str, str]:
     if prepare_backlog:
         _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -160325,6 +160326,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
         "status": "accepted",
         "action": "task_timeline_append",
         "server_projected": True,
+        "server_issued_binding": True,
         "projection_source": "server_route_token_mutation_gate",
         "resolved_from_ref": True,
         "registry_verified": True,
@@ -160342,6 +160344,10 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
             "task_id": task_id,
         },
     }
+    if observer_decision_source == "route_action_scope_lineage":
+        route_gate["route_token_ref"] = (
+            "rtok-" + _fake_sha(f"ref-{backlog_id}")[7:39]
+        )
     direct_event = task_timeline.record_event(
         conn,
         project_id=PID,
@@ -160403,11 +160409,31 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
             "action": "task_timeline_append",
             "required_role": "observer",
             "actor_role": "observer",
-            "source_of_authority": "route_token_gate",
+            "source_of_authority": observer_decision_source,
             "primary_decision_source": True,
             "meta_contract_gate_decision_source": False,
             "meta_contract_gate": meta_gate,
         }
+        if observer_decision_source == "route_action_scope_lineage":
+            contract_gate_decision.update(
+                {
+                    "gate_id": (
+                        "task_timeline_append:route_action_scope_lineage"
+                    ),
+                    "gate_type": "timeline_projection",
+                    "projection_actions": [
+                        {
+                            "schema_version": (
+                                "contract_gate_projection_action.v1"
+                            ),
+                            "action": "record_timeline_event",
+                            "source_of_authority": (
+                                "route_action_scope_lineage"
+                            ),
+                        }
+                    ],
+                }
+            )
         contract_gate_decision["decision_hash"] = server.stable_sha256(
             contract_gate_decision
         )
@@ -160433,7 +160459,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
             "repository_root_exact": True,
             "git_object_exists": True,
             "worktree_clean": True,
-            "route_token_ref": "",
+            "route_token_ref": str(route_gate.get("route_token_ref") or ""),
             "route_scope_exact": True,
             "direct_route_identity_exact": True,
             "direct_pre_mutation_event_count": 1,
@@ -160445,6 +160471,48 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
         commit_prewrite_authority["authority_hash"] = server.stable_sha256(
             commit_prewrite_authority
         )
+        if observer_decision_source == "route_action_scope_lineage":
+            route_identity = {
+                field: str(route_gate.get(field) or "")
+                for field in (
+                    "route_id",
+                    "route_context_hash",
+                    "prompt_contract_id",
+                    "prompt_contract_hash",
+                    "visible_injection_manifest_hash",
+                    "route_token_ref",
+                )
+            }
+            implementation_payload["route_action_scope_lineage"] = {
+                "schema_version": "route_action_scope_lineage.v1",
+                "accepted": True,
+                "status": "accepted",
+                "source": "server_route_token_action_scope",
+                "acceptance_source": "server_route_token_action_scope",
+                "projected_by": "handle_task_timeline_append",
+                "server_projected": True,
+                "allowed_action": "task_timeline_append",
+                "server_issued_binding": True,
+                "registry_verified": True,
+                "resolved_from_ref": True,
+                "binding_source": "observer_route_token_refs",
+                "route_token_ref": route_gate["route_token_ref"],
+                "parent_route_identity": dict(route_identity),
+                "child_route_identity": dict(route_identity),
+                "parent_route_lineage": {
+                    "schema_version": "parent_route_lineage.v1",
+                    **route_identity,
+                },
+                "child_route_lineage": {
+                    "schema_version": "child_route_lineage.v1",
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "allowed_actions": ["task_timeline_append"],
+                    **route_identity,
+                },
+                "route_token_gate": dict(route_gate),
+            }
         implementation_payload.update(
             {
                 "contract_gate_decision": contract_gate_decision,
@@ -160657,6 +160725,116 @@ def test_exact_candidate_direct_main_runtime_comparison_base_uses_server_lineage
         "server_runtime_context_base_to_exact_candidate_diff"
     )
     assert exact_context["candidate_diff_hash"].startswith("sha256:")
+
+
+def test_exact_candidate_observer_direct_main_accepts_route_action_scope_lineage(
+    conn,
+):
+    backlog_id = "AC-DIRECT-MAIN-EXACT-ROUTE-ACTION-SCOPE-LINEAGE"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+        record_failed_qa=False,
+        observer_authoritative_implementation=True,
+        observer_decision_source="route_action_scope_lineage",
+    )
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=lineage["task_id"],
+        limit=100,
+    )
+    direct_event = next(
+        event
+        for event in events
+        if event["event_kind"] == "observer_direct_implementation_exception"
+    )
+    implementation = next(
+        event for event in events if event["event_kind"] == "implementation"
+    )
+
+    assert server._qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
+        implementation,
+        direct_event=direct_event,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=lineage["task_id"],
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "not_server_projected",
+        "wrong_action",
+        "wrong_scope",
+        "wrong_route_identity",
+        "untrusted_nested_route_gate",
+        "missing_projection_action",
+    ],
+)
+def test_exact_candidate_observer_direct_main_route_action_scope_lineage_fails_closed(
+    conn,
+    mutation,
+):
+    backlog_id = (
+        "AC-DIRECT-MAIN-EXACT-ROUTE-ACTION-FAIL-"
+        + mutation.upper().replace("_", "-")
+    )
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+        record_failed_qa=False,
+        observer_authoritative_implementation=True,
+        observer_decision_source="route_action_scope_lineage",
+    )
+    events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=lineage["task_id"],
+        limit=100,
+    )
+    direct_event = next(
+        event
+        for event in events
+        if event["event_kind"] == "observer_direct_implementation_exception"
+    )
+    candidate = copy.deepcopy(
+        next(event for event in events if event["event_kind"] == "implementation")
+    )
+    route_lineage = candidate["payload"]["route_action_scope_lineage"]
+    if mutation == "not_server_projected":
+        route_lineage["server_projected"] = False
+    elif mutation == "wrong_action":
+        route_lineage["allowed_action"] = "backlog_close"
+    elif mutation == "wrong_scope":
+        route_lineage["child_route_lineage"]["task_id"] = "cross-task"
+    elif mutation == "wrong_route_identity":
+        route_lineage["child_route_identity"]["route_context_hash"] = _fake_sha(
+            "cross-route"
+        )
+    elif mutation == "untrusted_nested_route_gate":
+        route_lineage["route_token_gate"]["registry_verified"] = False
+    else:
+        decision = candidate["payload"]["contract_gate_decision"]
+        decision["projection_actions"] = []
+        decision["decision_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in decision.items()
+                if key != "decision_hash"
+            }
+        )
+
+    assert not server._qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
+        candidate,
+        direct_event=direct_event,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=lineage["task_id"],
+    )
 
 
 def test_fixed_base_failures_share_timeline_and_contract_runtime_authority(

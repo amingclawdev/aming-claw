@@ -131237,6 +131237,116 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
     implementation_event_id = int(
         event.get("id") or event.get("event_id") or 0
     )
+    decision_source = str(decision.get("source_of_authority") or "").strip()
+    route_action_scope_lineage = (
+        payload.get("route_action_scope_lineage")
+        if isinstance(payload.get("route_action_scope_lineage"), Mapping)
+        else {}
+    )
+    lineage_route_gate = (
+        route_action_scope_lineage.get("route_token_gate")
+        if isinstance(route_action_scope_lineage.get("route_token_gate"), Mapping)
+        else {}
+    )
+    lineage_route_scope = (
+        lineage_route_gate.get("scope")
+        if isinstance(lineage_route_gate.get("scope"), Mapping)
+        else {}
+    )
+    lineage_child_identity = (
+        route_action_scope_lineage.get("child_route_identity")
+        if isinstance(
+            route_action_scope_lineage.get("child_route_identity"), Mapping
+        )
+        else {}
+    )
+    lineage_child = (
+        route_action_scope_lineage.get("child_route_lineage")
+        if isinstance(route_action_scope_lineage.get("child_route_lineage"), Mapping)
+        else {}
+    )
+    lineage_parent_identity = (
+        route_action_scope_lineage.get("parent_route_identity")
+        if isinstance(
+            route_action_scope_lineage.get("parent_route_identity"), Mapping
+        )
+        else {}
+    )
+    lineage_projection_actions = [
+        candidate
+        for candidate in (decision.get("projection_actions") or [])
+        if isinstance(candidate, Mapping)
+    ]
+    route_action_scope_lineage_authoritative = bool(
+        decision_source == "route_action_scope_lineage"
+        and str(decision.get("gate_id") or "").strip()
+        == "task_timeline_append:route_action_scope_lineage"
+        and str(decision.get("gate_type") or "").strip()
+        == "timeline_projection"
+        and any(
+            str(candidate.get("action") or "").strip()
+            == "record_timeline_event"
+            and str(candidate.get("source_of_authority") or "").strip()
+            == "route_action_scope_lineage"
+            for candidate in lineage_projection_actions
+        )
+        and str(route_action_scope_lineage.get("schema_version") or "").strip()
+        == "route_action_scope_lineage.v1"
+        and route_action_scope_lineage.get("accepted") is True
+        and str(route_action_scope_lineage.get("status") or "").strip()
+        == "accepted"
+        and str(route_action_scope_lineage.get("source") or "").strip()
+        == "server_route_token_action_scope"
+        and str(
+            route_action_scope_lineage.get("acceptance_source") or ""
+        ).strip()
+        == "server_route_token_action_scope"
+        and str(route_action_scope_lineage.get("projected_by") or "").strip()
+        == "handle_task_timeline_append"
+        and route_action_scope_lineage.get("server_projected") is True
+        and route_action_scope_lineage.get("server_issued_binding") is True
+        and route_action_scope_lineage.get("registry_verified") is True
+        and route_action_scope_lineage.get("resolved_from_ref") is True
+        and str(route_action_scope_lineage.get("binding_source") or "").strip()
+        == "observer_route_token_refs"
+        and str(route_action_scope_lineage.get("allowed_action") or "").strip()
+        == "task_timeline_append"
+        and str(route_action_scope_lineage.get("route_token_ref") or "").strip()
+        == str(implementation_identity.get("route_token_ref") or "").strip()
+        and _observer_root_route_identity_complete(lineage_child_identity)
+        and _observer_root_route_identity_key(lineage_child_identity)
+        == _observer_root_route_identity_key(implementation_identity)
+        and str(lineage_child_identity.get("route_token_ref") or "").strip()
+        == str(implementation_identity.get("route_token_ref") or "").strip()
+        and _observer_root_route_identity_complete(lineage_parent_identity)
+        and str(lineage_child.get("project_id") or "").strip() == project_id
+        and str(lineage_child.get("backlog_id") or "").strip() == backlog_id
+        and str(lineage_child.get("task_id") or "").strip() == task_id
+        and "task_timeline_append"
+        in {
+            str(action or "").strip()
+            for action in (lineage_child.get("allowed_actions") or [])
+        }
+        and str(lineage_route_gate.get("action") or "").strip()
+        == "task_timeline_append"
+        and lineage_route_gate.get("allowed") is True
+        and lineage_route_gate.get("server_projected") is True
+        and lineage_route_gate.get("server_issued_binding") is True
+        and lineage_route_gate.get("registry_verified") is True
+        and lineage_route_gate.get("resolved_from_ref") is True
+        and str(lineage_route_gate.get("binding_source") or "").strip()
+        == "observer_route_token_refs"
+        and _observer_root_route_identity_complete(lineage_route_gate)
+        and _observer_root_route_identity_key(lineage_route_gate)
+        == _observer_root_route_identity_key(implementation_identity)
+        and str(lineage_route_gate.get("route_token_ref") or "").strip()
+        == str(implementation_identity.get("route_token_ref") or "").strip()
+        and str(lineage_route_scope.get("project_id") or "").strip()
+        == project_id
+        and str(lineage_route_scope.get("backlog_id") or "").strip()
+        == backlog_id
+        and str(lineage_route_scope.get("task_id") or "").strip() == task_id
+    )
 
     return bool(
         direct_event_id > 0
@@ -131306,8 +131416,10 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         and str(decision.get("action") or "").strip()
         == "task_timeline_append"
         and str(decision.get("actor_role") or "").strip() == "observer"
-        and str(decision.get("source_of_authority") or "").strip()
-        == "route_token_gate"
+        and (
+            decision_source == "route_token_gate"
+            or route_action_scope_lineage_authoritative
+        )
         and decision.get("primary_decision_source") is True
         and decision.get("meta_contract_gate_decision_source") is False
         and decision_hash
