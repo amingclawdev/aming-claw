@@ -2797,22 +2797,212 @@ def test_worker_guide_managed_adapters_default_compact_and_preserve_explicit_vie
     assert mirror_query["view"] == ["compact"]
 
 
-def test_worker_guide_managed_adapter_size_guard_fails_closed_with_parity():
+def test_worker_guide_managed_adapter_projects_current_authority_with_parity():
     oversized = {
         "ok": True,
-        "response_view": "compact",
-        "required_semantics": "x"
+        "schema_version": "runtime_context.worker_guide_response.v1",
+        "response_view": "all",
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-post-startup",
+        "task_id": "worker-post-startup",
+        "next_legal_action": "run_graph_query",
+        "graph_query_identity": {
+            "runtime_context_id": "mfrctx-post-startup",
+            "task_id": "worker-post-startup",
+            "parent_task_id": "cex-post-startup",
+            "target_project_root": "/repo/worker",
+            "route_id": "route-post-startup",
+            "route_context_hash": "sha256:route-post-startup",
+            "prompt_contract_id": "rprompt-post-startup",
+            "prompt_contract_hash": "sha256:prompt-post-startup",
+            "route_token_ref": "rtok-post-startup",
+        },
+        "canonical_executable_actions": {
+            "graph": {
+                "mcp_tool": "graph_query",
+                "copy_safe_body": {
+                    "project_id": "aming-claw",
+                    "runtime_context_id": "mfrctx-post-startup",
+                    "task_id": "worker-post-startup",
+                    "query_source": "mf_subagent",
+                },
+            }
+        },
+        "session_token": "raw-worker-session-must-not-escape",
+        "fence_token": "raw-worker-fence-must-not-escape",
+        "recursive_lifecycle_diagnostics": "x"
         * (mcp_tools._WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES + 1),
     }
     primary = mcp_tools._bounded_worker_guide_result(oversized)
     mirror = governance_mcp_server._bounded_worker_guide_result(oversized)
 
     assert primary == mirror
-    assert primary["ok"] is False
-    assert primary["error"] == "runtime_context_worker_guide_response_too_large"
+    assert primary["ok"] is True
+    assert primary["schema_version"] == (
+        "runtime_context.worker_guide_managed_compact.v1"
+    )
+    assert primary["next_legal_action"] == "run_graph_query"
+    assert primary["graph_query_identity"]["route_id"] == (
+        "route-post-startup"
+    )
+    assert primary["canonical_executable_action"]["mcp_tool"] == (
+        "graph_query"
+    )
     assert primary["semantic_truncation_performed"] is False
     assert primary["writes_performed"] is False
-    assert primary["serialized_bytes"] > primary["max_serialized_bytes"]
+    assert len(json.dumps(primary).encode()) < 64 * 1024
+    assert "recursive_lifecycle_diagnostics" not in primary
+    assert "raw-worker-session-must-not-escape" not in json.dumps(primary)
+    assert "raw-worker-fence-must-not-escape" not in json.dumps(primary)
+
+    explicit_full = mcp_tools._bounded_worker_guide_result(
+        oversized,
+        requested_view="all",
+    )
+    assert explicit_full["error"] == (
+        "runtime_context_worker_guide_full_response_too_large"
+    )
+    assert explicit_full["writes_performed"] is False
+    assert explicit_full["semantic_truncation_performed"] is False
+
+
+def test_post_startup_current_and_graph_query_are_bounded_with_truthful_authority():
+    huge = "x" * (300 * 1024)
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        if path.endswith("/current-state?view=compact"):
+            return {
+                "ok": True,
+                "project_id": "aming-claw",
+                "runtime_context_id": "mfrctx-post-startup",
+                "task_id": "worker-post-startup",
+                "runtime_context_status": "running",
+                "runtime_context_service": {
+                    "schema_version": "runtime_context.service.v1",
+                    "project_id": "aming-claw",
+                    "runtime_context_id": "mfrctx-post-startup",
+                    "content_address": {
+                        "projection_hash": "sha256:projection-post-startup",
+                        "projection_watermark": "timeline:136",
+                    },
+                    "views": {
+                        "worker_view": {
+                            "graph_query_identity": {
+                                "runtime_context_id": "mfrctx-post-startup",
+                                "task_id": "worker-post-startup",
+                                "route_id": "route-post-startup",
+                                "target_project_root": "/repo/worker",
+                            },
+                            "recursive_lifecycle_diagnostics": huge,
+                        }
+                    },
+                },
+                "executable_contract": {"recursive": huge},
+            }
+        return {
+            "ok": True,
+            "trace_id": "gqt-post-startup",
+            "tool": "find_node_by_path",
+            "result": {
+                "ok": True,
+                "nodes": [{"id": "L7.reminders", "path": "src/reminders.js"}],
+            },
+            "result_count": 1,
+            "trace": {
+                "trace_id": "gqt-post-startup",
+                "status": "complete",
+                "recursive_runtime_projection": huge,
+            },
+            "graph_query_identity": {
+                "runtime_context_id": "mfrctx-post-startup",
+                "task_id": "worker-post-startup",
+                "parent_task_id": "cex-post-startup",
+                "route_id": "route-post-startup",
+                "target_project_root": "/repo/worker",
+                "recursive_runtime_projection": huge,
+            },
+            "mf_sub_graph_query_canonical_gate": {
+                "ok": True,
+                "status": "passed",
+                "trace_id": "gqt-post-startup",
+                "recursive_runtime_projection": huge,
+            },
+            "contract_runtime_canonical_line": {
+                "accepted": True,
+                "status": "accepted",
+                "contract_execution_id": "cex-post-startup",
+                "execution_state_revision": 7,
+                "recursive_runtime_projection": huge,
+            },
+            "session_token": "raw-graph-session-must-not-escape",
+            "fence_token": "raw-graph-fence-must-not-escape",
+        }
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=".",
+    )
+    current = dispatcher.dispatch(
+        "runtime_context_current",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-post-startup",
+        },
+    )
+    graph = dispatcher.dispatch(
+        "graph_query",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-post-startup",
+            "task_id": "worker-post-startup",
+            "parent_task_id": "cex-post-startup",
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+            "worker_role": "mf_sub",
+            "tool": "find_node_by_path",
+            "args": {"path": "src/reminders.js"},
+        },
+    )
+
+    assert current["schema_version"] == (
+        "runtime_context.current_state_managed_compact.v1"
+    )
+    assert current["runtime_context_service"]["content_address"][
+        "projection_hash"
+    ] == "sha256:projection-post-startup"
+    assert len(json.dumps(current).encode()) < 64 * 1024
+    assert graph["schema_version"] == "graph_query.mf_sub_managed_compact.v1"
+    assert graph["result"]["nodes"][0]["path"] == "src/reminders.js"
+    assert graph["trace_id"] == "gqt-post-startup"
+    assert graph["contract_runtime_canonical_line"]["accepted"] is True
+    assert graph["writes_performed"] is True
+    assert graph["product_mutation_performed"] is False
+    assert graph["semantic_truncation_performed"] is False
+    assert len(json.dumps(graph).encode()) < 64 * 1024
+    assert "raw-graph-session-must-not-escape" not in json.dumps(graph)
+    assert "raw-graph-fence-must-not-escape" not in json.dumps(graph)
+    assert calls[0][1].endswith("/current-state?view=compact")
+
+    full_current = mcp_tools._bounded_runtime_context_current_result(
+        {
+            "ok": True,
+            "runtime_context_service": {
+                "content_address": {
+                    "projection_hash": "sha256:projection-post-startup"
+                },
+                "views": {"worker_view": {"recursive": huge}},
+            },
+        },
+        requested_view="full",
+    )
+    assert full_current["error"] == (
+        "runtime_context_current_full_response_too_large"
+    )
+    assert full_current["writes_performed"] is False
 
 
 def test_mcp_observer_command_list_advertises_consumer_recovery_diagnostics():

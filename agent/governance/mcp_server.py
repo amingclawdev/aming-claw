@@ -40,6 +40,8 @@ try:
         default_managed_host_envelope_continuity,
     )
     from agent.mcp.tools import (
+        _bounded_runtime_context_current_result,
+        _bounded_worker_guide_result as _runtime_bounded_worker_guide_result,
         _contract_runtime_precheck_line_compact_result,
         _contract_runtime_submit_line_compact_result,
         _current_full_reconcile_compact_result,
@@ -49,6 +51,8 @@ except ModuleNotFoundError:  # Direct ``python agent/governance/mcp_server.py``.
         default_managed_host_envelope_continuity,
     )
     from mcp.tools import (
+        _bounded_runtime_context_current_result,
+        _bounded_worker_guide_result as _runtime_bounded_worker_guide_result,
         _contract_runtime_precheck_line_compact_result,
         _contract_runtime_submit_line_compact_result,
         _current_full_reconcile_compact_result,
@@ -92,42 +96,17 @@ _WORKER_MCP_HOST_ONLY_TOOLS = frozenset(
 )
 
 
-def _bounded_worker_guide_result(value: Any) -> Any:
-    """Fail closed before an oversized Worker Guide reaches stdio/Desktop."""
+def _bounded_worker_guide_result(
+    value: Any,
+    *,
+    requested_view: str = "",
+) -> Any:
+    """Use the shared bounded current-authority projection."""
 
-    if not isinstance(value, dict):
-        return value
-    try:
-        serialized_bytes = len(
-            json.dumps(
-                value,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode("utf-8")
-        )
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": "runtime_context_worker_guide_response_not_serializable",
-            "message": str(exc),
-            "writes_performed": False,
-            "semantic_truncation_performed": False,
-        }
-    if serialized_bytes <= _WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES:
-        return value
-    return {
-        "ok": False,
-        "error": "runtime_context_worker_guide_response_too_large",
-        "message": "Worker Guide exceeded the managed MCP response limit.",
-        "response_view": str(value.get("response_view") or ""),
-        "serialized_bytes": serialized_bytes,
-        "max_serialized_bytes": _WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES,
-        "writes_performed": False,
-        "semantic_truncation_performed": False,
-        "retry_with_view_all_allowed_for_managed_transport": False,
-    }
+    return _runtime_bounded_worker_guide_result(
+        value,
+        requested_view=requested_view,
+    )
 _HOST_ENVELOPE_CONTINUITY = default_managed_host_envelope_continuity()
 
 
@@ -4161,8 +4140,7 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         pid = args["project_id"]
         runtime_context_id = urllib.parse.quote(str(args["runtime_context_id"]), safe="")
         request_args = _worker_auth_from_env(args)
-        if name == "runtime_context_worker_guide":
-            request_args.setdefault("view", "compact")
+        request_args.setdefault("view", "compact")
         query = _runtime_context_query(request_args)
         qs = f"?{urllib.parse.urlencode(query)}" if query else ""
         suffix = "current-state" if name == "runtime_context_current" else "worker-guide"
@@ -4172,9 +4150,15 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             f"{runtime_context_id}/{suffix}{qs}",
         )
         return (
-            _bounded_worker_guide_result(result)
+            _bounded_worker_guide_result(
+                result,
+                requested_view=str(request_args.get("view") or ""),
+            )
             if name == "runtime_context_worker_guide"
-            else result
+            else _bounded_runtime_context_current_result(
+                result,
+                requested_view=str(request_args.get("view") or ""),
+            )
         )
 
     if name in {

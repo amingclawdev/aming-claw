@@ -1016,15 +1016,13 @@ def test_worker_guide_readline_host_is_bounded_and_oversize_fails_same_id():
                     "copy_safe_body"
                 ]["session_token_ref"] == args["session_token_ref"]
             elif message["id"] == 3:
-                assert response["error"]["message"] == (
-                    "mcp_response_frame_too_large"
+                assert "error" not in response
+                payload = json.loads(response["result"]["content"][0]["text"])
+                assert payload["error"] == (
+                    "runtime_context_worker_guide_current_authority_missing"
                 )
-                data = response["error"]["data"]
-                assert data["writes_performed"] is False
-                assert data["semantic_truncation_performed"] is False
-                assert data["detail_ref"].startswith(
-                    "mcp-response-frame:sha256:"
-                )
+                assert payload["writes_performed"] is False
+                assert payload["semantic_truncation_performed"] is False
                 assert len(line.encode()) < 2_048
     finally:
         proc.stdin.close()
@@ -3535,6 +3533,70 @@ def test_governance_mcp_runtime_context_worker_guide_tool_is_read_only(monkeypat
             None,
         )
     ]
+
+
+def test_governance_mcp_post_startup_current_defaults_compact_and_bounds_recursive_projection(
+    monkeypatch,
+):
+    huge = "x" * (300 * 1024)
+    calls = []
+
+    def fake_http(method: str, path: str, body: dict | None = None):
+        calls.append((method, path, body))
+        return {
+            "ok": True,
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-post-startup-mirror",
+            "task_id": "worker-post-startup-mirror",
+            "runtime_context_status": "running",
+            "runtime_context_service": {
+                "schema_version": "runtime_context.service.v1",
+                "project_id": "aming-claw",
+                "runtime_context_id": "mfrctx-post-startup-mirror",
+                "content_address": {
+                    "projection_hash": "sha256:mirror-projection",
+                    "projection_watermark": "timeline:136",
+                },
+                "views": {
+                    "worker_view": {
+                        "graph_query_identity": {
+                            "runtime_context_id": "mfrctx-post-startup-mirror",
+                            "task_id": "worker-post-startup-mirror",
+                            "route_id": "route-post-startup-mirror",
+                        },
+                        "recursive_lifecycle_diagnostics": huge,
+                    }
+                },
+            },
+            "executable_contract": {"recursive": huge},
+        }
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    result = governance_mcp_server._dispatch_tool(
+        "runtime_context_current",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-post-startup-mirror",
+        },
+    )
+
+    assert calls == [
+        (
+            "GET",
+            "/api/graph-governance/aming-claw/runtime-contexts/"
+            "mfrctx-post-startup-mirror/current-state?view=compact",
+            None,
+        )
+    ]
+    assert result["schema_version"] == (
+        "runtime_context.current_state_managed_compact.v1"
+    )
+    assert result["runtime_context_service"]["content_address"][
+        "projection_hash"
+    ] == "sha256:mirror-projection"
+    assert len(json.dumps(result).encode()) < 64 * 1024
+    assert result["writes_performed"] is False
+    assert result["semantic_truncation_performed"] is False
 
 
 @pytest.mark.parametrize(
