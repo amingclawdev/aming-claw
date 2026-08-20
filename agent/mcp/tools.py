@@ -39,6 +39,8 @@ _RECONCILE_MCP_TIMEOUT_ENV_KEYS = (
     "AMING_RECONCILE_MCP_TIMEOUT_SECONDS",
 )
 _RECONCILE_PROGRESS_POLL_TIMEOUT_SECONDS = 10
+_CURRENT_FULL_RECONCILE_COMPACT_TRIGGER_BYTES = 64 * 1024
+_CURRENT_FULL_RECONCILE_FULL_MAX_SERIALIZED_BYTES = 192 * 1024
 _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS = 120
 _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS = 10
 _CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS = 60 * 60
@@ -917,6 +919,238 @@ def _current_full_reconcile_timeout_response(
             ),
         },
     }
+
+
+def _current_full_reconcile_public_fields(
+    value: Any,
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    """Project bounded copy-safe scalar fields from a reconcile mapping."""
+
+    if not isinstance(value, dict):
+        return {}
+    projected: dict[str, Any] = {}
+    for field in fields:
+        item = value.get(field)
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            if isinstance(item, str) and len(item.encode("utf-8")) > 2_048:
+                continue
+            if item not in (None, ""):
+                projected[field] = item
+    return projected
+
+
+def _current_full_reconcile_compact_result(
+    value: Any,
+    *,
+    response_view: str,
+) -> Any:
+    """Bound reconcile output without rewriting durable writes as zero-write.
+
+    Current-full responses can include a complete materialization trace and
+    exceed the MCP frame after activation is already committed.  Project only
+    durable public identities at the adapter boundary.  An explicit oversized
+    ``full`` request fails at the representation layer while retaining the
+    underlying reconcile outcome and current-request mutation truth.
+    """
+
+    if not isinstance(value, dict):
+        return value
+    try:
+        serialized_bytes = len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception:
+        return value
+
+    idempotent_replay = bool(value.get("idempotent_replay"))
+    resumed_candidate = bool(value.get("resumed_candidate"))
+    activated = bool(value.get("activated"))
+    candidate_only = bool(value.get("candidate_only"))
+    timeline_event = _current_full_reconcile_public_fields(
+        value.get("timeline_event_recorded"),
+        ("id", "ref", "event_kind", "phase", "status", "requirement_id"),
+    )
+    current_request_mutated = bool(
+        value.get("writes_performed") or value.get("mutation_performed")
+    )
+    if not current_request_mutated and not idempotent_replay:
+        current_request_mutated = bool(
+            activated
+            or (candidate_only and not resumed_candidate)
+            or timeline_event.get("id")
+        )
+
+    if response_view == "compact" and serialized_bytes <= (
+        _CURRENT_FULL_RECONCILE_COMPACT_TRIGGER_BYTES
+    ):
+        return value
+    if response_view == "full" and serialized_bytes <= (
+        _CURRENT_FULL_RECONCILE_FULL_MAX_SERIALIZED_BYTES
+    ):
+        return value
+
+    compact: dict[str, Any] = {
+        "schema_version": "graph_current_full_reconcile.compact_response.v1",
+        "response_view": "compact",
+        "requested_response_view": response_view,
+        "bounded_response": True,
+        "source_serialized_bytes": serialized_bytes,
+        **_current_full_reconcile_public_fields(
+            value,
+            (
+                "ok",
+                "status",
+                "error",
+                "message",
+                "project_id",
+                "run_id",
+                "snapshot_id",
+                "candidate_snapshot_id",
+                "active_snapshot_id",
+                "snapshot_status",
+                "target_commit_sha",
+                "head_commit",
+                "active_graph_commit",
+                "current_full_reconcile",
+                "strategy",
+                "scope_reconcile_strategy",
+                "graph_delta_mode",
+                "scope_graph_delta_mode",
+                "activated",
+                "candidate_only",
+                "exact_candidate_snapshot",
+                "resumed_candidate",
+                "idempotent_replay",
+                "rebuild_skipped",
+                "request_id",
+                "elapsed_ms",
+                "fallback_reason",
+                "fallback_required",
+                "operator_next_action",
+                "zero_write_rejection",
+            ),
+        ),
+        "http_request_performed": True,
+        "writes_performed": current_request_mutated,
+        "mutation_performed": current_request_mutated,
+        "raw_route_token_exposed": False,
+        "raw_observer_session_token_exposed": False,
+    }
+    nested_fields = {
+        "activation_verification": (
+            "schema_version",
+            "source",
+            "requested",
+            "verified",
+            "active_snapshot_id",
+            "active_graph_commit",
+            "target_commit_sha",
+            "head_commit",
+            "matches_target_commit",
+            "matches_head_commit",
+            "pending_scope_reconcile_count",
+            "pending_scope_reconcile_zero",
+            "ref_name",
+            "branch_ref",
+            "worktree_id",
+            "worktree_path",
+        ),
+        "activation": (
+            "ok",
+            "status",
+            "snapshot_id",
+            "active_snapshot_id",
+            "previous_snapshot_id",
+            "commit_sha",
+            "projection_id",
+            "projection_status",
+            "graph_ref_event_id",
+            "activated",
+        ),
+        "current_full_reconcile_provenance": (
+            "schema_version",
+            "provenance_id",
+            "project_id",
+            "snapshot_id",
+            "target_commit_sha",
+            "request_id",
+            "reconcile_event_id",
+            "route_bound",
+            "status",
+        ),
+        "operation_trace": (
+            "schema_version",
+            "operation_id",
+            "operation_type",
+            "status",
+            "target_commit_sha",
+            "snapshot_id",
+            "run_id",
+            "elapsed_ms",
+        ),
+        "current_full_target_identity": (
+            "schema_version",
+            "authority_source",
+            "ref_name",
+            "branch_ref",
+            "requested_ref_name",
+            "requested_branch_ref",
+            "canonicalized",
+        ),
+        "merge_queue_graph_epoch_auto_record": (
+            "schema_version",
+            "status",
+            "recorded",
+            "reason",
+            "merge_queue_id",
+            "queue_item_id",
+            "snapshot_id",
+            "projection_id",
+        ),
+        "post_commit_activation_events": ("published", "error"),
+        "graph_stats": ("nodes", "edges", "files", "symbols"),
+    }
+    if timeline_event:
+        compact["timeline_event_recorded"] = timeline_event
+    for field, allowed in nested_fields.items():
+        projected = _current_full_reconcile_public_fields(value.get(field), allowed)
+        if projected:
+            compact[field] = projected
+
+    if response_view == "full":
+        return {
+            "schema_version": (
+                "graph_current_full_reconcile.full_response_too_large.v1"
+            ),
+            "ok": False,
+            "error": "graph_current_full_reconcile_full_response_too_large",
+            "message": (
+                "The reconcile completed, but its explicit full representation "
+                "exceeds the managed MCP response limit; retrying the reconcile "
+                "is not safe. Use response_view=compact for the durable result."
+            ),
+            "response_view": "full",
+            "reconcile_ok": bool(value.get("ok")),
+            "source_serialized_bytes": serialized_bytes,
+            "max_full_serialized_bytes": (
+                _CURRENT_FULL_RECONCILE_FULL_MAX_SERIALIZED_BYTES
+            ),
+            "http_request_performed": True,
+            "writes_performed": current_request_mutated,
+            "mutation_performed": current_request_mutated,
+            "safe_retry": False,
+            "compact_result": compact,
+            "raw_route_token_exposed": False,
+            "raw_observer_session_token_exposed": False,
+        }
+    return compact
 
 
 def _current_full_reconcile_route_token_alias_error(
@@ -4221,6 +4455,17 @@ TOOLS: list[dict] = [
                         "AMING_GRAPH_RECONCILE_MCP_TIMEOUT_SECONDS or 900 seconds."
                     ),
                 },
+                "response_view": {
+                    "type": "string",
+                    "enum": ["compact", "full"],
+                    "default": "compact",
+                    "description": (
+                        "Bounded MCP response projection. compact is the safe "
+                        "default; full is compatibility-only and may return a "
+                        "truthful representation-too-large result after a "
+                        "durable reconcile."
+                    ),
+                },
             },
             "required": ["project_id"],
             "x-copy-safe-observer-reconcile-fields": [
@@ -6779,10 +7024,23 @@ class ToolDispatcher:
         if name == "graph_current_full_reconcile":
             pid = args["project_id"]
             timeout_seconds = _reconcile_mcp_timeout_seconds(args)
+            response_view = str(args.get("response_view") or "compact").strip()
+            if response_view not in {"compact", "full"}:
+                return {
+                    "ok": False,
+                    "error": "graph_current_full_reconcile_response_view_invalid",
+                    "message": "response_view must be compact or full",
+                    "response_view": response_view,
+                    "http_request_performed": False,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                }
             body = {
                 key: value
                 for key, value in args.items()
-                if key not in {"project_id", "timeout_seconds"} and value is not None
+                if key not in {"project_id", "timeout_seconds", "response_view"}
+                and value is not None
             }
             body, alias_error = _normalize_current_full_reconcile_route_token_aliases(
                 body
@@ -6813,7 +7071,10 @@ class ToolDispatcher:
                         _current_full_reconcile_run_id(body),
                     ),
                 )
-            return result
+            return _current_full_reconcile_compact_result(
+                result,
+                response_view=response_view,
+            )
 
         if name == "stale_artifact_cleanup":
             pid = args["project_id"]

@@ -2493,6 +2493,9 @@ def test_mcp_stdio_public_safe_batch_close_blocker_schema_guidance():
     )
     assert "route_proof_diagnostics" in reconcile["description"]
     assert "raw route tokens" in reconcile["description"]
+    response_view = reconcile["inputSchema"]["properties"]["response_view"]
+    assert response_view["enum"] == ["compact", "full"]
+    assert response_view["default"] == "compact"
 
     queue_status = next(
         tool for tool in tools if tool["name"] == "parallel_branch_merge_queue_status"
@@ -2504,6 +2507,39 @@ def test_mcp_stdio_public_safe_batch_close_blocker_schema_guidance():
     assert "freshly issued route-token response" in properties["merge_queue_id"][
         "description"
     ]
+
+
+def test_mcp_stdio_current_full_invalid_response_view_is_local_zero_write():
+    responses, stderr, returncode = _run_mcp_probe(
+        [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "graph_current_full_reconcile",
+                    "arguments": {
+                        "project_id": "aming-claw",
+                        "response_view": "verbose",
+                    },
+                },
+            }
+        ]
+    )
+
+    assert returncode == 0
+    assert stderr == ""
+    result = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert result == {
+        "ok": False,
+        "error": "graph_current_full_reconcile_response_view_invalid",
+        "message": "response_view must be compact or full",
+        "response_view": "verbose",
+        "http_request_performed": False,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+    }
 
 
 def test_mcp_stdio_backlog_audit_archive_schema_exposes_evidence_shape():

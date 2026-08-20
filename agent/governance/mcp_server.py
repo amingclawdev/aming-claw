@@ -39,10 +39,12 @@ try:
     from agent.mcp.host_envelope_continuity import (
         default_managed_host_envelope_continuity,
     )
+    from agent.mcp.tools import _current_full_reconcile_compact_result
 except ModuleNotFoundError:  # Direct ``python agent/governance/mcp_server.py``.
     from mcp.host_envelope_continuity import (
         default_managed_host_envelope_continuity,
     )
+    from mcp.tools import _current_full_reconcile_compact_result
 
 # ---------------------------------------------------------------------------
 # Ensure the agent package root is on sys.path so relative imports work when
@@ -2922,6 +2924,17 @@ TOOLS: list[dict] = [
                         "AMING_GRAPH_RECONCILE_MCP_TIMEOUT_SECONDS or 900 seconds."
                     ),
                 },
+                "response_view": {
+                    "type": "string",
+                    "enum": ["compact", "full"],
+                    "default": "compact",
+                    "description": (
+                        "Bounded MCP response projection. compact is the safe "
+                        "default; full is compatibility-only and may return a "
+                        "truthful representation-too-large result after a "
+                        "durable reconcile."
+                    ),
+                },
             },
             "required": ["project_id"],
         },
@@ -4050,10 +4063,23 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name == "graph_current_full_reconcile":
         pid = args["project_id"]
         timeout_seconds = _reconcile_mcp_timeout_seconds(args)
+        response_view = str(args.get("response_view") or "compact").strip()
+        if response_view not in {"compact", "full"}:
+            return {
+                "ok": False,
+                "error": "graph_current_full_reconcile_response_view_invalid",
+                "message": "response_view must be compact or full",
+                "response_view": response_view,
+                "http_request_performed": False,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+            }
         body = {
             key: value
             for key, value in args.items()
-            if key not in {"project_id", "timeout_seconds"} and value is not None
+            if key not in {"project_id", "timeout_seconds", "response_view"}
+            and value is not None
         }
         body, alias_error = _normalize_current_full_reconcile_route_token_aliases(body)
         if alias_error:
@@ -4082,7 +4108,10 @@ def _dispatch_tool(name: str, args: dict) -> Any:
                     _current_full_reconcile_run_id(body),
                 ),
             )
-        return result
+        return _current_full_reconcile_compact_result(
+            result,
+            response_view=response_view,
+        )
 
     if name in {"runtime_context_current", "runtime_context_worker_guide"}:
         pid = args["project_id"]

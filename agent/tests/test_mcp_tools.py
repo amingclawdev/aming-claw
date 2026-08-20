@@ -1697,6 +1697,24 @@ def test_mcp_graph_current_full_reconcile_schema_exposes_route_proof_fields():
     assert props["worktree_path"]["description"] == (
         "Alias for project_root on candidate-only builds."
     )
+    assert props["response_view"] == {
+        "type": "string",
+        "enum": ["compact", "full"],
+        "default": "compact",
+        "description": (
+            "Bounded MCP response projection. compact is the safe default; "
+            "full is compatibility-only and may return a truthful "
+            "representation-too-large result after a durable reconcile."
+        ),
+    }
+    mirror = next(
+        tool
+        for tool in governance_mcp_server.TOOLS
+        if tool["name"] == "graph_current_full_reconcile"
+    )
+    assert mirror["inputSchema"]["properties"]["response_view"] == (
+        props["response_view"]
+    )
 
 
 def test_mcp_graph_current_full_reconcile_forwards_route_proof_fields():
@@ -1738,6 +1756,160 @@ def test_mcp_graph_current_full_reconcile_forwards_route_proof_fields():
             },
         )
     ]
+
+
+def test_mcp_graph_current_full_reconcile_bounds_success_and_keeps_write_truth(
+    monkeypatch,
+):
+    raw_result = {
+        "ok": True,
+        "status": "complete",
+        "project_id": "aming-claw",
+        "run_id": "current-full-bounded-result",
+        "snapshot_id": "full-bounded-result",
+        "active_snapshot_id": "full-bounded-result",
+        "snapshot_status": "active",
+        "target_commit_sha": "a" * 40,
+        "head_commit": "a" * 40,
+        "active_graph_commit": "a" * 40,
+        "current_full_reconcile": True,
+        "activated": True,
+        "activation_verification": {
+            "verified": True,
+            "active_snapshot_id": "full-bounded-result",
+            "active_graph_commit": "a" * 40,
+            "pending_scope_reconcile_count": 0,
+            "pending_scope_reconcile_zero": True,
+        },
+        "timeline_event_recorded": {
+            "id": 25190,
+            "ref": "timeline:25190",
+            "event_kind": "reconcile",
+            "phase": "reconcile",
+            "status": "passed",
+        },
+        "current_full_reconcile_provenance": {
+            "provenance_id": "cfrp-bounded-result",
+            "snapshot_id": "full-bounded-result",
+            "reconcile_event_id": 25190,
+        },
+        "route_token": {"token": "raw-route-must-not-escape"},
+        "trace": {"oversized": "x" * 300_000},
+    }
+
+    class LargeReconcileRecorder(_Recorder):
+        def api(
+            self,
+            method: str,
+            url: str,
+            data: dict | None = None,
+            timeout: int = 15,
+        ) -> dict:
+            self.calls.append((method, url, data, timeout))
+            return raw_result
+
+    recorder = LargeReconcileRecorder()
+    direct = _dispatcher(recorder).dispatch(
+        "graph_current_full_reconcile",
+        {
+            "project_id": "aming-claw",
+            "run_id": "current-full-bounded-result",
+        },
+    )
+    assert direct["ok"] is True
+    assert direct["response_view"] == "compact"
+    assert direct["bounded_response"] is True
+    assert direct["activated"] is True
+    assert direct["writes_performed"] is True
+    assert direct["mutation_performed"] is True
+    assert direct["timeline_event_recorded"]["id"] == 25190
+    assert direct["current_full_reconcile_provenance"] == {
+        "provenance_id": "cfrp-bounded-result",
+        "snapshot_id": "full-bounded-result",
+        "reconcile_event_id": 25190,
+    }
+    assert len(json.dumps(direct).encode()) < 64 * 1024
+    assert "raw-route-must-not-escape" not in json.dumps(direct)
+    assert recorder.calls[0][2] == {
+        "run_id": "current-full-bounded-result"
+    }
+
+    calls = []
+
+    def fake_http(
+        method: str,
+        path: str,
+        body: dict | None = None,
+        *,
+        gov_token: str | None = None,
+        timeout_seconds: int | None = None,
+    ) -> dict:
+        calls.append((method, path, body, gov_token, timeout_seconds))
+        return raw_result
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    mirror = governance_mcp_server._dispatch_tool(
+        "graph_current_full_reconcile",
+        {
+            "project_id": "aming-claw",
+            "run_id": "current-full-bounded-result",
+        },
+    )
+    assert mirror == direct
+    assert calls[0][2] == {"run_id": "current-full-bounded-result"}
+
+    full = _dispatcher(LargeReconcileRecorder()).dispatch(
+        "graph_current_full_reconcile",
+        {
+            "project_id": "aming-claw",
+            "run_id": "current-full-bounded-result",
+            "response_view": "full",
+        },
+    )
+    assert full["ok"] is False
+    assert full["reconcile_ok"] is True
+    assert full["error"] == (
+        "graph_current_full_reconcile_full_response_too_large"
+    )
+    assert full["writes_performed"] is True
+    assert full["safe_retry"] is False
+    assert full["compact_result"]["active_snapshot_id"] == (
+        "full-bounded-result"
+    )
+
+
+def test_mcp_graph_current_full_reconcile_invalid_view_is_local_zero_write(
+    monkeypatch,
+):
+    recorder = _Recorder()
+    direct = _dispatcher(recorder).dispatch(
+        "graph_current_full_reconcile",
+        {"project_id": "aming-claw", "response_view": "verbose"},
+    )
+    assert direct == {
+        "ok": False,
+        "error": "graph_current_full_reconcile_response_view_invalid",
+        "message": "response_view must be compact or full",
+        "response_view": "verbose",
+        "http_request_performed": False,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+    }
+    assert recorder.calls == []
+
+    calls = []
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    mirror = governance_mcp_server._dispatch_tool(
+        "graph_current_full_reconcile",
+        {"project_id": "aming-claw", "response_view": "verbose"},
+    )
+    assert mirror == direct
+    assert calls == []
 
 
 def test_mcp_graph_current_full_reconcile_uses_reconcile_timeout(monkeypatch):
