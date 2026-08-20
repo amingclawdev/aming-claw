@@ -12178,7 +12178,18 @@ def _qa_validate_candidate_review_claims(
                         ]
                     else:
                         actual = []
-                    expected_value = list(expected or [])
+                    # A changed-file tuple is an exact normalized membership
+                    # claim, not an ordering claim.  Git-backed producers and
+                    # independent QA runners may enumerate the same paths in a
+                    # different stable order.  Sort both sides without
+                    # deduplicating so missing, extra, duplicate, malformed,
+                    # or otherwise different membership still fails closed.
+                    actual = sorted(actual)
+                    expected_value = sorted(
+                        str(item).strip().replace("\\", "/")
+                        for item in (expected or [])
+                        if str(item).strip()
+                    )
                 else:
                     actual = str(supplied or "").strip().lower()
                     expected_value = str(expected or "").strip().lower()

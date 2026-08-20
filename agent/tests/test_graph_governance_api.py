@@ -141267,6 +141267,19 @@ def test_qa_review_claims_accept_exact_targeted_comparison_test_results():
 
     server._qa_validate_candidate_review_claims(body, review_context)
 
+    reordered_changed_files = json.loads(json.dumps(body))
+    for container in (
+        reordered_changed_files["verification"],
+        reordered_changed_files["payload"]["test_results"],
+    ):
+        container["changed_files"] = list(
+            reversed(container["changed_files"])
+        )
+    server._qa_validate_candidate_review_claims(
+        reordered_changed_files,
+        review_context,
+    )
+
     post_body = json.loads(json.dumps(body))
     for container in (
         post_body["verification"],
@@ -141312,6 +141325,18 @@ def test_qa_review_claims_accept_exact_targeted_comparison_test_results():
     audit_only_status = json.loads(json.dumps(body))
     audit_only_status["status"] = "failed"
     invalid_variants.append(audit_only_status)
+
+    for malformed_changed_files in (
+        review_context["changed_files"][:-1],
+        [*review_context["changed_files"], "agent/tests/unexpected.py"],
+        [*review_context["changed_files"], review_context["changed_files"][0]],
+        {"not": "a path list"},
+    ):
+        malformed = json.loads(json.dumps(body))
+        malformed["verification"]["changed_files"] = (
+            malformed_changed_files
+        )
+        invalid_variants.append(malformed)
 
     missing_server_comparison = dict(review_context)
     missing_server_comparison["comparison_base_commit_sha"] = ""
