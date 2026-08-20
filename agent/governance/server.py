@@ -25596,6 +25596,7 @@ def _runtime_context_projection_response(
     )
     current_actionable_payloads = _runtime_context_worker_recovery_payloads(
         project_id=project_id,
+        main_worktree=_runtime_context_registered_main_worktree(project_id),
         runtime_context_id=runtime_context_id,
         task_id=str(getattr(context, "task_id", "") or ""),
         backlog_id=str(getattr(context, "backlog_id", "") or ""),
@@ -33897,6 +33898,7 @@ def _runtime_context_worker_guide_response(
     worker_authority_revision["active_owned_files"] = list(worker_scope_files)
     actionable_payloads = _runtime_context_worker_recovery_payloads(
         project_id=project_id,
+        main_worktree=_runtime_context_registered_main_worktree(project_id),
         runtime_context_id=runtime_context_id,
         task_id=task_id,
         backlog_id=str(task.get("backlog_id") or worker_view.get("backlog_id") or ""),
@@ -34928,6 +34930,20 @@ def _runtime_context_effective_target_project_root(context) -> str:
     return runtime_context_effective_target_project_root(context)
 
 
+def _runtime_context_registered_main_worktree(project_id: str) -> str:
+    """Return the registered host checkout without trusting worker root aliases."""
+
+    try:
+        root = project_service.resolve_project_root(
+            project_id,
+            None,
+            fallback_self=True,
+        )
+    except (OSError, TypeError, ValueError):
+        return ""
+    return str(Path(root).resolve()) if root is not None else ""
+
+
 def _runtime_context_git_head_commit(*paths: str) -> str:
     for raw_path in paths:
         path = str(raw_path or "").strip()
@@ -35541,6 +35557,7 @@ def _runtime_context_post_read_startup_receipt_authority_is_exact(
 def _runtime_context_worker_recovery_payloads(
     *,
     project_id: str,
+    main_worktree: str | None = None,
     runtime_context_id: str,
     task_id: str,
     parent_task_id: str,
@@ -35657,6 +35674,10 @@ def _runtime_context_worker_recovery_payloads(
     normalized_worktree_path = str(
         target_project_root if worktree_path is None else worktree_path
     ).strip()
+    normalized_main_worktree = str(
+        target_project_root if main_worktree is None else main_worktree
+    ).strip()
+    strict_main_worktree_authority = main_worktree is not None
     worktree_authority_ready = _runtime_context_non_placeholder_text(
         normalized_worktree_path
     )
@@ -36483,8 +36504,8 @@ def _runtime_context_worker_recovery_payloads(
         "observer_command_id": canonical_observer_command_id,
         "worker_id": worker_id,
         "actual_host_worker_id": allocated_governed_worker_id,
-        "main_worktree": target_project_root,
-        "workspace_root": target_project_root,
+        "main_worktree": normalized_main_worktree,
+        "workspace_root": normalized_main_worktree,
         "target_project_root": target_project_root,
         "worktree_path": normalized_worktree_path,
         "base_commit": normalized_base_commit,
@@ -36505,6 +36526,8 @@ def _runtime_context_worker_recovery_payloads(
         "parent_task_id": parent_task_id,
         "observer_command_id": canonical_observer_command_id,
         "worker_id": worker_id,
+        "main_worktree": normalized_main_worktree,
+        "workspace_root": normalized_main_worktree,
         "target_project_root": target_project_root,
         "worktree_path": normalized_worktree_path,
         "base_commit": normalized_base_commit,
@@ -36517,6 +36540,16 @@ def _runtime_context_worker_recovery_payloads(
         for field, value in prepare_required_fields.items()
         if not _runtime_context_non_placeholder_text(value)
     ]
+    if (
+        strict_main_worktree_authority
+        and _runtime_context_non_placeholder_text(normalized_main_worktree)
+        and _runtime_context_non_placeholder_text(normalized_worktree_path)
+        and Path(normalized_main_worktree).resolve()
+        == Path(normalized_worktree_path).resolve()
+    ):
+        prepare_missing_fields.append(
+            "main_worktree_distinct_from_worker_worktree"
+        )
     runtime_text_prepare_submission = {
         "schema_version": "runtime_context.runtime_text_prepare_submission.v1",
         "action": "prepare_runtime_context_launch_text",
@@ -38849,6 +38882,7 @@ def _runtime_context_worker_recovery_details(
             recovery_action_id = "copy_projected_target_project_root"
         actionable_payloads = _runtime_context_worker_recovery_payloads(
             project_id=project_id,
+            main_worktree=_runtime_context_registered_main_worktree(project_id),
             runtime_context_id=expected_runtime_context_id,
             task_id=str(getattr(context, "task_id", "") or ""),
             backlog_id=str(getattr(context, "backlog_id", "") or ""),
@@ -55885,6 +55919,7 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                 )
         recovery_payloads = _runtime_context_worker_recovery_payloads(
             project_id=project_id,
+            main_worktree=_runtime_context_registered_main_worktree(project_id),
             runtime_context_id=runtime_context_id,
             task_id=task_id,
             backlog_id=str(
@@ -138630,6 +138665,7 @@ def _onboard_worker_read_runtime_facade_projection(
         ).strip()
         startup_payloads = _runtime_context_worker_recovery_payloads(
             project_id=project_id,
+            main_worktree=_runtime_context_registered_main_worktree(project_id),
             runtime_context_id=runtime_context_id,
             task_id=task_id,
             parent_task_id=parent_task_id,
@@ -138939,6 +138975,7 @@ def _onboard_worker_read_runtime_facade_projection(
 
     actionable = _runtime_context_worker_recovery_payloads(
         project_id=project_id,
+        main_worktree=_runtime_context_registered_main_worktree(project_id),
         runtime_context_id=runtime_context_id,
         task_id=task_id,
         parent_task_id=parent_task_id,

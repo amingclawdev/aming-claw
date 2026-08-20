@@ -171833,6 +171833,94 @@ def test_worker_guide_source_launch_hash_fails_closed(revision):
     assert server._runtime_context_source_backed_launch_text_hash(revision) == ""
 
 
+def test_worker_guide_prepare_projects_registered_main_worktree_and_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    main_worktree = tmp_path / "canonical-main"
+    worker_worktree = tmp_path / ".worktrees" / "worker"
+    resolved: list[tuple[str, object, bool]] = []
+
+    def resolve_project_root(project_id, explicit_root=None, *, fallback_self=True):
+        resolved.append((project_id, explicit_root, fallback_self))
+        return main_worktree
+
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        resolve_project_root,
+    )
+    registered_main_worktree = server._runtime_context_registered_main_worktree(
+        PID
+    )
+    assert registered_main_worktree == str(main_worktree)
+    assert resolved == [(PID, None, True)]
+    route_identity = {
+        "route_id": "route-worker-guide-main-worktree",
+        "route_context_hash": _fake_sha("worker-guide-main-worktree-route"),
+        "prompt_contract_id": "rprompt-worker-guide-main-worktree",
+        "prompt_contract_hash": _fake_sha("worker-guide-main-worktree-prompt"),
+        "route_token_ref": "rtok-worker-guide-main-worktree",
+        "visible_injection_manifest_hash": _fake_sha(
+            "worker-guide-main-worktree-manifest"
+        ),
+    }
+    common = {
+        "project_id": PID,
+        "runtime_context_id": "mfrctx-worker-guide-main-worktree",
+        "task_id": "worker-guide-main-worktree-worker",
+        "parent_task_id": "cex-worker-guide-main-worktree",
+        "worker_id": "worker-guide-main-worktree-slot",
+        "worker_slot_id": "worker-guide-main-worktree-slot",
+        "target_project_root": str(worker_worktree),
+        "worktree_path": str(worker_worktree),
+        "backlog_id": "AC-WORKER-GUIDE-MAIN-WORKTREE",
+        "base_commit": "a" * 40,
+        "target_head_commit": "b" * 40,
+        "merge_queue_id": "mq-worker-guide-main-worktree",
+        "route_identity": route_identity,
+        "contract_execution_id": "cex-worker-guide-main-worktree",
+        "successor_contract_execution_id": "cex-worker-guide-main-worktree",
+        "contract_runtime_dispatch_identity": {
+            "accepted": True,
+            "observer_command_id": "cmd-worker-guide-main-worktree",
+        },
+        "authority_revision": {
+            "active_owned_files": ["agent/governance/server.py"]
+        },
+    }
+
+    projected = server._runtime_context_worker_recovery_payloads(
+        main_worktree=registered_main_worktree,
+        **common,
+    )["runtime_text_prepare_submission"]
+    assert projected["actionable"] is True
+    assert projected["copy_safe_body"]["main_worktree"] == str(main_worktree)
+    assert projected["copy_safe_body"]["workspace_root"] == str(main_worktree)
+    assert projected["copy_safe_body"]["target_project_root"] == str(
+        worker_worktree
+    )
+    assert projected["copy_safe_body"]["worktree_path"] == str(worker_worktree)
+
+    same_worktree = server._runtime_context_worker_recovery_payloads(
+        main_worktree=str(worker_worktree),
+        **common,
+    )["runtime_text_prepare_submission"]
+    assert same_worktree["actionable"] is False
+    assert "main_worktree_distinct_from_worker_worktree" in (
+        same_worktree["missing_fields"]
+    )
+
+    missing_main = server._runtime_context_worker_recovery_payloads(
+        main_worktree="",
+        **common,
+    )["runtime_text_prepare_submission"]
+    assert missing_main["actionable"] is False
+    assert {"main_worktree", "workspace_root"}.issubset(
+        missing_main["missing_fields"]
+    )
+
+
 def test_worker_guide_receipt_requires_prepare_then_projects_eight_hashes(
     conn,
     tmp_path,
