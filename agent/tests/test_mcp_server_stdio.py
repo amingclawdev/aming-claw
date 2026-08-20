@@ -454,6 +454,123 @@ def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
     assert raw_fence not in serialized
 
 
+def test_managed_rejoin_lends_graph_query_auth_without_raw_caller_fields(tmp_path):
+    raw_session = "managed-graph-session-secret"
+    raw_fence = "managed-graph-fence-secret"
+    route = {
+        "route_id": "route-managed-graph",
+        "route_context_hash": "sha256:" + ("7" * 64),
+        "prompt_contract_id": "rprompt-managed-graph",
+        "prompt_contract_hash": "sha256:" + ("8" * 64),
+        "route_token_ref": "rtok-managed-graph",
+        "visible_injection_manifest_hash": "sha256:" + ("9" * 64),
+    }
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-managed-graph",
+        "task_id": "worker-managed-graph",
+        "parent_task_id": "cex-managed-graph",
+        "contract_execution_id": "cex-managed-graph",
+        "target_project_root": str(tmp_path),
+        "worker_id": "worker-managed-graph",
+        "worker_slot_id": "worker-managed-graph",
+        "agent_id": "worker-managed-graph",
+        "allocation_owner": "worker-managed-graph",
+        "actual_host_worker_id": "worker-managed-graph",
+        "worker_session_id": "desktop-managed-graph",
+        "host_startup_id": "desktop-managed-graph",
+        "host_session_id": "desktop-managed-graph",
+        "session_token_ref": "wstok-managed-graph",
+        **route,
+    }
+    calls = []
+
+    def fake_api(method: str, path: str, data: dict | None = None):
+        calls.append((method, path, data))
+        if path.endswith("/session-token/rejoin"):
+            return {
+                "ok": True,
+                "status": "session_token_rejoined",
+                "delivery": "worker_host_envelope",
+                **identity,
+                "session_token": raw_session,
+                "fence_token": raw_fence,
+                "host_envelope": {
+                    **identity,
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": raw_session,
+                        "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                    },
+                },
+            }
+        assert method == "POST"
+        assert path.endswith("/query")
+        assert data is not None
+        assert data["session_token"] == raw_session
+        assert data["fence_token"] == raw_fence
+        return {
+            "ok": True,
+            "trace_id": "gqt-managed-graph",
+            "tool": "function_index",
+            "result": [{"node_id": "managed.graph"}],
+            "graph_query_identity": {
+                "runtime_context_id": identity["runtime_context_id"],
+                "task_id": identity["task_id"],
+                "session_token": raw_session,
+                "fence_token": raw_fence,
+            },
+        }
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    issued = dispatcher.dispatch(
+        "runtime_context_session_token_rejoin",
+        {**identity, "reason": "restore managed graph continuity"},
+    )
+    assert issued["auth_loaded"] is True
+    assert raw_session not in json.dumps(issued, sort_keys=True)
+    assert raw_fence not in json.dumps(issued, sort_keys=True)
+
+    arguments = {
+        **identity,
+        "tool": "function_index",
+        "args": {"query": "managed.graph"},
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "worker_role": "mf_sub",
+    }
+    result = dispatcher.dispatch("graph_query", arguments)
+
+    assert result["ok"] is True
+    assert result["trace_id"] == "gqt-managed-graph"
+    assert "session_token" not in arguments
+    assert "fence_token" not in arguments
+    assert raw_session not in json.dumps(result, sort_keys=True)
+    assert raw_fence not in json.dumps(result, sort_keys=True)
+    assert dispatcher._host_envelope_continuity.pending_count() == 1
+
+    call_count = len(calls)
+    wrong_root = dispatcher.dispatch(
+        "graph_query",
+        {**arguments, "target_project_root": str(tmp_path / "cross-root")},
+    )
+    assert wrong_root["error"] == "managed_host_envelope_scope_mismatch"
+    assert wrong_root["mismatched_fields"] == ["target_project_root"]
+    assert wrong_root["http_request_performed"] is False
+    wrong_ref = dispatcher.dispatch(
+        "graph_query",
+        {**arguments, "session_token_ref": "wstok-cross-managed-graph"},
+    )
+    assert wrong_ref["error"] == "managed_host_envelope_scope_mismatch"
+    assert wrong_ref["mismatched_fields"] == ["session_token_ref"]
+    assert wrong_ref["http_request_performed"] is False
+    assert len(calls) == call_count
+
+
 def test_real_stdio_expired_managed_entry_allows_no_ref_recovery_guide(tmp_path):
     raw_session = "stdio-expiry-session-secret"
     raw_fence = "stdio-expiry-fence-secret"

@@ -40,6 +40,7 @@ ISSUANCE_TOOLS = frozenset(
 )
 CONTINUATION_TOOLS = frozenset(
     {
+        "graph_query",
         "runtime_context_worker_guide",
         "runtime_context_read_receipt",
         "parallel_branch_startup",
@@ -537,7 +538,7 @@ class ManagedHostEnvelopeContinuity:
                             "The exact process-local host envelope already has an in-flight continuation.",
                         )
             if (
-                tool_name == "runtime_context_worker_guide"
+                tool_name in {"graph_query", "runtime_context_worker_guide"}
                 or not _text(request_args.get("session_token_ref"))
             ):
                 return send(request_args)
