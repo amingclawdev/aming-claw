@@ -159401,6 +159401,74 @@ def test_compact_worker_read_explicit_task_pin_selects_exact_sibling_zero_write(
     assert "\n".join(conn.iterdump()) == cross_cex_before_db
 
 
+def test_runtime_context_graph_guide_safe_ref_only_host_realization_warranty():
+    route_identity = {
+        "route_id": "route-graph-guide-warranty",
+        "route_context_hash": "sha256:" + "1" * 64,
+        "prompt_contract_id": "rprompt-graph-guide-warranty",
+        "prompt_contract_hash": "sha256:" + "2" * 64,
+        "route_token_ref": "rtok-graph-guide-warranty",
+        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+    }
+    body = server._runtime_context_graph_copy_safe_body(
+        project_id=PID,
+        runtime_context_id="mfrctx-graph-guide-warranty",
+        task_id="graph-guide-warranty-worker",
+        parent_task_id="cex-graph-guide-warranty",
+        target_project_root="/tmp/graph-guide-warranty",
+        session_token_ref="wstok-graph-guide-warranty",
+        route_identity=route_identity,
+        graph_payload_shape={"project_root": "/tmp/graph-guide-warranty"},
+    )
+
+    assert body["session_token_ref"] == "wstok-graph-guide-warranty"
+    assert body["route_identity"] == route_identity
+    assert "session_token" not in body
+    assert "fence_token" not in body
+
+    action = server._guide_canonical_executable_action(
+        project_id=PID,
+        action="run_graph_query",
+        body=body,
+        facade="graph_query",
+        mcp_tool="graph_query",
+        backlog_id="AC-GRAPH-GUIDE-WARRANTY",
+        contract_execution_id="cex-graph-guide-warranty",
+    )
+    assert action["copy_safe_body"] == body
+    assert action["host_realization"]["required_replacement_paths"] == [
+        "copy_safe_body.args.query"
+    ]
+    assert action["host_realization"]["authority_inference_allowed"] is False
+    assert action["safe_ref_policy"] == {
+        "session_token_ref_rotation_is_authoritative": True,
+        "copy_latest_joined_ref": True,
+        "raw_auth_process_local_only": True,
+    }
+
+    raw_auth_probe = server._guide_canonical_executable_action(
+        project_id=PID,
+        action="run_graph_query",
+        body={
+            **body,
+            "session_token": "raw-session-warranty-sentinel",
+            "fence_token": "raw-fence-warranty-sentinel",
+        },
+        facade="graph_query",
+        mcp_tool="graph_query",
+    )
+    serialized_probe = json.dumps(raw_auth_probe, sort_keys=True)
+    assert "raw-session-warranty-sentinel" not in serialized_probe
+    assert "raw-fence-warranty-sentinel" not in serialized_probe
+    assert set(
+        raw_auth_probe["host_realization"]["required_replacement_paths"]
+    ) == {
+        "copy_safe_body.args.query",
+        "copy_safe_body.session_token",
+        "copy_safe_body.fence_token",
+    }
+
+
 def test_compact_worker_graph_context_projects_exact_sibling_action_zero_write(
     conn,
     monkeypatch,
