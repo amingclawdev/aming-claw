@@ -141358,6 +141358,86 @@ def test_qa_review_claims_accept_exact_targeted_comparison_test_results():
         assert rejected.value.details["writes_performed"] is False
 
 
+def test_qa_review_changed_files_exact_membership_is_order_stable():
+    candidate_commit = "8b093d2de879edfa04d45398743102ba0f092ea9"
+    comparison_base_commit = "c2956b39d4584c22e0f943c8c02bb70e84091017"
+    canonical_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+        "agent/tests/test_mcp_tools.py",
+    ]
+    review_context = {
+        "candidate_commit_sha": candidate_commit,
+        "base_commit_sha": candidate_commit,
+        "comparison_base_commit_sha": comparison_base_commit,
+        "graph_basis": "exact_candidate_snapshot",
+        "changed_files": canonical_files,
+    }
+    comparison_results = {
+        "schema_version": "qa.targeted_scoped_pre_verification.v1",
+        "qa_stage": "PRE",
+        "scope": "targeted_scoped",
+        "verdict": "PASS",
+        "passed": True,
+        "used_as_pass": False,
+        "close_satisfying": False,
+        "overall_pass_claimed": False,
+        "overall_release_pass_claimed": False,
+        "full_suite_claimed": False,
+        "full_suite_status": "not_claimed",
+        "candidate_new_failures": 0,
+        "base_commit_sha": comparison_base_commit,
+        "candidate_commit_sha": candidate_commit,
+        "changed_files": canonical_files,
+    }
+    body = {
+        "status": "passed",
+        "commit_sha": candidate_commit,
+        "verification": json.loads(json.dumps(comparison_results)),
+        "payload": {
+            "candidate_commit_sha": candidate_commit,
+            "test_results": json.loads(json.dumps(comparison_results)),
+        },
+    }
+
+    for order in (
+        [canonical_files[2], canonical_files[0], canonical_files[1]],
+        [canonical_files[1], canonical_files[2], canonical_files[0]],
+    ):
+        reordered = json.loads(json.dumps(body))
+        reordered["verification"]["changed_files"] = order
+        reordered["payload"]["test_results"]["changed_files"] = order
+        server._qa_validate_candidate_review_claims(
+            reordered,
+            review_context,
+        )
+
+    malformed_memberships = (
+        canonical_files[:-1],
+        [*canonical_files, "agent/tests/unexpected.py"],
+        [*canonical_files, canonical_files[0]],
+        {"not": "a path list"},
+    )
+    for container_path in (
+        ("verification",),
+        ("payload", "test_results"),
+    ):
+        for malformed_membership in malformed_memberships:
+            malformed = json.loads(json.dumps(body))
+            container = malformed
+            for path_key in container_path:
+                container = container[path_key]
+            container["changed_files"] = malformed_membership
+            with pytest.raises(GovernanceError) as rejected:
+                server._qa_validate_candidate_review_claims(
+                    malformed,
+                    review_context,
+                )
+            assert rejected.value.code == "qa_graph_review_context_mismatch"
+            assert rejected.value.details["zero_write_rejection"] is True
+            assert rejected.value.details["writes_performed"] is False
+
+
 def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timeline(
     conn,
     tmp_path,
