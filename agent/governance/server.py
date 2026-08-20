@@ -30721,6 +30721,504 @@ def _runtime_context_graph_copy_safe_body(
 _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES = 32 * 1024
 _RUNTIME_CONTEXT_WORKER_GUIDE_INLINE_DIAGNOSTIC_BYTES = 2 * 1024
 _RUNTIME_CONTEXT_WORKER_GUIDE_INLINE_DIAGNOSTIC_ITEMS = 8
+_RUNTIME_CONTEXT_SERVER_READ_MAX_SERIALIZED_BYTES = 64 * 1024
+_RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES = 24 * 1024
+_RUNTIME_CONTEXT_SERVER_GRAPH_MAX_SERIALIZED_BYTES = 96 * 1024
+
+_RUNTIME_CONTEXT_SERVER_IDENTITY_FIELDS = (
+    "schema_version",
+    "status",
+    "action",
+    "next_legal_action",
+    "project_id",
+    "governance_project_id",
+    "target_project_id",
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "contract_execution_id",
+    "worker_id",
+    "worker_slot_id",
+    "agent_id",
+    "target_project_root",
+    "project_root",
+    "repo_root",
+    "worktree_path",
+    "branch_ref",
+    "base_commit",
+    "target_head_commit",
+    "merge_queue_id",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+    "session_token_ref",
+    "trace_id",
+    "snapshot_id",
+    "snapshot_commit",
+    "execution_state_revision",
+    "contract_revision_id",
+    "projection_hash",
+    "projection_watermark",
+    "generation",
+    "source_of_authority",
+    "authority_decision_source",
+    "accepted",
+    "canonical",
+    "terminal",
+    "actionable",
+    "complete",
+    "passed",
+    "ok",
+    "error",
+    "reason",
+    "message",
+)
+
+
+def _runtime_context_server_read_serialized_bytes(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    )
+
+
+def _runtime_context_server_scalar_projection(
+    value: Any,
+    fields: Sequence[str] = _RUNTIME_CONTEXT_SERVER_IDENTITY_FIELDS,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    projected: dict[str, Any] = {}
+    for field in fields:
+        if field not in value:
+            continue
+        item = value[field]
+        if not isinstance(item, (str, int, float, bool, type(None))):
+            continue
+        if isinstance(item, str) and len(item.encode("utf-8")) > 2_048:
+            continue
+        projected[field] = item
+    return projected
+
+
+def _runtime_context_server_bounded_mapping(
+    value: Any,
+    *,
+    field: str,
+) -> dict[str, Any]:
+    """Inline one small authority mapping and hash-address larger detail."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    serialized_bytes = _runtime_context_server_read_serialized_bytes(value)
+    if serialized_bytes <= _RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES:
+        return deepcopy(dict(value))
+    return {
+        **_runtime_context_server_scalar_projection(value),
+        "bounded_projection": True,
+        "source_field": field,
+        "source_hash": _stable_public_hash(value),
+        "source_serialized_bytes": serialized_bytes,
+        "semantic_truncation_performed": False,
+    }
+
+
+def _runtime_context_server_access_audit_truth(
+    value: Mapping[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    access_audit = value.get("access_audit")
+    access_audit = (
+        deepcopy(dict(access_audit))
+        if isinstance(access_audit, Mapping)
+        else {}
+    )
+    persisted = bool(str(access_audit.get("audit_id") or "").strip())
+    return access_audit, persisted
+
+
+def _runtime_context_server_bounded_current_state_response(
+    value: Mapping[str, Any],
+    *,
+    requested_view: str,
+) -> dict[str, Any]:
+    """Bound a recursive current-state tree before the public HTTP boundary."""
+
+    full = dict(value or {})
+    serialized_bytes = _runtime_context_server_read_serialized_bytes(full)
+    if serialized_bytes <= _RUNTIME_CONTEXT_SERVER_READ_MAX_SERIALIZED_BYTES:
+        return full
+    access_audit, audit_persisted = _runtime_context_server_access_audit_truth(full)
+    normalized_view = str(requested_view or "").strip().lower()
+    if normalized_view in {"all", "full"}:
+        return {
+            "ok": False,
+            "error": "runtime_context_current_full_response_too_large",
+            "message": (
+                "The explicit full current-state projection exceeds the "
+                "managed response limit."
+            ),
+            "response_view": normalized_view,
+            "source_hash": _stable_public_hash(full),
+            "source_serialized_bytes": serialized_bytes,
+            "access_audit": access_audit,
+            "access_audit_persisted": audit_persisted,
+            "governance_writes_performed": audit_persisted,
+            "writes_performed": audit_persisted,
+            "mutation_performed": audit_persisted,
+            "product_mutation_performed": False,
+            "semantic_truncation_performed": False,
+        }
+    service = full.get("runtime_context_service")
+    service = service if isinstance(service, Mapping) else {}
+    content_address = service.get("content_address")
+    content_address = content_address if isinstance(content_address, Mapping) else {}
+    views = service.get("views")
+    views = views if isinstance(views, Mapping) else {}
+    worker_view = views.get("worker_view")
+    worker_view = worker_view if isinstance(worker_view, Mapping) else {}
+    compact_worker_view = {
+        key: _runtime_context_server_bounded_mapping(
+            worker_view.get(key),
+            field=f"runtime_context_service.views.worker_view.{key}",
+        )
+        for key in (
+            "task",
+            "branch",
+            "route_identity",
+            "graph_query_identity",
+            "session_token_lease",
+            "worker_scope",
+        )
+        if isinstance(worker_view.get(key), Mapping)
+    }
+    compact = {
+        "ok": bool(full.get("ok")),
+        **_runtime_context_server_scalar_projection(full),
+        "schema_version": "runtime_context.current_state_server_compact.v1",
+        "response_view": "compact",
+        "runtime_context_status": full.get("runtime_context_status"),
+        "runtime_context_last_recovery_action": full.get(
+            "runtime_context_last_recovery_action"
+        ),
+        "runtime_context": _runtime_context_server_bounded_mapping(
+            full.get("runtime_context"), field="runtime_context"
+        ),
+        "session_token_lease": _runtime_context_server_bounded_mapping(
+            full.get("session_token_lease"), field="session_token_lease"
+        ),
+        "contract_runtime_current_state": _runtime_context_server_bounded_mapping(
+            full.get("contract_runtime_current_state"),
+            field="contract_runtime_current_state",
+        ),
+        "contract_runtime_next_legal_action": (
+            _runtime_context_server_bounded_mapping(
+                full.get("contract_runtime_next_legal_action"),
+                field="contract_runtime_next_legal_action",
+            )
+        ),
+        "post_read_startup_receipt_authority": (
+            _runtime_context_server_bounded_mapping(
+                full.get("post_read_startup_receipt_authority"),
+                field="post_read_startup_receipt_authority",
+            )
+        ),
+        "runtime_context_service": {
+            "schema_version": service.get("schema_version"),
+            "project_id": service.get("project_id"),
+            "runtime_context_id": service.get("runtime_context_id"),
+            "content_address": _runtime_context_server_bounded_mapping(
+                content_address,
+                field="runtime_context_service.content_address",
+            ),
+            "views": {"worker_view": compact_worker_view},
+        },
+        "access_audit": access_audit,
+        "access_audit_persisted": audit_persisted,
+        "source_projection": {
+            "schema_version": "runtime_context.server_bounded_source.v1",
+            "source_hash": _stable_public_hash(full),
+            "source_serialized_bytes": serialized_bytes,
+            "projection_scope": "current_runtime_context_authority",
+        },
+        "governance_writes_performed": audit_persisted,
+        "writes_performed": audit_persisted,
+        "mutation_performed": audit_persisted,
+        "product_mutation_performed": False,
+        "semantic_truncation_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    compact["serialized_bytes"] = _runtime_context_server_read_serialized_bytes(
+        compact
+    )
+    if compact["serialized_bytes"] > _RUNTIME_CONTEXT_SERVER_READ_MAX_SERIALIZED_BYTES:
+        return {
+            "ok": False,
+            "error": "runtime_context_current_authority_too_large",
+            "source_hash": _stable_public_hash(full),
+            "source_serialized_bytes": serialized_bytes,
+            "access_audit": access_audit,
+            "access_audit_persisted": audit_persisted,
+            "governance_writes_performed": audit_persisted,
+            "writes_performed": audit_persisted,
+            "mutation_performed": audit_persisted,
+            "product_mutation_performed": False,
+            "semantic_truncation_performed": False,
+        }
+    return compact
+
+
+def _runtime_context_server_bounded_worker_guide_response(
+    value: Mapping[str, Any],
+    *,
+    requested_view: str = "compact",
+) -> dict[str, Any]:
+    """Retain one executable Worker Guide action without recursive history."""
+
+    full = dict(value or {})
+    serialized_bytes = _runtime_context_server_read_serialized_bytes(full)
+    if serialized_bytes <= _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES:
+        projected = deepcopy(full)
+        if "serialized_bytes" in projected:
+            projected["serialized_bytes"] = _runtime_context_server_read_serialized_bytes(
+                {key: item for key, item in projected.items() if key != "serialized_bytes"}
+            )
+        return projected
+    normalized_view = str(requested_view or "compact").strip().lower()
+    if normalized_view in {"all", "full"}:
+        return {
+            "ok": False,
+            "error": "runtime_context_worker_guide_full_response_too_large",
+            "message": "The explicit full Worker Guide exceeds the managed response limit.",
+            "response_view": normalized_view,
+            "source_hash": _stable_public_hash(full),
+            "source_serialized_bytes": serialized_bytes,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "semantic_truncation_performed": False,
+            "retry_with_view_all_allowed_for_managed_transport": False,
+        }
+    nested = full.get("worker_guide")
+    nested = nested if isinstance(nested, Mapping) else {}
+    current_action = full.get("canonical_executable_action")
+    current_action = current_action if isinstance(current_action, Mapping) else {}
+    if not current_action:
+        executable_actions = full.get("canonical_executable_actions")
+        executable_actions = (
+            executable_actions if isinstance(executable_actions, Mapping) else {}
+        )
+        current_stage = _runtime_context_worker_guide_current_stage(full)
+        candidate = executable_actions.get(current_stage)
+        current_action = candidate if isinstance(candidate, Mapping) else {}
+    current_action_bytes = _runtime_context_server_read_serialized_bytes(current_action)
+    if current_action_bytes > _RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES:
+        raise GovernanceError(
+            "runtime_context_worker_guide_compact_response_too_large",
+            "The current executable Worker Guide action cannot be losslessly inlined.",
+            503,
+            {
+                "response_view": "compact",
+                "serialized_bytes": serialized_bytes,
+                "current_action_serialized_bytes": current_action_bytes,
+                "max_serialized_bytes": (
+                    _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+                ),
+                "semantic_truncation_performed": False,
+                "writes_performed": False,
+            },
+        )
+    route_identity = full.get("route_identity")
+    if not isinstance(route_identity, Mapping):
+        route_identity = nested.get("route_identity")
+    graph_query_identity = full.get("graph_query_identity")
+    if not isinstance(graph_query_identity, Mapping):
+        graph_query_identity = nested.get("graph_query_identity")
+    session_token_lease = full.get("session_token_lease")
+    if not isinstance(session_token_lease, Mapping):
+        session_token_lease = nested.get("session_token_lease")
+    compact = {
+        "ok": bool(full.get("ok")),
+        **_runtime_context_server_scalar_projection(full),
+        "schema_version": "runtime_context.worker_guide_server_compact.v1",
+        "response_view": "compact",
+        "runtime_context": _runtime_context_server_bounded_mapping(
+            full.get("runtime_context"), field="runtime_context"
+        ),
+        "route_identity": _runtime_context_server_bounded_mapping(
+            route_identity, field="route_identity"
+        ),
+        "graph_query_identity": _runtime_context_server_bounded_mapping(
+            graph_query_identity, field="graph_query_identity"
+        ),
+        "session_token_lease": _runtime_context_server_bounded_mapping(
+            session_token_lease, field="session_token_lease"
+        ),
+        "contract_runtime_current_state": _runtime_context_server_bounded_mapping(
+            full.get("contract_runtime_current_state"),
+            field="contract_runtime_current_state",
+        ),
+        "contract_runtime_next_legal_action": (
+            _runtime_context_server_bounded_mapping(
+                full.get("contract_runtime_next_legal_action"),
+                field="contract_runtime_next_legal_action",
+            )
+        ),
+        "canonical_executable_action": deepcopy(dict(current_action)),
+        "canonical_executable_action_hash": _stable_public_hash(current_action),
+        "source_projection": {
+            "schema_version": "runtime_context.server_bounded_source.v1",
+            "source_hash": _stable_public_hash(full),
+            "source_serialized_bytes": serialized_bytes,
+            "projection_scope": "current_worker_authority",
+            "omitted_recursive_sections": [
+                "worker_guide",
+                "executable_contract",
+                "inactive_canonical_executable_actions",
+                "duplicate_lifecycle_payloads",
+            ],
+        },
+        "writes_performed": False,
+        "mutation_performed": False,
+        "semantic_truncation_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    compact["serialized_bytes"] = _runtime_context_server_read_serialized_bytes(
+        compact
+    )
+    if compact["serialized_bytes"] > _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES:
+        raise GovernanceError(
+            "runtime_context_worker_guide_compact_response_too_large",
+            "The current Worker Guide authority alone exceeds the managed response limit.",
+            503,
+            {
+                "response_view": "compact",
+                "serialized_bytes": compact["serialized_bytes"],
+                "max_serialized_bytes": (
+                    _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+                ),
+                "semantic_truncation_performed": False,
+                "writes_performed": False,
+            },
+        )
+    return compact
+
+
+def _runtime_context_server_bounded_mf_sub_graph_query_response(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bound worker lifecycle diagnostics around one persisted graph result."""
+
+    full = dict(value or {})
+    serialized_bytes = _runtime_context_server_read_serialized_bytes(full)
+    if serialized_bytes <= _RUNTIME_CONTEXT_SERVER_GRAPH_MAX_SERIALIZED_BYTES:
+        return full
+    query_result = full.get("result")
+    query_result_bytes = _runtime_context_server_read_serialized_bytes(query_result)
+    trace = full.get("trace")
+    trace = trace if isinstance(trace, Mapping) else {}
+    canonical_line = full.get("contract_runtime_canonical_line")
+    canonical_line = canonical_line if isinstance(canonical_line, Mapping) else {}
+    trace_persisted = bool(full.get("trace_id") or trace.get("trace_id"))
+    contract_line_persisted = bool(
+        canonical_line.get("accepted")
+        or str(canonical_line.get("status") or "").strip().lower()
+        in {"accepted", "complete", "completed", "passed", "success"}
+    )
+    writes_performed = trace_persisted or contract_line_persisted
+    if query_result_bytes > _RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES:
+        return {
+            "ok": False,
+            "error": "mf_sub_graph_query_result_too_large",
+            "message": "The graph query result itself exceeds the managed inline limit.",
+            "trace_id": full.get("trace_id") or trace.get("trace_id"),
+            "tool": full.get("tool"),
+            "result_hash": _stable_public_hash(query_result),
+            "result_serialized_bytes": query_result_bytes,
+            "governance_writes_performed": writes_performed,
+            "writes_performed": writes_performed,
+            "mutation_performed": writes_performed,
+            "product_mutation_performed": False,
+            "semantic_truncation_performed": False,
+        }
+    compact = {
+        "ok": bool(full.get("ok")),
+        "schema_version": "graph_query.mf_sub_server_compact.v1",
+        "response_view": "compact",
+        "trace_id": full.get("trace_id") or trace.get("trace_id"),
+        "seq": full.get("seq"),
+        "tool": full.get("tool"),
+        "result": deepcopy(query_result),
+        "result_count": full.get("result_count"),
+        "duration_ms": full.get("duration_ms"),
+        "usage": deepcopy(full.get("usage") or {}),
+        "budget": deepcopy(full.get("budget") or {}),
+        "graph_query_identity": _runtime_context_server_bounded_mapping(
+            full.get("graph_query_identity"), field="graph_query_identity"
+        ),
+        "trace": _runtime_context_server_bounded_mapping(trace, field="trace"),
+        "mf_sub_graph_query_canonical_eligibility": (
+            _runtime_context_server_bounded_mapping(
+                full.get("mf_sub_graph_query_canonical_eligibility"),
+                field="mf_sub_graph_query_canonical_eligibility",
+            )
+        ),
+        "mf_sub_graph_query_canonical_gate": (
+            _runtime_context_server_bounded_mapping(
+                full.get("mf_sub_graph_query_canonical_gate"),
+                field="mf_sub_graph_query_canonical_gate",
+            )
+        ),
+        "contract_runtime_canonical_line": (
+            _runtime_context_server_bounded_mapping(
+                canonical_line, field="contract_runtime_canonical_line"
+            )
+        ),
+        "source_projection": {
+            "schema_version": "runtime_context.server_bounded_source.v1",
+            "source_hash": _stable_public_hash(full),
+            "source_serialized_bytes": serialized_bytes,
+            "projection_scope": "graph_result_and_canonical_gate",
+        },
+        "trace_persisted": trace_persisted,
+        "contract_runtime_line_persisted": contract_line_persisted,
+        "governance_writes_performed": writes_performed,
+        "writes_performed": writes_performed,
+        "mutation_performed": writes_performed,
+        "product_mutation_performed": False,
+        "semantic_truncation_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    compact["serialized_bytes"] = _runtime_context_server_read_serialized_bytes(
+        compact
+    )
+    if compact["serialized_bytes"] > _RUNTIME_CONTEXT_SERVER_GRAPH_MAX_SERIALIZED_BYTES:
+        return {
+            "ok": False,
+            "error": "mf_sub_graph_query_current_authority_too_large",
+            "trace_id": compact.get("trace_id"),
+            "source_hash": _stable_public_hash(full),
+            "source_serialized_bytes": serialized_bytes,
+            "governance_writes_performed": writes_performed,
+            "writes_performed": writes_performed,
+            "mutation_performed": writes_performed,
+            "product_mutation_performed": False,
+            "semantic_truncation_performed": False,
+        }
+    return compact
+
 
 _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_ACTIONABLE_KEYS = (
     "schema_version",
@@ -31547,30 +32045,9 @@ def _runtime_context_worker_guide_compact_response(
         )
     serialized_bytes = _runtime_context_worker_guide_serialized_bytes(compact)
     if serialized_bytes > _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES:
-        largest_fields = sorted(
-            (
-                (_runtime_context_worker_guide_serialized_bytes(value), key)
-                for key, value in compact.items()
-            ),
-            reverse=True,
-        )[:3]
-        raise GovernanceError(
-            "runtime_context_worker_guide_compact_response_too_large",
-            (
-                "bounded Worker Guide projection exceeds the managed response "
-                f"limit ({serialized_bytes} bytes; largest={largest_fields})"
-            ),
-            503,
-            {
-                "response_view": "compact",
-                "serialized_bytes": serialized_bytes,
-                "max_serialized_bytes": (
-                    _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
-                ),
-                "semantic_truncation_performed": False,
-                "retry_with_view_all_allowed_for_managed_transport": False,
-                "writes_performed": False,
-            },
+        return _runtime_context_server_bounded_worker_guide_response(
+            compact,
+            requested_view="compact",
         )
     compact["serialized_bytes"] = serialized_bytes
     return compact
@@ -32162,19 +32639,9 @@ def _runtime_context_worker_guide_early_compact_response(
         compact["serialized_bytes"]
         > _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
     ):
-        raise GovernanceError(
-            "runtime_context_worker_guide_compact_response_too_large",
-            "bounded Worker Guide projection exceeds the managed response limit",
-            503,
-            {
-                "response_view": "compact",
-                "serialized_bytes": compact["serialized_bytes"],
-                "max_serialized_bytes": (
-                    _RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
-                ),
-                "semantic_truncation_performed": False,
-                "writes_performed": False,
-            },
+        return _runtime_context_server_bounded_worker_guide_response(
+            compact,
+            requested_view="compact",
         )
     return compact
 
@@ -44277,13 +44744,20 @@ def handle_graph_governance_parallel_branch_runtime_context_current_state(ctx: R
             runtime_context_id=runtime_context_id,
         )
 
-        return _runtime_context_projection_response(
+        response = _runtime_context_projection_response(
             ctx,
             conn,
             project_id=project_id,
             context=context,
             role=role,
             session=session,
+        )
+        requested_view = str(ctx.query.get("view") or "compact").strip().lower()
+        if requested_view not in {"auto", "compact", "worker_view"}:
+            return response
+        return _runtime_context_server_bounded_current_state_response(
+            response,
+            requested_view=requested_view,
         )
     finally:
         conn.close()
@@ -44357,7 +44831,10 @@ def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: Re
                     detail_ref=str(query.get("detail_ref") or ""),
                     detail_cursor=detail_cursor,
                 )
-            return response
+            return _runtime_context_server_bounded_worker_guide_response(
+                response,
+                requested_view="compact",
+            )
         finally:
             conn.close()
     query["view"] = (
@@ -44379,6 +44856,8 @@ def handle_graph_governance_parallel_branch_runtime_context_worker_guide(ctx: Re
     current_state = handle_graph_governance_parallel_branch_runtime_context_current_state(
         state_ctx
     )
+    if current_state.get("ok") is False and current_state.get("error"):
+        return current_state
     response = _runtime_context_worker_guide_response(current_state)
     response["response_view"] = "all"
     return response
@@ -81150,7 +81629,9 @@ def handle_graph_governance_query(ctx: RequestContext):
                             cross_project_contract_line
                         )
                         conn.commit()
-                        return result
+                        return _runtime_context_server_bounded_mf_sub_graph_query_response(
+                            result
+                        )
                     from .parallel_branch_runtime import (
                         get_branch_context_by_runtime_context_id,
                         runtime_context_fence_token_verifier,
@@ -81208,7 +81689,9 @@ def handle_graph_governance_query(ctx: RequestContext):
                             ),
                         }
                         conn.commit()
-                        return result
+                        return _runtime_context_server_bounded_mf_sub_graph_query_response(
+                            result
+                        )
                     canonical_graph_gate = (
                         _runtime_context_mf_sub_graph_query_canonical_gate(
                             conn,
@@ -81254,7 +81737,9 @@ def handle_graph_governance_query(ctx: RequestContext):
                             "graph_query_canonical_gate": canonical_graph_gate,
                         }
                         conn.commit()
-                        return result
+                        return _runtime_context_server_bounded_mf_sub_graph_query_response(
+                            result
+                        )
                     trace_payload = (
                         result.get("trace")
                         if isinstance(result.get("trace"), Mapping)
@@ -81389,6 +81874,10 @@ def handle_graph_governance_query(ctx: RequestContext):
                     )
                     result["contract_runtime_canonical_line"] = canonical_line
                 conn.commit()
+            if str(body.get("query_source") or "") == "mf_subagent":
+                return _runtime_context_server_bounded_mf_sub_graph_query_response(
+                    result
+                )
             return result
         except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)

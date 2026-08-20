@@ -171953,6 +171953,224 @@ def test_worker_guide_compact_projection_is_bounded_and_semantically_complete():
     assert "merge_gate_evidence_payloads" not in compact["actionable_payloads"]
 
 
+def test_server_current_state_projection_bounds_recursive_worker_authority():
+    recursive = {"history": "h" * 300_000}
+    full = {
+        "ok": True,
+        "schema_version": "runtime_context.current_state_response.v1",
+        "project_id": PID,
+        "runtime_context_id": "mfrctx-server-compact",
+        "task_id": "worker-server-compact",
+        "runtime_context_status": "started",
+        "contract_runtime_current_state": {
+            "status": "active",
+            "execution_state_revision": 9,
+            "recursive": recursive,
+        },
+        "contract_runtime_next_legal_action": {
+            "action": "record_worker_graph_context",
+            "runtime_context_id": "mfrctx-server-compact",
+            "task_id": "worker-server-compact",
+            "recursive": recursive,
+        },
+        "runtime_context_service": {
+            "schema_version": "runtime_context.projection.v1",
+            "project_id": PID,
+            "runtime_context_id": "mfrctx-server-compact",
+            "content_address": {
+                "projection_hash": "sha256:projection",
+                "projection_watermark": "watermark-9",
+                "recursive": recursive,
+            },
+            "views": {
+                "worker_view": {
+                    "task": {
+                        "task_id": "worker-server-compact",
+                        "runtime_context_id": "mfrctx-server-compact",
+                        "recursive": recursive,
+                    },
+                    "route_identity": {
+                        "route_id": "route-server-compact",
+                        "route_token_ref": "rtok-server-compact",
+                    },
+                    "graph_query_identity": {
+                        "runtime_context_id": "mfrctx-server-compact",
+                        "task_id": "worker-server-compact",
+                        "target_project_root": "/tmp/server-compact",
+                    },
+                },
+                "current": recursive,
+            },
+        },
+        "access_audit": {
+            "schema_version": "runtime_context.access_audit.v1",
+            "audit_id": "audit-server-compact",
+            "projection_hash": "sha256:projection",
+        },
+    }
+
+    compact = server._runtime_context_server_bounded_current_state_response(
+        full,
+        requested_view="compact",
+    )
+
+    assert compact["ok"] is True
+    assert compact["response_view"] == "compact"
+    assert compact["serialized_bytes"] <= (
+        server._RUNTIME_CONTEXT_SERVER_READ_MAX_SERIALIZED_BYTES
+    )
+    assert compact["runtime_context_service"]["content_address"] == {
+        "projection_hash": "sha256:projection",
+        "projection_watermark": "watermark-9",
+        "bounded_projection": True,
+        "source_field": "runtime_context_service.content_address",
+        "source_hash": server._stable_public_hash(
+            full["runtime_context_service"]["content_address"]
+        ),
+        "source_serialized_bytes": server._runtime_context_server_read_serialized_bytes(
+            full["runtime_context_service"]["content_address"]
+        ),
+        "semantic_truncation_performed": False,
+    }
+    assert compact["access_audit_persisted"] is True
+    assert compact["writes_performed"] is True
+    assert "h" * 10_000 not in json.dumps(compact, sort_keys=True)
+
+
+def test_server_current_state_explicit_full_fails_closed_with_audit_truth():
+    full = {
+        "ok": True,
+        "runtime_context_id": "mfrctx-server-full",
+        "runtime_context_service": {"views": {"current": "x" * 100_000}},
+        "access_audit": {"audit_id": "audit-server-full"},
+    }
+
+    result = server._runtime_context_server_bounded_current_state_response(
+        full,
+        requested_view="full",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "runtime_context_current_full_response_too_large"
+    assert result["writes_performed"] is True
+    assert result["product_mutation_performed"] is False
+    assert result["semantic_truncation_performed"] is False
+
+
+def test_server_worker_guide_projection_preserves_current_action():
+    action = {
+        "mcp_tool": "graph_query",
+        "copy_safe_body": {
+            "runtime_context_id": "mfrctx-server-guide",
+            "task_id": "worker-server-guide",
+            "tool": "function_index",
+            "args": {"query": "toggleReminder"},
+        },
+    }
+    full = {
+        "ok": True,
+        "runtime_context_id": "mfrctx-server-guide",
+        "task_id": "worker-server-guide",
+        "next_legal_action": "record_worker_graph_context",
+        "canonical_executable_action": action,
+        "worker_guide": {
+            "route_identity": {
+                "route_id": "route-server-guide",
+                "route_token_ref": "rtok-server-guide",
+            },
+            "graph_query_identity": {
+                "runtime_context_id": "mfrctx-server-guide",
+                "task_id": "worker-server-guide",
+            },
+        },
+        "recursive_lifecycle": "l" * 700_000,
+    }
+
+    compact = server._runtime_context_server_bounded_worker_guide_response(full)
+
+    assert compact["ok"] is True
+    assert compact["response_view"] == "compact"
+    assert compact["canonical_executable_action"] == action
+    assert compact["canonical_executable_action_hash"] == (
+        server._stable_public_hash(action)
+    )
+    assert compact["graph_query_identity"]["task_id"] == "worker-server-guide"
+    assert compact["serialized_bytes"] <= (
+        server._RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+    )
+    assert compact["semantic_truncation_performed"] is False
+
+
+def test_worker_guide_compact_uses_server_fallback_for_recursive_runtime_state():
+    full = _representative_oversized_worker_guide()
+    full["runtime_context"] = {
+        "runtime_context_id": "mfrctx-compact-guide",
+        "task_id": "worker-compact-guide",
+        "status": "started",
+        "recursive_lifecycle": "l" * 300_000,
+    }
+
+    compact = server._runtime_context_worker_guide_compact_response(full)
+
+    assert compact["ok"] is True
+    assert compact["schema_version"] == (
+        "runtime_context.worker_guide_server_compact.v1"
+    )
+    assert compact["canonical_executable_action"]["copy_safe_body"][
+        "read_receipt_hash"
+    ].startswith("sha256:")
+    assert compact["runtime_context"]["runtime_context_id"] == (
+        "mfrctx-compact-guide"
+    )
+    assert compact["runtime_context"]["bounded_projection"] is True
+    assert compact["serialized_bytes"] <= (
+        server._RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES
+    )
+    assert compact["semantic_truncation_performed"] is False
+
+
+def test_server_mf_sub_graph_projection_preserves_result_and_write_truth():
+    result = {"nodes": [{"id": "node-reminder", "path": "src/reminders.js"}]}
+    full = {
+        "ok": True,
+        "trace_id": "gqt-server-compact",
+        "tool": "find_node_by_path",
+        "result": result,
+        "trace": {
+            "trace_id": "gqt-server-compact",
+            "status": "complete",
+            "recursive": "t" * 400_000,
+        },
+        "mf_sub_graph_query_canonical_gate": {
+            "ok": True,
+            "status": "verified",
+            "recursive": "g" * 300_000,
+        },
+        "contract_runtime_canonical_line": {
+            "accepted": True,
+            "status": "accepted",
+            "line_id": "worker_graph_context",
+            "recursive": "c" * 300_000,
+        },
+    }
+
+    compact = server._runtime_context_server_bounded_mf_sub_graph_query_response(
+        full
+    )
+
+    assert compact["ok"] is True
+    assert compact["result"] == result
+    assert compact["trace_id"] == "gqt-server-compact"
+    assert compact["trace_persisted"] is True
+    assert compact["contract_runtime_line_persisted"] is True
+    assert compact["writes_performed"] is True
+    assert compact["product_mutation_performed"] is False
+    assert compact["semantic_truncation_performed"] is False
+    assert compact["serialized_bytes"] <= (
+        server._RUNTIME_CONTEXT_SERVER_GRAPH_MAX_SERIALIZED_BYTES
+    )
+
+
 def test_worker_guide_compact_pages_large_diagnostics_and_fits_desktop_frame():
     full = _representative_oversized_worker_guide()
     expected_reissue = full["actionable_payloads"][
