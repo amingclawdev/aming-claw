@@ -12234,6 +12234,152 @@ def test_current_full_reconcile_accepts_observer_route_token_proof(
     assert calls[0]["activate"] is False
 
 
+def test_current_full_reconcile_bounded_http_response_preserves_small_and_fails_closed():
+    small = {
+        "ok": True,
+        "status": "complete",
+        "snapshot_id": "full-small-current",
+        "activated": True,
+    }
+    assert server._current_full_reconcile_bounded_http_response(
+        small,
+        request_id="req-small-current-full",
+        db_total_changes_delta=1,
+    ) == small
+
+    rejected = server._current_full_reconcile_bounded_http_response(
+        {
+            "ok": False,
+            "error": "expected_old_snapshot_mismatch",
+            "zero_write_rejection": True,
+            "oversized_diagnostic": "x" * 700_000,
+        },
+        request_id="req-rejected-current-full",
+        db_total_changes_delta=0,
+    )
+    assert rejected["bounded_response"] is True
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert rejected["current_request_mutation_proven"] is False
+    assert rejected["zero_write_proven"] is True
+    assert rejected["write_disposition"] == "not_written"
+    assert rejected["safe_retry"] is True
+    assert len(json.dumps(rejected).encode("utf-8")) < 64 * 1024
+
+    ambiguous = server._current_full_reconcile_bounded_http_response(
+        {
+            "ok": True,
+            "snapshot_id": "full-ambiguous-current",
+            "oversized_diagnostic": "x" * 700_000,
+        },
+        request_id="req-ambiguous-current-full",
+        db_total_changes_delta=0,
+    )
+    assert ambiguous["write_disposition"] == "ambiguous"
+    assert ambiguous["current_request_mutation_proven"] is False
+    assert ambiguous["zero_write_proven"] is False
+    assert ambiguous["safe_retry"] is False
+    assert "writes_performed" not in ambiguous
+    assert "mutation_performed" not in ambiguous
+
+
+def test_current_full_reconcile_http_bounds_persisted_activation_for_legacy_client(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    old_snapshot_id = "full-legacy-client-old"
+    _activate_basic_graph(conn, old_snapshot_id, commit_sha="b" * 40)
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-CURRENT-FULL-LEGACY-CLIENT-BOUNDED-RESPONSE"
+    route_token_ref = "rtok-current-full-legacy-client-bounded-response"
+    execution_id, observer_session_id = _current_full_direct_main_route_fixture(
+        conn,
+        backlog_id=backlog_id,
+        observer_session_id="obs-current-full-legacy-client-bounded-response",
+        route_token_ref=route_token_ref,
+    )
+    original_boundary = server._current_full_reconcile_bounded_http_response
+
+    def oversized_boundary(response, **kwargs):
+        oversized = dict(response)
+        oversized["legacy_client_oversized_materialization_trace"] = (
+            "x" * 700_000
+        )
+        oversized["legacy_client_raw_route_probe"] = (
+            "raw-route-must-not-cross-http-boundary"
+        )
+        return original_boundary(oversized, **kwargs)
+
+    monkeypatch.setattr(
+        server,
+        "_current_full_reconcile_bounded_http_response",
+        oversized_boundary,
+    )
+    before_reconcile_events = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events "
+        "WHERE project_id = ? AND backlog_id = ? "
+        "AND event_kind = 'reconcile'",
+        (PID, backlog_id),
+    ).fetchone()[0]
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "activate": True,
+                "semantic_enrich": False,
+                "run_id": "current-full-legacy-client-bounded-response",
+                "expected_old_snapshot_id": old_snapshot_id,
+                "backlog_id": backlog_id,
+                "task_id": execution_id,
+                "observer_session_id": observer_session_id,
+                "observer_route_token_ref": route_token_ref,
+            },
+        )
+    )
+
+    assert status == 201
+    assert result["schema_version"] == (
+        "graph_current_full_reconcile.http_bounded_response.v1"
+    )
+    assert result["ok"] is True
+    assert result["bounded_response"] is True
+    assert result["response_view"] == "compact"
+    assert result["activated"] is True
+    assert result["active_snapshot_id"] == "full-current"
+    assert result["writes_performed"] is True
+    assert result["mutation_performed"] is True
+    assert result["current_request_mutation_proven"] is True
+    assert result["write_disposition"] == "written"
+    assert result["safe_retry"] is False
+    assert result["mutation_authority"]["db_write_proven"] is True
+    assert result["mutation_authority"]["db_total_changes_delta"] > 0
+    assert result["mutation_authority"]["activation_write_proven"] is True
+    assert result["mutation_authority"]["timeline_write_proven"] is True
+    assert result["mutation_authority"]["timeline_event_id"] > 0
+    assert result["mutation_authority"]["provenance_id"]
+    assert result["activation_verification"]["verified"] is True
+    assert result["timeline_event_recorded"]["status"] == "passed"
+    serialized = json.dumps(result, sort_keys=True)
+    assert len(serialized.encode("utf-8")) < 64 * 1024
+    assert "legacy_client_oversized_materialization_trace" not in serialized
+    assert "raw-route-must-not-cross-http-boundary" not in serialized
+
+    assert calls[0]["activate"] is False
+    assert store.graph_governance_status(conn, PID)["active_snapshot_id"] == (
+        "full-current"
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events "
+        "WHERE project_id = ? AND backlog_id = ? "
+        "AND event_kind = 'reconcile'",
+        (PID, backlog_id),
+    ).fetchone()[0] == before_reconcile_events + 1
+
+
 def test_current_full_reconcile_accepts_legacy_reconcile_action_only(
     conn,
     monkeypatch,

@@ -84455,6 +84455,286 @@ def _current_full_reconcile_idempotent_response(
     }
 
 
+_CURRENT_FULL_RECONCILE_HTTP_COMPACT_TRIGGER_BYTES = 64 * 1024
+
+
+def _current_full_reconcile_http_public_fields(
+    value: Any,
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    """Project bounded copy-safe scalar fields from one reconcile mapping."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    projected: dict[str, Any] = {}
+    for field in fields:
+        item = value.get(field)
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            if isinstance(item, str) and len(item.encode("utf-8")) > 2_048:
+                continue
+            if item not in (None, ""):
+                projected[field] = item
+    return projected
+
+
+def _current_full_reconcile_bounded_http_response(
+    response: Mapping[str, Any],
+    *,
+    request_id: str,
+    db_total_changes_delta: int,
+) -> dict[str, Any]:
+    """Bound current-full output before an already-loaded MCP adapter sees it.
+
+    A reconcile may commit activation, timeline, and provenance before its full
+    materialization trace is serialized.  Stale MCP adapters cannot acquire a
+    newly added adapter-side projector, so the governance HTTP boundary must
+    preserve the durable result and current-request write truth in a bounded
+    copy-safe response.  Historical small responses retain their exact shape.
+    """
+
+    source = dict(response)
+    try:
+        source_serialized_bytes = len(
+            json.dumps(
+                source,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception:
+        return source
+    if (
+        source_serialized_bytes
+        <= _CURRENT_FULL_RECONCILE_HTTP_COMPACT_TRIGGER_BYTES
+    ):
+        return source
+
+    timeline_event = _current_full_reconcile_http_public_fields(
+        source.get("timeline_event_recorded"),
+        ("id", "ref", "event_kind", "phase", "status", "requirement_id"),
+    )
+    activation_verification = (
+        source.get("activation_verification")
+        if isinstance(source.get("activation_verification"), Mapping)
+        else {}
+    )
+    provenance = (
+        source.get("current_full_reconcile_provenance")
+        if isinstance(source.get("current_full_reconcile_provenance"), Mapping)
+        else {}
+    )
+    idempotent_replay = bool(source.get("idempotent_replay"))
+    explicit_write = bool(
+        source.get("writes_performed") is True
+        or source.get("mutation_performed") is True
+    )
+    db_write_proven = int(db_total_changes_delta or 0) > 0
+    activation_write_proven = bool(
+        source.get("ok") is True
+        and source.get("activated") is True
+        and activation_verification.get("verified") is True
+        and timeline_event.get("id")
+        and str(provenance.get("provenance_id") or "").strip()
+        and not idempotent_replay
+    )
+    timeline_write_proven = bool(
+        source.get("ok") is True
+        and timeline_event.get("id")
+        and not idempotent_replay
+    )
+    current_request_mutated = bool(
+        explicit_write
+        or db_write_proven
+        or activation_write_proven
+        or timeline_write_proven
+    )
+    explicit_zero_write = bool(
+        source.get("zero_write_rejection") is True
+        or source.get("zero_write") is True
+        or (source.get("ok") is False and not current_request_mutated)
+    )
+
+    compact: dict[str, Any] = {
+        "schema_version": (
+            "graph_current_full_reconcile.http_bounded_response.v1"
+        ),
+        "source_response_schema_version": str(
+            source.get("schema_version") or ""
+        ),
+        "response_view": "compact",
+        "bounded_response": True,
+        "source_serialized_bytes": source_serialized_bytes,
+        "max_serialized_bytes": (
+            _CURRENT_FULL_RECONCILE_HTTP_COMPACT_TRIGGER_BYTES
+        ),
+        **_current_full_reconcile_http_public_fields(
+            source,
+            (
+                "ok",
+                "status",
+                "error",
+                "message",
+                "project_id",
+                "run_id",
+                "snapshot_id",
+                "candidate_snapshot_id",
+                "active_snapshot_id",
+                "snapshot_status",
+                "target_commit_sha",
+                "head_commit",
+                "active_graph_commit",
+                "current_full_reconcile",
+                "strategy",
+                "scope_reconcile_strategy",
+                "graph_delta_mode",
+                "scope_graph_delta_mode",
+                "activated",
+                "candidate_only",
+                "exact_candidate_snapshot",
+                "resumed_candidate",
+                "idempotent_replay",
+                "rebuild_skipped",
+                "elapsed_ms",
+                "fallback_reason",
+                "fallback_required",
+                "operator_next_action",
+                "zero_write_rejection",
+            ),
+        ),
+        "request_id": request_id,
+        "http_request_performed": True,
+        "current_request_mutation_proven": current_request_mutated,
+        "zero_write_proven": bool(
+            explicit_zero_write and not current_request_mutated
+        ),
+        "write_disposition": (
+            "written"
+            if current_request_mutated
+            else "not_written"
+            if explicit_zero_write
+            else "ambiguous"
+        ),
+        "safe_retry": bool(
+            source.get("ok") is False
+            and explicit_zero_write
+            and not current_request_mutated
+        ),
+        "semantic_truncation_performed": False,
+        "raw_materialization_trace_omitted": True,
+        "raw_graph_payload_omitted": True,
+        "raw_route_token_exposed": False,
+        "raw_observer_session_token_exposed": False,
+        "mutation_authority": {
+            "schema_version": (
+                "graph_current_full_reconcile.mutation_authority.v1"
+            ),
+            "db_total_changes_delta": max(
+                0, int(db_total_changes_delta or 0)
+            ),
+            "db_write_proven": db_write_proven,
+            "explicit_write_flag": explicit_write,
+            "activation_write_proven": activation_write_proven,
+            "timeline_write_proven": timeline_write_proven,
+            "timeline_event_id": int(timeline_event.get("id") or 0),
+            "provenance_id": str(provenance.get("provenance_id") or ""),
+            "idempotent_replay": idempotent_replay,
+            "source": "governance_http_request_connection",
+        },
+    }
+    if current_request_mutated:
+        compact["writes_performed"] = True
+        compact["mutation_performed"] = True
+    elif explicit_zero_write:
+        compact["writes_performed"] = False
+        compact["mutation_performed"] = False
+
+    nested_fields = {
+        "activation_verification": (
+            "schema_version",
+            "source",
+            "requested",
+            "verified",
+            "active_snapshot_id",
+            "active_graph_commit",
+            "target_commit_sha",
+            "head_commit",
+            "matches_target_commit",
+            "matches_head_commit",
+            "pending_scope_reconcile_count",
+            "pending_scope_reconcile_zero",
+            "ref_name",
+            "branch_ref",
+            "worktree_id",
+            "worktree_path",
+        ),
+        "activation": (
+            "ok",
+            "status",
+            "snapshot_id",
+            "active_snapshot_id",
+            "previous_snapshot_id",
+            "commit_sha",
+            "projection_id",
+            "projection_status",
+            "graph_ref_event_id",
+            "activated",
+        ),
+        "current_full_reconcile_provenance": (
+            "schema_version",
+            "provenance_id",
+            "project_id",
+            "snapshot_id",
+            "target_commit_sha",
+            "request_id",
+            "reconcile_event_id",
+            "route_bound",
+            "status",
+        ),
+        "operation_trace": (
+            "schema_version",
+            "operation_id",
+            "operation_type",
+            "status",
+            "target_commit_sha",
+            "snapshot_id",
+            "run_id",
+            "elapsed_ms",
+        ),
+        "current_full_target_identity": (
+            "schema_version",
+            "authority_source",
+            "ref_name",
+            "branch_ref",
+            "requested_ref_name",
+            "requested_branch_ref",
+            "canonicalized",
+        ),
+        "merge_queue_graph_epoch_auto_record": (
+            "schema_version",
+            "status",
+            "recorded",
+            "reason",
+            "merge_queue_id",
+            "queue_item_id",
+            "snapshot_id",
+            "projection_id",
+        ),
+        "post_commit_activation_events": ("published", "error"),
+        "graph_stats": ("nodes", "edges", "files", "symbols"),
+    }
+    if timeline_event:
+        compact["timeline_event_recorded"] = timeline_event
+    for field, allowed in nested_fields.items():
+        projected = _current_full_reconcile_http_public_fields(
+            source.get(field), allowed
+        )
+        if projected:
+            compact[field] = projected
+    return compact
+
+
 @route("POST", "/api/graph-governance/{project_id}/reconcile/current-full")
 def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     """Build a candidate, then atomically activate it with route evidence."""
@@ -84596,6 +84876,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
     request_started_at = _utc_now()
     request_started_monotonic = time.monotonic()
     conn = get_connection(project_id)
+    request_total_changes_before = int(conn.total_changes)
     process_build_key: tuple[str, str] | None = None
     try:
         current_full_auth = _require_current_full_reconcile_auth(
@@ -85108,7 +85389,15 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                             "fail_closed": True,
                         },
                     )
-                return 201, result
+                request_db_total_changes_delta = max(
+                    0,
+                    int(conn.total_changes) - request_total_changes_before,
+                )
+                return 201, _current_full_reconcile_bounded_http_response(
+                    result,
+                    request_id=str(ctx.request_id),
+                    db_total_changes_delta=request_db_total_changes_delta,
+                )
             store.terminalize_current_full_build_claim(
                 conn,
                 project_id,
@@ -85225,7 +85514,17 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 }
             if not resumed_candidate:
                 conn.commit()
-            return (200 if resumed_candidate else 201), result
+            request_db_total_changes_delta = max(
+                0,
+                int(conn.total_changes) - request_total_changes_before,
+            )
+            return (
+                200 if resumed_candidate else 201
+            ), _current_full_reconcile_bounded_http_response(
+                result,
+                request_id=str(ctx.request_id),
+                db_total_changes_delta=request_db_total_changes_delta,
+            )
 
         from .db import sqlite_write_lock
         from .state_reconcile import (
@@ -85699,7 +85998,17 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         )
         if runtime_context_scope:
             result["current_full_reconcile_runtime_context_scope"] = dict(runtime_context_scope)
-        return (200 if resumed_candidate else 201), result
+        request_db_total_changes_delta = max(
+            0,
+            int(conn.total_changes) - request_total_changes_before,
+        )
+        return (
+            200 if resumed_candidate else 201
+        ), _current_full_reconcile_bounded_http_response(
+            result,
+            request_id=str(ctx.request_id),
+            db_total_changes_delta=request_db_total_changes_delta,
+        )
     finally:
         if process_build_key is not None:
             _release_current_full_process_build_key(process_build_key)
