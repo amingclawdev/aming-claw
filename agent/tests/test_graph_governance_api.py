@@ -172099,6 +172099,148 @@ def test_worker_guide_prepare_projects_registered_main_worktree_and_fails_closed
     )
 
 
+def test_worker_guide_prepare_main_worktree_warranty_advances_to_receipt(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-WORKER-GUIDE-MAIN-WORKTREE-WARRANTY"
+    worker_task_id = "worker-guide-main-worktree-warranty"
+    worker_fence = "fence-worker-guide-main-worktree-warranty"
+    worker_token = "token-worker-guide-main-worktree-warranty"
+    main_fixture_root = tmp_path / "canonical-main"
+    worker_fixture_root = tmp_path / "worker"
+    main_fixture_root.mkdir()
+    worker_fixture_root.mkdir()
+    main_worktree = _git_repo(main_fixture_root)
+    worker_worktree = _git_repo(worker_fixture_root)
+    successor, context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="worker-guide-main-worktree-warranty-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_worktree),
+        target_project_root=str(worker_worktree),
+        parent_task_is_contract_execution=True,
+    )
+    monkeypatch.setattr(server, "get_connection", lambda _pid: _NoCloseConn(conn))
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda _project_id, explicit_root=None, *, fallback_self=True: (
+            main_worktree
+        ),
+    )
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+    session_auth = {
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(context),
+    }
+
+    def read_guide():
+        return server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": successor["contract_execution_id"],
+                    "fence_token": worker_fence,
+                    "target_project_root": str(worker_worktree),
+                    "view": "compact",
+                    **session_auth,
+                    **route_identity,
+                },
+            )
+        )
+
+    before = "\n".join(conn.iterdump())
+    initial_join_guide = read_guide()
+    assert "\n".join(conn.iterdump()) == before
+    assert initial_join_guide["next_legal_action"] == (
+        "request_runtime_context_initial_join_host_envelope"
+    )
+    initial_join_body = copy.deepcopy(
+        initial_join_guide["actionable_payloads"]
+        ["session_token_initial_join_submission"]["copy_safe_body"]
+    )
+    worker_session_id = "/root/worker_guide_main_worktree_warranty"
+    initial_join_body.update(
+        {
+            "task_id": worker_task_id,
+            "parent_task_id": successor["contract_execution_id"],
+            "contract_execution_id": successor["contract_execution_id"],
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id,
+            "agent_id": context.worker_id,
+            "actual_host_worker_id": context.worker_id,
+            "worker_session_id": worker_session_id,
+            "host_session_id": worker_session_id,
+            "reason": "load the managed worker envelope before guide read",
+            **route_identity,
+        }
+    )
+    initial_join = server.handle_graph_governance_runtime_context_session_token_initial_join(
+        _ctx_with_role(
+            {"project_id": PID, "runtime_context_id": context.runtime_context_id},
+            "coordinator",
+            method="POST",
+            body=initial_join_body,
+        )
+    )
+    assert initial_join["ok"] is True
+    session_auth.update(
+        {
+            "session_token": initial_join["session_token"],
+            "session_token_ref": initial_join["session_token_ref"],
+        }
+    )
+
+    prepare_guide = read_guide()
+    assert prepare_guide["next_legal_action"] == "observer_runtime_text_prepare"
+    prepare_body = copy.deepcopy(
+        prepare_guide["canonical_executable_action"]["copy_safe_body"]
+    )
+    assert prepare_body["main_worktree"] == str(main_worktree)
+    assert prepare_body["workspace_root"] == str(main_worktree)
+    assert prepare_body["target_project_root"] == str(worker_worktree)
+    assert prepare_body["worktree_path"] == str(worker_worktree)
+
+    prepared = server.handle_observer_runtime_text_prepare(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=prepare_body,
+        )
+    )
+    assert prepared["ok"] is True
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", prepared["launch_text_hash"])
+
+    receipt_guide = read_guide()
+    assert receipt_guide["next_legal_action"] in {
+        "record_read_receipt",
+        "submit_mf_subagent_read_receipt",
+    }
+    assert receipt_guide["canonical_executable_action"]["mcp_tool"] == (
+        "runtime_context_read_receipt"
+    )
+    assert receipt_guide["canonical_executable_action"]["copy_safe_body"][
+        "launch_text_hash"
+    ] == prepared["launch_text_hash"]
+
+
 def test_worker_guide_receipt_requires_prepare_then_projects_eight_hashes(
     conn,
     tmp_path,
