@@ -81856,6 +81856,29 @@ def test_mf_sub_graph_query_valid_active_identity_succeeds_and_records_trace_con
     )
 
     assert queried["ok"] is True
+    fence_hash = "sha256:" + hashlib.sha256(
+        b"fence-worker-valid"
+    ).hexdigest()
+    queried_identity = queried["graph_query_identity"]
+    assert "fence_token" not in queried_identity
+    assert "fence_token" not in queried_identity["identity_fields"]
+    assert queried_identity["fence_token_hash"] == fence_hash
+    assert queried_identity["fence_token_present"] is True
+    assert queried_identity["fence_token_redacted"] is True
+    assert queried_identity["raw_fence_token_exposed"] is False
+    assert "fence-worker-valid" not in json.dumps(queried, sort_keys=True)
+
+    persisted = conn.execute(
+        "SELECT fence_token, fence_token_hash, artifact_path "
+        "FROM graph_query_traces WHERE trace_id = ?",
+        (queried["trace_id"],),
+    ).fetchone()
+    assert persisted["fence_token"] == ""
+    assert persisted["fence_token_hash"] == fence_hash
+    artifact_text = Path(persisted["artifact_path"]).read_text(encoding="utf-8")
+    assert "fence-worker-valid" not in artifact_text
+    assert fence_hash in artifact_text
+
     fetched = server.handle_graph_governance_query_trace_get(
         _ctx_with_role(
             {"project_id": PID, "trace_id": queried["trace_id"]},
@@ -81869,6 +81892,9 @@ def test_mf_sub_graph_query_valid_active_identity_succeeds_and_records_trace_con
     assert trace["fence_token_redacted"] is True
     assert trace["graph_query_identity"]["fence_token_redacted"] is True
     assert trace["fence_token_hash"]
+    assert "fence_token" not in trace
+    assert "fence_token" not in trace["graph_query_identity"]
+    assert trace["fence_token_hash"] == fence_hash
     assert "fence-worker-valid" not in json.dumps(trace, sort_keys=True)
 
 
@@ -171723,6 +171749,7 @@ def test_bounded_replacement_preserves_exact_pre_rotation_graph_trace(
         "nonaccepted_replacement",
         "post_rotation_trace",
         "snapshot_drift",
+        "fence_hash_drift",
     ),
 )
 def test_bounded_replacement_graph_trace_negatives_fail_closed(
@@ -171773,6 +171800,12 @@ def test_bounded_replacement_graph_trace_negatives_fail_closed(
             conn,
             "scope-bounded-replacement-stale-successor",
             commit_sha=case["target_commit"],
+        )
+    elif drift == "fence_hash_drift":
+        conn.execute(
+            "UPDATE graph_query_traces SET fence_token_hash = ? "
+            "WHERE trace_id = ?",
+            ("sha256:malformed", case["trace_id"]),
         )
     conn.commit()
 
@@ -172198,6 +172231,8 @@ def test_worker_guide_compact_uses_server_fallback_for_recursive_runtime_state()
 
 def test_server_mf_sub_graph_projection_preserves_result_and_write_truth():
     result = {"nodes": [{"id": "node-reminder", "path": "src/reminders.js"}]}
+    raw_fence = "fence-server-compact"
+    fence_hash = "sha256:" + hashlib.sha256(raw_fence.encode("utf-8")).hexdigest()
     full = {
         "ok": True,
         "trace_id": "gqt-server-compact",
@@ -172206,8 +172241,20 @@ def test_server_mf_sub_graph_projection_preserves_result_and_write_truth():
         "trace": {
             "trace_id": "gqt-server-compact",
             "status": "complete",
+            "fence_token": raw_fence,
+            "graph_query_identity": {
+                "trace_id": "gqt-server-compact",
+                "fence_token": raw_fence,
+                "identity_fields": ["trace_id", "fence_token"],
+            },
             "recursive": "t" * 400_000,
         },
+        "graph_query_identity": {
+            "trace_id": "gqt-server-compact",
+            "fence_token": raw_fence,
+            "identity_fields": ["trace_id", "fence_token"],
+        },
+        "graph_identity_fields": ["trace_id", "fence_token"],
         "mf_sub_graph_query_canonical_gate": {
             "ok": True,
             "status": "verified",
@@ -172233,9 +172280,46 @@ def test_server_mf_sub_graph_projection_preserves_result_and_write_truth():
     assert compact["writes_performed"] is True
     assert compact["product_mutation_performed"] is False
     assert compact["semantic_truncation_performed"] is False
+    assert compact["graph_query_identity"]["fence_token_hash"] == fence_hash
+    assert "fence_token" not in compact["graph_query_identity"]
+    assert "fence_token" not in compact["graph_query_identity"]["identity_fields"]
+    assert "fence_token" not in compact["graph_identity_fields"]
+    assert compact["trace"]["fence_token_hash"] == fence_hash
+    assert "fence_token" not in compact["trace"]
+    assert raw_fence not in json.dumps(compact, sort_keys=True)
     assert compact["serialized_bytes"] <= (
         server._RUNTIME_CONTEXT_SERVER_GRAPH_MAX_SERIALIZED_BYTES
     )
+
+
+def test_server_mf_sub_graph_small_response_redacts_raw_fence_before_return():
+    raw_fence = "fence-server-small"
+    fence_hash = "sha256:" + hashlib.sha256(raw_fence.encode("utf-8")).hexdigest()
+    full = {
+        "ok": True,
+        "trace_id": "gqt-server-small",
+        "tool": "query_schema",
+        "result": {"tools": ["query_schema"]},
+        "graph_query_identity": {
+            "trace_id": "gqt-server-small",
+            "fence_token": raw_fence,
+            "identity_fields": ["trace_id", "fence_token"],
+        },
+        "graph_identity_fields": ["trace_id", "fence_token"],
+    }
+
+    projected = server._runtime_context_server_bounded_mf_sub_graph_query_response(
+        full
+    )
+
+    assert projected["ok"] is True
+    assert projected["graph_query_identity"]["fence_token_hash"] == fence_hash
+    assert projected["graph_query_identity"]["fence_token_present"] is True
+    assert projected["graph_query_identity"]["fence_token_redacted"] is True
+    assert "fence_token" not in projected["graph_query_identity"]
+    assert "fence_token" not in projected["graph_identity_fields"]
+    assert projected["raw_fence_token_exposed"] is False
+    assert raw_fence not in json.dumps(projected, sort_keys=True)
 
 
 def test_worker_guide_compact_pages_large_diagnostics_and_fits_desktop_frame():

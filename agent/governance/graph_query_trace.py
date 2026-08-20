@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS graph_query_traces (
   qa_scope_binding_ref TEXT NOT NULL DEFAULT '',
   worker_role TEXT NOT NULL DEFAULT '',
   fence_token TEXT NOT NULL DEFAULT '',
+  fence_token_hash TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   budget_json TEXT NOT NULL DEFAULT '{}',
   usage_json TEXT NOT NULL DEFAULT '{}',
@@ -381,7 +382,9 @@ GRAPH_QUERY_IDENTITY_FIELDS = (
     "qa_session_id",
     "qa_scope_binding_ref",
     "worker_role",
-    "fence_token",
+    "fence_token_hash",
+    "fence_token_present",
+    "fence_token_redacted",
     "actor",
 )
 
@@ -616,11 +619,37 @@ _TRACE_IDENTITY_COLUMNS = {
     "qa_scope_binding_ref": "TEXT NOT NULL DEFAULT ''",
     "worker_role": "TEXT NOT NULL DEFAULT ''",
     "fence_token": "TEXT NOT NULL DEFAULT ''",
+    "fence_token_hash": "TEXT NOT NULL DEFAULT ''",
 }
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _fence_token_hash(value: Any) -> str:
+    """Return the copy-safe full digest for one raw or already-hashed fence."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) == 71 and text.startswith("sha256:"):
+        digest = text[7:].lower()
+        if all(char in "0123456789abcdef" for char in digest):
+            return f"sha256:{digest}"
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _persisted_fence_token_hash(source: Mapping[str, Any] | None) -> str:
+    value = source or {}
+    persisted = str(value.get("fence_token_hash") or "").strip().lower()
+    if persisted:
+        if len(persisted) == 71 and persisted.startswith("sha256:"):
+            digest = persisted[7:]
+            if all(char in "0123456789abcdef" for char in digest):
+                return persisted
+        return ""
+    return _fence_token_hash(value.get("fence_token"))
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -1016,6 +1045,22 @@ def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
     """Return the Runtime Context projection identity for one graph query trace."""
 
     source = trace or {}
+    fence_token_hash = _persisted_fence_token_hash(source)
+    fence_token_present = bool(fence_token_hash)
+    fence_token_redacted = bool(
+        fence_token_present
+        or str(source.get("query_source") or "").strip() == "mf_subagent"
+        or str(source.get("worker_role") or "").strip() == "mf_sub"
+    )
+    identity_fields = list(GRAPH_QUERY_IDENTITY_FIELDS)
+    # Preserve the deprecated input-name advertisement for direct, unpersisted
+    # helper callers only. Persisted traces always carry fence_token_hash, so
+    # artifacts and every HTTP/MCP projection use the copy-safe field set.
+    if (
+        str(source.get("fence_token") or "").strip()
+        and not str(source.get("fence_token_hash") or "").strip()
+    ):
+        identity_fields.append("fence_token")
     # Comparison authority is not a caller-owned graph-query field.  The QA
     # handler derives it into the validated root identity before the trace is
     # inserted, and trace reads reconstruct that persisted root verbatim.  Keep
@@ -1081,7 +1126,7 @@ def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
     )
     return {
         "schema_version": GRAPH_QUERY_IDENTITY_SCHEMA_VERSION,
-        "identity_fields": list(GRAPH_QUERY_IDENTITY_FIELDS),
+        "identity_fields": identity_fields,
         "trace_id": str(source.get("trace_id") or ""),
         "project_id": str(source.get("project_id") or ""),
         "snapshot_id": str(source.get("snapshot_id") or ""),
@@ -1106,7 +1151,10 @@ def graph_query_identity(trace: dict[str, Any] | None) -> dict[str, Any]:
         "qa_session_id": str(source.get("qa_session_id") or ""),
         "qa_scope_binding_ref": str(source.get("qa_scope_binding_ref") or ""),
         "worker_role": str(source.get("worker_role") or ""),
-        "fence_token": str(source.get("fence_token") or ""),
+        "fence_token_hash": fence_token_hash,
+        "fence_token_present": fence_token_present,
+        "fence_token_redacted": fence_token_redacted,
+        "raw_fence_token_exposed": False,
         "actor": str(source.get("actor") or ""),
     }
 
@@ -1372,6 +1420,7 @@ def start_trace(
         canonical_project_identity_hash=canonical_project_identity_hash,
         repository_identity_hash=repository_identity_hash,
     )
+    persisted_fence_token_hash = _fence_token_hash(fence_token)
     insert_columns = (
         "trace_id", "project_id", "snapshot_id", "actor", "query_source",
         "query_purpose", "run_id", "parent_task_id", "runtime_context_id",
@@ -1385,8 +1434,9 @@ def start_trace(
         "candidate_overlay_hash", "root_identity_json", "root_identity_hash",
         "query_root_identity_hash", "canonical_project_identity_hash",
         "repository_identity_hash", "qa_session_id", "qa_scope_binding_ref",
-        "worker_role", "fence_token", "status", "budget_json", "usage_json",
-        "artifact_path", "created_at", "updated_at",
+        "worker_role", "fence_token", "fence_token_hash", "status",
+        "budget_json", "usage_json", "artifact_path", "created_at",
+        "updated_at",
     )
     insert_values = (
             tid,
@@ -1426,7 +1476,8 @@ def start_trace(
             str(qa_session_id or ""),
             str(qa_scope_binding_ref or ""),
             str(worker_role or ""),
-            str(fence_token or ""),
+            "",
+            persisted_fence_token_hash,
             "running",
             _json(budget_json),
             _json(usage),
@@ -1465,7 +1516,14 @@ def start_trace(
         "qa_session_id": str(qa_session_id or ""),
         "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
         "worker_role": str(worker_role or ""),
-        "fence_token": str(fence_token or ""),
+        "fence_token_hash": persisted_fence_token_hash,
+        "fence_token_present": bool(persisted_fence_token_hash),
+        "fence_token_redacted": bool(
+            persisted_fence_token_hash
+            or source == "mf_subagent"
+            or str(worker_role or "").strip() == "mf_sub"
+        ),
+        "raw_fence_token_persisted": False,
         "budget": budget_json,
         "graph_query_identity": graph_query_identity({
             "trace_id": tid,
@@ -1491,7 +1549,7 @@ def start_trace(
             "qa_session_id": str(qa_session_id or ""),
             "qa_scope_binding_ref": str(qa_scope_binding_ref or ""),
             "worker_role": str(worker_role or ""),
-            "fence_token": str(fence_token or ""),
+            "fence_token_hash": persisted_fence_token_hash,
             "actor": str(actor or ""),
         }),
         "ts": now,
@@ -1517,6 +1575,17 @@ def get_trace(conn: sqlite3.Connection, project_id: str, trace_id: str) -> dict[
         trace.pop("candidate_overlay_json", "{}"), {}
     )
     trace["root_identity"] = _decode(trace.pop("root_identity_json", "{}"), {})
+    raw_fence_token_persisted = bool(str(trace.get("fence_token") or "").strip())
+    fence_token_hash = _persisted_fence_token_hash(trace)
+    trace["fence_token"] = ""
+    trace["fence_token_hash"] = fence_token_hash
+    trace["fence_token_present"] = bool(fence_token_hash)
+    trace["fence_token_redacted"] = bool(
+        fence_token_hash
+        or str(trace.get("query_source") or "").strip() == "mf_subagent"
+        or str(trace.get("worker_role") or "").strip() == "mf_sub"
+    )
+    trace["raw_fence_token_persisted"] = raw_fence_token_persisted
     persisted_decision = _decode(
         trace.pop("graph_basis_decision_json", "{}"),
         {},

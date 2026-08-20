@@ -14930,29 +14930,78 @@ def _require_graph_query_trace_capability(ctx: RequestContext, conn, trace: dict
     return session
 
 
+def _graph_query_trace_fence_hash(value: Mapping[str, Any] | None) -> str:
+    """Resolve one persisted graph-trace fence to its copy-safe full hash."""
+
+    if isinstance(value, Mapping):
+        source: Mapping[str, Any] = value
+    elif value is not None and hasattr(value, "keys"):
+        source = {str(key): value[key] for key in value.keys()}
+    else:
+        source = {}
+    persisted = str(source.get("fence_token_hash") or "").strip().lower()
+    if persisted:
+        return (
+            persisted
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", persisted)
+            else ""
+        )
+    raw = str(source.get("fence_token") or "").strip()
+    if not raw:
+        return ""
+    from .parallel_branch_runtime import runtime_context_secret_hash
+
+    return runtime_context_secret_hash(raw)
+
+
+def _graph_query_public_fence_projection(
+    value: Mapping[str, Any] | None,
+    *,
+    force_redacted: bool = False,
+) -> dict[str, Any]:
+    """Remove a raw worker fence while retaining hash-bound identity authority."""
+
+    payload = deepcopy(dict(value or {}))
+    fence_hash = _graph_query_trace_fence_hash(payload)
+    payload.pop("fence_token", None)
+    payload["fence_token_hash"] = fence_hash
+    payload["fence_token_present"] = bool(fence_hash)
+    payload["fence_token_redacted"] = bool(force_redacted or fence_hash)
+    payload["raw_fence_token_exposed"] = False
+    identity_fields = payload.get("identity_fields")
+    if isinstance(identity_fields, (list, tuple)):
+        safe_fields = [
+            str(field)
+            for field in identity_fields
+            if str(field) != "fence_token"
+        ]
+        for field in (
+            "fence_token_hash",
+            "fence_token_present",
+            "fence_token_redacted",
+        ):
+            if field not in safe_fields:
+                safe_fields.append(field)
+        payload["identity_fields"] = safe_fields
+    nested_identity = payload.get("graph_query_identity")
+    if isinstance(nested_identity, Mapping):
+        payload["graph_query_identity"] = _graph_query_public_fence_projection(
+            nested_identity,
+            force_redacted=force_redacted,
+        )
+    return payload
+
+
 def _graph_query_trace_response_payload(result: dict) -> dict:
     payload = dict(result)
     trace = dict(payload.get("trace") or {})
     if str(trace.get("query_source") or "") != "mf_subagent":
         payload["trace"] = trace
         return payload
-
-    fence_token = str(trace.get("fence_token") or "")
-    if fence_token:
-        trace["fence_token_hash"] = hashlib.sha256(
-            fence_token.encode("utf-8")
-        ).hexdigest()[:16]
-    trace["fence_token"] = ""
-    trace["fence_token_redacted"] = True
-    identity = trace.get("graph_query_identity")
-    if isinstance(identity, Mapping):
-        identity_payload = dict(identity)
-        identity_payload["fence_token"] = ""
-        identity_payload["fence_token_redacted"] = True
-        if fence_token:
-            identity_payload["fence_token_hash"] = trace["fence_token_hash"]
-        trace["graph_query_identity"] = identity_payload
-    payload["trace"] = trace
+    payload["trace"] = _graph_query_public_fence_projection(
+        trace,
+        force_redacted=True,
+    )
     return payload
 
 
@@ -22370,9 +22419,8 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
     ):
         return reject("runtime context is not the exact bounded replacement lane")
 
-    trace_fence_token = str(trace.get("fence_token") or "").strip()
     trace_created_at = str(trace.get("created_at") or "").strip()
-    trace_fence_hash = runtime_context_secret_hash(trace_fence_token)
+    trace_fence_hash = _graph_query_trace_fence_hash(trace)
     current_fence_hash = runtime_context_secret_hash(current_fence_token)
     if (
         not trace_fence_hash
@@ -22609,6 +22657,7 @@ def _runtime_context_service_graph_trace_refs(
 
     from .parallel_branch_runtime import (
         get_branch_context_by_runtime_context_id,
+        runtime_context_secret_hash,
     )
 
     runtime_context = (
@@ -22643,7 +22692,8 @@ def _runtime_context_service_graph_trace_refs(
                            t.backlog_id, t.route_id, t.route_context_hash,
                            t.prompt_contract_id, t.prompt_contract_hash,
                            t.visible_injection_manifest_hash,
-                           t.route_token_ref, t.created_at
+                           t.route_token_ref, t.created_at,
+                           t.fence_token_hash
                     FROM graph_query_traces t
                     LEFT JOIN graph_snapshots s
                       ON s.project_id = t.project_id
@@ -22660,9 +22710,11 @@ def _runtime_context_service_graph_trace_refs(
             )
         if not strict_explicit_trace_ids or not requested_trace_ids:
             current_run_id_like = ""
+            current_fence_hash = ""
             if task_id and fence_token:
                 fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
                 current_run_id_like = f"mf_subagent:{task_id}:fence:{fence_hash}%"
+                current_fence_hash = runtime_context_secret_hash(fence_token)
             contextual_rows = conn.execute(
                 f"""
                 SELECT t.trace_id, t.query_source, t.query_purpose,
@@ -22675,7 +22727,8 @@ def _runtime_context_service_graph_trace_refs(
                        t.backlog_id, t.route_id, t.route_context_hash,
                        t.prompt_contract_id, t.prompt_contract_hash,
                        t.visible_injection_manifest_hash,
-                       t.route_token_ref, t.created_at
+                       t.route_token_ref, t.created_at,
+                       t.fence_token_hash
                 FROM graph_query_traces t
                 LEFT JOIN graph_snapshots s
                   ON s.project_id = t.project_id
@@ -22688,6 +22741,7 @@ def _runtime_context_service_graph_trace_refs(
                     (? != '' AND t.runtime_context_id = ?)
                     OR (? != '' AND t.task_id = ?)
                     OR (? != '' AND t.fence_token = ?)
+                    OR (? != '' AND t.fence_token_hash = ?)
                     OR (
                       t.query_source = 'mf_subagent'
                       AND ? != ''
@@ -22705,6 +22759,8 @@ def _runtime_context_service_graph_trace_refs(
                     task_id,
                     fence_token,
                     fence_token,
+                    current_fence_hash,
+                    current_fence_hash,
                     current_run_id_like,
                     current_run_id_like,
                 ),
@@ -22741,6 +22797,7 @@ def _runtime_context_service_graph_trace_refs(
             "task_id": _row_text("task_id", 5),
             "runtime_context_id": _row_text("runtime_context_id", 6),
             "fence_token": _row_text("fence_token", 8),
+            "fence_token_hash": _row_text("fence_token_hash", 22),
             "status": _row_text("status", 9).lower(),
             "snapshot_id": _row_text("snapshot_id", 10),
             "snapshot_commit_sha": _row_text(
@@ -22781,7 +22838,11 @@ def _runtime_context_service_graph_trace_refs(
             for field, value in expected.items()
             if value and fields[field] != value
         ]
-        if fence_token and fields["fence_token"] != fence_token:
+        expected_fence_hash = (
+            runtime_context_secret_hash(fence_token) if fence_token else ""
+        )
+        actual_fence_hash = _graph_query_trace_fence_hash(fields)
+        if expected_fence_hash and actual_fence_hash != expected_fence_hash:
             bounded_authority = (
                 _runtime_context_bounded_replacement_graph_trace_authority(
                     conn,
@@ -22805,9 +22866,9 @@ def _runtime_context_service_graph_trace_refs(
                 trace_mismatches.append(
                     {
                         "trace_id": trace_id,
-                        "field": "fence_token",
-                        "expected": fence_token,
-                        "actual": fields["fence_token"],
+                        "field": "fence_token_hash",
+                        "expected": expected_fence_hash,
+                        "actual": actual_fence_hash,
                     }
                 )
         if fields["query_purpose"] not in {
@@ -27349,14 +27410,13 @@ def _runtime_context_worker_implementation_correction_authority_validation(
         f"""
         SELECT trace_id, project_id, runtime_context_id, task_id,
                parent_task_id, worker_role, query_source, query_purpose,
-               fence_token, status
+               fence_token, fence_token_hash, status
         FROM graph_query_traces
         WHERE trace_id IN ({placeholders})
         """,
         tuple(trace_ids),
     ).fetchall()
     rows_by_id = {str(row["trace_id"] or "").strip(): row for row in rows}
-    from .parallel_branch_runtime import runtime_context_secret_hash
 
     for trace_id in trace_ids:
         row = rows_by_id.get(trace_id)
@@ -27375,9 +27435,9 @@ def _runtime_context_worker_implementation_correction_authority_validation(
                 ("query_purpose", "subagent_context_build"),
                 ("status", "complete"),
             )
-        ) or runtime_context_secret_hash(
-            str(row["fence_token"] or "")
-        ) != str(source_authority.get("fence_token_hash") or "").strip():
+        ) or _graph_query_trace_fence_hash(row) != str(
+            source_authority.get("fence_token_hash") or ""
+        ).strip():
             return {
                 "accepted": False,
                 "reason": "correction_graph_authority_registry_mismatch",
@@ -31119,7 +31179,35 @@ def _runtime_context_server_bounded_mf_sub_graph_query_response(
 ) -> dict[str, Any]:
     """Bound worker lifecycle diagnostics around one persisted graph result."""
 
-    full = dict(value or {})
+    full = deepcopy(dict(value or {}))
+    graph_identity = full.get("graph_query_identity")
+    if isinstance(graph_identity, Mapping):
+        full["graph_query_identity"] = _graph_query_public_fence_projection(
+            graph_identity,
+            force_redacted=True,
+        )
+    trace_value = full.get("trace")
+    if isinstance(trace_value, Mapping):
+        full["trace"] = _graph_query_public_fence_projection(
+            trace_value,
+            force_redacted=True,
+        )
+    graph_identity_fields = full.get("graph_identity_fields")
+    if isinstance(graph_identity_fields, (list, tuple)):
+        safe_fields = [
+            str(field)
+            for field in graph_identity_fields
+            if str(field) != "fence_token"
+        ]
+        for field in (
+            "fence_token_hash",
+            "fence_token_present",
+            "fence_token_redacted",
+        ):
+            if field not in safe_fields:
+                safe_fields.append(field)
+        full["graph_identity_fields"] = safe_fields
+    full["raw_fence_token_exposed"] = False
     serialized_bytes = _runtime_context_server_read_serialized_bytes(full)
     if serialized_bytes <= _RUNTIME_CONTEXT_SERVER_GRAPH_MAX_SERIALIZED_BYTES:
         return full
@@ -31151,6 +31239,24 @@ def _runtime_context_server_bounded_mf_sub_graph_query_response(
             "product_mutation_performed": False,
             "semantic_truncation_performed": False,
         }
+    bounded_trace = _runtime_context_server_bounded_mapping(trace, field="trace")
+    trace_fence_hash = _graph_query_trace_fence_hash(trace)
+    bounded_trace.update(
+        {
+            "fence_token_hash": trace_fence_hash,
+            "fence_token_present": bool(trace_fence_hash),
+            "fence_token_redacted": True,
+            "raw_fence_token_exposed": False,
+        }
+    )
+    trace_identity = trace.get("graph_query_identity")
+    if isinstance(trace_identity, Mapping):
+        bounded_trace["graph_query_identity"] = (
+            _runtime_context_server_bounded_mapping(
+                trace_identity,
+                field="graph_query_identity",
+            )
+        )
     compact = {
         "ok": bool(full.get("ok")),
         "schema_version": "graph_query.mf_sub_server_compact.v1",
@@ -31166,7 +31272,8 @@ def _runtime_context_server_bounded_mf_sub_graph_query_response(
         "graph_query_identity": _runtime_context_server_bounded_mapping(
             full.get("graph_query_identity"), field="graph_query_identity"
         ),
-        "trace": _runtime_context_server_bounded_mapping(trace, field="trace"),
+        "graph_identity_fields": list(full.get("graph_identity_fields") or []),
+        "trace": bounded_trace,
         "mf_sub_graph_query_canonical_eligibility": (
             _runtime_context_server_bounded_mapping(
                 full.get("mf_sub_graph_query_canonical_eligibility"),
@@ -114857,6 +114964,7 @@ def _contract_runtime_worker_commit_graph_epoch_transition_authority(
             SELECT t.trace_id, t.snapshot_id, t.query_source,
                    t.query_purpose, t.parent_task_id, t.task_id,
                    t.runtime_context_id, t.worker_role, t.fence_token,
+                   t.fence_token_hash,
                    t.status, t.route_id, t.route_context_hash,
                    t.prompt_contract_id, t.prompt_contract_hash,
                    t.visible_injection_manifest_hash, t.route_token_ref,
@@ -114890,7 +114998,7 @@ def _contract_runtime_worker_commit_graph_epoch_transition_authority(
         "task_id",
         "runtime_context_id",
         "worker_role",
-        "fence_token",
+        "fence_token_hash",
         "route_id",
         "route_context_hash",
         "prompt_contract_id",
@@ -114904,7 +115012,9 @@ def _contract_runtime_worker_commit_graph_epoch_transition_authority(
         "task_id": task_id,
         "runtime_context_id": runtime_context_id,
         "worker_role": "mf_sub",
-        "fence_token": fence_token,
+        "fence_token_hash": _graph_query_trace_fence_hash(
+            {"fence_token": fence_token}
+        ),
     }
     identity_anchor = rows_by_id[old_ids[0]]
     for trace_id in trace_ids:
@@ -114917,12 +115027,25 @@ def _contract_runtime_worker_commit_graph_epoch_transition_authority(
         }:
             return {}
         for field, expected in canonical_identity.items():
-            if str(row[field] or "").strip() != expected:
+            actual = (
+                _graph_query_trace_fence_hash(row)
+                if field == "fence_token_hash"
+                else str(row[field] or "").strip()
+            )
+            if actual != expected:
                 return {}
         for field in identity_fields:
-            if str(row[field] or "").strip() != str(
-                identity_anchor[field] or ""
-            ).strip():
+            actual = (
+                _graph_query_trace_fence_hash(row)
+                if field == "fence_token_hash"
+                else str(row[field] or "").strip()
+            )
+            anchor = (
+                _graph_query_trace_fence_hash(identity_anchor)
+                if field == "fence_token_hash"
+                else str(identity_anchor[field] or "").strip()
+            )
+            if actual != anchor:
                 return {}
 
     expected_old_commits = {

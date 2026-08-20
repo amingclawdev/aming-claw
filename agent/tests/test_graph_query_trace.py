@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -1671,3 +1672,48 @@ def test_route_bound_trace_persists_identity_and_rejects_unbound_reuse(conn, tmp
             tool="query_schema",
             project_root=project_root,
         )
+
+
+def test_mf_sub_trace_persists_only_copy_safe_fence_authority(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    raw_fence = "fence-worker-copy-safe"
+    fence_hash = "sha256:" + hashlib.sha256(raw_fence.encode("utf-8")).hexdigest()
+
+    result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="worker-copy-safe",
+        query_source="mf_subagent",
+        query_purpose="subagent_context_build",
+        run_id="mf_subagent:worker-copy-safe:fence:test",
+        parent_task_id="parent-copy-safe",
+        runtime_context_id="mfrctx-copy-safe",
+        task_id="worker-copy-safe",
+        backlog_id="AC-GRAPH-COPY-SAFE",
+        worker_role="mf_sub",
+        fence_token=raw_fence,
+        tool="query_schema",
+        project_root=project_root,
+    )
+
+    row = conn.execute(
+        "SELECT fence_token, fence_token_hash, artifact_path "
+        "FROM graph_query_traces WHERE trace_id = ?",
+        (result["trace_id"],),
+    ).fetchone()
+    assert row["fence_token"] == ""
+    assert row["fence_token_hash"] == fence_hash
+
+    stored = graph_query_trace.get_trace(conn, PID, result["trace_id"])["trace"]
+    identity = stored["graph_query_identity"]
+    assert "fence_token" not in identity
+    assert "fence_token" not in identity["identity_fields"]
+    assert identity["fence_token_hash"] == fence_hash
+    assert identity["fence_token_present"] is True
+    assert identity["fence_token_redacted"] is True
+    assert identity["raw_fence_token_exposed"] is False
+
+    artifact_text = Path(row["artifact_path"]).read_text(encoding="utf-8")
+    assert raw_fence not in artifact_text
+    assert fence_hash in artifact_text
