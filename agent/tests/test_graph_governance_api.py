@@ -28675,8 +28675,35 @@ def test_acceptance_behavior_contract_gate_accepts_concrete_and_compatible_work(
     )
 
 
+@pytest.mark.parametrize(
+    ("criterion", "expected_trigger_source"),
+    [
+        (
+            _r11_unspecified_behavior_criterion(),
+            "unspecified_new_behavior_prose",
+        ),
+        (
+            {
+                "id": "ac-explicit-new-reminder-behavior",
+                "text": "Add snoozeReminder with its separately defined contract.",
+                "change_kind": "new_product_behavior",
+                "required_scope": {
+                    "kind": "files_and_nodes",
+                    "files": [
+                        "src/reminders.js",
+                        "tests/reminders.test.mjs",
+                    ],
+                    "nodes": ["Reminder domain behavior"],
+                },
+            },
+            "explicit_new_product_behavior_marker",
+        ),
+    ],
+)
 def test_mf_parallel_enter_rejects_r11_unspecified_behavior_before_any_write(
     conn,
+    criterion,
+    expected_trigger_source,
 ):
     backlog_id = "AC-PARALLEL-ENTER-R11-BEHAVIOR-CONTRACT"
     task_id = "parallel-enter-r11-behavior-contract"
@@ -28690,7 +28717,7 @@ def test_mf_parallel_enter_rejects_r11_unspecified_behavior_before_any_write(
         """,
         (
             json.dumps(target_files),
-            json.dumps([_r11_unspecified_behavior_criterion()]),
+            json.dumps([criterion]),
             backlog_id,
         ),
     )
@@ -28729,11 +28756,9 @@ def test_mf_parallel_enter_rejects_r11_unspecified_behavior_before_any_write(
     assert rejected.value.code == "acceptance_behavior_contract_incomplete"
     details = rejected.value.details
     assert details["field"] == "acceptance_criteria[].behavior_contract"
-    assert details["missing_behavior_contract_criterion_ids"] == [
-        "ac-r11-reminder-domain-change"
-    ]
+    assert details["missing_behavior_contract_criterion_ids"] == [criterion["id"]]
     assert details["behavior_contract_gate"]["trigger_sources"] == {
-        "ac-r11-reminder-domain-change": "unspecified_new_behavior_prose"
+        criterion["id"]: expected_trigger_source
     }
     assert details["guide"]["action"] == (
         "observer_define_behavior_contract_before_mf_runtime"
