@@ -3600,6 +3600,105 @@ def test_governance_mcp_post_startup_current_defaults_compact_and_bounds_recursi
 
 
 @pytest.mark.parametrize(
+    "tool_name",
+    [
+        "runtime_context_current",
+        "runtime_context_worker_guide",
+        "graph_query",
+    ],
+)
+def test_managed_worker_reads_bound_oversized_server_recovery_error(
+    tool_name,
+):
+    current_action = {
+        "schema_version": "runtime_context.session_token_rejoin_submission.v1",
+        "action": "request_runtime_context_rejoin_host_envelope",
+        "method": "POST",
+        "path": "/api/runtime-context/rejoin",
+        "copy_safe_body": {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-managed-error",
+            "task_id": "worker-managed-error",
+            "session_token_ref": "wstok-managed-error",
+            "route_token_ref": "rtok-managed-error",
+        },
+    }
+    oversized_error = {
+        "error": "fence_invalidated_or_unknown",
+        "message": "mf_subagent runtime context fence is invalidated or unknown",
+        "details": {
+            "runtime_context_id": "mfrctx-managed-error",
+            "governance_project_id": "aming-claw",
+            "target_project_id": "aming-claw",
+            "reason": "worker_auth_material_missing",
+            "recoverable": True,
+            "next_legal_action": (
+                "request_runtime_context_rejoin_host_envelope"
+            ),
+            "recovery_actions": [
+                {
+                    "id": "request_runtime_context_rejoin_host_envelope",
+                    "action": "request_runtime_context_rejoin_host_envelope",
+                }
+            ],
+            "actionable_payloads": {
+                "session_token_rejoin_submission": current_action,
+                "startup_facade_payload_skeleton": {
+                    "recursive_lifecycle": "x" * (700 * 1024)
+                },
+            },
+            "diagnostics": {"recursive_lifecycle": "y" * (700 * 1024)},
+        },
+    }
+    calls = []
+
+    def fake_api(method: str, path: str, body: dict | None = None):
+        calls.append((method, path, body))
+        return oversized_error
+
+    dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    args = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-managed-error",
+    }
+    if tool_name == "graph_query":
+        args = {
+            "project_id": "aming-claw",
+            "tool": "find_node_by_path",
+            "args": {"path": "agent/governance/server.py"},
+            "query_source": "mf_subagent",
+            "query_purpose": "implementation_context",
+            "worker_role": "mf_sub",
+            "runtime_context_id": "mfrctx-managed-error",
+            "task_id": "worker-managed-error",
+            "parent_task_id": "cex-managed-error",
+            "session_token_ref": "wstok-managed-error",
+        }
+
+    result = dispatcher.dispatch(tool_name, args)
+
+    assert len(calls) == 1
+    assert result["error"] == "fence_invalidated_or_unknown"
+    assert result["schema_version"] == "runtime_context.bounded_managed_error.v1"
+    assert result["runtime_context_id"] == "mfrctx-managed-error"
+    assert result["next_legal_action"] == (
+        "request_runtime_context_rejoin_host_envelope"
+    )
+    assert result["canonical_executable_action"] == current_action
+    assert result["writes_performed"] is False
+    assert result["mutation_performed"] is False
+    assert result["http_request_performed"] is True
+    assert result["semantic_truncation_performed"] is False
+    assert result["raw_session_token_exposed"] is False
+    assert len(json.dumps(result).encode()) < 64 * 1024
+
+
+@pytest.mark.parametrize(
     ("requested_view", "forwarded_view"),
     [
         (None, "compact"),

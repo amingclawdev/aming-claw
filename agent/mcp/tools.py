@@ -401,6 +401,148 @@ def _managed_worker_guide_compact_projection(
     return compact
 
 
+_MANAGED_RUNTIME_ERROR_ACTION_KEYS = {
+    "request_runtime_context_initial_join_host_envelope": (
+        "session_token_initial_join_submission"
+    ),
+    "request_runtime_context_pre_lineage_rejoin_host_envelope": (
+        "session_token_rejoin_submission"
+    ),
+    "request_runtime_context_bounded_replacement_rejoin_host_envelope": (
+        "session_token_rejoin_submission"
+    ),
+    "request_runtime_context_rejoin_host_envelope": (
+        "session_token_rejoin_submission"
+    ),
+    "reissue_runtime_session_token": "session_token_reissue_submission",
+    "observer_runtime_text_prepare": "runtime_text_prepare_submission",
+    "submit_mf_subagent_read_receipt": "read_receipt_facade_payload_skeleton",
+    "record_mf_subagent_startup": "startup_facade_payload_skeleton",
+}
+
+
+def _bounded_runtime_context_error_result(value: Any) -> dict[str, Any] | None:
+    """Keep one exact recovery action from an oversized governance error."""
+
+    if not isinstance(value, dict) or not value.get("error"):
+        return None
+    serialized_bytes = _managed_runtime_read_serialized_bytes(value)
+    if serialized_bytes <= _MANAGED_RUNTIME_READ_COMPACT_TRIGGER_BYTES:
+        return None
+    details = value.get("details")
+    details = details if isinstance(details, dict) else {}
+    runtime_context_id = str(details.get("runtime_context_id") or "").strip()
+    next_legal_action = str(details.get("next_legal_action") or "").strip()
+    if not runtime_context_id or not next_legal_action:
+        return None
+    actionable_payloads = details.get("actionable_payloads")
+    actionable_payloads = (
+        actionable_payloads if isinstance(actionable_payloads, dict) else {}
+    )
+    action_key = _MANAGED_RUNTIME_ERROR_ACTION_KEYS.get(next_legal_action, "")
+    current_action = (
+        dict(actionable_payloads.get(action_key) or {})
+        if action_key and isinstance(actionable_payloads.get(action_key), dict)
+        else {}
+    )
+    current_action_bytes = _managed_runtime_read_serialized_bytes(current_action)
+    if current_action and current_action_bytes > _MANAGED_RUNTIME_READ_INLINE_BYTES:
+        return {
+            "ok": False,
+            "error": "runtime_context_error_current_action_too_large",
+            "runtime_context_id": runtime_context_id,
+            "next_legal_action": next_legal_action,
+            "current_action_source_key": action_key,
+            "current_action_hash": _managed_runtime_read_hash(current_action),
+            "current_action_serialized_bytes": current_action_bytes,
+            "source_error": str(value.get("error") or ""),
+            "source_hash": _managed_runtime_read_hash(value),
+            "source_serialized_bytes": serialized_bytes,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "product_mutation_performed": False,
+            "http_request_performed": True,
+            "semantic_truncation_performed": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        }
+    compact = {
+        "ok": False,
+        "error": str(value.get("error") or "runtime_context_read_rejected"),
+        "message": str(value.get("message") or ""),
+        "schema_version": "runtime_context.bounded_managed_error.v1",
+        "response_view": "compact",
+        "runtime_context_id": runtime_context_id,
+        "next_legal_action": next_legal_action,
+        "current_action_source_key": action_key,
+        "canonical_executable_action": current_action,
+        "details": {
+            "runtime_context_id": runtime_context_id,
+            "governance_project_id": details.get("governance_project_id"),
+            "target_project_id": details.get("target_project_id"),
+            "reason": details.get("reason") or value.get("error"),
+            "recoverable": bool(details.get("recoverable")),
+            "next_legal_action": next_legal_action,
+            "recovery_actions": (
+                list(details.get("recovery_actions") or [])
+                if isinstance(details.get("recovery_actions"), list)
+                else []
+            ),
+            "current_action_source_key": action_key,
+            "canonical_executable_action": current_action,
+            "actionable_payloads": (
+                {action_key: current_action}
+                if action_key and current_action
+                else {}
+            ),
+            "target_project_root_projection": _managed_runtime_bounded_mapping(
+                details.get("target_project_root_projection"),
+                field="details.target_project_root_projection",
+                scalar_fields=_MANAGED_RUNTIME_IDENTITY_FIELDS,
+            ),
+            "fail_closed": True,
+        },
+        "source_projection": {
+            "schema_version": "managed_mcp.bounded_error_source.v1",
+            "source_hash": _managed_runtime_read_hash(value),
+            "source_serialized_bytes": serialized_bytes,
+            "projection_scope": "current_runtime_context_recovery_authority",
+        },
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "product_mutation_performed": False,
+        "http_request_performed": True,
+        "semantic_truncation_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    compact["serialized_bytes"] = _managed_runtime_read_serialized_bytes(compact)
+    if compact["serialized_bytes"] > _WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES:
+        return {
+            "ok": False,
+            "error": "runtime_context_error_current_authority_too_large",
+            "runtime_context_id": runtime_context_id,
+            "next_legal_action": next_legal_action,
+            "current_action_source_key": action_key,
+            "source_hash": _managed_runtime_read_hash(value),
+            "source_serialized_bytes": serialized_bytes,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "product_mutation_performed": False,
+            "http_request_performed": True,
+            "semantic_truncation_performed": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        }
+    return compact
+
+
 def _bounded_worker_guide_result(
     value: Any,
     *,
@@ -410,6 +552,9 @@ def _bounded_worker_guide_result(
 
     if not isinstance(value, dict):
         return value
+    bounded_error = _bounded_runtime_context_error_result(value)
+    if bounded_error is not None:
+        return bounded_error
     try:
         serialized_bytes = _managed_runtime_read_serialized_bytes(value)
     except Exception as exc:
@@ -501,6 +646,9 @@ def _bounded_runtime_context_current_result(
 
     if not isinstance(value, dict):
         return value
+    bounded_error = _bounded_runtime_context_error_result(value)
+    if bounded_error is not None:
+        return bounded_error
     serialized_bytes = _managed_runtime_read_serialized_bytes(value)
     if serialized_bytes <= _MANAGED_RUNTIME_READ_COMPACT_TRIGGER_BYTES:
         return value
@@ -627,6 +775,9 @@ def _bounded_mf_sub_graph_query_result(value: Any, request_args: dict) -> Any:
         == "mf_sub"
     ):
         return value
+    bounded_error = _bounded_runtime_context_error_result(value)
+    if bounded_error is not None:
+        return bounded_error
     serialized_bytes = _managed_runtime_read_serialized_bytes(value)
     if serialized_bytes <= _MANAGED_RUNTIME_READ_COMPACT_TRIGGER_BYTES:
         return value

@@ -36215,6 +36215,73 @@ def test_runtime_context_write_facade_accepts_runtime_session_token_without_gov_
     assert "fence-session-facade" not in response_json
 
 
+def test_server_bounds_runtime_context_recovery_error_before_http_frame():
+    current_action = {
+        "schema_version": "runtime_context.session_token_rejoin_submission.v1",
+        "action": "request_runtime_context_rejoin_host_envelope",
+        "method": "POST",
+        "path": "/api/graph-governance/{project_id}/runtime-contexts/{runtime_context_id}/session-token/rejoin",
+        "copy_safe_body": {
+            "project_id": PID,
+            "runtime_context_id": "mfrctx-server-error-bounded",
+            "task_id": "worker-server-error-bounded",
+            "session_token_ref": "wstok-server-error-bounded",
+            "route_token_ref": "rtok-server-error-bounded",
+        },
+    }
+    error = server.GovernanceError(
+        "fence_invalidated_or_unknown",
+        "mf_subagent runtime context fence is invalidated or unknown",
+        403,
+        {
+            "runtime_context_id": "mfrctx-server-error-bounded",
+            "governance_project_id": PID,
+            "target_project_id": PID,
+            "reason": "worker_auth_material_missing",
+            "recoverable": True,
+            "next_legal_action": (
+                "request_runtime_context_rejoin_host_envelope"
+            ),
+            "recovery_actions": [
+                {
+                    "id": "request_runtime_context_rejoin_host_envelope",
+                    "action": "request_runtime_context_rejoin_host_envelope",
+                }
+            ],
+            "actionable_payloads": {
+                "session_token_rejoin_submission": current_action,
+                "startup_facade_payload_skeleton": {
+                    "recursive_lifecycle": "x" * (700 * 1024)
+                },
+            },
+            "diagnostics": {"recursive_lifecycle": "y" * (700 * 1024)},
+            "fail_closed": True,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        },
+    )
+
+    compact = server._public_zero_write_error_response(error)
+
+    assert compact["error"] == "fence_invalidated_or_unknown"
+    assert compact["schema_version"] == "runtime_context.bounded_public_error.v1"
+    assert compact["runtime_context_id"] == "mfrctx-server-error-bounded"
+    assert compact["next_legal_action"] == (
+        "request_runtime_context_rejoin_host_envelope"
+    )
+    assert compact["canonical_executable_action"] == current_action
+    assert compact["details"]["actionable_payloads"] == {
+        "session_token_rejoin_submission": current_action
+    }
+    assert compact["source_serialized_bytes"] > 1_000_000
+    assert compact["writes_performed"] is False
+    assert compact["mutation_performed"] is False
+    assert compact["semantic_truncation_performed"] is False
+    assert compact["raw_session_token_exposed"] is False
+    assert len(json.dumps(compact).encode()) < 64 * 1024
+
+
 def test_runtime_context_write_facades_cover_worker_happy_path(conn, tmp_path):
     fixture = create_parallel_fixture_project(
         tmp_path,

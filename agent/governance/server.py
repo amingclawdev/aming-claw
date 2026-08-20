@@ -2535,7 +2535,7 @@ def _public_zero_write_error_response(error: GovernanceError) -> dict[str, Any]:
         and details.get("secret_safe") is True
         and all(key in details for key in required)
     ):
-        return body
+        return _runtime_context_server_bounded_public_error_response(body)
     for key in (
         *required,
         "field_mismatches",
@@ -2565,7 +2565,7 @@ def _public_zero_write_error_response(error: GovernanceError) -> dict[str, Any]:
     ):
         if key in details:
             body[key] = details[key]
-    return body
+    return _runtime_context_server_bounded_public_error_response(body)
 
 
 def _runtime_context_implementation_zero_write_details(
@@ -31216,6 +31216,196 @@ def _runtime_context_server_bounded_mf_sub_graph_query_response(
             "mutation_performed": writes_performed,
             "product_mutation_performed": False,
             "semantic_truncation_performed": False,
+        }
+    return compact
+
+
+_RUNTIME_CONTEXT_PUBLIC_ERROR_ACTION_KEYS = {
+    "request_runtime_context_initial_join_host_envelope": (
+        "session_token_initial_join_submission"
+    ),
+    "request_runtime_context_pre_lineage_rejoin_host_envelope": (
+        "session_token_rejoin_submission"
+    ),
+    "request_runtime_context_bounded_replacement_rejoin_host_envelope": (
+        "session_token_rejoin_submission"
+    ),
+    "request_runtime_context_rejoin_host_envelope": (
+        "session_token_rejoin_submission"
+    ),
+    "reissue_runtime_session_token": "session_token_reissue_submission",
+    "observer_runtime_text_prepare": "runtime_text_prepare_submission",
+    "submit_mf_subagent_read_receipt": "read_receipt_facade_payload_skeleton",
+    "record_mf_subagent_startup": "startup_facade_payload_skeleton",
+}
+
+
+def _runtime_context_server_bounded_public_error_response(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bound one runtime worker recovery error before the HTTP response frame.
+
+    Runtime fence failures are raised before the normal current-state, Worker
+    Guide, or graph-query response projectors run.  Their recovery details can
+    nevertheless contain the complete lifecycle tree.  Keep the exact current
+    copy-safe recovery action and source-address the recursive diagnostics so a
+    managed worker can recover without receiving a multi-hundred-KiB error.
+    """
+
+    full = dict(value or {})
+    serialized_bytes = _runtime_context_server_read_serialized_bytes(full)
+    if serialized_bytes <= _RUNTIME_CONTEXT_SERVER_READ_MAX_SERIALIZED_BYTES:
+        return full
+    details = full.get("details")
+    details = details if isinstance(details, Mapping) else {}
+    runtime_context_id = str(details.get("runtime_context_id") or "").strip()
+    next_legal_action = str(details.get("next_legal_action") or "").strip()
+    if not runtime_context_id or not next_legal_action:
+        return full
+
+    actionable_payloads = details.get("actionable_payloads")
+    actionable_payloads = (
+        actionable_payloads if isinstance(actionable_payloads, Mapping) else {}
+    )
+    action_key = _RUNTIME_CONTEXT_PUBLIC_ERROR_ACTION_KEYS.get(
+        next_legal_action,
+        "",
+    )
+    current_action = (
+        actionable_payloads.get(action_key)
+        if action_key and isinstance(actionable_payloads.get(action_key), Mapping)
+        else {}
+    )
+    current_action = (
+        deepcopy(dict(current_action))
+        if isinstance(current_action, Mapping)
+        else {}
+    )
+    current_action_bytes = _runtime_context_server_read_serialized_bytes(
+        current_action
+    )
+    if (
+        current_action
+        and current_action_bytes > _RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES
+    ):
+        return {
+            "ok": False,
+            "error": "runtime_context_error_current_action_too_large",
+            "message": (
+                "The current runtime-context recovery action cannot be "
+                "losslessly inlined."
+            ),
+            "runtime_context_id": runtime_context_id,
+            "next_legal_action": next_legal_action,
+            "current_action_source_key": action_key,
+            "current_action_hash": _stable_public_hash(current_action),
+            "current_action_serialized_bytes": current_action_bytes,
+            "source_error": str(full.get("error") or ""),
+            "source_hash": _stable_public_hash(full),
+            "source_serialized_bytes": serialized_bytes,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "product_mutation_performed": False,
+            "semantic_truncation_performed": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        }
+
+    recovery_actions = details.get("recovery_actions")
+    recovery_actions = (
+        deepcopy(list(recovery_actions))
+        if isinstance(recovery_actions, Sequence)
+        and not isinstance(recovery_actions, (str, bytes, bytearray))
+        else []
+    )
+    target_root_projection = details.get("target_project_root_projection")
+    target_root_projection = (
+        _runtime_context_server_bounded_mapping(
+            target_root_projection,
+            field="details.target_project_root_projection",
+        )
+        if isinstance(target_root_projection, Mapping)
+        else {}
+    )
+    compact_details = {
+        "runtime_context_id": runtime_context_id,
+        "governance_project_id": details.get("governance_project_id"),
+        "target_project_id": details.get("target_project_id"),
+        "reason": details.get("reason") or full.get("error"),
+        "recoverable": bool(details.get("recoverable")),
+        "next_legal_action": next_legal_action,
+        "recovery_actions": recovery_actions,
+        "current_action_source_key": action_key,
+        "canonical_executable_action": current_action,
+        "actionable_payloads": (
+            {action_key: current_action} if action_key and current_action else {}
+        ),
+        "target_project_root_projection": target_root_projection,
+        "fail_closed": True,
+        "source_projection": {
+            "schema_version": "runtime_context.server_bounded_error_source.v1",
+            "source_hash": _stable_public_hash(full),
+            "source_serialized_bytes": serialized_bytes,
+            "projection_scope": "current_runtime_context_recovery_authority",
+            "omitted_recursive_sections": [
+                "diagnostics",
+                "inactive_actionable_payloads",
+                "duplicate_facade_payload_skeletons",
+            ],
+        },
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "product_mutation_performed": False,
+        "semantic_truncation_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    compact = {
+        "ok": False,
+        "error": str(full.get("error") or "runtime_context_read_rejected"),
+        "message": str(full.get("message") or ""),
+        "schema_version": "runtime_context.bounded_public_error.v1",
+        "response_view": "compact",
+        "runtime_context_id": runtime_context_id,
+        "next_legal_action": next_legal_action,
+        "current_action_source_key": action_key,
+        "canonical_executable_action": current_action,
+        "details": compact_details,
+        "source_hash": _stable_public_hash(full),
+        "source_serialized_bytes": serialized_bytes,
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "product_mutation_performed": False,
+        "semantic_truncation_performed": False,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    compact["serialized_bytes"] = _runtime_context_server_read_serialized_bytes(
+        compact
+    )
+    if compact["serialized_bytes"] > _RUNTIME_CONTEXT_SERVER_READ_MAX_SERIALIZED_BYTES:
+        return {
+            "ok": False,
+            "error": "runtime_context_error_current_authority_too_large",
+            "runtime_context_id": runtime_context_id,
+            "next_legal_action": next_legal_action,
+            "current_action_source_key": action_key,
+            "source_hash": _stable_public_hash(full),
+            "source_serialized_bytes": serialized_bytes,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "product_mutation_performed": False,
+            "semantic_truncation_performed": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
         }
     return compact
 
