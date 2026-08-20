@@ -177,9 +177,18 @@ def test_managed_mcp_host_envelope_stages_injects_and_acks_startup():
     assert len(calls) == call_count
     assert dispatcher._host_envelope_continuity.pending_count() == 1
 
+    startup_properties = _tool_properties("parallel_branch_startup")
+    schema_startup_body = {
+        key: value
+        for key, value in guide_startup_body.items()
+        if key in startup_properties
+    }
+    assert schema_startup_body["target_project_root"] == identity[
+        "target_project_root"
+    ]
     startup = dispatcher.dispatch(
         "parallel_branch_startup",
-        guide_startup_body,
+        schema_startup_body,
     )
     assert startup["managed_host_envelope_consumed"] is True
     assert dispatcher._host_envelope_continuity.pending_count() == 0
@@ -5281,6 +5290,7 @@ def test_mcp_parallel_branch_tool_schemas_expose_bounded_identity_fields():
         "host_session_id",
         "actual_cwd",
         "actual_git_root",
+        "target_project_root",
         "branch",
         "head_commit",
         "base_commit",

@@ -2871,6 +2871,7 @@ def test_mcp_stdio_parallel_branch_startup_schema_exposes_read_receipt_bridge_fi
         "harness_type",
         "filer_principal",
         "contract_execution_id",
+        "target_project_root",
         "route_token_ref",
         "read_receipt_hash",
         "read_receipt_event_id",

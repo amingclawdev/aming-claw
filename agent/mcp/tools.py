@@ -5467,6 +5467,13 @@ TOOLS: list[dict] = [
                 "host_session_id": {"type": "string"},
                 "actual_cwd": {"type": "string"},
                 "actual_git_root": {"type": "string"},
+                "target_project_root": {
+                    "type": "string",
+                    "description": (
+                        "Exact allocated worker project root required by managed "
+                        "host-envelope continuity validation."
+                    ),
+                },
                 "branch": {"type": "string"},
                 "branch_ref": {"type": "string"},
                 "head_commit": {"type": "string"},
