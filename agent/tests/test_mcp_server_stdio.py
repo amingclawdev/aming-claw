@@ -883,6 +883,265 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
     assert raw_fence not in serialized
 
 
+def test_real_stdio_safe_ref_graph_query_auto_rejoin_lifecycle_warranty(tmp_path):
+    raw_session = "stdio-safe-ref-warranty-session-secret"
+    raw_fence = "stdio-safe-ref-warranty-fence-secret"
+    caller_raw_fence = "stdio-safe-ref-warranty-caller-raw-fence"
+    route = {
+        "route_id": "route-stdio-safe-ref-warranty",
+        "route_context_hash": "sha256:" + ("1" * 64),
+        "prompt_contract_id": "rprompt-stdio-safe-ref-warranty",
+        "prompt_contract_hash": "sha256:" + ("2" * 64),
+        "route_token_ref": "rtok-stdio-safe-ref-warranty",
+        "visible_injection_manifest_hash": "sha256:" + ("3" * 64),
+    }
+
+    def worker_identity(suffix):
+        worker = f"worker-stdio-safe-ref-{suffix}"
+        execution = f"cex-stdio-safe-ref-{suffix}"
+        return {
+            "project_id": "aming-claw",
+            "runtime_context_id": f"mfrctx-stdio-safe-ref-{suffix}",
+            "task_id": worker,
+            "parent_task_id": execution,
+            "contract_execution_id": execution,
+            "target_project_root": str(tmp_path),
+            "worker_id": worker,
+            "worker_slot_id": worker,
+            "agent_id": worker,
+            "allocation_owner": worker,
+            "actual_host_worker_id": worker,
+            "worker_session_id": f"desktop-stdio-safe-ref-{suffix}",
+            "host_startup_id": f"desktop-stdio-safe-ref-{suffix}",
+            "host_session_id": f"desktop-stdio-safe-ref-{suffix}",
+            "session_token_ref": f"wstok-stdio-safe-ref-{suffix}",
+            **route,
+        }
+
+    auto_identity = worker_identity("auto-warranty")
+    failure_identity = worker_identity("failure-warranty")
+    explicit_identity = worker_identity("explicit-warranty")
+    raw_identity = worker_identity("raw-warranty")
+    identities = {
+        identity["runtime_context_id"]: identity
+        for identity in (
+            auto_identity,
+            failure_identity,
+            explicit_identity,
+            raw_identity,
+        )
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        calls = []
+
+        def log_message(self, *_args):
+            return None
+
+        def _send(self, payload):
+            encoded = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def do_POST(self):
+            size = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(size) or b"{}")
+            self.__class__.calls.append((self.path, body))
+            identity = identities[body["runtime_context_id"]]
+            if self.path.endswith("/session-token/rejoin"):
+                self._send(
+                    {
+                        "ok": True,
+                        "status": "session_token_rejoined",
+                        "delivery": "worker_host_envelope",
+                        **identity,
+                        "session_token": raw_session,
+                        "fence_token": raw_fence,
+                        "host_envelope": {
+                            **identity,
+                            "env": {
+                                "AMING_WORKER_SESSION_TOKEN": raw_session,
+                                "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                            },
+                        },
+                    }
+                )
+                return
+            assert self.path.endswith("/query")
+            assert body["session_token"] == raw_session
+            assert body["fence_token"] == raw_fence
+            if body.get("args", {}).get("query") == "warranty.reject":
+                self._send(
+                    {
+                        "ok": False,
+                        "error": "warranty_graph_rejected_after_rejoin",
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                        "zero_write": True,
+                    }
+                )
+                return
+            self._send(
+                {
+                    "ok": True,
+                    "trace_id": (
+                        "gqt-stdio-safe-ref-warranty-"
+                        + body["runtime_context_id"].rsplit("-", 1)[-1]
+                    ),
+                    "tool": "function_index",
+                    "result": [{"node_id": "stdio.safe.ref.warranty"}],
+                    "graph_query_identity": {
+                        "runtime_context_id": body["runtime_context_id"],
+                        "task_id": body["task_id"],
+                        "session_token": raw_session,
+                        "fence_token": raw_fence,
+                    },
+                }
+            )
+
+    def graph_args(identity, query):
+        return {
+            **identity,
+            "tool": "function_index",
+            "args": {"query": query},
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+            "worker_role": "mf_sub",
+        }
+
+    auto_args = graph_args(auto_identity, "warranty.auto")
+    failure_args = graph_args(failure_identity, "warranty.reject")
+    explicit_args = graph_args(explicit_identity, "warranty.explicit")
+    raw_args = graph_args(raw_identity, "warranty.raw")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        responses, stderr, returncode = _run_mcp_probe(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "graph_query", "arguments": auto_args},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "graph_query",
+                        "arguments": {
+                            **auto_args,
+                            "target_project_root": str(tmp_path / "cross-root"),
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "graph_query",
+                        "arguments": {
+                            **auto_args,
+                            "session_token_ref": "wstok-cross-safe-ref-warranty",
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "graph_query",
+                        "arguments": failure_args,
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "graph_query",
+                        "arguments": {
+                            **explicit_args,
+                            "managed_rejoin": {
+                                **explicit_identity,
+                                "reason": "warranty explicit compatibility",
+                            },
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "graph_query",
+                        "arguments": {
+                            **raw_args,
+                            "fence_token": caller_raw_fence,
+                        },
+                    },
+                },
+            ],
+            extra_args=[
+                "--governance-url",
+                f"http://127.0.0.1:{server.server_address[1]}",
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert returncode == 0
+    assert stderr == ""
+    payloads = [
+        json.loads(item["result"]["content"][0]["text"])
+        for item in responses[1:]
+    ]
+    assert payloads[0]["ok"] is True
+    assert payloads[0]["managed_rejoin"]["trigger"] == "implicit_safe_ref"
+    assert payloads[0]["governance_writes_performed"] is True
+    assert payloads[0]["writes_performed"] is True
+    assert "session_token" not in payloads[0]["graph_query_identity"]
+    assert "fence_token" not in payloads[0]["graph_query_identity"]
+    for payload, field in zip(
+        payloads[1:3],
+        ("target_project_root", "session_token_ref"),
+    ):
+        assert payload["error"] == "managed_host_envelope_scope_mismatch"
+        assert payload["mismatched_fields"] == [field]
+        assert payload["http_request_performed"] is False
+        assert payload["writes_performed"] is False
+    assert payloads[3]["error"] == "warranty_graph_rejected_after_rejoin"
+    assert payloads[3]["managed_rejoin"]["trigger"] == "implicit_safe_ref"
+    assert payloads[3]["writes_performed"] is True
+    assert payloads[3]["mutation_performed"] is True
+    assert payloads[3]["zero_write_rejection"] is False
+    assert payloads[4]["ok"] is True
+    assert payloads[4]["managed_rejoin"]["trigger"] == "explicit"
+    assert payloads[5]["error"] == "managed_graph_rejoin_auth_ambiguous"
+    assert payloads[5]["http_request_performed"] is False
+    assert payloads[5]["writes_performed"] is False
+    assert len(Handler.calls) == 6
+    serialized = json.dumps(responses, sort_keys=True) + stderr
+    assert raw_session not in serialized
+    assert raw_fence not in serialized
+    assert caller_raw_fence not in serialized
+
+
 def test_real_stdio_managed_rejoin_graph_failure_keeps_write_truth(tmp_path):
     raw_session = "stdio-managed-failure-session-secret"
     raw_fence = "stdio-managed-failure-fence-secret"
