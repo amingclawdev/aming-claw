@@ -17147,6 +17147,34 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                             if path.strip()
                         ]
                     }
+                elif error in {
+                    "acceptance_behavior_contract_required",
+                    "acceptance_behavior_contract_invalid",
+                }:
+                    field = "acceptance_criteria[].behavior_contract"
+                    behavior_gate = dict(
+                        acceptance_scope_closure.get("behavior_contract_gate")
+                        or {}
+                    )
+                    expected = behavior_gate.get("required_contract") or {
+                        "schema_version": (
+                            _ACCEPTANCE_BEHAVIOR_CONTRACT_SCHEMA_VERSION
+                        )
+                    }
+                    actual = {
+                        "missing_criterion_ids": behavior_gate.get(
+                            "missing_behavior_contract_criterion_ids"
+                        )
+                        or [],
+                        "invalid_criterion_ids": behavior_gate.get(
+                            "invalid_behavior_contract_criterion_ids"
+                        )
+                        or [],
+                        "invalid_fields": behavior_gate.get(
+                            "invalid_behavior_contract_fields"
+                        )
+                        or {},
+                    }
                 field_mismatches.append(
                     {
                         "field": field,
@@ -17156,18 +17184,32 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                     }
                 )
             first_mismatch = field_mismatches[0]
+            behavior_contract_incomplete = not dict(
+                acceptance_scope_closure.get("behavior_contract_gate") or {}
+            ).get("accepted", True)
             raise GovernanceError(
                 (
-                    "parallel_branch_allocate_precheck_atomic_gate_failed"
-                    if atomic
-                    else "parallel_branch_allocate_precheck_lane_gate_failed"
+                    "parallel_branch_allocate_precheck_behavior_contract_incomplete"
+                    if behavior_contract_incomplete
+                    else (
+                        "parallel_branch_allocate_precheck_atomic_gate_failed"
+                        if atomic
+                        else "parallel_branch_allocate_precheck_lane_gate_failed"
+                    )
                 ),
                 (
-                    "atomic allocation lanes failed identity, fence, or "
-                    "acceptance validation"
-                    if atomic
-                    else "per-child allocation lane failed identity, fence, "
-                    "or acceptance validation"
+                    "allocation acceptance requests a new product behavior "
+                    "without a concrete structured behavior contract"
+                    if behavior_contract_incomplete
+                    else (
+                        "atomic allocation lanes failed identity, fence, or "
+                        "acceptance validation"
+                        if atomic
+                        else (
+                            "per-child allocation lane failed identity, fence, "
+                            "or acceptance validation"
+                        )
+                    )
                 ),
                 422,
                 {
@@ -17178,7 +17220,11 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                     "field_mismatches": field_mismatches,
                     "acceptance_scope_closure": acceptance_scope_closure,
                     "guide": {
-                        "action": "correct_atomic_allocation_lane_inputs",
+                        "action": (
+                            "observer_define_behavior_contract_before_mf_runtime"
+                            if behavior_contract_incomplete
+                            else "correct_atomic_allocation_lane_inputs"
+                        ),
                         "route_token_ref_action": (
                             "use the current mf_parallel guide's per-lane "
                             "observer_route_context_issue request bodies; copy "
@@ -99823,6 +99869,12 @@ def _contract_runtime_mf_parallel_rev8_atomic_acceptance_gate(
         actor_role="observer",
         implementation_started=False,
     )
+    gate = _acceptance_scope_with_behavior_contract_gate(
+        gate,
+        criteria,
+        authority_source=f"backlog_bugs:{backlog_id}:acceptance_criteria",
+        implementation_started=False,
+    )
     errors = list(gate.get("errors") or [])
     claims = _contract_runtime_acceptance_criteria_claims(
         acceptance_claim_source
@@ -99835,6 +99887,12 @@ def _contract_runtime_mf_parallel_rev8_atomic_acceptance_gate(
             authority_source=f"backlog_bugs:{backlog_id}:acceptance_criteria",
             actor_role="observer",
             reported_acceptance_criteria=claim,
+            implementation_started=False,
+        )
+        claim_gate = _acceptance_scope_with_behavior_contract_gate(
+            claim_gate,
+            criteria,
+            authority_source=f"backlog_bugs:{backlog_id}:acceptance_criteria",
             implementation_started=False,
         )
         if claim_gate.get("authority_mismatch"):
@@ -128889,6 +128947,282 @@ def _backlog_declared_direct_file_scope(conn, backlog_id: str) -> list[str]:
 
 _ACCEPTANCE_SCOPE_REPORT_UNSET = object()
 _ACCEPTANCE_FILE_FENCE_UNSET = object()
+_ACCEPTANCE_BEHAVIOR_CONTRACT_SCHEMA_VERSION = (
+    "acceptance.behavior_contract.v1"
+)
+_ACCEPTANCE_NEW_BEHAVIOR_VERB_PATTERN = re.compile(
+    r"\b(?:implement|add|introduce|create|build|provide|support|complete)\b",
+    re.IGNORECASE,
+)
+_ACCEPTANCE_UNSPECIFIED_BEHAVIOR_PATTERN = re.compile(
+    r"\b(?:one|a|an|some|new)\s+(?:[a-z0-9_.:-]+\s+){0,8}behaviou?r\b",
+    re.IGNORECASE,
+)
+_ACCEPTANCE_BEHAVIOR_PLACEHOLDER_PATTERN = re.compile(
+    r"(?:<[^>]+>|\b(?:tbd|todo|unspecified|to\s+be\s+defined)\b)",
+    re.IGNORECASE,
+)
+
+
+def _acceptance_behavior_contract_items(value: Any) -> tuple[list[str], bool]:
+    """Normalize one explicit behavior-contract input/output declaration."""
+
+    if not isinstance(value, list) or not value:
+        return [], False
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return [], False
+        text = item.strip()
+        if (
+            not text
+            or len(text) > 256
+            or _ACCEPTANCE_BEHAVIOR_PLACEHOLDER_PATTERN.search(text)
+        ):
+            return [], False
+        items.append(text)
+    if len(set(items)) != len(items):
+        return [], False
+    return items, True
+
+
+def _acceptance_criterion_requires_behavior_contract(
+    criterion: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Detect the narrow, deterministic new-behavior placeholder contract."""
+
+    explicit_marker = (
+        criterion.get("behavior_contract_required") is True
+        or str(criterion.get("change_kind") or "").strip().lower()
+        == "new_product_behavior"
+    )
+    scope = (
+        criterion.get("required_scope")
+        if isinstance(criterion.get("required_scope"), Mapping)
+        else {}
+    )
+    implementation_scope = str(scope.get("kind") or "").strip().lower() in {
+        "files",
+        "nodes",
+        "files_and_nodes",
+    }
+    prose = str(
+        criterion.get("text") or criterion.get("description") or ""
+    ).strip()
+    prose_placeholder = bool(
+        implementation_scope
+        and _ACCEPTANCE_NEW_BEHAVIOR_VERB_PATTERN.search(prose)
+        and _ACCEPTANCE_UNSPECIFIED_BEHAVIOR_PATTERN.search(prose)
+    )
+    if explicit_marker:
+        return True, "explicit_new_product_behavior_marker"
+    if prose_placeholder:
+        return True, "unspecified_new_behavior_prose"
+    return False, ""
+
+
+def _acceptance_behavior_contract_gate(
+    acceptance_criteria: Any,
+    *,
+    authority_source: str,
+    implementation_started: bool,
+) -> dict[str, Any]:
+    """Require explicit semantics for a criterion that asks for a new behavior.
+
+    This gate intentionally recognizes only an explicit marker or the narrow
+    ``implement/add ... one/a/new ... behavior`` placeholder shape.  It does
+    not attempt to infer product requirements from prose and therefore leaves
+    bug fixes, preservation-only work, infrastructure, and verification-only
+    criteria compatible.
+    """
+
+    criteria = (
+        list(acceptance_criteria)
+        if isinstance(acceptance_criteria, (list, tuple))
+        else ([] if acceptance_criteria in (None, "") else [acceptance_criteria])
+    )
+    required_ids: list[str] = []
+    trigger_sources: dict[str, str] = {}
+    missing_ids: list[str] = []
+    invalid_ids: list[str] = []
+    invalid_fields: dict[str, list[str]] = {}
+    canonical_contracts: list[dict[str, Any]] = []
+
+    for index, item in enumerate(criteria, start=1):
+        if not isinstance(item, Mapping):
+            continue
+        required, trigger_source = _acceptance_criterion_requires_behavior_contract(
+            item
+        )
+        if not required:
+            continue
+        criterion_id = str(item.get("id") or f"<criterion:{index}>").strip()
+        required_ids.append(criterion_id)
+        trigger_sources[criterion_id] = trigger_source
+        contract = item.get("behavior_contract")
+        if not isinstance(contract, Mapping):
+            missing_ids.append(criterion_id)
+            continue
+
+        fields: list[str] = []
+        schema_version = str(contract.get("schema_version") or "").strip()
+        if schema_version != _ACCEPTANCE_BEHAVIOR_CONTRACT_SCHEMA_VERSION:
+            fields.append("schema_version")
+        operation_id = str(contract.get("operation_id") or "").strip()
+        if (
+            not operation_id
+            or len(operation_id) > 128
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", operation_id)
+            is None
+            or _ACCEPTANCE_BEHAVIOR_PLACEHOLDER_PATTERN.search(operation_id)
+        ):
+            fields.append("operation_id")
+        inputs, inputs_valid = _acceptance_behavior_contract_items(
+            contract.get("inputs")
+        )
+        if not inputs_valid:
+            fields.append("inputs")
+        outputs, outputs_valid = _acceptance_behavior_contract_items(
+            contract.get("outputs")
+        )
+        if not outputs_valid:
+            fields.append("outputs")
+        malformed_input_outcome = str(
+            contract.get("malformed_input_outcome") or ""
+        ).strip()
+        if (
+            not malformed_input_outcome
+            or len(malformed_input_outcome) > 512
+            or _ACCEPTANCE_BEHAVIOR_PLACEHOLDER_PATTERN.search(
+                malformed_input_outcome
+            )
+        ):
+            fields.append("malformed_input_outcome")
+        if fields:
+            invalid_ids.append(criterion_id)
+            invalid_fields[criterion_id] = fields
+            continue
+        canonical_contracts.append(
+            {
+                "criterion_id": criterion_id,
+                "schema_version": schema_version,
+                "operation_id": operation_id,
+                "inputs": inputs,
+                "outputs": outputs,
+                "malformed_input_outcome": malformed_input_outcome,
+            }
+        )
+
+    errors: list[str] = []
+    if missing_ids:
+        errors.append("acceptance_behavior_contract_required")
+    if invalid_ids:
+        errors.append("acceptance_behavior_contract_invalid")
+    accepted = not errors
+    affected_ids = list(dict.fromkeys([*missing_ids, *invalid_ids]))
+    remediation_action = (
+        "create_fresh_or_rework_contract_with_defined_behavior_contract"
+        if implementation_started
+        else "observer_define_behavior_contract_before_mf_runtime"
+    )
+    return {
+        "schema_version": "acceptance_behavior_contract_gate.v1",
+        "accepted": accepted,
+        "passed": accepted,
+        "status": "passed" if accepted else "blocked",
+        "authority_source": authority_source,
+        "implementation_started": bool(implementation_started),
+        "required_criterion_ids": required_ids,
+        "trigger_sources": trigger_sources,
+        "missing_behavior_contract_criterion_ids": missing_ids,
+        "invalid_behavior_contract_criterion_ids": invalid_ids,
+        "invalid_behavior_contract_fields": invalid_fields,
+        "canonical_behavior_contracts": canonical_contracts,
+        "errors": errors,
+        "required_contract": {
+            "schema_version": _ACCEPTANCE_BEHAVIOR_CONTRACT_SCHEMA_VERSION,
+            "required_fields": [
+                "operation_id",
+                "inputs",
+                "outputs",
+                "malformed_input_outcome",
+            ],
+            "inputs_and_outputs": "non_empty_unique_concrete_string_lists",
+            "placeholder_values_allowed": False,
+            "server_requirement_inference_allowed": False,
+        },
+        "copy_safe_observer_remediation": {
+            "owner_role": "observer",
+            "action": remediation_action,
+            "criterion_ids": affected_ids,
+            "required_contract": {
+                "schema_version": _ACCEPTANCE_BEHAVIOR_CONTRACT_SCHEMA_VERSION,
+                "required_fields": [
+                    "operation_id",
+                    "inputs",
+                    "outputs",
+                    "malformed_input_outcome",
+                ],
+            },
+            "update_authority": authority_source,
+            "worker_or_qa_requirement_invention_allowed": False,
+            "post_implementation_in_place_definition_allowed": False,
+        },
+    }
+
+
+def _acceptance_scope_with_behavior_contract_gate(
+    gate: Mapping[str, Any],
+    acceptance_criteria: Any,
+    *,
+    authority_source: str,
+    implementation_started: bool,
+) -> dict[str, Any]:
+    """Compose behavior completeness into the existing scope authority gate."""
+
+    combined = dict(gate)
+    behavior_gate = _acceptance_behavior_contract_gate(
+        acceptance_criteria,
+        authority_source=authority_source,
+        implementation_started=implementation_started,
+    )
+    errors = list(
+        dict.fromkeys(
+            [
+                *[str(error) for error in combined.get("errors") or []],
+                *[str(error) for error in behavior_gate.get("errors") or []],
+            ]
+        )
+    )
+    accepted = not errors
+    combined.update(
+        {
+            "accepted": accepted,
+            "passed": accepted,
+            "status": "passed" if accepted else "blocked",
+            "errors": errors,
+            "behavior_contract_gate": behavior_gate,
+            "behavior_contract_required_criterion_ids": list(
+                behavior_gate.get("required_criterion_ids") or []
+            ),
+            "missing_behavior_contract_criterion_ids": list(
+                behavior_gate.get("missing_behavior_contract_criterion_ids")
+                or []
+            ),
+            "invalid_behavior_contract_criterion_ids": list(
+                behavior_gate.get("invalid_behavior_contract_criterion_ids")
+                or []
+            ),
+            "invalid_behavior_contract_fields": dict(
+                behavior_gate.get("invalid_behavior_contract_fields") or {}
+            ),
+        }
+    )
+    if not behavior_gate.get("accepted"):
+        combined["copy_safe_observer_remediation"] = dict(
+            behavior_gate.get("copy_safe_observer_remediation") or {}
+        )
+    return combined
 
 
 def _acceptance_file_fence_argument(
@@ -129025,6 +129359,11 @@ def _acceptance_file_fence_zero_write_diagnostics(
         or diagnostic.get("unresolved_criterion_ids")
     ):
         field = "acceptance_criteria[].required_scope"
+    elif (
+        diagnostic.get("missing_behavior_contract_criterion_ids")
+        or diagnostic.get("invalid_behavior_contract_criterion_ids")
+    ):
+        field = "acceptance_criteria[].behavior_contract"
     elif diagnostic.get("lane_files_outside_row_authority"):
         field = "owned_files"
     else:
@@ -129038,6 +129377,16 @@ def _acceptance_file_fence_zero_write_diagnostics(
             "nodes": "non_empty node_ids",
             "files_and_nodes": "both non_empty files and non_empty node_ids",
         },
+        "behavior_contract_rules": {
+            "schema_version": _ACCEPTANCE_BEHAVIOR_CONTRACT_SCHEMA_VERSION,
+            "required_fields": [
+                "operation_id",
+                "inputs",
+                "outputs",
+                "malformed_input_outcome",
+            ],
+            "server_requirement_inference_allowed": False,
+        },
         "worker_or_qa_scope_widening_allowed": False,
         "post_implementation_in_place_widening_allowed": False,
     }
@@ -129049,6 +129398,10 @@ def _acceptance_file_fence_zero_write_diagnostics(
         "missing_scope_criterion_ids",
         "invalid_scope_criterion_ids",
         "unresolved_criterion_ids",
+        "behavior_contract_required_criterion_ids",
+        "missing_behavior_contract_criterion_ids",
+        "invalid_behavior_contract_criterion_ids",
+        "invalid_behavior_contract_fields",
         "required_file_union",
         "required_node_union",
         "missing_required_files",
@@ -129179,6 +129532,12 @@ def _require_backlog_acceptance_file_fence_closure(
         reported_acceptance_criteria=reported,
         implementation_started=bool(implementation_started),
     )
+    gate = _acceptance_scope_with_behavior_contract_gate(
+        gate,
+        criteria,
+        authority_source=f"backlog_bugs:{backlog_id}:acceptance_criteria",
+        implementation_started=bool(implementation_started),
+    )
     gate.update(
         {
             "project_id": project_id,
@@ -129201,10 +129560,23 @@ def _require_backlog_acceptance_file_fence_closure(
             source_gate="_require_backlog_acceptance_file_fence_closure",
         )
         raise GovernanceError(
-            "acceptance_file_fence_closure_failed",
             (
-                "acceptance criteria are not authoritatively closed by the "
-                "minted target_files/owned_files fence"
+                "acceptance_behavior_contract_incomplete"
+                if not (
+                    gate.get("behavior_contract_gate") or {}
+                ).get("accepted", True)
+                else "acceptance_file_fence_closure_failed"
+            ),
+            (
+                "acceptance criteria request a new product behavior without "
+                "a concrete structured behavior contract"
+                if not (
+                    gate.get("behavior_contract_gate") or {}
+                ).get("accepted", True)
+                else (
+                    "acceptance criteria are not authoritatively closed by "
+                    "the minted target_files/owned_files fence"
+                )
             ),
             422,
             gate,
@@ -129244,6 +129616,12 @@ def _require_mf_parallel_rev8_lane_acceptance_authority(
         authority_source=f"backlog_bugs:{backlog_id}:acceptance_criteria",
         actor_role=actor_role,
         reported_acceptance_criteria=reported,
+        implementation_started=bool(implementation_started),
+    )
+    gate = _acceptance_scope_with_behavior_contract_gate(
+        gate,
+        criteria,
+        authority_source=f"backlog_bugs:{backlog_id}:acceptance_criteria",
         implementation_started=bool(implementation_started),
     )
     lane_files_outside_row_authority = (
@@ -129296,10 +129674,23 @@ def _require_mf_parallel_rev8_lane_acceptance_authority(
             ),
         )
         raise GovernanceError(
-            "acceptance_file_fence_closure_failed",
             (
-                "rev8 per-lane authority is invalid; full row acceptance "
-                "closure remains deferred to atomic dispatch"
+                "acceptance_behavior_contract_incomplete"
+                if not (
+                    gate.get("behavior_contract_gate") or {}
+                ).get("accepted", True)
+                else "acceptance_file_fence_closure_failed"
+            ),
+            (
+                "rev8 lane requests a new product behavior without a "
+                "concrete structured behavior contract"
+                if not (
+                    gate.get("behavior_contract_gate") or {}
+                ).get("accepted", True)
+                else (
+                    "rev8 per-lane authority is invalid; full row acceptance "
+                    "closure remains deferred to atomic dispatch"
+                )
             ),
             422,
             gate,

@@ -24790,6 +24790,147 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
         assert Path(allocated["context"]["worktree_path"]).exists()
 
 
+def test_parallel_branch_allocate_precheck_rejects_unspecified_behavior_contract(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-ALLOCATE-PRECHECK-R11-BEHAVIOR"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = ["src/reminders.js", "tests/reminders.test.mjs"]
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(row_files),
+            json.dumps(
+                [
+                    _r11_unspecified_behavior_criterion(
+                        _concrete_reminder_behavior_contract()
+                    )
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    contract_execution_id = _enter_standalone_mf_parallel_for_allocation_precheck(
+        conn,
+        backlog_id=backlog_id,
+        task_id="allocation-precheck-r11-behavior",
+        owned_files=row_files,
+        suffix="r11-behavior",
+        required_worker_count=1,
+    )
+    route_token_ref = "rtok-allocation-precheck-r11-behavior"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        target_files=row_files,
+    )
+    conn.execute(
+        "UPDATE backlog_bugs SET acceptance_criteria = ? WHERE bug_id = ?",
+        (
+            json.dumps([_r11_unspecified_behavior_criterion()]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    body = {
+        "base_commit": candidate_commit,
+        "target_head_commit": candidate_commit,
+        "expected_lane_count": 1,
+        "expected_worker_count": 1,
+        "lanes": [
+            {
+                "task_id": "r11-behavior-worker",
+                "backlog_id": backlog_id,
+                "contract_execution_id": contract_execution_id,
+                "worker_id": "slot-r11-behavior",
+                "route_token_ref": route_token_ref,
+                "owned_files": row_files,
+            }
+        ],
+    }
+    zero_write_tables = (
+        "parallel_branch_runtime_contexts",
+        "parallel_branch_runtime_contract_revisions",
+        "parallel_branch_merge_queue_items",
+        "task_timeline_events",
+    )
+    before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    }
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_precheck_behavior_contract_incomplete"
+    )
+    details = rejected.value.details
+    assert details["field"] == "acceptance_criteria[].behavior_contract"
+    assert details["acceptance_scope_closure"][
+        "missing_behavior_contract_criterion_ids"
+    ] == ["ac-r11-reminder-domain-change"]
+    assert details["guide"]["action"] == (
+        "observer_define_behavior_contract_before_mf_runtime"
+    )
+    assert details["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    } == before
+    assert not (repository_root / ".worktrees").exists()
+
+    conn.execute(
+        "UPDATE backlog_bugs SET acceptance_criteria = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                [
+                    _r11_unspecified_behavior_criterion(
+                        _concrete_reminder_behavior_contract()
+                    )
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    response = server.handle_graph_governance_parallel_branch_allocate_precheck(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert response["status"] == "ready"
+    behavior_gate = response["acceptance_scope_closure"][
+        "behavior_contract_gate"
+    ]
+    assert behavior_gate["accepted"] is True
+    assert behavior_gate["canonical_behavior_contracts"][0]["operation_id"] == (
+        "reminders.snoozeReminder"
+    )
+
+
 def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_single_lane(
     conn,
     tmp_path,
@@ -28376,6 +28517,262 @@ def test_mf_parallel_enter_invalid_acceptance_scope_is_public_complete_zero_writ
         assert mcp_public[key] == public[key]
     assert mcp_public["zero_write_rejection"] is True
     assert mcp_public["writes_performed"] is False
+
+
+def _r11_unspecified_behavior_criterion(behavior_contract=None):
+    criterion = {
+        "id": "ac-r11-reminder-domain-change",
+        "text": (
+            "Implement and test one bounded Reminder successor behavior only "
+            "in src/reminders.js and tests/reminders.test.mjs, preserving "
+            "existing behavior and failing closed for malformed inputs."
+        ),
+        "required_scope": {
+            "kind": "files_and_nodes",
+            "files": ["src/reminders.js", "tests/reminders.test.mjs"],
+            "nodes": ["Reminder domain behavior"],
+        },
+    }
+    if behavior_contract is not None:
+        criterion["behavior_contract"] = behavior_contract
+    return criterion
+
+
+def _concrete_reminder_behavior_contract():
+    return {
+        "schema_version": "acceptance.behavior_contract.v1",
+        "operation_id": "reminders.snoozeReminder",
+        "inputs": ["tasks:ReminderTask[]", "selectedTaskId:string"],
+        "outputs": ["ReminderTask[] with only the selected dueAt advanced"],
+        "malformed_input_outcome": (
+            "Return the original tasks value without mutation when tasks is "
+            "not an array or selectedTaskId is not a non-empty string."
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("behavior_contract", "expected_missing", "expected_invalid_field"),
+    [
+        (None, True, ""),
+        ({}, False, "schema_version"),
+        (
+            {
+                **_concrete_reminder_behavior_contract(),
+                "schema_version": "acceptance.behavior_contract.v0",
+            },
+            False,
+            "schema_version",
+        ),
+        (
+            {
+                **_concrete_reminder_behavior_contract(),
+                "operation_id": "<choose an operation>",
+            },
+            False,
+            "operation_id",
+        ),
+        (
+            {**_concrete_reminder_behavior_contract(), "inputs": []},
+            False,
+            "inputs",
+        ),
+        (
+            {
+                **_concrete_reminder_behavior_contract(),
+                "inputs": ["tasks:ReminderTask[]", "tasks:ReminderTask[]"],
+            },
+            False,
+            "inputs",
+        ),
+        (
+            {**_concrete_reminder_behavior_contract(), "outputs": ["TBD"]},
+            False,
+            "outputs",
+        ),
+        (
+            {
+                **_concrete_reminder_behavior_contract(),
+                "malformed_input_outcome": "unspecified",
+            },
+            False,
+            "malformed_input_outcome",
+        ),
+    ],
+)
+def test_acceptance_behavior_contract_gate_rejects_missing_or_partial_contracts(
+    behavior_contract,
+    expected_missing,
+    expected_invalid_field,
+):
+    criterion = _r11_unspecified_behavior_criterion(behavior_contract)
+    if behavior_contract is None:
+        criterion["artifact_refs"] = {
+            "behavior_contract": _concrete_reminder_behavior_contract()
+        }
+    gate = server._acceptance_behavior_contract_gate(
+        [criterion],
+        authority_source="backlog_bugs:AC-R11:acceptance_criteria",
+        implementation_started=False,
+    )
+
+    assert gate["accepted"] is False
+    assert gate["required_criterion_ids"] == [
+        "ac-r11-reminder-domain-change"
+    ]
+    if expected_missing:
+        assert gate["missing_behavior_contract_criterion_ids"] == [
+            "ac-r11-reminder-domain-change"
+        ]
+        assert gate["invalid_behavior_contract_criterion_ids"] == []
+    else:
+        assert gate["missing_behavior_contract_criterion_ids"] == []
+        assert gate["invalid_behavior_contract_criterion_ids"] == [
+            "ac-r11-reminder-domain-change"
+        ]
+        assert expected_invalid_field in gate[
+            "invalid_behavior_contract_fields"
+        ]["ac-r11-reminder-domain-change"]
+    assert gate["copy_safe_observer_remediation"]["action"] == (
+        "observer_define_behavior_contract_before_mf_runtime"
+    )
+    assert gate["required_contract"]["server_requirement_inference_allowed"] is False
+
+
+def test_acceptance_behavior_contract_gate_accepts_concrete_and_compatible_work():
+    gate = server._acceptance_behavior_contract_gate(
+        [
+            _r11_unspecified_behavior_criterion(
+                _concrete_reminder_behavior_contract()
+            ),
+            {
+                "id": "ac-fix-existing-toggle",
+                "text": "Fix toggleReminder to preserve its documented output.",
+                "required_scope": {
+                    "kind": "files",
+                    "files": ["src/reminders.js"],
+                },
+            },
+            {
+                "id": "ac-external-verification",
+                "text": "Verify the deployed Reminder response.",
+                "required_scope": {
+                    "kind": "verification_only_external_dependency",
+                    "dependency_id": "deployed-reminder-api",
+                },
+            },
+        ],
+        authority_source="backlog_bugs:AC-R11:acceptance_criteria",
+        implementation_started=False,
+    )
+
+    assert gate["accepted"] is True
+    assert gate["required_criterion_ids"] == [
+        "ac-r11-reminder-domain-change"
+    ]
+    assert gate["canonical_behavior_contracts"][0]["operation_id"] == (
+        "reminders.snoozeReminder"
+    )
+
+
+def test_mf_parallel_enter_rejects_r11_unspecified_behavior_before_any_write(
+    conn,
+):
+    backlog_id = "AC-PARALLEL-ENTER-R11-BEHAVIOR-CONTRACT"
+    task_id = "parallel-enter-r11-behavior-contract"
+    target_files = ["src/reminders.js", "tests/reminders.test.mjs"]
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = '[]', acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(target_files),
+            json.dumps([_r11_unspecified_behavior_criterion()]),
+            backlog_id,
+        ),
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-parallel-r11-behavior-contract",
+    )
+    route_token_ref = "rtok-parallel-r11-behavior-contract"
+    service_execution_id = server._onboard_service_execution_id(PID, backlog_id)
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=service_execution_id,
+        route_token_ref=route_token_ref,
+        allowed_actions=["mf_parallel_enter"],
+    )
+    body = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "reason": "Prove R11-style vague behavior fails before MF runtime.",
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_token_ref,
+        "onboard_service_waiver": True,
+        "owned_files": target_files,
+        "metadata": {"required_worker_count": 1},
+    }
+    server._contract_runtime_store(conn)
+    before_counts = _acceptance_fence_durable_counts(conn)
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_mf_parallel_enter(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == "acceptance_behavior_contract_incomplete"
+    details = rejected.value.details
+    assert details["field"] == "acceptance_criteria[].behavior_contract"
+    assert details["missing_behavior_contract_criterion_ids"] == [
+        "ac-r11-reminder-domain-change"
+    ]
+    assert details["behavior_contract_gate"]["trigger_sources"] == {
+        "ac-r11-reminder-domain-change": "unspecified_new_behavior_prose"
+    }
+    assert details["guide"]["action"] == (
+        "observer_define_behavior_contract_before_mf_runtime"
+    )
+    assert details["retry_same_world_allowed"] is True
+    _assert_complete_acceptance_fence_zero_write(details)
+    assert _acceptance_fence_durable_counts(conn) == before_counts
+    assert conn.total_changes == before_changes
+    with pytest.raises(ContractRuntimeError):
+        server._contract_runtime_store(conn).get(service_execution_id)
+
+    conn.execute(
+        "UPDATE backlog_bugs SET acceptance_criteria = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                [
+                    _r11_unspecified_behavior_criterion(
+                        _concrete_reminder_behavior_contract()
+                    )
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx({"project_id": PID}, method="POST", body=body)
+    )
+
+    assert entered["ok"] is True
+    entered_record = server._contract_runtime_store(conn).get(
+        entered["contract_execution_id"]
+    )
+    acceptance_gate = entered_record["metadata"]["acceptance_scope_closure"]
+    assert acceptance_gate["accepted"] is True
+    assert acceptance_gate["behavior_contract_gate"]["accepted"] is True
+    assert acceptance_gate["behavior_contract_gate"][
+        "canonical_behavior_contracts"
+    ][0]["operation_id"] == "reminders.snoozeReminder"
 
 
 def test_mf_batch_parallel_enter_outside_child_fence_is_public_complete_zero_write(
