@@ -146939,10 +146939,16 @@ def test_contract_runtime_bounded_line_write_response_preserves_small_and_fails_
     assert "mutation_performed" not in ambiguous
 
 
+@pytest.mark.parametrize(
+    "legacy_payload_bytes",
+    (350_000, 700_000),
+    ids=("bounded-http", "stale-mcp-frame"),
+)
 def test_contract_runtime_line_write_http_bounds_persisted_dispatch_for_legacy_client(
     conn,
     tmp_path,
     monkeypatch,
+    legacy_payload_bytes,
 ):
     backlog_id = "AC-CONTRACT-RUNTIME-LEGACY-CLIENT-BOUNDED-DISPATCH"
     parent_task_id = "contract-runtime-legacy-client-parent"
@@ -147038,7 +147044,9 @@ def test_contract_runtime_line_write_http_bounds_persisted_dispatch_for_legacy_c
     def oversized_response(record, **kwargs):
         response = original_response(record, **kwargs)
         if not kwargs.get("response_view"):
-            response["legacy_client_oversized_padding"] = "x" * 350_000
+            response["legacy_client_oversized_padding"] = (
+                "x" * legacy_payload_bytes
+            )
             response["legacy_client_raw_auth_probe"] = (
                 "raw-session-must-not-cross-http-boundary"
             )
@@ -147103,6 +147111,7 @@ def test_contract_runtime_line_write_http_bounds_persisted_dispatch_for_legacy_c
     assert dispatch["ok"] is True
     assert dispatch["bounded_response"] is True
     assert dispatch["response_view"] == "compact"
+    assert dispatch["source_serialized_bytes"] >= legacy_payload_bytes
     assert dispatch["writes_performed"] is True
     assert dispatch["mutation_performed"] is True
     assert dispatch["current_request_mutation_proven"] is True
