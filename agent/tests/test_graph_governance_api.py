@@ -141220,6 +141220,119 @@ def test_qa_review_claims_keep_ordinary_comparison_forgeries_fail_closed():
         assert rejected.value.code == "qa_graph_review_context_mismatch"
 
 
+def test_qa_review_claims_accept_exact_targeted_comparison_test_results():
+    candidate_commit = "8b093d2de879edfa04d45398743102ba0f092ea9"
+    comparison_base_commit = "c2956b39d4584c22e0f943c8c02bb70e84091017"
+    review_context = {
+        "candidate_commit_sha": candidate_commit,
+        "base_commit_sha": candidate_commit,
+        "comparison_base_commit_sha": comparison_base_commit,
+        "graph_basis": "exact_candidate_snapshot",
+        "changed_files": [
+            "agent/governance/server.py",
+            "agent/tests/test_graph_governance_api.py",
+        ],
+    }
+    comparison_results = {
+        "schema_version": "qa.targeted_scoped_pre_verification.v1",
+        "qa_stage": "PRE",
+        "scope": "targeted_scoped",
+        "verdict": "PASS",
+        "passed": True,
+        "used_as_pass": False,
+        "close_satisfying": False,
+        "overall_pass_claimed": False,
+        "overall_release_pass_claimed": False,
+        "full_suite_claimed": False,
+        "full_suite_status": "not_claimed",
+        "candidate_new_failures": 0,
+        "base_commit_sha": comparison_base_commit,
+        "candidate_commit_sha": candidate_commit,
+        "changed_files": list(review_context["changed_files"]),
+        "immutable_parent_candidate_test_overlay": {
+            "passed": 114,
+            "failed": 4,
+            "intended_target_failure_reproduced": 1,
+        },
+    }
+    body = {
+        "status": "passed",
+        "commit_sha": candidate_commit,
+        "verification": json.loads(json.dumps(comparison_results)),
+        "payload": {
+            "candidate_commit_sha": candidate_commit,
+            "test_results": json.loads(json.dumps(comparison_results)),
+        },
+    }
+
+    server._qa_validate_candidate_review_claims(body, review_context)
+
+    post_body = json.loads(json.dumps(body))
+    for container in (
+        post_body["verification"],
+        post_body["payload"]["test_results"],
+    ):
+        container["schema_version"] = (
+            "qa.targeted_scoped_post_verification.v1"
+        )
+        container["qa_stage"] = "POST"
+    server._qa_validate_candidate_review_claims(post_body, review_context)
+
+    invalid_variants = []
+    for path in (("verification",), ("payload", "test_results")):
+        for key, value in (
+            ("base_commit_sha", "f" * 40),
+            ("candidate_commit_sha", comparison_base_commit),
+            ("candidate_new_failures", 1),
+            ("used_as_pass", True),
+            ("close_satisfying", True),
+            ("overall_pass_claimed", True),
+            ("overall_release_pass_claimed", True),
+            ("full_suite_claimed", True),
+            ("full_suite_status", "passed"),
+            ("schema_version", "qa.caller_selected_comparison.v1"),
+        ):
+            variant = json.loads(json.dumps(body))
+            container = variant
+            for path_key in path:
+                container = container[path_key]
+            container[key] = value
+            invalid_variants.append(variant)
+
+    wrong_path = json.loads(json.dumps(body))
+    wrong_path["artifact_refs"] = {
+        "comparison_results": wrong_path["payload"].pop("test_results")
+    }
+    invalid_variants.append(wrong_path)
+
+    wrong_body_commit = json.loads(json.dumps(body))
+    wrong_body_commit["commit_sha"] = comparison_base_commit
+    invalid_variants.append(wrong_body_commit)
+
+    audit_only_status = json.loads(json.dumps(body))
+    audit_only_status["status"] = "failed"
+    invalid_variants.append(audit_only_status)
+
+    missing_server_comparison = dict(review_context)
+    missing_server_comparison["comparison_base_commit_sha"] = ""
+    with pytest.raises(GovernanceError) as missing_authority:
+        server._qa_validate_candidate_review_claims(
+            body,
+            missing_server_comparison,
+        )
+    assert missing_authority.value.code == "qa_graph_review_context_mismatch"
+
+    for variant in invalid_variants:
+        with pytest.raises(GovernanceError) as rejected:
+            server._qa_validate_candidate_review_claims(
+                variant,
+                review_context,
+            )
+        assert rejected.value.code == "qa_graph_review_context_mismatch"
+        assert rejected.value.details["zero_write_rejection"] is True
+        assert rejected.value.details["writes_performed"] is False
+
+
 def test_contract_runtime_rev5_reconcile_accepts_completed_qa_without_qa_timeline(
     conn,
     tmp_path,

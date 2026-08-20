@@ -11602,6 +11602,14 @@ _QA_EXTERNAL_NO_PASS_COMPARISON_PATHS = {
     ("payload",),
     ("artifact_refs", "external_no_pass_baseline_ledger"),
 }
+_QA_EXACT_COMPARISON_TEST_RESULTS_PATHS = {
+    ("verification",),
+    ("payload", "test_results"),
+}
+_QA_EXACT_COMPARISON_TEST_RESULTS_SCHEMAS = {
+    "qa.targeted_scoped_pre_verification.v1": "PRE",
+    "qa.targeted_scoped_post_verification.v1": "POST",
+}
 
 
 def _qa_external_no_pass_failure_set_authority(
@@ -12000,6 +12008,67 @@ def _qa_external_no_pass_comparison_tuple(
     }
 
 
+def _qa_is_exact_comparison_test_results_claim(
+    body: Mapping[str, Any],
+    path: tuple[str, ...],
+    value: Mapping[str, Any],
+    *,
+    candidate_commit_sha: str,
+    comparison_base_commit_sha: str,
+) -> bool:
+    """Identify one server-bound targeted comparison result namespace.
+
+    Exact-candidate QA uses the candidate as the graph basis while a targeted
+    differential may reproduce its immutable parent.  The parent commit is a
+    comparison identity, not a second graph basis.  Only the two canonical
+    test-result locations are eligible, and every no-overall-PASS safety bit
+    plus both ends of the server-derived tuple must agree exactly.  Other
+    nested claims remain visible to the ordinary recursive validator.
+    """
+
+    if path not in _QA_EXACT_COMPARISON_TEST_RESULTS_PATHS:
+        return False
+    schema_version = str(value.get("schema_version") or "").strip()
+    expected_stage = _QA_EXACT_COMPARISON_TEST_RESULTS_SCHEMAS.get(
+        schema_version
+    )
+    candidate = str(candidate_commit_sha or "").strip().lower()
+    comparison_base = str(
+        comparison_base_commit_sha or ""
+    ).strip().lower()
+    body_commit = str(body.get("commit_sha") or "").strip().lower()
+    value_candidate = str(
+        value.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    value_base = str(value.get("base_commit_sha") or "").strip().lower()
+    return bool(
+        expected_stage
+        and str(value.get("qa_stage") or "").strip().upper()
+        == expected_stage
+        and str(value.get("scope") or "").strip().lower()
+        == "targeted_scoped"
+        and str(value.get("verdict") or "").strip().upper() == "PASS"
+        and value.get("passed") is True
+        and value.get("used_as_pass") is False
+        and value.get("close_satisfying") is False
+        and value.get("overall_pass_claimed") is False
+        and value.get("overall_release_pass_claimed") is False
+        and value.get("full_suite_claimed") is False
+        and str(value.get("full_suite_status") or "").strip().lower()
+        == "not_claimed"
+        and type(value.get("candidate_new_failures")) is int
+        and value.get("candidate_new_failures") == 0
+        and str(body.get("status") or "").strip().lower()
+        in {"accepted", "ok", "pass", "passed", "success", "succeeded"}
+        and candidate
+        and comparison_base
+        and candidate != comparison_base
+        and body_commit == candidate
+        and value_candidate == candidate
+        and value_base == comparison_base
+    )
+
+
 def _qa_validate_candidate_review_claims(
     body: Mapping[str, Any],
     review_context: Mapping[str, Any],
@@ -12079,6 +12148,22 @@ def _qa_validate_candidate_review_claims(
                     and field == "base_commit_sha"
                     and str(container.get(alias) or "").strip().lower()
                     == comparison_base
+                ):
+                    continue
+                if (
+                    field == "base_commit_sha"
+                    and _qa_is_exact_comparison_test_results_claim(
+                        body,
+                        path,
+                        container,
+                        candidate_commit_sha=str(
+                            review_context.get("candidate_commit_sha") or ""
+                        ),
+                        comparison_base_commit_sha=str(
+                            review_context.get("comparison_base_commit_sha")
+                            or ""
+                        ),
+                    )
                 ):
                     continue
                 supplied = container.get(alias)
