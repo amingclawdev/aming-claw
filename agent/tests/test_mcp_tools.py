@@ -4082,6 +4082,7 @@ def test_mcp_graph_query_schema_exposes_mf_sub_runtime_identity_fields():
         "route_token_ref",
         "visible_injection_manifest_hash",
         "route_identity",
+        "managed_rejoin",
     ):
         assert key in properties
     assert "route_token_ref" in properties["task_id"]["description"]
@@ -4089,6 +4090,12 @@ def test_mcp_graph_query_schema_exposes_mf_sub_runtime_identity_fields():
     assert "Observer queries derive canonical" in properties["route_token_ref"][
         "description"
     ]
+    managed_rejoin = properties["managed_rejoin"]
+    assert "session_token_ref" in managed_rejoin["properties"]
+    assert "reason" in managed_rejoin["properties"]
+    assert "session_token" not in managed_rejoin["properties"]
+    assert "fence_token" not in managed_rejoin["properties"]
+    assert "route_token" not in managed_rejoin["properties"]
 
 
 def test_mcp_graph_query_forwards_observer_route_scope_claims():

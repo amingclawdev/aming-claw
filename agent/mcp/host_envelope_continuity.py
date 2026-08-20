@@ -199,6 +199,11 @@ class ManagedHostEnvelopeContinuity:
         with self._lock:
             return len(self._entries)
 
+    def has_staged_entry(self, args: Mapping[str, Any]) -> bool:
+        """Return whether this exact public worker identity is staged locally."""
+
+        return self._entry_for(args) is not None
+
     @staticmethod
     def _preflight_issuance(
         tool_name: str,

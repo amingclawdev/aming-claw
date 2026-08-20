@@ -81,6 +81,213 @@ _MANAGED_WORKER_GUIDE_PUBLIC_BINDING_FIELDS = (
     "visible_injection_manifest_hash",
 )
 
+_MANAGED_GRAPH_REJOIN_REQUIRED_IDENTITY_FIELDS = (
+    "project_id",
+    "runtime_context_id",
+    "task_id",
+    "parent_task_id",
+    "target_project_root",
+    "session_token_ref",
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "route_token_ref",
+    "visible_injection_manifest_hash",
+)
+_MANAGED_GRAPH_REJOIN_PARITY_FIELDS = (
+    *_MANAGED_GRAPH_REJOIN_REQUIRED_IDENTITY_FIELDS,
+    "contract_execution_id",
+    "worker_id",
+    "worker_slot_id",
+    "agent_id",
+    "allocation_owner",
+    "actual_host_worker_id",
+    "worker_session_id",
+    "host_startup_id",
+    "host_session_id",
+)
+_MANAGED_GRAPH_REJOIN_RAW_AUTH_FIELDS = frozenset(
+    {
+        "session_token",
+        "fence_token",
+        "raw_token",
+        "route_token",
+        "qa_session_token",
+    }
+)
+
+
+def _managed_graph_rejoin_error(
+    code: str,
+    message: str,
+    **details: Any,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": code,
+        "message": message,
+        "source": "runtime_mcp.ToolDispatcher.graph_query_managed_rejoin",
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "product_mutation_performed": False,
+        "http_request_performed": False,
+        "raw_worker_auth_exposed": False,
+        **details,
+    }
+
+
+def _managed_graph_rejoin_raw_auth_paths(
+    value: Any,
+    *,
+    prefix: str = "managed_rejoin",
+) -> list[str]:
+    if isinstance(value, dict):
+        paths: list[str] = []
+        for key, nested in value.items():
+            path = f"{prefix}.{key}"
+            if str(key).strip().lower() in _MANAGED_GRAPH_REJOIN_RAW_AUTH_FIELDS:
+                paths.append(path)
+            paths.extend(
+                _managed_graph_rejoin_raw_auth_paths(nested, prefix=path)
+            )
+        return paths
+    if isinstance(value, list):
+        paths = []
+        for index, nested in enumerate(value):
+            paths.extend(
+                _managed_graph_rejoin_raw_auth_paths(
+                    nested,
+                    prefix=f"{prefix}[{index}]",
+                )
+            )
+        return paths
+    return []
+
+
+def _managed_graph_rejoin_identity_value(
+    value: dict[str, Any],
+    field: str,
+) -> tuple[str, bool]:
+    candidates = [value.get(field)]
+    if field == "target_project_root":
+        candidates.extend((value.get("project_root"), value.get("repo_root")))
+    if field in {
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    }:
+        route_identity = value.get("route_identity")
+        if isinstance(route_identity, dict):
+            candidates.append(route_identity.get(field))
+    normalized = {
+        str(candidate or "").strip()
+        for candidate in candidates
+        if str(candidate or "").strip()
+    }
+    return (
+        next(iter(normalized)) if len(normalized) == 1 else "",
+        len(normalized) > 1,
+    )
+
+
+def _validate_managed_graph_rejoin(
+    graph_args: dict[str, Any],
+    managed_rejoin: Any,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if not isinstance(managed_rejoin, dict):
+        return graph_args, _managed_graph_rejoin_error(
+            "managed_graph_rejoin_invalid",
+            "managed_rejoin must be one copy-safe rejoin object.",
+            field="managed_rejoin",
+        )
+    raw_paths = sorted(set(_managed_graph_rejoin_raw_auth_paths(managed_rejoin)))
+    if raw_paths:
+        return graph_args, _managed_graph_rejoin_error(
+            "managed_graph_rejoin_raw_auth_forbidden",
+            "managed_rejoin must not contain raw worker or route credentials.",
+            forbidden_paths=raw_paths,
+        )
+
+    missing: list[str] = []
+    mismatched: list[str] = []
+    ambiguous: list[str] = []
+    request_args = dict(graph_args)
+    for field in _MANAGED_GRAPH_REJOIN_PARITY_FIELDS:
+        graph_value, graph_ambiguous = _managed_graph_rejoin_identity_value(
+            request_args,
+            field,
+        )
+        rejoin_value, rejoin_ambiguous = _managed_graph_rejoin_identity_value(
+            managed_rejoin,
+            field,
+        )
+        if graph_ambiguous or rejoin_ambiguous:
+            ambiguous.append(field)
+            continue
+        if field in _MANAGED_GRAPH_REJOIN_REQUIRED_IDENTITY_FIELDS:
+            if not graph_value or not rejoin_value:
+                missing.append(field)
+                continue
+        if graph_value and rejoin_value and graph_value != rejoin_value:
+            mismatched.append(field)
+
+    if not str(
+        managed_rejoin.get("reason")
+        or managed_rejoin.get("rejoin_reason")
+        or ""
+    ).strip():
+        missing.append("reason")
+    if ambiguous or missing or mismatched:
+        return request_args, _managed_graph_rejoin_error(
+            "managed_graph_rejoin_scope_mismatch",
+            "managed_rejoin does not match the exact graph-query worker identity.",
+            ambiguous_fields=sorted(set(ambiguous)),
+            missing_fields=sorted(set(missing)),
+            mismatched_fields=sorted(set(mismatched)),
+        )
+    return request_args, None
+
+
+def _managed_graph_rejoin_result(
+    graph_result: Any,
+    rejoin_result: dict[str, Any],
+) -> Any:
+    if not isinstance(graph_result, dict):
+        graph_result = {
+            "ok": False,
+            "error": "managed_graph_rejoin_graph_result_invalid",
+            "message": "Graph query returned no structured result after managed rejoin.",
+            "graph_result_type": type(graph_result).__name__,
+        }
+    result = dict(graph_result)
+    result["managed_rejoin"] = {
+        "schema_version": "graph_query.managed_rejoin.v1",
+        "status": "staged_and_borrowed",
+        "request_id": rejoin_result.get("request_id"),
+        "audit_event_ref": rejoin_result.get("audit_event_ref"),
+        "session_token_ref": rejoin_result.get("session_token_ref"),
+        "runtime_context_id": rejoin_result.get("runtime_context_id"),
+        "task_id": rejoin_result.get("task_id"),
+        "process_local": True,
+        "raw_worker_auth_exposed": False,
+    }
+    result["managed_rejoin_performed"] = True
+    result["governance_writes_performed"] = True
+    result["writes_performed"] = True
+    result["mutation_performed"] = True
+    result["product_mutation_performed"] = bool(
+        graph_result.get("product_mutation_performed")
+    )
+    result["http_request_performed"] = True
+    result["zero_write_rejection"] = False
+    result["raw_worker_auth_exposed"] = False
+    return result
+
 
 def _managed_worker_guide_staged_identity_args(
     continuity: ManagedHostEnvelopeContinuity,
@@ -5925,6 +6132,27 @@ TOOLS: list[dict] = [
                     "type": "object",
                     "description": "Optional nested safe route identity block. Top-level route identity fields are also accepted.",
                 },
+                "managed_rejoin": {
+                    "type": "object",
+                    "description": (
+                        "Optional copy-safe runtime_context_session_token_rejoin "
+                        "body. The dispatcher executes rejoin and this graph query "
+                        "inside one MCP process so raw worker auth is borrowed only "
+                        "in memory. Raw session, fence, route, or QA tokens are "
+                        "forbidden."
+                    ),
+                    "properties": {
+                        key: value
+                        for key, value in _runtime_context_write_schema_properties().items()
+                        if key
+                        not in {
+                            "session_token",
+                            "fence_token",
+                            "route_token",
+                            "qa_session_token_ref",
+                        }
+                    },
+                },
             },
             "required": ["project_id", "tool"],
         },
@@ -8438,6 +8666,58 @@ class ToolDispatcher:
             )
 
         if name == "graph_query":
+            managed_rejoin = args.pop("managed_rejoin", None)
+            if managed_rejoin is not None:
+                args, managed_rejoin_error = _validate_managed_graph_rejoin(
+                    args,
+                    managed_rejoin,
+                )
+                if managed_rejoin_error is not None:
+                    return managed_rejoin_error
+                if not self._host_envelope_continuity.has_staged_entry(args):
+                    if str(args.get("session_token") or "").strip() or str(
+                        args.get("fence_token") or ""
+                    ).strip():
+                        return _managed_graph_rejoin_error(
+                            "managed_graph_rejoin_auth_ambiguous",
+                            "Do not combine managed_rejoin with caller-provided raw auth.",
+                        )
+                    rejoin_result = self.dispatch(
+                        "runtime_context_session_token_rejoin",
+                        dict(managed_rejoin),
+                    )
+                    if not isinstance(rejoin_result, dict) or not (
+                        rejoin_result.get("ok") is True
+                        and rejoin_result.get("auth_loaded") is True
+                    ):
+                        return rejoin_result
+                    rotated_ref = str(
+                        rejoin_result.get("session_token_ref")
+                        or (
+                            rejoin_result.get("managed_host_envelope") or {}
+                        ).get("session_token_ref")
+                        or ""
+                    ).strip()
+                    if not rotated_ref:
+                        return {
+                            **_managed_graph_rejoin_error(
+                                "managed_graph_rejoin_safe_ref_missing",
+                                "Successful managed rejoin returned no copy-safe current ref.",
+                            ),
+                            "zero_write_rejection": False,
+                            "writes_performed": True,
+                            "mutation_performed": True,
+                            "http_request_performed": True,
+                            "server_mutation_accepted": True,
+                            "rejoin_request_id": rejoin_result.get("request_id"),
+                        }
+                    args["session_token_ref"] = rotated_ref
+                    graph_result = self.dispatch("graph_query", args)
+                    return _managed_graph_rejoin_result(
+                        graph_result,
+                        rejoin_result,
+                    )
+
             pid = args["project_id"]
             qa_session_token, qa_ref_error = self._qa_role_token_for_scope(
                 args,

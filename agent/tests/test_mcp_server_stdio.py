@@ -508,6 +508,14 @@ def test_managed_rejoin_lends_graph_query_auth_without_raw_caller_fields(tmp_pat
         assert data is not None
         assert data["session_token"] == raw_session
         assert data["fence_token"] == raw_fence
+        if data.get("args", {}).get("query") == "managed.fail":
+            return {
+                "ok": False,
+                "error": "graph_query_rejected_after_rejoin",
+                "writes_performed": False,
+                "mutation_performed": False,
+                "zero_write_rejection": True,
+            }
         return {
             "ok": True,
             "trace_id": "gqt-managed-graph",
@@ -527,14 +535,6 @@ def test_managed_rejoin_lends_graph_query_auth_without_raw_caller_fields(tmp_pat
         manager_api_fn=fake_api,
         workspace=str(ROOT),
     )
-    issued = dispatcher.dispatch(
-        "runtime_context_session_token_rejoin",
-        {**identity, "reason": "restore managed graph continuity"},
-    )
-    assert issued["auth_loaded"] is True
-    assert raw_session not in json.dumps(issued, sort_keys=True)
-    assert raw_fence not in json.dumps(issued, sort_keys=True)
-
     arguments = {
         **identity,
         "tool": "function_index",
@@ -542,23 +542,38 @@ def test_managed_rejoin_lends_graph_query_auth_without_raw_caller_fields(tmp_pat
         "query_source": "mf_subagent",
         "query_purpose": "subagent_context_build",
         "worker_role": "mf_sub",
+        "managed_rejoin": {
+            **identity,
+            "reason": "restore managed graph continuity",
+        },
     }
     result = dispatcher.dispatch("graph_query", arguments)
 
     assert result["ok"] is True
     assert result["trace_id"] == "gqt-managed-graph"
+    assert result["managed_rejoin_performed"] is True
+    assert result["managed_rejoin"]["status"] == "staged_and_borrowed"
+    assert result["writes_performed"] is True
     assert "session_token" not in arguments
     assert "fence_token" not in arguments
     assert raw_session not in json.dumps(result, sort_keys=True)
     assert raw_fence not in json.dumps(result, sort_keys=True)
     assert dispatcher._host_envelope_continuity.pending_count() == 1
+    assert len(calls) == 2
+    assert "managed_rejoin" not in calls[1][2]
 
     call_count = len(calls)
     wrong_root = dispatcher.dispatch(
         "graph_query",
-        {**arguments, "target_project_root": str(tmp_path / "cross-root")},
+        {
+            **arguments,
+            "managed_rejoin": {
+                **arguments["managed_rejoin"],
+                "target_project_root": str(tmp_path / "cross-root"),
+            },
+        },
     )
-    assert wrong_root["error"] == "managed_host_envelope_scope_mismatch"
+    assert wrong_root["error"] == "managed_graph_rejoin_scope_mismatch"
     assert wrong_root["mismatched_fields"] == ["target_project_root"]
     assert wrong_root["http_request_performed"] is False
     wrong_ref = dispatcher.dispatch(
@@ -568,7 +583,42 @@ def test_managed_rejoin_lends_graph_query_auth_without_raw_caller_fields(tmp_pat
     assert wrong_ref["error"] == "managed_host_envelope_scope_mismatch"
     assert wrong_ref["mismatched_fields"] == ["session_token_ref"]
     assert wrong_ref["http_request_performed"] is False
+    raw_nested = dispatcher.dispatch(
+        "graph_query",
+        {
+            **arguments,
+            "managed_rejoin": {
+                **arguments["managed_rejoin"],
+                "fence_token": raw_fence,
+            },
+        },
+    )
+    assert raw_nested["error"] == "managed_graph_rejoin_raw_auth_forbidden"
+    assert raw_nested["forbidden_paths"] == ["managed_rejoin.fence_token"]
+    assert raw_nested["http_request_performed"] is False
     assert len(calls) == call_count
+
+    failure_dispatcher = ToolDispatcher(
+        api_fn=fake_api,
+        worker_pool=None,
+        manager_api_fn=fake_api,
+        workspace=str(ROOT),
+    )
+    failed_graph = failure_dispatcher.dispatch(
+        "graph_query",
+        {
+            **arguments,
+            "args": {"query": "managed.fail"},
+        },
+    )
+    assert failed_graph["error"] == "graph_query_rejected_after_rejoin"
+    assert failed_graph["managed_rejoin_performed"] is True
+    assert failed_graph["writes_performed"] is True
+    assert failed_graph["mutation_performed"] is True
+    assert failed_graph["zero_write_rejection"] is False
+    assert failed_graph["product_mutation_performed"] is False
+    assert raw_session not in json.dumps(failed_graph, sort_keys=True)
+    assert raw_fence not in json.dumps(failed_graph, sort_keys=True)
 
 
 def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
@@ -700,22 +750,19 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
                     "id": 3,
                     "method": "tools/call",
                     "params": {
-                        "name": "runtime_context_session_token_rejoin",
+                        "name": "graph_query",
                         "arguments": {
-                            **identity,
-                            "reason": "restore managed graph continuity",
+                            **graph_args,
+                            "managed_rejoin": {
+                                **identity,
+                                "reason": "restore managed graph continuity",
+                            },
                         },
                     },
                 },
                 {
                     "jsonrpc": "2.0",
                     "id": 4,
-                    "method": "tools/call",
-                    "params": {"name": "graph_query", "arguments": graph_args},
-                },
-                {
-                    "jsonrpc": "2.0",
-                    "id": 5,
                     "method": "tools/call",
                     "params": {
                         "name": "graph_query",
@@ -729,7 +776,7 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
                 },
                 {
                     "jsonrpc": "2.0",
-                    "id": 6,
+                    "id": 5,
                     "method": "tools/call",
                     "params": {
                         "name": "graph_query",
@@ -762,17 +809,18 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
     assert payloads[0]["writes_performed"] is False
     assert payloads[0]["mutation_performed"] is False
     assert payloads[0]["zero_write"] is True
-    assert payloads[1]["auth_loaded"] is True
-    assert payloads[2]["ok"] is True
-    assert payloads[2]["trace_id"] == "gqt-stdio-managed-graph"
-    assert "session_token" not in payloads[2]["graph_query_identity"]
-    assert "fence_token" not in payloads[2]["graph_query_identity"]
+    assert payloads[1]["ok"] is True
+    assert payloads[1]["trace_id"] == "gqt-stdio-managed-graph"
+    assert payloads[1]["managed_rejoin_performed"] is True
+    assert payloads[1]["managed_rejoin"]["status"] == "staged_and_borrowed"
+    assert "session_token" not in payloads[1]["graph_query_identity"]
+    assert "fence_token" not in payloads[1]["graph_query_identity"]
+    assert payloads[2]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[2]["mismatched_fields"] == ["target_project_root"]
+    assert payloads[2]["http_request_performed"] is False
     assert payloads[3]["error"] == "managed_host_envelope_scope_mismatch"
-    assert payloads[3]["mismatched_fields"] == ["target_project_root"]
+    assert payloads[3]["mismatched_fields"] == ["session_token_ref"]
     assert payloads[3]["http_request_performed"] is False
-    assert payloads[4]["error"] == "managed_host_envelope_scope_mismatch"
-    assert payloads[4]["mismatched_fields"] == ["session_token_ref"]
-    assert payloads[4]["http_request_performed"] is False
     assert len(Handler.calls) == 3
     serialized = json.dumps(responses, sort_keys=True) + stderr
     assert raw_session not in serialized
