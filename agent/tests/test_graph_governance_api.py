@@ -24827,6 +24827,7 @@ def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_si
         "allocation_precheck.expected_lane_count": 2,
     }
     for field, value in drift_cases.items():
+        pristine_copy_safe_body = copy.deepcopy(copy_safe_body)
         drifted = copy.deepcopy(copy_safe_body)
         if field.startswith("allocation_precheck."):
             drifted["allocation_precheck"][field.split(".", 1)[1]] = value
@@ -24861,6 +24862,7 @@ def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_si
                 "copy_safe_body_unchanged"
             )
             assert rejected.value.details["retry_same_world_allowed"] is True
+        assert copy_safe_body == pristine_copy_safe_body
         assert conn.total_changes == before_allocation_changes
         assert not (repository_root / ".worktrees").exists()
 
@@ -24882,6 +24884,12 @@ def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_si
     assert allocated["allocation_precheck_verification"][
         "legacy_compatibility"
     ] is False
+    assert allocated["allocation_precheck_verification"][
+        "authority_source"
+    ] == receipt["authority_source"]
+    assert allocated["allocation_precheck_verification"]["bound_fields"] == (
+        receipt["bound_fields"]
+    )
     assert Path(allocated["context"]["worktree_path"]).exists()
 
     legacy = server._parallel_branch_allocate_precheck_receipt_verification(
