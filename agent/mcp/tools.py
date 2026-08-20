@@ -253,9 +253,54 @@ def _validate_managed_graph_rejoin(
     return request_args, None
 
 
+def _managed_graph_safe_ref_rejoin(
+    graph_args: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Build the bounded rejoin body for a copy-safe worker graph call.
+
+    Managed MCP calls are not guaranteed to reuse the process that handled a
+    preceding standalone rejoin.  When an exact mf_sub graph request carries
+    the current safe ref but no raw authentication, recover by performing the
+    rejoin and graph query inside this dispatch.  Only identity already present
+    in the public graph request is projected; the normal managed-rejoin
+    validator and protected rejoin facade remain authoritative.
+    """
+
+    query_source = str(graph_args.get("query_source") or "").strip().lower()
+    worker_role = str(graph_args.get("worker_role") or "").strip().lower()
+    if query_source != "mf_subagent" and worker_role != "mf_sub":
+        return None
+    if not str(graph_args.get("session_token_ref") or "").strip():
+        return None
+    for field in _MANAGED_GRAPH_REJOIN_REQUIRED_IDENTITY_FIELDS:
+        value, ambiguous = _managed_graph_rejoin_identity_value(
+            graph_args,
+            field,
+        )
+        if not value or ambiguous:
+            return None
+
+    rejoin: dict[str, Any] = {
+        "reason": "restore managed graph continuity from the current safe ref",
+    }
+    for field in _MANAGED_GRAPH_REJOIN_PARITY_FIELDS:
+        value, ambiguous = _managed_graph_rejoin_identity_value(
+            graph_args,
+            field,
+        )
+        if value and not ambiguous:
+            rejoin[field] = value
+    route_identity = graph_args.get("route_identity")
+    if isinstance(route_identity, dict):
+        rejoin["route_identity"] = dict(route_identity)
+    return rejoin
+
+
 def _managed_graph_rejoin_result(
     graph_result: Any,
     rejoin_result: dict[str, Any],
+    *,
+    trigger: str = "explicit",
 ) -> Any:
     if not isinstance(graph_result, dict):
         graph_result = {
@@ -273,6 +318,7 @@ def _managed_graph_rejoin_result(
         "session_token_ref": rejoin_result.get("session_token_ref"),
         "runtime_context_id": rejoin_result.get("runtime_context_id"),
         "task_id": rejoin_result.get("task_id"),
+        "trigger": trigger,
         "process_local": True,
         "raw_worker_auth_exposed": False,
     }
@@ -8667,6 +8713,22 @@ class ToolDispatcher:
 
         if name == "graph_query":
             managed_rejoin = args.pop("managed_rejoin", None)
+            managed_rejoin_trigger = "explicit"
+            if managed_rejoin is None:
+                implicit_rejoin = _managed_graph_safe_ref_rejoin(args)
+                if (
+                    implicit_rejoin is not None
+                    and not self._host_envelope_continuity.has_staged_entry(args)
+                ):
+                    if str(args.get("session_token") or "").strip() or str(
+                        args.get("fence_token") or ""
+                    ).strip():
+                        return _managed_graph_rejoin_error(
+                            "managed_graph_rejoin_auth_ambiguous",
+                            "Do not combine copy-safe graph auto-rejoin with caller-provided raw auth.",
+                        )
+                    managed_rejoin = implicit_rejoin
+                    managed_rejoin_trigger = "implicit_safe_ref"
             if managed_rejoin is not None:
                 args, managed_rejoin_error = _validate_managed_graph_rejoin(
                     args,
@@ -8716,6 +8778,7 @@ class ToolDispatcher:
                     return _managed_graph_rejoin_result(
                         graph_result,
                         rejoin_result,
+                        trigger=managed_rejoin_trigger,
                     )
 
             pid = args["project_id"]

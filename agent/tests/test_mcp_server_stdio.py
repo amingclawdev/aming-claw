@@ -650,6 +650,22 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
         "session_token_ref": "wstok-stdio-managed-graph",
         **route,
     }
+    auto_identity = {
+        **identity,
+        "runtime_context_id": "mfrctx-stdio-safe-ref-auto-graph",
+        "task_id": "worker-stdio-safe-ref-auto-graph",
+        "parent_task_id": "cex-stdio-safe-ref-auto-graph",
+        "contract_execution_id": "cex-stdio-safe-ref-auto-graph",
+        "worker_id": "worker-stdio-safe-ref-auto-graph",
+        "worker_slot_id": "worker-stdio-safe-ref-auto-graph",
+        "agent_id": "worker-stdio-safe-ref-auto-graph",
+        "allocation_owner": "worker-stdio-safe-ref-auto-graph",
+        "actual_host_worker_id": "worker-stdio-safe-ref-auto-graph",
+        "worker_session_id": "desktop-stdio-safe-ref-auto-graph",
+        "host_startup_id": "desktop-stdio-safe-ref-auto-graph",
+        "host_session_id": "desktop-stdio-safe-ref-auto-graph",
+        "session_token_ref": "wstok-stdio-safe-ref-auto-graph",
+    }
 
     class Handler(BaseHTTPRequestHandler):
         calls = []
@@ -670,16 +686,22 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
             body = json.loads(self.rfile.read(size) or b"{}")
             self.__class__.calls.append((self.path, body))
             if self.path.endswith("/session-token/rejoin"):
+                response_identity = (
+                    auto_identity
+                    if body.get("runtime_context_id")
+                    == auto_identity["runtime_context_id"]
+                    else identity
+                )
                 self._send(
                     {
                         "ok": True,
                         "status": "session_token_rejoined",
                         "delivery": "worker_host_envelope",
-                        **identity,
+                        **response_identity,
                         "session_token": raw_session,
                         "fence_token": raw_fence,
                         "host_envelope": {
-                            **identity,
+                            **response_identity,
                             "env": {
                                 "AMING_WORKER_SESSION_TOKEN": raw_session,
                                 "AMING_WORKER_FENCE_TOKEN": raw_fence,
@@ -705,14 +727,17 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
             self._send(
                 {
                     "ok": True,
-                    "trace_id": "gqt-stdio-managed-graph",
+                    "trace_id": (
+                        "gqt-stdio-safe-ref-auto-graph"
+                        if body.get("runtime_context_id")
+                        == auto_identity["runtime_context_id"]
+                        else "gqt-stdio-managed-graph"
+                    ),
                     "tool": "function_index",
                     "result": [{"node_id": "stdio.managed.graph"}],
                     "graph_query_identity": {
-                        "runtime_context_id": identity[
-                            "runtime_context_id"
-                        ],
-                        "task_id": identity["task_id"],
+                        "runtime_context_id": body["runtime_context_id"],
+                        "task_id": body["task_id"],
                         "session_token": raw_session,
                         "fence_token": raw_fence,
                     },
@@ -730,6 +755,14 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
         "query_purpose": "subagent_context_build",
         "worker_role": "mf_sub",
     }
+    auto_graph_args = {
+        **auto_identity,
+        "tool": "function_index",
+        "args": {"query": "stdio.safe.ref.auto.graph"},
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "worker_role": "mf_sub",
+    }
     try:
         responses, stderr, returncode = _run_mcp_probe(
             [
@@ -743,7 +776,13 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "tools/call",
-                    "params": {"name": "graph_query", "arguments": graph_args},
+                    "params": {
+                        "name": "graph_query",
+                        "arguments": {
+                            **graph_args,
+                            "session_token_ref": "",
+                        },
+                    },
                 },
                 {
                     "jsonrpc": "2.0",
@@ -788,6 +827,15 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
                         },
                     },
                 },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "graph_query",
+                        "arguments": auto_graph_args,
+                    },
+                },
             ],
             extra_args=[
                 "--governance-url",
@@ -821,7 +869,15 @@ def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
     assert payloads[3]["error"] == "managed_host_envelope_scope_mismatch"
     assert payloads[3]["mismatched_fields"] == ["session_token_ref"]
     assert payloads[3]["http_request_performed"] is False
-    assert len(Handler.calls) == 3
+    assert payloads[4]["ok"] is True
+    assert payloads[4]["trace_id"] == "gqt-stdio-safe-ref-auto-graph"
+    assert payloads[4]["managed_rejoin_performed"] is True
+    assert payloads[4]["managed_rejoin"]["trigger"] == "implicit_safe_ref"
+    assert payloads[4]["governance_writes_performed"] is True
+    assert payloads[4]["writes_performed"] is True
+    assert "session_token" not in payloads[4]["graph_query_identity"]
+    assert "fence_token" not in payloads[4]["graph_query_identity"]
+    assert len(Handler.calls) == 5
     serialized = json.dumps(responses, sort_keys=True) + stderr
     assert raw_session not in serialized
     assert raw_fence not in serialized
