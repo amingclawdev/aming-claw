@@ -571,6 +571,214 @@ def test_managed_rejoin_lends_graph_query_auth_without_raw_caller_fields(tmp_pat
     assert len(calls) == call_count
 
 
+def test_real_stdio_managed_rejoin_lends_graph_query_staged_fence(tmp_path):
+    raw_session = "stdio-managed-graph-session-secret"
+    raw_fence = "stdio-managed-graph-fence-secret"
+    route = {
+        "route_id": "route-stdio-managed-graph",
+        "route_context_hash": "sha256:" + ("a" * 64),
+        "prompt_contract_id": "rprompt-stdio-managed-graph",
+        "prompt_contract_hash": "sha256:" + ("b" * 64),
+        "route_token_ref": "rtok-stdio-managed-graph",
+        "visible_injection_manifest_hash": "sha256:" + ("c" * 64),
+    }
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-stdio-managed-graph",
+        "task_id": "worker-stdio-managed-graph",
+        "parent_task_id": "cex-stdio-managed-graph",
+        "contract_execution_id": "cex-stdio-managed-graph",
+        "target_project_root": str(tmp_path),
+        "worker_id": "worker-stdio-managed-graph",
+        "worker_slot_id": "worker-stdio-managed-graph",
+        "agent_id": "worker-stdio-managed-graph",
+        "allocation_owner": "worker-stdio-managed-graph",
+        "actual_host_worker_id": "worker-stdio-managed-graph",
+        "worker_session_id": "desktop-stdio-managed-graph",
+        "host_startup_id": "desktop-stdio-managed-graph",
+        "host_session_id": "desktop-stdio-managed-graph",
+        "session_token_ref": "wstok-stdio-managed-graph",
+        **route,
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        calls = []
+
+        def log_message(self, *_args):
+            return None
+
+        def _send(self, payload):
+            encoded = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def do_POST(self):
+            size = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(size) or b"{}")
+            self.__class__.calls.append((self.path, body))
+            if self.path.endswith("/session-token/rejoin"):
+                self._send(
+                    {
+                        "ok": True,
+                        "status": "session_token_rejoined",
+                        "delivery": "worker_host_envelope",
+                        **identity,
+                        "session_token": raw_session,
+                        "fence_token": raw_fence,
+                        "host_envelope": {
+                            **identity,
+                            "env": {
+                                "AMING_WORKER_SESSION_TOKEN": raw_session,
+                                "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                            },
+                        },
+                    }
+                )
+                return
+            assert self.path.endswith("/query")
+            if "session_token" not in body or "fence_token" not in body:
+                self._send(
+                    {
+                        "ok": False,
+                        "error": "fence_token is required",
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                        "zero_write": True,
+                    }
+                )
+                return
+            assert body["session_token"] == raw_session
+            assert body["fence_token"] == raw_fence
+            self._send(
+                {
+                    "ok": True,
+                    "trace_id": "gqt-stdio-managed-graph",
+                    "tool": "function_index",
+                    "result": [{"node_id": "stdio.managed.graph"}],
+                    "graph_query_identity": {
+                        "runtime_context_id": identity[
+                            "runtime_context_id"
+                        ],
+                        "task_id": identity["task_id"],
+                        "session_token": raw_session,
+                        "fence_token": raw_fence,
+                    },
+                }
+            )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    graph_args = {
+        **identity,
+        "tool": "function_index",
+        "args": {"query": "stdio.managed.graph"},
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "worker_role": "mf_sub",
+    }
+    try:
+        responses, stderr, returncode = _run_mcp_probe(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "graph_query", "arguments": graph_args},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "runtime_context_session_token_rejoin",
+                        "arguments": {
+                            **identity,
+                            "reason": "restore managed graph continuity",
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {"name": "graph_query", "arguments": graph_args},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "graph_query",
+                        "arguments": {
+                            **graph_args,
+                            "target_project_root": str(
+                                tmp_path / "cross-root"
+                            ),
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "graph_query",
+                        "arguments": {
+                            **graph_args,
+                            "session_token_ref": (
+                                "wstok-cross-stdio-managed-graph"
+                            ),
+                        },
+                    },
+                },
+            ],
+            extra_args=[
+                "--governance-url",
+                f"http://127.0.0.1:{server.server_address[1]}",
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert returncode == 0
+    assert stderr == ""
+    payloads = [
+        json.loads(item["result"]["content"][0]["text"])
+        for item in responses[1:]
+    ]
+    assert payloads[0]["error"] == "fence_token is required"
+    assert payloads[0]["writes_performed"] is False
+    assert payloads[0]["mutation_performed"] is False
+    assert payloads[0]["zero_write"] is True
+    assert payloads[1]["auth_loaded"] is True
+    assert payloads[2]["ok"] is True
+    assert payloads[2]["trace_id"] == "gqt-stdio-managed-graph"
+    assert "session_token" not in payloads[2]["graph_query_identity"]
+    assert "fence_token" not in payloads[2]["graph_query_identity"]
+    assert payloads[3]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[3]["mismatched_fields"] == ["target_project_root"]
+    assert payloads[3]["http_request_performed"] is False
+    assert payloads[4]["error"] == "managed_host_envelope_scope_mismatch"
+    assert payloads[4]["mismatched_fields"] == ["session_token_ref"]
+    assert payloads[4]["http_request_performed"] is False
+    assert len(Handler.calls) == 3
+    serialized = json.dumps(responses, sort_keys=True) + stderr
+    assert raw_session not in serialized
+    assert raw_fence not in serialized
+
+
 def test_real_stdio_expired_managed_entry_allows_no_ref_recovery_guide(tmp_path):
     raw_session = "stdio-expiry-session-secret"
     raw_fence = "stdio-expiry-fence-secret"
