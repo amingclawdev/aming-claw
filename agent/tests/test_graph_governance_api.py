@@ -24810,6 +24810,12 @@ def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_si
         "project_id": "foreign-project",
         "task_id": "standalone-one-worker-drift",
         "worker_id": "slot-standalone-one-drift",
+        "assigned_worktree": str(
+            repository_root / ".worktrees" / "caller-assigned-alias"
+        ),
+        "worker_worktree_path": str(
+            repository_root / ".worktrees" / "caller-worker-alias"
+        ),
         "target_project_root": str(repository_root),
         "worktree_path": str(repository_root),
         "branch_ref": "refs/heads/codex/standalone-one-worker-drift",
@@ -24842,6 +24848,19 @@ def test_parallel_branch_allocate_precheck_accepts_server_selected_standalone_si
         assert rejected.value.details["mutation_performed"] is False
         assert rejected.value.details["raw_paths_exposed"] is False
         assert str(repository_root) not in json.dumps(rejected.value.details)
+        if field in {"assigned_worktree", "worker_worktree_path"}:
+            assert rejected.value.details["field_mismatches"] == [
+                {
+                    "field": "allocation_precheck.authority_hash",
+                    "expected": "exact_current_precheck_body_authority",
+                    "actual": "body_or_receipt_drift",
+                }
+            ]
+            assert rejected.value.details["next_legal_action"] == (
+                "rerun_parallel_branch_allocate_precheck_and_submit_"
+                "copy_safe_body_unchanged"
+            )
+            assert rejected.value.details["retry_same_world_allowed"] is True
         assert conn.total_changes == before_allocation_changes
         assert not (repository_root / ".worktrees").exists()
 
