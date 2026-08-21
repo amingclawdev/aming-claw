@@ -123404,6 +123404,15 @@ def _contract_runtime_bind_observer_merge_authority(
                     record.get("contract_execution_id") or ""
                 ),
                 "mismatches": mismatches,
+                "next_legal_action": (
+                    "refresh_contract_runtime_guide_and_copy_observer_merge_"
+                    "lane_identity"
+                ),
+                "guide_source": (
+                    "contract_runtime_current.runtime_guide.next_legal_action."
+                    "writer_role_safe_copy_payload.copy_payload"
+                ),
+                "server_may_infer_missing_caller_lane_identity": False,
                 "fail_closed": True,
             },
         )

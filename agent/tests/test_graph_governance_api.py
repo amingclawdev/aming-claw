@@ -871,6 +871,16 @@ def test_observer_merge_binder_rejects_top_level_cross_lane_identity(
         "contract_runtime_observer_merge_authority_mismatch"
     )
     assert rejected.value.details["mismatches"][0]["field"] == field
+    assert rejected.value.details["next_legal_action"] == (
+        "refresh_contract_runtime_guide_and_copy_observer_merge_lane_identity"
+    )
+    assert rejected.value.details["guide_source"] == (
+        "contract_runtime_current.runtime_guide.next_legal_action."
+        "writer_role_safe_copy_payload.copy_payload"
+    )
+    assert rejected.value.details[
+        "server_may_infer_missing_caller_lane_identity"
+    ] is False
 
 
 def test_mf_parallel_two_lane_observer_merge_selects_current_atomic_lane():
@@ -90800,6 +90810,26 @@ def _complete_source_backed_mf_parallel_successor(
                 "record_verified"
             ] is True
         if line_id == "observer_merge":
+            projected = (
+                server._contract_runtime_bind_observer_dispatch_transport_proof(
+                    record,
+                    None,
+                    conn=conn,
+                    project_id=PID,
+                )
+            )
+            next_action = projected["runtime_guide"]["next_legal_action"]
+            copy_payload = next_action[
+                "writer_role_safe_copy_payload"
+            ]["copy_payload"]
+            guide_lane_identity = {
+                field: str(copy_payload.get(field) or "").strip()
+                for field in (
+                    server._CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS
+                )
+            }
+            assert all(guide_lane_identity.values())
+            write.update(guide_lane_identity)
             write = server._contract_runtime_bind_server_line_authority(
                 _ctx({"project_id": PID}),
                 conn,
