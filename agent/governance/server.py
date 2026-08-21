@@ -133499,6 +133499,15 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         == backlog_id
         and str(lineage_route_scope.get("task_id") or "").strip() == task_id
     )
+    route_caller_role = str(route_gate.get("caller_role") or "").strip()
+    observer_actor_authoritative = bool(
+        route_caller_role == "observer"
+        or (
+            not route_caller_role
+            and str(decision.get("actor_role") or "").strip()
+            == "observer"
+        )
+    )
 
     return bool(
         direct_event_id > 0
@@ -133511,7 +133520,10 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         and str(event.get("event_kind") or "").strip() == "implementation"
         and str(event.get("phase") or "").strip() == "implementation"
         and task_timeline._event_passed(dict(event))
-        and str(event.get("actor") or "").strip() == "observer"
+        # `actor` was historically persisted as a caller display label. The
+        # server-derived route decision and source-backed route authority
+        # below are the authority for the observer role; current writes are
+        # canonicalized to `observer` before persistence.
         and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha)
         and not _qa_request_has_impersonation_claim(event)
         and direct_authority.get("accepted") is True
@@ -133567,7 +133579,7 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         and str(decision.get("decision") or "").strip() in {"allow", "warn"}
         and str(decision.get("action") or "").strip()
         == "task_timeline_append"
-        and str(decision.get("actor_role") or "").strip() == "observer"
+        and observer_actor_authoritative
         and (
             decision_source == "route_token_gate"
             or route_action_scope_lineage_authoritative
@@ -169104,6 +169116,7 @@ def handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
     project_id = ctx.get_project_id()
     persisted_event_type = str(ctx.body.get("event_type") or "")
+    persisted_actor = str(ctx.body.get("actor") or "")
     from . import task_timeline
     from .mf_subagent_contract import (
         MfSubagentContractError,
@@ -170170,6 +170183,31 @@ def handle_task_timeline_append(ctx: RequestContext):
             persisted_event_type = (
                 _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE
             )
+            # The authenticated route gate already establishes the observer
+            # role. Persist that canonical authority instead of retaining a
+            # caller-supplied display label that exact-candidate QA could
+            # later mistake for (or reject as) authority.
+            persisted_actor = "observer"
+            contract_gate_decision = norm_payload.get(
+                "contract_gate_decision"
+            )
+            if isinstance(contract_gate_decision, Mapping):
+                canonical_contract_gate_decision = dict(
+                    contract_gate_decision
+                )
+                canonical_contract_gate_decision["actor_role"] = "observer"
+                canonical_contract_gate_decision["decision_hash"] = (
+                    stable_sha256(
+                        {
+                            key: value
+                            for key, value in canonical_contract_gate_decision.items()
+                            if key != "decision_hash"
+                        }
+                    )
+                )
+                norm_payload["contract_gate_decision"] = (
+                    canonical_contract_gate_decision
+                )
             event_type_authority = {
                 "schema_version": (
                     "parentless_direct_main."
@@ -170281,7 +170319,7 @@ def handle_task_timeline_append(ctx: RequestContext):
             severity=ctx.body.get("severity", ""),
             decision=ctx.body.get("decision", ""),
             schema_version=_query_int(ctx.body, "schema_version", 2),
-            actor=ctx.body.get("actor", ""),
+            actor=persisted_actor,
             status=norm_status,
             payload=norm_payload,
             verification=ctx.body.get("verification") or {},

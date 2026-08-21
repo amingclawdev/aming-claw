@@ -89910,6 +89910,7 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
         commit_sha=candidate_commit,
     )
     accepted_body["event_type"] = "mf.implementation_complete"
+    accepted_body["actor"] = "observer:direct-main-display-label"
     accepted_body["payload"].pop("dirty_scope_check")
     accepted = server.handle_task_timeline_append(
         _ctx_with_role(
@@ -89920,6 +89921,10 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
         )
     )
     assert accepted["event_type"] == "observer.implementation"
+    assert accepted["actor"] == "observer"
+    assert accepted["payload"]["contract_gate_decision"][
+        "actor_role"
+    ] == "observer"
     event_type_authority = accepted["payload"][
         "direct_main_implementation_event_type_authority"
     ]
@@ -90035,6 +90040,34 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
         backlog_id=backlog_id,
         task_id=task_id,
     ) is True
+    historical_display_label = copy.deepcopy(accepted)
+    historical_display_label["actor"] = "observer:direct-main-display-label"
+    assert server._qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
+        historical_display_label,
+        direct_event=direct_event,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    ) is True
+    forged_route_authority = copy.deepcopy(historical_display_label)
+    source_authority = forged_route_authority["payload"][
+        "source_backed_contract_gate_authority"
+    ]
+    source_authority["route_token_gate"]["caller_role"] = "worker"
+    source_authority["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in source_authority.items()
+            if key != "authority_hash"
+        }
+    )
+    assert server._qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
+        forged_route_authority,
+        direct_event=direct_event,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    ) is False
     legacy_prewrite_event = copy.deepcopy(accepted)
     legacy_prewrite_event["payload"].pop(
         "direct_main_implementation_commit_prewrite_authority"
@@ -165023,7 +165056,7 @@ def test_exact_candidate_direct_main_comparison_authority_rejects_untrusted_line
     [
         "forged_authority_hash",
         "wrong_route_scope",
-        "wrong_actor",
+        "wrong_route_caller_role",
         "wrong_event_type",
         "wrong_order",
         "wrong_commit_binding",
@@ -165085,8 +165118,18 @@ def test_exact_candidate_observer_direct_main_comparison_authority_fails_closed(
                 if key != "authority_hash"
             }
         )
-    elif mutation == "wrong_actor":
-        candidate["actor"] = "worker:/root/forged"
+    elif mutation == "wrong_route_caller_role":
+        authority = candidate["payload"][
+            "source_backed_contract_gate_authority"
+        ]
+        authority["route_token_gate"]["caller_role"] = "worker"
+        authority["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in authority.items()
+                if key != "authority_hash"
+            }
+        )
     elif mutation == "wrong_event_type":
         candidate["event_type"] = "worker.implementation"
     elif mutation == "wrong_order":
