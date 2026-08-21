@@ -47454,6 +47454,7 @@ def _runtime_context_initial_join_canonical_identity_binding(
     from .parallel_branch_runtime import (
         mf_subagent_session_token_hash,
         runtime_context_fence_token_verifier,
+        runtime_context_secret_hash,
     )
 
     if saved_context is None:
@@ -47531,7 +47532,11 @@ def _runtime_context_initial_join_canonical_identity_binding(
         != str(saved_context.session_token_hash or "").strip()
     ):
         mismatches.append("result.session_token_binding")
-    if not fence_token or fence_token != str(saved_context.fence_token or ""):
+    if (
+        not fence_token
+        or runtime_context_secret_hash(fence_token)
+        != runtime_context_fence_token_verifier(saved_context)
+    ):
         mismatches.append("result.fence_token_binding")
     result_lease = result.get("session_token_lease")
     expected_lease_binding = dict(binding["session_token_lease"])
@@ -47598,7 +47603,6 @@ def _runtime_context_initial_join_canonical_identity_binding(
         "target_head_commit",
         "merge_queue_id",
         "status",
-        "fence_token",
     )
     for field in durable_fields:
         if getattr(original_context, field, None) != getattr(
@@ -47607,6 +47611,18 @@ def _runtime_context_initial_join_canonical_identity_binding(
             None,
         ):
             mismatches.append(f"context.{field}")
+    original_fence_verifier = runtime_context_secret_hash(
+        str(original_context.fence_token or "")
+    )
+    if (
+        not original_fence_verifier
+        or str(saved_context.fence_token or "").strip()
+        or str(saved_context.fence_token_verifier or "").strip()
+        != original_fence_verifier
+        or runtime_context_fence_token_verifier(saved_context)
+        != original_fence_verifier
+    ):
+        mismatches.append("context.fence_token_custody_transition")
     if str(saved_context.actual_host_worker_id or "").strip() != governed_worker_id:
         mismatches.append("context.actual_host_worker_id")
     if str(saved_context.host_startup_id or "").strip() != expected_host_startup_id:
@@ -47759,6 +47775,8 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
             get_branch_context_by_runtime_context_id,
             initial_join_mf_subagent_runtime_session_token,
             runtime_context_id_for_branch_context,
+            runtime_context_secret_hash,
+            upsert_branch_context,
             validate_initial_join_mf_subagent_host_identity,
         )
         from .permissions import require_operator_capability, session_role
@@ -48326,6 +48344,78 @@ def handle_graph_governance_runtime_context_session_token_initial_join(ctx: Requ
                     "fail_closed": True,
                 },
             ) from exc
+
+        # Initial join is the custody boundary for the allocation fence.  The
+        # raw credential leaves durable storage in the same transaction that
+        # issues the worker host envelope; subsequent worker gates compare the
+        # process-local bearer only with this explicit verifier.
+        issued_fence_token = str(result.get("fence_token") or "").strip()
+        issued_fence_verifier = runtime_context_secret_hash(issued_fence_token)
+        issued_context = get_branch_context_by_runtime_context_id(
+            conn,
+            project_id,
+            runtime_context_id,
+        )
+        initial_fence_verifier = runtime_context_secret_hash(
+            str(context.fence_token or "")
+        )
+        persisted_explicit_verifier = str(
+            getattr(issued_context, "fence_token_verifier", "") or ""
+        ).strip()
+        if (
+            issued_context is None
+            or not issued_fence_token
+            or not issued_fence_verifier
+            or initial_fence_verifier != issued_fence_verifier
+            or str(result.get("fence_token_hash") or "").strip()
+            != issued_fence_verifier
+            or str(getattr(issued_context, "fence_token", "") or "").strip()
+            != issued_fence_token
+            or persisted_explicit_verifier
+            not in {"", issued_fence_verifier}
+        ):
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_fence_authority_mismatch",
+                "runtime-context initial join fence does not match the issued host credential",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "mutation_performed": False,
+                    "timeline_event_persisted": False,
+                    "credential_rotated": False,
+                    "fail_closed": True,
+                },
+            )
+        issued_context = upsert_branch_context(
+            conn,
+            replace(
+                issued_context,
+                fence_token="",
+                fence_token_verifier=issued_fence_verifier,
+            ),
+            now_iso=str(body.get("now_iso") or ""),
+        )
+        if (
+            str(issued_context.fence_token or "").strip()
+            or str(issued_context.fence_token_verifier or "").strip()
+            != issued_fence_verifier
+        ):
+            conn.rollback()
+            raise GovernanceError(
+                "runtime_context_initial_join_fence_authority_persistence_failed",
+                "runtime-context initial join could not persist the issued fence verifier",
+                409,
+                {
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "mutation_performed": False,
+                    "timeline_event_persisted": False,
+                    "credential_rotated": False,
+                    "fail_closed": True,
+                },
+            )
 
         renewed_contract_revision = None
         if resolved_route_identity and safe_route_identity:
@@ -54259,6 +54349,7 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
 
     from .parallel_branch_runtime import (
         ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
+        runtime_context_has_fence_authority,
         runtime_context_id_for_branch_context,
         runtime_context_session_token_lease_view,
         runtime_context_session_token_ref,
@@ -54299,7 +54390,7 @@ def _runtime_context_pre_lineage_bootstrap_rejoin_authority(
         errors.append("runtime_context_not_active")
     if not (
         str(getattr(context, "session_token_hash", "") or "").strip()
-        and str(getattr(context, "fence_token", "") or "").strip()
+        and runtime_context_has_fence_authority(context)
         and active_session_token_ref
     ):
         errors.append("initial_join_auth_binding_missing")

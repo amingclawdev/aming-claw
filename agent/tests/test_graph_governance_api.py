@@ -63146,6 +63146,47 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
             },
         )
     )
+    joined_context = get_branch_context(conn, PID, allocated.task_id)
+    assert joined_context is not None
+    assert joined_context.fence_token == ""
+    assert joined_context.fence_token_verifier == joined["fence_token_hash"]
+    assert joined_context.fence_token_verifier == runtime_context_secret_hash(
+        joined["fence_token"]
+    )
+    before_wrong_fence = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as wrong_fence:
+        server.handle_graph_governance_runtime_context_read_receipt(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": allocated.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body={
+                    "runtime_context_id": allocated.runtime_context_id,
+                    "contract_execution_id": contract_execution_id,
+                    "task_id": allocated.task_id,
+                    "parent_task_id": contract_execution_id,
+                    "worker_id": allocated.worker_id,
+                    "worker_slot_id": allocated.worker_slot_id,
+                    "fence_token": "wrong-safe-ref-prestartup-fence",
+                    "session_token": joined["session_token"],
+                    "session_token_ref": joined["session_token_ref"],
+                    "target_project_root": str(target_root),
+                    "actor": allocated.worker_id,
+                    "read_receipt_hash": _fake_sha(
+                        "safe-ref-prestartup-wrong-fence"
+                    ),
+                    "launch_text_hash": _fake_sha(
+                        "safe-ref-prestartup-wrong-launch"
+                    ),
+                    **route_identity,
+                },
+            )
+        )
+    assert wrong_fence.value.code == "fence_invalidated_or_unknown"
+    assert "\n".join(conn.iterdump()) == before_wrong_fence
     receipt_hash = _fake_sha("safe-ref-prestartup-read")
     read = server.handle_graph_governance_runtime_context_read_receipt(
         _ctx_with_role(
@@ -65519,6 +65560,11 @@ def test_runtime_context_session_token_initial_join_audits_host_envelope_before_
     assert saved is not None
     assert saved.session_token_hash == mf_subagent_session_token_hash(
         result["session_token"]
+    )
+    assert saved.fence_token == ""
+    assert saved.fence_token_verifier == result["fence_token_hash"]
+    assert saved.fence_token_verifier == runtime_context_secret_hash(
+        result["fence_token"]
     )
     assert saved.last_recovery_action == "mf_subagent_initial_join_issued"
     assert runtime_context_session_token_ref(saved) == result["session_token_ref"]
