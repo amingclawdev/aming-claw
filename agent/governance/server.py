@@ -160388,6 +160388,14 @@ _PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_STATUSES = {
     "success",
     "succeeded",
 }
+_PARENTLESS_DIRECT_MAIN_GRAPH_LINEAGE_CARRIER_EVENT_KINDS = {
+    "implementation",
+    "verification",
+    "independent_verification",
+    "qa_verification",
+    "close_ready",
+    "backlog_close_blocked",
+}
 
 
 def _contract_runtime_parentless_direct_main_event_order(
@@ -161607,6 +161615,8 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
     raw_trace_ids: list[str] = []
     invalid_trace_ids: list[str] = []
     post_hoc_trace_ids: list[str] = []
+    post_implementation_trace_events: list[dict[str, Any]] = []
+    lineage_only_trace_references: list[dict[str, Any]] = []
     post_hoc_graph_trace_marker = False
     for event_order, event in ordered_events:
         has_graph_trace_key = (
@@ -161623,8 +161633,33 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
             direct_event_id and event_id and event_id == direct_event_id
         )
         marker = _contract_runtime_parentless_direct_main_marker(event)
+        typed_graph_marker = "_".join(
+            str(event.get(key) or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(".", "_")
+            for key in ("event_type", "event_kind", "phase")
+            if str(event.get(key) or "").strip()
+        )
+        event_kind = (
+            str(event.get("event_kind") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        is_post_implementation_lineage_carrier = bool(
+            implementation_order
+            and event_order >= implementation_order
+            and event_kind
+            in _PARENTLESS_DIRECT_MAIN_GRAPH_LINEAGE_CARRIER_EVENT_KINDS
+        )
         event_ref = f"timeline:{event_id}" if event_id else marker
-        if not is_direct_exception_event and "graph" not in marker:
+        if (
+            not is_direct_exception_event
+            and "graph" not in typed_graph_marker
+            and not is_post_implementation_lineage_carrier
+        ):
             rejected_events.append(
                 {
                     "event_ref": event_ref,
@@ -161663,15 +161698,18 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
             )
             continue
         if implementation_order and event_order >= implementation_order:
-            post_hoc_trace_ids.extend(ids)
-            post_hoc_graph_trace_marker = True
-            rejected_events.append(
+            post_implementation_trace_events.append(
                 {
                     "event_ref": event_ref,
                     "event_kind": event.get("event_kind"),
                     "phase": event.get("phase"),
-                    "reason": "graph_trace_recorded_after_direct_main_implementation",
-                    "graph_trace_ids": ids,
+                    "graph_trace_ids": list(ids),
+                    "has_graph_trace_key": has_graph_trace_key,
+                    "reference_classification": (
+                        "typed_lineage_carrier"
+                        if is_post_implementation_lineage_carrier
+                        else "typed_graph_evidence_event"
+                    ),
                 }
             )
             continue
@@ -161700,7 +161738,6 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
 
     trace_ids = _runtime_context_service_dedupe(raw_trace_ids)
     invalid_trace_ids = _runtime_context_service_dedupe(invalid_trace_ids)
-    post_hoc_trace_ids = _runtime_context_service_dedupe(post_hoc_trace_ids)
     db_evidence = _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
         conn,
         project_id=project_id,
@@ -161709,6 +161746,52 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
         trace_ids=trace_ids,
         route_identity=direct_identity,
     )
+    verified_pre_implementation_trace_ids = set(
+        _runtime_context_service_dedupe(
+            list(db_evidence.get("verified_trace_ids") or [])
+        )
+    )
+    for event in post_implementation_trace_events:
+        event_trace_ids = _runtime_context_service_dedupe(
+            list(event.get("graph_trace_ids") or [])
+        )
+        lineage_trace_ids = [
+            trace_id
+            for trace_id in event_trace_ids
+            if trace_id in verified_pre_implementation_trace_ids
+        ]
+        newly_recorded_trace_ids = [
+            trace_id
+            for trace_id in event_trace_ids
+            if trace_id not in verified_pre_implementation_trace_ids
+        ]
+        if lineage_trace_ids:
+            lineage_only_trace_references.append(
+                {
+                    "event_ref": event.get("event_ref"),
+                    "event_kind": event.get("event_kind"),
+                    "phase": event.get("phase"),
+                    "graph_trace_ids": lineage_trace_ids,
+                    "classification": "verified_pre_implementation_lineage_reference",
+                }
+            )
+        if event.get("reference_classification") == "typed_lineage_carrier":
+            continue
+        if newly_recorded_trace_ids or (
+            bool(event.get("has_graph_trace_key")) and not event_trace_ids
+        ):
+            post_hoc_trace_ids.extend(newly_recorded_trace_ids)
+            post_hoc_graph_trace_marker = True
+            rejected_events.append(
+                {
+                    "event_ref": event.get("event_ref"),
+                    "event_kind": event.get("event_kind"),
+                    "phase": event.get("phase"),
+                    "reason": "graph_trace_recorded_after_direct_main_implementation",
+                    "graph_trace_ids": newly_recorded_trace_ids,
+                }
+            )
+    post_hoc_trace_ids = _runtime_context_service_dedupe(post_hoc_trace_ids)
     missing: list[str] = []
     if not candidate_events:
         missing.append("pre_implementation_graph_trace")
@@ -161723,7 +161806,9 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
             for item in db_evidence.get("identity_mismatches") or []
         ):
             missing.append("graph_trace_task_id_db_verified")
-    if post_hoc_trace_ids or post_hoc_graph_trace_marker:
+    if (
+        post_hoc_trace_ids or post_hoc_graph_trace_marker
+    ) and not verified_pre_implementation_trace_ids:
         missing.append("graph_trace_before_direct_main_implementation")
     passed = bool(candidate_events and trace_ids) and not missing
     return {
@@ -161736,6 +161821,7 @@ def _contract_runtime_parentless_direct_main_graph_trace_gate(
         "verified_trace_ids": list(db_evidence.get("verified_trace_ids") or []),
         "invalid_trace_ids": invalid_trace_ids,
         "post_hoc_trace_ids": post_hoc_trace_ids,
+        "lineage_only_trace_references": lineage_only_trace_references,
         "evidence_events": candidate_events,
         "rejected_evidence_events": rejected_events,
         "db_evidence": db_evidence,

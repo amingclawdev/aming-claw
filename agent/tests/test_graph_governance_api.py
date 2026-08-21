@@ -104615,6 +104615,154 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
     assert closed["gate_summary"]["can_close"] is True
 
 
+def test_parentless_direct_main_graph_trace_gate_distinguishes_lineage_reference_from_late_acquisition(
+    monkeypatch,
+):
+    pre_implementation_trace_id = "gqt-20260821-abcdef0123"
+    late_trace_id = "gqt-20260821-fedcba9876"
+    direct_event = {
+        "id": 25677,
+        "event_type": "mf.observer_direct_implementation_exception",
+        "event_kind": "observer_direct_implementation_exception",
+        "phase": "pre_mutation",
+        "status": "accepted",
+        "payload": {"graph_trace_ids": [pre_implementation_trace_id]},
+    }
+    implementation_event = {
+        "id": 25686,
+        "event_type": "observer.implementation",
+        "event_kind": "implementation",
+        "phase": "implementation",
+        "decision": (
+            "candidate_implementation_complete_pending_exact_graph_qa_and_deployment"
+        ),
+        "status": "passed",
+        "artifact_refs": {
+            "graph_query_trace_ids": [pre_implementation_trace_id],
+        },
+    }
+    direct_gate = {"implementation_event": implementation_event}
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_close_authority_route_token_backed_event",
+        lambda *_args, **_kwargs: True,
+    )
+
+    def verified_pre_implementation_trace(
+        _conn,
+        *,
+        project_id,
+        backlog_id,
+        task_id,
+        trace_ids,
+        route_identity,
+    ):
+        assert project_id == PID
+        assert backlog_id == "AC-DIRECT-MAIN-GRAPH-LINEAGE-REREFERENCE"
+        assert task_id == "onboard-service-graph-lineage-rereference"
+        assert trace_ids in ([], [pre_implementation_trace_id])
+        assert route_identity == {}
+        return {
+            "db_verified": bool(trace_ids),
+            "verified_trace_ids": list(trace_ids),
+            "identity_mismatches": [],
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_parentless_direct_main_graph_trace_db_evidence",
+        verified_pre_implementation_trace,
+    )
+
+    lineage_only = (
+        server._contract_runtime_parentless_direct_main_graph_trace_gate(
+            None,
+            project_id=PID,
+            backlog_id="AC-DIRECT-MAIN-GRAPH-LINEAGE-REREFERENCE",
+            task_id="onboard-service-graph-lineage-rereference",
+            timeline_events=[direct_event, implementation_event],
+            direct_event=direct_event,
+            direct_identity={},
+            direct_gate=direct_gate,
+        )
+    )
+
+    assert lineage_only["passed"] is True
+    assert lineage_only["missing_requirement_ids"] == []
+    assert lineage_only["post_hoc_trace_ids"] == []
+    assert lineage_only["lineage_only_trace_references"] == [
+        {
+            "event_ref": "timeline:25686",
+            "event_kind": "implementation",
+            "phase": "implementation",
+            "graph_trace_ids": [pre_implementation_trace_id],
+            "classification": "verified_pre_implementation_lineage_reference",
+        }
+    ]
+
+    genuinely_late_event = {
+        "id": 25688,
+        "event_type": "observer.graph_query",
+        "event_kind": "graph_query",
+        "phase": "graph_context",
+        "status": "passed",
+        "payload": {"graph_trace_ids": [late_trace_id]},
+    }
+    late_acquisition = (
+        server._contract_runtime_parentless_direct_main_graph_trace_gate(
+            None,
+            project_id=PID,
+            backlog_id="AC-DIRECT-MAIN-GRAPH-LINEAGE-REREFERENCE",
+            task_id="onboard-service-graph-lineage-rereference",
+            timeline_events=[
+                direct_event,
+                implementation_event,
+                genuinely_late_event,
+            ],
+            direct_event=direct_event,
+            direct_identity={},
+            direct_gate=direct_gate,
+        )
+    )
+
+    assert late_acquisition["passed"] is True
+    assert late_acquisition["post_hoc_trace_ids"] == [late_trace_id]
+    assert late_acquisition["missing_requirement_ids"] == []
+
+    missing_pre_direct_event = {
+        **direct_event,
+        "payload": {},
+    }
+    implementation_without_trace_reference = {
+        **implementation_event,
+        "artifact_refs": {},
+    }
+    late_only = server._contract_runtime_parentless_direct_main_graph_trace_gate(
+        None,
+        project_id=PID,
+        backlog_id="AC-DIRECT-MAIN-GRAPH-LINEAGE-REREFERENCE",
+        task_id="onboard-service-graph-lineage-rereference",
+        timeline_events=[
+            missing_pre_direct_event,
+            implementation_without_trace_reference,
+            genuinely_late_event,
+        ],
+        direct_event=missing_pre_direct_event,
+        direct_identity={},
+        direct_gate={"implementation_event": implementation_without_trace_reference},
+    )
+
+    assert late_only["passed"] is False
+    assert late_only["post_hoc_trace_ids"] == [late_trace_id]
+    assert "pre_implementation_graph_trace" in late_only[
+        "missing_requirement_ids"
+    ]
+    assert "graph_trace_before_direct_main_implementation" in late_only[
+        "missing_requirement_ids"
+    ]
+
+
 def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
     conn,
     monkeypatch,
