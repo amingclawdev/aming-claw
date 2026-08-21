@@ -14922,8 +14922,8 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
                     "tool": "graph_query",
                     "description": (
                         "Retry the audited subagent graph query with "
-                        "query_purpose=subagent_context_build for context lookup "
-                        "or subagent_gate_validation for gate evidence."
+                            "query_purpose=subagent_context_build for context lookup "
+                            "or subagent_gate_validation for gate evidence."
                     ),
                 },
             },
@@ -23214,7 +23214,8 @@ def _runtime_context_service_graph_trace_refs(
                            t.prompt_contract_id, t.prompt_contract_hash,
                            t.visible_injection_manifest_hash,
                            t.route_token_ref, t.created_at,
-                           t.fence_token_hash
+                           t.fence_token_hash,
+                           s.snapshot_kind AS snapshot_kind
                     FROM graph_query_traces t
                     LEFT JOIN graph_snapshots s
                       ON s.project_id = t.project_id
@@ -23249,7 +23250,8 @@ def _runtime_context_service_graph_trace_refs(
                        t.prompt_contract_id, t.prompt_contract_hash,
                        t.visible_injection_manifest_hash,
                        t.route_token_ref, t.created_at,
-                       t.fence_token_hash
+                       t.fence_token_hash,
+                       s.snapshot_kind AS snapshot_kind
                 FROM graph_query_traces t
                 LEFT JOIN graph_snapshots s
                   ON s.project_id = t.project_id
@@ -23341,6 +23343,7 @@ def _runtime_context_service_graph_trace_refs(
             ),
             "route_token_ref": _row_text("route_token_ref", 20),
             "created_at": _row_text("created_at", 21),
+            "snapshot_kind": _row_text("snapshot_kind", 23).lower(),
         }
         expected = {
             "query_source": "mf_subagent",
@@ -23406,8 +23409,7 @@ def _runtime_context_service_graph_trace_refs(
             )
         authority_expected = {
             "status": "complete",
-            "active_snapshot_id": fields["snapshot_id"],
-            "active_commit_sha": expected_graph_commit,
+            "snapshot_kind": "full",
             "snapshot_commit_sha": expected_graph_commit,
         }
         for field, expected_value in authority_expected.items():
@@ -23477,7 +23479,10 @@ def _runtime_context_service_graph_trace_refs(
             "parent_task_id": parent_task_id,
             "backlog_id": backlog_id,
             "complete_trace_required": True,
-            "active_snapshot_required": True,
+            "exact_full_snapshot_required": True,
+            "active_snapshot_required": False,
+            "frozen_runtime_world_authoritative": True,
+            "global_active_ref_authoritative": False,
             "expected_graph_commit": expected_graph_commit,
             "expected_graph_commit_source": expected_graph_commit_source,
             "bounded_replacement_trace_count": len(
@@ -82042,76 +82047,89 @@ def _runtime_context_mf_sub_graph_query_canonical_gate(
         )
     except (KeyError, TypeError, ValueError, sqlite3.Error) as exc:
         return reject(
-            "mf_sub_graph_query_active_snapshot_unavailable",
-            "current active graph authority could not be resolved",
+            "mf_sub_graph_query_snapshot_authority_unavailable",
+            "graph snapshot authority could not be resolved",
             graph_trace_id=graph_trace_id,
             snapshot_id=resolved_snapshot_id,
             snapshot_error=str(exc),
         )
-    if not active_ref or not active_snapshot or not queried_snapshot:
+    if not queried_snapshot:
         return reject(
-            "mf_sub_graph_query_active_snapshot_missing",
-            "canonical graph context requires an active graph snapshot binding",
+            "mf_sub_graph_query_snapshot_missing",
+            "canonical graph context requires a persisted graph snapshot",
             graph_trace_id=graph_trace_id,
             snapshot_id=resolved_snapshot_id,
         )
 
-    active_ref_snapshot_id = str(active_ref["snapshot_id"] or "").strip()
-    active_snapshot_id = str(active_snapshot.get("snapshot_id") or "").strip()
-    active_ref_commit = str(active_ref["commit_sha"] or "").strip().lower()
+    active_ref_snapshot_id = str(
+        (active_ref["snapshot_id"] if active_ref else "") or ""
+    ).strip()
+    active_snapshot_id = str(
+        (active_snapshot.get("snapshot_id") if active_snapshot else "") or ""
+    ).strip()
+    active_ref_commit = str(
+        (active_ref["commit_sha"] if active_ref else "") or ""
+    ).strip().lower()
     active_snapshot_commit = str(
-        active_snapshot.get("commit_sha") or ""
+        (active_snapshot.get("commit_sha") if active_snapshot else "") or ""
     ).strip().lower()
     queried_snapshot_commit = str(
         queried_snapshot.get("commit_sha") or ""
     ).strip().lower()
+    queried_snapshot_kind = str(
+        queried_snapshot.get("snapshot_kind") or ""
+    ).strip().lower()
+    queried_snapshot_status = str(
+        queried_snapshot.get("status") or ""
+    ).strip().lower()
     expected_runtime_commit, expected_runtime_commit_source = (
         _runtime_context_expected_graph_commit(context)
     )
-    if (
-        not active_ref_snapshot_id
-        or active_ref_snapshot_id != resolved_snapshot_id
-        or active_snapshot_id != resolved_snapshot_id
-    ):
+    if queried_snapshot_kind != "full":
         return reject(
-            "mf_sub_graph_query_nonactive_snapshot",
-            "worker_graph_context requires the current active graph snapshot",
+            "mf_sub_graph_query_snapshot_not_full",
+            "worker_graph_context requires an exact full graph snapshot",
             graph_trace_id=graph_trace_id,
-            expected_active_snapshot_id=active_ref_snapshot_id,
-            active_snapshot_id=active_snapshot_id,
-            query_snapshot_id=resolved_snapshot_id,
+            snapshot_id=resolved_snapshot_id,
+            snapshot_kind=queried_snapshot_kind,
+            snapshot_status=queried_snapshot_status,
+            expected_snapshot_kind="full",
         )
     if (
         not expected_runtime_commit
-        or not active_ref_commit
-        or not active_snapshot_commit
         or not queried_snapshot_commit
-        or len(
-            {
-                active_ref_commit,
-                active_snapshot_commit,
-                queried_snapshot_commit,
-                expected_runtime_commit,
-            }
-        )
-        != 1
+        or queried_snapshot_commit != expected_runtime_commit
     ):
         return reject(
-            "mf_sub_graph_query_active_commit_mismatch",
+            "mf_sub_graph_query_frozen_world_commit_mismatch",
             (
-                "query snapshot is not bound to the current expected active "
-                "graph commit"
+                "query snapshot is not bound to the frozen RuntimeContext "
+                "WorldRef commit"
             ),
             graph_trace_id=graph_trace_id,
             snapshot_id=resolved_snapshot_id,
-            expected_active_graph_commit=active_ref_commit,
-            active_snapshot_commit=active_snapshot_commit,
             query_snapshot_commit=queried_snapshot_commit,
             expected_runtime_context_commit=expected_runtime_commit,
             expected_runtime_context_commit_source=(
                 expected_runtime_commit_source
             ),
+            active_snapshot_id=active_snapshot_id,
+            active_snapshot_commit=active_snapshot_commit,
+            global_active_ref_authoritative=False,
         )
+
+    active_binding_exact = bool(
+        active_ref_snapshot_id
+        and active_ref_snapshot_id == resolved_snapshot_id
+        and active_snapshot_id == resolved_snapshot_id
+        and active_ref_commit == queried_snapshot_commit
+        and active_snapshot_commit == queried_snapshot_commit
+    )
+    snapshot_authority_mode = (
+        "active_exact_frozen_world"
+        if active_binding_exact
+        else "historical_exact_frozen_world"
+    )
 
     return {
         "schema_version": (
@@ -82126,16 +82144,25 @@ def _runtime_context_mf_sub_graph_query_canonical_gate(
         "trace_complete": True,
         "trace_snapshot_id": trace_snapshot_id,
         "snapshot_id": resolved_snapshot_id,
+        "snapshot_kind": queried_snapshot_kind,
+        "snapshot_status": queried_snapshot_status,
         "expected_active_snapshot_id": active_ref_snapshot_id,
         "expected_active_graph_commit": active_ref_commit,
+        "observed_active_snapshot_id": active_snapshot_id,
+        "observed_active_snapshot_commit": active_snapshot_commit,
         "expected_runtime_context_commit": expected_runtime_commit,
         "expected_runtime_context_commit_source": (
             expected_runtime_commit_source
         ),
         "snapshot_commit": queried_snapshot_commit,
+        "snapshot_authority_mode": snapshot_authority_mode,
+        "frozen_runtime_world_authoritative": True,
+        "global_active_ref_authoritative": False,
+        "active_snapshot_required": False,
+        "active_binding_exact": active_binding_exact,
         "source_of_authority": (
-            "graph_query_traces+graph_query_events+graph_snapshot_refs+"
-            "graph_snapshots"
+            "runtime_context_frozen_world+graph_query_traces+"
+            "graph_query_events+graph_snapshots"
         ),
     }
 

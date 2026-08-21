@@ -82899,6 +82899,22 @@ def _install_mf_sub_multitrace_contract_runtime(
         store = FakeStore()
 
         @staticmethod
+        def mf_parallel_atomic_lane_gate_view(
+            lane_record,
+            lane_guide,
+            _write,
+            *,
+            source_record,
+            projection,
+        ):
+            assert source_record is lane_record
+            assert projection == {}
+            return (
+                copy.deepcopy(lane_record.get("execution_state") or {}),
+                copy.deepcopy(lane_guide),
+            )
+
+        @staticmethod
         def pinned_definition_has_line(requested_execution_id, line_id):
             assert requested_execution_id == execution_id
             return line_id in {
@@ -83247,8 +83263,90 @@ def test_mf_sub_post_trace_query_failure_is_audited_without_canonical_progress(
     )
 
 
-@pytest.mark.parametrize("mismatch", ("snapshot", "graph_commit"))
-def test_mf_sub_complete_graph_trace_requires_current_snapshot_and_commit(
+def test_mf_sub_complete_graph_trace_accepts_historical_exact_frozen_world(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    fixture = _install_mf_sub_multitrace_contract_runtime(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="historical-exact-frozen-world",
+    )
+    body = _mf_sub_multitrace_query_body(
+        fixture,
+        0,
+        tool="query_schema",
+        args={},
+    )
+    frozen_snapshot_id = fixture["active_snapshot_id"]
+    _activate_basic_graph(
+        conn,
+        f"{frozen_snapshot_id}-new-global-active",
+        commit_sha="b" * 40,
+    )
+    body["snapshot_id"] = frozen_snapshot_id
+
+    result = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=body,
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["result"]["ok"] is True
+    assert result["result_count"] > 0
+    canonical = result["contract_runtime_canonical_line"]
+    assert canonical["status"] == "completed"
+    gate = result["mf_sub_graph_query_canonical_gate"]
+    assert gate["ok"] is True
+    assert gate["snapshot_id"] == frozen_snapshot_id
+    assert gate["snapshot_kind"] == "full"
+    assert gate["snapshot_status"] == "superseded"
+    assert gate["snapshot_commit"] == fixture["target_commit"]
+    assert gate["expected_runtime_context_commit"] == fixture["target_commit"]
+    assert gate["snapshot_authority_mode"] == (
+        "historical_exact_frozen_world"
+    )
+    assert gate["frozen_runtime_world_authoritative"] is True
+    assert gate["global_active_ref_authoritative"] is False
+    assert gate["active_snapshot_required"] is False
+    assert gate["active_binding_exact"] is False
+    assert gate["observed_active_snapshot_commit"] == "b" * 40
+    assert gate["source_of_authority"] == (
+        "runtime_context_frozen_world+graph_query_traces+"
+        "graph_query_events+graph_snapshots"
+    )
+    context = fixture["lanes"][0]["context"]
+    graph_evidence = server._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PID,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        parent_task_id=fixture["execution_id"],
+        backlog_id=fixture["backlog_id"],
+        fence_token=context.fence_token,
+        explicit_trace_ids=[result["trace_id"]],
+        strict_explicit_trace_ids=True,
+    )
+    assert graph_evidence["db_verified"] is True
+    assert graph_evidence["verified_trace_ids"] == [result["trace_id"]]
+    assert graph_evidence["source_details"]["exact_full_snapshot_required"] is True
+    assert graph_evidence["source_details"]["active_snapshot_required"] is False
+    assert graph_evidence["source_details"][
+        "frozen_runtime_world_authoritative"
+    ] is True
+    assert graph_evidence["source_details"][
+        "global_active_ref_authoritative"
+    ] is False
+
+
+@pytest.mark.parametrize("mismatch", ("graph_commit", "snapshot_kind"))
+def test_mf_sub_complete_graph_trace_rejects_wrong_frozen_world_basis(
     conn,
     monkeypatch,
     tmp_path,
@@ -83258,7 +83356,7 @@ def test_mf_sub_complete_graph_trace_requires_current_snapshot_and_commit(
         conn,
         monkeypatch,
         tmp_path,
-        suffix=f"{mismatch}-mismatch",
+        suffix=f"frozen-world-{mismatch}-mismatch",
     )
     body = _mf_sub_multitrace_query_body(
         fixture,
@@ -83266,21 +83364,7 @@ def test_mf_sub_complete_graph_trace_requires_current_snapshot_and_commit(
         tool="query_schema",
         args={},
     )
-    if mismatch == "snapshot":
-        stale_snapshot_id = f"{fixture['active_snapshot_id']}-stale"
-        _activate_basic_graph(
-            conn,
-            stale_snapshot_id,
-            commit_sha=fixture["target_commit"],
-        )
-        store.activate_graph_snapshot(
-            conn,
-            PID,
-            fixture["active_snapshot_id"],
-        )
-        conn.commit()
-        body["snapshot_id"] = stale_snapshot_id
-    else:
+    if mismatch == "graph_commit":
         mismatched_snapshot_id = (
             f"{fixture['active_snapshot_id']}-wrong-commit"
         )
@@ -83289,6 +83373,32 @@ def test_mf_sub_complete_graph_trace_requires_current_snapshot_and_commit(
             mismatched_snapshot_id,
             commit_sha="b" * 40,
         )
+        body["snapshot_id"] = mismatched_snapshot_id
+        expected_error = (
+            "mf_sub_graph_query_frozen_world_commit_mismatch"
+        )
+    else:
+        mismatched_snapshot_id = (
+            f"{fixture['active_snapshot_id']}-partial"
+        )
+        snapshot = store.create_graph_snapshot(
+            conn,
+            PID,
+            snapshot_id=mismatched_snapshot_id,
+            commit_sha=fixture["target_commit"],
+            snapshot_kind="scope",
+            graph_json=_graph(),
+        )
+        store.index_graph_snapshot(
+            conn,
+            PID,
+            snapshot["snapshot_id"],
+            nodes=_graph()["deps_graph"]["nodes"],
+            edges=_graph()["deps_graph"]["edges"],
+        )
+        conn.commit()
+        body["snapshot_id"] = mismatched_snapshot_id
+        expected_error = "mf_sub_graph_query_snapshot_not_full"
     before = _mf_sub_multitrace_contract_state(fixture["record"])
 
     result = server.handle_graph_governance_query(
@@ -83313,12 +83423,15 @@ def test_mf_sub_complete_graph_trace_requires_current_snapshot_and_commit(
         )
     )["trace"]
     assert persisted["status"] == "complete"
-    if mismatch == "snapshot":
-        assert persisted["snapshot_id"] != fixture["active_snapshot_id"]
-    else:
-        active = store.get_active_graph_snapshot(conn, PID)
-        assert active["snapshot_id"] == persisted["snapshot_id"]
-        assert active["commit_sha"] != fixture["target_commit"]
+    assert persisted["snapshot_id"] == mismatched_snapshot_id
+    gate = result["mf_sub_graph_query_canonical_gate"]
+    assert gate["ok"] is False
+    assert gate["error"] == expected_error
+    assert gate["contract_runtime_mutated"] is False
+    assert gate["completed_lines_mutated"] is False
+    assert gate["verified_projection_allowed"] is False
+    assert gate["finish_projection_allowed"] is False
+    assert gate["close_projection_allowed"] is False
     _assert_mf_sub_graph_query_rejected_without_contract_progress(
         conn,
         fixture=fixture,
