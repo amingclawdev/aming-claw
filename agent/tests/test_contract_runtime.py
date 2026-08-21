@@ -16,6 +16,9 @@ from agent.governance import (
 )
 from agent.governance.contracts import ContractDefinitionRegistry
 from agent.governance.contracts.registry import ContractDependencyUnresolvedError
+from agent.governance.contracts.registry import (
+    ContractCommonRuleApplicabilityError,
+)
 from agent.governance.contracts.runtime import (
     ContractRetirementError,
     ContractRuntime,
@@ -29,6 +32,155 @@ from agent.governance.contracts.runtime import (
     _worker_commit_completed_implementation,
 )
 from agent.governance.contracts.execution_state import build_execution_state
+
+
+def _common_rule_bound_definition(registry, *, package_digest=None):
+    package = registry.common_rule_package()
+    return {
+        "schema_version": "contract_definition.v1",
+        "contract_id": "common_rule_bound_runtime_test",
+        "version": "v1",
+        "revision": "rev1",
+        "role": "observer",
+        "contract_type": "implementation",
+        "status": "active",
+        "rule_layer": {
+            "stages": [
+                {
+                    "stage_id": "implementation",
+                    "lines": [
+                        {
+                            "line_id": "observer_implementation",
+                            "owner_role": "observer",
+                            "allowed_writer_roles": ["observer"],
+                            "evidence_kind": "implementation",
+                        }
+                    ],
+                }
+            ]
+        },
+        "instruction_layer": {
+            "inline": ["Implement only the bounded common Rule test row."],
+            "refs": [],
+        },
+        "metadata": {
+            "common_rule_applicability": {
+                "schema_version": "contract_common_rule_applicability.v1",
+                "join_state": "resolved",
+                "package_id": package["package_id"],
+                "package_version": package["package_version"],
+                "package_digest": package_digest or package["package_digest"],
+                "rule_ids": [
+                    "AC-COMMON-IDENTITY-PROJECT-BACKLOG-TASK",
+                    "AC-COMMON-SCOPE-OWNED-FILES",
+                ],
+                "scopes": ["runtime_test"],
+                "omitted_rules_apply": False,
+                "server_inference_allowed": False,
+                "activation_allowed": True,
+            }
+        },
+    }
+
+
+def test_contract_runtime_pins_and_exposes_one_common_rule_join_for_precheck_write(
+    tmp_path,
+):
+    package_registry = ContractDefinitionRegistry()
+    payload = _common_rule_bound_definition(package_registry)
+    (tmp_path / "common_rule_bound_runtime_test.v1.rev1.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path))
+    created = runtime.start_execution(
+        "common_rule_bound_runtime_test",
+        project_id="aming-claw",
+        backlog_id="AC-COMMON-RULE-RUNTIME-PARITY",
+        actor_role="observer",
+        contract_execution_id="cex-common-rule-runtime-parity",
+    )
+    join = created["authoritative_common_rule_join"]
+    assert join["authoritative"] is True
+    assert join["rule_ids"] == [
+        "AC-COMMON-IDENTITY-PROJECT-BACKLOG-TASK",
+        "AC-COMMON-SCOPE-OWNED-FILES",
+    ]
+    assert (
+        created["execution_state"]["authoritative_common_rule_join"]
+        ["authority_hash"]
+        == join["authority_hash"]
+    )
+    assert (
+        created["runtime_guide"]["authoritative_common_rule_join"]
+        ["authority_hash"]
+        == join["authority_hash"]
+    )
+
+    proposed_write = {
+        "project_id": created["project_id"],
+        "backlog_id": created["backlog_id"],
+        "contract_execution_id": created["contract_execution_id"],
+        "definition_hash": created["definition_hash"],
+        "instruction_bundle_hash": created["instruction_bundle_hash"],
+        "execution_state_revision": created["execution_state_revision"],
+        "runtime_guide_hash": created["runtime_guide"]["runtime_guide_hash"],
+        "stage_id": "implementation",
+        "line_id": "observer_implementation",
+        "actor_role": "observer",
+        "evidence_kind": "implementation",
+    }
+    precheck = runtime.precheck_line_write(
+        created["contract_execution_id"],
+        proposed_write,
+        actor_role="observer",
+    )
+    assert precheck["ok"] is True
+    assert precheck["would_mutate_completed_lines"] is False
+    assert (
+        precheck["record"]["authoritative_common_rule_join"]["authority_hash"]
+        == join["authority_hash"]
+    )
+
+    written = runtime.submit_line_write(
+        created["contract_execution_id"],
+        proposed_write,
+        actor_role="observer",
+    )
+    assert written["ok"] is True
+    assert (
+        written["record"]["authoritative_common_rule_join"]["authority_hash"]
+        == join["authority_hash"]
+    )
+    assert precheck["decision"] == written["decision"]
+
+
+def test_contract_runtime_rejects_digest_mismatch_before_execution_mutation(
+    tmp_path,
+):
+    package_registry = ContractDefinitionRegistry()
+    payload = _common_rule_bound_definition(
+        package_registry,
+        package_digest="sha256:wrong",
+    )
+    (tmp_path / "common_rule_bound_runtime_test.v1.rev1.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path))
+
+    with pytest.raises(ContractCommonRuleApplicabilityError) as raised:
+        runtime.start_execution(
+            "common_rule_bound_runtime_test",
+            project_id="aming-claw",
+            backlog_id="AC-COMMON-RULE-RUNTIME-DIGEST-MISMATCH",
+            actor_role="observer",
+        )
+
+    assert raised.value.to_dict()["code"] == (
+        "common_rule_applicability_digest_mismatch"
+    )
+    assert runtime.store._records == {}
 
 
 @pytest.mark.parametrize(

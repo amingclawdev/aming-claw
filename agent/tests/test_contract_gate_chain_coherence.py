@@ -129,10 +129,17 @@ def test_direct_main_runtime_order_and_qa_role_gate_are_definition_derived() -> 
 
 
 def test_direct_main_dependency_join_is_explicit_and_uniformly_fail_closed() -> None:
-    definition = _direct_definition()
+    registry = ContractDefinitionRegistry()
+    definition = registry.get(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev1",
+    )
     template = get_contract_template("operator_supervised_direct_main.v1")
     definition_join = definition["metadata"]["common_rule_applicability"]
     template_join = template["common_rule_applicability"]
+    package = registry.common_rule_package()
+    resolved_join = registry.resolve_common_rule_applicability(definition)
 
     expected_join = {
         "schema_version": "contract_common_rule_applicability.unresolved.v1",
@@ -164,6 +171,13 @@ def test_direct_main_dependency_join_is_explicit_and_uniformly_fail_closed() -> 
     assert template["activation_policy"]["result"] == (
         definition["metadata"]["activation"]["result"]
     )
+    assert package["package_id"] == "aming-claw.common-safety"
+    assert package["package_version"] == "v1"
+    assert len(package["rule_ids"]) == 10
+    assert resolved_join["join_state"] == "unresolved"
+    assert resolved_join["authoritative"] is False
+    assert resolved_join["rule_ids"] == []
+    assert resolved_join["server_inference_allowed"] is False
 
 
 def test_direct_main_terminal_and_retry_policy_forbid_in_place_repair() -> None:

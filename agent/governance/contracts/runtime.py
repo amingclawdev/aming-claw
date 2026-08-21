@@ -2676,6 +2676,42 @@ def _contract_runtime_features_for_record(
     return _contract_runtime_features(definition)
 
 
+def _bind_authoritative_common_rule_join_to_state(
+    state: dict[str, Any],
+    join: Mapping[str, Any],
+) -> None:
+    """Bind the exact Rule authority set before execution-state hashing."""
+
+    if join.get("authoritative") is not True:
+        return
+    state["authoritative_common_rule_join"] = deepcopy(dict(join))
+    state["execution_state_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in state.items()
+            if key != "execution_state_hash"
+        }
+    )
+
+
+def _bind_authoritative_common_rule_join_to_guide(
+    guide: dict[str, Any],
+    join: Mapping[str, Any],
+) -> None:
+    """Expose the same join to every precheck/write Guide projection."""
+
+    if join.get("authoritative") is not True:
+        return
+    guide["authoritative_common_rule_join"] = deepcopy(dict(join))
+    guide["runtime_guide_hash"] = stable_sha256(
+        {
+            key: value
+            for key, value in guide.items()
+            if key != "runtime_guide_hash"
+        }
+    )
+
+
 _LEGACY_WORKER_GRAPH_CONTEXT_COMPAT_ERRORS = {
     "worker_graph_context requires non-empty graph_trace_ids",
     "worker_graph_context requires db_verified graph_trace_evidence",
@@ -8411,6 +8447,9 @@ class ContractRuntime:
             version=version,
             requested_revision=revision,
         )
+        common_rule_join = self.registry.resolve_common_rule_applicability(
+            definition
+        )
         if not is_new_execution_allowed(definition):
             lifecycle = (definition.get("metadata") or {}).get("lifecycle") or {}
             if (
@@ -8436,6 +8475,7 @@ class ContractRuntime:
                 "contract_chain_id": contract_chain_id,
                 "route_token_ref": route_token_ref,
                 "parent_contract": parent_contract,
+                "authoritative_common_rule_join": common_rule_join,
             },
         )
         if start_precheck.decision == "block" and _enforce_start_precheck(definition):
@@ -8467,11 +8507,16 @@ class ContractRuntime:
             route_token_ref=route_token_ref,
             instruction_bundle_hash=instruction_bundle["instruction_bundle_hash"],
         )
+        _bind_authoritative_common_rule_join_to_state(state, common_rule_join)
         guide = compile_runtime_guide(
             definition,
             state,
             instruction_bundle=instruction_bundle,
             judgment_hints=judgment_hints,
+        )
+        _bind_authoritative_common_rule_join_to_guide(
+            guide,
+            common_rule_join,
         )
         _attach_completed_line_evidence(guide, [])
         _attach_precheck_decision(guide, start_precheck.to_dict())
@@ -8504,6 +8549,7 @@ class ContractRuntime:
             "backlog_lineage": dict(backlog_lineage or {}),
             "metadata": dict(metadata or {}),
             "contract_runtime_features": _contract_runtime_features(definition),
+            "authoritative_common_rule_join": deepcopy(common_rule_join),
         }
         return self.store.create(record)
 
@@ -8632,6 +8678,10 @@ class ContractRuntime:
         projection: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         definition = self._load_pinned_definition(record)
+        common_rule_join = self._authoritative_common_rule_join(
+            record,
+            definition,
+        )
         instruction_bundle = resolve_instruction_bundle(
             definition,
             root=self.instruction_root,
@@ -8667,11 +8717,16 @@ class ContractRuntime:
             instruction_bundle_hash=str(record.get("instruction_bundle_hash") or ""),
             execution_state_revision=int(record.get("execution_state_revision") or 1),
         )
+        _bind_authoritative_common_rule_join_to_state(state, common_rule_join)
         guide = compile_runtime_guide(
             definition,
             state,
             instruction_bundle=instruction_bundle,
             judgment_hints=_record_judgment_hints(record),
+        )
+        _bind_authoritative_common_rule_join_to_guide(
+            guide,
+            common_rule_join,
         )
         terminal_disposition = _audited_bypass_terminal_disposition(
             {**dict(record), "completed_lines": line_items}
@@ -8796,6 +8851,7 @@ class ContractRuntime:
                     "root_contract_execution_id": record.get("root_contract_execution_id"),
                     "contract_chain_id": record.get("contract_chain_id"),
                     "route_token_ref": record.get("route_token_ref"),
+                    "authoritative_common_rule_join": common_rule_join,
                 },
             )
         _attach_precheck_decision(guide, current_precheck.to_dict())
@@ -8804,6 +8860,7 @@ class ContractRuntime:
         view["execution_state"] = state
         view["runtime_guide"] = guide
         view["precheck_decision"] = current_precheck.to_dict()
+        view["authoritative_common_rule_join"] = deepcopy(common_rule_join)
         if sanitized_projection:
             view["completed_lines_projection"] = sanitized_projection
             view["projected_completed_lines_count"] = len(line_items)
@@ -10640,7 +10697,31 @@ class ContractRuntime:
                 record=record,
                 definition=definition,
             )
+        self._authoritative_common_rule_join(record, definition)
         return definition
+
+    def _authoritative_common_rule_join(
+        self,
+        record: Mapping[str, Any],
+        definition: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        resolved = self.registry.resolve_common_rule_applicability(definition)
+        pinned = record.get("authoritative_common_rule_join")
+        if isinstance(pinned, Mapping):
+            _assert_hash(
+                "common_rule_authority_hash",
+                pinned.get("authority_hash"),
+                resolved.get("authority_hash"),
+                record=record,
+                definition=definition,
+            )
+        elif resolved.get("authoritative") is True:
+            raise ContractRuntimeError(
+                "common_rule_authority_join_missing_from_pinned_execution: "
+                "a resolved common Rule join must be pinned when the execution "
+                "is created; historical evidence is not backfilled"
+            )
+        return resolved
 
     def _terminal_retirement_for_record(
         self,

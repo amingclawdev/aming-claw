@@ -3,6 +3,164 @@
   "template_id": "mf_workflow_runtime.v1",
   "version": "v1",
   "description": "Contract for deterministic MF workflow workers that call a unified local precheck/gate service for each privileged stage.",
+  "common_rule_package": {
+    "schema_version": "contract_common_rule_package.v1",
+    "package_id": "aming-claw.common-safety",
+    "package_version": "v1",
+    "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603",
+    "digest_scope": "canonical package object excluding package_digest and derived rule_ids",
+    "authority_model": {
+      "contract_join_required": true,
+      "omitted_rules_apply": false,
+      "server_inference_allowed": false,
+      "guide_fallback_allowed": false,
+      "historical_evidence_relabel_allowed": false
+    },
+    "rules": [
+      {
+        "rule_id": "AC-COMMON-IDENTITY-PROJECT-BACKLOG-TASK",
+        "scope": "execution_identity",
+        "statement": "Project, backlog, task, parent-task, and Contract execution identities must be explicit and equal to their source-backed bindings.",
+        "admitted_fact_selectors": [
+          "project_id",
+          "backlog_id",
+          "task_id",
+          "parent_task_id",
+          "contract_execution_id"
+        ],
+        "gate_obligation": "Reject missing, ambiguous, or unequal execution identity before mutation."
+      },
+      {
+        "rule_id": "AC-COMMON-IDENTITY-ROUTE",
+        "scope": "route_identity",
+        "statement": "Every protected action must consume the exact active route id, route-context hash, prompt Contract identity, visible-injection manifest hash, and copy-safe route token reference.",
+        "admitted_fact_selectors": [
+          "route_id",
+          "route_context_hash",
+          "prompt_contract_id",
+          "prompt_contract_hash",
+          "visible_injection_manifest_hash",
+          "route_token_ref"
+        ],
+        "gate_obligation": "Reject absent, expired, replayed, cross-task, or scope-mismatched route authority before mutation."
+      },
+      {
+        "rule_id": "AC-COMMON-SCOPE-OWNED-FILES",
+        "scope": "file_fence",
+        "statement": "Requested, owned, changed, and commit-diff files must remain inside the immutable row and worker file fence.",
+        "admitted_fact_selectors": [
+          "target_files",
+          "owned_files",
+          "changed_files",
+          "commit_diff_files",
+          "dirty_files"
+        ],
+        "gate_obligation": "Reject unknown ownership, an unexpected path, or a dirty-scope mismatch before mutation, merge, or close."
+      },
+      {
+        "rule_id": "AC-COMMON-WORKTREE-EXACT-IDENTITY",
+        "scope": "worktree_identity",
+        "statement": "Worker evidence and graph queries must bind the assigned physical worktree root, branch, base, target HEAD, runtime context, worker slot, and fence.",
+        "admitted_fact_selectors": [
+          "target_project_root",
+          "worktree_path",
+          "branch_ref",
+          "base_commit",
+          "target_head_commit",
+          "runtime_context_id",
+          "worker_slot_id",
+          "fence_token_hash"
+        ],
+        "gate_obligation": "Reject canonical-root substitution, stale HEAD, foreign branch, missing physical worktree, or fence mismatch."
+      },
+      {
+        "rule_id": "AC-COMMON-CREDENTIAL-NO-RAW-PERSISTENCE",
+        "scope": "credential_hygiene",
+        "statement": "Raw route, session, QA, governance, and fence credentials must remain process-local and must never be persisted in Contract, timeline, backlog, graph, Guide, or artifact evidence.",
+        "admitted_fact_selectors": [
+          "route_token_ref",
+          "session_token_ref",
+          "qa_session_token_ref",
+          "fence_token_hash",
+          "raw_token_field_scan"
+        ],
+        "gate_obligation": "Reject raw credential-shaped fields and expose only copy-safe opaque references or hashes."
+      },
+      {
+        "rule_id": "AC-COMMON-COMMIT-IMMUTABLE-WORKER",
+        "scope": "candidate_custody",
+        "statement": "Implementation custody must name one immutable worker-authored commit whose tree, diff, owned files, lineage, and clean-worktree evidence agree.",
+        "admitted_fact_selectors": [
+          "worker_commit_sha",
+          "immutable_head_commit",
+          "commit_diff_files",
+          "owned_files",
+          "worker_implementation_lineage",
+          "clean_worktree"
+        ],
+        "gate_obligation": "Reject observer-authored worker evidence, mutable or missing commits, lineage mismatch, and candidate-diff escape."
+      },
+      {
+        "rule_id": "AC-COMMON-QA-ROLE-SEPARATION",
+        "scope": "independent_verification",
+        "statement": "Independent QA evidence must be authored by the QA role in its own authenticated session against the exact candidate or landed comparison base.",
+        "admitted_fact_selectors": [
+          "actor_role",
+          "qa_session_token_ref",
+          "commit_sha",
+          "comparison_base_commit_sha",
+          "test_results",
+          "graph_trace_ids"
+        ],
+        "gate_obligation": "Reject self-attestation, wrong-role evidence, ambiguous comparison base, fabricated PASS, or stale graph context."
+      },
+      {
+        "rule_id": "AC-COMMON-MERGE-ORDERED",
+        "scope": "canonical_landing",
+        "statement": "Canonical landing must follow source-backed merge authority, required worker fan-in, deterministic merge order, exact target-HEAD checks, and append-only merge receipts.",
+        "admitted_fact_selectors": [
+          "merge_queue_id",
+          "required_worker_ids",
+          "worker_commit_shas",
+          "merge_order",
+          "target_head_commit",
+          "merge_receipts"
+        ],
+        "gate_obligation": "Reject missing fan-in, unauthorized or out-of-order merge, moved target HEAD, duplicate non-idempotent landing, or bypass-only authority."
+      },
+      {
+        "rule_id": "AC-COMMON-GRAPH-EXACT-ACTIVE-PREFLIGHT",
+        "scope": "graph_and_preflight",
+        "statement": "Architecture, QA, reconcile, and close claims must use DB-verified graph traces and an exact active full snapshot at the claimed immutable HEAD.",
+        "admitted_fact_selectors": [
+          "graph_trace_ids",
+          "snapshot_id",
+          "snapshot_kind",
+          "active_snapshot_id",
+          "graph_snapshot_commit",
+          "head_commit",
+          "preflight_ok"
+        ],
+        "gate_obligation": "Reject unverified traces, stale or partial graph basis, candidate/canonical root substitution, or failed preflight."
+      },
+      {
+        "rule_id": "AC-COMMON-CLOSE-INTEGRITY",
+        "scope": "terminal_close",
+        "statement": "Close requires exact implementation custody, independent QA, canonical landing where applicable, deployed runtime identity, current full reconcile, acceptance-scope coverage, and truthful terminal status.",
+        "admitted_fact_selectors": [
+          "implementation_commit",
+          "qa_evidence",
+          "merge_receipts",
+          "runtime_sync",
+          "live_regression",
+          "full_reconcile_snapshot",
+          "acceptance_criteria",
+          "terminal_status"
+        ],
+        "gate_obligation": "Reject scope gaps, stale deployment, missing current-world evidence, no-PASS laundering, historical backfill, or close authority inferred from bypass."
+      }
+    ]
+  },
   "task_types": [
     "mf_parallel",
     "mf_workflow",

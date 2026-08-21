@@ -25,6 +25,11 @@ from .schema import (
 
 
 DEFAULT_DEFINITION_DIR = Path(__file__).resolve().parent.parent / "contract_definitions"
+DEFAULT_COMMON_RULE_PACKAGE_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "contract_templates"
+    / "mf_workflow_runtime.v1.json"
+)
 CONTRACT_REGISTRY_RUNTIME_VERSION = "contract_registry.v1"
 _UNSET = object()
 
@@ -90,6 +95,46 @@ class ContractDependencyUnresolvedError(ContractDefinitionError):
         return payload
 
 
+class ContractCommonRuleApplicabilityError(ContractDefinitionError):
+    """Typed zero-write denial for an invalid explicit common-Rule join."""
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        definition: Mapping[str, Any],
+        field: str,
+        expected: Any,
+        actual: Any,
+    ) -> None:
+        self.code = code
+        self.definition = deepcopy(dict(definition))
+        self.field = field
+        self.expected = deepcopy(expected)
+        self.actual = deepcopy(actual)
+        super().__init__(
+            f"{code}: {field} expected {expected!r}, got {actual!r}"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "contract_common_rule_applicability_error.v1",
+            "code": self.code,
+            "error": self.code,
+            "status": "rejected",
+            "classification": "contract_authority_join",
+            "field": self.field,
+            "expected": deepcopy(self.expected),
+            "actual": deepcopy(self.actual),
+            "contract_id": str(self.definition.get("contract_id") or ""),
+            "version": str(self.definition.get("version") or ""),
+            "revision": str(self.definition.get("revision") or ""),
+            "authorizes_write": False,
+            "mutation_performed": False,
+            "server_inference_allowed": False,
+        }
+
+
 class ContractDefinitionRegistry:
     """Registry for source-controlled contract definition config files."""
 
@@ -98,8 +143,10 @@ class ContractDefinitionRegistry:
         root: str | Path = DEFAULT_DEFINITION_DIR,
         *,
         loaded_at: str | None = None,
+        common_rule_package_path: str | Path = DEFAULT_COMMON_RULE_PACKAGE_PATH,
     ):
         self.root = Path(root)
+        self.common_rule_package_path = Path(common_rule_package_path)
         self.loaded_at = loaded_at or _utc_now()
         self._loaded_at_override = loaded_at is not None
         self._snapshot_lock = RLock()
@@ -283,7 +330,261 @@ class ContractDefinitionRegistry:
             return retirement
         if _unresolved_activation_dependency(selected):
             raise ContractDependencyUnresolvedError(selected)
+        self.resolve_common_rule_applicability(selected)
         return selected
+
+    def common_rule_package(self) -> dict[str, Any]:
+        """Load and verify the one source-backed common safety Rule package."""
+
+        if not self.common_rule_package_path.is_file():
+            raise ContractDefinitionError(
+                "common Rule package source is missing: "
+                f"{self.common_rule_package_path}"
+            )
+        source = _load_json(self.common_rule_package_path)
+        package = source.get("common_rule_package")
+        if not isinstance(package, Mapping):
+            raise ContractDefinitionError(
+                "common Rule package source must declare common_rule_package"
+            )
+        normalized = deepcopy(dict(package))
+        if normalized.get("schema_version") != "contract_common_rule_package.v1":
+            raise ContractDefinitionError(
+                "common Rule package schema_version must be "
+                "contract_common_rule_package.v1"
+            )
+        for field in ("package_id", "package_version", "package_digest"):
+            if not str(normalized.get(field) or "").strip():
+                raise ContractDefinitionError(
+                    f"common Rule package requires non-empty {field}"
+                )
+        rules = normalized.get("rules")
+        if not isinstance(rules, list) or not rules:
+            raise ContractDefinitionError(
+                "common Rule package requires at least one rule"
+            )
+        rule_ids: list[str] = []
+        for index, rule in enumerate(rules):
+            if not isinstance(rule, Mapping):
+                raise ContractDefinitionError(
+                    f"common Rule package rules[{index}] must be an object"
+                )
+            rule_id = str(rule.get("rule_id") or "").strip()
+            if not rule_id:
+                raise ContractDefinitionError(
+                    f"common Rule package rules[{index}] requires rule_id"
+                )
+            if rule_id in rule_ids:
+                raise ContractDefinitionError(
+                    f"duplicate common Rule rule_id: {rule_id}"
+                )
+            if not str(rule.get("statement") or "").strip():
+                raise ContractDefinitionError(
+                    f"common Rule {rule_id} requires statement"
+                )
+            selectors = rule.get("admitted_fact_selectors")
+            if not isinstance(selectors, list) or not selectors:
+                raise ContractDefinitionError(
+                    f"common Rule {rule_id} requires admitted_fact_selectors"
+                )
+            rule_ids.append(rule_id)
+        expected_digest = _common_rule_package_digest(normalized)
+        actual_digest = str(normalized.get("package_digest") or "")
+        if actual_digest != expected_digest:
+            raise ContractDefinitionError(
+                "common Rule package digest mismatch: "
+                f"expected {expected_digest}, got {actual_digest}"
+            )
+        normalized["rule_ids"] = rule_ids
+        return normalized
+
+    def resolve_common_rule_applicability(
+        self,
+        definition: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve only an explicit Contract join; never infer by work type."""
+
+        metadata = definition.get("metadata")
+        raw_join = (
+            metadata.get("common_rule_applicability")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        if raw_join is None:
+            projection = {
+                "schema_version": "contract_common_rule_authority_join.v1",
+                "declared": False,
+                "join_state": "not_declared",
+                "authoritative": False,
+                "package_id": "",
+                "package_version": "",
+                "package_digest": "",
+                "rule_ids": [],
+                "rules": [],
+                "scopes": [],
+                "omitted_rules_apply": False,
+                "server_inference_allowed": False,
+                "activation_allowed": True,
+            }
+            projection["authority_hash"] = stable_sha256(projection)
+            return projection
+        if not isinstance(raw_join, Mapping):
+            raise self._common_rule_join_error(
+                definition,
+                code="common_rule_applicability_invalid",
+                field="metadata.common_rule_applicability",
+                expected="object",
+                actual=type(raw_join).__name__,
+            )
+
+        join = deepcopy(dict(raw_join))
+        join_state = str(join.get("join_state") or "").strip()
+        if join_state == "unresolved":
+            projection = {
+                "schema_version": "contract_common_rule_authority_join.v1",
+                "declared": True,
+                "join_state": "unresolved",
+                "authoritative": False,
+                "package_id": str(join.get("package_id") or ""),
+                "package_version": str(join.get("package_version") or ""),
+                "package_digest": str(join.get("package_digest") or ""),
+                "rule_ids": list(join.get("rule_ids") or []),
+                "rules": [],
+                "scopes": list(join.get("scopes") or []),
+                "omitted_rules_apply": False,
+                "server_inference_allowed": False,
+                "activation_allowed": False,
+            }
+            projection["authority_hash"] = stable_sha256(projection)
+            return projection
+        if join_state != "resolved":
+            raise self._common_rule_join_error(
+                definition,
+                code="common_rule_applicability_state_invalid",
+                field="metadata.common_rule_applicability.join_state",
+                expected="resolved|unresolved",
+                actual=join_state,
+            )
+
+        package = self.common_rule_package()
+        for field in ("package_id", "package_version", "package_digest"):
+            actual = str(join.get(field) or "").strip()
+            expected = str(package.get(field) or "")
+            if not actual:
+                raise self._common_rule_join_error(
+                    definition,
+                    code="common_rule_applicability_field_missing",
+                    field=f"metadata.common_rule_applicability.{field}",
+                    expected=expected,
+                    actual=actual,
+                )
+            if actual != expected:
+                code = (
+                    "common_rule_applicability_digest_mismatch"
+                    if field == "package_digest"
+                    else "common_rule_applicability_package_unknown"
+                )
+                raise self._common_rule_join_error(
+                    definition,
+                    code=code,
+                    field=f"metadata.common_rule_applicability.{field}",
+                    expected=expected,
+                    actual=actual,
+                )
+
+        rule_ids = join.get("rule_ids")
+        if not isinstance(rule_ids, list) or not rule_ids:
+            raise self._common_rule_join_error(
+                definition,
+                code="common_rule_applicability_field_missing",
+                field="metadata.common_rule_applicability.rule_ids",
+                expected="non-empty unique list",
+                actual=rule_ids,
+            )
+        normalized_rule_ids = [str(value or "").strip() for value in rule_ids]
+        if any(not value for value in normalized_rule_ids) or len(
+            normalized_rule_ids
+        ) != len(set(normalized_rule_ids)):
+            raise self._common_rule_join_error(
+                definition,
+                code="common_rule_applicability_rule_ids_invalid",
+                field="metadata.common_rule_applicability.rule_ids",
+                expected="non-empty unique rule_ids",
+                actual=normalized_rule_ids,
+            )
+        available = {
+            str(rule.get("rule_id") or ""): deepcopy(dict(rule))
+            for rule in package["rules"]
+        }
+        unknown = [rule_id for rule_id in normalized_rule_ids if rule_id not in available]
+        if unknown:
+            raise self._common_rule_join_error(
+                definition,
+                code="common_rule_applicability_rule_unknown",
+                field="metadata.common_rule_applicability.rule_ids",
+                expected=package["rule_ids"],
+                actual=unknown,
+            )
+        scopes = join.get("scopes")
+        if not isinstance(scopes, list) or not scopes:
+            raise self._common_rule_join_error(
+                definition,
+                code="common_rule_applicability_field_missing",
+                field="metadata.common_rule_applicability.scopes",
+                expected="non-empty list",
+                actual=scopes,
+            )
+        for field in ("omitted_rules_apply", "server_inference_allowed"):
+            if join.get(field) is not False:
+                raise self._common_rule_join_error(
+                    definition,
+                    code="common_rule_applicability_inference_forbidden",
+                    field=f"metadata.common_rule_applicability.{field}",
+                    expected=False,
+                    actual=join.get(field),
+                )
+        if join.get("activation_allowed") is not True:
+            raise self._common_rule_join_error(
+                definition,
+                code="common_rule_applicability_activation_denied",
+                field="metadata.common_rule_applicability.activation_allowed",
+                expected=True,
+                actual=join.get("activation_allowed"),
+            )
+        projection = {
+            "schema_version": "contract_common_rule_authority_join.v1",
+            "declared": True,
+            "join_state": "resolved",
+            "authoritative": True,
+            "package_id": package["package_id"],
+            "package_version": package["package_version"],
+            "package_digest": package["package_digest"],
+            "rule_ids": normalized_rule_ids,
+            "rules": [available[rule_id] for rule_id in normalized_rule_ids],
+            "scopes": [str(value or "").strip() for value in scopes],
+            "omitted_rules_apply": False,
+            "server_inference_allowed": False,
+            "activation_allowed": True,
+        }
+        projection["authority_hash"] = stable_sha256(projection)
+        return projection
+
+    @staticmethod
+    def _common_rule_join_error(
+        definition: Mapping[str, Any],
+        *,
+        code: str,
+        field: str,
+        expected: Any,
+        actual: Any,
+    ) -> ContractCommonRuleApplicabilityError:
+        return ContractCommonRuleApplicabilityError(
+            code=code,
+            definition=definition,
+            field=field,
+            expected=expected,
+            actual=actual,
+        )
 
     def validate_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         return normalize_definition(payload)
@@ -398,6 +699,17 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ContractDefinitionError(f"{path.name}: root must be an object")
     return payload
+
+
+def _common_rule_package_digest(package: Mapping[str, Any]) -> str:
+    """Hash package semantics without creating a self-referential digest."""
+
+    semantic_package = {
+        str(key): deepcopy(value)
+        for key, value in package.items()
+        if str(key) not in {"package_digest", "rule_ids"}
+    }
+    return stable_sha256(semantic_package)
 
 
 def _load_json_bytes(path: Path, source_bytes: bytes) -> dict[str, Any]:

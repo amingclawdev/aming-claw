@@ -18,6 +18,7 @@ from agent.governance.contracts import (
 )
 from agent.governance.contracts.hash import file_sha256, stable_sha256
 from agent.governance.contracts.registry import (
+    ContractCommonRuleApplicabilityError,
     ContractDependencyUnresolvedError,
     UnknownContractDefinitionError,
 )
@@ -101,6 +102,132 @@ def _governance_hints(*, operation="bind"):
             "target_module": "agent.governance.contracts.registry",
         }],
     }
+
+
+EXPECTED_COMMON_SAFETY_RULE_IDS = [
+    "AC-COMMON-IDENTITY-PROJECT-BACKLOG-TASK",
+    "AC-COMMON-IDENTITY-ROUTE",
+    "AC-COMMON-SCOPE-OWNED-FILES",
+    "AC-COMMON-WORKTREE-EXACT-IDENTITY",
+    "AC-COMMON-CREDENTIAL-NO-RAW-PERSISTENCE",
+    "AC-COMMON-COMMIT-IMMUTABLE-WORKER",
+    "AC-COMMON-QA-ROLE-SEPARATION",
+    "AC-COMMON-MERGE-ORDERED",
+    "AC-COMMON-GRAPH-EXACT-ACTIVE-PREFLIGHT",
+    "AC-COMMON-CLOSE-INTEGRITY",
+]
+
+
+def _resolved_common_rule_join(registry, *, rule_ids=None, **overrides):
+    package = registry.common_rule_package()
+    join = {
+        "schema_version": "contract_common_rule_applicability.v1",
+        "join_state": "resolved",
+        "package_id": package["package_id"],
+        "package_version": package["package_version"],
+        "package_digest": package["package_digest"],
+        "rule_ids": list(rule_ids or package["rule_ids"]),
+        "scopes": ["direct_main"],
+        "omitted_rules_apply": False,
+        "server_inference_allowed": False,
+        "activation_allowed": True,
+    }
+    join.update(overrides)
+    return join
+
+
+def test_common_safety_rule_package_is_source_backed_versioned_and_digestable():
+    registry = ContractDefinitionRegistry()
+    package = registry.common_rule_package()
+
+    assert package["schema_version"] == "contract_common_rule_package.v1"
+    assert package["package_id"] == "aming-claw.common-safety"
+    assert package["package_version"] == "v1"
+    assert package["package_digest"].startswith("sha256:")
+    assert package["rule_ids"] == EXPECTED_COMMON_SAFETY_RULE_IDS
+    assert all(rule["statement"] for rule in package["rules"])
+    assert all(rule["admitted_fact_selectors"] for rule in package["rules"])
+
+
+def test_missing_common_rule_join_never_infers_authority_from_contract_type():
+    registry = ContractDefinitionRegistry()
+    projection = registry.resolve_common_rule_applicability(
+        _definition(contract_type="mf_parallel")
+    )
+
+    assert projection["declared"] is False
+    assert projection["join_state"] == "not_declared"
+    assert projection["authoritative"] is False
+    assert projection["rule_ids"] == []
+    assert projection["omitted_rules_apply"] is False
+    assert projection["server_inference_allowed"] is False
+
+
+def test_explicit_common_rule_join_resolves_only_named_rules_and_scopes():
+    registry = ContractDefinitionRegistry()
+    selected_rule_ids = EXPECTED_COMMON_SAFETY_RULE_IDS[:3]
+    definition = _definition(
+        metadata={
+            "common_rule_applicability": _resolved_common_rule_join(
+                registry,
+                rule_ids=selected_rule_ids,
+            )
+        }
+    )
+
+    projection = registry.resolve_common_rule_applicability(definition)
+
+    assert projection["declared"] is True
+    assert projection["join_state"] == "resolved"
+    assert projection["authoritative"] is True
+    assert projection["rule_ids"] == selected_rule_ids
+    assert [rule["rule_id"] for rule in projection["rules"]] == selected_rule_ids
+    assert projection["scopes"] == ["direct_main"]
+    assert projection["authority_hash"].startswith("sha256:")
+
+
+@pytest.mark.parametrize(
+    ("join_patch", "code", "field"),
+    [
+        (
+            {"package_digest": ""},
+            "common_rule_applicability_field_missing",
+            "metadata.common_rule_applicability.package_digest",
+        ),
+        (
+            {"package_digest": "sha256:wrong"},
+            "common_rule_applicability_digest_mismatch",
+            "metadata.common_rule_applicability.package_digest",
+        ),
+        (
+            {"rule_ids": ["AC-COMMON-UNKNOWN"]},
+            "common_rule_applicability_rule_unknown",
+            "metadata.common_rule_applicability.rule_ids",
+        ),
+    ],
+)
+def test_invalid_explicit_common_rule_join_fails_with_expected_actual(
+    join_patch,
+    code,
+    field,
+):
+    registry = ContractDefinitionRegistry()
+    join = _resolved_common_rule_join(registry)
+    join.update(join_patch)
+    definition = _definition(
+        metadata={"common_rule_applicability": join}
+    )
+
+    with pytest.raises(ContractCommonRuleApplicabilityError) as raised:
+        registry.resolve_common_rule_applicability(definition)
+
+    error = raised.value.to_dict()
+    assert error["code"] == code
+    assert error["field"] == field
+    assert "expected" in error
+    assert "actual" in error
+    assert error["authorizes_write"] is False
+    assert error["mutation_performed"] is False
 
 
 def test_registry_loads_definition_with_hash_and_alias(tmp_path):
