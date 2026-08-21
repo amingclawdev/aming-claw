@@ -150334,6 +150334,18 @@ def _mf_parallel_terminal_supersession_lane_records(
     ]
     if len(policy_lanes) != 2:
         return []
+    forbidden_materialization_fields = {
+        "runtime_context_id",
+        "worktree_path",
+        "branch",
+        "branch_ref",
+        "merge_queue_id",
+        "fence_token",
+        "fence_token_verifier",
+        "session_token",
+        "session_token_hash",
+        "session_token_ref",
+    }
     verified: list[dict[str, Any]] = []
     for reservation, lane in zip(reservations, policy_lanes, strict=True):
         if not isinstance(reservation, Mapping):
@@ -150366,6 +150378,7 @@ def _mf_parallel_terminal_supersession_lane_records(
             and reservation.get("fresh_generation") == 1
             and reservation.get("allocation_authority")
             == "parallel_branch_allocate_precheck"
+            and forbidden_materialization_fields.isdisjoint(reservation)
             and sorted(reservation.get("owned_files") or [])
             == sorted(str(value or "") for value in lane.get("owned_files") or [])
             and str(reservation.get("reservation_hash") or "")
