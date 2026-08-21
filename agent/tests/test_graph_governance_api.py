@@ -163334,6 +163334,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
     worker_claim_overrides: Mapping[str, Any] | None = None,
     observer_claim_overrides: Mapping[str, Any] | None = None,
     observer_decision_source: str = "route_token_gate",
+    implementation_status: str = "passed",
 ) -> dict[str, str]:
     if prepare_backlog:
         _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -163620,7 +163621,7 @@ def _record_parentless_direct_main_failed_qa_route_lineage(
         event_type=implementation_event_type,
         event_kind="implementation",
         phase="implementation",
-        status="passed",
+        status=implementation_status,
         actor=implementation_actor,
         commit_sha=commit_sha,
         payload=implementation_payload,
@@ -163789,6 +163790,97 @@ def test_exact_candidate_observer_direct_main_accepts_route_action_scope_lineage
         backlog_id=backlog_id,
         task_id=lineage["task_id"],
     )
+
+
+def test_exact_candidate_observer_direct_main_reuses_canonical_passing_status(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    fixture = create_parallel_fixture_project(
+        tmp_path,
+        name="direct-main-canonical-passing-status",
+    )
+    project_root = fixture.root
+    base_commit = fixture.main_head
+    (project_root / "src" / "direct_main.py").write_text(
+        "DIRECT_MAIN_STATUS = 'accepted'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "src/direct_main.py"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "direct-main accepted status candidate"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    backlog_id = "AC-DIRECT-MAIN-EXACT-CANONICAL-PASSING-STATUS"
+    lineage = _record_parentless_direct_main_failed_qa_route_lineage(
+        conn,
+        backlog_id=backlog_id,
+        record_failed_qa=False,
+        observer_authoritative_implementation=True,
+        implementation_commit_sha=candidate_commit,
+        implementation_status="accepted",
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    proof = {
+        "backlog_id": backlog_id,
+        "task_id": lineage["task_id"],
+        "commit_sha": candidate_commit,
+    }
+
+    assert server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=proof,
+    ) == {
+        "commit_sha": base_commit,
+        "source": server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
+        "lineage_source": server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE,
+    }
+
+    implementation_id = int(
+        lineage["implementation_event_ref"].split(":", 1)[1]
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET status = 'blocked' WHERE id = ?",
+        (implementation_id,),
+    )
+    conn.commit()
+    rejected = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=proof,
+    )
+    assert rejected["machine_reason"] == (
+        "exact_candidate_direct_main_implementation_missing"
+    )
+    assert rejected["identity_mismatches"] == [
+        {
+            "field": "authoritative_implementation_event_count",
+            "expected": 1,
+            "actual": 0,
+        }
+    ]
 
 
 @pytest.mark.parametrize(

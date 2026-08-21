@@ -133211,6 +133211,8 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
 ) -> bool:
     """Accept one canonical, server-gated observer Direct Main implementation."""
 
+    from . import task_timeline
+
     payload = (
         event.get("payload")
         if isinstance(event.get("payload"), Mapping)
@@ -133424,7 +133426,7 @@ def _qa_exact_candidate_direct_main_observer_implementation_is_authoritative(
         == "observer.implementation"
         and str(event.get("event_kind") or "").strip() == "implementation"
         and str(event.get("phase") or "").strip() == "implementation"
-        and str(event.get("status") or "").strip().lower() == "passed"
+        and task_timeline._event_passed(dict(event))
         and str(event.get("actor") or "").strip() == "observer"
         and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha)
         and not _qa_request_has_impersonation_claim(event)
