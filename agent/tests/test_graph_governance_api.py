@@ -159486,6 +159486,96 @@ def test_runtime_context_graph_guide_safe_ref_only_host_realization_warranty():
     ]
 
 
+@pytest.mark.parametrize(
+    "legacy_auth_shape",
+    [
+        {
+            "session_token": "legacy-session-placeholder-sentinel",
+            "fence_token": "env:AMING_WORKER_FENCE_TOKEN",
+        },
+        {
+            "route_token": {"raw": "legacy-route-token-sentinel"},
+            "qa_session_token": "legacy-qa-token-placeholder-sentinel",
+        },
+        {
+            "session_token": "legacy-raw-session-sentinel",
+            "fence_token": "legacy-raw-fence-sentinel",
+            "route_token": "legacy-raw-route-sentinel",
+            "qa_session_token": "legacy-raw-qa-sentinel",
+        },
+    ],
+    ids=("env-placeholders", "route-and-qa", "all-raw-auth"),
+)
+def test_runtime_context_graph_guide_public_body_replacement_parity_warranty(
+    legacy_auth_shape,
+):
+    route_identity = {
+        "route_id": "route-graph-guide-parity-warranty",
+        "route_context_hash": "sha256:" + "4" * 64,
+        "prompt_contract_id": "rprompt-graph-guide-parity-warranty",
+        "prompt_contract_hash": "sha256:" + "5" * 64,
+        "route_token_ref": "rtok-graph-guide-parity-warranty",
+        "visible_injection_manifest_hash": "sha256:" + "6" * 64,
+    }
+    body = server._runtime_context_graph_copy_safe_body(
+        project_id=PID,
+        runtime_context_id="mfrctx-graph-guide-parity-warranty",
+        task_id="graph-guide-parity-warranty-worker",
+        parent_task_id="cex-graph-guide-parity-warranty",
+        target_project_root="/tmp/graph-guide-parity-warranty",
+        session_token_ref="wstok-graph-guide-parity-warranty",
+        route_identity=route_identity,
+        graph_payload_shape={
+            "tool": "function_index",
+            "args": {"query": "<legacy query placeholder>"},
+            "query_source": "observer",
+            "query_purpose": "legacy-purpose",
+            **legacy_auth_shape,
+        },
+    )
+
+    assert body["session_token_ref"] == "wstok-graph-guide-parity-warranty"
+    assert body["route_identity"] == route_identity
+    assert body["runtime_context_id"] == "mfrctx-graph-guide-parity-warranty"
+    assert body["task_id"] == "graph-guide-parity-warranty-worker"
+    assert body["parent_task_id"] == "cex-graph-guide-parity-warranty"
+    assert body["query_source"] == "mf_subagent"
+    assert body["query_purpose"] == "subagent_context_build"
+    assert set(server._GUIDE_RAW_AUTH_BODY_FIELDS).isdisjoint(body)
+
+    action = server._guide_canonical_executable_action(
+        project_id=PID,
+        action="run_graph_query",
+        body=body,
+        facade="graph_query",
+        mcp_tool="graph_query",
+        backlog_id="AC-GRAPH-GUIDE-PARITY-WARRANTY",
+        contract_execution_id="cex-graph-guide-parity-warranty",
+    )
+    assert action["copy_safe_body"] == body
+    assert action["host_realization"]["required_replacement_paths"] == [
+        "copy_safe_body.args.query"
+    ]
+
+    legacy_direct_action = server._guide_canonical_executable_action(
+        project_id=PID,
+        action="run_graph_query",
+        body={**body, **legacy_auth_shape},
+        facade="graph_query",
+        mcp_tool="graph_query",
+    )
+    assert legacy_direct_action["copy_safe_body"] == body
+    assert legacy_direct_action["host_realization"][
+        "required_replacement_paths"
+    ] == ["copy_safe_body.args.query"]
+    serialized = json.dumps(legacy_direct_action, sort_keys=True)
+    for raw_value in legacy_auth_shape.values():
+        if isinstance(raw_value, str):
+            assert raw_value not in serialized
+        else:
+            assert json.dumps(raw_value, sort_keys=True) not in serialized
+
+
 def test_compact_worker_graph_context_projects_exact_sibling_action_zero_write(
     conn,
     monkeypatch,
