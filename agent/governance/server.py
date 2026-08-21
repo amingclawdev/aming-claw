@@ -162028,6 +162028,213 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
     }
 
 
+def _contract_runtime_parentless_direct_main_qa_prewrite_gate(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    event_kind: str,
+    normalized_status: str,
+    normalized_payload: Mapping[str, Any],
+    trusted_qa_verification_authority: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Reject Direct QA that immutable close authority cannot recognize.
+
+    A Direct observer route authorizes observer coordination; it is not an
+    independent QA principal.  Passing QA is therefore writable only through
+    the authenticated bounded-QA path or through the existing exact observer
+    materialization of such a QA report.  This gate runs before route-gate
+    audit persistence and before the timeline append.
+    """
+
+    from . import task_timeline
+
+    normalized_kind = str(event_kind or "").strip().lower().replace("-", "_")
+    prospective = {
+        "event_kind": normalized_kind,
+        "status": normalized_status,
+        "payload": dict(normalized_payload or {}),
+        "verification": dict(body.get("verification") or {}),
+        "artifact_refs": dict(body.get("artifact_refs") or {}),
+    }
+    if (
+        normalized_kind not in _QA_TIMELINE_VERIFICATION_EVENT_KINDS
+        or not task_timeline._event_passed(prospective)
+    ):
+        return {}
+
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    if not backlog_id or not task_id:
+        return {}
+    selected_scope = _contract_runtime_parentless_direct_main_selected_scope(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=str(body.get("route_token_ref") or "").strip(),
+        rebuild_if_missing=False,
+    )
+    if (
+        selected_scope.get("resolved") is not True
+        or str(selected_scope.get("contract_execution_id") or "").strip()
+        != task_id
+    ):
+        return {}
+
+    events = task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        limit=1000,
+    )
+    direct_events = [
+        event
+        for event in events
+        if isinstance(event.get("payload"), Mapping)
+        and isinstance(
+            event["payload"].get("observer_direct_pre_mutation_authority"),
+            Mapping,
+        )
+        and event["payload"]["observer_direct_pre_mutation_authority"].get(
+            "accepted"
+        )
+        is True
+        and event["payload"]["observer_direct_pre_mutation_authority"].get(
+            "server_projected"
+        )
+        is True
+        and str(
+            event["payload"]["observer_direct_pre_mutation_authority"].get(
+                "projection_source"
+            )
+            or ""
+        ).strip()
+        == "task_timeline_append_pre_persistence_gate"
+    ]
+    if not direct_events:
+        return {}
+
+    missing: list[str] = []
+    if len(direct_events) != 1:
+        missing.append("unique_direct_main_pre_mutation_event")
+    direct_event = max(
+        direct_events,
+        key=lambda event: _contract_runtime_parentless_direct_main_event_order(
+            event,
+            0,
+        ),
+    )
+    implementation_event = task_timeline._latest_passing_close_event(
+        events,
+        "implementation",
+        after_event_id=_contract_runtime_parentless_direct_main_event_order(
+            direct_event,
+            0,
+        ),
+    )
+    if not implementation_event:
+        missing.append("implementation_after_direct_main_pre_mutation")
+
+    candidate_commit = str(body.get("commit_sha") or "").strip().lower()
+    implementation_commit = str(
+        (implementation_event or {}).get("commit_sha") or ""
+    ).strip().lower()
+    if (
+        not candidate_commit
+        or not implementation_commit
+        or candidate_commit != implementation_commit
+    ):
+        missing.append("qa_commit_matches_direct_main_implementation")
+
+    qa_authority = (
+        task_timeline.source_backed_qa_session_authority(
+            dict(trusted_qa_verification_authority or {})
+        )
+        if trusted_qa_verification_authority
+        else {}
+    )
+    authenticated_qa = bool(
+        qa_authority
+        and task_timeline._source_backed_qa_session_authority_valid(
+            qa_authority,
+            conn=conn,
+        )
+    )
+
+    materialized_qa: dict[str, Any] = {}
+    if implementation_event and candidate_commit == implementation_commit:
+        sequence_row = conn.execute(
+            """SELECT seq FROM sqlite_sequence
+                 WHERE name = 'task_timeline_events'"""
+        ).fetchone()
+        prospective_event_id = int(sequence_row[0] or 0) + 1 if sequence_row else 1
+        materialized_qa = (
+            _contract_runtime_parentless_direct_main_materialized_qa_event(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                close_commit=candidate_commit,
+                implementation_event=implementation_event,
+                event={
+                    "id": prospective_event_id,
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "event_type": str(body.get("event_type") or ""),
+                    "event_kind": normalized_kind,
+                    "phase": str(body.get("phase") or ""),
+                    "parent_event_id": int(body.get("parent_event_id") or 0),
+                    "actor": str(body.get("actor") or ""),
+                    "status": str(normalized_status or ""),
+                    "commit_sha": candidate_commit,
+                    "payload": dict(normalized_payload or {}),
+                    "verification": dict(body.get("verification") or {}),
+                    "artifact_refs": dict(body.get("artifact_refs") or {}),
+                },
+            )
+        )
+    observer_materialized_qa = bool(materialized_qa)
+    if not (authenticated_qa or observer_materialized_qa):
+        missing.append("authenticated_bounded_qa_session_authority")
+
+    missing = list(dict.fromkeys(missing))
+    passed = not missing
+    return {
+        "schema_version": "parentless_direct_main.qa_prewrite_authority.v1",
+        "applicable": True,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": task_id,
+        "candidate_commit_sha": candidate_commit,
+        "implementation_event_ref": (
+            f"timeline:{implementation_event.get('id')}"
+            if implementation_event
+            else ""
+        ),
+        "authenticated_qa_session_authority": authenticated_qa,
+        "observer_materialized_qa_authority": observer_materialized_qa,
+        "accepted_authority_paths": [
+            "authenticated_bounded_qa_session",
+            "exact_observer_materialization_of_authenticated_qa_report",
+        ],
+        "observer_route_is_independent_qa_authority": False,
+        "route_waiver_is_independent_qa_authority": False,
+        "actor_string_is_independent_qa_authority": False,
+        "no_pass_metadata_is_independent_qa_authority": False,
+        "missing_requirement_ids": missing,
+        "selected_scope": selected_scope,
+        "zero_timeline_write_on_failure": True,
+        "zero_route_gate_audit_write_on_failure": True,
+        "historical_persisted_event_backfill_allowed": False,
+        "previously_blocked_source_warranty_resume_allowed": False,
+        "fresh_validation_generation_required_after_prior_close_block": True,
+    }
+
+
 def _contract_runtime_parentless_direct_main_historical_diff_projection(
     *,
     conn,
@@ -167635,6 +167842,55 @@ def handle_task_timeline_append(ctx: RequestContext):
                 norm_payload["contract_runtime_canonical_line"] = dict(
                     canonical_contract_line
                 )
+        direct_main_qa_prewrite_gate = (
+            _contract_runtime_parentless_direct_main_qa_prewrite_gate(
+                conn,
+                project_id=project_id,
+                body=ctx.body or {},
+                event_kind=norm_event_kind,
+                normalized_status=norm_status,
+                normalized_payload=norm_payload,
+                trusted_qa_verification_authority=(
+                    trusted_qa_verification_authority
+                ),
+            )
+        )
+        if (
+            direct_main_qa_prewrite_gate.get("applicable") is True
+            and direct_main_qa_prewrite_gate.get("passed") is not True
+        ):
+            raise GovernanceError(
+                "parentless_direct_main_independent_qa_authority_required",
+                (
+                    "parentless Direct Main passing QA requires an "
+                    "authenticated bounded QA session or the exact authorized "
+                    "materialization of such a QA report"
+                ),
+                422,
+                {
+                    **direct_main_qa_prewrite_gate,
+                    "source": (
+                        "server.handle_task_timeline_append."
+                        "parentless_direct_main_qa_prewrite_gate"
+                    ),
+                    "guide": {
+                        "current_zero_write_retry": (
+                            "allocate a bounded QA session, run a QA-owned "
+                            "independent_verification graph query, and retry "
+                            "the still-unpersisted event without observer route "
+                            "or waiver authority"
+                        ),
+                        "after_prior_close_block": (
+                            "start a fresh validation generation; never append "
+                            "post-hoc QA to, resume, or retry the blocked source "
+                            "warranty"
+                        ),
+                    },
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "persisted_as_accepted": False,
+                },
+            )
         direct_main_implementation_prewrite_gate = (
             _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
                 conn,

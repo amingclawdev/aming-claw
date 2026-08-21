@@ -100715,28 +100715,69 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             },
         )
     )
-    server.handle_task_timeline_append(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                **append_base,
-                "event_type": "qa.independent_verification",
-                "event_kind": "independent_verification",
-                "phase": "qa",
-                "status": "passed",
-                "actor": "qa:direct-main",
-                "commit_sha": close_commit,
-                "verification": {
-                    "tests_run": ["pytest -q agent/tests/test_graph_governance_api.py"],
-                    "diff_check": {"unexpected_files": []},
-                    "live_regression": {"status": "passed"},
-                },
-                "payload": {"observer_impersonation": False},
-            },
+    event_count_before_impersonated_qa = len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            limit=1000,
         )
     )
+    changes_before_impersonated_qa = conn.total_changes
+    with pytest.raises(GovernanceError) as impersonated_qa:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    **append_base,
+                    "event_type": "qa.independent_verification",
+                    "event_kind": "independent_verification",
+                    "phase": "qa",
+                    "status": "accepted",
+                    "actor": "qa:direct-main",
+                    "commit_sha": close_commit,
+                    "verification": {
+                        "tests_run": [
+                            "pytest -q agent/tests/test_graph_governance_api.py"
+                        ],
+                        "diff_check": {"unexpected_files": []},
+                        "live_regression": {"status": "passed"},
+                    },
+                    "payload": {
+                        "observer_impersonation": False,
+                        "row_scoped_qa_pass": True,
+                        "used_as_pass": False,
+                        "no_pass_claim": True,
+                    },
+                },
+            )
+        )
+    assert impersonated_qa.value.code == (
+        "parentless_direct_main_independent_qa_authority_required"
+    )
+    assert "authenticated_bounded_qa_session_authority" in (
+        impersonated_qa.value.details["missing_requirement_ids"]
+    )
+    assert impersonated_qa.value.details[
+        "observer_route_is_independent_qa_authority"
+    ] is False
+    assert impersonated_qa.value.details[
+        "no_pass_metadata_is_independent_qa_authority"
+    ] is False
+    assert impersonated_qa.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == changes_before_impersonated_qa
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            limit=1000,
+        )
+    ) == event_count_before_impersonated_qa
     impersonated_precheck = server.handle_backlog_timeline_gate(
         _ctx(
             {"project_id": PID, "bug_id": backlog_id},
