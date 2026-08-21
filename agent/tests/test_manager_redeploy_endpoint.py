@@ -353,17 +353,18 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
         proc = MagicMock()
         proc.pid = 84539
         proc.poll.return_value = None
+        exact_commit = "a0266c5d309f6f221a4b3a21fd6379704e0e0030"
         payload = {
             "status": "ok",
             "pid": 84539,
             "version": "a0266c5d",
             "worktree_head_version": "a0266c5d",
-            "runtime_loaded_version": "a0266c5d",
+            "runtime_loaded_version": exact_commit,
             "runtime_loaded_source_sha256": "sha256:" + "a" * 64,
             "runtime_stale": False,
             "loaded_runtime_identity": {
                 "loaded_pid": 84539,
-                "loaded_commit": "a0266c5d",
+                "loaded_commit": exact_commit,
                 "loaded_source_sha256": "sha256:" + "a" * 64,
                 "worktree_source_sha256": "sha256:" + "a" * 64,
                 "runtime_stale": False,
@@ -382,7 +383,7 @@ class TestGovernanceListenerAndRuntimeIdentity(unittest.TestCase):
             self.assertTrue(
                 manager_http_server._wait_for_health(
                     proc,
-                    "a0266c5d309f6f221a4b3a21fd6379704e0e0030",
+                    exact_commit,
                     "sha256:" + "a" * 64,
                     timeout=0.05,
                 )

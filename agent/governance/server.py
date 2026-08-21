@@ -184,6 +184,28 @@ def get_server_version():
     return _version_cache["value"]
 
 
+def get_server_commit() -> str:
+    """Return the exact immutable build commit or full Git object id."""
+    build_commit = _immutable_build_commit()
+    if build_commit:
+        return build_commit
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        ).stdout.strip().lower()
+    except Exception:
+        return "unknown"
+    return (
+        head
+        if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head)
+        else "unknown"
+    )
+
+
 def get_governance_runtime_version(default: str = "unknown") -> str:
     """Return the governance code version frozen when this process loaded."""
     try:
@@ -239,7 +261,9 @@ def _source_file_fingerprint(path: str) -> dict[str, Any]:
 
 LOADED_RUNTIME_IDENTITY: dict[str, Any] = {
     "schema_version": LOADED_RUNTIME_IDENTITY_SCHEMA,
-    "loaded_commit": SERVER_VERSION,
+    # SERVER_VERSION remains the backward-compatible display version.  Runtime
+    # authority must freeze the full object id so it can serve as a WorldRef.
+    "loaded_commit": get_server_commit(),
     "loaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "loaded_pid": SERVER_PID,
     "loaded_source": _source_file_fingerprint(_loaded_module_source_path()),
@@ -253,6 +277,21 @@ LOADED_RUNTIME_IDENTITY: dict[str, Any] = {
 # Re-hash the module source only when stat() says it changed; this file is large
 # and /api/health is polled.
 _loaded_source_probe_cache: dict[str, Any] = {"key": None, "fingerprint": None}
+
+
+def _git_object_identity_matches(left: str, right: str) -> bool:
+    """Compare exact and abbreviated hexadecimal refs for one Git object."""
+    left = str(left or "").strip().lower()
+    right = str(right or "").strip().lower()
+    if left == right:
+        return bool(left)
+    if not (
+        re.fullmatch(r"[0-9a-f]{7,64}", left)
+        and re.fullmatch(r"[0-9a-f]{7,64}", right)
+    ):
+        return False
+    shorter, longer = sorted((left, right), key=len)
+    return len(longer) in {40, 64} and longer.startswith(shorter)
 
 
 def _current_module_source_fingerprint() -> dict[str, Any]:
@@ -292,7 +331,7 @@ def governance_loaded_runtime_identity(worktree_version: str = "") -> dict[str, 
         and loaded_commit
         and worktree_version != "unknown"
         and loaded_commit != "unknown"
-        and worktree_version != loaded_commit
+        and not _git_object_identity_matches(worktree_version, loaded_commit)
     ):
         reasons.append("worktree_head_moved")
     if current_source.get("sha256") != loaded_source.get("sha256"):

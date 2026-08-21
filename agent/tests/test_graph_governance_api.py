@@ -10949,21 +10949,22 @@ def test_health_reports_loaded_runtime_identity_and_flags_worktree_drift(monkeyp
 
     # Pin the import-time commit so the assertions below do not depend on the
     # checkout's real git HEAD.
-    loaded_commit = "abc1234"
+    loaded_commit = "abc1234" + "0" * 33
+    display_commit = loaded_commit[:8]
     monkeypatch.setitem(server.LOADED_RUNTIME_IDENTITY, "loaded_commit", loaded_commit)
 
-    # Fresh runtime: the worktree HEAD still matches the code this process
-    # loaded, so health reports both and does not raise the stale signal.
-    monkeypatch.setattr(server, "get_server_version", lambda: loaded_commit)
+    # Fresh runtime: the display HEAD abbreviates the exact object loaded by
+    # this process, so health preserves both without raising a stale signal.
+    monkeypatch.setattr(server, "get_server_version", lambda: display_commit)
     fresh = server.handle_health(_ctx({"project_id": PID}))
     assert fresh["runtime_loaded_version"] == loaded_commit
     assert fresh["runtime_loaded_source_sha256"] == loaded_sha
-    assert fresh["worktree_head_version"] == loaded_commit
+    assert fresh["worktree_head_version"] == display_commit
     assert fresh["runtime_stale"] is False
     assert fresh["runtime_stale_reasons"] == []
     # Backward compatibility: the pre-existing fields keep their meaning.
-    assert fresh["version"] == loaded_commit
-    assert fresh["health_version"] == loaded_commit
+    assert fresh["version"] == display_commit
+    assert fresh["health_version"] == display_commit
 
     # A commit/merge lands with no redeploy: the worktree HEAD moves, the loaded
     # runtime does not. Health must report both values and flag the drift rather
@@ -10986,7 +10987,7 @@ def test_health_reports_loaded_runtime_identity_and_flags_worktree_drift(monkeyp
 
     # Content drift is caught even when the commit string is unchanged: the
     # module source on disk no longer matches the bytes this process loaded.
-    monkeypatch.setattr(server, "get_server_version", lambda: loaded_commit)
+    monkeypatch.setattr(server, "get_server_version", lambda: display_commit)
     monkeypatch.setitem(
         server.LOADED_RUNTIME_IDENTITY,
         "loaded_source",
@@ -11000,7 +11001,7 @@ def test_health_reports_loaded_runtime_identity_and_flags_worktree_drift(monkeyp
     monkeypatch.setitem(server._loaded_source_probe_cache, "key", None)
     monkeypatch.setitem(server._loaded_source_probe_cache, "fingerprint", None)
     content_drift = server.handle_health(_ctx({"project_id": PID}))
-    assert content_drift["worktree_head_version"] == loaded_commit
+    assert content_drift["worktree_head_version"] == display_commit
     assert content_drift["runtime_stale"] is True
     assert "loaded_source_file_changed" in content_drift["runtime_stale_reasons"]
     assert (
