@@ -10927,6 +10927,79 @@ def _qa_exact_candidate_postmerge_records(
     return list(postmerge_records.values())
 
 
+def _qa_exact_candidate_postmerge_comparison_authority_for_record(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    candidate_commit_sha: str,
+    record: Mapping[str, Any],
+) -> dict[str, str]:
+    """Resolve one combined candidate from server-verified post-merge state."""
+
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    if not (
+        execution_id
+        and str(record.get("project_id") or "").strip() == project_id
+        and str(record.get("backlog_id") or "").strip() == backlog_id
+    ):
+        return {}
+    postmerge = _contract_runtime_rev8_postmerge_qa_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+    )
+    unsigned_postmerge = {
+        key: value
+        for key, value in postmerge.items()
+        if key != "authority_hash"
+    }
+    if not (
+        postmerge.get("verified") is True
+        and postmerge.get("server_derived") is True
+        and postmerge.get("db_verified") is True
+        and postmerge.get("live_verified") is True
+        and postmerge.get("graph_reconciled") is True
+        and postmerge.get("active_snapshot_verified") is True
+        and str(postmerge.get("project_id") or "").strip() == project_id
+        and str(postmerge.get("backlog_id") or "").strip() == backlog_id
+        and str(postmerge.get("contract_execution_id") or "").strip()
+        == execution_id
+        and str(postmerge.get("parent_task_id") or "").strip()
+        == execution_id
+        and str(postmerge.get("qa_graph_trace_task_id") or "").strip()
+        == execution_id
+        and str(postmerge.get("qa_graph_trace_task_source") or "").strip()
+        == "ContractRuntime.contract_execution_id"
+        and str(postmerge.get("candidate_commit_sha") or "").strip().lower()
+        == candidate_commit_sha
+        and str(postmerge.get("reconciled_commit_sha") or "").strip().lower()
+        == candidate_commit_sha
+        and str(postmerge.get("canonical_head_commit") or "").strip().lower()
+        == candidate_commit_sha
+        and str(postmerge.get("active_snapshot_commit") or "").strip().lower()
+        == candidate_commit_sha
+        and str(postmerge.get("authority_hash") or "").strip()
+        == stable_sha256(unsigned_postmerge)
+    ):
+        return {}
+    comparison = _contract_runtime_server_comparison_authority(
+        conn,
+        project_id=project_id,
+        record=record,
+        expected_candidate_commit=candidate_commit_sha,
+    )
+    if not (
+        comparison.get("commit_sha")
+        and comparison.get("source") == _QA_POSTMERGE_COMPARISON_BASE_SOURCE
+    ):
+        return {}
+    return {
+        **comparison,
+        "lineage_source": _QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE,
+    }
+
+
 def _qa_exact_candidate_runtime_comparison_authority(
     conn,
     *,
@@ -10954,87 +11027,17 @@ def _qa_exact_candidate_runtime_comparison_authority(
         if postmerge_records:
             resolved_authorities: dict[str, dict[str, str]] = {}
             for record in postmerge_records:
-                if not (
-                    str(record.get("project_id") or "").strip()
-                    == project_id
-                    and str(record.get("backlog_id") or "").strip()
-                    == backlog_id
-                ):
-                    continue
-                postmerge = _contract_runtime_rev8_postmerge_qa_authority(
-                    conn,
-                    project_id=project_id,
-                    record=record,
+                authority = (
+                    _qa_exact_candidate_postmerge_comparison_authority_for_record(
+                        conn,
+                        project_id=project_id,
+                        backlog_id=backlog_id,
+                        candidate_commit_sha=candidate_commit_sha,
+                        record=record,
+                    )
                 )
-                unsigned_postmerge = {
-                    key: value
-                    for key, value in postmerge.items()
-                    if key != "authority_hash"
-                }
-                if not (
-                    postmerge.get("verified") is True
-                    and postmerge.get("server_derived") is True
-                    and postmerge.get("db_verified") is True
-                    and postmerge.get("live_verified") is True
-                    and postmerge.get("graph_reconciled") is True
-                    and postmerge.get("active_snapshot_verified") is True
-                    and str(postmerge.get("project_id") or "").strip()
-                    == project_id
-                    and str(postmerge.get("backlog_id") or "").strip()
-                    == backlog_id
-                    and str(
-                        postmerge.get("contract_execution_id") or ""
-                    ).strip()
-                    == task_id
-                    and str(postmerge.get("parent_task_id") or "").strip()
-                    == task_id
-                    and str(
-                        postmerge.get("qa_graph_trace_task_id") or ""
-                    ).strip()
-                    == task_id
-                    and str(
-                        postmerge.get("qa_graph_trace_task_source") or ""
-                    ).strip()
-                    == "ContractRuntime.contract_execution_id"
-                    and str(postmerge.get("candidate_commit_sha") or "")
-                    .strip()
-                    .lower()
-                    == candidate_commit_sha
-                    and str(postmerge.get("reconciled_commit_sha") or "")
-                    .strip()
-                    .lower()
-                    == candidate_commit_sha
-                    and str(postmerge.get("canonical_head_commit") or "")
-                    .strip()
-                    .lower()
-                    == candidate_commit_sha
-                    and str(postmerge.get("active_snapshot_commit") or "")
-                    .strip()
-                    .lower()
-                    == candidate_commit_sha
-                    and str(postmerge.get("authority_hash") or "").strip()
-                    == stable_sha256(unsigned_postmerge)
-                ):
-                    continue
-                comparison = _contract_runtime_server_comparison_authority(
-                    conn,
-                    project_id=project_id,
-                    record=record,
-                    expected_candidate_commit=candidate_commit_sha,
-                )
-                if not (
-                    comparison.get("commit_sha")
-                    and comparison.get("source")
-                    == _QA_POSTMERGE_COMPARISON_BASE_SOURCE
-                ):
-                    continue
-                authority = {
-                    **comparison,
-                    "lineage_source": (
-                        _QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE
-                    ),
-                }
-                resolved_authorities[stable_sha256(authority)] = authority
+                if authority:
+                    resolved_authorities[stable_sha256(authority)] = authority
             if len(resolved_authorities) == 1:
                 return next(iter(resolved_authorities.values()))
             return {
@@ -11110,6 +11113,30 @@ def _qa_exact_candidate_runtime_comparison_authority(
             expected_candidate_commit=candidate_commit_sha,
             expected_context=context,
         )
+        lane_head_commit = _contract_runtime_full_commit_value(
+            project_id,
+            getattr(context, "head_commit", ""),
+        )
+        if (
+            not authority
+            and candidate_commit_sha
+            and lane_head_commit
+            and candidate_commit_sha != lane_head_commit
+        ):
+            # A final QA session may retain its authenticated worker-lane task
+            # scope after the observer has merged and reconciled the combined
+            # candidate.  The verified dispatch above proves that this lane
+            # belongs to the record; the post-merge authority then replaces
+            # only the graph task/comparison projection, never the QA proof.
+            authority = (
+                _qa_exact_candidate_postmerge_comparison_authority_for_record(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    candidate_commit_sha=candidate_commit_sha,
+                    record=record,
+                )
+            )
         if authority:
             resolved_authorities[stable_sha256(authority)] = authority
     return (

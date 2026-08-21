@@ -57215,6 +57215,7 @@ def _one_worker_postmerge_comparison_world(
     tmp_path,
     *,
     nonancestor_base: bool = False,
+    reuse_lane_scope: bool = False,
 ) -> dict[str, Any]:
     project_root = tmp_path / "one-worker-postmerge-comparison"
     initial_head = _init_test_git_repo(project_root, filename="baseline.txt")
@@ -57331,6 +57332,30 @@ def _one_worker_postmerge_comparison_world(
         "resolve_project_root",
         lambda *_args, **_kwargs: project_root,
     )
+    proof_task_id = record["contract_execution_id"]
+    if reuse_lane_scope:
+        upsert_branch_context(
+            conn,
+            BranchTaskRuntimeContext(
+                project_id=PID,
+                task_id=worker["task_id"],
+                runtime_context_id=worker["runtime_context_id"],
+                backlog_id=record["backlog_id"],
+                parent_task_id=record["contract_execution_id"],
+                root_task_id=record["contract_execution_id"],
+                worker_id=worker["worker_id"],
+                worker_slot_id=worker["worker_slot_id"],
+                merge_queue_id=worker["merge_queue_id"],
+                branch_ref="refs/heads/codex/reused-postmerge-qa-lane",
+                status=STATE_VALIDATED,
+                base_commit=comparison_base,
+                target_head_commit=comparison_base,
+                head_commit=comparison_base,
+            ),
+            now_iso="2026-08-21T01:01:00Z",
+        )
+        conn.commit()
+        proof_task_id = worker["task_id"]
     return {
         "project_root": project_root,
         "record": record,
@@ -57339,7 +57364,7 @@ def _one_worker_postmerge_comparison_world(
         "candidate_commit": candidate_commit,
         "proof": {
             "backlog_id": record["backlog_id"],
-            "task_id": record["contract_execution_id"],
+            "task_id": proof_task_id,
             "commit_sha": candidate_commit,
         },
     }
@@ -57403,6 +57428,82 @@ def test_exact_candidate_runtime_comparison_authority_joins_parent_postmerge_cex
         project_id=PID,
         proof=world["proof"],
     ) is True
+
+
+def test_exact_candidate_reused_lane_scope_joins_parent_postmerge_cex(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    world = _one_worker_postmerge_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        reuse_lane_scope=True,
+    )
+    runtime_store = server._contract_runtime(conn).store
+    before_record = runtime_store.get(world["record"]["contract_execution_id"])
+    before_queue = list_merge_queue_items(
+        conn,
+        PID,
+        world["state"]["queue_items"][0].merge_queue_id,
+    )
+    before_snapshot = store.get_active_graph_snapshot(conn, PID)
+    before_total_changes = conn.total_changes
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=world["proof"],
+    )
+    exact = server._qa_exact_candidate_context(
+        world["project_root"],
+        project_id=PID,
+        canonical_project_root=world["project_root"],
+        candidate_commit_sha=world["candidate_commit"],
+        comparison_base_commit_sha=authority["commit_sha"],
+        comparison_base_commit_source=authority["source"],
+        comparison_base_commit_lineage_source=authority["lineage_source"],
+        comparison_authority_required=True,
+    )
+
+    assert world["proof"]["task_id"] != world["record"]["contract_execution_id"]
+    assert authority == {
+        "commit_sha": world["comparison_base"],
+        "source": server._QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+        "lineage_source": server._QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE,
+    }
+    assert exact["root_identity"]["candidate_commit_sha"] == (
+        world["candidate_commit"]
+    )
+    assert exact["comparison_base_commit_sha"] == world["comparison_base"]
+    assert conn.total_changes == before_total_changes
+    assert runtime_store.get(world["record"]["contract_execution_id"]) == (
+        before_record
+    )
+    assert list_merge_queue_items(
+        conn,
+        PID,
+        world["state"]["queue_items"][0].merge_queue_id,
+    ) == before_queue
+    assert store.get_active_graph_snapshot(conn, PID) == before_snapshot
+
+    wrong_lane_candidate = dict(world["proof"], commit_sha="8" * 40)
+    assert server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=wrong_lane_candidate,
+    ) == {}
+    assert conn.total_changes == before_total_changes
+    assert runtime_store.get(world["record"]["contract_execution_id"]) == (
+        before_record
+    )
+    assert list_merge_queue_items(
+        conn,
+        PID,
+        world["state"]["queue_items"][0].merge_queue_id,
+    ) == before_queue
+    assert store.get_active_graph_snapshot(conn, PID) == before_snapshot
 
 
 def test_exact_candidate_parent_postmerge_nonancestor_base_is_zero_write(
