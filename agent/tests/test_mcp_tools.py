@@ -274,6 +274,27 @@ def test_managed_mcp_post_startup_envelope_submits_worker_line_then_acks_finish(
     assert malformed["http_request_performed"] is False
     assert calls == []
 
+    missing_route_identity = continuity.dispatch(
+        "runtime_context_implementation_evidence",
+        {
+            **{
+                field: value
+                for field, value in identity.items()
+                if field not in route
+            },
+            "session_token": "<host-realized session_token>",
+            "fence_token": "<host-realized fence_token>",
+        },
+        lambda args: calls.append(args),
+    )
+    assert missing_route_identity["error"] == (
+        "managed_host_envelope_scope_mismatch"
+    )
+    assert missing_route_identity["missing_fields"] == sorted(route)
+    assert missing_route_identity["http_request_performed"] is False
+    assert calls == []
+    assert continuity.pending_count() == 1
+
     implementation = continuity.dispatch(
         "runtime_context_implementation_evidence",
         {

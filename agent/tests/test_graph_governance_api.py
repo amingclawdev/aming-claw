@@ -65200,6 +65200,7 @@ def test_runtime_context_worker_guide_missing_auth_points_to_initial_join_before
             stage_task_id="worker-auth-missing",
             worker_id="worker-auth-missing",
             worker_slot_id="slot-auth-missing",
+            host_session_id="codex:worker-auth-missing",
             branch_ref="refs/heads/codex/worker-auth-missing",
             status=STATE_WORKTREE_READY,
             fence_token="",
@@ -65251,6 +65252,10 @@ def test_runtime_context_worker_guide_missing_auth_points_to_initial_join_before
             "contract_execution_id",
             "worker_id",
             "worker_slot_id",
+            "project_id",
+            "agent_id",
+            "actual_host_worker_id",
+            "worker_session_id",
         )
     } == {
         "task_id": context.task_id,
@@ -65258,7 +65263,16 @@ def test_runtime_context_worker_guide_missing_auth_points_to_initial_join_before
         "contract_execution_id": context.root_task_id,
         "worker_id": context.worker_id,
         "worker_slot_id": context.worker_slot_id,
+        "project_id": PID,
+        "agent_id": context.worker_id,
+        "actual_host_worker_id": context.worker_id,
+        "worker_session_id": "codex:worker-auth-missing",
     }
+    assert submission["governed_identity_fields"] == [
+        "agent_id",
+        "actual_host_worker_id",
+    ]
+    assert submission["host_realization"]["required_replacement_paths"] == []
     assert submission["security_boundary"]["session_token_ref_alone_authorizes_writes"] is False
     assert "session_token_reissue_submission" not in details[
         "actionable_payloads"
@@ -82896,10 +82910,10 @@ def test_runtime_context_worker_guide_accepts_worktree_alias_for_read_only(
     assert implementation_skeleton["copy_safe_body"]["route_token_ref"] == (
         route_identity["route_token_ref"]
     )
-    assert not (
-        set(implementation_skeleton["copy_safe_body"])
-        & (set(server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS) - {"route_token_ref"})
-    )
+    assert {
+        field: implementation_skeleton["copy_safe_body"][field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == route_identity
     assert implementation_skeleton["route_token_policy"][
         "omit_stale_child_route_token_when_using_parent_route_token_ref"
     ] is True
@@ -149526,6 +149540,7 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
         backlog_id="AC-GUIDE-SCOPE",
         merge_queue_id="mq-guide-scope",
         base_commit="a" * 40,
+        session_token_ref="wstok-guide-scope",
         route_identity={
             "route_id": "route-guide-scope",
             "route_context_hash": "sha256:guide-scope",
@@ -149642,7 +149657,144 @@ def test_runtime_context_merge_payloads_separate_contract_and_worker_route_refs(
     )
     assert set(implementation_body) & set(
         server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-    ) == {"route_token_ref"}
+    ) == set(server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS)
+    assert implementation_body["contract_execution_id"] == (
+        "cex-guide-scope-contract"
+    )
+    assert {
+        field: implementation_body[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == {
+        "route_id": "route-guide-scope",
+        "route_context_hash": "sha256:guide-scope",
+        "prompt_contract_id": "rprompt-guide-scope",
+        "prompt_contract_hash": "sha256:prompt-guide-scope",
+        "route_token_ref": "rtok-contract-runtime-guide-scope",
+        "visible_injection_manifest_hash": "sha256:visible-guide-scope",
+    }
+    scope_body = payloads[
+        "scope_insufficiency_request_facade_payload_skeleton"
+    ]["copy_safe_body"]
+    assert scope_body["contract_execution_id"] == "cex-guide-scope-contract"
+    assert {
+        field: scope_body[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == {
+        field: implementation_body[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    managed_binding = {
+        "project_id": PID,
+        "runtime_context_id": "mfrctx-guide-scope",
+        "task_id": "worker-guide-scope-task",
+        "parent_task_id": "cex-guide-scope-contract",
+        "contract_execution_id": "cex-guide-scope-contract",
+        "target_project_root": "/tmp/worker-guide-scope",
+        "worker_id": "worker-guide-scope",
+        "worker_slot_id": "worker-guide-scope",
+        "session_token_ref": "wstok-guide-scope",
+        **{
+            field: implementation_body[field]
+            for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
+    }
+    managed_continuity = ManagedHostEnvelopeContinuity()
+    issued = managed_continuity.dispatch(
+        "runtime_context_session_token_rejoin",
+        managed_binding,
+        lambda _args: {
+            "ok": True,
+            "status": "session_token_rejoined",
+            "delivery": "worker_host_envelope",
+            **managed_binding,
+            "session_token": "raw-guide-scope-session",
+            "fence_token": "raw-guide-scope-fence",
+            "host_envelope": {
+                **managed_binding,
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": "raw-guide-scope-session",
+                    "AMING_WORKER_FENCE_TOKEN": "raw-guide-scope-fence",
+                },
+            },
+        },
+    )
+    assert issued["auth_loaded"] is True
+    dispatched_bodies = []
+    accepted = managed_continuity.dispatch(
+        "runtime_context_implementation_evidence",
+        {
+            **implementation_body,
+            "session_token": "<host-realized session_token>",
+            "fence_token": "<host-realized fence_token>",
+        },
+        lambda args: dispatched_bodies.append(dict(args))
+        or {"ok": True, "status": "accepted"},
+    )
+    assert accepted == {"ok": True, "status": "accepted"}
+    assert dispatched_bodies[-1]["session_token"] == "raw-guide-scope-session"
+    assert dispatched_bodies[-1]["fence_token"] == "raw-guide-scope-fence"
+    guide_response = server._runtime_context_worker_guide_response(
+        {
+            "project_id": PID,
+            "runtime_context_id": "mfrctx-guide-scope",
+            "task_id": "worker-guide-scope-task",
+            "parent_task_id": "cex-guide-scope-contract",
+            "session_token_ref": "wstok-guide-scope",
+            "contract_runtime_current_state": {
+                "contract_execution_id": "cex-guide-scope-contract",
+            },
+            "runtime_context_service": {
+                "views": {
+                    "current": {
+                        "current_values": {
+                            "runtime_context_id": "mfrctx-guide-scope",
+                            "task_id": "worker-guide-scope-task",
+                            "parent_task_id": "cex-guide-scope-contract",
+                            "target_project_root": "/tmp/worker-guide-scope",
+                        }
+                    },
+                    "worker_view": {
+                        "session_token_ref": "wstok-guide-scope",
+                        "route_identity": {
+                            field: implementation_body[field]
+                            for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                        },
+                        "task": {
+                            "task_id": "worker-guide-scope-task",
+                            "parent_task_id": "cex-guide-scope-contract",
+                            "target_project_root": "/tmp/worker-guide-scope",
+                        },
+                        "graph_query_identity": {
+                            "target_project_root": "/tmp/worker-guide-scope",
+                        },
+                    },
+                }
+            },
+        }
+    )
+    finish_body = guide_response["worker_guide"]["write_guides"][
+        "finish_gate"
+    ]["copy_safe_body"]
+    assert finish_body["contract_execution_id"] == "cex-guide-scope-contract"
+    assert {
+        field: finish_body[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    } == {
+        field: implementation_body[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    finished = managed_continuity.dispatch(
+        "runtime_context_finish_gate",
+        {
+            **finish_body,
+            "session_token": "<host-realized session_token>",
+            "fence_token": "<host-realized fence_token>",
+        },
+        lambda args: dispatched_bodies.append(dict(args))
+        or {"ok": True, "status": "passed"},
+    )
+    assert finished["managed_host_envelope_consumed"] is True
+    assert managed_continuity.pending_count() == 0
     assert implementation_diff_guidance["expected_diff_base_commit"] == "a" * 40
     assert implementation_diff_guidance["required_submission"] == (
         "changed_files=cumulative_runtime_diff"

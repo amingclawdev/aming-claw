@@ -34614,16 +34614,23 @@ def _runtime_context_worker_guide_response(
         or timeline_refs.get("observer_command_id")
         or ""
     ).strip()
+    finish_contract_execution_id = str(
+        contract_runtime_execution_resolution.get("contract_execution_id")
+        or contract_runtime_current_state.get("contract_execution_id")
+        or parent_task_id
+        or ""
+    ).strip()
+    finish_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str(route_identity.get(field) or "").strip()
+    }
     finish_attestation_body = {
         "project_id": project_id,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
-        "contract_execution_id": str(
-            contract_runtime_execution_resolution.get("contract_execution_id")
-            or contract_runtime_current_state.get("contract_execution_id")
-            or ""
-        ),
+        "contract_execution_id": finish_contract_execution_id,
         "worker_role": "mf_sub",
         "target_project_root": target_project_root,
         "session_token": session_token_placeholder,
@@ -34685,11 +34692,7 @@ def _runtime_context_worker_guide_response(
                 }
             )
         ),
-        **{
-            field: str(route_identity.get(field) or "").strip()
-            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-            if str(route_identity.get(field) or "").strip()
-        },
+        **finish_route_identity,
     }
     if hinted_worker_transcript_path:
         finish_attestation_body["worker_transcript_path"] = hinted_worker_transcript_path
@@ -34747,6 +34750,7 @@ def _runtime_context_worker_guide_response(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "contract_execution_id": finish_contract_execution_id,
         "target_project_root": target_project_root,
         "status": (
             finish_hint_source_backed_resolution.get("status")
@@ -34893,6 +34897,7 @@ def _runtime_context_worker_guide_response(
             or "<same observer_command_id used for finish-time attestation>"
         ),
         **canonical_dispatch_projection_fields,
+        **finish_route_identity,
         "finish_time_worker_self_attestation": (
             "<finish_time_worker_self_attestation returned by "
             "finish-time-worker-attestation>"
@@ -34902,6 +34907,7 @@ def _runtime_context_worker_guide_response(
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
+            "contract_execution_id": finish_contract_execution_id,
             "fence_token": "<same fence_token from the worker launch envelope>",
             "session_token": "<current runtime_context_session_token>",
             "session_token_ref": session_token_ref_placeholder,
@@ -34925,6 +34931,7 @@ def _runtime_context_worker_guide_response(
                 or "<same observer_command_id used for finish-time attestation>"
             ),
             **canonical_dispatch_projection_fields,
+            **finish_route_identity,
             "finish_time_worker_self_attestation": (
                 "<finish_time_worker_self_attestation returned by "
                 "finish-time-worker-attestation>"
@@ -35224,6 +35231,7 @@ def _runtime_context_worker_guide_response(
                 "task_id",
                 "checkpoint_id",
                 "parent_task_id",
+                "contract_execution_id",
                 "fence_token",
                 "session_token or session_token_ref",
                 "target_project_root",
@@ -35235,6 +35243,7 @@ def _runtime_context_worker_guide_response(
                 "read_receipt_hash",
                 "observer_command_id",
                 "finish_time_worker_self_attestation",
+                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
             ],
             "finish_gate_submission": finish_gate_submission_template,
             "submission": finish_gate_submission_template,
@@ -35264,13 +35273,14 @@ def _runtime_context_worker_guide_response(
                 "runtime_context_id",
                 "task_id",
                 "parent_task_id",
+                "contract_execution_id",
                 *_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS,
                 "fence_token",
                 "session_token or session_token_ref",
                 "target_project_root",
                 "changed_files",
                 "tests",
-                "route_token_ref",
+                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
             ],
             "server_derived_fields": [
                 "actor",
@@ -35289,11 +35299,11 @@ def _runtime_context_worker_guide_response(
             ),
             "route_identity_policy": {
                 "top_level_route_identity_source": (
-                    "copy_safe_body supplies route_token_ref; the server resolves "
-                    "the current worker route identity for this runtime_context_id."
+                    "copy_safe_body supplies the exact current worker route identity; "
+                    "the server revalidates it for this runtime_context_id."
                 ),
-                "copy_safe_body_uses_route_token_ref_only": True,
-                "server_derives_route_identity_from_route_token_ref": True,
+                "copy_safe_body_uses_exact_current_route_identity": True,
+                "server_revalidates_exact_route_identity": True,
                 "parent_route_lineage_location": (
                     "Only use parent_route_lineage when a server error or "
                     "route-token binding response explicitly asks for it; keep "
@@ -37105,12 +37115,15 @@ def _runtime_context_worker_recovery_payloads(
     present_route_identity = {
         field: value for field, value in safe_route_identity.items() if value
     }
-    implementation_route_reference = {
-        "route_token_ref": (
-            safe_route_identity.get("route_token_ref")
-            or "<current worker route_token_ref>"
-        )
-    }
+    active_contract_execution_id = (
+        str(
+            successor_contract_execution_id
+            or contract_execution_id
+            or parent_task_id
+            or ""
+        ).strip()
+        or "<active ContractRuntime contract_execution_id>"
+    )
     implementation_diff_submission_guidance = {
         "schema_version": (
             "runtime_context.implementation_diff_submission_guidance.v1"
@@ -38189,6 +38202,7 @@ def _runtime_context_worker_recovery_payloads(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "contract_execution_id": active_contract_execution_id,
         "lane_id": worker_slot_id or worker_id,
         "worker_role": "mf_sub",
         "worker_id": worker_id,
@@ -38203,7 +38217,7 @@ def _runtime_context_worker_recovery_payloads(
         "raw_session_token_persisted": False,
         "raw_fence_token_persisted": False,
         **implementation_writer_binding,
-        **implementation_route_reference,
+        **present_route_identity,
     }
     implementation_evidence_tests = [
         {"command": "<worker test command>", "status": "passed"}
@@ -38218,6 +38232,7 @@ def _runtime_context_worker_recovery_payloads(
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "contract_execution_id": active_contract_execution_id,
         "lane_id": worker_slot_id or worker_id,
         "worker_role": "mf_sub",
         "worker_id": worker_id,
@@ -38239,7 +38254,7 @@ def _runtime_context_worker_recovery_payloads(
         "write_authorization_policy": dict(write_authorization_policy),
         **implementation_writer_binding,
         "payload": implementation_evidence_payload,
-        **implementation_route_reference,
+        **present_route_identity,
     }
     scope_insufficiency_path = (
         f"/api/graph-governance/{project_id}/runtime-contexts/"
@@ -38251,6 +38266,7 @@ def _runtime_context_worker_recovery_payloads(
         "backlog_id": normalized_backlog_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
+        "contract_execution_id": active_contract_execution_id,
         "worker_role": "mf_sub",
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
@@ -38263,7 +38279,7 @@ def _runtime_context_worker_recovery_payloads(
         "blocked_acceptance_ids": ["<blocked acceptance criterion id>"],
         "reason": "<why the active file fence cannot satisfy acceptance>",
         "graph_refs": ["graph-query:<worker-owned graph trace id>"],
-        **implementation_route_reference,
+        **present_route_identity,
     }
     implementation_evidence_field_pointers = {
         "top_level_post_json": (
@@ -38287,16 +38303,16 @@ def _runtime_context_worker_recovery_payloads(
         "changed_files": "copy_safe_body.changed_files",
         "tests": "copy_safe_body.tests",
         "test_results": "copy_safe_body.test_results",
-        "route_token_ref": "copy_safe_body.route_token_ref",
+        "contract_execution_id": "copy_safe_body.contract_execution_id",
+        **{
+            field: f"copy_safe_body.{field}"
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
         **{
             field: f"copy_safe_body.{field}"
             for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
         },
     }
-    active_contract_execution_id = (
-        str(successor_contract_execution_id or contract_execution_id or "").strip()
-        or "<active ContractRuntime contract_execution_id>"
-    )
     worker_commit_body = {
         "project_id": project_id,
         "runtime_context_id": runtime_context_id,
@@ -38796,6 +38812,7 @@ def _runtime_context_worker_recovery_payloads(
                 "runtime_context_id",
                 "task_id",
                 "parent_task_id",
+                "contract_execution_id",
                 "worker_role",
                 "worker_id",
                 "worker_slot_id",
@@ -39004,6 +39021,7 @@ def _runtime_context_worker_recovery_payloads(
                 "runtime_context_id",
                 "task_id",
                 "parent_task_id",
+                "contract_execution_id",
                 "lane_id",
                 "worker_role",
                 "session_token or session_token_ref",
@@ -39012,7 +39030,7 @@ def _runtime_context_worker_recovery_payloads(
                 "changed_files",
                 "tests",
                 "test_results",
-                "route_token_ref",
+                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
                 *_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS,
             ],
             "forbidden_shapes": [
@@ -39057,13 +39075,9 @@ def _runtime_context_worker_recovery_payloads(
                     "route_token_ref",
                     "",
                 ),
-                "copy_safe_body_route_identity_fields_omitted": [
-                    field
-                    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-                    if field != "route_token_ref"
-                ],
-                "copy_safe_body_uses_route_token_ref_only": True,
-                "server_derives_route_identity_from_route_token_ref": True,
+                "copy_safe_body_route_identity_fields_omitted": [],
+                "copy_safe_body_uses_exact_current_route_identity": True,
+                "server_revalidates_exact_route_identity": True,
                 "parent_route_token_ref": safe_route_identity.get(
                     "route_token_ref",
                     "",
@@ -39090,6 +39104,7 @@ def _runtime_context_worker_recovery_payloads(
                 "backlog_id",
                 "task_id",
                 "parent_task_id",
+                "contract_execution_id",
                 "worker_role",
                 "session_token or session_token_ref",
                 "fence_token",
@@ -39099,6 +39114,7 @@ def _runtime_context_worker_recovery_payloads(
                 "blocked_acceptance_ids",
                 "reason",
                 "graph_refs",
+                *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
             ],
             "copy_safe_body": dict(scope_insufficiency_body),
             "request_is_append_only": True,
@@ -40097,6 +40113,12 @@ def _runtime_context_worker_recovery_details(
             ):
                 next_legal_action = "request_runtime_context_initial_join_host_envelope"
                 recovery_action_id = "request_runtime_context_initial_join_host_envelope"
+                initial_join_worker_session_id = str(
+                    getattr(context, "host_session_id", "")
+                    or _runtime_context_request_value(ctx, "worker_session_id")
+                    or _runtime_context_request_value(ctx, "host_session_id")
+                    or "<actual Desktop/Codex worker session id>"
+                ).strip()
                 session_token_initial_join_submission = {
                     "schema_version": (
                         "runtime_context.session_token_initial_join_submission.v1"
@@ -40108,6 +40130,7 @@ def _runtime_context_worker_recovery_details(
                         "{runtime_context_id}/session-token/initial-join"
                     ),
                     "body": {
+                        "project_id": project_id,
                         "runtime_context_id": expected_runtime_context_id,
                         "task_id": str(getattr(context, "task_id", "") or ""),
                         "parent_task_id": expected_parent_task_id,
@@ -40115,6 +40138,9 @@ def _runtime_context_worker_recovery_details(
                         "target_project_root": expected_target_root,
                         "worker_id": expected_worker_id,
                         "worker_slot_id": expected_worker_slot_id,
+                        "agent_id": expected_worker_id,
+                        "actual_host_worker_id": expected_worker_id,
+                        "worker_session_id": initial_join_worker_session_id,
                         **safe_route_identity,
                         "reason": (
                             "<operator reason: host adapter needs first worker auth env>"
@@ -40122,6 +40148,7 @@ def _runtime_context_worker_recovery_details(
                         "ttl_seconds": 3600,
                     },
                     "copy_safe_body": {
+                        "project_id": project_id,
                         "runtime_context_id": expected_runtime_context_id,
                         "task_id": str(getattr(context, "task_id", "") or ""),
                         "parent_task_id": expected_parent_task_id,
@@ -40129,6 +40156,9 @@ def _runtime_context_worker_recovery_details(
                         "target_project_root": expected_target_root,
                         "worker_id": expected_worker_id,
                         "worker_slot_id": expected_worker_slot_id,
+                        "agent_id": expected_worker_id,
+                        "actual_host_worker_id": expected_worker_id,
+                        "worker_session_id": initial_join_worker_session_id,
                         **safe_route_identity,
                         "reason": (
                             "<operator reason: host adapter needs first worker auth env>"
@@ -40138,6 +40168,18 @@ def _runtime_context_worker_recovery_details(
                     "required_route_identity_fields": list(
                         _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
                     ),
+                    "governed_identity_fields": [
+                        "agent_id",
+                        "actual_host_worker_id",
+                    ],
+                    "host_realization": {
+                        "desktop_identity_field": "worker_session_id",
+                        "required_replacement_paths": (
+                            ["worker_session_id"]
+                            if not getattr(context, "host_session_id", "")
+                            else []
+                        ),
+                    },
                     "missing_lineage": list(missing_worker_lineage),
                     "required_before_worker_evidence": [
                         (
