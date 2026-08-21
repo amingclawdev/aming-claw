@@ -1,0 +1,405 @@
+{
+  "schema_version": "contract_definition.v1",
+  "contract_id": "operator_supervised_direct_main",
+  "version": "v1",
+  "revision": "rev2",
+  "role": "observer",
+  "contract_type": "operator_supervised_direct_main",
+  "status": "active",
+  "compat_aliases": [
+    "operator_supervised_direct_main.v1",
+    "direct_main",
+    "direct_main.v1"
+  ],
+  "successors": [
+    {
+      "contract_id": "operator_supervised_direct_main",
+      "version": "v1",
+      "reason": "A failed source generation is audit-only; retry requires a fresh bounded row and a later source revision whose dependencies are resolved."
+    },
+    {
+      "contract_id": "mf_parallel.v2",
+      "version": "v2",
+      "reason": "Scope expansion may transition to the parallel contract only through an authenticated operator-approved typed transition."
+    }
+  ],
+  "system_layer": {
+    "entrypoint_policy": {
+      "allow_root_start": true,
+      "allow_entry": true,
+      "root_start_default": "deny_without_explicit_operator_approved_bound_route",
+      "required_work_type": "operator_supervised_direct_main",
+      "requires_backlog": true,
+      "requires_operator_approval": true
+    },
+    "successor_policy": {
+      "allow_successor_start": true,
+      "successor_start_default": "deny_without_fresh_bounded_row_and_explicit_transition",
+      "same_generation_retry_allowed": false,
+      "fresh_bounded_row_required": true,
+      "explicit_scope_expansion_required_for_parallel": true,
+      "allowed_successors": [
+        {
+          "contract_id": "operator_supervised_direct_main",
+          "version": "v1",
+          "transition": "fresh_generation_after_terminal_source"
+        },
+        {
+          "contract_id": "mf_parallel.v2",
+          "version": "v2",
+          "transition": "authenticated_operator_approved_scope_expansion"
+        }
+      ]
+    },
+    "write_authority_policy": {
+      "agent_facing_generic_crud_allowed": false,
+      "allowed_writer_roles_source": "rule_layer.allowed_writer_roles",
+      "body_supplied_role_claims_trusted": false,
+      "observer_implementation_exception_is_contract_scoped": true,
+      "qa_must_be_role_separated": true,
+      "unlisted_role_default": "deny"
+    },
+    "next_action_policy": {
+      "decision_source": "contract_runtime_first_missing_line",
+      "guide_is_projection_only": true,
+      "legacy_server_predicates_are_validation_only": true,
+      "legacy_close_gate_gap_reconstruction": "audit_only"
+    },
+    "projection_policy": {
+      "read_model_source": "source_json_normalized_definition",
+      "runtime_projection_source": "contract_runtime_execution_state",
+      "mutable_completed_lines_trust_root": false,
+      "historical_behavior_oracle_is_certificate": false
+    },
+    "route_policy": {
+      "start_allowed": true,
+      "new_route_allowed": true,
+      "route_identity_required": true,
+      "route_token_ref_required": true,
+      "visible_injection_manifest_required": true,
+      "exact_project_backlog_task_binding_required": true,
+      "raw_route_token_persistence_allowed": false
+    },
+    "authority_policy": {
+      "semantic_change_requires_new_revision": true,
+      "same_revision_semantic_change_allowed": false,
+      "operator_approval_required": true,
+      "independent_review_required": true,
+      "common_rule_applicability_must_be_explicit": true,
+      "server_rule_inference_allowed": false
+    },
+    "graph_binding_policy": {
+      "graph_first_required": true,
+      "pre_implementation_graph_trace_required": true,
+      "pre_implementation_graph_trace_query_source": "observer",
+      "qa_graph_trace_required": true,
+      "qa_graph_trace_query_source": "qa",
+      "direct_trusted_graph_db_writes_allowed": false,
+      "current_head_full_reconcile_required_before_close": true,
+      "new_graph_context_allowed": true,
+      "candidate_commit_evidence_policy": {
+        "enabled": true,
+        "line_ids": [
+          "observer_implementation"
+        ],
+        "candidate_commit_path": "commit_sha",
+        "full_commit_required": true
+      },
+      "current_full_reconcile_evidence_policy": {
+        "enabled": true,
+        "line_ids": [
+          "observer_reconcile"
+        ],
+        "reconcile_mode": "current_full",
+        "activate_required": true,
+        "canonical_head_verified": true,
+        "active_snapshot_verified": true,
+        "exact_close_commit_required": true
+      }
+    },
+    "scope_identity_policy": {
+      "required_fields": [
+        "project_id",
+        "backlog_id",
+        "task_id",
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+        "owned_files",
+        "target_project_root",
+        "worktree_path",
+        "base_commit",
+        "target_head_commit"
+      ],
+      "owned_files_closed_set": true,
+      "changed_files_must_be_subset": true,
+      "worktree_must_match_selected_route": true,
+      "caller_aliases_are_authority": false
+    },
+    "retry_policy": {
+      "same_execution_retry_allowed": false,
+      "same_generation_retry_allowed": false,
+      "post_hoc_pass_backfill_allowed": false,
+      "failed_source_generation_terminal": true,
+      "fresh_bounded_row_required": true,
+      "fresh_contract_revision_required_after_dependency_resolution": false,
+      "historical_source_retained_as_audit": true
+    },
+    "terminal_outcome_policy": {
+      "success": "observer_close_ready_after_independent_qa_and_current_head_full_reconcile",
+      "qa_failure": "terminal_no_pass_preserve_source_generation_as_audit",
+      "authoritative_close_failure": "terminal_no_pass_preserve_source_generation_as_audit",
+      "dependency_unresolved": "typed_rejection_without_execution_or_write",
+      "history_rewrite_allowed": false
+    },
+    "common_rule_policy": {
+      "join_state": "resolved",
+      "activation_allowed": true,
+      "omitted_rules_apply": false,
+      "server_inference_allowed": false,
+      "package_id": "aming-claw.common-safety",
+      "package_version": "v1",
+      "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603",
+      "applicable_rule_count": 10,
+      "new_revision_required_after_resolution": false
+    }
+  },
+  "rule_layer": {
+    "stages": [
+      {
+        "stage_id": "route_gate",
+        "description": "Observer binds the exact project, backlog, task, route, closed file fence, current worktree, base HEAD, target HEAD, and operator approval before graph or mutation evidence can advance.",
+        "lines": [
+          {
+            "line_id": "observer_bind_direct_scope",
+            "owner_role": "observer",
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "evidence_kind": "contract_binding",
+            "description": "Source-backed Direct scope identity, route identity, immutable owned-files fence, worktree identity, commit boundary, test plan, and operator approval."
+          }
+        ]
+      },
+      {
+        "stage_id": "graph_first",
+        "description": "Observer resolves exact symbols and records DB-backed graph traces before the mutation exception is entered.",
+        "lines": [
+          {
+            "line_id": "observer_graph_context",
+            "owner_role": "observer",
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "evidence_kind": "graph_trace",
+            "requires": [
+              "observer_bind_direct_scope"
+            ],
+            "description": "Pre-implementation graph trace evidence bound to the exact route, task, file fence, target root, and pre-mutation world."
+          }
+        ]
+      },
+      {
+        "stage_id": "pre_mutation",
+        "description": "Observer enters the bounded operator-supervised Direct mutation only after route and graph-first proof.",
+        "lines": [
+          {
+            "line_id": "observer_direct_implementation_exception",
+            "owner_role": "observer",
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "evidence_kind": "observer_direct_implementation_exception",
+            "requires": [
+              "observer_graph_context"
+            ],
+            "description": "Server-admitted pre-mutation boundary proving tiny deterministic scope, clean file fence, explicit operator approval, and graph-first completion."
+          }
+        ]
+      },
+      {
+        "stage_id": "implementation",
+        "description": "Observer records the exact committed implementation and command-backed test evidence inside the closed Direct scope.",
+        "lines": [
+          {
+            "line_id": "observer_implementation",
+            "owner_role": "observer",
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "evidence_kind": "implementation",
+            "requires": [
+              "observer_direct_implementation_exception"
+            ],
+            "description": "Immutable implementation commit, exact changed-file subset, clean worktree proof, diff proof, and passing commit-bound test commands."
+          }
+        ]
+      },
+      {
+        "stage_id": "qa_graph_context",
+        "description": "Independent QA builds candidate graph context from the exact implementation commit.",
+        "lines": [
+          {
+            "line_id": "qa_graph_context",
+            "owner_role": "qa",
+            "allowed_writer_roles": [
+              "qa"
+            ],
+            "evidence_kind": "graph_trace",
+            "requires": [
+              "observer_implementation"
+            ],
+            "description": "QA-authored DB-backed graph traces for the exact candidate commit and target root; observer evidence cannot satisfy this line."
+          }
+        ]
+      },
+      {
+        "stage_id": "qa",
+        "description": "Independent QA returns exactly one PASS or NO-PASS verdict for the committed candidate.",
+        "lines": [
+          {
+            "line_id": "qa_independent_verification",
+            "owner_role": "qa",
+            "allowed_writer_roles": [
+              "qa"
+            ],
+            "evidence_kind": "independent_verification",
+            "requires": [
+              "qa_graph_context"
+            ],
+            "description": "Role-separated QA verdict with exact commit, structured test results, graph basis, and authenticated reviewer identity. NO-PASS terminalizes this source generation."
+          }
+        ]
+      },
+      {
+        "stage_id": "reconcile",
+        "description": "Observer reconciles and activates one full graph snapshot at the exact QA-accepted canonical HEAD.",
+        "lines": [
+          {
+            "line_id": "observer_reconcile",
+            "owner_role": "observer",
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "evidence_kind": "current_full_reconcile",
+            "requires": [
+              "qa_independent_verification"
+            ],
+            "description": "Canonical current-full reconcile evidence with exact commit ancestry, active snapshot identity, and QA-before-reconcile ordering."
+          }
+        ]
+      },
+      {
+        "stage_id": "close_ready",
+        "description": "Observer records close readiness only after accepted QA, runtime verification, and active current-HEAD full reconcile.",
+        "lines": [
+          {
+            "line_id": "observer_close_ready",
+            "owner_role": "observer",
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "evidence_kind": "close_ready",
+            "requires": [
+              "observer_reconcile"
+            ],
+            "description": "Exact closing HEAD, structured tests, live verification, graph reconcile proof, preflight result, and close-integrity evidence."
+          }
+        ]
+      }
+    ]
+  },
+  "instruction_layer": {
+    "inline": [
+      "Contract is task authority; the explicitly joined common Rule package is additional declared authority, Gate validates both, and Guide only projects their current result.",
+      "This rev2 is a fresh active successor to immutable draft rev1; it does not resume, relabel, or rewrite rev1 or any historical Direct execution.",
+      "Apply only the ten named aming-claw.common-safety v1 rule_ids at the pinned digest and operator_supervised_direct_main scope; omitted rules do not apply and server inference is forbidden.",
+      "Start only through an exact operator-approved route/backlog/task/file/worktree binding and preserve the source-backed definition, package, and route hashes in the fresh execution.",
+      "Ordinary Direct is one bounded operator-supervised current-world flow: exact route and file scope, graph first, committed implementation, role-separated QA, current-HEAD full reconcile, then close-ready.",
+      "A QA or authoritative close failure terminalizes the source generation. Preserve it as audit-only and use a fresh bounded row; never synthesize PASS, backfill missing historical evidence, or splice old and new worlds."
+    ],
+    "refs": []
+  },
+  "metadata": {
+    "backlog_id": "AC-DIRECT-MAIN-COMMON-RULE-BOUND-REV2-P0-20260821",
+    "runtime_dogfood": true,
+    "activation": {
+      "schema_version": "contract_activation_dependency.v1",
+      "state": "ready",
+      "activation_ready": true,
+      "new_execution_allowed": true,
+      "template_selection_allowed": true,
+      "unresolved_dependencies": [],
+      "resolved_dependencies": [
+        {
+          "dependency_id": "AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815",
+          "status": "FIXED",
+          "commit_sha": "c994b511aae3e2a99d6100ca1f61c8cae95a0e48",
+          "package_id": "aming-claw.common-safety",
+          "package_version": "v1",
+          "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603"
+        }
+      ],
+      "result": {
+        "schema_version": "contract_activation_ready.v1",
+        "code": "contract_activation_ready",
+        "status": "accepted",
+        "classification": "source_backed_dependency_resolved",
+        "message": "operator_supervised_direct_main v1 rev2 pins the accepted common Rule package and allows only fresh explicitly bound executions",
+        "authorizes_write": false,
+        "activation_ready": true,
+        "new_execution_allowed": true
+      }
+    },
+    "common_rule_applicability": {
+      "schema_version": "contract_common_rule_applicability.v1",
+      "join_state": "resolved",
+      "package_id": "aming-claw.common-safety",
+      "package_version": "v1",
+      "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603",
+      "rule_ids": [
+        "AC-COMMON-IDENTITY-PROJECT-BACKLOG-TASK",
+        "AC-COMMON-IDENTITY-ROUTE",
+        "AC-COMMON-SCOPE-OWNED-FILES",
+        "AC-COMMON-WORKTREE-EXACT-IDENTITY",
+        "AC-COMMON-CREDENTIAL-NO-RAW-PERSISTENCE",
+        "AC-COMMON-COMMIT-IMMUTABLE-WORKER",
+        "AC-COMMON-QA-ROLE-SEPARATION",
+        "AC-COMMON-MERGE-ORDERED",
+        "AC-COMMON-GRAPH-EXACT-ACTIVE-PREFLIGHT",
+        "AC-COMMON-CLOSE-INTEGRITY"
+      ],
+      "scopes": [
+        "operator_supervised_direct_main"
+      ],
+      "omitted_rules_apply": false,
+      "server_inference_allowed": false,
+      "activation_allowed": true
+    },
+    "historical_behavior_oracle": {
+      "commit_prefix": "8a6ef43",
+      "classification": "behavior_oracle_only",
+      "authority": false,
+      "certificate": false,
+      "relabels_historical_execution": false,
+      "proves_current_activation": false
+    }
+  },
+  "governance_hints": {
+    "schema_version": "governance_hints.v1",
+    "asset_binding_events": [
+      {
+        "schema_version": "asset_binding_event.v1",
+        "operation": "bind",
+        "path": ".",
+        "role": "config",
+        "target_module": "agent.governance.contracts.registry"
+      }
+    ]
+  }
+}
+
+

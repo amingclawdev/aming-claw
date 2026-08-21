@@ -17,81 +17,97 @@
   ],
   "applicability": {
     "allowed_only_for": "one_bounded_operator_supervised_current_world_direct_main_flow",
-    "activation_ready": false,
-    "new_execution_allowed": false,
-    "template_selection_allowed": false,
-    "dependency_state": "dependency_unresolved",
-    "unresolved_dependency_id": "AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815",
-    "requires_new_definition_revision_after_dependency_resolution": true,
+    "activation_ready": true,
+    "new_execution_allowed": true,
+    "template_selection_allowed": true,
+    "dependency_state": "resolved",
+    "requires_new_definition_revision_after_dependency_resolution": false,
     "not_for": [
       "unbounded_or_multi_lane_implementation",
       "same_generation_retry_after_no_pass",
       "historical_evidence_backfill",
       "implicit_common_rule_inference"
-    ]
+    ],
+    "resolved_dependency": {
+      "dependency_id": "AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815",
+      "status": "FIXED",
+      "commit_sha": "c994b511aae3e2a99d6100ca1f61c8cae95a0e48",
+      "package_id": "aming-claw.common-safety",
+      "package_version": "v1",
+      "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603"
+    }
   },
   "source": {
     "type": "source_controlled",
-    "path": "contract_definitions/operator_supervised_direct_main.v1.rev1.json",
+    "path": "contract_definitions/operator_supervised_direct_main.v1.rev2.json",
     "authority": "contract_definition",
     "template_is_authoritative": false,
     "contract_id": "operator_supervised_direct_main",
     "version": "v1",
-    "revision": "rev1",
-    "definition_hash": "sha256:3b0da25cf3ab87f7e4bd59b65dca81882798f13fa92558def8707a4f174a21bb",
-    "definition_source_sha256": "sha256:2559e1e2302c8a03d63a297c173afce6ffeb11100afadc53c85ff09101428a15"
+    "revision": "rev2",
+    "definition_hash": "sha256:ea169f8dd6c5badd7e7ba774fb0636739608dee4844d6aa775e9538dbbbe5ca2",
+    "definition_source_sha256": "sha256:a98b860023b33cebaabc3d76d30c3a2c779532bd642bc8eb1a4ae7917540bef0"
   },
   "activation_policy": {
     "schema_version": "contract_activation_dependency.v1",
-    "state": "dependency_unresolved",
-    "activation_ready": false,
-    "new_execution_allowed": false,
-    "template_selection_allowed": false,
-    "unresolved_dependencies": [
+    "state": "ready",
+    "activation_ready": true,
+    "new_execution_allowed": true,
+    "template_selection_allowed": true,
+    "unresolved_dependencies": [],
+    "resolved_dependencies": [
       {
         "dependency_id": "AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815",
-        "kind": "verification_only_external_dependency",
-        "resolution_requires_new_contract_revision": true
+        "status": "FIXED",
+        "commit_sha": "c994b511aae3e2a99d6100ca1f61c8cae95a0e48",
+        "package_id": "aming-claw.common-safety",
+        "package_version": "v1",
+        "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603"
       }
     ],
     "result": {
-      "schema_version": "contract_dependency_unresolved.v1",
-      "code": "contract_dependency_unresolved",
-      "error": "contract_dependency_unresolved",
-      "status": "rejected",
-      "classification": "external_dependency",
-      "retryable": false,
-      "message": "operator_supervised_direct_main v1 rev1 cannot start until the Common Rule package is source-backed and a new Direct revision pins its exact applicability join",
+      "schema_version": "contract_activation_ready.v1",
+      "code": "contract_activation_ready",
+      "status": "accepted",
+      "classification": "source_backed_dependency_resolved",
+      "message": "operator_supervised_direct_main v1 rev2 pins the accepted common Rule package and allows only fresh explicitly bound executions",
       "authorizes_write": false,
-      "activation_ready": false,
-      "next_legal_action": {
-        "id": "complete_common_rule_package_then_create_direct_revision",
-        "action": "continue_sequential_contract_authoring",
-        "next_step": "Complete AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815, then create a new Direct revision that pins the exact package version, digest, rule_ids, and scopes."
-      }
+      "activation_ready": true,
+      "new_execution_allowed": true
     }
   },
   "common_rule_applicability": {
-    "schema_version": "contract_common_rule_applicability.unresolved.v1",
-    "join_state": "unresolved",
-    "dependency_id": "AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815",
-    "package_id": "",
-    "package_version": "",
-    "package_digest": "",
-    "rule_ids": [],
-    "scopes": [],
+    "schema_version": "contract_common_rule_applicability.v1",
+    "join_state": "resolved",
+    "package_id": "aming-claw.common-safety",
+    "package_version": "v1",
+    "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603",
+    "rule_ids": [
+      "AC-COMMON-IDENTITY-PROJECT-BACKLOG-TASK",
+      "AC-COMMON-IDENTITY-ROUTE",
+      "AC-COMMON-SCOPE-OWNED-FILES",
+      "AC-COMMON-WORKTREE-EXACT-IDENTITY",
+      "AC-COMMON-CREDENTIAL-NO-RAW-PERSISTENCE",
+      "AC-COMMON-COMMIT-IMMUTABLE-WORKER",
+      "AC-COMMON-QA-ROLE-SEPARATION",
+      "AC-COMMON-MERGE-ORDERED",
+      "AC-COMMON-GRAPH-EXACT-ACTIVE-PREFLIGHT",
+      "AC-COMMON-CLOSE-INTEGRITY"
+    ],
+    "scopes": [
+      "operator_supervised_direct_main"
+    ],
     "omitted_rules_apply": false,
     "server_inference_allowed": false,
-    "activation_allowed": false,
-    "resolution_requires_new_contract_revision": true
+    "activation_allowed": true
   },
   "gate_policy": {
     "schema_version": "operator_supervised_direct_main_gate_policy.v1",
     "non_authoritative_template_mirror": true,
-    "authority": "contract_definitions/operator_supervised_direct_main.v1.rev1.json",
+    "authority": "contract_definitions/operator_supervised_direct_main.v1.rev2.json",
     "fail_closed": true,
-    "activation_ready": false,
-    "entry_allowed": false,
+    "activation_ready": true,
+    "entry_allowed": true,
     "same_generation_retry_allowed": false,
     "post_hoc_pass_backfill_allowed": false,
     "graph_first_required": true,
@@ -163,7 +179,7 @@
     "failed_source_generation_terminal": true,
     "fresh_bounded_row_required": true,
     "historical_source_retained_as_audit": true,
-    "new_revision_required_after_dependency_resolution": true
+    "new_revision_required_after_dependency_resolution": false
   },
   "historical_behavior_oracle": {
     "commit_prefix": "8a6ef43",

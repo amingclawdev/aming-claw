@@ -29,7 +29,7 @@ def _direct_definition():
     return ContractDefinitionRegistry().get(
         "operator_supervised_direct_main",
         version="v1",
-        revision="rev1",
+        revision="rev2",
     )
 
 
@@ -128,16 +128,14 @@ def test_direct_main_runtime_order_and_qa_role_gate_are_definition_derived() -> 
     assert "qa_graph_context requires actor_role=qa" in decision.errors
 
 
-def test_direct_main_dependency_join_is_explicit_and_uniformly_fail_closed() -> None:
+def test_direct_main_rev1_dependency_join_remains_immutable_and_fail_closed() -> None:
     registry = ContractDefinitionRegistry()
     definition = registry.get(
         "operator_supervised_direct_main",
         version="v1",
         revision="rev1",
     )
-    template = get_contract_template("operator_supervised_direct_main.v1")
     definition_join = definition["metadata"]["common_rule_applicability"]
-    template_join = template["common_rule_applicability"]
     package = registry.common_rule_package()
     resolved_join = registry.resolve_common_rule_applicability(definition)
 
@@ -156,7 +154,6 @@ def test_direct_main_dependency_join_is_explicit_and_uniformly_fail_closed() -> 
         "resolution_requires_new_contract_revision": True,
     }
     assert definition_join == expected_join
-    assert template_join == expected_join
     assert definition["status"] == "draft"
     assert definition["system_layer"]["entrypoint_policy"]["allow_entry"] is False
     assert definition["system_layer"]["route_policy"]["start_allowed"] is False
@@ -167,10 +164,6 @@ def test_direct_main_dependency_join_is_explicit_and_uniformly_fail_closed() -> 
         "server_inference_allowed": False,
         "new_revision_required_after_resolution": True,
     }
-    assert template["source"]["definition_hash"] == definition["definition_hash"]
-    assert template["activation_policy"]["result"] == (
-        definition["metadata"]["activation"]["result"]
-    )
     assert package["package_id"] == "aming-claw.common-safety"
     assert package["package_version"] == "v1"
     assert len(package["rule_ids"]) == 10
@@ -178,6 +171,48 @@ def test_direct_main_dependency_join_is_explicit_and_uniformly_fail_closed() -> 
     assert resolved_join["authoritative"] is False
     assert resolved_join["rule_ids"] == []
     assert resolved_join["server_inference_allowed"] is False
+
+
+def test_direct_main_rev2_rule_gate_and_guide_join_one_explicit_authority() -> None:
+    registry = ContractDefinitionRegistry()
+    definition = _direct_definition()
+    template = get_contract_template("operator_supervised_direct_main.v1")
+    package = registry.common_rule_package()
+    join = registry.resolve_common_rule_applicability(definition)
+
+    assert definition["status"] == "active"
+    assert definition["revision"] == "rev2"
+    assert join["authoritative"] is True
+    assert join["join_state"] == "resolved"
+    assert join["package_id"] == package["package_id"]
+    assert join["package_version"] == package["package_version"]
+    assert join["package_digest"] == package["package_digest"]
+    assert join["rule_ids"] == package["rule_ids"]
+    assert join["scopes"] == ["operator_supervised_direct_main"]
+    assert join["omitted_rules_apply"] is False
+    assert join["server_inference_allowed"] is False
+    assert definition["system_layer"]["entrypoint_policy"]["allow_entry"] is True
+    assert definition["system_layer"]["route_policy"]["start_allowed"] is True
+    assert definition["system_layer"]["common_rule_policy"] == {
+        "join_state": "resolved",
+        "activation_allowed": True,
+        "omitted_rules_apply": False,
+        "server_inference_allowed": False,
+        "package_id": package["package_id"],
+        "package_version": package["package_version"],
+        "package_digest": package["package_digest"],
+        "applicable_rule_count": len(package["rule_ids"]),
+        "new_revision_required_after_resolution": False,
+    }
+    assert template["source"]["revision"] == "rev2"
+    assert template["source"]["definition_hash"] == definition["definition_hash"]
+    assert template["source"]["definition_source_sha256"] == definition[
+        "source_sha256"
+    ]
+    assert template["common_rule_applicability"] == definition["metadata"][
+        "common_rule_applicability"
+    ]
+    assert template["activation_policy"] == definition["metadata"]["activation"]
 
 
 def test_direct_main_terminal_and_retry_policy_forbid_in_place_repair() -> None:

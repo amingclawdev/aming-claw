@@ -322,6 +322,75 @@ def test_direct_main_rev1_dependency_unresolved_prevents_new_execution(
     assert runtime.store._records == {}
 
 
+def test_direct_main_rev2_starts_fresh_with_authoritative_common_rule_join():
+    registry = ContractDefinitionRegistry()
+    runtime = ContractRuntime(registry)
+
+    created = runtime.start_execution(
+        "direct_main",
+        version="v1",
+        revision="rev2",
+        project_id="aming-claw",
+        backlog_id="AC-DIRECT-MAIN-REV2-FRESH-EXECUTION",
+        actor_role="observer",
+        contract_execution_id="cex-direct-main-rev2-fresh",
+    )
+
+    join = created["authoritative_common_rule_join"]
+    package = registry.common_rule_package()
+    assert created["revision"] == "rev2"
+    assert join["authoritative"] is True
+    assert join["join_state"] == "resolved"
+    assert join["package_id"] == package["package_id"]
+    assert join["package_version"] == package["package_version"]
+    assert join["package_digest"] == package["package_digest"]
+    assert join["rule_ids"] == package["rule_ids"]
+    assert join["scopes"] == ["operator_supervised_direct_main"]
+    assert join["omitted_rules_apply"] is False
+    assert join["server_inference_allowed"] is False
+    assert created["execution_state"]["authoritative_common_rule_join"] == join
+    assert created["runtime_guide"]["authoritative_common_rule_join"] == join
+    assert set(runtime.store._records) == {"cex-direct-main-rev2-fresh"}
+
+    proposed_write = {
+        "project_id": created["project_id"],
+        "backlog_id": created["backlog_id"],
+        "contract_execution_id": created["contract_execution_id"],
+        "definition_hash": created["definition_hash"],
+        "instruction_bundle_hash": created["instruction_bundle_hash"],
+        "execution_state_revision": created["execution_state_revision"],
+        "runtime_guide_hash": created["runtime_guide"]["runtime_guide_hash"],
+        "stage_id": "route_gate",
+        "line_id": "observer_bind_direct_scope",
+        "actor_role": "observer",
+        "evidence_kind": "contract_binding",
+    }
+    precheck = runtime.precheck_line_write(
+        created["contract_execution_id"],
+        proposed_write,
+        actor_role="observer",
+    )
+    written = runtime.submit_line_write(
+        created["contract_execution_id"],
+        proposed_write,
+        actor_role="observer",
+    )
+    assert precheck["ok"] is True
+    assert precheck["would_mutate_completed_lines"] is False
+    assert written["ok"] is True
+    assert precheck["decision"] == written["decision"]
+    assert precheck["record"]["authoritative_common_rule_join"] == join
+    assert written["record"]["authoritative_common_rule_join"] == join
+
+    rev1 = registry.get(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev1",
+    )
+    assert rev1["status"] == "draft"
+    assert registry.resolve_common_rule_applicability(rev1)["authoritative"] is False
+
+
 def test_ordinary_direct_contract_has_no_retired_world_alias_or_dependency():
     definition = ContractDefinitionRegistry().get(
         "operator_supervised_direct_main",
