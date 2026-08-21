@@ -30837,6 +30837,14 @@ def _runtime_context_guide_executable_actions(
     }
 
 
+_GUIDE_RAW_AUTH_BODY_FIELDS = {
+    "fence_token",
+    "qa_session_token",
+    "route_token",
+    "session_token",
+}
+
+
 def _runtime_context_graph_copy_safe_body(
     *,
     project_id: str,
@@ -30851,6 +30859,11 @@ def _runtime_context_graph_copy_safe_body(
     """Build the one canonical worker graph body shared by all guides."""
 
     body = dict(graph_payload_shape or {})
+    # A graph Guide is executable through the managed safe-ref adapter.  Raw
+    # auth fields from an older RuntimeContext payload shape must not survive
+    # into the public action body (or create a dangling host replacement path).
+    for field in _GUIDE_RAW_AUTH_BODY_FIELDS:
+        body.pop(field, None)
     body.update(
         {
             "project_id": project_id,
@@ -137885,14 +137898,6 @@ def _onboard_guide_capsule_find_action_input(
     return {}, ""
 
 
-_GUIDE_RAW_AUTH_BODY_FIELDS = {
-    "fence_token",
-    "qa_session_token",
-    "route_token",
-    "session_token",
-}
-
-
 def _guide_executable_action_safe_body(
     value: Mapping[str, Any],
     *,
@@ -137960,6 +137965,22 @@ def _guide_canonical_executable_action(
         copy_safe_body.setdefault("project_id", project_id)
 
     if normalized_tool == "graph_query":
+        # Graph queries consume the managed HostEnvelopeStore through the
+        # copy-safe session ref.  Unlike worker write facades, their public
+        # Guide body must never ask the model/host to realize raw auth.  Keep
+        # this second normalization layer for direct or legacy callers that
+        # bypass _runtime_context_graph_copy_safe_body.
+        graph_raw_auth_paths = {
+            f"copy_safe_body.{field}"
+            for field in _GUIDE_RAW_AUTH_BODY_FIELDS
+        }
+        for field in _GUIDE_RAW_AUTH_BODY_FIELDS:
+            copy_safe_body.pop(field, None)
+        replacement_paths = [
+            item
+            for item in replacement_paths
+            if item not in graph_raw_auth_paths
+        ]
         copy_safe_body.setdefault("tool", "function_index")
         args = (
             dict(copy_safe_body.get("args"))

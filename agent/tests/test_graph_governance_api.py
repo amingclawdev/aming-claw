@@ -159418,13 +159418,33 @@ def test_runtime_context_graph_guide_safe_ref_only_host_realization_warranty():
         target_project_root="/tmp/graph-guide-warranty",
         session_token_ref="wstok-graph-guide-warranty",
         route_identity=route_identity,
-        graph_payload_shape={"project_root": "/tmp/graph-guide-warranty"},
+        graph_payload_shape={
+            "project_root": "/tmp/graph-guide-warranty",
+            "runtime_context_id": "mfrctx-cross-runtime",
+            "task_id": "cross-worker",
+            "parent_task_id": "cex-cross",
+            "session_token_ref": "wstok-cross",
+            "route_identity": {"route_id": "route-cross"},
+            "query_source": "observer",
+            "query_purpose": "wrong-purpose",
+            "session_token": "legacy-raw-session-warranty-sentinel",
+            "fence_token": "env:AMING_WORKER_FENCE_TOKEN",
+            "route_token": {"legacy": "raw-route-warranty-sentinel"},
+            "qa_session_token": "<legacy qa token placeholder>",
+        },
     )
 
     assert body["session_token_ref"] == "wstok-graph-guide-warranty"
     assert body["route_identity"] == route_identity
+    assert body["runtime_context_id"] == "mfrctx-graph-guide-warranty"
+    assert body["task_id"] == "graph-guide-warranty-worker"
+    assert body["parent_task_id"] == "cex-graph-guide-warranty"
+    assert body["query_source"] == "mf_subagent"
+    assert body["query_purpose"] == "subagent_context_build"
     assert "session_token" not in body
     assert "fence_token" not in body
+    assert "route_token" not in body
+    assert "qa_session_token" not in body
 
     action = server._guide_canonical_executable_action(
         project_id=PID,
@@ -159460,13 +159480,10 @@ def test_runtime_context_graph_guide_safe_ref_only_host_realization_warranty():
     serialized_probe = json.dumps(raw_auth_probe, sort_keys=True)
     assert "raw-session-warranty-sentinel" not in serialized_probe
     assert "raw-fence-warranty-sentinel" not in serialized_probe
-    assert set(
-        raw_auth_probe["host_realization"]["required_replacement_paths"]
-    ) == {
-        "copy_safe_body.args.query",
-        "copy_safe_body.session_token",
-        "copy_safe_body.fence_token",
-    }
+    assert raw_auth_probe["copy_safe_body"] == body
+    assert raw_auth_probe["host_realization"]["required_replacement_paths"] == [
+        "copy_safe_body.args.query"
+    ]
 
 
 def test_compact_worker_graph_context_projects_exact_sibling_action_zero_write(
@@ -169595,10 +169612,10 @@ def test_guide_canonical_executable_action_is_secret_safe_and_schema_shaped():
         "prompt_contract_hash": "sha256:prompt-contract",
         "visible_injection_manifest_hash": "sha256:visible-manifest",
     }
+    assert "session_token" not in body
+    assert "fence_token" not in body
     assert raw_session not in json.dumps(action)
     assert action["host_realization"]["required_replacement_paths"] == [
-        "copy_safe_body.session_token",
-        "copy_safe_body.fence_token",
         "copy_safe_body.args.query",
     ]
     assert action["prewrite_failure_contract"] == {
