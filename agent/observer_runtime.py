@@ -38,6 +38,7 @@ try:
         build_registered_host_adapter_spawn_identity,
         branch_strategy_from_runtime_context,
         plan_branch_runtime_context,
+        runtime_context_fence_token_verifier,
         runtime_context_id_for_branch_context,
         runtime_context_session_token_ref,
     )
@@ -66,6 +67,7 @@ except ImportError:  # pragma: no cover - package import path
         build_registered_host_adapter_spawn_identity,
         branch_strategy_from_runtime_context,
         plan_branch_runtime_context,
+        runtime_context_fence_token_verifier,
         runtime_context_id_for_branch_context,
         runtime_context_session_token_ref,
     )
@@ -304,7 +306,7 @@ RUNTIME_TEXT_STARTUP_PROJECTION_FIELDS = (
     "task_id",
     "parent_task_id",
     "worker_role",
-    "fence_token",
+    "fence_token_hash",
     "worktree_path",
     "branch_ref",
     "base_commit",
@@ -321,7 +323,7 @@ RUNTIME_TEXT_FINISH_PROJECTION_FIELDS = (
     "task_id",
     "parent_task_id",
     "worker_role",
-    "fence_token",
+    "fence_token_hash",
     "worktree_path",
     "base_commit",
     "target_head_commit",
@@ -339,6 +341,7 @@ RUNTIME_TEXT_PROJECTION_FIELD_SOURCES = {
     "parent_task_id": "runtime_context.current.v1.worker_view.parent_task_id",
     "worker_role": "runtime_context.worker_view.v1.worker_role",
     "fence_token": "runtime_context.worker_view.v1.fence_token",
+    "fence_token_hash": "runtime_context.worker_view.v1.fence_token_hash",
     "worktree_path": "runtime_context.worker_view.v1.worktree_path",
     "branch_ref": "runtime_context.worker_view.v1.branch_ref",
     "base_commit": "runtime_context.worker_view.v1.base_commit",
@@ -908,6 +911,12 @@ def _runtime_text_secret_hash(value: str) -> str:
     if not token:
         return ""
     return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _runtime_text_fence_token_hash(context: Any) -> str:
+    """Project the durable fence verifier without requiring the raw secret."""
+
+    return runtime_context_fence_token_verifier(context)
 
 
 def _runtime_text_test_environment_preflight(
@@ -2908,6 +2917,7 @@ def _runtime_text_branch_runtime_evidence(
         "task_id": context.task_id,
         "parent_task_id": parent_task_id,
         "fence_token": context.fence_token,
+        "fence_token_verifier": _runtime_text_fence_token_hash(context),
         "worktree_path": context.worktree_path,
         "base_commit": context.base_commit,
         "target_head_commit": context.target_head_commit,
@@ -3029,6 +3039,11 @@ def _runtime_text_branch_runtime_evidence(
             "planned_context": planned_context,
         }
 
+    observed_fence_token = _evidence_field("fence_token")
+    observed_fence_token_verifier = _evidence_field(
+        "fence_token_verifier",
+        "fence_token_hash",
+    ) or _runtime_text_secret_hash(observed_fence_token)
     observed_context = {
         "runtime_context_id": evidence_runtime_context_id,
         "governance_project_id": _evidence_field("governance_project_id"),
@@ -3048,7 +3063,8 @@ def _runtime_text_branch_runtime_evidence(
         "branch_ref": _evidence_field("branch_ref", "branch"),
         "ref_name": _evidence_field("ref_name"),
         "worktree_id": _evidence_field("worktree_id"),
-        "fence_token": _evidence_field("fence_token"),
+        "fence_token": observed_fence_token,
+        "fence_token_verifier": observed_fence_token_verifier,
         "worktree_path": _evidence_field("worktree_path", "worktree"),
         "base_commit": _evidence_field("base_commit"),
         "target_head_commit": _evidence_field("target_head_commit"),
@@ -3056,12 +3072,16 @@ def _runtime_text_branch_runtime_evidence(
     }
     required_fields = {
         "task_id": context.task_id,
-        "fence_token": context.fence_token,
         "worktree_path": context.worktree_path,
         "base_commit": context.base_commit,
         "target_head_commit": context.target_head_commit,
         "merge_queue_id": context.merge_queue_id,
     }
+    planned_fence_token_verifier = _runtime_text_fence_token_hash(context)
+    if planned_fence_token_verifier:
+        required_fields["fence_token_verifier"] = planned_fence_token_verifier
+    elif context.fence_token:
+        required_fields["fence_token"] = context.fence_token
     if parent_task_id:
         required_fields["parent_task_id"] = parent_task_id
     missing = [
@@ -3116,6 +3136,8 @@ def _runtime_text_branch_runtime_evidence(
         "task_id": observed_context["task_id"],
         "parent_task_id": observed_context["parent_task_id"],
         "fence_token": observed_context["fence_token"],
+        "fence_token_hash": observed_context["fence_token_verifier"],
+        "fence_token_verifier": observed_context["fence_token_verifier"],
         "branch_ref": observed_context["branch_ref"],
         "ref_name": observed_context["ref_name"],
         "worktree_id": observed_context["worktree_id"],
@@ -3144,6 +3166,8 @@ def _runtime_text_branch_runtime_evidence(
             "task_id": observed_context["task_id"],
             "parent_task_id": observed_context["parent_task_id"],
             "fence_token": observed_context["fence_token"],
+            "fence_token_hash": observed_context["fence_token_verifier"],
+            "fence_token_verifier": observed_context["fence_token_verifier"],
             "branch_ref": observed_context["branch_ref"],
             "ref_name": observed_context["ref_name"],
             "worktree_id": observed_context["worktree_id"],
@@ -3715,6 +3739,10 @@ def _runtime_text_apply_branch_runtime_context(
         "target_head_commit",
         "merge_queue_id",
         "fence_token",
+        "fence_token_verifier",
+        "session_token_hash",
+        "lease_id",
+        "lease_expires_at",
         "worker_id",
         "worker_slot_id",
         "agent_id",
@@ -3722,6 +3750,7 @@ def _runtime_text_apply_branch_runtime_context(
         "actual_host_worker_id",
         "host_startup_id",
         "host_session_id",
+        "last_recovery_action",
         "governance_project_id",
         "target_project_id",
         "target_project_root",
@@ -4184,6 +4213,7 @@ def _runtime_text_graph_first_obligations(
     task_id: str,
     parent_task_id: str,
     fence_token: str,
+    fence_token_hash: str = "",
     governance_project_id: str = "",
     target_project_id: str = "",
     target_project_root: str = "",
@@ -4213,6 +4243,9 @@ def _runtime_text_graph_first_obligations(
             "parent_task_id": parent_task_id,
             "worker_role": "mf_sub",
             "fence_token": fence_token,
+            "fence_token_hash": fence_token_hash
+            or _runtime_text_secret_hash(fence_token),
+            "fence_token_env": "AMING_WORKER_FENCE_TOKEN",
         },
         "minimum_before_edit": [
             "record mf_subagent_read_receipt for the visible route contract",
@@ -4484,6 +4517,7 @@ def _runtime_text_local_projection(
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
         "fence_token": context.fence_token,
+        "fence_token_hash": _runtime_text_fence_token_hash(context),
         "branch_ref": context.branch_ref,
         "worktree_path": context.worktree_path,
         "base_commit": context.base_commit,
@@ -4944,9 +4978,7 @@ def _runtime_text_same_owner_session_token_startup(
     ).strip()
     worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
     fence_token_env = "AMING_WORKER_FENCE_TOKEN"
-    fence_token_hash = _runtime_text_secret_hash(
-        str(getattr(context, "fence_token", "") or "")
-    )
+    fence_token_hash = _runtime_text_fence_token_hash(context)
     return {
         "schema_version": "mf_subagent_same_owner_session_token_startup.v1",
         "startup_mode": "same_owner_session_token",
@@ -5039,9 +5071,7 @@ def _runtime_text_host_adapter_surrogate_startup(
     ).strip()
     worktree_path = str(getattr(context, "worktree_path", "") or "").strip()
     fence_token_env = "AMING_WORKER_FENCE_TOKEN"
-    fence_token_hash = _runtime_text_secret_hash(
-        str(getattr(context, "fence_token", "") or "")
-    )
+    fence_token_hash = _runtime_text_fence_token_hash(context)
     return {
         "schema_version": "mf_subagent_host_adapter_surrogate_startup.v1",
         "startup_mode": "host_adapter_surrogate",
@@ -5218,9 +5248,7 @@ def _runtime_text_worker_launch_pack(
         "raw_fence_token_persisted": False,
     }
     fence_token_env = "AMING_WORKER_FENCE_TOKEN"
-    fence_token_hash = _runtime_text_secret_hash(
-        str(getattr(context, "fence_token", "") or "")
-    )
+    fence_token_hash = _runtime_text_fence_token_hash(context)
     launch_env_additions = {
         "AMING_GOVERNANCE_URL": "http://localhost:40000",
         "AMING_WORKER_SESSION_TOKEN": "<server-issued-worker-session-token>",
@@ -5530,8 +5558,11 @@ def _runtime_text_worker_launch_pack(
         )
     if not str(getattr(context, "merge_queue_id", "") or "").strip():
         add_blocker("unresolved_merge_queue", "worker launch requires merge_queue_id")
-    if not str(getattr(context, "fence_token", "") or "").strip():
-        add_blocker("unresolved_fence", "worker launch requires a fence_token")
+    if not _runtime_text_fence_token_hash(context):
+        add_blocker(
+            "unresolved_fence_verifier",
+            "worker launch requires a fence_token verifier",
+        )
     if context_pack_status not in {
         "ready",
         "ok",
@@ -6223,9 +6254,7 @@ def _runtime_text_executable_worker_launch(
 
     session_token_env = "AMING_WORKER_SESSION_TOKEN"
     fence_token_env = "AMING_WORKER_FENCE_TOKEN"
-    fence_token_hash = _runtime_text_secret_hash(
-        str(getattr(context, "fence_token", "") or "")
-    )
+    fence_token_hash = _runtime_text_fence_token_hash(context)
     env_template = {
         "AMING_GOVERNANCE_URL": "http://localhost:40000",
         session_token_env: "<server-issued-worker-session-token>",
@@ -6438,6 +6467,7 @@ def _runtime_text_executable_worker_launch(
             or ""
         ),
         "fence_token": fence_token_placeholder,
+        "fence_token_hash": fence_token_hash,
         "session_token": session_token_placeholder,
         "fence_token_env": fence_token_env,
         "session_token_env": session_token_env,
@@ -6463,8 +6493,9 @@ def _runtime_text_executable_worker_launch(
         "worker_id": "copy_safe_body.worker_id",
         "worker_slot_id": "copy_safe_body.worker_slot_id",
         "target_project_root": "copy_safe_body.target_project_root",
-        "session_token": "copy_safe_body.session_token",
-        "fence_token": "copy_safe_body.fence_token",
+        "session_token_field": "copy_safe_body.session_token",
+        "fence_token_field": "copy_safe_body.fence_token",
+        "fence_token_hash_field": "copy_safe_body.fence_token_hash",
         "route_identity": {
             field: f"copy_safe_body.{field}"
             for field in required_route_identity_fields
@@ -6518,6 +6549,7 @@ def _runtime_text_executable_worker_launch(
             "session_token": session_token_placeholder,
             "session_token_env": session_token_env,
             "fence_token": fence_token_placeholder,
+            "fence_token_hash": fence_token_hash,
             "fence_token_env": fence_token_env,
         },
         "auth_alternatives": {
@@ -6593,6 +6625,7 @@ def _runtime_text_executable_worker_launch(
         "registered_host_adapter_spawn": dict(registered_host_adapter_spawn),
         "observer_command_id": observer_command_id,
         "fence_token": fence_token_placeholder,
+        "fence_token_hash": fence_token_hash,
         "session_token": session_token_placeholder,
         "session_token_ref": str(
             worker_envelope_claim.get("session_token_ref")
@@ -6623,6 +6656,7 @@ def _runtime_text_executable_worker_launch(
             "session_token": session_token_placeholder,
             "session_token_env": session_token_env,
             "fence_token": fence_token_placeholder,
+            "fence_token_hash": fence_token_hash,
             "fence_token_env": fence_token_env,
         },
         "auth_alternatives": {
@@ -7034,6 +7068,7 @@ def _runtime_text_observer_next_legal_action(
         "worktree_path": str(payload.get("worktree_path") or ""),
         "branch": str(payload.get("branch") or payload.get("branch_ref") or ""),
         "fence_token": str(handoff_packet.get("fence_token") or ""),
+        "fence_token_hash": str(handoff_packet.get("fence_token_hash") or ""),
         "fence_token_env": str(handoff_packet.get("fence_token_env") or ""),
         "merge_queue_id": str(payload.get("merge_queue_id") or ""),
         "owned_files": list(payload.get("owned_files") or []),
@@ -7154,15 +7189,6 @@ def build_observer_runtime_text_context(
     merge_queue_id = request.merge_queue_id or (
         "mq-runtime-text-" + _stable_suffix(request.project_id, request.backlog_id, task_id)
     )
-    fence_token = request.fence_token or (
-        "fence-runtime-text-"
-        + _stable_suffix(
-            request.project_id,
-            request.backlog_id,
-            task_id,
-            request.route.route_context_hash,
-        )
-    )
     expected_branch_fields = {
         "task_id": task_id,
         "parent_task_id": parent_task_id,
@@ -7181,6 +7207,16 @@ def build_observer_runtime_text_context(
             expected_fields=expected_branch_fields,
         )
     )
+    fence_token = request.fence_token
+    if not fence_token and not _runtime_text_packet_registered(
+        hydrated_branch_runtime_evidence
+    ):
+        fence_token = "fence-runtime-text-" + _stable_suffix(
+            request.project_id,
+            request.backlog_id,
+            task_id,
+            request.route.route_context_hash,
+        )
     observer_command_id = _runtime_text_observer_command_id(
         request,
         branch_runtime_evidence=hydrated_branch_runtime_evidence,
@@ -7276,6 +7312,7 @@ def build_observer_runtime_text_context(
         task_id=context.task_id,
         parent_task_id=parent_task_id,
         fence_token=context.fence_token,
+        fence_token_hash=_runtime_text_fence_token_hash(context),
     )
     branch_runtime_evidence = _runtime_text_branch_runtime_evidence(
         project_id=request.project_id,
@@ -7310,6 +7347,7 @@ def build_observer_runtime_text_context(
         "target_head_commit": context.target_head_commit,
         "merge_queue_id": context.merge_queue_id,
         "fence_token": context.fence_token,
+        "fence_token_hash": _runtime_text_fence_token_hash(context),
         "route_context_hash": request.route.route_context_hash,
         "prompt_contract_id": request.route.prompt_contract_id,
         "prompt_contract_hash": request.route.prompt_contract_hash,
@@ -7345,6 +7383,7 @@ def build_observer_runtime_text_context(
             "parent_task_id": parent_task_id,
             "worker_role": "mf_sub",
             "fence_token": context.fence_token,
+            "fence_token_hash": _runtime_text_fence_token_hash(context),
             "message": (
                 "Dispatch graph obligation does not satisfy finish gates; the "
                 "worker must record its own graph_trace_evidence after startup."
@@ -7697,11 +7736,9 @@ def build_observer_runtime_text_context(
         "parent_task_id": parent_task_id,
         "worker_role": "mf_sub",
         "worker_slot_id": context.worker_slot_id or worker_id,
-        "fence_token_hash": _runtime_text_secret_hash(
-            str(getattr(context, "fence_token", "") or "")
-        ),
+        "fence_token_hash": _runtime_text_fence_token_hash(context),
         "fence_token_env": "AMING_WORKER_FENCE_TOKEN",
-        "fence_token_redacted": bool(str(getattr(context, "fence_token", "") or "")),
+        "fence_token_redacted": bool(_runtime_text_fence_token_hash(context)),
         "raw_fence_token_persisted": False,
         "branch": context.branch_ref,
         "branch_ref": context.branch_ref,

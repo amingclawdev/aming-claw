@@ -175596,6 +175596,17 @@ def test_worker_guide_prepare_main_worktree_warranty_advances_to_receipt(
         )
     )
     assert initial_join["ok"] is True
+    joined_context = parallel_branch_runtime.get_branch_context_by_runtime_context_id(
+        conn,
+        PID,
+        context.runtime_context_id,
+    )
+    assert joined_context is not None
+    assert joined_context.fence_token == ""
+    expected_fence_verifier = parallel_branch_runtime.runtime_context_secret_hash(
+        worker_fence
+    )
+    assert joined_context.fence_token_verifier == expected_fence_verifier
     session_auth.update(
         {
             "session_token": initial_join["session_token"],
@@ -175612,6 +175623,7 @@ def test_worker_guide_prepare_main_worktree_warranty_advances_to_receipt(
     assert prepare_body["workspace_root"] == str(main_worktree)
     assert prepare_body["target_project_root"] == str(worker_worktree)
     assert prepare_body["worktree_path"] == str(worker_worktree)
+    assert not str(prepare_body.get("fence_token") or "")
 
     prepared = server.handle_observer_runtime_text_prepare(
         _ctx_with_role(
@@ -175623,6 +175635,15 @@ def test_worker_guide_prepare_main_worktree_warranty_advances_to_receipt(
     )
     assert prepared["ok"] is True
     assert re.fullmatch(r"sha256:[0-9a-f]{64}", prepared["launch_text_hash"])
+    assert prepared["worker_launch_pack"]["fence_token_hash"] == (
+        expected_fence_verifier
+    )
+    assert prepared["executable_handoff_packet"]["fence_token_hash"] == (
+        expected_fence_verifier
+    )
+    serialized_prepared = json.dumps(prepared, sort_keys=True)
+    assert worker_fence not in serialized_prepared
+    assert initial_join["session_token"] not in serialized_prepared
 
     receipt_guide = read_guide()
     assert receipt_guide["next_legal_action"] in {

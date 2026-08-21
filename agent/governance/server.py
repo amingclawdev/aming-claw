@@ -2298,14 +2298,18 @@ def _observer_runtime_text_prepare_persistable_payload(
                     continue
                 if key_text == "fence_token":
                     fence_text = str(nested or "").strip()
+                    supplied_fence_hash = str(
+                        value.get("fence_token_hash")
+                        or value.get("fence_token_verifier")
+                        or ""
+                    ).strip()
+                    if not re.fullmatch(r"sha256:[0-9a-f]{64}", supplied_fence_hash):
+                        supplied_fence_hash = ""
                     if _looks_like_placeholder(fence_text):
                         result["fence_token"] = fence_text
-                        supplied_fence_hash = str(
-                            value.get("fence_token_hash") or ""
-                        ).strip()
                         canonical_fence_hash = (
                             supplied_fence_hash
-                            if supplied_fence_hash in canonical_fence_hashes
+                            if supplied_fence_hash
                             else (
                                 canonical_fence_hashes[0]
                                 if len(canonical_fence_hashes) == 1
@@ -2317,7 +2321,10 @@ def _observer_runtime_text_prepare_persistable_payload(
                         result["fence_token_redacted"] = True
                         result["raw_fence_token_persisted"] = False
                     else:
-                        fence_hash = runtime_context_secret_hash(fence_text)
+                        fence_hash = (
+                            runtime_context_secret_hash(fence_text)
+                            or supplied_fence_hash
+                        )
                         if fence_hash:
                             result["fence_token_hash"] = fence_hash
                         result["fence_token_redacted"] = bool(fence_hash)
@@ -172589,6 +172596,7 @@ def _resolve_observer_runtime_text_branch_runtime_evidence(
     from .parallel_branch_runtime import (
         branch_runtime_allocation_evidence,
         get_branch_context_by_runtime_context_id,
+        runtime_context_fence_token_verifier,
     )
 
     conn = get_connection(project_id)
@@ -172613,6 +172621,14 @@ def _resolve_observer_runtime_text_branch_runtime_evidence(
         "task_id": (str(body.get("task_id") or ""), str(context.task_id or "")),
         "parent_task_id": (expected_parent, actual_parent),
         "fence_token": (str(body.get("fence_token") or ""), str(context.fence_token or "")),
+        "fence_token_hash": (
+            str(
+                body.get("fence_token_hash")
+                or body.get("fence_token_verifier")
+                or ""
+            ),
+            runtime_context_fence_token_verifier(context),
+        ),
         "worktree_path": (
             str(
                 body.get("worktree_path")
@@ -173385,6 +173401,15 @@ def _record_bounded_worker_dispatch_event(
         *source_maps,
         keys=("owned_files", "target_files"),
     )
+    dispatch_fence_token = _first_field("fence_token", "worker_fence_token")
+    dispatch_fence_token_hash = _first_field(
+        "fence_token_hash",
+        "fence_token_verifier",
+    )
+    if not dispatch_fence_token_hash and dispatch_fence_token:
+        from .parallel_branch_runtime import runtime_context_secret_hash
+
+        dispatch_fence_token_hash = runtime_context_secret_hash(dispatch_fence_token)
     dispatch = {
         "schema_version": "bounded_implementation_worker_dispatch.v1",
         "source": source,
@@ -173420,7 +173445,8 @@ def _record_bounded_worker_dispatch_event(
             "host_worker_id",
             "worker_agent_id",
         ),
-        "fence_token": _first_field("fence_token", "worker_fence_token"),
+        "fence_token": dispatch_fence_token,
+        "fence_token_hash": dispatch_fence_token_hash,
         "worktree_path": worktree_path,
         "target_project_root": _first_field(
             "target_project_root",
@@ -173674,7 +173700,7 @@ def _record_bounded_worker_dispatch_event(
         "parent_task_id",
         "observer_command_id",
         "worker_slot_id",
-        "fence_token",
+        "fence_token_hash",
         "worktree_path",
         "branch",
         "base_commit",

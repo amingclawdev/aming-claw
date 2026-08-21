@@ -66,6 +66,7 @@ from agent.governance.parallel_branch_runtime import (
     branch_runtime_context_id,
     mf_subagent_session_token_hash,
     mf_subagent_session_token_ref,
+    runtime_context_secret_hash,
     _startup_token_evidence,
 )
 
@@ -1884,6 +1885,32 @@ def test_dispatch_gate_accepts_isolated_worktree_with_compact_evidence() -> None
     assert evidence["service_dispatch_evidence"]["present"] is False
 
 
+def test_dispatch_gate_accepts_hash_only_fence_projection() -> None:
+    fence_token_hash = runtime_context_secret_hash("fence-1")
+    evidence = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(
+            fence_token="",
+            fence_token_hash=fence_token_hash,
+        ),
+        target_worktree_path="/repo",
+    )
+
+    assert evidence["allowed"] is True
+    assert evidence["fence_token"] == ""
+    assert evidence["fence_token_hash"] == fence_token_hash
+
+
+def test_dispatch_gate_rejects_malformed_hash_only_fence_projection() -> None:
+    with pytest.raises(MfSubagentContractError, match="fence_token_hash"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                fence_token="",
+                fence_token_hash="sha256:not-a-verifier",
+            ),
+            target_worktree_path="/repo",
+        )
+
+
 def test_dispatch_gate_accepts_judge_routed_parent_lineage() -> None:
     evidence = validate_mf_subagent_dispatch_gate(
         _dispatch_payload(
@@ -1988,6 +2015,68 @@ def test_dispatch_gate_accepts_governed_work_with_graph_obligation_only() -> Non
     assert evidence["dispatch_graph_obligation"]["finish_gate_requires_worker_graph_trace"] is True
     assert evidence["branch_runtime_evidence"]["registered"] is True
     assert evidence["service_dispatch_evidence"]["present"] is True
+
+
+def test_dispatch_gate_hash_only_projection_matches_governed_evidence() -> None:
+    fence_token_hash = runtime_context_secret_hash("fence-1")
+    graph_obligation = _graph_first_obligations(
+        query={
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+            "task_id": "task-mf-sub-1",
+            "parent_task_id": "task-mf-parent",
+            "worker_role": "mf_sub",
+            "fence_token_hash": fence_token_hash,
+        }
+    )
+    branch_evidence = _branch_runtime_evidence(
+        context={
+            "fence_token": "",
+            "fence_token_verifier": fence_token_hash,
+        }
+    )
+    evidence = validate_mf_subagent_dispatch_gate(
+        _dispatch_payload(
+            fence_token="",
+            fence_token_hash=fence_token_hash,
+            governed_nontrivial=True,
+            dispatch_graph_obligation=graph_obligation,
+            branch_runtime_evidence=branch_evidence,
+            service_dispatch_evidence=_service_dispatch_evidence(),
+        ),
+        target_worktree_path="/repo",
+    )
+
+    assert evidence["allowed"] is True
+    assert evidence["dispatch_graph_obligation"]["fence_token_hash"] == (
+        fence_token_hash
+    )
+    assert evidence["branch_runtime_evidence"]["fence_token_hash"] == (
+        fence_token_hash
+    )
+
+
+def test_dispatch_gate_rejects_hash_only_branch_verifier_mismatch() -> None:
+    fence_token_hash = runtime_context_secret_hash("fence-1")
+    with pytest.raises(MfSubagentContractError, match="identity mismatch"):
+        validate_mf_subagent_dispatch_gate(
+            _dispatch_payload(
+                fence_token="",
+                fence_token_hash=fence_token_hash,
+                governed_nontrivial=True,
+                dispatch_graph_obligation=_graph_first_obligations(),
+                branch_runtime_evidence=_branch_runtime_evidence(
+                    context={
+                        "fence_token": "",
+                        "fence_token_verifier": runtime_context_secret_hash(
+                            "other-fence"
+                        ),
+                    }
+                ),
+                service_dispatch_evidence=_service_dispatch_evidence(),
+            ),
+            target_worktree_path="/repo",
+        )
 
 
 def test_dispatch_gate_rejects_governed_work_without_graph_obligation() -> None:
@@ -2265,7 +2354,7 @@ def test_dispatch_gate_accepts_optional_prompt_contract_hash_absent() -> None:
     [
         ("branch", {"branch": ""}),
         ("worktree", {"worktree": ""}),
-        ("fence_token", {"fence_token": ""}),
+        ("fence_token_hash", {"fence_token": ""}),
         ("base_commit", {"base_commit": ""}),
         ("target_head_commit", {"target_head_commit": ""}),
         ("merge_queue_id", {"merge_queue_id": ""}),

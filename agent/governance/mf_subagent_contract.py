@@ -26,6 +26,7 @@ from agent.governance.parallel_branch_runtime import (
     RUNTIME_CONTEXT_GATE_INPUTS_SCHEMA_VERSION,
     RUNTIME_CONTEXT_WORKER_VIEW_SCHEMA_VERSION,
     build_runtime_context_projection,
+    runtime_context_fence_token_verifier,
     runtime_context_mf_parallel_happy_path_reminders,
     runtime_context_id_for_branch_context,
 )
@@ -110,7 +111,6 @@ _REQUIRED_CONTEXT_FIELDS = (
     "base_commit",
     "target_head_commit",
     "merge_queue_id",
-    "fence_token",
 )
 _READY_STATUSES = {
     "completed",
@@ -203,7 +203,7 @@ _DISPATCH_REQUIRED_FIELDS = (
     "base_commit",
     "target_head_commit",
     "merge_queue_id",
-    "fence_token",
+    "fence_token_hash",
     "route_token_ref",
     "route_context_hash",
     "prompt_contract_id",
@@ -2532,6 +2532,18 @@ def _dispatch_graph_obligation_source(payload: Mapping[str, Any]) -> dict[str, A
     return {}
 
 
+def _canonical_fence_token_verifier(
+    *,
+    fence_token: str = "",
+    fence_token_hash: str = "",
+) -> str:
+    explicit = _string(fence_token_hash)
+    if explicit:
+        return explicit if re.fullmatch(r"sha256:[0-9a-f]{64}", explicit) else ""
+    raw = _string(fence_token)
+    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest() if raw else ""
+
+
 def _normalize_dispatch_graph_obligation(
     payload: Mapping[str, Any],
     *,
@@ -2540,6 +2552,7 @@ def _normalize_dispatch_graph_obligation(
     parent_task_id: str = "",
     worker_role: str = "",
     fence_token: str = "",
+    fence_token_hash: str = "",
 ) -> dict[str, Any]:
     source = _dispatch_graph_obligation_source(payload)
     query = _nested_mapping(source, "query")
@@ -2550,6 +2563,18 @@ def _normalize_dispatch_graph_obligation(
     embedded_parent_task_id = _first_deep_string(identity_source, {"parent_task_id"})
     embedded_worker_role = _first_deep_string(identity_source, {"worker_role", "role"})
     embedded_fence_token = _first_deep_string(identity_source, {"fence_token"})
+    embedded_fence_token_hash = _first_deep_string(
+        identity_source,
+        {"fence_token_hash", "fence_token_verifier"},
+    )
+    observed_fence_token_hash = _canonical_fence_token_verifier(
+        fence_token=embedded_fence_token,
+        fence_token_hash=embedded_fence_token_hash,
+    )
+    expected_fence_token_hash = _canonical_fence_token_verifier(
+        fence_token=fence_token,
+        fence_token_hash=fence_token_hash,
+    )
     read_receipt_before = _string_list(
         source.get("read_receipt_required_before"),
         field_name="read_receipt_required_before",
@@ -2598,13 +2623,14 @@ def _normalize_dispatch_graph_obligation(
         or ("" if required else parent_task_id),
         "worker_role": embedded_worker_role
         or ("" if required else worker_role or MF_SUB_ROLE),
-        "fence_token": embedded_fence_token or ("" if required else fence_token),
+        "fence_token_hash": observed_fence_token_hash
+        or ("" if required else expected_fence_token_hash),
     }
     expected = {
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "worker_role": MF_SUB_ROLE if required else worker_role or MF_SUB_ROLE,
-        "fence_token": fence_token,
+        "fence_token_hash": expected_fence_token_hash,
     }
     mismatches = [
         field
@@ -2619,7 +2645,12 @@ def _normalize_dispatch_graph_obligation(
     missing_context = [
         field
         for field, value in observed.items()
-        if field in {"task_id", "parent_task_id", "worker_role", "fence_token"}
+        if field in {
+            "task_id",
+            "parent_task_id",
+            "worker_role",
+            "fence_token_hash",
+        }
         and not value
     ]
     if required and missing_context:
@@ -2643,7 +2674,7 @@ def _normalize_dispatch_graph_obligation(
         "task_id": observed["task_id"],
         "parent_task_id": observed["parent_task_id"],
         "worker_role": observed["worker_role"],
-        "fence_token": observed["fence_token"],
+        "fence_token_hash": observed["fence_token_hash"],
         "read_receipt_required_before": read_receipt_before,
         "trace_evidence_schema_version": (
             trace_schema_version or GRAPH_TRACE_SCHEMA_VERSION
@@ -2696,6 +2727,7 @@ def _normalize_branch_runtime_evidence(
     task_id: str = "",
     parent_task_id: str = "",
     fence_token: str = "",
+    fence_token_hash: str = "",
     worktree_path: str = "",
     base_commit: str = "",
     target_head_commit: str = "",
@@ -2703,6 +2735,16 @@ def _normalize_branch_runtime_evidence(
 ) -> dict[str, Any]:
     source = _branch_runtime_source(payload)
     source_ref = _branch_runtime_source_ref(source)
+    observed_fence_token = _context_field(source, "fence_token") if source else ""
+    observed_fence_token_hash = (
+        _context_field(source, "fence_token_verifier", "fence_token_hash")
+        if source
+        else ""
+    )
+    observed_fence_token_hash = _canonical_fence_token_verifier(
+        fence_token=observed_fence_token,
+        fence_token_hash=observed_fence_token_hash,
+    )
     normalized = {
         "schema_version": BRANCH_RUNTIME_SCHEMA_VERSION,
         "required": required,
@@ -2742,7 +2784,8 @@ def _normalize_branch_runtime_evidence(
             if source
             else ""
         ),
-        "fence_token": _context_field(source, "fence_token") if source else "",
+        "fence_token": observed_fence_token,
+        "fence_token_hash": observed_fence_token_hash,
         "worktree_path": _context_field(source, "worktree_path", "worktree")
         if source
         else "",
@@ -2771,7 +2814,10 @@ def _normalize_branch_runtime_evidence(
 
     required_fields = {
         "task_id": task_id,
-        "fence_token": fence_token,
+        "fence_token_hash": _canonical_fence_token_verifier(
+            fence_token=fence_token,
+            fence_token_hash=fence_token_hash,
+        ),
         "worktree_path": worktree_path,
         "base_commit": base_commit,
         "target_head_commit": target_head_commit,
@@ -6588,6 +6634,18 @@ def validate_mf_subagent_dispatch_gate(
         ),
     )
     fence_token = _dispatch_string(payload, names=("fence_token",))
+    supplied_fence_token_hash = _dispatch_string(
+        payload,
+        names=("fence_token_hash", "fence_token_verifier"),
+        nested_keys=(
+            ("runtime_identity", ("fence_token_hash", "fence_token_verifier")),
+            ("branch_context", ("fence_token_hash", "fence_token_verifier")),
+        ),
+    )
+    fence_token_hash = _canonical_fence_token_verifier(
+        fence_token=fence_token,
+        fence_token_hash=supplied_fence_token_hash,
+    )
     route_context_hash = _dispatch_string(
         payload,
         names=("route_context_hash",),
@@ -6740,7 +6798,7 @@ def validate_mf_subagent_dispatch_gate(
         "base_commit": base_commit,
         "target_head_commit": target_head_commit,
         "merge_queue_id": merge_queue_id,
-        "fence_token": fence_token,
+        "fence_token_hash": fence_token_hash,
         "route_context_hash": route_context_hash,
         "prompt_contract_id": prompt_contract_id,
         "prompt_contract_hash": prompt_contract_hash,
@@ -6802,6 +6860,7 @@ def validate_mf_subagent_dispatch_gate(
         parent_task_id=parent_task_id,
         worker_role=worker_role,
         fence_token=fence_token,
+        fence_token_hash=fence_token_hash,
     )
     branch_runtime_evidence = _normalize_branch_runtime_evidence(
         payload,
@@ -6809,6 +6868,7 @@ def validate_mf_subagent_dispatch_gate(
         task_id=task_id,
         parent_task_id=parent_task_id,
         fence_token=fence_token,
+        fence_token_hash=fence_token_hash,
         worktree_path=worktree,
         base_commit=base_commit,
         target_head_commit=target_head_commit,
@@ -6890,6 +6950,7 @@ def validate_mf_subagent_dispatch_gate(
         "target_head_commit": target_head_commit,
         "merge_queue_id": merge_queue_id,
         "fence_token": fence_token,
+        "fence_token_hash": fence_token_hash,
         "route_context_hash": route_context_hash,
         "prompt_contract_id": prompt_contract_id,
         "prompt_contract_hash": prompt_contract_hash,
@@ -6921,6 +6982,8 @@ def validate_mf_subagent_dispatch_gate(
 
 def _require_context(context: BranchTaskRuntimeContext) -> None:
     missing = [field for field in _REQUIRED_CONTEXT_FIELDS if not getattr(context, field)]
+    if not runtime_context_fence_token_verifier(context):
+        missing.append("fence_token_verifier")
     if missing:
         raise MfSubagentContractError(
             f"MF subagent context missing required fields: {', '.join(missing)}"
@@ -7027,6 +7090,7 @@ def build_mf_subagent_input(
     """Build the stable input payload for a branch-isolated MF subagent."""
 
     _require_context(context)
+    fence_token_verifier = runtime_context_fence_token_verifier(context)
     parent_task_id = _parent_task_id_for_contract_view(context)
     runtime_context_id = mf_subagent_runtime_context_id(context)
     child_route_prompt_contract = _child_route_prompt_contract(
@@ -7050,7 +7114,7 @@ def build_mf_subagent_input(
         required_evidence=_DEFAULT_RUNTIME_CONTRACT_EVIDENCE,
         target_files=target_files,
         owned_files=target_files,
-        target_fences=[context.fence_token],
+        target_fences=[context.fence_token or fence_token_verifier],
         lifecycle_state=context.status,
     )
     happy_path_reminders = dict(
@@ -7090,7 +7154,7 @@ def build_mf_subagent_input(
                 "task_id",
                 "parent_task_id",
                 "worker_role",
-                "fence_token",
+                "fence_token" if context.fence_token else "fence_token_hash",
             ],
             "runtime_context_id": runtime_context_id,
             "project_id": context.project_id,
@@ -7109,6 +7173,9 @@ def build_mf_subagent_input(
             "attempt": context.attempt,
             "lease_id": context.lease_id,
             "fence_token": context.fence_token,
+            "fence_token_hash": fence_token_verifier,
+            "fence_token_redacted": bool(fence_token_verifier),
+            "raw_fence_token_persisted": False,
             "checkpoint_id": context.checkpoint_id,
             "depends_on": list(context.depends_on),
         },
