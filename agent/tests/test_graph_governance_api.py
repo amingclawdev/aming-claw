@@ -61815,6 +61815,17 @@ def test_mf_sub_graph_query_accepts_current_safe_ref_without_raw_fence(
     ).fetchone()[0] == timeline_count
 
 
+def test_mf_sub_graph_query_current_safe_ref_authority_warranty(
+    conn,
+    tmp_path,
+):
+    """Keep the full safe-ref authority and zero-write matrix as a warranty."""
+    test_mf_sub_graph_query_accepts_current_safe_ref_without_raw_fence(
+        conn,
+        tmp_path,
+    )
+
+
 def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     conn,
     tmp_path,
