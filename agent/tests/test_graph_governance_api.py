@@ -61537,6 +61537,284 @@ def test_mf_sub_graph_query_resolves_runtime_context_and_route_identity(
     ]
 
 
+def test_mf_sub_graph_query_accepts_current_safe_ref_without_raw_fence(
+    conn,
+    tmp_path,
+):
+    candidate_server, _ = _preload_candidate_server_module()
+    _activate_basic_graph(conn, "full-query-mf-sub-safe-ref")
+    target_root = tmp_path / "target-safe-ref"
+    target_root.mkdir()
+    fence_hash = runtime_context_secret_hash("raw-fence-safe-ref")
+    context = upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            governance_project_id=PID,
+            target_project_id=PID,
+            target_project_root=str(target_root),
+            task_id="worker-safe-ref",
+            root_task_id="parent-safe-ref",
+            backlog_id="AC-MF-SAFE-REF-GRAPH-QUERY",
+            stage_task_id="worker-safe-ref",
+            worker_id="worker-safe-ref",
+            worker_slot_id="worker-safe-ref",
+            branch_ref="refs/heads/codex/worker-safe-ref",
+            status="worktree_ready",
+            fence_token="",
+            fence_token_verifier=fence_hash,
+            session_token_hash=mf_subagent_session_token_hash(
+                "session-safe-ref"
+            ),
+            lease_id="lease-safe-ref",
+            lease_expires_at="2999-01-01T00:00:00Z",
+            last_recovery_action="mf_subagent_session_token_rejoin_issued",
+        ),
+    )
+    route_identity = {
+        "route_id": "route-safe-ref",
+        "route_context_hash": "sha256:route-safe-ref",
+        "prompt_contract_id": "rprompt-safe-ref",
+        "prompt_contract_hash": "sha256:prompt-safe-ref",
+        "route_token_ref": "rtok-safe-ref",
+        "visible_injection_manifest_hash": "sha256:visible-safe-ref",
+    }
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-safe-ref-graph-query",
+        payload={"target_files": ["agent/governance/server.py"]},
+        route_identity=route_identity,
+    )
+    read_receipt = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=context.task_id,
+        backlog_id=context.backlog_id,
+        event_type="mf_subagent_read_receipt",
+        event_kind="mf_subagent_read_receipt",
+        phase="startup_read_receipt",
+        status="ok",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": context.root_task_id,
+            "read_receipt_hash": "sha256:read-safe-ref",
+        },
+    )
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=context.task_id,
+        backlog_id=context.backlog_id,
+        event_type="mf_subagent.startup",
+        event_kind="mf_subagent_startup",
+        phase="startup_gate",
+        status="passed",
+        payload={
+            "mf_subagent_startup_gate": {
+                "runtime_context_id": context.runtime_context_id,
+                "task_id": context.task_id,
+                "parent_task_id": context.root_task_id,
+                "fence_token_present": True,
+                "status": "passed",
+                "actual_startup_recorded": True,
+                "actual_cwd": str(target_root),
+                "actual_git_root": str(target_root),
+                "worktree_path": str(target_root),
+                "worker_role": "mf_sub",
+                "worker_id": context.worker_id,
+                "read_receipt_event_id": read_receipt["id"],
+                "read_receipt_hash": "sha256:read-safe-ref",
+                **route_identity,
+            }
+        },
+    )
+    conn.commit()
+
+    safe_ref = runtime_context_session_token_ref(context)
+    body = {
+        "snapshot_id": "active",
+        "tool": "query_schema",
+        "args": {},
+        "query_source": "mf_subagent",
+        "query_purpose": "subagent_context_build",
+        "worker_role": "mf_sub",
+        "runtime_context_id": context.runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.root_task_id,
+        "target_project_root": str(target_root),
+        "session_token_ref": safe_ref,
+        "route_identity": dict(route_identity),
+    }
+    queried = candidate_server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body=copy.deepcopy(body),
+        )
+    )
+
+    assert queried["ok"] is True
+    authority = queried["mf_sub_graph_query_safe_ref_authority"]
+    assert authority["authorization_source"] == (
+        "runtime_context_session_token_ref"
+    )
+    assert authority["server_derived"] is True
+    assert authority["caller_claims_trusted"] is False
+    assert authority["fence_token_hash"] == fence_hash
+    assert authority["raw_fence_token_required"] is False
+    assert queried["trace_persisted"] is True
+    assert queried["governance_writes_performed"] is True
+    assert queried["writes_performed"] is True
+    assert queried["mutation_performed"] is True
+    assert queried["product_mutation_performed"] is False
+    assert queried["graph_query_identity"]["fence_token_hash"] == fence_hash
+    safe_trace = conn.execute(
+        "SELECT fence_token, fence_token_hash, artifact_path "
+        "FROM graph_query_traces "
+        "WHERE trace_id = ?",
+        (queried["trace_id"],),
+    ).fetchone()
+    assert safe_trace["fence_token"] == ""
+    assert safe_trace["fence_token_hash"] == fence_hash
+    artifact_text = Path(safe_trace["artifact_path"]).read_text()
+    assert fence_hash in artifact_text
+    assert "raw-fence-safe-ref" not in artifact_text
+    assert "session-safe-ref" not in artifact_text
+    serialized_result = json.dumps(queried, sort_keys=True)
+    assert "raw-fence-safe-ref" not in serialized_result
+    assert "session-safe-ref" not in serialized_result
+    trace_count = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces"
+    ).fetchone()[0]
+    timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+
+    for rejected_body, expected_code in (
+        ({**body, "session_token_ref": "wstok-cross"}, "fence_invalidated_or_unknown"),
+        (
+            {**body, "target_project_root": str(target_root / "wrong")},
+            "fence_invalidated_or_unknown",
+        ),
+        (
+            {key: value for key, value in body.items() if key != "runtime_context_id"},
+            "fence_invalidated_or_unknown",
+        ),
+        (
+            {key: value for key, value in body.items() if key != "task_id"},
+            "fence_invalidated_or_unknown",
+        ),
+        (
+            {key: value for key, value in body.items() if key != "parent_task_id"},
+            "fence_invalidated_or_unknown",
+        ),
+        (
+            {
+                key: value
+                for key, value in body.items()
+                if key != "target_project_root"
+            },
+            "fence_invalidated_or_unknown",
+        ),
+        (
+            {**body, "session_token": "caller-raw-session"},
+            "mf_subagent_graph_query_safe_ref_auth_ambiguous",
+        ),
+        (
+            {**body, "fence_token_hash": fence_hash},
+            "mf_subagent_graph_query_safe_ref_auth_ambiguous",
+        ),
+        (
+            {
+                **body,
+                "route_identity": {
+                    **route_identity,
+                    "route_context_hash": "sha256:wrong-safe-ref-route",
+                },
+            },
+            "fence_invalidated_or_unknown",
+        ),
+    ):
+        with pytest.raises(GovernanceError) as rejected:
+            candidate_server.handle_graph_governance_query(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "mf_sub",
+                    method="POST",
+                    body=copy.deepcopy(rejected_body),
+                )
+            )
+        assert rejected.value.code == expected_code
+        assert rejected.value.details["writes_performed"] is False
+    with pytest.raises(ValidationError):
+        candidate_server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    key: value
+                    for key, value in body.items()
+                    if key != "session_token_ref"
+                },
+            )
+        )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces"
+    ).fetchone()[0] == trace_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == timeline_count
+
+    for invalid_context in (
+        replace(context, last_recovery_action="mf_subagent_initial_join_issued"),
+        replace(context, fence_token="legacy-raw-fence-safe-ref"),
+    ):
+        upsert_branch_context(conn, invalid_context)
+        conn.commit()
+        with pytest.raises(GovernanceError) as incompatible_context:
+            candidate_server.handle_graph_governance_query(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "mf_sub",
+                    method="POST",
+                    body=copy.deepcopy(body),
+                )
+            )
+        assert incompatible_context.value.code == (
+            "fence_invalidated_or_unknown"
+        )
+        assert incompatible_context.value.details["writes_performed"] is False
+        upsert_branch_context(conn, context)
+        conn.commit()
+
+    upsert_branch_context(
+        conn,
+        replace(context, lease_expires_at="2000-01-01T00:00:00Z"),
+    )
+    conn.commit()
+    with pytest.raises(GovernanceError) as expired:
+        candidate_server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body=copy.deepcopy(body),
+            )
+        )
+    assert expired.value.code == "runtime_session_token_expired"
+    assert expired.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces"
+    ).fetchone()[0] == trace_count
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == timeline_count
+
+
 def test_runtime_context_current_state_and_guide_expose_session_token_lease(
     conn,
     tmp_path,

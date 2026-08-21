@@ -14807,8 +14807,34 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             raise ValidationError("parent_task_id is required for mf_subagent graph query")
     if worker_role != "mf_sub":
         raise ValidationError("worker_role=mf_sub is required for mf_subagent graph query")
-    if not fence_token:
+    if not fence_token and not session_token_ref:
         raise ValidationError("fence_token is required for mf_subagent graph query")
+    if not fence_token and session_token_ref and (
+        session_token or str(body.get("fence_token_hash") or "").strip()
+    ):
+        raise GovernanceError(
+            "mf_subagent_graph_query_safe_ref_auth_ambiguous",
+            (
+                "copy-safe graph compatibility cannot be combined with caller "
+                "raw session auth or a caller-claimed fence hash"
+            ),
+            422,
+            {
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "session_token_ref_present": True,
+                "raw_session_token_present": bool(session_token),
+                "caller_fence_token_hash_present": bool(
+                    str(body.get("fence_token_hash") or "").strip()
+                ),
+                "fail_closed": True,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "product_mutation_performed": False,
+                "raw_worker_auth_exposed": False,
+            },
+        )
     nested_route_identity = (
         body.get("route_identity")
         if isinstance(body.get("route_identity"), Mapping)
@@ -14819,25 +14845,244 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     }
     from .parallel_branch_runtime import (
+        ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
         BranchRuntimeFenceError,
+        get_branch_context_by_runtime_context_id,
+        runtime_context_effective_target_project_root,
+        runtime_context_fence_token_verifier,
+        runtime_context_has_fence_authority,
+        runtime_context_id_for_branch_context,
+        runtime_context_session_token_lease_view,
+        runtime_context_session_token_ref_matches,
         validate_mf_subagent_graph_query_identity,
     )
     try:
-        context = validate_mf_subagent_graph_query_identity(
-            conn,
-            project_id=ctx.get_project_id(),
-            task_id=task_id,
-            runtime_context_id=runtime_context_id,
-            parent_task_id=parent_task_id,
-            worker_role=worker_role,
-            fence_token=fence_token,
-            governance_project_id=governance_project_id,
-            target_project_id=target_project_id,
-            target_project_root=target_project_root,
-            session_token=session_token,
-            session_token_ref=session_token_ref,
-            route_identity=route_identity,
-        )
+        safe_ref_authority: dict[str, Any] = {}
+        if fence_token:
+            context = validate_mf_subagent_graph_query_identity(
+                conn,
+                project_id=ctx.get_project_id(),
+                task_id=task_id,
+                runtime_context_id=runtime_context_id,
+                parent_task_id=parent_task_id,
+                worker_role=worker_role,
+                fence_token=fence_token,
+                governance_project_id=governance_project_id,
+                target_project_id=target_project_id,
+                target_project_root=target_project_root,
+                session_token=session_token,
+                session_token_ref=session_token_ref,
+                route_identity=route_identity,
+            )
+        else:
+            def safe_ref_failure(reason: str, **details: Any) -> None:
+                error = BranchRuntimeFenceError(reason)
+                error.details = {  # type: ignore[attr-defined]
+                    "runtime_context_id": runtime_context_id,
+                    "task_id": task_id,
+                    "parent_task_id": parent_task_id,
+                    "governance_project_id": governance_project_id,
+                    "target_project_id": target_project_id,
+                    "safe_ref_server_compatibility": True,
+                    "fail_closed": True,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                    "product_mutation_performed": False,
+                    "raw_worker_auth_exposed": False,
+                    **details,
+                }
+                raise error
+
+            if not runtime_context_id:
+                safe_ref_failure(
+                    "fence_invalidated_or_unknown",
+                    missing_fields=["runtime_context_id"],
+                )
+            missing_identity_fields = [
+                field
+                for field, value in (
+                    ("task_id", task_id),
+                    ("parent_task_id", parent_task_id),
+                    ("target_project_root", target_project_root),
+                )
+                if not value
+            ]
+            if missing_identity_fields:
+                safe_ref_failure(
+                    "fence_invalidated_or_unknown",
+                    missing_fields=missing_identity_fields,
+                )
+            context = get_branch_context_by_runtime_context_id(
+                conn,
+                governance_project_id,
+                runtime_context_id,
+            )
+            if (
+                context is None
+                or not runtime_context_has_fence_authority(context)
+                or not runtime_context_session_token_ref_matches(
+                    context,
+                    session_token_ref,
+                )
+            ):
+                safe_ref_failure("fence_invalidated_or_unknown")
+            if task_id != context.task_id:
+                safe_ref_failure(
+                    "runtime_context_task_mismatch",
+                    expected_task_id=context.task_id,
+                )
+            if context.status not in ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES:
+                safe_ref_failure(
+                    "fence_invalidated_or_unknown",
+                    runtime_context_status=context.status,
+                )
+            if (
+                str(context.last_recovery_action or "").strip()
+                != "mf_subagent_session_token_rejoin_issued"
+                or bool(str(context.fence_token or "").strip())
+            ):
+                safe_ref_failure(
+                    "fence_invalidated_or_unknown",
+                    required_last_recovery_action=(
+                        "mf_subagent_session_token_rejoin_issued"
+                    ),
+                    actual_last_recovery_action=str(
+                        context.last_recovery_action or ""
+                    ).strip(),
+                    verifier_only_fence_authority_required=True,
+                    raw_fence_stored=bool(
+                        str(context.fence_token or "").strip()
+                    ),
+                )
+            lease = runtime_context_session_token_lease_view(context)
+            if str(lease.get("status") or "") == "expired":
+                safe_ref_failure(
+                    "runtime_session_token_expired",
+                    lease_id=str(lease.get("lease_id") or ""),
+                    lease_expires_at=str(
+                        lease.get("lease_expires_at") or ""
+                    ),
+                )
+            if (
+                str(lease.get("status") or "") != "active"
+                or lease.get("authorization_valid") is not True
+                or lease.get("expired") is not False
+            ):
+                safe_ref_failure(
+                    "fence_invalidated_or_unknown",
+                    lease_status=str(lease.get("status") or ""),
+                )
+            context_governance_project_id = (
+                context.governance_project_id or context.project_id
+            )
+            context_target_project_id = (
+                context.target_project_id or context.project_id
+            )
+            if (
+                governance_project_id != context_governance_project_id
+                or ctx.get_project_id()
+                not in {context.project_id, context_target_project_id}
+                or target_project_id != context_target_project_id
+            ):
+                safe_ref_failure("fence_invalidated_or_unknown")
+
+            def normalized_target_root(value: Any) -> str:
+                text = str(value or "").strip()
+                if not text:
+                    return ""
+                try:
+                    return str(Path(text).expanduser().resolve())
+                except (OSError, RuntimeError):
+                    return text
+
+            requested_target_root = normalized_target_root(target_project_root)
+            context_target_root = normalized_target_root(
+                runtime_context_effective_target_project_root(context)
+            )
+            if (
+                not context_target_root
+                or requested_target_root != context_target_root
+            ):
+                safe_ref_failure(
+                    "fence_invalidated_or_unknown",
+                    mismatched_fields=["target_project_root"],
+                )
+            expected_parent_task_id = _runtime_context_mf_sub_parent_task_id(
+                context
+            )
+            if (
+                not expected_parent_task_id
+                or parent_task_id != expected_parent_task_id
+            ):
+                safe_ref_failure(
+                    "fence_invalidated_or_unknown",
+                    mismatched_fields=["parent_task_id"],
+                    expected_parent_task_id=expected_parent_task_id,
+                )
+            expected_route_identity = _runtime_context_latest_route_identity(
+                conn,
+                context,
+            )
+            missing_route_identity = [
+                field
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                if str(expected_route_identity.get(field) or "").strip()
+                and not str(route_identity.get(field) or "").strip()
+            ]
+            if missing_route_identity:
+                safe_ref_failure(
+                    "route_identity_missing",
+                    missing_route_identity_fields=missing_route_identity,
+                )
+            route_identity_mismatches = [
+                {
+                    "field": field,
+                    "expected": str(
+                        expected_route_identity.get(field) or ""
+                    ).strip(),
+                    "actual": str(route_identity.get(field) or "").strip(),
+                }
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                if str(expected_route_identity.get(field) or "").strip()
+                != str(route_identity.get(field) or "").strip()
+            ]
+            if route_identity_mismatches:
+                safe_ref_failure(
+                    "route_identity_mismatch",
+                    route_identity_mismatches=route_identity_mismatches,
+                )
+            fence_token_hash = runtime_context_fence_token_verifier(context)
+            safe_ref_authority = {
+                "schema_version": (
+                    "runtime_context.mf_sub_graph_query_safe_ref_authority.v1"
+                ),
+                "authorization_source": "runtime_context_session_token_ref",
+                "server_derived": True,
+                "caller_claims_trusted": False,
+                "safe_ref_current": True,
+                "runtime_context_id": runtime_context_id_for_branch_context(
+                    context
+                ),
+                "task_id": context.task_id,
+                "parent_task_id": parent_task_id,
+                "session_token_ref": session_token_ref,
+                "fence_token_hash": fence_token_hash,
+                "lease_id": str(lease.get("lease_id") or ""),
+                "lease_expires_at": str(
+                    lease.get("lease_expires_at") or ""
+                ),
+                "lease_status": "active",
+                "raw_session_token_required": False,
+                "raw_fence_token_required": False,
+                "raw_worker_auth_exposed": False,
+                "write_scope": "graph_trace_and_canonical_worker_graph_context",
+            }
+            setattr(
+                ctx,
+                "_trusted_mf_sub_graph_query_safe_ref_authority",
+                safe_ref_authority,
+            )
     except BranchRuntimeFenceError as exc:
         reason = str(exc) or "fence_invalidated_or_unknown"
         details = {
@@ -14916,7 +15161,24 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             403,
             recovery_details,
         )
-    fence_hash = hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
+    trusted_safe_ref_authority = getattr(
+        ctx,
+        "_trusted_mf_sub_graph_query_safe_ref_authority",
+        {},
+    )
+    trusted_safe_ref_authority = (
+        trusted_safe_ref_authority
+        if isinstance(trusted_safe_ref_authority, Mapping)
+        else {}
+    )
+    trusted_fence_token_hash = str(
+        trusted_safe_ref_authority.get("fence_token_hash") or ""
+    ).strip()
+    fence_hash = (
+        trusted_fence_token_hash.removeprefix("sha256:")[:16]
+        if trusted_fence_token_hash
+        else hashlib.sha256(fence_token.encode("utf-8")).hexdigest()[:16]
+    )
     body["task_id"] = context.task_id
     body["parent_task_id"] = (
         parent_task_id
@@ -14930,7 +15192,11 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
 
     body["runtime_context_id"] = runtime_context_id_for_branch_context(context)
     body["worker_role"] = "mf_sub"
-    body["fence_token"] = fence_token
+    if fence_token:
+        body["fence_token"] = fence_token
+    else:
+        body.pop("fence_token", None)
+        body["fence_token_hash"] = trusted_fence_token_hash
     if session_token_ref and not body.get("session_token_ref"):
         body["session_token_ref"] = session_token_ref
     body["governance_project_id"] = context.governance_project_id or context.project_id
@@ -31313,12 +31579,6 @@ def _runtime_context_server_bounded_mf_sub_graph_query_response(
             if field not in safe_fields:
                 safe_fields.append(field)
         full["graph_identity_fields"] = safe_fields
-    full["raw_fence_token_exposed"] = False
-    serialized_bytes = _runtime_context_server_read_serialized_bytes(full)
-    if serialized_bytes <= _RUNTIME_CONTEXT_SERVER_GRAPH_MAX_SERIALIZED_BYTES:
-        return full
-    query_result = full.get("result")
-    query_result_bytes = _runtime_context_server_read_serialized_bytes(query_result)
     trace = full.get("trace")
     trace = trace if isinstance(trace, Mapping) else {}
     canonical_line = full.get("contract_runtime_canonical_line")
@@ -31330,6 +31590,23 @@ def _runtime_context_server_bounded_mf_sub_graph_query_response(
         in {"accepted", "complete", "completed", "passed", "success"}
     )
     writes_performed = trace_persisted or contract_line_persisted
+    full.update(
+        {
+            "trace_persisted": trace_persisted,
+            "contract_runtime_line_persisted": contract_line_persisted,
+            "governance_writes_performed": writes_performed,
+            "writes_performed": writes_performed,
+            "mutation_performed": writes_performed,
+            "product_mutation_performed": False,
+            "semantic_truncation_performed": False,
+        }
+    )
+    full["raw_fence_token_exposed"] = False
+    serialized_bytes = _runtime_context_server_read_serialized_bytes(full)
+    if serialized_bytes <= _RUNTIME_CONTEXT_SERVER_GRAPH_MAX_SERIALIZED_BYTES:
+        return full
+    query_result = full.get("result")
+    query_result_bytes = _runtime_context_server_read_serialized_bytes(query_result)
     if query_result_bytes > _RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES:
         return {
             "ok": False,
@@ -31390,6 +31667,12 @@ def _runtime_context_server_bounded_mf_sub_graph_query_response(
             _runtime_context_server_bounded_mapping(
                 full.get("mf_sub_graph_query_canonical_gate"),
                 field="mf_sub_graph_query_canonical_gate",
+            )
+        ),
+        "mf_sub_graph_query_safe_ref_authority": (
+            _runtime_context_server_bounded_mapping(
+                full.get("mf_sub_graph_query_safe_ref_authority"),
+                field="mf_sub_graph_query_safe_ref_authority",
             )
         ),
         "contract_runtime_canonical_line": (
@@ -81733,6 +82016,19 @@ def handle_graph_governance_query(ctx: RequestContext):
         _bind_trusted_mf_sub_graph_query_authority(ctx, conn, body)
         mf_sub_proof = getattr(ctx, "_trusted_mf_sub_graph_query_authority", {})
         mf_sub_proof = mf_sub_proof if isinstance(mf_sub_proof, Mapping) else {}
+        safe_ref_authority = getattr(
+            ctx,
+            "_trusted_mf_sub_graph_query_safe_ref_authority",
+            {},
+        )
+        safe_ref_authority = (
+            safe_ref_authority
+            if isinstance(safe_ref_authority, Mapping)
+            else {}
+        )
+        safe_ref_fence_hash = str(
+            safe_ref_authority.get("fence_token_hash") or ""
+        ).strip()
         route_proof = mf_sub_proof or observer_proof
         if root is None and (
             body.get("project_root")
@@ -81858,10 +82154,16 @@ def handle_graph_governance_query(ctx: RequestContext):
                         qa_proof.get("qa_scope_binding_ref") or ""
                     ),
                     worker_role=str(body.get("worker_role") or ""),
-                    fence_token=str(body.get("fence_token") or ""),
+                    fence_token=str(
+                        body.get("fence_token") or safe_ref_fence_hash or ""
+                    ),
                     budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
                     project_root=root,
                 )
+                if safe_ref_fence_hash:
+                    result["mf_sub_graph_query_safe_ref_authority"] = dict(
+                        safe_ref_authority
+                    )
                 result_error = str(
                     (result.get("result") or {}).get("error")
                     if isinstance(result.get("result"), Mapping)
