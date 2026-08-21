@@ -31213,6 +31213,15 @@ def _runtime_context_guide_executable_actions(
                 default_action=action,
                 default_tool=tool,
                 default_facade=facade,
+                optional_omission_fields=(
+                    (
+                        "implementation_diff_submission_guidance",
+                        "worker_session_lifecycle_policy",
+                        "write_authorization_policy",
+                    )
+                    if stage == "implementation"
+                    else ()
+                ),
             )
 
     graph_source = {
@@ -32690,28 +32699,58 @@ def _runtime_context_worker_guide_compact_current_action(
     current_stage: str,
     detail_ref: str,
 ) -> dict[str, Any]:
-    """Keep optional policy diagnostics out of the executable startup body."""
+    """Keep declared optional diagnostics out of one executable action body."""
 
     compact = deepcopy(dict(action or {}))
-    if current_stage != "startup":
-        return compact
     body = compact.get("copy_safe_body")
     if not isinstance(body, Mapping):
         return compact
     source_body = dict(body)
-    omitted_fields = (
-        "worker_session_lifecycle_policy",
-        "write_authorization_policy",
-        "worker_identity_pointers",
-        "semantic_role_binding",
+    host_realization = compact.get("host_realization")
+    host_realization = (
+        dict(host_realization)
+        if isinstance(host_realization, Mapping)
+        else {}
     )
-    bounded_body = {
-        key: deepcopy(value)
-        for key, value in source_body.items()
-        if key not in omitted_fields
-    }
-    omitted = [key for key in omitted_fields if key in source_body]
-    if not omitted:
+    declared_optional_fields = tuple(
+        str(field or "").strip()
+        for field in host_realization.get("optional_omission_fields") or []
+        if str(field or "").strip()
+    )
+    if current_stage == "startup" and not declared_optional_fields:
+        # Preserve the already-shipped startup compact projection for legacy
+        # canonical actions that predate declared optional omission fields.
+        declared_optional_fields = (
+            "worker_session_lifecycle_policy",
+            "write_authorization_policy",
+            "worker_identity_pointers",
+            "semantic_role_binding",
+        )
+    if not declared_optional_fields:
+        return compact
+
+    omitted_paths: list[str] = []
+
+    def project(value: Any, *, path: str) -> Any:
+        if isinstance(value, Mapping):
+            projected: dict[str, Any] = {}
+            for key, child in value.items():
+                child_key = str(key)
+                child_path = f"{path}.{child_key}"
+                if child_key in declared_optional_fields:
+                    omitted_paths.append(child_path)
+                    continue
+                projected[child_key] = project(child, path=child_path)
+            return projected
+        if isinstance(value, (list, tuple)):
+            return [
+                project(child, path=f"{path}[{index}]")
+                for index, child in enumerate(value)
+            ]
+        return deepcopy(value)
+
+    bounded_body = project(source_body, path="copy_safe_body")
+    if not omitted_paths:
         return compact
     compact["copy_safe_body"] = bounded_body
     compact["source_copy_safe_body_hash"] = _stable_public_hash(source_body)
@@ -32719,25 +32758,21 @@ def _runtime_context_worker_guide_compact_current_action(
         "schema_version": (
             "runtime_context.worker_guide_optional_body_metadata.v1"
         ),
-        "fields": omitted,
+        "fields": list(dict.fromkeys(omitted_paths)),
         "detail_ref": detail_ref,
         "source_body_hash": compact["source_copy_safe_body_hash"],
         "execution_semantics_changed": False,
         "semantic_truncation_performed": False,
     }
-    host_realization = compact.get("host_realization")
-    if isinstance(host_realization, Mapping):
-        projected_host_realization = deepcopy(dict(host_realization))
+    if host_realization:
+        projected_host_realization = deepcopy(host_realization)
         replacement_paths = list(
             projected_host_realization.get("required_replacement_paths") or []
         )
         projected_host_realization["required_replacement_paths"] = [
             path
             for path in replacement_paths
-            if not any(
-                str(path).startswith(f"copy_safe_body.{field}")
-                for field in omitted
-            )
+            if not any(str(path).startswith(omitted) for omitted in omitted_paths)
         ]
         compact["host_realization"] = projected_host_realization
     return compact

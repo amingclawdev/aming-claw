@@ -211,6 +211,108 @@ def test_managed_mcp_host_envelope_stages_injects_and_acks_startup():
     assert len(calls) == call_count
 
 
+def test_managed_mcp_post_startup_envelope_submits_worker_line_then_acks_finish():
+    continuity = mcp_tools.ManagedHostEnvelopeContinuity()
+    raw_session = "managed-post-startup-session"
+    raw_fence = "managed-post-startup-fence"
+    route = {
+        "route_id": "route-managed-post-startup",
+        "route_context_hash": "sha256:" + ("1" * 64),
+        "prompt_contract_id": "rprompt-managed-post-startup",
+        "prompt_contract_hash": "sha256:" + ("2" * 64),
+        "route_token_ref": "rtok-managed-post-startup",
+        "visible_injection_manifest_hash": "sha256:" + ("3" * 64),
+    }
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-managed-post-startup",
+        "task_id": "worker-managed-post-startup",
+        "parent_task_id": "cex-managed-post-startup",
+        "contract_execution_id": "cex-managed-post-startup",
+        "target_project_root": "/tmp/managed-post-startup",
+        "worker_id": "worker-managed-post-startup",
+        "worker_slot_id": "worker-managed-post-startup",
+        "worker_session_id": "desktop-managed-post-startup",
+        "session_token_ref": "wstok-managed-post-startup",
+        **route,
+    }
+    issued = continuity.dispatch(
+        "runtime_context_session_token_rejoin",
+        identity,
+        lambda _args: {
+            "ok": True,
+            "status": "session_token_rejoined",
+            "delivery": "worker_host_envelope",
+            **identity,
+            "session_token": raw_session,
+            "fence_token": raw_fence,
+            "host_envelope": {
+                **identity,
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": raw_session,
+                    "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                },
+            },
+        },
+    )
+    assert issued["auth_loaded"] is True
+    assert continuity.pending_count() == 1
+    calls = []
+
+    malformed = continuity.dispatch(
+        "runtime_context_implementation_evidence",
+        {
+            **identity,
+            "session_token": "<host-realized wrong_field>",
+            "fence_token": "<host-realized fence_token>",
+        },
+        lambda args: calls.append(args),
+    )
+    assert malformed["error"] == (
+        "managed_host_envelope_auth_placeholder_invalid"
+    )
+    assert malformed["http_request_performed"] is False
+    assert calls == []
+
+    implementation = continuity.dispatch(
+        "runtime_context_implementation_evidence",
+        {
+            **identity,
+            "session_token": "<host-realized session_token>",
+            "fence_token": "<host-realized fence_token>",
+            "changed_files": ["src/app.py"],
+            "tests": [{"command": "pytest -q", "status": "passed"}],
+            "test_results": {"status": "passed", "passed": True},
+            "graph_trace_ids": ["gqt-managed-post-startup"],
+        },
+        lambda args: calls.append(dict(args))
+        or {"ok": True, "status": "accepted"},
+    )
+    assert implementation == {"ok": True, "status": "accepted"}
+    assert calls[-1]["session_token"] == raw_session
+    assert calls[-1]["fence_token"] == raw_fence
+    assert continuity.pending_count() == 1
+
+    finished = continuity.dispatch(
+        "runtime_context_finish_gate",
+        {
+            **identity,
+            "session_token": "<host-realized session_token>",
+            "fence_token": "<host-realized fence_token>",
+        },
+        lambda args: calls.append(dict(args))
+        or {"ok": True, "status": "passed"},
+    )
+    assert finished["managed_host_envelope_consumed"] is True
+    assert finished["managed_host_envelope_consumed_at"] == (
+        "runtime_context_finish_gate"
+    )
+    assert continuity.pending_count() == 0
+    serialized = json.dumps([issued, implementation, finished], sort_keys=True)
+    assert raw_session not in serialized
+    assert raw_fence not in serialized
+
+
 def test_managed_mcp_host_envelope_accepts_authoritative_safe_ref_rotation():
     continuity = mcp_tools.ManagedHostEnvelopeContinuity()
     old_ref = "wstok-before-managed-capture"

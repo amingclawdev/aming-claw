@@ -175009,6 +175009,89 @@ def test_worker_guide_compact_projection_fails_closed_instead_of_truncating():
     assert exc_info.value.details["writes_performed"] is False
 
 
+def test_worker_guide_compact_omits_declared_implementation_guidance_losslessly():
+    full = _representative_oversized_worker_guide()
+    repeated_guidance = {
+        "implementation_diff_submission_guidance": {
+            "schema_version": "runtime_context.implementation_diff_submission_guidance.v1",
+            "diagnostics": "d" * 7_000,
+        },
+        "worker_session_lifecycle_policy": {
+            "schema_version": "runtime_context.worker_session_lifecycle_policy.v1",
+            "diagnostics": "l" * 7_000,
+        },
+        "write_authorization_policy": {
+            "schema_version": "runtime_context.worker_write_authorization_policy.v1",
+            "diagnostics": "w" * 7_000,
+        },
+    }
+    source_body = {
+        "project_id": PID,
+        "runtime_context_id": "mfrctx-compact-guide",
+        "task_id": "worker-compact-guide",
+        "parent_task_id": "cex-compact-guide",
+        "target_project_root": "/tmp/compact-guide",
+        "session_token": "<read from env:AMING_WORKER_SESSION_TOKEN>",
+        "session_token_ref": "wstok-compact-guide",
+        "fence_token": "<read from env:AMING_WORKER_FENCE_TOKEN>",
+        "changed_files": ["src/app.py"],
+        "tests": [{"command": "pytest -q", "status": "passed"}],
+        "test_results": {"status": "passed", "passed": True},
+        "graph_trace_ids": ["gqt-compact-implementation"],
+        **copy.deepcopy(repeated_guidance),
+        "payload": {
+            "runtime_context_id": "mfrctx-compact-guide",
+            **copy.deepcopy(repeated_guidance),
+        },
+    }
+    action = server._guide_canonical_executable_action(
+        project_id=PID,
+        backlog_id="AC-COMPACT-GUIDE",
+        contract_execution_id="cex-compact-guide",
+        action="record_implementation_evidence",
+        facade="runtime_context.implementation_evidence",
+        mcp_tool="runtime_context_implementation_evidence",
+        stage_id="implementation",
+        line_id="worker_implementation",
+        body=source_body,
+        optional_omission_fields=tuple(repeated_guidance),
+    )
+    assert server._runtime_context_worker_guide_serialized_bytes(action) >= 36_692
+    full["next_legal_action"] = "record_implementation_evidence"
+    full["canonical_executable_actions"]["implementation"] = action
+
+    compact = server._runtime_context_worker_guide_compact_response(full)
+
+    projected = compact["canonical_executable_action"]
+    projected_body = projected["copy_safe_body"]
+    assert compact["serialized_bytes"] <= compact["max_serialized_bytes"]
+    assert projected["mcp_tool"] == "runtime_context_implementation_evidence"
+    assert projected["source_copy_safe_body_hash"] == server._stable_public_hash(
+        action["copy_safe_body"]
+    )
+    assert projected["omitted_optional_body_metadata"][
+        "execution_semantics_changed"
+    ] is False
+    assert projected["omitted_optional_body_metadata"][
+        "semantic_truncation_performed"
+    ] is False
+    omitted_paths = set(
+        projected["omitted_optional_body_metadata"]["fields"]
+    )
+    for field in repeated_guidance:
+        assert field not in projected_body
+        assert field not in projected_body["payload"]
+        assert f"copy_safe_body.{field}" in omitted_paths
+        assert f"copy_safe_body.payload.{field}" in omitted_paths
+    assert projected_body["changed_files"] == ["src/app.py"]
+    assert projected_body["tests"] == [
+        {"command": "pytest -q", "status": "passed"}
+    ]
+    assert projected_body["graph_trace_ids"] == [
+        "gqt-compact-implementation"
+    ]
+
+
 def test_worker_guide_compact_has_one_full_current_action_in_post_auth_world():
     full = _representative_oversized_worker_guide()
     receipt = full["canonical_executable_actions"]["receipt"]

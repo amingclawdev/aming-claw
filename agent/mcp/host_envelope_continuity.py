@@ -44,6 +44,11 @@ CONTINUATION_TOOLS = frozenset(
         "runtime_context_worker_guide",
         "runtime_context_read_receipt",
         "parallel_branch_startup",
+        "runtime_context_implementation_evidence",
+        "runtime_context_worker_commit",
+        "runtime_context_finish_time_worker_attestation",
+        "runtime_context_finish_gate",
+        "runtime_context_scope_insufficiency_request",
     }
 )
 MANAGED_TOOLS = ISSUANCE_TOOLS | CONTINUATION_TOOLS
@@ -526,6 +531,34 @@ class ManagedHostEnvelopeContinuity:
         request_args.pop("fence_token", None)
         return request_args, None
 
+    @staticmethod
+    def _normalize_declared_host_auth_placeholders(
+        args: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Consume only the exact public placeholders emitted by the Guide.
+
+        Managed MCP callers can spread the canonical copy-safe body without
+        receiving raw worker credentials. The process-local store remains the
+        sole authority that realizes these two fields.
+        """
+
+        request_args = dict(args)
+        placeholders = {
+            "session_token": "<host-realized session_token>",
+            "fence_token": "<host-realized fence_token>",
+        }
+        for field, placeholder in placeholders.items():
+            supplied = _text(request_args.get(field))
+            if supplied == placeholder:
+                request_args.pop(field, None)
+            elif supplied.startswith("<host-realized "):
+                return request_args, _local_error(
+                    "managed_host_envelope_auth_placeholder_invalid",
+                    "Managed host auth placeholder does not match the canonical Guide.",
+                    field=field,
+                )
+        return request_args, None
+
     def dispatch(
         self,
         tool_name: str,
@@ -561,6 +594,11 @@ class ManagedHostEnvelopeContinuity:
                 "managed_host_envelope_not_loaded",
                 "This MCP process has no exact staged worker host envelope.",
             )
+        request_args, placeholder_rejection = (
+            self._normalize_declared_host_auth_placeholders(request_args)
+        )
+        if placeholder_rejection is not None:
+            return placeholder_rejection
         request_args, redundant_fence_rejection = (
             self._normalize_exact_redundant_fence(tool_name, request_args, entry)
         )
@@ -675,11 +713,18 @@ class ManagedHostEnvelopeContinuity:
 
         scrub_host_envelope_payload(result)
         if (
-            tool_name == "parallel_branch_startup"
+            tool_name in {"parallel_branch_startup", "runtime_context_finish_gate"}
             and isinstance(result, dict)
             and result.get("ok") is True
             and _text(result.get("status"))
-            in {"accepted", "started", "startup_recorded", "running"}
+            in {
+                "accepted",
+                "started",
+                "startup_recorded",
+                "running",
+                "passed",
+                "finish_gate_recorded",
+            }
         ):
             self._store.acknowledge(
                 entry.run_id,
@@ -690,6 +735,7 @@ class ManagedHostEnvelopeContinuity:
             with self._lock:
                 self._entries.pop(entry.run_id, None)
             result["managed_host_envelope_consumed"] = True
+            result["managed_host_envelope_consumed_at"] = tool_name
             result["raw_worker_auth_exposed"] = False
         return result
 
