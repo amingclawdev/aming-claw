@@ -57199,123 +57199,249 @@ def test_exact_candidate_runtime_comparison_base_resolves_child_cex(
     ) == base_commit
 
 
+def _one_worker_postmerge_comparison_world(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    nonancestor_base: bool = False,
+) -> dict[str, Any]:
+    project_root = tmp_path / "one-worker-postmerge-comparison"
+    initial_head = _init_test_git_repo(project_root, filename="baseline.txt")
+    candidate_commit = _commit_test_git_files(
+        project_root,
+        ("src/combined.py",),
+        message="one-worker combined merge",
+    )
+    comparison_base = initial_head
+    if nonancestor_base:
+        candidate_branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "nonancestor-base", initial_head],
+            cwd=project_root,
+            check=True,
+        )
+        comparison_base = _commit_test_git_files(
+            project_root,
+            ("src/nonancestor.py",),
+            message="nonancestor comparison base",
+        )
+        subprocess.run(
+            ["git", "checkout", "-q", candidate_branch],
+            cwd=project_root,
+            check=True,
+        )
+
+    record = _rev8_postmerge_qa_binding_record()
+    record["revision"] = "rev9"
+    dispatch = copy.deepcopy(record["completed_lines"][0])
+    worker = dispatch["payload"]["bounded_workers"][0]
+    dispatch["payload"].update(
+        {
+            "worker_count": 1,
+            "required_worker_count": 1,
+            "atomic_dispatch": False,
+            "bounded_workers": [worker],
+        }
+    )
+    selection = {
+        "observer_selected": True,
+        "selection_frozen": True,
+        "selection_origin": "mf_parallel_enter",
+        "required_worker_count": 1,
+    }
+    selection["selection_hash"] = server.stable_sha256(selection)
+    record["metadata"] = {
+        "observer_worker_cardinality_selection": selection,
+    }
+    merge = copy.deepcopy(record["completed_lines"][1])
+    merge["commit_sha"] = candidate_commit
+    durable = merge["payload"]["durable_merge_authority"]
+    durable.update(
+        {
+            "merge_commit": candidate_commit,
+            "branch_head": candidate_commit,
+            "target_head_before_merge": comparison_base,
+            "target_head_after_merge": candidate_commit,
+        }
+    )
+    reconcile = copy.deepcopy(record["completed_lines"][-1])
+    receipt = reconcile["payload"]["reconcile_authority"]
+    receipt.update(
+        {
+            "lane_merge_count": 1,
+            "lane_runtime_context_ids": [worker["runtime_context_id"]],
+            "lane_merge_queue_ids": [worker["merge_queue_id"]],
+            "runtime_context_id": worker["runtime_context_id"],
+            "task_id": worker["task_id"],
+            "parent_task_id": record["contract_execution_id"],
+            "merge_queue_id": worker["merge_queue_id"],
+            "merged_commit_sha": candidate_commit,
+            "merge_source_ref": durable["merge_event_ref"],
+            "merge_event_id": durable["merge_event_id"],
+            "merge_event_created_at": durable["merge_event_created_at"],
+        }
+    )
+    receipt["authority_hash"] = server.stable_sha256(
+        {key: value for key, value in receipt.items() if key != "authority_hash"}
+    )
+    record["completed_lines"] = [dispatch, merge, reconcile]
+    record["execution_state_revision"] = len(record["completed_lines"])
+
+    state = _install_rev8_postmerge_qa_helper_boundaries(
+        monkeypatch,
+        record,
+        terminal_commit=candidate_commit,
+    )
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "list_merge_queue_items",
+        list_merge_queue_items,
+    )
+    upsert_merge_queue_item(
+        conn,
+        state["queue_items"][0],
+        now_iso="2026-08-21T01:00:00Z",
+    )
+    _activate_basic_graph(
+        conn,
+        state["current_full"]["active_snapshot_id"],
+        commit_sha=candidate_commit,
+    )
+    server._contract_runtime(conn).store.create(record)
+    conn.commit()
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    return {
+        "project_root": project_root,
+        "record": record,
+        "state": state,
+        "comparison_base": comparison_base,
+        "candidate_commit": candidate_commit,
+        "proof": {
+            "backlog_id": record["backlog_id"],
+            "task_id": record["contract_execution_id"],
+            "commit_sha": candidate_commit,
+        },
+    }
+
+
 def test_exact_candidate_runtime_comparison_authority_joins_parent_postmerge_cex(
     conn,
     monkeypatch,
+    tmp_path,
 ):
-    backlog_id = "AC-EXACT-CANDIDATE-POSTMERGE-CEX"
-    execution_id = "cex-exact-candidate-postmerge"
-    candidate_commit = "c" * 40
-    comparison_base = "b" * 40
-    record = {
-        "project_id": PID,
-        "backlog_id": backlog_id,
-        "contract_execution_id": execution_id,
-        "contract_id": "mf_parallel.v2",
-        "revision": "rev9",
-        "completed_lines": [],
-    }
-
-    class Store:
-        @staticmethod
-        def get(candidate_execution_id):
-            assert candidate_execution_id == execution_id
-            return copy.deepcopy(record)
-
-        @staticmethod
-        def list_by_backlog(**kwargs):
-            assert kwargs == {
-                "project_id": PID,
-                "backlog_id": backlog_id,
-            }
-            return [copy.deepcopy(record)]
-
-    ticket = {
-        "schema_version": "contract_runtime.rev8_postmerge_qa_authority.v1",
-        "status": "verified",
-        "verified": True,
-        "server_derived": True,
-        "db_verified": True,
-        "live_verified": True,
-        "graph_reconciled": True,
-        "active_snapshot_verified": True,
-        "project_id": PID,
-        "backlog_id": backlog_id,
-        "contract_execution_id": execution_id,
-        "runtime_context_id": "mfrctx-exact-candidate-postmerge",
-        "task_id": "exact-candidate-postmerge-worker",
-        "parent_task_id": execution_id,
-        "qa_graph_trace_task_id": execution_id,
-        "qa_graph_trace_task_source": (
-            "ContractRuntime.contract_execution_id"
-        ),
-        "candidate_commit_sha": candidate_commit,
-        "reconciled_commit_sha": candidate_commit,
-        "canonical_head_commit": candidate_commit,
-        "active_snapshot_commit": candidate_commit,
-    }
-    ticket["authority_hash"] = server.stable_sha256(ticket)
-    comparison_calls: list[dict[str, Any]] = []
-
-    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: Store())
-    monkeypatch.setattr(
-        server,
-        "_contract_runtime_rev8_postmerge_qa_authority",
-        lambda *_args, **_kwargs: copy.deepcopy(ticket),
-    )
-
-    def comparison_authority(_conn, **kwargs):
-        comparison_calls.append(kwargs)
-        return {
-            "commit_sha": comparison_base,
-            "source": server._QA_POSTMERGE_COMPARISON_BASE_SOURCE,
-        }
-
-    monkeypatch.setattr(
-        server,
-        "_contract_runtime_server_comparison_authority",
-        comparison_authority,
-    )
-    monkeypatch.setattr(
-        server,
-        "_qa_exact_candidate_direct_main_comparison_authority",
-        lambda *_args, **_kwargs: pytest.fail(
-            "combined post-merge QA must not fall through to Direct Main"
-        ),
-    )
-    proof = {
-        "backlog_id": backlog_id,
-        "task_id": execution_id,
-        "commit_sha": candidate_commit,
-        # Caller-provided comparison identity is deliberately untrusted.
-        "comparison_base_commit_sha": "f" * 40,
-    }
+    world = _one_worker_postmerge_comparison_world(conn, monkeypatch, tmp_path)
 
     authority = server._qa_exact_candidate_runtime_comparison_authority(
         conn,
         project_id=PID,
-        proof=proof,
+        proof=world["proof"],
+    )
+    exact = server._qa_exact_candidate_context(
+        world["project_root"],
+        project_id=PID,
+        canonical_project_root=world["project_root"],
+        candidate_commit_sha=world["candidate_commit"],
+        comparison_base_commit_sha=authority["commit_sha"],
+        comparison_base_commit_source=authority["source"],
+        comparison_base_commit_lineage_source=authority["lineage_source"],
+        comparison_authority_required=True,
     )
 
     assert authority == {
-        "commit_sha": comparison_base,
+        "commit_sha": world["comparison_base"],
         "source": server._QA_POSTMERGE_COMPARISON_BASE_SOURCE,
-        "lineage_source": (
-            server._QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE
-        ),
+        "lineage_source": server._QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE,
     }
-    assert comparison_calls == [
-        {
-            "project_id": PID,
-            "record": record,
-            "expected_candidate_commit": candidate_commit,
-        }
-    ]
+    assert exact["root_identity"]["base_commit_sha"] == world["candidate_commit"]
+    assert exact["root_identity"]["candidate_commit_sha"] == world["candidate_commit"]
+    assert exact["comparison_base_commit_sha"] == world["comparison_base"]
+    assert exact["changed_files"] == ["src/combined.py"]
+    persisted = server._contract_runtime(conn).store.get(
+        world["record"]["contract_execution_id"]
+    )
+    assert len(persisted["completed_lines"][0]["payload"]["bounded_workers"]) == 1
+    assert [
+        line["line_id"] for line in persisted["completed_lines"]
+    ].count("observer_merge") == 1
+    queue = list_merge_queue_items(
+        conn,
+        PID,
+        world["state"]["queue_items"][0].merge_queue_id,
+    )
+    assert len(queue) == 1
+    assert queue[0].target_head_before_merge == world["comparison_base"]
+    assert queue[0].target_head_after_merge == world["candidate_commit"]
+    current_full = world["state"]["current_full"]
+    assert current_full["reconciled_commit_sha"] == world["candidate_commit"]
+    assert current_full["active_snapshot_commit"] == world["candidate_commit"]
+    assert store.get_active_graph_snapshot(conn, PID)["commit_sha"] == (
+        world["candidate_commit"]
+    )
     assert server._qa_exact_candidate_comparison_authority_required(
         conn,
         project_id=PID,
-        proof=proof,
+        proof=world["proof"],
     ) is True
+
+
+def test_exact_candidate_parent_postmerge_nonancestor_base_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    world = _one_worker_postmerge_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        nonancestor_base=True,
+    )
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=world["proof"],
+    )
+    runtime_store = server._contract_runtime(conn).store
+    before_record = runtime_store.get(world["record"]["contract_execution_id"])
+    before_queue = list_merge_queue_items(
+        conn,
+        PID,
+        world["state"]["queue_items"][0].merge_queue_id,
+    )
+    before_snapshot = store.get_active_graph_snapshot(conn, PID)
+    before_total_changes = conn.total_changes
+
+    with pytest.raises(server._QACandidateOverlayError) as blocked:
+        server._qa_exact_candidate_context(
+            world["project_root"],
+            project_id=PID,
+            canonical_project_root=world["project_root"],
+            candidate_commit_sha=world["candidate_commit"],
+            comparison_base_commit_sha=authority["commit_sha"],
+            comparison_base_commit_source=authority["source"],
+            comparison_base_commit_lineage_source=authority["lineage_source"],
+            comparison_authority_required=True,
+        )
+
+    assert blocked.value.reason == "exact_candidate_comparison_base_not_ancestor"
+    assert conn.total_changes == before_total_changes
+    assert runtime_store.get(world["record"]["contract_execution_id"]) == before_record
+    assert list_merge_queue_items(
+        conn,
+        PID,
+        world["state"]["queue_items"][0].merge_queue_id,
+    ) == before_queue
+    assert store.get_active_graph_snapshot(conn, PID) == before_snapshot
 
 
 @pytest.mark.parametrize(
@@ -78754,11 +78880,23 @@ def _install_rev8_postmerge_qa_helper_boundaries(
     reconcile_worker_index: int = -1,
     persist_current_receipt: bool = False,
 ) -> dict[str, Any]:
-    merged_commit = "2" * 40
+    merge_lines = [
+        line
+        for line in record["completed_lines"]
+        if line.get("line_id") == "observer_merge"
+    ]
+    final_merge = merge_lines[-1]
+    durable_merge = final_merge["payload"]["durable_merge_authority"]
+    merged_commit = str(
+        durable_merge.get("target_head_after_merge")
+        or durable_merge.get("merge_commit")
+        or final_merge.get("commit_sha")
+        or ""
+    )
     final_commit = terminal_commit
     final_worker = record["completed_lines"][0]["payload"][
         "bounded_workers"
-    ][1]
+    ][-1]
     reconcile_worker = record["completed_lines"][0]["payload"][
         "bounded_workers"
     ][reconcile_worker_index]
@@ -78778,15 +78916,22 @@ def _install_rev8_postmerge_qa_helper_boundaries(
     queue_item = MergeQueueItem(
         project_id=PID,
         merge_queue_id=final_worker["merge_queue_id"],
-        queue_item_id="mqitem-rev8-postmerge-2",
+        queue_item_id=durable_merge["queue_item_id"],
         backlog_id=record["backlog_id"],
         task_id=final_worker["task_id"],
         branch_ref="refs/heads/codex/rev8-postmerge-test",
-        queue_index=2,
+        queue_index=len(merge_lines),
         status="merged",
-        target_ref="refs/heads/integration",
-        branch_head="b" * 40,
+        target_ref=str(
+            durable_merge.get("target_ref") or "refs/heads/integration"
+        ),
+        branch_head=str(
+            durable_merge.get("branch_head") or merged_commit
+        ),
         merge_commit=merged_commit,
+        target_head_before_merge=str(
+            durable_merge.get("target_head_before_merge") or ""
+        ),
         target_head_after_merge=merged_commit,
     )
     state = {
