@@ -9349,6 +9349,10 @@ _QA_POSTMERGE_COMPARISON_BASE_SOURCE = (
     "ContractRuntime.completed_lines.observer_merge+"
     "parallel_branch_merge_queue_items.target_head_before_merge"
 )
+_QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE = (
+    "ContractRuntime.rev8_postmerge_qa_authority+"
+    "observer_merge.durable_merge_authority"
+)
 _QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE = _QA_WORKER_COMPARISON_BASE_SOURCE
 _QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE = (
     "task_timeline.accepted_direct_main_worker_implementation+"
@@ -10879,6 +10883,50 @@ def _qa_exact_candidate_direct_main_comparison_authority(
     }
 
 
+def _qa_exact_candidate_postmerge_records(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+) -> list[Mapping[str, Any]]:
+    """Return exact-execution post-merge records without trusting QA claims."""
+
+    runtime_store = _contract_runtime_store(conn)
+    candidate_records: list[Mapping[str, Any]] = []
+    if contract_execution_id:
+        try:
+            direct_record = runtime_store.get(contract_execution_id)
+        except ContractRuntimeError as exc:
+            if str(exc) != (
+                f"unknown contract execution: {contract_execution_id}"
+            ):
+                raise
+        else:
+            if isinstance(direct_record, Mapping):
+                candidate_records.append(direct_record)
+    list_by_backlog = getattr(runtime_store, "list_by_backlog", None)
+    if callable(list_by_backlog) and backlog_id:
+        candidate_records.extend(
+            record
+            for record in list_by_backlog(
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+            if isinstance(record, Mapping)
+        )
+    postmerge_records: dict[str, Mapping[str, Any]] = {}
+    for record in candidate_records:
+        if not _is_mf_parallel_postmerge_revision(record):
+            continue
+        execution_id = str(
+            record.get("contract_execution_id") or ""
+        ).strip()
+        if execution_id == contract_execution_id:
+            postmerge_records[stable_sha256(record)] = record
+    return list(postmerge_records.values())
+
+
 def _qa_exact_candidate_runtime_comparison_authority(
     conn,
     *,
@@ -10897,6 +10945,109 @@ def _qa_exact_candidate_runtime_comparison_authority(
     )
     context = get_branch_context(conn, project_id, task_id) if task_id else None
     if context is None:
+        postmerge_records = _qa_exact_candidate_postmerge_records(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=task_id,
+        )
+        if postmerge_records:
+            resolved_authorities: dict[str, dict[str, str]] = {}
+            for record in postmerge_records:
+                if not (
+                    str(record.get("project_id") or "").strip()
+                    == project_id
+                    and str(record.get("backlog_id") or "").strip()
+                    == backlog_id
+                ):
+                    continue
+                postmerge = _contract_runtime_rev8_postmerge_qa_authority(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                )
+                unsigned_postmerge = {
+                    key: value
+                    for key, value in postmerge.items()
+                    if key != "authority_hash"
+                }
+                if not (
+                    postmerge.get("verified") is True
+                    and postmerge.get("server_derived") is True
+                    and postmerge.get("db_verified") is True
+                    and postmerge.get("live_verified") is True
+                    and postmerge.get("graph_reconciled") is True
+                    and postmerge.get("active_snapshot_verified") is True
+                    and str(postmerge.get("project_id") or "").strip()
+                    == project_id
+                    and str(postmerge.get("backlog_id") or "").strip()
+                    == backlog_id
+                    and str(
+                        postmerge.get("contract_execution_id") or ""
+                    ).strip()
+                    == task_id
+                    and str(postmerge.get("parent_task_id") or "").strip()
+                    == task_id
+                    and str(
+                        postmerge.get("qa_graph_trace_task_id") or ""
+                    ).strip()
+                    == task_id
+                    and str(
+                        postmerge.get("qa_graph_trace_task_source") or ""
+                    ).strip()
+                    == "ContractRuntime.contract_execution_id"
+                    and str(postmerge.get("candidate_commit_sha") or "")
+                    .strip()
+                    .lower()
+                    == candidate_commit_sha
+                    and str(postmerge.get("reconciled_commit_sha") or "")
+                    .strip()
+                    .lower()
+                    == candidate_commit_sha
+                    and str(postmerge.get("canonical_head_commit") or "")
+                    .strip()
+                    .lower()
+                    == candidate_commit_sha
+                    and str(postmerge.get("active_snapshot_commit") or "")
+                    .strip()
+                    .lower()
+                    == candidate_commit_sha
+                    and str(postmerge.get("authority_hash") or "").strip()
+                    == stable_sha256(unsigned_postmerge)
+                ):
+                    continue
+                comparison = _contract_runtime_server_comparison_authority(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                    expected_candidate_commit=candidate_commit_sha,
+                )
+                if not (
+                    comparison.get("commit_sha")
+                    and comparison.get("source")
+                    == _QA_POSTMERGE_COMPARISON_BASE_SOURCE
+                ):
+                    continue
+                authority = {
+                    **comparison,
+                    "lineage_source": (
+                        _QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE
+                    ),
+                }
+                resolved_authorities[stable_sha256(authority)] = authority
+            if len(resolved_authorities) == 1:
+                return next(iter(resolved_authorities.values()))
+            return {
+                "machine_reason": (
+                    "postmerge_comparison_authority_ambiguous"
+                    if len(resolved_authorities) > 1
+                    else "postmerge_comparison_authority_unverified"
+                ),
+                "source": _QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+                "lineage_source": (
+                    _QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE
+                ),
+            }
         return _qa_exact_candidate_direct_main_comparison_authority(
             conn,
             project_id=project_id,
@@ -11001,6 +11152,14 @@ def _qa_exact_candidate_comparison_authority_required(
             and str(getattr(context, "backlog_id", "") or "").strip()
             == backlog_id
         )
+    if task_id:
+        if _qa_exact_candidate_postmerge_records(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=task_id,
+        ):
+            return True
     direct_events = _qa_exact_candidate_direct_main_events(
         conn,
         project_id=project_id,
