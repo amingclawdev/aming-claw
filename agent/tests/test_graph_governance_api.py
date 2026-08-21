@@ -68953,6 +68953,16 @@ def test_mf_parallel_rev10_terminal_supersession_is_atomic_and_idempotent(
     )
     assert allocation_precheck["status"] == "ready"
     assert allocation_precheck["lane_count"] == 2
+    assert {
+        body["base_commit"]
+        for body in allocation_precheck["copy_safe_allocation_bodies"]
+    } == {request["base_commit"]}
+    assert {
+        body["target_head_commit"]
+        for body in allocation_precheck["copy_safe_allocation_bodies"]
+    } == {request["target_head_commit"]}
+    assert len(request["base_commit"]) == 40
+    assert len(request["target_head_commit"]) == 40
     allocated_lanes = []
     for body in allocation_precheck["copy_safe_allocation_bodies"]:
         status, allocated = (
