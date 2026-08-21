@@ -41,6 +41,7 @@ ISSUANCE_TOOLS = frozenset(
 CONTINUATION_TOOLS = frozenset(
     {
         "graph_query",
+        "runtime_context_current",
         "runtime_context_worker_guide",
         "runtime_context_read_receipt",
         "parallel_branch_startup",

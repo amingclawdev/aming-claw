@@ -295,6 +295,17 @@ def test_managed_mcp_post_startup_envelope_submits_worker_line_then_acks_finish(
     assert calls == []
     assert continuity.pending_count() == 1
 
+    current = continuity.dispatch(
+        "runtime_context_current",
+        {**identity, "view": "all"},
+        lambda args: calls.append(dict(args))
+        or {"ok": True, "status": "current"},
+    )
+    assert current == {"ok": True, "status": "current"}
+    assert calls[-1]["session_token"] == raw_session
+    assert calls[-1]["fence_token"] == raw_fence
+    assert continuity.pending_count() == 1
+
     implementation = continuity.dispatch(
         "runtime_context_implementation_evidence",
         {
