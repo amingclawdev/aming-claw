@@ -102183,6 +102183,274 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         assert later_qa_event["payload"]["route_token_ref"] not in public_close
 
 
+def test_direct_main_rev2_fresh_world_warranty_requires_db_verified_qa(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DIRECT-MAIN-REV2-FRESH-WORLD-WARRANTY-R2"
+    project_root = tmp_path / "direct-main-rev2-fresh-world-warranty-r2"
+    parent_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ? WHERE bug_id = ?",
+        (
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": "rtok-direct-main-r2-parent",
+            },
+        )
+    )
+    task_id = guide["contract_chain_current"]["current_contract_execution_id"]
+    route_token_ref = "rtok-direct-main-r2"
+    route_identity = {
+        "route_id": "route-direct-main-r2",
+        "route_context_hash": _fake_sha("route-direct-main-r2"),
+        "prompt_contract_id": "rprompt-direct-main-r2",
+        "prompt_contract_hash": _fake_sha("prompt-direct-main-r2"),
+        "visible_injection_manifest_hash": _fake_sha("visible-direct-main-r2"),
+        "route_token_ref": route_token_ref,
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            **route_identity,
+            "caller_role": "observer",
+            "allowed_actions": [
+                "graph_query",
+                "observer_direct_mutation_exception",
+                "task_timeline_append",
+                "run_tests",
+                "git_diff",
+                "graph_current_full_reconcile",
+                "backlog_close",
+                "merge",
+                "route_context",
+                "observer_direct_implementation_exception",
+                "current_full_reconcile",
+                "preflight_check",
+            ],
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [f"contract_runtime:{task_id}"],
+        },
+    )
+    graph_trace_id = "gqt-20260821-d1ec7a1001"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_identity=route_identity,
+    )
+    append_base = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "route_token_ref": route_token_ref,
+    }
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": "mf.observer_direct_implementation_exception",
+                "event_kind": "observer_direct_implementation_exception",
+                "phase": "pre_mutation",
+                "status": "accepted",
+                "decision": "operator_supervised_direct_main_approved",
+                "actor": "observer",
+                "payload": {
+                    **route_identity,
+                    "reason": "fresh Direct rev2 post-repair warranty",
+                    "observer_direct_mutation": True,
+                    "tiny_deterministic_scope": True,
+                    "operator_approval": {
+                        "approved": True,
+                        "approved_by": "operator",
+                        "approval_ref": "operator-direct-main-r2",
+                    },
+                    "dirty_scope_check": {
+                        "allowed_files": [
+                            "agent/tests/test_graph_governance_api.py"
+                        ],
+                        "dirty_files": [],
+                        "exact_match": True,
+                    },
+                    "allowed_files": [
+                        "agent/tests/test_graph_governance_api.py"
+                    ],
+                    "graph_trace_ids": [graph_trace_id],
+                },
+                "artifact_refs": {
+                    "allowed_files": [
+                        "agent/tests/test_graph_governance_api.py"
+                    ],
+                    "operator_approval_ref": "operator-direct-main-r2",
+                    "graph_trace_ids": [graph_trace_id],
+                },
+            },
+        )
+    )
+    close_commit = _commit_test_git_files(
+        project_root,
+        ["agent/tests/test_graph_governance_api.py"],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_commit=parent_commit,
+        ),
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **append_base,
+                "event_type": "observer.implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "passed",
+                "actor": "observer",
+                "commit_sha": close_commit,
+                "payload": {
+                    **route_identity,
+                    "test_results": {
+                        "schema_version": "parentless_direct_main.test_results.v1",
+                        "status": "passed",
+                        "passed": True,
+                        "commit_sha": close_commit,
+                        "commands": [
+                            {
+                                "command": "python3 -m pytest -q direct-r2",
+                                "status": "passed",
+                                "exit_code": 0,
+                            }
+                        ],
+                    },
+                    "changed_files": [
+                        "agent/tests/test_graph_governance_api.py"
+                    ],
+                    "dirty_scope_check": {
+                        "allowed_files": [
+                            "agent/tests/test_graph_governance_api.py"
+                        ],
+                        "changed_files": [
+                            "agent/tests/test_graph_governance_api.py"
+                        ],
+                        "unexpected_files": [],
+                        "exact_match": True,
+                    },
+                },
+            },
+        )
+    )
+    events_before = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        limit=1000,
+    )
+    changes_before = conn.total_changes
+    with pytest.raises(GovernanceError) as observer_qa:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    **append_base,
+                    "event_type": "qa.independent_verification",
+                    "event_kind": "independent_verification",
+                    "phase": "qa",
+                    "status": "passed",
+                    "actor": "qa:direct-main-r2",
+                    "commit_sha": close_commit,
+                    "bypass_identity": "bypass-direct-main-r2",
+                    "route_waiver": {"approved": True},
+                    "verification": {
+                        "tests_run": ["pytest -q direct-r2"],
+                        "live_regression": {"status": "passed"},
+                    },
+                    "payload": {
+                        "row_scoped_qa_pass": True,
+                        "used_as_pass": False,
+                        "no_pass_claim": True,
+                    },
+                },
+            )
+        )
+    assert observer_qa.value.code == (
+        "parentless_direct_main_independent_qa_authority_required"
+    )
+    assert observer_qa.value.details["zero_write_rejection"] is True
+    assert observer_qa.value.details[
+        "observer_route_is_independent_qa_authority"
+    ] is False
+    assert observer_qa.value.details[
+        "route_waiver_is_independent_qa_authority"
+    ] is False
+    assert observer_qa.value.details[
+        "actor_string_is_independent_qa_authority"
+    ] is False
+    assert observer_qa.value.details[
+        "no_pass_metadata_is_independent_qa_authority"
+    ] is False
+    assert observer_qa.value.details["zero_timeline_write_on_failure"] is True
+    assert observer_qa.value.details[
+        "zero_route_gate_audit_write_on_failure"
+    ] is True
+    assert conn.total_changes == changes_before
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        limit=1000,
+    ) == events_before
+
+    qa_event = _append_authenticated_qa_verification(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=close_commit,
+        snapshot_id="full-direct-main-r2",
+        principal_id="qa:direct-main-r2",
+    )
+    authority = qa_event["payload"]["source_backed_contract_gate_authority"]
+    assert authority["source"] == "server_qa_session_verification"
+    assert authority["close_satisfying"] is True
+    assert authority["qa_session_proof"]["verified"] is True
+    assert authority["qa_session_proof"]["observer_impersonation"] is False
+
+
 def test_parentless_direct_main_qa_timeline_accepts_explicit_service_parent_once(
     conn,
     monkeypatch,
