@@ -132,10 +132,26 @@
     "direct_fix_allowed": false,
     "fresh_qa_session_required": true
   },
+  "terminal_supersession_policy": {
+    "schema_version": "mf_parallel.template_terminal_supersession_policy.v1",
+    "authority_source": "active_contract_definition.system_layer.terminal_supersession_policy",
+    "eligible_source": "one_exact_contract_declared_replacement_exhausted_generation",
+    "outcome": "old_generation_terminal_no_pass_and_one_fresh_two_lane_generation",
+    "atomic_reservation_required": true,
+    "reservation_scope": "lane_intent_only_no_runtime_context_or_credential",
+    "fresh_worldref_source": "loaded_governance_runtime_identity_at_transition",
+    "runtime_context_allocation_authority": "parallel_branch_allocate_precheck",
+    "exact_replay_idempotent": true,
+    "mismatch_policy": "zero_write_fail_closed",
+    "old_evidence_carry_forward_allowed": false,
+    "same_execution_retry_allowed": false,
+    "second_fresh_generation_allowed": false,
+    "bypass_allowed": false
+  },
   "runtime_contract_hints": {
     "schema_version": "contract_template.runtime_hints.v1",
     "contract_definition_id": "mf_parallel.v2",
-    "contract_definition_revision": "rev9"
+    "contract_definition_revision": "rev10"
   },
   "route_topology_policy": {
     "schema_version": "route_topology_policy.v1",

@@ -81,6 +81,7 @@ from .contracts.runtime import (
     rebuild_backlog_contract_chain_projection,
     SQLiteContractExecutionStore,
     StalePinnedContractExecutionError,
+    terminal_supersession_receipt_for_record,
     worker_implementation_source_execution_state_revision,
     worker_implementation_source_line_sha256,
     worker_implementation_copy_safe_test_command,
@@ -106573,6 +106574,11 @@ def _contract_runtime_apply_mf_parallel_context_projection(
     record: Mapping[str, Any],
     actor_role: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    terminal_record, terminal_projection = (
+        _mf_parallel_apply_terminal_supersession_projection(record)
+    )
+    if terminal_projection:
+        return terminal_record, terminal_projection
     projection = _contract_runtime_mf_parallel_context_projection(
         conn,
         project_id=project_id,
@@ -128528,12 +128534,22 @@ def _contract_runtime_reconcile_receipt_resolution(
 ) -> dict[str, Any]:
     """Resolve one canonical receipt or one legacy+correction transition."""
 
+    current_dispatch = _contract_runtime_current_dispatch_authority_line(
+        record
+    )
+    current_dispatch_index = (
+        int(current_dispatch.get("completed_line_index"))
+        if current_dispatch.get("status") == "selected"
+        and isinstance(current_dispatch.get("completed_line_index"), int)
+        else -1
+    )
     lines = [
         (index, line)
         for index, line in enumerate(record.get("completed_lines") or [])
-        if isinstance(line, Mapping)
+        if index > current_dispatch_index
+        and isinstance(line, Mapping)
         and str(line.get("stage_id") or "").strip()
-        in {"observer_integration", "observer_reconcile"}
+        in {"reconcile", "observer_integration", "observer_reconcile"}
         and str(line.get("line_id") or "").strip()
         == "observer_reconcile"
         and str(line.get("evidence_kind") or "").strip() == "reconcile"
@@ -128643,7 +128659,7 @@ def _contract_runtime_reconcile_receipt_correction(
     if not (
         actor_role == "observer"
         and str(write.get("stage_id") or "").strip()
-        in {"observer_integration", "observer_reconcile"}
+        in {"reconcile", "observer_integration", "observer_reconcile"}
         and str(write.get("line_id") or "").strip()
         == "observer_reconcile"
         and str(write.get("evidence_kind") or "").strip() == "reconcile"
@@ -128659,6 +128675,64 @@ def _contract_runtime_reconcile_receipt_correction(
         record=record,
         authority=authority,
     )
+    if (
+        str(record.get("revision") or "").strip() == "rev10"
+        and resolution.get("status") == "legacy_pending"
+    ):
+        definition = _CONTRACT_DEFINITION_REGISTRY.get(
+            MF_PARALLEL_CONTRACT_ID,
+            version="v2",
+            revision="rev10",
+            include_deprecated=True,
+        )
+        policy = (
+            definition.get("system_layer", {}).get(
+                "legacy_reconcile_receipt_correction_policy"
+            )
+            if isinstance(definition.get("system_layer"), Mapping)
+            else {}
+        )
+        if not (
+            isinstance(policy, Mapping)
+            and policy.get("schema_version")
+            == "mf_parallel.legacy_reconcile_receipt_correction_policy.v1"
+            and policy.get("enabled_for_revision") is False
+            and str(policy.get("revision") or "") == "rev10"
+            and policy.get(
+                "same_revision_business_evidence_mutation_allowed"
+            )
+            is False
+            and policy.get(
+                "exact_duplicate_idempotency_transport_only"
+            )
+            is True
+        ):
+            raise GovernanceError(
+                "mf_parallel_rev10_reconcile_correction_policy_unavailable",
+                "rev10 reconcile correction policy is unavailable",
+                409,
+                {"writes_performed": False, "fail_closed": True},
+            )
+        raise GovernanceError(
+            "mf_parallel_rev10_legacy_reconcile_correction_forbidden",
+            (
+                "rev10 forbids legacy reconcile business-evidence "
+                "correction; only an exact duplicate is transport-idempotent"
+            ),
+            409,
+            {
+                "contract_execution_id": str(
+                    record.get("contract_execution_id") or ""
+                ),
+                "source_completed_line_index": int(
+                    resolution.get("source_line_index") or 0
+                ),
+                "writes_performed": False,
+                "mutation_performed": False,
+                "exact_duplicate_idempotency_transport_only": True,
+                "fail_closed": True,
+            },
+        )
     if resolution.get("status") == "corrected":
         guide = (
             record.get("runtime_guide")
@@ -142031,6 +142105,14 @@ def _onboard_route_guide_compact_service_response(
             "runtime_context_recovery_authority": dict(
                 runtime_context_recovery_authority
             ),
+            "terminal_supersession_authority": (
+                dict(next_action.get("terminal_supersession_authority"))
+                if isinstance(
+                    next_action.get("terminal_supersession_authority"),
+                    Mapping,
+                )
+                else {}
+            ),
             "irreversible_runtime_audit_terminal_authority": (
                 dict(
                     next_action.get(
@@ -142925,6 +143007,175 @@ def _qa_onboard_compact_selected_role_response(
     }
 
 
+def _mf_parallel_terminal_supersession_guide_action(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+    request_body: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project the sole Contract-backed redirection for the exact dead end."""
+
+    policy = _mf_parallel_terminal_supersession_policy()
+    if not (
+        policy
+        and project_id == str(policy.get("source_project_id") or "")
+        and backlog_id == str(policy.get("source_backlog_id") or "")
+    ):
+        return {}
+    evaluation = _mf_parallel_terminal_supersession_evaluation(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        policy=policy,
+    )
+    if evaluation.get("eligible") is not True:
+        return {}
+    source_record = evaluation["source_record"]
+    source_context_id = str(policy.get("source_runtime_context_id") or "")
+
+    body_request = dict(request_body or {})
+    selected_route_ref = str(
+        route_token_ref or source_record.get("route_token_ref") or ""
+    ).strip()
+    observer_session_id = str(
+        body_request.get("observer_session_id") or ""
+    ).strip()
+    route_authority = _mf_parallel_terminal_supersession_route_authority(
+        conn,
+        policy=policy,
+        route_token_ref=selected_route_ref,
+    )
+    if route_authority.get("accepted") is not True:
+        issue_body = dict(
+            route_authority.get("observer_route_context_issue_body") or {}
+        )
+        action = _guide_canonical_executable_action(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=str(
+                policy.get("source_contract_execution_id") or ""
+            ),
+            parent_contract_execution_id=str(
+                source_record.get("parent_contract_execution_id") or ""
+            ),
+            action="issue_terminal_supersession_route",
+            facade="observer_route_context_issue",
+            mcp_tool="observer_route_context_issue",
+            method="POST",
+            path="/api/observer/route-context/issue",
+            stage_id="terminal_supersession_route",
+            body=issue_body,
+        )
+        action["host_realization"].update(
+            {
+                "source": (
+                    "Contract:mf_parallel.v2@v2#rev10."
+                    "terminal_supersession_policy"
+                ),
+                "next_after_success": "rerun_onboard_route_guide",
+                "raw_route_token_required": False,
+                "raw_route_token_exposed": False,
+            }
+        )
+        action["terminal_supersession_authority"] = {
+            "schema_version": (
+                "mf_parallel.terminal_supersession_guide_authority.v1"
+            ),
+            "source_contract_execution_id": str(
+                policy.get("source_contract_execution_id") or ""
+            ),
+            "source_runtime_context_id": source_context_id,
+            "source_stage_checkpoint_id": str(
+                policy.get("source_stage_checkpoint_id") or ""
+            ),
+            "source_recovery_mode": "replacement_exhausted",
+            "no_pass_claim": True,
+            "pass_synthesized": False,
+            "write_eligible": False,
+            "route_issue_required": True,
+        }
+        return action
+    selected_route_ref = str(
+        route_authority.get("route_token_ref") or ""
+    )
+    terminal_request = dict(evaluation["expected_request"])
+    copy_safe_body = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": str(policy.get("fresh_contract_task_id") or ""),
+        "contract_execution_id": str(
+            policy.get("fresh_contract_execution_id") or ""
+        ),
+        "reason": "<human reason for the exact rev10 terminal supersession>",
+        "route_token_ref": selected_route_ref,
+        "observer_session_id": (
+            observer_session_id or "<active observer session id>"
+        ),
+        "metadata": {
+            "required_worker_count": 2,
+            "terminal_supersession": terminal_request,
+        },
+    }
+    action = _guide_canonical_executable_action(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=str(
+            policy.get("fresh_contract_execution_id") or ""
+        ),
+        parent_contract_execution_id=str(
+            source_record.get("parent_contract_execution_id") or ""
+        ),
+        action="terminal_supersede_no_pass_and_enter_fresh_rev10",
+        facade="mf_parallel_enter",
+        mcp_tool="mf_parallel_enter",
+        method="POST",
+        path="/api/projects/{project_id}/mf-parallel/enter",
+        stage_id="terminal_supersession",
+        body=copy_safe_body,
+    )
+    replacements = ["copy_safe_body.reason"]
+    if not observer_session_id:
+        replacements.append("copy_safe_body.observer_session_id")
+    action["host_realization"].update(
+        {
+            "required_replacement_paths": replacements,
+            "source": (
+                "Contract:mf_parallel.v2@v2#rev10."
+                "terminal_supersession_policy"
+            ),
+            "old_execution_terminal_no_pass": True,
+            "authoritative_pass_synthesized": False,
+            "fresh_generation_count": 1,
+            "fresh_worker_count": 2,
+            "old_evidence_carry_forward": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+        }
+    )
+    action["terminal_supersession_authority"] = {
+        "schema_version": "mf_parallel.terminal_supersession_guide_authority.v1",
+        "source": (
+            "Contract:mf_parallel.v2@v2#rev10."
+            "terminal_supersession_policy"
+        ),
+        "source_contract_execution_id": str(
+            policy.get("source_contract_execution_id") or ""
+        ),
+        "source_runtime_context_id": source_context_id,
+        "source_stage_checkpoint_id": str(
+            policy.get("source_stage_checkpoint_id") or ""
+        ),
+        "source_recovery_mode": "replacement_exhausted",
+        "no_pass_claim": True,
+        "pass_synthesized": False,
+        "scheduler_eligible_before_transition": False,
+        "write_revalidated_by": "mf_parallel_enter",
+    }
+    return action
+
+
 def _onboard_route_guide_service_response(
     conn,
     *,
@@ -143459,6 +143710,42 @@ def _onboard_route_guide_service_response(
                     onboard_service_continuation_authority
                 ),
             )
+    terminal_supersession_action = (
+        _mf_parallel_terminal_supersession_guide_action(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=requested_route_token_ref or route_token_ref,
+            request_body=request_body,
+        )
+        if str(role or "").strip() == "observer"
+        else {}
+    )
+    if terminal_supersession_action:
+        next_action = dict(terminal_supersession_action)
+        current_projection = {
+            **dict(current_projection),
+            "readiness_state": "terminal_supersession_ready_no_pass",
+            "next_legal_action": dict(next_action),
+            "scheduler_eligible": False,
+            "resume_eligible": False,
+            "source_execution_write_eligible": False,
+            "terminal_supersession_authority": dict(
+                next_action.get("terminal_supersession_authority") or {}
+            ),
+        }
+        runtime_resume = {
+            **dict(runtime_resume),
+            "status": "terminal_supersession_ready_no_pass",
+            "readiness_state": "terminal_supersession_ready_no_pass",
+            "next_legal_action": dict(next_action),
+            "scheduler_eligible": False,
+            "resume_eligible": False,
+            "source_execution_write_eligible": False,
+            "terminal_supersession_authority": dict(
+                next_action.get("terminal_supersession_authority") or {}
+            ),
+        }
     managed_hotfix_attempt = (
         _onboard_legacy_operator_hotfix_attempt_projection(
             conn,
@@ -143471,6 +143758,8 @@ def _onboard_route_guide_service_response(
             current_projection=current_projection,
             runtime_resume=runtime_resume,
         )
+        if not terminal_supersession_action
+        else {}
     )
     if managed_hotfix_attempt:
         next_action = managed_hotfix_attempt
@@ -143516,6 +143805,8 @@ def _onboard_route_guide_service_response(
             current_projection=current_projection,
             direct_main_failed_qa_state=direct_main_failed_qa_state,
         )
+        if not terminal_supersession_action
+        else {}
     )
     if irreversible_runtime_terminal_action:
         next_action = dict(irreversible_runtime_terminal_action)
@@ -148784,7 +149075,7 @@ MF_BATCH_PARALLEL_RECORD_CONTRACT_ID = "mf_batch_parallel"
 MF_PARALLEL_RECORD_CONTRACT_IDS = frozenset(
     {MF_PARALLEL_RECORD_CONTRACT_ID, MF_PARALLEL_CONTRACT_ID}
 )
-MF_PARALLEL_POSTMERGE_REVISION_FAMILY = frozenset({"rev8", "rev9"})
+MF_PARALLEL_POSTMERGE_REVISION_FAMILY = frozenset({"rev8", "rev9", "rev10"})
 
 
 def _is_mf_parallel_record_contract_id(contract_id: str) -> bool:
@@ -148792,7 +149083,7 @@ def _is_mf_parallel_record_contract_id(contract_id: str) -> bool:
 
 
 def _is_mf_parallel_postmerge_revision(record: Mapping[str, Any]) -> bool:
-    """Keep rev9 on the complete rev8 two-lane merge/reconcile/QA runtime."""
+    """Keep rev9/rev10 on the complete rev8 merge/reconcile/QA runtime."""
 
     return (
         _is_mf_parallel_record_contract_id(
@@ -148852,6 +149143,7 @@ def _mf_parallel_successor_runtime_enter(
     acceptance_scope_criteria: Sequence[Any],
     acceptance_scope_closure: Mapping[str, Any],
     observer_proof: Mapping[str, Any] | None = None,
+    defer_child_route_issue: bool = False,
 ) -> dict[str, Any]:
     runtime = _contract_runtime(conn)
     store = runtime.store
@@ -148895,7 +149187,7 @@ def _mf_parallel_successor_runtime_enter(
             parent_contract_execution_id=parent_execution_id,
             root_contract_execution_id=root_execution_id,
             contract_chain_id=chain_id,
-            route_token_ref=route_token_ref,
+            route_token_ref=("" if defer_child_route_issue else route_token_ref),
             role_binding={
                 "observer": actor_role,
                 "mf_sub": "mf_sub",
@@ -148995,19 +149287,56 @@ def _mf_parallel_successor_runtime_enter(
                     },
                 },
             )
-        if route_token_ref and not str(successor.get("route_token_ref") or ""):
+        if (
+            not defer_child_route_issue
+            and route_token_ref
+            and not str(successor.get("route_token_ref") or "")
+        ):
             successor["route_token_ref"] = route_token_ref
             store.update(successor_execution_id, successor)
-    successor, child_route_binding = _contract_runtime_with_child_route_token_ref(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-        parent_record=parent_record,
-        child_record=successor,
-        parent_route_token_ref=route_token_ref,
-        target_files=child_route_target_files,
-        source="mf_parallel_successor_runtime",
-    )
+    if defer_child_route_issue:
+        from . import observer_route_context
+
+        try:
+            deferred_parent_route = (
+                observer_route_context.resolve_route_token_ref(
+                    conn,
+                    project_id=project_id,
+                    route_token_ref=route_token_ref,
+                    backlog_id=backlog_id,
+                )
+                or {}
+            )
+        except observer_route_context.RouteTokenRefError:
+            deferred_parent_route = {}
+        child_route_binding = {
+            "schema_version": "contract_runtime.child_route_token_binding.v1",
+            "source": "mf_parallel_successor_runtime",
+            "status": "deferred_to_fresh_guide",
+            "route_token_ref": "",
+            "parent_route_token_ref": route_token_ref,
+            "resolved": dict(deferred_parent_route),
+            "child_contract_execution_id": successor_execution_id,
+            "target_files": child_route_target_files,
+            "allowed_actions": list(
+                _CONTRACT_RUNTIME_CURRENT_ROUTE_TOKEN_ALLOWED_ACTIONS
+            ),
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        }
+    else:
+        successor, child_route_binding = (
+            _contract_runtime_with_child_route_token_ref(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                parent_record=parent_record,
+                child_record=successor,
+                parent_route_token_ref=route_token_ref,
+                target_files=child_route_target_files,
+                source="mf_parallel_successor_runtime",
+            )
+        )
     successor_contract = {
         "schema_version": "contract_successor_handoff.v1",
         "contract_chain_id": chain_id,
@@ -149051,7 +149380,11 @@ def _mf_parallel_successor_runtime_enter(
     )
     if not isinstance(route_token_ref_binding, Mapping) or not route_token_ref_binding:
         route_token_ref_binding = child_route_binding
-    response_route_ref = successor_route_ref or route_token_ref
+    response_route_ref = (
+        successor_route_ref
+        if defer_child_route_issue
+        else successor_route_ref or route_token_ref
+    )
     route_token_ref_guidance: dict[str, Any] = {
         "schema_version": "mf_parallel.child_route_token_ref_guidance.v1",
         "status": str(route_token_ref_binding.get("status") or ""),
@@ -149291,6 +149624,1342 @@ def _mf_parallel_successor_runtime_enter(
             "observer_must_not_author": True,
         },
         "worker_cardinality_policy": worker_cardinality_policy,
+    }
+
+
+def _mf_parallel_terminal_supersession_policy() -> dict[str, Any]:
+    """Return the sole source-backed rev10 terminal redirection Rule."""
+
+    try:
+        definition = _CONTRACT_DEFINITION_REGISTRY.get(
+            MF_PARALLEL_CONTRACT_ID,
+            version="v2",
+            revision="rev10",
+            include_deprecated=True,
+        )
+    except Exception:
+        return {}
+    system_layer = (
+        definition.get("system_layer")
+        if isinstance(definition.get("system_layer"), Mapping)
+        else {}
+    )
+    policy = (
+        system_layer.get("terminal_supersession_policy")
+        if isinstance(
+            system_layer.get("terminal_supersession_policy"), Mapping
+        )
+        else {}
+    )
+    lanes = policy.get("fresh_lanes")
+    worldref_policy = (
+        policy.get("fresh_worldref_policy")
+        if isinstance(policy.get("fresh_worldref_policy"), Mapping)
+        else {}
+    )
+    if not (
+        policy.get("schema_version")
+        == "mf_parallel.terminal_supersession_policy.v1"
+        and policy.get("enabled") is True
+        and bool(str(policy.get("source_project_id") or "").strip())
+        and policy.get("old_execution_terminal") is True
+        and policy.get("old_execution_pass_synthesized") is False
+        and policy.get("atomic_reservation_required") is True
+        and policy.get("exact_replay_idempotent") is True
+        and str(policy.get("mismatch_policy") or "")
+        == "zero_write_fail_closed"
+        and int(policy.get("required_worker_count") or 0) == 2
+        and isinstance(lanes, list)
+        and len(lanes) == 2
+        and worldref_policy.get("schema_version")
+        == "mf_parallel.terminal_fresh_worldref_policy.v1"
+        and policy.get("runtime_context_allocation_authority")
+        == "parallel_branch_allocate_precheck"
+    ):
+        return {}
+    return dict(policy)
+
+
+def _mf_parallel_terminal_supersession_request(
+    body: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    for source in (body, metadata):
+        value = source.get("terminal_supersession")
+        if isinstance(value, Mapping) and value:
+            return dict(value)
+    return {}
+
+
+def _mf_parallel_terminal_supersession_worldref(
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the fresh base from the code loaded by this governance process."""
+
+    worldref_policy = (
+        policy.get("fresh_worldref_policy")
+        if isinstance(policy.get("fresh_worldref_policy"), Mapping)
+        else {}
+    )
+    if not (
+        worldref_policy.get("schema_version")
+        == "mf_parallel.terminal_fresh_worldref_policy.v1"
+        and worldref_policy.get("base_commit_source")
+        == "loaded_governance_runtime_identity_at_transition"
+        and worldref_policy.get("target_head_commit_source")
+        == "loaded_governance_runtime_identity_at_transition"
+        and worldref_policy.get("full_commit_required") is True
+        and worldref_policy.get("registered_repository_object_required") is True
+        and worldref_policy.get("runtime_stale_allowed") is False
+        and worldref_policy.get("freeze_in_server_receipt") is True
+    ):
+        return {}
+    runtime_identity = governance_loaded_runtime_identity()
+    loaded_commit = str(runtime_identity.get("loaded_commit") or "").lower()
+    if (
+        runtime_identity.get("runtime_stale") is True
+        or re.fullmatch(r"[0-9a-f]{40}", loaded_commit) is None
+    ):
+        return {}
+    return {
+        "schema_version": "mf_parallel.terminal_fresh_worldref.v1",
+        "base_commit": loaded_commit,
+        "target_head_commit": loaded_commit,
+        "source": "governance_loaded_runtime_identity.loaded_commit",
+        "loaded_pid": int(runtime_identity.get("loaded_pid") or 0),
+        "loaded_source_sha256": str(
+            runtime_identity.get("loaded_source_sha256") or ""
+        ),
+        "runtime_stale": False,
+    }
+
+
+def _mf_parallel_terminal_supersession_route_authority(
+    conn,
+    *,
+    policy: Mapping[str, Any],
+    route_token_ref: str,
+) -> dict[str, Any]:
+    """Resolve the existing observer route contract for the one transition."""
+
+    from . import observer_route_context
+
+    project_id = str(policy.get("source_project_id") or "")
+    backlog_id = str(policy.get("source_backlog_id") or "")
+    source_execution_id = str(
+        policy.get("source_contract_execution_id") or ""
+    )
+    route_ref = str(route_token_ref or "").strip()
+    resolved: Mapping[str, Any] = {}
+    if route_ref:
+        try:
+            resolved = observer_route_context.resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=route_ref,
+                backlog_id=backlog_id,
+                task_id=source_execution_id,
+            ) or {}
+        except observer_route_context.RouteTokenRefError:
+            resolved = {}
+    expected_files = sorted(
+        {
+            str(path or "")
+            for lane in policy.get("fresh_lanes") or []
+            if isinstance(lane, Mapping)
+            for path in lane.get("owned_files") or []
+            if str(path or "")
+        }
+    )
+    allowed_actions = sorted(
+        {
+            _normalized_contract_runtime_action(item)
+            for item in resolved.get("allowed_actions") or []
+            if str(item or "").strip()
+        }
+    )
+    expected_actions = ["mf_parallel_enter"]
+    accepted = bool(
+        resolved
+        and str(resolved.get("caller_role") or "") == "observer"
+        and allowed_actions == expected_actions
+        and sorted(resolved.get("target_files") or []) == expected_files
+        and sorted(resolved.get("owned_files") or []) == expected_files
+    )
+    issue_body = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": source_execution_id,
+        "allowed_actions": expected_actions,
+        "target_files": expected_files,
+        "owned_files": expected_files,
+        "evidence_refs": [
+            f"contract_runtime:{source_execution_id}",
+            f"backlog:{backlog_id}",
+            f"runtime_context:{str(policy.get('source_runtime_context_id') or '')}",
+            str(policy.get("user_authority_ref") or ""),
+        ],
+    }
+    return {
+        "schema_version": (
+            "mf_parallel.terminal_supersession_route_authority.v1"
+        ),
+        "accepted": accepted,
+        "server_derived": True,
+        "route_token_ref": route_ref if accepted else "",
+        "expected_scope": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": source_execution_id,
+        },
+        "expected_allowed_actions": expected_actions,
+        "expected_files": expected_files,
+        "observer_route_context_issue_body": issue_body,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _mf_parallel_terminal_supersession_expected_request(
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    worldref = _mf_parallel_terminal_supersession_worldref(policy)
+    return {
+        "schema_version": "mf_parallel.terminal_supersession_request.v1",
+        "source_project_id": str(policy.get("source_project_id") or ""),
+        "source_contract_execution_id": str(
+            policy.get("source_contract_execution_id") or ""
+        ),
+        "source_execution_state_revision": int(
+            policy.get("source_execution_state_revision") or 0
+        ),
+        "source_runtime_context_id": str(
+            policy.get("source_runtime_context_id") or ""
+        ),
+        "source_stage_checkpoint_id": str(
+            policy.get("source_stage_checkpoint_id") or ""
+        ),
+        "source_recovery_mode": str(
+            policy.get("required_recovery_mode") or ""
+        ),
+        "user_authority_ref": str(policy.get("user_authority_ref") or ""),
+        "fresh_generation": int(policy.get("fresh_generation") or 0),
+        "fresh_contract_execution_id": str(
+            policy.get("fresh_contract_execution_id") or ""
+        ),
+        "fresh_contract_task_id": str(
+            policy.get("fresh_contract_task_id") or ""
+        ),
+        "fresh_revision": str(policy.get("fresh_revision") or ""),
+        "base_commit": str(worldref.get("base_commit") or ""),
+        "target_head_commit": str(
+            worldref.get("target_head_commit") or ""
+        ),
+        "required_worker_count": int(
+            policy.get("required_worker_count") or 0
+        ),
+    }
+
+
+def _mf_parallel_terminal_supersession_evaluation(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Evaluate the one terminal redirection without performing writes.
+
+    Guide and Entrance both consume this evaluator so they cannot disagree
+    about the source Position, lane intent, WorldRef, parent, or acceptance
+    closure.  Entrance still repeats route authorization and the source CAS in
+    its transaction.
+    """
+
+    def rejected(
+        code: str,
+        message: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": (
+                "mf_parallel.terminal_supersession_evaluation.v1"
+            ),
+            "eligible": False,
+            "code": code,
+            "message": message,
+            "details": deepcopy(dict(details or {})),
+            "writes_performed": False,
+            "mutation_performed": False,
+        }
+
+    if not (
+        policy
+        and project_id == str(policy.get("source_project_id") or "")
+        and backlog_id == str(policy.get("source_backlog_id") or "")
+    ):
+        return rejected(
+            "mf_parallel_terminal_supersession_scope_mismatch",
+            "terminal supersession scope does not match the Contract",
+        )
+
+    store = _contract_runtime_store(conn)
+    source_execution_id = str(
+        policy.get("source_contract_execution_id") or ""
+    )
+    try:
+        source_record = store.get(source_execution_id)
+    except ContractRuntimeError:
+        return rejected(
+            "mf_parallel_terminal_supersession_source_missing",
+            "the exact source ContractRuntime is missing",
+        )
+    if _mf_parallel_terminal_supersession_marker(source_record):
+        return rejected(
+            "mf_parallel_terminal_supersession_source_already_terminal",
+            "the source ContractRuntime is already terminal",
+        )
+
+    expected_identity = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": source_execution_id,
+        "contract_id": MF_PARALLEL_CONTRACT_ID,
+        "revision": str(policy.get("source_revision") or ""),
+        "execution_state_revision": int(
+            policy.get("source_execution_state_revision") or 0
+        ),
+    }
+    source_identity = {
+        "project_id": str(source_record.get("project_id") or ""),
+        "backlog_id": str(source_record.get("backlog_id") or ""),
+        "contract_execution_id": str(
+            source_record.get("contract_execution_id") or ""
+        ),
+        "contract_id": str(source_record.get("contract_id") or ""),
+        "revision": str(source_record.get("revision") or ""),
+        "execution_state_revision": int(
+            source_record.get("execution_state_revision") or 0
+        ),
+    }
+    if source_identity != expected_identity:
+        return rejected(
+            "mf_parallel_terminal_supersession_source_state_mismatch",
+            "source ContractRuntime identity changed before terminal supersession",
+            {"expected": expected_identity, "actual": source_identity},
+        )
+
+    source_next = _runtime_next_action_from_guide(
+        source_record.get("runtime_guide") or {},
+        source="contract_runtime_current_state",
+    )
+    expected_next = dict(policy.get("source_next_action") or {})
+    if any(
+        str(source_next.get(field) or "") != str(expected or "")
+        for field, expected in expected_next.items()
+    ):
+        return rejected(
+            "mf_parallel_terminal_supersession_source_next_action_mismatch",
+            "source execution is no longer at the Contract-declared checkpoint",
+            {"expected": expected_next, "actual": source_next},
+        )
+
+    from .parallel_branch_runtime import (
+        get_branch_context_by_runtime_context_id,
+    )
+
+    source_context_id = str(
+        policy.get("source_runtime_context_id") or ""
+    )
+    source_context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        source_context_id,
+    )
+    if source_context is None:
+        return rejected(
+            "mf_parallel_terminal_supersession_source_context_missing",
+            "the exact source RuntimeContext is missing",
+        )
+    recovery = _runtime_context_bounded_replacement_rejoin_authority(
+        conn,
+        project_id=project_id,
+        context=source_context,
+        timeline_events=_runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=str(getattr(source_context, "task_id", "") or ""),
+            backlog_id=backlog_id,
+        ),
+        body=None,
+    )
+    actual_rejoin_refs = list(
+        recovery.get("current_checkpoint_issuance_event_refs") or []
+    ) + list(
+        recovery.get("current_checkpoint_replacement_event_refs") or []
+    )
+    if not (
+        str(getattr(source_context, "task_id", "") or "")
+        == str(policy.get("source_task_id") or "")
+        and str(getattr(source_context, "worker_slot_id", "") or "")
+        == str(policy.get("source_worker_slot_id") or "")
+        and recovery.get("applicable") is True
+        and recovery.get("eligible") is False
+        and str(recovery.get("mode") or "")
+        == str(policy.get("required_recovery_mode") or "")
+        and int(recovery.get("replacement_generation") or 0)
+        == int(policy.get("required_replacement_generation") or 0)
+        and str(recovery.get("current_stage_checkpoint_id") or "")
+        == str(policy.get("source_stage_checkpoint_id") or "")
+        and actual_rejoin_refs
+        == list(policy.get("required_rejoin_event_refs") or [])
+    ):
+        return rejected(
+            "mf_parallel_terminal_supersession_recovery_not_exhausted",
+            "source RuntimeContext lacks the exact terminal recovery authority",
+            {
+                "recovery": recovery,
+                "actual_rejoin_event_refs": actual_rejoin_refs,
+            },
+        )
+
+    forbidden_lines = {
+        str(value or "")
+        for value in policy.get(
+            "source_lane_forbidden_accepted_lines"
+        )
+        or []
+    }
+    affected_lane_lines = []
+    for index, line in _contract_runtime_completed_lines(source_record):
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if str(
+            line.get("runtime_context_id")
+            or payload.get("runtime_context_id")
+            or ""
+        ) != source_context_id:
+            continue
+        if str(line.get("line_id") or "") in forbidden_lines:
+            affected_lane_lines.append(index)
+    if affected_lane_lines:
+        return rejected(
+            "mf_parallel_terminal_supersession_source_lane_progressed",
+            "source lane already has protected implementation or finish evidence",
+            {"completed_line_indices": affected_lane_lines},
+        )
+
+    expected_request = _mf_parallel_terminal_supersession_expected_request(
+        policy
+    )
+    if not (
+        expected_request.get("base_commit")
+        and expected_request.get("target_head_commit")
+    ):
+        return rejected(
+            "mf_parallel_terminal_supersession_worldref_unavailable",
+            "fresh rev10 requires one non-stale loaded governance release commit",
+            {"fail_closed": True},
+        )
+    try:
+        repository_root = (
+            _parallel_branch_allocate_precheck_registered_repository(
+                project_id
+            )
+        )
+        _parallel_branch_allocate_verify_commits(
+            project_id,
+            workspace_root=str(repository_root),
+            workspace_root_source="registered_project",
+            base_commit=str(expected_request.get("base_commit") or ""),
+            target_head_commit=str(
+                expected_request.get("target_head_commit") or ""
+            ),
+        )
+    except GovernanceError as exc:
+        return rejected(exc.code, exc.message, exc.details)
+
+    policy_lanes = [
+        dict(lane)
+        for lane in policy.get("fresh_lanes") or []
+        if isinstance(lane, Mapping)
+    ]
+    lane_ids = [str(lane.get("lane_id") or "") for lane in policy_lanes]
+    lane_tasks = [str(lane.get("task_id") or "") for lane in policy_lanes]
+    lane_workers = [
+        str(lane.get("worker_slot_id") or "") for lane in policy_lanes
+    ]
+    if any(
+        len(values) != 2
+        or any(not value for value in values)
+        or len(set(values)) != 2
+        for values in (lane_ids, lane_tasks, lane_workers)
+    ):
+        return rejected(
+            "mf_parallel_terminal_supersession_lane_policy_invalid",
+            "rev10 fresh lane identities are not exact and distinct",
+        )
+    _row_criteria, row_files = _backlog_acceptance_scope_authority(
+        conn,
+        backlog_id,
+    )
+    policy_files = sorted(
+        {
+            str(path or "")
+            for lane in policy_lanes
+            for path in lane.get("owned_files") or []
+            if str(path or "")
+        }
+    )
+    if policy_files != sorted(row_files):
+        return rejected(
+            "mf_parallel_terminal_supersession_lane_scope_mismatch",
+            "rev10 lane union does not equal the source backlog file fence",
+            {"expected": sorted(row_files), "actual": policy_files},
+        )
+
+    source_parent_id = str(
+        source_record.get("parent_contract_execution_id") or ""
+    )
+    try:
+        parent_record = store.get(source_parent_id)
+    except ContractRuntimeError:
+        return rejected(
+            "mf_parallel_terminal_supersession_parent_missing",
+            "source parent ContractRuntime is missing",
+        )
+    if not _runtime_record_is_complete(parent_record):
+        return rejected(
+            "mf_parallel_terminal_supersession_parent_incomplete",
+            "source parent ContractRuntime is no longer complete",
+        )
+
+    fresh_execution_id = str(
+        policy.get("fresh_contract_execution_id") or ""
+    )
+    (
+        fresh_acceptance_criteria,
+        fresh_acceptance_scope_closure,
+        fresh_acceptance_errors,
+    ) = _contract_runtime_mf_parallel_rev8_atomic_acceptance_gate(
+        conn,
+        project_id=project_id,
+        record={
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": fresh_execution_id,
+        },
+        lane_owned_files=[
+            list(lane.get("owned_files") or []) for lane in policy_lanes
+        ],
+        acceptance_claim_source=policy_lanes,
+    )
+    if fresh_acceptance_errors:
+        return rejected(
+            "mf_parallel_terminal_supersession_acceptance_scope_invalid",
+            "fresh rev10 lane intent does not close over current row acceptance",
+            {
+                "errors": list(fresh_acceptance_errors),
+                "fail_closed": True,
+            },
+        )
+
+    return {
+        "schema_version": "mf_parallel.terminal_supersession_evaluation.v1",
+        "eligible": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "source_record": source_record,
+        "source_context": source_context,
+        "recovery": recovery,
+        "expected_request": expected_request,
+        "policy_lanes": policy_lanes,
+        "policy_files": policy_files,
+        "parent_record": parent_record,
+        "fresh_acceptance_criteria": fresh_acceptance_criteria,
+        "fresh_acceptance_scope_closure": fresh_acceptance_scope_closure,
+    }
+
+
+def _mf_parallel_terminal_supersession_marker(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    return terminal_supersession_receipt_for_record(record)
+
+
+def _mf_parallel_apply_terminal_supersession_projection(
+    record: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    marker = _mf_parallel_terminal_supersession_marker(record)
+    if not marker:
+        return dict(record), {}
+    projected = deepcopy(dict(record))
+    guide = (
+        deepcopy(dict(projected.get("runtime_guide") or {}))
+        if isinstance(projected.get("runtime_guide"), Mapping)
+        else {}
+    )
+    refusal = {
+        "schema_version": "mf_parallel.terminal_supersession_refusal.v1",
+        "status": "terminal",
+        "actionable": False,
+        "source_contract_execution_id": str(
+            marker.get("source_contract_execution_id") or ""
+        ),
+        "fresh_contract_execution_id": str(
+            marker.get("fresh_contract_execution_id") or ""
+        ),
+        "receipt_ref": str(marker.get("receipt_ref") or ""),
+        "receipt_hash": str(marker.get("receipt_hash") or ""),
+        "no_pass_claim": True,
+        "pass_synthesized": False,
+        "scheduler_eligible": False,
+        "write_eligible": False,
+        "retry_eligible": False,
+        "resume_eligible": False,
+        "merge_eligible": False,
+        "qa_eligible": False,
+        "close_eligible": False,
+        "next_legal_execution_id": str(
+            marker.get("fresh_contract_execution_id") or ""
+        ),
+    }
+    guide["next_legal_action"] = None
+    guide["terminal_supersession_refusal"] = refusal
+    guide["runtime_guide_hash"] = stable_sha256(
+        {
+            "schema_version": "mf_parallel.terminal_runtime_guide.v1",
+            "prior_runtime_guide_hash": str(
+                guide.get("runtime_guide_hash") or ""
+            ),
+            "receipt_hash": refusal["receipt_hash"],
+        }
+    )
+    projected["runtime_guide"] = guide
+    projected["terminal_supersession_refusal"] = refusal
+    state = (
+        deepcopy(dict(projected.get("execution_state") or {}))
+        if isinstance(projected.get("execution_state"), Mapping)
+        else {}
+    )
+    state.update(
+        {
+            "terminal": True,
+            "status": "superseded_no_pass",
+            "next_legal_action": None,
+            "terminal_supersession_refusal": refusal,
+        }
+    )
+    projected["execution_state"] = state
+    return projected, {
+        "schema_version": "mf_parallel.terminal_supersession_projection.v1",
+        "terminal": True,
+        "source": "Contract:mf_parallel.v2@v2#rev10.terminal_supersession_policy",
+        "receipt": marker,
+        "refusal": refusal,
+        "projected_completed_lines": list(
+            projected.get("completed_lines") or []
+        ),
+    }
+
+
+def _mf_parallel_terminal_supersession_lane_records(
+    conn,
+    *,
+    project_id: str,
+    fresh_contract_execution_id: str,
+    policy: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        fresh_record = _contract_runtime_store(conn).get(
+            fresh_contract_execution_id
+        )
+    except ContractRuntimeError:
+        return []
+    metadata = (
+        fresh_record.get("metadata")
+        if isinstance(fresh_record.get("metadata"), Mapping)
+        else {}
+    )
+    reservations = metadata.get("terminal_supersession_lane_reservations")
+    if not isinstance(reservations, list) or len(reservations) != 2:
+        return []
+    policy_lanes = [
+        dict(lane)
+        for lane in policy.get("fresh_lanes") or []
+        if isinstance(lane, Mapping)
+    ]
+    if len(policy_lanes) != 2:
+        return []
+    verified: list[dict[str, Any]] = []
+    for reservation, lane in zip(reservations, policy_lanes, strict=True):
+        if not isinstance(reservation, Mapping):
+            return []
+        core = {
+            key: value
+            for key, value in reservation.items()
+            if key != "reservation_hash"
+        }
+        expected = {
+            "lane_id": str(lane.get("lane_id") or ""),
+            "task_id": str(lane.get("task_id") or ""),
+            "worker_id": str(lane.get("worker_id") or ""),
+            "worker_slot_id": str(lane.get("worker_slot_id") or ""),
+            "parent_task_id": fresh_contract_execution_id,
+            "backlog_id": str(policy.get("source_backlog_id") or ""),
+        }
+        if any(
+            str(reservation.get(field) or "") != expected_value
+            for field, expected_value in expected.items()
+        ):
+            return []
+        if not (
+            reservation.get("schema_version")
+            == "mf_parallel.terminal_lane_reservation.v1"
+            and reservation.get("reservation_only") is True
+            and reservation.get("runtime_context_persisted") is False
+            and reservation.get("worktree_materialized") is False
+            and reservation.get("credentials_issued") is False
+            and reservation.get("fresh_generation") == 1
+            and reservation.get("allocation_authority")
+            == "parallel_branch_allocate_precheck"
+            and sorted(reservation.get("owned_files") or [])
+            == sorted(str(value or "") for value in lane.get("owned_files") or [])
+            and str(reservation.get("reservation_hash") or "")
+            == stable_sha256(core)
+        ):
+            return []
+        verified.append(deepcopy(dict(reservation)))
+    return verified
+
+
+def _mf_parallel_terminal_fresh_dispatch_plan(
+    *,
+    project_id: str,
+    backlog_id: str,
+    fresh_contract_execution_id: str,
+    reservations: Sequence[Mapping[str, Any]],
+    base_commit: str,
+    target_head_commit: str,
+) -> dict[str, Any]:
+    """Project existing route-issue and allocation-precheck actions."""
+
+    route_issue_actions: list[dict[str, Any]] = []
+    lane_templates: list[dict[str, Any]] = []
+    for reservation in reservations:
+        lane_id = str(reservation.get("lane_id") or "")
+        task_id = str(reservation.get("task_id") or "")
+        worker_id = str(reservation.get("worker_id") or "")
+        worker_slot_id = str(reservation.get("worker_slot_id") or "")
+        owned_files = list(reservation.get("owned_files") or [])
+        route_issue_actions.append(
+            {
+                "lane_id": lane_id,
+                "mcp_tool": "observer_route_context_issue",
+                "copy_safe_body": {
+                    "project_id": project_id,
+                    "caller_role": "observer",
+                    "backlog_id": backlog_id,
+                    "task_id": fresh_contract_execution_id,
+                    "allowed_actions": [
+                        "parallel_branch_allocate",
+                        "task_timeline_append",
+                    ],
+                    "target_files": owned_files,
+                    "owned_files": owned_files,
+                    "evidence_refs": [
+                        f"contract_runtime:{fresh_contract_execution_id}",
+                        f"backlog:{backlog_id}",
+                        f"lane:{lane_id}",
+                    ],
+                },
+            }
+        )
+        lane_templates.append(
+            {
+                "lane_id": lane_id,
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "contract_execution_id": fresh_contract_execution_id,
+                "worker_id": worker_id,
+                "worker_slot_id": worker_slot_id,
+                "owned_files": owned_files,
+                "route_token_ref_from": (
+                    f"route_issue_results.{lane_id}.route_token_ref"
+                ),
+            }
+        )
+    return {
+        "schema_version": "mf_parallel.terminal_fresh_dispatch_plan.v1",
+        "source": "existing_mf_parallel_allocation_happy_path",
+        "route_issue_actions": route_issue_actions,
+        "allocation_precheck_action": {
+            "mcp_tool": "parallel_branch_allocate_precheck",
+            "copy_safe_body_template": {
+                "project_id": project_id,
+                "base_commit": base_commit,
+                "target_head_commit": target_head_commit,
+                "expected_lane_count": 2,
+                "expected_worker_count": 2,
+                "lanes": lane_templates,
+            },
+            "substitution_rule": (
+                "replace each route_token_ref_from with only that lane's "
+                "observer_route_context_issue.route_token_ref; change no other field"
+            ),
+        },
+        "runtime_context_creation_authority": (
+            "parallel_branch_allocate_precheck_then_unchanged_allocate_bodies"
+        ),
+        "runtime_contexts_already_created": False,
+        "credentials_already_issued": False,
+        "manual_identity_composition_allowed": False,
+    }
+
+
+def _mf_parallel_terminal_supersession_enter(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    actor_role: str,
+    route_token_ref: str,
+    reason: str,
+    request: Mapping[str, Any],
+    requested_contract_execution_id: str = "",
+) -> dict[str, Any]:
+    """Atomically terminalize one exact rev9 dead end and reserve rev10."""
+
+    from . import task_timeline
+    policy = _mf_parallel_terminal_supersession_policy()
+    if not policy:
+        raise GovernanceError(
+            "mf_parallel_terminal_supersession_policy_unavailable",
+            "rev10 terminal supersession Contract policy is unavailable",
+            409,
+            {"writes_performed": False, "fail_closed": True},
+        )
+    supplied_request = dict(request)
+    fresh_execution_id = str(
+        policy.get("fresh_contract_execution_id") or ""
+    )
+    if requested_contract_execution_id and (
+        requested_contract_execution_id != fresh_execution_id
+    ):
+        raise GovernanceError(
+            "mf_parallel_terminal_supersession_fresh_execution_mismatch",
+            "caller fresh contract_execution_id does not match the Contract",
+            409,
+            {
+                "field": "contract_execution_id",
+                "expected": fresh_execution_id,
+                "actual": requested_contract_execution_id,
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+    if (
+        project_id != str(policy.get("source_project_id") or "")
+        or backlog_id != str(policy.get("source_backlog_id") or "")
+        or task_id != str(policy.get("fresh_contract_task_id") or "")
+    ):
+        raise GovernanceError(
+            "mf_parallel_terminal_supersession_scope_mismatch",
+            "terminal supersession backlog/task scope does not match the Contract",
+            409,
+            {
+                "expected_project_id": str(
+                    policy.get("source_project_id") or ""
+                ),
+                "actual_project_id": project_id,
+                "expected_backlog_id": str(
+                    policy.get("source_backlog_id") or ""
+                ),
+                "actual_backlog_id": backlog_id,
+                "expected_task_id": str(
+                    policy.get("fresh_contract_task_id") or ""
+                ),
+                "actual_task_id": task_id,
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+    route_authority = _mf_parallel_terminal_supersession_route_authority(
+        conn,
+        policy=policy,
+        route_token_ref=route_token_ref,
+    )
+    if route_authority.get("accepted") is not True:
+        raise GovernanceError(
+            "mf_parallel_terminal_supersession_route_scope_invalid",
+            "terminal supersession requires the exact active observer route scope",
+            409,
+            {
+                "expected_scope": route_authority.get("expected_scope") or {},
+                "expected_allowed_actions": route_authority.get(
+                    "expected_allowed_actions"
+                )
+                or [],
+                "expected_files": route_authority.get("expected_files") or [],
+                "next_legal_action": {
+                    "mcp_tool": "observer_route_context_issue",
+                    "copy_safe_body": route_authority.get(
+                        "observer_route_context_issue_body"
+                    )
+                    or {},
+                },
+                "writes_performed": False,
+                "mutation_performed": False,
+                "fail_closed": True,
+            },
+        )
+
+    store = _contract_runtime_store(conn)
+    source_execution_id = str(
+        policy.get("source_contract_execution_id") or ""
+    )
+    source_record = store.get(source_execution_id)
+    existing_marker = _mf_parallel_terminal_supersession_marker(source_record)
+    expected_request = _mf_parallel_terminal_supersession_expected_request(
+        policy
+    )
+    if existing_marker:
+        request_hash = stable_sha256(supplied_request)
+    else:
+        if not (
+            expected_request.get("base_commit")
+            and expected_request.get("target_head_commit")
+        ):
+            raise GovernanceError(
+                "mf_parallel_terminal_supersession_worldref_unavailable",
+                "fresh rev10 requires one non-stale loaded governance release commit",
+                409,
+                {
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                },
+            )
+        if supplied_request != expected_request:
+            mismatches = [
+                {
+                    "field": field,
+                    "expected": expected_request.get(field, "<absent>"),
+                    "actual": supplied_request.get(field, "<absent>"),
+                }
+                for field in sorted(
+                    set(expected_request) | set(supplied_request)
+                )
+                if supplied_request.get(field, "<absent>")
+                != expected_request.get(field, "<absent>")
+            ]
+            first = mismatches[0] if mismatches else {"field": "request"}
+            raise GovernanceError(
+                "mf_parallel_terminal_supersession_request_mismatch",
+                "terminal supersession must consume the exact rev10 Contract request",
+                409,
+                {
+                    "field": first.get("field"),
+                    "mismatches": mismatches,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                },
+            )
+        request_hash = stable_sha256(expected_request)
+    if existing_marker:
+        if str(existing_marker.get("request_hash") or "") != request_hash:
+            raise GovernanceError(
+                "mf_parallel_terminal_supersession_replay_conflict",
+                "terminal supersession source already has a different receipt",
+                409,
+                {
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                    "fail_closed": True,
+                },
+            )
+        try:
+            fresh_record = store.get(fresh_execution_id)
+        except ContractRuntimeError as exc:
+            raise GovernanceError(
+                "mf_parallel_terminal_supersession_replay_incomplete",
+                "terminal receipt exists but the fresh rev10 execution is missing",
+                409,
+                {"writes_performed": False, "fail_closed": True},
+            ) from exc
+        lanes = _mf_parallel_terminal_supersession_lane_records(
+            conn,
+            project_id=project_id,
+            fresh_contract_execution_id=fresh_execution_id,
+            policy=policy,
+        )
+        if not lanes:
+            raise GovernanceError(
+                "mf_parallel_terminal_supersession_replay_incomplete",
+                "terminal receipt exists but its exact fresh lane reservation is missing",
+                409,
+                {"writes_performed": False, "fail_closed": True},
+            )
+        fresh_record = _contract_runtime_read(
+            conn,
+            contract_execution_id=fresh_execution_id,
+            actor_role=actor_role,
+        )
+        fresh_dispatch_plan = _mf_parallel_terminal_fresh_dispatch_plan(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            fresh_contract_execution_id=fresh_execution_id,
+            reservations=lanes,
+            base_commit=str(existing_marker.get("base_commit") or ""),
+            target_head_commit=str(
+                existing_marker.get("target_head_commit") or ""
+            ),
+        )
+        return {
+            "ok": True,
+            "schema_version": "mf_parallel_enter.runtime_contract_response.v1",
+            "project_id": project_id,
+            "terminal_supersession_replay": True,
+            "writes_performed": False,
+            "terminal_supersession_receipt": existing_marker,
+            "reserved_lanes": lanes,
+            "fresh_dispatch_plan": fresh_dispatch_plan,
+            "contract_execution_id": fresh_execution_id,
+            "successor_contract_execution_id": fresh_execution_id,
+            "parent_contract_execution_id": str(
+                fresh_record.get("parent_contract_execution_id") or ""
+            ),
+            "root_contract_execution_id": str(
+                fresh_record.get("root_contract_execution_id") or ""
+            ),
+            "contract_chain_id": str(
+                fresh_record.get("contract_chain_id") or ""
+            ),
+            "runtime_guide": fresh_record.get("runtime_guide") or {},
+            "contract_runtime_current_state": (
+                _runtime_current_state_from_record(fresh_record)
+            ),
+            "next_legal_action": _runtime_next_action_from_guide(
+                fresh_record.get("runtime_guide") or {}
+            ),
+            "execution_state_revision": int(
+                fresh_record.get("execution_state_revision") or 0
+            ),
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+        }
+
+    evaluation = _mf_parallel_terminal_supersession_evaluation(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        policy=policy,
+    )
+    if evaluation.get("eligible") is not True:
+        raise GovernanceError(
+            str(evaluation.get("code") or "mf_parallel_terminal_supersession_blocked"),
+            str(
+                evaluation.get("message")
+                or "terminal supersession is no longer eligible"
+            ),
+            409,
+            {
+                **dict(evaluation.get("details") or {}),
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+    source_record = evaluation["source_record"]
+    expected_request = dict(evaluation["expected_request"])
+    policy_lanes = list(evaluation["policy_lanes"])
+    policy_files = list(evaluation["policy_files"])
+    parent_record = evaluation["parent_record"]
+    fresh_acceptance_criteria = list(
+        evaluation["fresh_acceptance_criteria"]
+    )
+    fresh_acceptance_scope_closure = dict(
+        evaluation["fresh_acceptance_scope_closure"]
+    )
+
+    cardinality_selection = {
+        "schema_version": "mf_parallel.observer_worker_cardinality_selection.v1",
+        "source": "contract_terminal_supersession_policy",
+        "observer_selected": True,
+        "selection_origin": "mf_parallel_enter",
+        "selection_frozen": True,
+        "selection_frozen_at_enter": True,
+        "required_worker_count": 2,
+        "worker_count_policy": "exactly",
+        "atomic_dispatch_required": True,
+        "batch_row_scoped_successor": False,
+        "batch_child_authority": {},
+        "caller_may_change_after_enter": False,
+        "fresh_mcp_contract_requires_explicit_selection": True,
+        "legacy_implicit_compatibility": False,
+    }
+    cardinality_selection["selection_hash"] = stable_sha256(
+        cardinality_selection
+    )
+    lane_reservations = []
+    for lane in policy_lanes:
+        reservation_core = {
+            "schema_version": "mf_parallel.terminal_lane_reservation.v1",
+            "lane_id": str(lane.get("lane_id") or ""),
+            "fresh_generation": 1,
+            "task_id": str(lane.get("task_id") or ""),
+            "parent_task_id": fresh_execution_id,
+            "backlog_id": backlog_id,
+            "worker_id": str(lane.get("worker_id") or ""),
+            "worker_slot_id": str(lane.get("worker_slot_id") or ""),
+            "owned_files": list(lane.get("owned_files") or []),
+            "raw_fence_token_persisted": False,
+            "raw_session_token_persisted": False,
+            "reservation_only": True,
+            "runtime_context_persisted": False,
+            "worktree_materialized": False,
+            "credentials_issued": False,
+            "allocation_authority": "parallel_branch_allocate_precheck",
+        }
+        lane_reservations.append(
+            {
+                **reservation_core,
+                "reservation_hash": stable_sha256(reservation_core),
+            }
+        )
+
+    successor_runtime = _mf_parallel_successor_runtime_enter(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        parent_record=parent_record,
+        actor_role=actor_role,
+        route_token_ref=route_token_ref,
+        reason=reason,
+        contract_execution_id=fresh_execution_id,
+        contract_revision="rev10",
+        metadata={
+            "owned_files": policy_files,
+            "target_files": policy_files,
+            "test_files": [
+                path for path in policy_files if path.startswith("agent/tests/")
+            ],
+            "required_worker_count": 2,
+            "observer_worker_cardinality_selection": cardinality_selection,
+            "observer_worker_cardinality_initial_selection": cardinality_selection,
+            "observer_worker_cardinality_revisions": [],
+            "terminal_supersession_request": expected_request,
+            "terminal_supersession_request_hash": request_hash,
+            "terminal_supersession_source_contract_execution_id": (
+                source_execution_id
+            ),
+            "terminal_supersession_generation": 1,
+            "terminal_supersession_lane_reservations": lane_reservations,
+            "old_evidence_carry_forward": False,
+        },
+        acceptance_scope_criteria=fresh_acceptance_criteria,
+        acceptance_scope_closure=fresh_acceptance_scope_closure,
+        defer_child_route_issue=True,
+    )
+    receipt_core = {
+        "schema_version": "mf_parallel.terminal_supersession_receipt.v1",
+        "server_derived": True,
+        "source": "Contract:mf_parallel.v2@v2#rev10.terminal_supersession_policy",
+        "request_hash": request_hash,
+        "source_contract_execution_id": source_execution_id,
+        "source_execution_state_revision": int(
+            policy.get("source_execution_state_revision") or 0
+        ),
+        "source_runtime_context_id": str(
+            policy.get("source_runtime_context_id") or ""
+        ),
+        "source_stage_checkpoint_id": str(
+            policy.get("source_stage_checkpoint_id") or ""
+        ),
+        "source_recovery_mode": str(
+            policy.get("required_recovery_mode") or ""
+        ),
+        "fresh_contract_execution_id": fresh_execution_id,
+        "fresh_contract_task_id": task_id,
+        "fresh_revision": "rev10",
+        "fresh_generation": 1,
+        "required_worker_count": 2,
+        "reserved_lanes": lane_reservations,
+        "base_commit": str(expected_request.get("base_commit") or ""),
+        "target_head_commit": str(
+            expected_request.get("target_head_commit") or ""
+        ),
+        "user_authority_ref": str(policy.get("user_authority_ref") or ""),
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "old_execution_terminal": True,
+        "old_completed_lines_mutated": False,
+        "old_evidence_carried_forward": False,
+        "fresh_lane_credentials_issued": False,
+        "fresh_lane_auth_generation_reserved": False,
+        "fresh_lane_intent_reserved": True,
+        "fresh_runtime_contexts_persisted": False,
+    }
+    receipt_hash = stable_sha256(receipt_core)
+    event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="mf_parallel.terminal_superseded_no_pass",
+        phase="orchestration",
+        event_kind="observer_command",
+        actor="observer",
+        status="superseded_no_pass",
+        payload={
+            **receipt_core,
+            "receipt_hash": receipt_hash,
+            "evidence_kind": "superseded_no_pass",
+        },
+        artifact_refs={
+            "source_contract_execution_id": source_execution_id,
+            "fresh_contract_execution_id": fresh_execution_id,
+            "source_runtime_context_id": str(
+                policy.get("source_runtime_context_id") or ""
+            ),
+            "receipt_hash": receipt_hash,
+        },
+    )
+    receipt = {
+        **receipt_core,
+        "receipt_ref": f"timeline:{int(event.get('id') or 0)}",
+    }
+    receipt["receipt_hash"] = receipt_hash
+
+    source_updated = deepcopy(dict(source_record))
+    source_metadata = (
+        deepcopy(dict(source_updated.get("metadata") or {}))
+        if isinstance(source_updated.get("metadata"), Mapping)
+        else {}
+    )
+    source_metadata["terminal_supersession_receipt"] = receipt
+    source_updated["metadata"] = source_metadata
+    source_updated["execution_state_revision"] = int(
+        source_record.get("execution_state_revision") or 0
+    ) + 1
+    source_guide = (
+        deepcopy(dict(source_updated.get("runtime_guide") or {}))
+        if isinstance(source_updated.get("runtime_guide"), Mapping)
+        else {}
+    )
+    source_guide["next_legal_action"] = None
+    source_guide["terminal_supersession_receipt"] = receipt
+    source_guide["runtime_guide_hash"] = stable_sha256(
+        {
+            "schema_version": "mf_parallel.terminal_runtime_guide.v1",
+            "prior_runtime_guide_hash": str(
+                source_guide.get("runtime_guide_hash") or ""
+            ),
+            "receipt_hash": receipt["receipt_hash"],
+        }
+    )
+    source_updated["runtime_guide"] = source_guide
+    source_state = (
+        deepcopy(dict(source_updated.get("execution_state") or {}))
+        if isinstance(source_updated.get("execution_state"), Mapping)
+        else {}
+    )
+    source_state.update(
+        {
+            "terminal": True,
+            "status": "superseded_no_pass",
+            "next_legal_action": None,
+            "receipt_ref": receipt["receipt_ref"],
+            "receipt_hash": receipt["receipt_hash"],
+        }
+    )
+    source_updated["execution_state"] = source_state
+    store.update(
+        source_execution_id,
+        source_updated,
+        expected_revision=int(
+            policy.get("source_execution_state_revision") or 0
+        ),
+    )
+    fresh_record = store.get(fresh_execution_id)
+    fresh_metadata = (
+        deepcopy(dict(fresh_record.get("metadata") or {}))
+        if isinstance(fresh_record.get("metadata"), Mapping)
+        else {}
+    )
+    fresh_metadata["terminal_supersession_receipt_ref"] = receipt[
+        "receipt_ref"
+    ]
+    fresh_metadata["terminal_supersession_receipt_hash"] = receipt[
+        "receipt_hash"
+    ]
+    fresh_record["metadata"] = fresh_metadata
+    store.update(fresh_execution_id, fresh_record)
+    conn.commit()
+
+    reserved_lanes = deepcopy(lane_reservations)
+    fresh_dispatch_plan = _mf_parallel_terminal_fresh_dispatch_plan(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        fresh_contract_execution_id=fresh_execution_id,
+        reservations=reserved_lanes,
+        base_commit=str(expected_request.get("base_commit") or ""),
+        target_head_commit=str(
+            expected_request.get("target_head_commit") or ""
+        ),
+    )
+    return {
+        "ok": True,
+        "schema_version": "mf_parallel_enter.runtime_contract_response.v1",
+        "project_id": project_id,
+        "terminal_supersession_replay": False,
+        "writes_performed": True,
+        "event": event,
+        "terminal_supersession_receipt": receipt,
+        "reserved_lanes": reserved_lanes,
+        "fresh_dispatch_plan": fresh_dispatch_plan,
+        "contract_execution_id": fresh_execution_id,
+        "successor_contract_execution_id": fresh_execution_id,
+        "parent_contract_execution_id": successor_runtime.get(
+            "parent_contract_execution_id", ""
+        ),
+        "root_contract_execution_id": successor_runtime.get(
+            "root_contract_execution_id", ""
+        ),
+        "contract_chain_id": successor_runtime.get("contract_chain_id", ""),
+        "runtime_guide": successor_runtime.get("runtime_guide") or {},
+        "contract_runtime_current_state": successor_runtime.get(
+            "current_state"
+        )
+        or {},
+        "next_legal_action": successor_runtime.get("next_legal_action") or {},
+        "execution_state_revision": successor_runtime.get(
+            "execution_state_revision", 0
+        ),
+        "execution_state_hash": successor_runtime.get(
+            "execution_state_hash", ""
+        ),
+        "contract_chain_current": successor_runtime.get(
+            "contract_chain_current"
+        )
+        or {},
+        "route_token_ref": successor_runtime.get("route_token_ref", ""),
+        "route_token_ref_guidance": successor_runtime.get(
+            "route_token_ref_guidance"
+        )
+        or {},
+        "worker_cardinality_policy": successor_runtime.get(
+            "worker_cardinality_policy"
+        )
+        or {},
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
     }
 
 
@@ -181437,15 +183106,57 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
     worker_fence = (
         body.get("worker_fence") if isinstance(body.get("worker_fence"), Mapping) else {}
     )
-    if not worker_fence and not owned_files and not target_files:
-        raise ValidationError(
-            "mf_parallel entry requires worker_fence, owned_files, or target_files"
-        )
     metadata = (
         dict(body.get("metadata"))
         if isinstance(body.get("metadata"), Mapping)
         else {}
     )
+    terminal_supersession_request = (
+        _mf_parallel_terminal_supersession_request(body, metadata)
+    )
+    if terminal_supersession_request and (
+        worker_fence or owned_files or target_files
+    ):
+        raise GovernanceError(
+            "mf_parallel_terminal_supersession_scope_override_forbidden",
+            (
+                "terminal supersession derives the exact two-lane scope from "
+                "the rev10 Contract; caller fence/file overrides are forbidden"
+            ),
+            409,
+            {
+                "writes_performed": False,
+                "mutation_performed": False,
+                "fail_closed": True,
+            },
+        )
+    if (
+        terminal_supersession_request
+        and int(metadata.get("required_worker_count") or 0) != 2
+    ):
+        raise GovernanceError(
+            "mf_parallel_terminal_supersession_cardinality_override_forbidden",
+            "terminal supersession requires the Contract-declared two lanes",
+            409,
+            {
+                "expected_required_worker_count": 2,
+                "actual_required_worker_count": metadata.get(
+                    "required_worker_count"
+                ),
+                "writes_performed": False,
+                "mutation_performed": False,
+                "fail_closed": True,
+            },
+        )
+    if (
+        not terminal_supersession_request
+        and not worker_fence
+        and not owned_files
+        and not target_files
+    ):
+        raise ValidationError(
+            "mf_parallel entry requires worker_fence, owned_files, or target_files"
+        )
     caller_direct_main_contract_transition = (
         _direct_main_cross_contract_transition_input(body, metadata)
     )
@@ -181559,6 +183270,49 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                     "body_role_claim": body_role_claim,
                     "role_source": "contract_runtime_effective_actor_role",
                 },
+            )
+        if terminal_supersession_request:
+            observer_session_id = _contract_runtime_ref_value(
+                ctx,
+                "observer_session_id",
+                "observer_session_ref",
+            )
+            observer_session_record = (
+                observer_session.get_session(
+                    conn,
+                    project_id=project_id,
+                    session_id=observer_session_id,
+                )
+                if observer_session_id
+                else None
+            )
+            if not observer_session_record or str(
+                observer_session_record.get("computed_status") or ""
+            ) != "active":
+                raise GovernanceError(
+                    "mf_parallel_terminal_supersession_observer_proof_invalid",
+                    "terminal supersession requires one active observer session and exact route",
+                    403,
+                    {
+                        "proof_error": (
+                            "observer_session_not_active"
+                        ),
+                        "observer_session_id": observer_session_id,
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                        "fail_closed": True,
+                    },
+                )
+            return _mf_parallel_terminal_supersession_enter(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                actor_role=derived_actor_role,
+                route_token_ref=route_token_ref,
+                reason=reason,
+                request=terminal_supersession_request,
+                requested_contract_execution_id=contract_execution_id,
             )
         direct_main_failed_qa_state = (
             _onboard_parentless_direct_main_failed_qa_state(

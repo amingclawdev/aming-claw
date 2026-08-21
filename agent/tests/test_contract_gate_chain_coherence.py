@@ -237,3 +237,51 @@ def test_direct_main_terminal_and_retry_policy_forbid_in_place_repair() -> None:
     }
     assert system["successor_policy"]["same_generation_retry_allowed"] is False
     assert system["successor_policy"]["fresh_bounded_row_required"] is True
+
+
+def test_mf_parallel_rev10_keeps_nominal_chain_and_forbids_commit_backedge() -> None:
+    registry = ContractDefinitionRegistry()
+    rev9 = registry.get(
+        "mf_parallel.v2", version="v2", revision="rev9"
+    )
+    rev10 = registry.get(
+        "mf_parallel.v2", version="v2", revision="rev10"
+    )
+
+    def chain(definition):
+        return [
+            (
+                stage["stage_id"],
+                line["line_id"],
+                tuple(line.get("requires") or []),
+                line["owner_role"],
+                line["evidence_kind"],
+            )
+            for stage in definition["rule_layer"]["stages"]
+            for line in stage["lines"]
+        ]
+
+    assert chain(rev10) == chain(rev9)
+    ordered_line_ids = [line_id for _, line_id, *_ in chain(rev10)]
+    assert ordered_line_ids.count("worker_commit") == 1
+    assert ordered_line_ids.index("worker_implementation") < ordered_line_ids.index(
+        "worker_commit"
+    ) < ordered_line_ids.index("worker_finish_time_attestation")
+    later_requirements = {
+        requirement
+        for _, line_id, requirements, *_ in chain(rev10)
+        if ordered_line_ids.index(line_id) > ordered_line_ids.index("worker_commit")
+        for requirement in requirements
+    }
+    assert "worker_implementation" not in later_requirements
+
+    applicability = rev10["metadata"]["common_rule_applicability"]
+    assert "AC-COMMON-COMMIT-IMMUTABLE-WORKER" in applicability["rule_ids"]
+    assert applicability["server_inference_allowed"] is False
+
+    successor_modes = {
+        successor.get("mode")
+        for successor in rev10["successors"]
+        if successor.get("contract_id") == "mf_parallel.v2"
+    }
+    assert successor_modes == {"same_contract_append_only_failed_qa_rework"}

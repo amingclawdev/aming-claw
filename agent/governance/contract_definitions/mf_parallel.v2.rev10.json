@@ -1,0 +1,915 @@
+{
+  "compat_aliases": [
+    "mf_parallel.v2",
+    "parallel_worker.v1"
+  ],
+  "contract_id": "mf_parallel.v2",
+  "contract_type": "parallel_worker",
+  "governance_hints": {
+    "asset_binding_events": [
+      {
+        "operation": "bind",
+        "path": ".",
+        "role": "config",
+        "schema_version": "asset_binding_event.v1",
+        "target_module": "agent.governance.contracts.registry"
+      }
+    ],
+    "schema_version": "governance_hints.v1"
+  },
+  "instruction_layer": {
+    "inline": [
+      "The compiled runtime guide is authoritative for the next legal action.",
+      "Observer owns orchestration, cardinality-aware dispatch (two atomic standalone lanes or one verified batch-child lane), per-lane merge, canonical reconcile, and close-ready evidence only.",
+      "Dispatch exactly the effective worker count: two host-created Codex Desktop mf_sub workers in one atomic bounded_workers payload for standalone mf_parallel, or one non-atomic worker for a verified batch-child contract. Each worker has a distinct RuntimeContext, task, worker slot, worktree, branch, merge queue, and owned_files fence.",
+      "Before initial mf_sub allocation, call parallel_branch_allocate_precheck using the effective allocation-precheck policy: exactly two atomic lanes for standalone mf_parallel, or exactly one non-atomic lane per verified batch-child contract. Copy every returned copy_safe_allocation_body unchanged into parallel_branch_allocate; do not manually compose route, task, worktree, branch, merge-queue, or acceptance identity.",
+      "Allocation precheck and every Drift Gym checkpoint are read-only. The precheck must perform zero RuntimeContext, worktree, merge-queue, timeline, and ContractRuntime writes; caller-supplied external paths are diagnostics only and are projected to the registered repository .worktrees directory.",
+      "Every selected worker owns its own read receipt, startup, graph trace, implementation, worker commit, finish-time attestation, and finish gate evidence. Every worker line uses its runtime_context line_instance_id.",
+      "Do not advance to merge until every required worker line instance has passed finish gate. Merge each lane through its own durable merge queue, then reconcile the final canonical HEAD exactly once.",
+      "Independent integration QA runs only after all required lane merges and the activated canonical reconcile. QA must test and query the final canonical HEAD/reconciled graph, never a worker worktree or historical fixture.",
+      "Authenticated independent QA alone authors PASS or NO-PASS. QA NO-PASS keeps the parent open and allocates exactly one bounded failed_qa_rework worker tied to the failed QA source on the same append-only mf_parallel execution; it does not repeat the initial required-lane fan-out. After repair it returns through merge, reconcile, and a fresh QA session. direct_fix is forbidden.",
+      "Before implementation, compare each persisted owned_files fence with worker-authored files. Inherited target-head files are not worker-authored files and must not be added to changed_files.",
+      "A worker scope-insufficiency request is append-only sideband evidence, not authority. Never widen owned_files from the request itself.",
+      "Merge materialize uses durable status merge_ready. If live apply proves a candidate is already contained, retain the canonical observer merge event with git_mutation_executed=false.",
+      "Post-merge graph_current_full_reconcile activate=true requires durable merge authority for all required lanes and a distinct activation snapshot id.",
+      "An accepted worker_commit is immutable within its lane and execution. Final QA NO-PASS may allocate exactly one fresh append-only failed_qa_rework RuntimeContext; it never reopens, replaces, or supersedes the accepted worker_commit.",
+      "The only legacy terminal supersession admitted by rev10 is the exact source/state/checkpoint declared by system_layer.terminal_supersession_policy. That transition records superseded_no_pass on the old generation and reserves exactly one fresh two-lane rev10 generation; old lines, traces, credentials, QA, commits, worktrees, and merge queues never carry forward.",
+      "A terminal supersession replay is transport-idempotent only for the exact typed request. Any source, state, checkpoint, base, generation, authority, or cardinality mismatch is a zero-write refusal. The old execution remains terminal and can never project implementation, retry, resume, merge, QA, or close authority.",
+      "Copy only copy-safe route and runtime references. Never persist raw route, session, or fence tokens."
+    ],
+    "refs": []
+  },
+  "metadata": {
+    "backlog_id": "AC-MF-PARALLEL-REV9-RETRY-MIGRATION-CONTRACT-P0-20260815",
+    "common_rule_applicability": {
+      "schema_version": "contract_common_rule_applicability.v1",
+      "join_state": "resolved",
+      "package_id": "aming-claw.common-safety",
+      "package_version": "v1",
+      "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603",
+      "rule_ids": [
+        "AC-COMMON-IDENTITY-PROJECT-BACKLOG-TASK",
+        "AC-COMMON-IDENTITY-ROUTE",
+        "AC-COMMON-SCOPE-OWNED-FILES",
+        "AC-COMMON-WORKTREE-EXACT-IDENTITY",
+        "AC-COMMON-CREDENTIAL-NO-RAW-PERSISTENCE",
+        "AC-COMMON-COMMIT-IMMUTABLE-WORKER",
+        "AC-COMMON-QA-ROLE-SEPARATION",
+        "AC-COMMON-MERGE-ORDERED",
+        "AC-COMMON-GRAPH-EXACT-ACTIVE-PREFLIGHT",
+        "AC-COMMON-CLOSE-INTEGRITY"
+      ],
+      "scopes": [
+        "mf_parallel"
+      ],
+      "omitted_rules_apply": false,
+      "server_inference_allowed": false,
+      "activation_allowed": true
+    },
+    "legacy_template_id": "mf_parallel.v1",
+    "previous_revision": "mf_parallel.v2.rev9",
+    "revision_reason": "Preserve the rev9 nominal two-worker state machine, pin the existing common Rule package, disable reconcile receipt correction for fresh executions, and admit one exact source-backed terminal no-PASS supersession into a fresh rev10 generation.",
+    "runtime_dogfood": true
+  },
+  "revision": "rev10",
+  "role": "observer",
+  "rule_layer": {
+    "stages": [
+      {
+        "description": "Observer binds parent route context and prefills role-bound child contracts before dispatch.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Record the parent mf_parallel contract binding, route identity, child contract plan, owned_files fences, test commands, merge queue identity, and route_token_ref.",
+            "evidence_kind": "contract_binding",
+            "line_id": "observer_prefill_child_contracts",
+            "owner_role": "observer"
+          }
+        ],
+        "stage_id": "orchestration"
+      },
+      {
+        "description": "Observer dispatches bounded workers only after runtime prefill and local dispatch gates are ready.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Call parallel_branch_allocate_precheck with the effective worker cardinality (two atomic standalone lanes or one lane for this verified batch-child contract), submit every returned allocation body unchanged, then re-read ContractRuntime and submit writer_role_safe_copy_payload.copy_payload unchanged. Manual route/task/worktree/acceptance composition is forbidden.",
+            "evidence_kind": "dispatch_bounded_worker",
+            "line_id": "observer_dispatch_bounded_workers",
+            "owner_role": "observer",
+            "requires": [
+              "observer_prefill_child_contracts"
+            ]
+          }
+        ],
+        "stage_id": "dispatch"
+      },
+      {
+        "description": "The bounded mf_sub worker proves it read the runtime guide before implementation.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored read receipt for runtime_context_worker_guide/current-state.",
+            "evidence_kind": "read_receipt",
+            "line_id": "worker_read_runtime_guide",
+            "owner_role": "mf_sub",
+            "requires": [
+              "observer_dispatch_bounded_workers"
+            ]
+          }
+        ],
+        "stage_id": "worker_read"
+      },
+      {
+        "description": "The bounded mf_sub worker proves actual startup inside its assigned runtime context.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored startup evidence with runtime_context_id, task_id, parent_task_id, worker_slot_id, session token evidence, worktree, branch, and fence.",
+            "evidence_kind": "mf_subagent_startup",
+            "line_id": "worker_startup",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_read_runtime_guide"
+            ]
+          }
+        ],
+        "stage_id": "worker_startup"
+      },
+      {
+        "description": "The worker gathers graph context using the mf_subagent query identity.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Audited graph trace ids produced with query_source=mf_subagent and matching task/fence identity.",
+            "evidence_kind": "graph_trace",
+            "line_id": "worker_graph_context",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_startup"
+            ]
+          }
+        ],
+        "stage_id": "worker_context"
+      },
+      {
+        "description": "The worker records bounded implementation evidence for owned files only.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Implementation evidence with changed files, tests run or planned, graph traces, and generated-assets policy.",
+            "evidence_kind": "implementation",
+            "line_id": "worker_implementation",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_graph_context"
+            ]
+          }
+        ],
+        "stage_id": "worker_implementation"
+      },
+      {
+        "description": "The worker records the exact clean implementation commit before finish-time attestation.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Worker-authored commit evidence binding the active runtime, task, session, implementation event, DB graph traces, exact owned-file diff, clean worktree, and immutable HEAD.",
+            "evidence_kind": "worker_commit",
+            "line_id": "worker_commit",
+            "owner_role": "mf_sub",
+            "required_fields": [
+              "commit_sha"
+            ],
+            "requires": [
+              "worker_implementation"
+            ]
+          }
+        ],
+        "stage_id": "worker_commit"
+      },
+      {
+        "description": "The worker records finish-time self-attestation before the finish gate.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Finish-time worker self-attestation authored by the worker session, not observer reconstruction.",
+            "evidence_kind": "record_finish_time_worker_attestation",
+            "line_id": "worker_finish_time_attestation",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_commit"
+            ]
+          }
+        ],
+        "stage_id": "worker_attestation"
+      },
+      {
+        "description": "The worker records the close-satisfying finish gate and stops at review_ready or waiting_merge.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "mf_sub"
+            ],
+            "description": "Passed finish gate with route identity, runtime lineage, observer command id, implementation commit, changed files, tests, review_ready, and close_ready projection.",
+            "evidence_kind": "mf_subagent_finish_gate",
+            "line_id": "worker_finish_gate",
+            "owner_role": "mf_sub",
+            "requires": [
+              "worker_finish_time_attestation"
+            ]
+          }
+        ],
+        "stage_id": "worker_finish"
+      },
+      {
+        "stage_id": "observer_lane_merge",
+        "description": "Observer integrates every finished worker lane required by the effective cardinality policy through that lane's durable merge queue.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer records one durable merge for each finished worker lane; every required line instance must complete before canonical reconcile.",
+            "evidence_kind": "merge",
+            "line_id": "observer_merge",
+            "owner_role": "observer",
+            "requires": [
+              "worker_finish_gate"
+            ]
+          }
+        ]
+      },
+      {
+        "stage_id": "observer_reconcile",
+        "description": "Observer activates one canonical graph snapshot after all required lane merges.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "After all required lane merges land, reconcile and activate the final canonical HEAD exactly once before independent integration QA.",
+            "evidence_kind": "reconcile",
+            "line_id": "observer_reconcile",
+            "owner_role": "observer",
+            "requires": [
+              "observer_merge"
+            ]
+          }
+        ]
+      },
+      {
+        "stage_id": "qa_graph_context",
+        "description": "Independent QA builds graph context from the reconciled canonical HEAD.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "qa"
+            ],
+            "description": "Independent QA queries the reconciled final canonical HEAD after all required lane merges; worker worktrees and historical fixtures are forbidden targets.",
+            "evidence_kind": "graph_trace",
+            "line_id": "qa_graph_context",
+            "owner_role": "qa",
+            "requires": [
+              "observer_reconcile"
+            ]
+          }
+        ]
+      },
+      {
+        "stage_id": "qa",
+        "description": "Independent integration QA verifies the reconciled canonical HEAD.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "qa"
+            ],
+            "description": "A fresh independent QA session verifies the integrated final canonical HEAD after reconcile. NO-PASS requires exactly one append-only bounded failed_qa_rework worker on the same mf_parallel execution; it does not repeat the initial required-lane fan-out and direct_fix is forbidden.",
+            "evidence_kind": "independent_verification",
+            "line_id": "qa_independent_verification",
+            "owner_role": "qa",
+            "requires": [
+              "qa_graph_context"
+            ]
+          }
+        ]
+      },
+      {
+        "stage_id": "observer_close",
+        "description": "Observer closes only after final canonical QA passes.",
+        "lines": [
+          {
+            "allowed_writer_roles": [
+              "observer"
+            ],
+            "description": "Observer close-ready evidence after all required lane merges, canonical reconcile, final independent QA PASS, and close-gate prerequisites.",
+            "evidence_kind": "close_ready",
+            "line_id": "observer_close_ready",
+            "owner_role": "observer",
+            "requires": [
+              "qa_independent_verification"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "schema_version": "contract_definition.v1",
+  "status": "active",
+  "system_layer": {
+    "entrypoint_policy": {
+      "allow_root_start": false,
+      "root_start_default": "deny",
+      "requires_parent_execution": true,
+      "denied_reason": "mf_parallel workers run under an approved parent contract and fenced worktree, not as a root entrypoint"
+    },
+    "successor_policy": {
+      "allow_successor_start": true,
+      "allowed_parent_contracts": [
+        {
+          "contract_id": "onboard_contract",
+          "version": "v1"
+        },
+        {
+          "contract_id": "onboard_route_guide",
+          "version": "service"
+        }
+      ],
+      "allowed_successors": [
+        {
+          "contract_id": "qa_evidence_gate_review.v1",
+          "version": "v1"
+        }
+      ],
+      "successor_start_default": "deny_until_parent_path_is_source_backed",
+      "requires_parent_execution_id": true,
+      "requires_root_execution_id": true,
+      "requires_contract_chain_id": true,
+      "requires_handoff_evidence": [
+        "observer_work_mode_transition"
+      ],
+      "requires_worker_fence": true
+    },
+    "write_authority_policy": {
+      "agent_facing_generic_crud_allowed": false,
+      "allowed_writer_roles_source": "rule_layer.allowed_writer_roles",
+      "body_supplied_role_claims_trusted": false,
+      "unlisted_role_default": "deny"
+    },
+    "next_action_policy": {
+      "decision_source": "contract_runtime_first_missing_line",
+      "legacy_close_gate_gap_reconstruction": "audit_only",
+      "legacy_meta_contract_gate": "audit_only"
+    },
+    "projection_policy": {
+      "read_model_source": "source_json_normalized_definition",
+      "runtime_projection_source": "contract_runtime_execution_state",
+      "mutable_completed_lines_trust_root": false
+    },
+    "route_policy": {
+      "route_identity_required": true,
+      "route_token_ref_required": true,
+      "visible_injection_manifest_required": true
+    },
+    "authority_policy": {
+      "semantic_change_requires_new_revision": true,
+      "same_revision_semantic_change_allowed": false,
+      "independent_review_required": true,
+      "formatting_only_drift_must_remain_visible": true
+    },
+    "legacy_reconcile_receipt_correction_policy": {
+      "schema_version": "mf_parallel.legacy_reconcile_receipt_correction_policy.v1",
+      "enabled_for_revision": false,
+      "revision": "rev10",
+      "same_revision_business_evidence_mutation_allowed": false,
+      "exact_duplicate_idempotency_transport_only": true
+    },
+    "terminal_supersession_policy": {
+      "schema_version": "mf_parallel.terminal_supersession_policy.v1",
+      "enabled": true,
+      "source_project_id": "aming-claw",
+      "source_contract_execution_id": "cex-mf-parallel-0b99800fddc4b4ad5f70",
+      "source_backlog_id": "AC-RUNTIMECONTEXT-BOUNDED-REPLACEMENT-ATOMIC-LANE-GRAPH-AUTHORITY-P0-20260815",
+      "source_revision": "rev9",
+      "source_execution_state_revision": 13,
+      "source_runtime_context_id": "mfrctx-c12af464d7b55290",
+      "source_task_id": "BRAL-SERVER-SELECTOR-20260815",
+      "source_worker_slot_id": "/root/finish_guide_repair_worker",
+      "source_stage_checkpoint_id": "sha256:5b9a7f0ec4263b3ad20c5f4a78e2fbb7693fce888eda7c604301da31cc825961",
+      "source_next_action": {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+        "owner_role": "mf_sub"
+      },
+      "required_recovery_mode": "replacement_exhausted",
+      "required_replacement_generation": 1,
+      "required_rejoin_event_refs": [
+        "timeline:24117",
+        "timeline:24118"
+      ],
+      "source_lane_forbidden_accepted_lines": [
+        "worker_implementation",
+        "worker_commit",
+        "worker_finish_time_attestation",
+        "worker_finish_gate"
+      ],
+      "user_authority_ref": "user-message:2026-08-21:goal-three-lane-convergence",
+      "fresh_generation": 1,
+      "fresh_revision": "rev10",
+      "fresh_contract_execution_id": "cex-mf-parallel-rev10-fresh-g1-0b99800fddc4b",
+      "fresh_contract_task_id": "BRAL-REV10-FRESH-G1",
+      "required_worker_count": 2,
+      "worker_count_policy": "exactly",
+      "atomic_reservation_required": true,
+      "fresh_worldref_policy": {
+        "schema_version": "mf_parallel.terminal_fresh_worldref_policy.v1",
+        "base_commit_source": "loaded_governance_runtime_identity_at_transition",
+        "target_head_commit_source": "loaded_governance_runtime_identity_at_transition",
+        "full_commit_required": true,
+        "registered_repository_object_required": true,
+        "runtime_stale_allowed": false,
+        "freeze_in_server_receipt": true
+      },
+      "runtime_context_allocation_authority": "parallel_branch_allocate_precheck",
+      "fresh_lanes": [
+        {
+          "lane_id": "server",
+          "task_id": "BRAL-REV10-FRESH-G1-SERVER",
+          "worker_id": "mf-parallel-rev10-g1-server",
+          "worker_slot_id": "mf-parallel-rev10-g1-server",
+          "owned_files": [
+            "agent/governance/server.py"
+          ]
+        },
+        {
+          "lane_id": "regression",
+          "task_id": "BRAL-REV10-FRESH-G1-REGRESSION",
+          "worker_id": "mf-parallel-rev10-g1-regression",
+          "worker_slot_id": "mf-parallel-rev10-g1-regression",
+          "owned_files": [
+            "agent/tests/test_graph_governance_api.py"
+          ]
+        }
+      ],
+      "receipt_evidence_kind": "superseded_no_pass",
+      "old_execution_terminal": true,
+      "old_execution_pass_synthesized": false,
+      "fresh_identity_fields": [
+        "contract_execution_id",
+        "task_id",
+        "worker_id",
+        "worker_slot_id",
+        "owned_files",
+        "fresh_generation"
+      ],
+      "forbidden_carry_forward": [
+        "completed_lines",
+        "graph_trace_ids",
+        "session_token_ref",
+        "fence_token",
+        "worker_commit",
+        "qa_evidence",
+        "merge_evidence",
+        "close_evidence"
+      ],
+      "forbidden_alternatives": [
+        "direct_fix",
+        "observer_hotfix",
+        "bypass",
+        "backfill",
+        "old_trace_reuse",
+        "same_cex_retry",
+        "second_fresh_generation"
+      ],
+      "exact_replay_idempotent": true,
+      "mismatch_policy": "zero_write_fail_closed"
+    },
+    "scope_insufficiency_sideband_policy": {
+      "schema_version": "mf_parallel.scope_insufficiency_sideband.v1",
+      "linear_contract_line": false,
+      "worker_facade": "runtime_context_scope_insufficiency_request",
+      "worker_event_type": "runtime_context.scope_insufficiency_requested",
+      "worker_event_kind": "record_blocker",
+      "required_request_fields": [
+        "project_id",
+        "backlog_id",
+        "task_id",
+        "runtime_context_id",
+        "missing_files",
+        "requested_files",
+        "blocked_acceptance_ids",
+        "reason",
+        "graph_refs"
+      ],
+      "request_grants_authority": false,
+      "request_mutates_owned_files": false,
+      "observer_disposition": {
+        "preimplementation": "explicit_same_runtime_allocation_authority_revision",
+        "postimplementation": "fresh_or_rework_runtime_context",
+        "new_or_out_of_acceptance": "file_bounded_linked_backlog_row"
+      },
+      "qa_verdict_policy": {
+        "sole_author_role": "qa",
+        "optional_finding_schema": "runtime_context.qa_scope_insufficiency_finding.v1",
+        "observer_may_author_or_rewrite_verdict": false,
+        "source_lane_evidence_must_be_preserved": true
+      }
+    },
+    "dispatch_ticket_authority_policy": {
+      "schema_version": "mf_parallel.dispatch_ticket_authority_policy.v2",
+      "enabled": true,
+      "line_ids": [
+        "observer_dispatch_bounded_workers"
+      ],
+      "authority_derivation": "server_runtime_context_and_route_token_registry",
+      "caller_authority_fields_trusted": false,
+      "validate_before_precheck_and_submit": true,
+      "rejection_must_be_atomic": true,
+      "distinct_root_fields": [
+        "target_project_root",
+        "worktree_path"
+      ],
+      "required_dispatch_fields": [
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_id",
+        "worker_slot_id",
+        "observer_command_id",
+        "worker_role",
+        "target_project_root",
+        "worktree_path",
+        "branch_ref",
+        "base_commit",
+        "target_head_commit",
+        "merge_queue_id",
+        "owned_files",
+        "profile_requirements",
+        "retry_policy"
+      ],
+      "required_child_route_fields": [
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash"
+      ],
+      "route_identity_source": "observer_route_token_refs",
+      "mixed_parent_child_identity_policy": "fail_closed",
+      "ticket_material_owner": "build_cli_agent_execution_ticket",
+      "required_worker_count": 2,
+      "worker_count_policy": "exactly",
+      "atomic_dispatch_required": true,
+      "worker_payload_key": "bounded_workers",
+      "disjoint_owned_files_required": true,
+      "distinct_identity_fields": [
+        "runtime_context_id",
+        "task_id",
+        "worker_id",
+        "worker_slot_id",
+        "worktree_path",
+        "branch_ref",
+        "merge_queue_id"
+      ],
+      "stable_order_by": [
+        "task_id",
+        "runtime_context_id"
+      ],
+      "all_worker_lines_require_line_instance_id": true
+    },
+    "graph_binding_policy": {
+      "candidate_commit_evidence_policy": {
+        "candidate_commit_path": "commit_sha",
+        "enabled": true,
+        "line_ids": [
+          "worker_commit"
+        ],
+        "required_format": "full_git_object_id",
+        "schema_version": "contract_candidate_commit_evidence_policy.v1"
+      },
+      "bounded_qa_review_policy": {
+        "accepted_graph_basis": [
+          "exact_candidate_snapshot",
+          "canonical_base_plus_candidate_diff"
+        ],
+        "authority_derivation": "server_db_trace_reverification",
+        "authority_object_path": "payload.graph_trace_evidence",
+        "authority_source": "graph_query_traces",
+        "base_diff_required_hash_fields": [
+          "candidate_overlay_hash",
+          "root_identity_hash",
+          "query_root_identity_hash",
+          "canonical_project_identity_hash",
+          "repository_identity_hash"
+        ],
+        "caller_authority_fields_trusted": false,
+        "candidate_diff_derivation": "server_only",
+        "default_graph_basis": "canonical_base_plus_candidate_diff",
+        "graph_basis_decision_required": true,
+        "graph_basis_decision_source": "server_bounded_qa_graph_basis",
+        "canonical_head_policy": "base_or_candidate",
+        "exact_candidate_upgrade_policy": "server_classified_or_qa_explicit",
+        "exact_candidate_escalation_stage": "server_persisted_overlay_failure_classification",
+        "exact_candidate_acceptance_stage": "graph_query_trace_persisted_basis_decision",
+        "exact_candidate_escalation_authority_source": "qa_graph_basis_escalations",
+        "server_trigger_escalation_ref_required": true,
+        "exact_candidate_upgrade_triggers": [
+          "graph_algorithm_or_graph_config_change",
+          "governance_semantic_or_structure_hint_change",
+          "broad_or_unbounded_candidate_change",
+          "deterministic_overlay_or_one_hop_dependency_failure",
+          "qa_explicit_exact_snapshot_request"
+        ],
+        "overlay_failure_policy": "fail_closed",
+        "one_hop_dependency_failure_policy": "fail_closed",
+        "enabled": true,
+        "exact_candidate_required_hash_fields": [
+          "root_identity_hash",
+          "query_root_identity_hash",
+          "canonical_project_identity_hash",
+          "repository_identity_hash"
+        ],
+        "exact_candidate_query_root_clean_required": true,
+        "exact_candidate_query_root_tree_identity_required": true,
+        "exact_candidate_query_root_untracked_files_checked": true,
+        "assigned_target_project_root_required": true,
+        "forged_or_mismatched_tuple_policy": "fail_closed",
+        "line_ids": [
+          "qa_graph_context"
+        ],
+        "lookup_key_fields": [
+          "graph_trace_ids",
+          "graph_query_trace_ids"
+        ],
+        "query_purposes": [
+          "qa_context_build",
+          "qa_gate_validation",
+          "independent_verification"
+        ],
+        "query_sources": [
+          "qa"
+        ],
+        "required_identity_fields": [
+          "project_id",
+          "backlog_id",
+          "task_id",
+          "qa_session_id",
+          "qa_principal",
+          "target_project_root"
+        ],
+        "schema_version": "contract_bounded_qa_review_policy.v1"
+      },
+      "current_full_reconcile_evidence_policy": {
+        "authority_derivation": "server_live_graph_snapshot_verification",
+        "authority_object_path": "payload.reconcile_authority",
+        "authority_source": "graph_snapshot_store.current_full_reconcile_state",
+        "caller_authority_fields_trusted": false,
+        "current_full_reconcile_required": true,
+        "enabled": true,
+        "line_ids": [
+          "observer_reconcile"
+        ],
+        "required_after": "observer_merge",
+        "required_commit_fields": [
+          "merged_commit_sha",
+          "reconciled_commit_sha",
+          "canonical_head_commit",
+          "active_snapshot_commit"
+        ],
+        "required_identity_fields": [
+          "project_id",
+          "backlog_id",
+          "contract_execution_id",
+          "runtime_context_id",
+          "task_id",
+          "target_project_root"
+        ],
+        "required_verification_fields": [
+          "db_verified",
+          "live_verified",
+          "canonical_head_verified",
+          "active_snapshot_verified",
+          "graph_reconciled",
+          "provenance_verified",
+          "provenance_scope_verified",
+          "durable_order_verified"
+        ],
+        "required_temporal_fields": [
+          "merge_event_id",
+          "merge_event_created_at",
+          "reconcile_event_id",
+          "reconcile_event_created_at"
+        ],
+        "qa_authority_required_before_reconcile": false,
+        "qa_authority_required_after_reconcile": true,
+        "required_temporal_order": "both_lane_merge_events_before_reconcile_event_before_fresh_qa",
+        "allow_taskless_reconcile_only_for_explicit_shared_batch": true,
+        "explicit_task_id_mismatch_policy": "fail_closed",
+        "observer_reconcile_next_action": {
+          "schema_version": "mf_parallel.observer_reconcile_next_action.v1",
+          "source_backed": true,
+          "copy_safe": true,
+          "route_scopes_interchangeable": false,
+          "canonical_runtime_task": {
+            "task_id_source": "dispatched_runtime_context.task_id",
+            "runtime_context_id_source": "dispatched_runtime_context.runtime_context_id",
+            "target_project_root_source": "dispatched_runtime_context.target_project_root",
+            "target_commit_sha_source": "canonical_target_head_commit",
+            "runtime_context_scope_submission": "server_derived_not_caller_supplied",
+            "explicit_task_id_mismatch_policy": "fail_closed"
+          },
+          "sequence": [
+            {
+              "order": 1,
+              "action": "graph_current_full_reconcile",
+              "route_kind": "reconcile_only",
+              "route_task_id_source": "dispatched_runtime_context.task_id",
+              "protected_action": "graph_current_full_reconcile",
+              "required_copy_safe_fields": [
+                "project_id",
+                "observer_session_id",
+                "route_token_ref",
+                "backlog_id",
+                "task_id",
+                "target_commit_sha"
+              ],
+              "server_derived_fields": [
+                "contract_execution_id",
+                "runtime_context_id",
+                "target_project_root"
+              ],
+              "task_scope_alias_policy": "submit_task_id_only_do_not_pair_with_contract_execution_id_alias",
+              "raw_route_token_required": false,
+              "produces": [
+                "active_snapshot_id",
+                "active_snapshot_commit",
+                "current_full_reconcile_provenance"
+              ]
+            },
+            {
+              "order": 2,
+              "action": "contract_runtime_submit_line",
+              "route_kind": "contract_runtime_submit",
+              "route_task_id_source": "contract_execution_id",
+              "line_id": "observer_reconcile",
+              "requires": [
+                "task_scoped_current_full_reconcile",
+                "authoritative_snapshot_verified"
+              ],
+              "raw_route_token_required": false
+            }
+          ],
+          "authoritative_snapshot": {
+            "source": "graph_snapshot_store.current_full_reconcile_state",
+            "strategy": "current_full_reconcile",
+            "caller_claims_trusted": false,
+            "required_checks": [
+              "db_verified",
+              "live_verified",
+              "canonical_head_verified",
+              "active_snapshot_verified",
+              "provenance_scope_verified",
+              "durable_order_verified"
+            ]
+          }
+        },
+        "schema_version": "contract_current_full_reconcile_evidence_policy.v1",
+        "strategy": "current_full_reconcile"
+      },
+      "source_asset_materialization_required": true,
+      "direct_trusted_graph_db_writes_allowed": false,
+      "graph_binding_gap_blocks_close": true
+    },
+    "fan_in_policy": {
+      "schema_version": "mf_parallel.two_worker_fan_in_policy.v1",
+      "required_worker_count": 2,
+      "barrier_line_id": "worker_finish_gate",
+      "merge_line_id": "observer_merge",
+      "merge_line_instances_required": 2,
+      "reconcile_after_all_merges": true,
+      "final_qa_after_reconcile": true,
+      "final_qa_target": "canonical_head_reconciled_graph"
+    },
+    "qa_no_pass_successor_policy": {
+      "schema_version": "mf_parallel.qa_no_pass_worker_fix_successor_policy.v2",
+      "enabled": true,
+      "verdict_owner_role": "qa",
+      "no_pass_statuses": [
+        "failed",
+        "fail",
+        "rejected",
+        "blocked",
+        "no_pass"
+      ],
+      "successor_contract_id": "mf_parallel.v2",
+      "successor_contract_version": "v2",
+      "successor_worker_role": "mf_sub",
+      "worker_fix_cardinality": 1,
+      "bounded_to_failed_qa_findings": true,
+      "return_sequence": [
+        "observer_merge",
+        "observer_reconcile",
+        "qa_graph_context",
+        "qa_independent_verification"
+      ],
+      "fresh_qa_session_required": true,
+      "observer_may_author_worker_fix_evidence": false,
+      "successor_mode": "same_contract_append_only_failed_qa_rework",
+      "allocation_tool": "parallel_branch_allocate",
+      "allocation_stage_type": "failed_qa_rework",
+      "minimum_attempt": 2,
+      "fresh_runtime_context_required": true,
+      "allocation_precheck_required": false,
+      "two_lane_fanout_repeated": false,
+      "direct_fix_allowed": false
+    },
+    "allocation_precheck_policy": {
+      "schema_version": "mf_parallel.allocation_precheck_policy.v1",
+      "enabled": true,
+      "tool": "parallel_branch_allocate_precheck",
+      "endpoint": "/api/graph-governance/{project_id}/parallel-branches/allocation-precheck",
+      "required_before": "initial_parallel_branch_allocate",
+      "expected_lane_count": 2,
+      "default_scope": "standalone_contract",
+      "allowed_lane_counts": [
+        1,
+        2
+      ],
+      "lane_count_policy": "exactly",
+      "atomic": true,
+      "cardinality_source": "runtime_guide.effective_worker_cardinality_policy.required_worker_count",
+      "effective_policy_projection": "runtime_guide.effective_allocation_precheck_policy",
+      "standalone_policy": {
+        "expected_lane_count": 2,
+        "atomic": true,
+        "scope": "standalone_contract"
+      },
+      "verified_batch_child_policy": {
+        "cardinality_source": "verified_batch_child_lineage",
+        "expected_lane_count": 1,
+        "atomic": false,
+        "scope": "per_child_contract",
+        "cross_child_union_allowed": false,
+        "precheck_each_child_independently": true
+      },
+      "read_only": true,
+      "applies_to_stage_types": [
+        "mf_sub"
+      ],
+      "excluded_stage_types": [
+        "failed_qa_rework"
+      ],
+      "submit_returned_bodies_unchanged": true,
+      "required_checks": [
+        "child_route_ref_matches_contract_execution",
+        "distinct_route_token_ref",
+        "distinct_lane_identity",
+        "disjoint_owned_files",
+        "acceptance_union_closed",
+        "registered_repository_root",
+        "repository_local_worktree_path"
+      ],
+      "zero_write_surfaces": [
+        "runtime_context",
+        "worktree",
+        "merge_queue",
+        "timeline",
+        "contract_runtime"
+      ],
+      "external_path_policy": "diagnose_and_project_without_materialization",
+      "drift_gym_checkpoint_policy": "read_only",
+      "raw_private_context_exposed": false
+    }
+  },
+  "successors": [
+    {
+      "contract_id": "qa_evidence_gate_review.v1",
+      "reason": "Run a stricter QA evidence gate when parallel QA finds missing or ambiguous evidence.",
+      "version": "v1"
+    },
+    {
+      "contract_id": "mf_parallel.v2",
+      "version": "v2",
+      "mode": "same_contract_append_only_failed_qa_rework",
+      "reason": "After final canonical integration QA NO-PASS, allocate exactly one bounded failed_qa_rework worker tied to the failed QA source without repeating the initial required-lane fan-out, then merge, reconcile, and run a fresh independent QA session."
+    }
+  ],
+  "version": "v2"
+}

@@ -2378,6 +2378,46 @@ def _project_record_state(record: Mapping[str, Any]) -> dict[str, Any]:
     terminal_retirement = _terminal_retirement_record_projection(record)
     if terminal_retirement is not None:
         return terminal_retirement
+    terminal_supersession = terminal_supersession_receipt_for_record(record)
+    if terminal_supersession:
+        source_execution_id = str(
+            record.get("contract_execution_id") or ""
+        )
+        fresh_execution_id = str(
+            terminal_supersession.get("fresh_contract_execution_id") or ""
+        )
+        return {
+            # This is the projection of the terminal source record.  Preserve
+            # its custody identity here; the chain-level projection selects
+            # the fresh execution independently.
+            "current_contract_execution_id": source_execution_id,
+            "current_contract_id": _record_contract_id(record),
+            "parent_to_resume_contract_execution_id": "",
+            "active_child_contract_execution_id": "",
+            "readiness_state": "superseded_no_pass",
+            "disposition": "superseded_no_pass",
+            "terminal": True,
+            "scheduler_eligible": False,
+            "schedulable": False,
+            "current_eligible": False,
+            "close_eligible": False,
+            "closeable": False,
+            "resume_eligible": False,
+            "resumable": False,
+            "generation": int(record.get("execution_state_revision") or 0),
+            "next_legal_action": {},
+            "next_legal_execution_id": fresh_execution_id,
+            "terminal_disposition": {
+                "schema_version": (
+                    "contract_runtime.terminal_supersession_disposition.v1"
+                ),
+                "status": "superseded_no_pass",
+                "terminal": True,
+                "no_pass_claim": True,
+                "pass_synthesized": False,
+                "receipt": terminal_supersession,
+            },
+        }
     current_id = str(record.get("contract_execution_id") or "")
     current_contract_id = _record_contract_id(record)
     terminal = _audited_bypass_terminal_disposition(record)
@@ -2419,6 +2459,56 @@ def _project_record_state(record: Mapping[str, Any]) -> dict[str, Any]:
         "generation": int(record.get("execution_state_revision") or 0),
         "next_legal_action": next_action,
     }
+
+
+def terminal_supersession_receipt_for_record(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one server-derived immutable no-PASS supersession receipt."""
+
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    receipt = (
+        metadata.get("terminal_supersession_receipt")
+        if isinstance(
+            metadata.get("terminal_supersession_receipt"), Mapping
+        )
+        else {}
+    )
+    if not receipt:
+        return {}
+    receipt_hash = str(receipt.get("receipt_hash") or "").strip()
+    core = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"receipt_hash", "receipt_ref"}
+    }
+    source_execution_id = str(
+        receipt.get("source_contract_execution_id") or ""
+    ).strip()
+    fresh_execution_id = str(
+        receipt.get("fresh_contract_execution_id") or ""
+    ).strip()
+    if not (
+        receipt.get("schema_version")
+        == "mf_parallel.terminal_supersession_receipt.v1"
+        and receipt.get("server_derived") is True
+        and receipt.get("no_pass_claim") is True
+        and receipt.get("authoritative_pass_synthesized") is False
+        and receipt.get("old_execution_terminal") is True
+        and source_execution_id
+        and source_execution_id
+        == str(record.get("contract_execution_id") or "").strip()
+        and fresh_execution_id
+        and fresh_execution_id != source_execution_id
+        and receipt_hash
+        and receipt_hash == stable_sha256(core)
+    ):
+        return {}
+    return deepcopy(dict(receipt))
 
 
 def _project_direct_fix_state(

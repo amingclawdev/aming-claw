@@ -29,7 +29,9 @@ from agent.governance.contracts.runtime import (
     _enrich_qa_evidence_provenance,
     _line_status_allows_contract_completion,
     _mf_parallel_worker_commit_errors,
+    _project_record_state,
     _worker_commit_completed_implementation,
+    terminal_supersession_receipt_for_record,
 )
 from agent.governance.contracts.execution_state import build_execution_state
 
@@ -1066,6 +1068,141 @@ def test_mf_parallel_rev9_requires_two_lanes_before_merge_and_final_qa():
     assert current()["line_id"] == "qa_graph_context"
     finish_next()
     assert current()["line_id"] == "qa_independent_verification"
+
+
+def test_mf_parallel_rev10_preserves_rev9_nominal_machine_and_pins_common_rules():
+    registry = ContractDefinitionRegistry()
+    rev9 = registry.get(
+        "mf_parallel.v2", version="v2", revision="rev9"
+    )
+    rev10 = registry.get(
+        "mf_parallel.v2", version="v2", revision="rev10"
+    )
+    latest = registry.resolve_for_new_execution(
+        "mf_parallel.v2", version="v2"
+    )
+    package = registry.common_rule_package()
+    join = registry.resolve_common_rule_applicability(rev10)
+
+    assert rev10["rule_layer"]["stages"] == rev9["rule_layer"]["stages"]
+    assert latest["revision"] == "rev10"
+    assert join["authoritative"] is True
+    assert join["package_id"] == package["package_id"]
+    assert join["package_version"] == package["package_version"]
+    assert join["package_digest"] == package["package_digest"]
+    assert join["rule_ids"] == package["rule_ids"]
+    assert join["scopes"] == ["mf_parallel"]
+    assert join["omitted_rules_apply"] is False
+    assert join["server_inference_allowed"] is False
+    assert "AC-COMMON-COMMIT-IMMUTABLE-WORKER" in join["rule_ids"]
+
+    system = rev10["system_layer"]
+    assert "accepted_worker_commit_policy" not in system
+    assert system["legacy_reconcile_receipt_correction_policy"] == {
+        "schema_version": "mf_parallel.legacy_reconcile_receipt_correction_policy.v1",
+        "enabled_for_revision": False,
+        "revision": "rev10",
+        "same_revision_business_evidence_mutation_allowed": False,
+        "exact_duplicate_idempotency_transport_only": True,
+    }
+    successor_ids = {
+        successor["contract_id"] for successor in rev10["successors"]
+    }
+    assert "observer_hotfix" not in successor_ids
+    assert "audit_close_with_qa_acceptance.v1" not in successor_ids
+
+
+def test_mf_parallel_terminal_supersession_receipt_projects_old_record_no_pass():
+    source_execution_id = "cex-mf-parallel-source"
+    receipt = {
+        "schema_version": "mf_parallel.terminal_supersession_receipt.v1",
+        "server_derived": True,
+        "source_contract_execution_id": source_execution_id,
+        "fresh_contract_execution_id": "cex-mf-parallel-fresh",
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "old_execution_terminal": True,
+        "receipt_ref": "timeline:1",
+    }
+    receipt["receipt_hash"] = server.stable_sha256(
+        {key: value for key, value in receipt.items() if key != "receipt_ref"}
+    )
+    record = {
+        "contract_execution_id": source_execution_id,
+        "contract_id": "mf_parallel.v2",
+        "execution_state_revision": 14,
+        "metadata": {"terminal_supersession_receipt": receipt},
+    }
+
+    assert terminal_supersession_receipt_for_record(record) == receipt
+    projection = _project_record_state(record)
+    assert projection["current_contract_execution_id"] == source_execution_id
+    assert projection["active_child_contract_execution_id"] == ""
+    assert projection["readiness_state"] == "superseded_no_pass"
+    assert projection["terminal"] is True
+    assert projection["scheduler_eligible"] is False
+    assert projection["resume_eligible"] is False
+    assert projection["close_eligible"] is False
+    assert projection["next_legal_action"] == {}
+    assert projection["next_legal_execution_id"] == "cex-mf-parallel-fresh"
+    assert projection["terminal_disposition"]["no_pass_claim"] is True
+    assert projection["terminal_disposition"]["pass_synthesized"] is False
+
+    tampered = deepcopy(record)
+    tampered["metadata"]["terminal_supersession_receipt"][
+        "fresh_contract_execution_id"
+    ] = "cex-mf-parallel-conflict"
+    assert terminal_supersession_receipt_for_record(tampered) == {}
+    assert _project_record_state(tampered)["readiness_state"] != (
+        "superseded_no_pass"
+    )
+
+
+def test_mf_parallel_rev10_rejects_legacy_reconcile_business_correction(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_reconcile_receipt_resolution",
+        lambda *_args, **_kwargs: {
+            "status": "legacy_pending",
+            "source_line_index": 7,
+            "source_line": {"line_id": "observer_reconcile"},
+        },
+    )
+    record = {
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev10",
+        "contract_execution_id": "cex-rev10-reconcile-correction",
+        "completed_lines": [{"line_id": "observer_reconcile"}],
+    }
+    write = {
+        "stage_id": "reconcile",
+        "line_id": "observer_reconcile",
+        "evidence_kind": "reconcile",
+        "payload": {"reconcile_authority": {"record_verified": True}},
+    }
+
+    with pytest.raises(server.GovernanceError) as rejected:
+        server._contract_runtime_reconcile_receipt_correction(
+            None,
+            runtime=None,
+            project_id="aming-claw",
+            record=record,
+            write=write,
+            actor_role="observer",
+            mutate=True,
+        )
+
+    assert rejected.value.code == (
+        "mf_parallel_rev10_legacy_reconcile_correction_forbidden"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details[
+        "exact_duplicate_idempotency_transport_only"
+    ] is True
 
 
 def test_worker_commit_contract_accepts_target_relative_delta_with_inherited_projection():

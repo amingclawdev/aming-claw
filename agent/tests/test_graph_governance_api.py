@@ -68478,6 +68478,552 @@ def test_pre_lineage_rejoin_guide_advertises_one_bounded_replacement(
     assert exhausted["mode"] == "replacement_exhausted"
 
 
+def test_mf_parallel_rev10_terminal_supersession_is_atomic_and_idempotent(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="rev10-terminal-supersession",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+    )
+    first = _pre_lineage_rejoin(case)
+    _pre_lineage_rejoin(
+        case,
+        body_updates={
+            "session_token_ref": first["session_token_ref"],
+            "reason": "consume the only bounded replacement before supersession",
+        },
+    )
+    context = get_branch_context(conn, PID, case["task_id"])
+    assert context is not None
+    timeline_events = server._runtime_context_service_timeline_events(
+        conn,
+        project_id=PID,
+        task_id=context.task_id,
+        backlog_id=case["backlog_id"],
+    )
+    recovery = server._runtime_context_bounded_replacement_rejoin_authority(
+        conn,
+        project_id=PID,
+        context=context,
+        timeline_events=timeline_events,
+        body=None,
+    )
+    assert recovery["mode"] == "replacement_exhausted"
+    required_event_refs = list(
+        recovery["current_checkpoint_issuance_event_refs"]
+    ) + list(recovery["current_checkpoint_replacement_event_refs"])
+
+    source_record = server._contract_runtime_store(conn).get(
+        case["parent_task_id"]
+    )
+    source_next = server._runtime_next_action_from_guide(
+        source_record["runtime_guide"],
+        source="contract_runtime_current_state",
+    )
+    source_parent_id = source_record["parent_contract_execution_id"]
+    assert server._runtime_record_is_complete(
+        server._contract_runtime_store(conn).get(source_parent_id)
+    )
+
+    owned_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    acceptance = [
+        {
+            "id": "AC-REV10-TERMINAL-SUPERSESSION-TEST",
+            "text": "Reserve the two exact fresh rev10 lanes.",
+            "required_scope": {"kind": "files", "files": owned_files},
+        }
+    ]
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ?, "
+        "acceptance_criteria = ? WHERE bug_id = ?",
+        (
+            json.dumps(owned_files),
+            json.dumps([owned_files[1]]),
+            json.dumps(acceptance),
+            case["backlog_id"],
+        ),
+    )
+    conn.commit()
+
+    fresh_execution_id = "cex-mf-parallel-rev10-terminal-fresh"
+    fresh_task_id = "rev10-terminal-fresh"
+    repository_root = tmp_path / "rev10-terminal-repository"
+    base_commit = _init_test_git_repo(repository_root)
+    policy = {
+        "schema_version": "mf_parallel.terminal_supersession_policy.v1",
+        "enabled": True,
+        "source_project_id": PID,
+        "source_contract_execution_id": case["parent_task_id"],
+        "source_backlog_id": case["backlog_id"],
+        "source_revision": source_record["revision"],
+        "source_execution_state_revision": source_record[
+            "execution_state_revision"
+        ],
+        "source_runtime_context_id": context.runtime_context_id,
+        "source_task_id": context.task_id,
+        "source_worker_slot_id": context.worker_slot_id,
+        "source_stage_checkpoint_id": recovery[
+            "current_stage_checkpoint_id"
+        ],
+        "source_next_action": {
+            key: source_next[key]
+            for key in (
+                "stage_id",
+                "line_id",
+                "evidence_kind",
+                "owner_role",
+            )
+        },
+        "required_recovery_mode": "replacement_exhausted",
+        "required_replacement_generation": recovery[
+            "replacement_generation"
+        ],
+        "required_rejoin_event_refs": required_event_refs,
+        "source_lane_forbidden_accepted_lines": [
+            "worker_implementation",
+            "worker_commit",
+            "worker_finish_time_attestation",
+            "worker_finish_gate",
+        ],
+        "user_authority_ref": "test:rev10-terminal-supersession",
+        "fresh_generation": 1,
+        "fresh_revision": "rev10",
+        "fresh_contract_execution_id": fresh_execution_id,
+        "fresh_contract_task_id": fresh_task_id,
+        "required_worker_count": 2,
+        "worker_count_policy": "exactly",
+        "atomic_reservation_required": True,
+        "fresh_worldref_policy": {
+            "schema_version": "mf_parallel.terminal_fresh_worldref_policy.v1",
+            "base_commit_source": (
+                "loaded_governance_runtime_identity_at_transition"
+            ),
+            "target_head_commit_source": (
+                "loaded_governance_runtime_identity_at_transition"
+            ),
+            "full_commit_required": True,
+            "registered_repository_object_required": True,
+            "runtime_stale_allowed": False,
+            "freeze_in_server_receipt": True,
+        },
+        "runtime_context_allocation_authority": (
+            "parallel_branch_allocate_precheck"
+        ),
+        "fresh_lanes": [
+            {
+                "lane_id": "server",
+                "task_id": "rev10-terminal-fresh-server",
+                "worker_id": "rev10-terminal-fresh-server",
+                "worker_slot_id": "rev10-terminal-fresh-server",
+                "owned_files": [owned_files[0]],
+            },
+            {
+                "lane_id": "regression",
+                "task_id": "rev10-terminal-fresh-regression",
+                "worker_id": "rev10-terminal-fresh-regression",
+                "worker_slot_id": "rev10-terminal-fresh-regression",
+                "owned_files": [owned_files[1]],
+            },
+        ],
+        "receipt_evidence_kind": "superseded_no_pass",
+        "old_execution_terminal": True,
+        "old_execution_pass_synthesized": False,
+        "forbidden_carry_forward": ["completed_lines"],
+        "forbidden_alternatives": ["bypass", "same_cex_retry"],
+        "exact_replay_idempotent": True,
+        "mismatch_policy": "zero_write_fail_closed",
+    }
+    monkeypatch.setattr(
+        server, "_mf_parallel_terminal_supersession_policy", lambda: policy
+    )
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_allocate_precheck_registered_repository",
+        lambda _project_id: repository_root,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    monkeypatch.setitem(
+        server.LOADED_RUNTIME_IDENTITY,
+        "loaded_commit",
+        base_commit,
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-rev10-terminal-test",
+    )
+    request = server._mf_parallel_terminal_supersession_expected_request(
+        policy
+    )
+    route_issue_action = server._mf_parallel_terminal_supersession_guide_action(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref=case["route_identity"]["route_token_ref"],
+        request_body={"observer_session_id": observer_session_id},
+    )
+    assert route_issue_action["action"] == (
+        "issue_terminal_supersession_route"
+    )
+    assert route_issue_action["mcp_tool"] == "observer_route_context_issue"
+    issued_terminal_route = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=route_issue_action["copy_safe_body"],
+        )
+    )
+    assert issued_terminal_route["ok"] is True
+    terminal_route_ref = issued_terminal_route["route_token_ref"]
+    guide_action = server._mf_parallel_terminal_supersession_guide_action(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref=terminal_route_ref,
+        request_body={"observer_session_id": observer_session_id},
+    )
+    assert guide_action["action"] == (
+        "terminal_supersede_no_pass_and_enter_fresh_rev10"
+    )
+    assert guide_action["facade"] == "mf_parallel_enter"
+    assert guide_action["mcp_tool"] == "mf_parallel_enter"
+    assert guide_action["copy_safe_body"]["metadata"] == {
+        "required_worker_count": 2,
+        "terminal_supersession": request,
+    }
+    assert "worker_fence" not in guide_action["copy_safe_body"]
+    assert guide_action["terminal_supersession_authority"][
+        "source_recovery_mode"
+    ] == "replacement_exhausted"
+    assert guide_action["terminal_supersession_authority"][
+        "no_pass_claim"
+    ] is True
+    assert guide_action["terminal_supersession_authority"][
+        "pass_synthesized"
+    ] is False
+    compact_guide = server._onboard_route_guide_service_response(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref=terminal_route_ref,
+        role="observer",
+        work_type="legacy_operator_recovery",
+        response_view="compact",
+        request_body={"observer_session_id": observer_session_id},
+    )
+    assert compact_guide["next_legal_action"]["action"] == (
+        "terminal_supersede_no_pass_and_enter_fresh_rev10"
+    )
+    assert compact_guide["mcp_tool"] == "mf_parallel_enter"
+    assert compact_guide["canonical_executable_action"]["mcp_tool"] == (
+        "mf_parallel_enter"
+    )
+    compact_authority = compact_guide["next_legal_action"][
+        "terminal_supersession_authority"
+    ]
+    assert compact_authority["scheduler_eligible_before_transition"] is False
+    assert compact_authority["no_pass_claim"] is True
+
+    before_mismatch = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as mismatch:
+        server._mf_parallel_terminal_supersession_enter(
+            conn,
+            project_id=PID,
+            backlog_id=case["backlog_id"],
+            task_id=fresh_task_id,
+            actor_role="observer",
+            route_token_ref=terminal_route_ref,
+            reason="reject a conflicting terminal supersession request",
+            request={**request, "fresh_generation": 2},
+            requested_contract_execution_id=fresh_execution_id,
+        )
+    assert mismatch.value.code == (
+        "mf_parallel_terminal_supersession_request_mismatch"
+    )
+    assert "\n".join(conn.iterdump()) == before_mismatch
+
+    enter_body = copy.deepcopy(
+        compact_guide["canonical_executable_action"]["copy_safe_body"]
+    )
+    enter_body.pop("project_id")
+    enter_body["reason"] = (
+        "terminalize the exhausted source and reserve rev10 exactly once"
+    )
+    invalid_session_body = copy.deepcopy(enter_body)
+    invalid_session_body["observer_session_id"] = "obs-rev10-not-active"
+    before_invalid_session = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as invalid_session:
+        server.handle_project_mf_parallel_enter(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=invalid_session_body,
+            )
+        )
+    assert invalid_session.value.code == (
+        "mf_parallel_terminal_supersession_observer_proof_invalid"
+    )
+    assert "\n".join(conn.iterdump()) == before_invalid_session
+
+    original_row_scope = conn.execute(
+        "SELECT target_files, test_files FROM backlog_bugs WHERE bug_id = ?",
+        (case["backlog_id"],),
+    ).fetchone()
+    assert original_row_scope is not None
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = '[]', test_files = '[]' "
+        "WHERE bug_id = ?",
+        (case["backlog_id"],),
+    )
+    conn.commit()
+    before_row_drift_rejection = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as row_drift:
+        server._mf_parallel_terminal_supersession_enter(
+            conn,
+            project_id=PID,
+            backlog_id=case["backlog_id"],
+            task_id=fresh_task_id,
+            actor_role="observer",
+            route_token_ref=terminal_route_ref,
+            reason="reject row scope drift after Guide projection",
+            request=request,
+            requested_contract_execution_id=fresh_execution_id,
+        )
+    assert row_drift.value.code == (
+        "mf_parallel_terminal_supersession_lane_scope_mismatch"
+    )
+    assert "\n".join(conn.iterdump()) == before_row_drift_rejection
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ? "
+        "WHERE bug_id = ?",
+        (
+            original_row_scope["target_files"],
+            original_row_scope["test_files"],
+            case["backlog_id"],
+        ),
+    )
+    conn.commit()
+
+    before_injected_failure = "\n".join(conn.iterdump())
+    original_successor_enter = server._mf_parallel_successor_runtime_enter
+
+    def fail_after_fresh_execution_write(*args, **kwargs):
+        original_successor_enter(*args, **kwargs)
+        raise RuntimeError("injected terminal supersession write failure")
+
+    with monkeypatch.context() as fault_patch:
+        fault_patch.setattr(
+            server,
+            "_mf_parallel_successor_runtime_enter",
+            fail_after_fresh_execution_write,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="injected terminal supersession write failure",
+        ):
+            server.handle_project_mf_parallel_enter(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body=enter_body,
+                )
+            )
+    assert "\n".join(conn.iterdump()) == before_injected_failure
+
+    result = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=enter_body,
+        )
+    )
+    assert result["ok"] is True
+    assert result["terminal_supersession_replay"] is False
+    assert result["writes_performed"] is True
+    assert result["terminal_supersession_receipt"]["no_pass_claim"] is True
+    assert result["terminal_supersession_receipt"][
+        "authoritative_pass_synthesized"
+    ] is False
+    assert result["contract_chain_current"][
+        "current_contract_execution_id"
+    ] == fresh_execution_id
+    assert len(result["reserved_lanes"]) == 2
+    assert result["raw_session_token_exposed"] is False
+    assert result["raw_fence_token_exposed"] is False
+    assert result["route_token_ref"] == ""
+    fresh_contract_route_issue_body = result["route_token_ref_guidance"][
+        "observer_route_context_issue_payload"
+    ]
+    assert fresh_contract_route_issue_body["task_id"] == fresh_execution_id
+    issued_fresh_contract_route = (
+        server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=fresh_contract_route_issue_body,
+            )
+        )
+    )
+    if isinstance(issued_fresh_contract_route, tuple):
+        fresh_route_status, issued_fresh_contract_route = (
+            issued_fresh_contract_route
+        )
+        assert fresh_route_status in {200, 201}, issued_fresh_contract_route
+    assert issued_fresh_contract_route["ok"] is True
+    assert issued_fresh_contract_route["route_token_ref"]
+
+    old_record = server._contract_runtime_store(conn).get(
+        case["parent_task_id"]
+    )
+    projected_old, terminal_projection = (
+        server._mf_parallel_apply_terminal_supersession_projection(old_record)
+    )
+    assert terminal_projection["terminal"] is True
+    assert projected_old["runtime_guide"]["next_legal_action"] is None
+    assert projected_old["terminal_supersession_refusal"][
+        "scheduler_eligible"
+    ] is False
+    fresh_record = server._contract_runtime_store(conn).get(fresh_execution_id)
+    assert fresh_record["revision"] == "rev10"
+    assert fresh_record["completed_lines"] == []
+    assert fresh_record["metadata"]["old_evidence_carry_forward"] is False
+    assert all(
+        lane["reservation_only"] is True
+        and lane["runtime_context_persisted"] is False
+        and lane["worktree_materialized"] is False
+        and lane["credentials_issued"] is False
+        and "fence_token_verifier" not in lane
+        and "runtime_context_id" not in lane
+        and "worktree_path" not in lane
+        for lane in result["reserved_lanes"]
+    )
+    assert all(
+        get_branch_context(conn, PID, lane["task_id"]) is None
+        for lane in result["reserved_lanes"]
+    )
+    dispatch_plan = result["fresh_dispatch_plan"]
+    assert dispatch_plan["runtime_contexts_already_created"] is False
+    allocation_route_refs = {}
+    for route_action in dispatch_plan["route_issue_actions"]:
+        issued_lane_route = server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=route_action["copy_safe_body"],
+            )
+        )
+        assert issued_lane_route["ok"] is True
+        allocation_route_refs[route_action["lane_id"]] = (
+            issued_lane_route["route_token_ref"]
+        )
+    precheck_body = copy.deepcopy(
+        dispatch_plan["allocation_precheck_action"][
+            "copy_safe_body_template"
+        ]
+    )
+    precheck_body.pop("project_id")
+    for lane in precheck_body["lanes"]:
+        lane.pop("route_token_ref_from")
+        lane["route_token_ref"] = allocation_route_refs[lane["lane_id"]]
+        lane.pop("lane_id")
+    allocation_precheck = (
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=precheck_body,
+            )
+        )
+    )
+    assert allocation_precheck["status"] == "ready"
+    assert allocation_precheck["lane_count"] == 2
+    allocated_lanes = []
+    for body in allocation_precheck["copy_safe_allocation_bodies"]:
+        status, allocated = (
+            server.handle_graph_governance_parallel_branch_allocate(
+                _ctx(
+                    {"project_id": PID},
+                    method="POST",
+                    body=body,
+                )
+            )
+        )
+        assert status == 201
+        assert allocated["allocation_precheck_verification"]["verified"] is True
+        allocated_lanes.append(allocated)
+    assert {
+        lane["context"]["task_id"] for lane in allocated_lanes
+    } == {lane["task_id"] for lane in policy["fresh_lanes"]}
+    assert all(
+        Path(lane["context"]["worktree_path"]).is_dir()
+        for lane in allocated_lanes
+    )
+    allocated_verifiers = {}
+    for lane in allocated_lanes:
+        allocated_context = get_branch_context(
+            conn,
+            PID,
+            lane["context"]["task_id"],
+        )
+        assert allocated_context is not None
+        allocated_verifiers[allocated_context.task_id] = (
+            runtime_context_fence_token_verifier(allocated_context)
+        )
+    assert all(allocated_verifiers.values())
+    supersession_events = [
+        event
+        for event in task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=case["backlog_id"],
+            task_id=fresh_task_id,
+        )
+        if event["event_type"] == "mf_parallel.terminal_superseded_no_pass"
+    ]
+    assert len(supersession_events) == 1
+    assert server._mf_parallel_terminal_supersession_guide_action(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        route_token_ref=case["route_identity"]["route_token_ref"],
+        request_body={"observer_session_id": observer_session_id},
+    ) == {}
+
+    before_replay = "\n".join(conn.iterdump())
+    replay = server._mf_parallel_terminal_supersession_enter(
+        conn,
+        project_id=PID,
+        backlog_id=case["backlog_id"],
+        task_id=fresh_task_id,
+        actor_role="observer",
+        route_token_ref=terminal_route_ref,
+        reason="replay the exact immutable request",
+        request=request,
+        requested_contract_execution_id=fresh_execution_id,
+    )
+    assert replay["terminal_supersession_replay"] is True
+    assert replay["writes_performed"] is False
+    assert replay["terminal_supersession_receipt"] == result[
+        "terminal_supersession_receipt"
+    ]
+    assert "\n".join(conn.iterdump()) == before_replay
+
+
 def test_compact_legacy_recovery_projects_managed_observer_hotfix_attempt(
     conn,
     monkeypatch,
