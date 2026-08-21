@@ -57199,6 +57199,345 @@ def test_exact_candidate_runtime_comparison_base_resolves_child_cex(
     ) == base_commit
 
 
+def test_exact_candidate_runtime_comparison_authority_joins_parent_postmerge_cex(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-EXACT-CANDIDATE-POSTMERGE-CEX"
+    execution_id = "cex-exact-candidate-postmerge"
+    candidate_commit = "c" * 40
+    comparison_base = "b" * 40
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev9",
+        "completed_lines": [],
+    }
+
+    class Store:
+        @staticmethod
+        def get(candidate_execution_id):
+            assert candidate_execution_id == execution_id
+            return copy.deepcopy(record)
+
+        @staticmethod
+        def list_by_backlog(**kwargs):
+            assert kwargs == {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+            }
+            return [copy.deepcopy(record)]
+
+    ticket = {
+        "schema_version": "contract_runtime.rev8_postmerge_qa_authority.v1",
+        "status": "verified",
+        "verified": True,
+        "server_derived": True,
+        "db_verified": True,
+        "live_verified": True,
+        "graph_reconciled": True,
+        "active_snapshot_verified": True,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": "mfrctx-exact-candidate-postmerge",
+        "task_id": "exact-candidate-postmerge-worker",
+        "parent_task_id": execution_id,
+        "qa_graph_trace_task_id": execution_id,
+        "qa_graph_trace_task_source": (
+            "ContractRuntime.contract_execution_id"
+        ),
+        "candidate_commit_sha": candidate_commit,
+        "reconciled_commit_sha": candidate_commit,
+        "canonical_head_commit": candidate_commit,
+        "active_snapshot_commit": candidate_commit,
+    }
+    ticket["authority_hash"] = server.stable_sha256(ticket)
+    comparison_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: Store())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(ticket),
+    )
+
+    def comparison_authority(_conn, **kwargs):
+        comparison_calls.append(kwargs)
+        return {
+            "commit_sha": comparison_base,
+            "source": server._QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_comparison_authority",
+        comparison_authority,
+    )
+    monkeypatch.setattr(
+        server,
+        "_qa_exact_candidate_direct_main_comparison_authority",
+        lambda *_args, **_kwargs: pytest.fail(
+            "combined post-merge QA must not fall through to Direct Main"
+        ),
+    )
+    proof = {
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "commit_sha": candidate_commit,
+        # Caller-provided comparison identity is deliberately untrusted.
+        "comparison_base_commit_sha": "f" * 40,
+    }
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=proof,
+    )
+
+    assert authority == {
+        "commit_sha": comparison_base,
+        "source": server._QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+        "lineage_source": (
+            server._QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE
+        ),
+    }
+    assert comparison_calls == [
+        {
+            "project_id": PID,
+            "record": record,
+            "expected_candidate_commit": candidate_commit,
+        }
+    ]
+    assert server._qa_exact_candidate_comparison_authority_required(
+        conn,
+        project_id=PID,
+        proof=proof,
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_authority",
+        "wrong_backlog",
+        "wrong_candidate",
+        "wrong_execution",
+        "forged_authority_hash",
+    ),
+)
+def test_exact_candidate_parent_postmerge_comparison_authority_fails_closed(
+    conn,
+    monkeypatch,
+    mutation,
+):
+    backlog_id = "AC-EXACT-CANDIDATE-POSTMERGE-FAIL-CLOSED"
+    execution_id = "cex-exact-candidate-postmerge-fail-closed"
+    candidate_commit = "c" * 40
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev8",
+        "completed_lines": [],
+    }
+    ticket = {
+        "status": "verified",
+        "verified": True,
+        "server_derived": True,
+        "db_verified": True,
+        "live_verified": True,
+        "graph_reconciled": True,
+        "active_snapshot_verified": True,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "parent_task_id": execution_id,
+        "qa_graph_trace_task_id": execution_id,
+        "qa_graph_trace_task_source": (
+            "ContractRuntime.contract_execution_id"
+        ),
+        "candidate_commit_sha": candidate_commit,
+        "reconciled_commit_sha": candidate_commit,
+        "canonical_head_commit": candidate_commit,
+        "active_snapshot_commit": candidate_commit,
+    }
+    ticket["authority_hash"] = server.stable_sha256(ticket)
+    if mutation == "missing_authority":
+        ticket = {}
+    elif mutation == "wrong_backlog":
+        record["backlog_id"] = "AC-WRONG-BACKLOG"
+    elif mutation == "wrong_candidate":
+        for field in (
+            "candidate_commit_sha",
+            "reconciled_commit_sha",
+            "canonical_head_commit",
+            "active_snapshot_commit",
+        ):
+            ticket[field] = "d" * 40
+        ticket["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in ticket.items()
+                if key != "authority_hash"
+            }
+        )
+    elif mutation == "wrong_execution":
+        ticket["contract_execution_id"] = "cex-other"
+        ticket["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in ticket.items()
+                if key != "authority_hash"
+            }
+        )
+    else:
+        ticket["authority_hash"] = "sha256:" + "0" * 64
+
+    class Store:
+        @staticmethod
+        def get(_execution_id):
+            return copy.deepcopy(record)
+
+        @staticmethod
+        def list_by_backlog(**_kwargs):
+            return [copy.deepcopy(record)]
+
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: Store())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(ticket),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_comparison_authority",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unverified post-merge authority must stop before base resolution"
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_qa_exact_candidate_direct_main_comparison_authority",
+        lambda *_args, **_kwargs: pytest.fail(
+            "managed post-merge scope must never fall through to Direct Main"
+        ),
+    )
+    proof = {
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "commit_sha": candidate_commit,
+    }
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=proof,
+    )
+
+    assert authority.get("commit_sha", "") == ""
+    assert authority["machine_reason"] == (
+        "postmerge_comparison_authority_unverified"
+    )
+    assert server._qa_exact_candidate_comparison_authority_required(
+        conn,
+        project_id=PID,
+        proof=proof,
+    ) is True
+
+
+def test_exact_candidate_parent_postmerge_comparison_authority_rejects_ambiguity(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-EXACT-CANDIDATE-POSTMERGE-AMBIGUOUS"
+    execution_id = "cex-exact-candidate-postmerge-ambiguous"
+    candidate_commit = "c" * 40
+    records = [
+        {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "contract_id": "mf_parallel.v2",
+            "revision": "rev9",
+            "record_variant": variant,
+            "completed_lines": [],
+        }
+        for variant in ("first", "second")
+    ]
+
+    class Store:
+        @staticmethod
+        def get(_execution_id):
+            return copy.deepcopy(records[0])
+
+        @staticmethod
+        def list_by_backlog(**_kwargs):
+            return copy.deepcopy(records)
+
+    def postmerge_authority(_conn, *, record, **_kwargs):
+        authority = {
+            "verified": True,
+            "server_derived": True,
+            "db_verified": True,
+            "live_verified": True,
+            "graph_reconciled": True,
+            "active_snapshot_verified": True,
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "parent_task_id": execution_id,
+            "qa_graph_trace_task_id": execution_id,
+            "qa_graph_trace_task_source": (
+                "ContractRuntime.contract_execution_id"
+            ),
+            "candidate_commit_sha": candidate_commit,
+            "reconciled_commit_sha": candidate_commit,
+            "canonical_head_commit": candidate_commit,
+            "active_snapshot_commit": candidate_commit,
+            "record_variant": record["record_variant"],
+        }
+        authority["authority_hash"] = server.stable_sha256(authority)
+        return authority
+
+    monkeypatch.setattr(server, "_contract_runtime_store", lambda _conn: Store())
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        postmerge_authority,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_comparison_authority",
+        lambda _conn, *, record, **_kwargs: {
+            "commit_sha": (
+                "a" * 40
+                if record["record_variant"] == "first"
+                else "b" * 40
+            ),
+            "source": server._QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+        },
+    )
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": backlog_id,
+            "task_id": execution_id,
+            "commit_sha": candidate_commit,
+        },
+    )
+
+    assert authority.get("commit_sha", "") == ""
+    assert authority["machine_reason"] == (
+        "postmerge_comparison_authority_ambiguous"
+    )
+
+
 def test_qa_graph_bind_rejects_persisted_comparison_base_drift(monkeypatch):
     candidate_commit = "c" * 40
     persisted_base = "a" * 40
