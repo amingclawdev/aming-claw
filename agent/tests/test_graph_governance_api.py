@@ -165608,6 +165608,7 @@ def test_runtime_context_graph_guide_safe_ref_only_host_realization_warranty():
     assert action["host_realization"]["required_replacement_paths"] == [
         "copy_safe_body.args.query"
     ]
+    assert action["host_realization"]["mcp_invocation"] == "graph_query(**copy_safe_body)"
     assert action["host_realization"]["authority_inference_allowed"] is False
     assert action["safe_ref_policy"] == {
         "session_token_ref_rotation_is_authoritative": True,
