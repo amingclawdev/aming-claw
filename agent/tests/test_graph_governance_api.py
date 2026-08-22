@@ -91444,6 +91444,42 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         sort_keys=True,
     )
     assert close_authority["missing_requirement_ids"] == []
+    for passed_deployment_signal in (
+        "runtime_sync",
+        "governance_redeploy",
+    ):
+        mixed_deployment_record = copy.deepcopy(completed_record)
+        mixed_close_line = next(
+            line
+            for line in mixed_deployment_record["completed_lines"]
+            if line.get("line_id") == "observer_close_ready"
+        )
+        mixed_verification = mixed_close_line["payload"]["verification"]
+        for deployment_signal in (
+            "runtime_sync",
+            "governance_redeploy",
+        ):
+            mixed_verification[deployment_signal]["status"] = (
+                "passed"
+                if deployment_signal == passed_deployment_signal
+                else "failed"
+            )
+        mixed_deployment_authority = (
+            server._contract_runtime_operator_supervised_direct_main_close_authority_gate(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                record=mixed_deployment_record,
+                close_commit=implementation_commit,
+            )
+        )
+        assert mixed_deployment_authority["passed"] is True, (
+            passed_deployment_signal,
+            mixed_deployment_authority,
+        )
+        assert "direct_close_integrity_evidence" not in (
+            mixed_deployment_authority["missing_requirement_ids"]
+        )
     missing_runtime_sync_record = copy.deepcopy(completed_record)
     close_line = next(
         line
