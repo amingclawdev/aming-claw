@@ -1417,6 +1417,9 @@ def test_mf_sub_startup_accepts_initial_join_bound_actual_host_worker(
         desktop_session_id
     )
     assert initial_join["host_envelope"]["principal_id"] == governed_worker_id
+    assert initial_join["host_envelope"]["session_token_ref"] == (
+        initial_join["session_token_ref"]
+    )
 
     result = record_mf_subagent_startup(
         conn,
