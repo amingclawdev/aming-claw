@@ -141672,12 +141672,179 @@ def _onboard_route_guide_completed_mf_parallel_action_input(
     }
 
 
+def _onboard_route_guide_completed_mf_parallel_entry_authority(
+    conn,
+    *,
+    request_context: RequestContext | None,
+    project_id: str,
+    backlog_id: str,
+    parent_record: Mapping[str, Any],
+    route_token_ref: str,
+    target_files: Sequence[str],
+    request_body: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read-only proof that one projected rev10 enter body is executable."""
+
+    request = request_body if isinstance(request_body, Mapping) else {}
+    metadata = (
+        request.get("metadata")
+        if isinstance(request.get("metadata"), Mapping)
+        else {}
+    )
+    task_id = str(request.get("task_id") or "").strip()
+    reason = str(
+        request.get("reason") or request.get("human_reason") or ""
+    ).strip()
+    observer_session_id = str(
+        request.get("observer_session_id")
+        or request.get("observer_session_ref")
+        or ""
+    ).strip()
+    lane_intents = metadata.get("lane_intents")
+    syntactically_complete = bool(
+        request_context is not None
+        and route_token_ref
+        and observer_session_id
+        and task_id
+        and reason
+        and metadata.get("required_worker_count") == 2
+        and isinstance(lane_intents, list)
+        and len(lane_intents) == 2
+    )
+    authority = {
+        "schema_version": (
+            "onboard_route_guide.mf_parallel_entry_authority.v1"
+        ),
+        "evaluated": syntactically_complete,
+        "accepted": False,
+        "observer_proof_accepted": False,
+        "lane_plan_conformance_accepted": False,
+        "zero_write_projection": True,
+        "caller_claims_trusted": False,
+    }
+    if not syntactically_complete:
+        return authority
+
+    parent_execution_id = str(
+        parent_record.get("contract_execution_id") or ""
+    ).strip()
+    root_execution_id = str(
+        parent_record.get("root_contract_execution_id")
+        or parent_execution_id
+    ).strip()
+    try:
+        observer_proof = _resolve_contract_runtime_observer_proof(
+            request_context,
+            conn,
+            project_id=project_id,
+            action="mf_parallel_enter",
+            backlog_id=backlog_id,
+            contract_execution_id=parent_execution_id,
+        )
+        if not isinstance(observer_proof, Mapping):
+            raise PermissionDeniedError(
+                "coordinator",
+                "mf_parallel_enter",
+                {"proof_error": "observer_proof_missing"},
+            )
+        authority["observer_proof_accepted"] = True
+        route_identity = (
+            observer_proof.get("route_identity")
+            if isinstance(observer_proof.get("route_identity"), Mapping)
+            else {}
+        )
+        parent_route_binding = {
+            "schema_version": "mf_parallel.parent_route_binding.v1",
+            "source": "authenticated_observer_mf_parallel_enter",
+            "route_token_ref": route_token_ref,
+            "route_identity": {
+                field: str(route_identity.get(field) or "").strip()
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            },
+        }
+        parent_route_binding["binding_hash"] = stable_sha256(
+            parent_route_binding
+        )
+        row = conn.execute(
+            "SELECT test_files FROM backlog_bugs WHERE bug_id = ?",
+            (backlog_id,),
+        ).fetchone()
+        row_test_files = _string_list_field(
+            _row_get(row, "test_files", "")
+        )
+        acceptance_criteria, acceptance_scope_closure = (
+            _require_backlog_acceptance_file_fence_closure(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                allowed_files=target_files,
+                actor_role="observer",
+                reported_acceptance_criteria=(
+                    _ACCEPTANCE_SCOPE_REPORT_UNSET
+                ),
+                implementation_started=False,
+            )
+        )
+        execution_id = _mf_parallel_execution_id(
+            project_id,
+            backlog_id,
+            parent_execution_id,
+            task_id,
+        )
+        plan = _contract_runtime_mf_parallel_build_prefill_child_plan(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            parent_contract_execution_id=parent_execution_id,
+            root_contract_execution_id=root_execution_id,
+            required_worker_count=2,
+            declared_files=target_files,
+            row_test_files=row_test_files,
+            acceptance_criteria=acceptance_criteria,
+            acceptance_scope_closure=acceptance_scope_closure,
+            test_command_authority=(
+                _contract_runtime_mf_parallel_project_test_command_authority(
+                    project_id
+                )
+            ),
+            parent_route_binding=parent_route_binding,
+            lane_intents=lane_intents,
+        )
+    except (GovernanceError, PermissionDeniedError, ValidationError) as exc:
+        details = dict(getattr(exc, "details", {}) or {})
+        authority.update(
+            {
+                "error": str(getattr(exc, "code", "") or type(exc).__name__),
+                "proof_error": str(details.get("proof_error") or ""),
+                "field": str(details.get("field") or ""),
+                "errors": list(details.get("errors") or []),
+            }
+        )
+        return authority
+
+    authority.update(
+        {
+            "accepted": True,
+            "lane_plan_conformance_accepted": True,
+            "plan_hash": str(plan.get("plan_hash") or ""),
+            "parent_route_binding_hash": str(
+                parent_route_binding.get("binding_hash") or ""
+            ),
+            "contract_execution_id": execution_id,
+        }
+    )
+    return authority
+
+
 def _onboard_route_guide_completed_mf_parallel_successor_action_input(
     *,
     project_id: str,
     backlog_id: str,
     target_files: Sequence[str],
+    route_token_ref: str = "",
     request_body: Mapping[str, Any] | None = None,
+    entry_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Copy-safe second-step mf_parallel_enter input projected after route issue."""
 
@@ -141693,11 +141860,49 @@ def _onboard_route_guide_completed_mf_parallel_successor_action_input(
     supplied_lane_intents = (
         deepcopy(lane_intents) if isinstance(lane_intents, list) else None
     )
-    action_input_ready = bool(
+    observer_session_id = str(
+        request.get("observer_session_id")
+        or request.get("observer_session_ref")
+        or ""
+    ).strip()
+    effective_route_token_ref = str(
+        route_token_ref
+        or request.get("observer_route_token_ref")
+        or request.get("route_token_ref")
+        or ""
+    ).strip()
+    task_id = str(request.get("task_id") or "").strip()
+    reason = str(
+        request.get("reason") or request.get("human_reason") or ""
+    ).strip()
+    metadata_ready = bool(
         required_worker_count == 2
         and isinstance(supplied_lane_intents, list)
         and len(supplied_lane_intents) == 2
     )
+    missing_fields = [
+        field
+        for field, ready in (
+            ("observer_session_id", bool(observer_session_id)),
+            ("observer_route_token_ref", bool(effective_route_token_ref)),
+            ("task_id", bool(task_id)),
+            ("reason", bool(reason)),
+            (
+                "metadata.required_worker_count",
+                required_worker_count == 2,
+            ),
+            ("metadata.lane_intents", metadata_ready),
+        )
+        if not ready
+    ]
+    authority = (
+        dict(entry_authority)
+        if isinstance(entry_authority, Mapping)
+        else {}
+    )
+    if not missing_fields and authority.get("accepted") is not True:
+        missing_fields.append("verified_entry_authority")
+    action_input_ready = not missing_fields
     static_body = {
         "project_id": project_id,
         "backlog_id": backlog_id,
@@ -141705,11 +141910,22 @@ def _onboard_route_guide_completed_mf_parallel_successor_action_input(
         "target_files": scoped_target_files,
         "owned_files": scoped_target_files,
     }
-    if action_input_ready:
+    if metadata_ready:
         static_body["metadata"] = {
             "required_worker_count": required_worker_count,
             "lane_intents": supplied_lane_intents,
         }
+    copy_safe_body = (
+        {
+            **static_body,
+            "task_id": task_id,
+            "reason": reason,
+            "observer_session_id": observer_session_id,
+            "observer_route_token_ref": effective_route_token_ref,
+        }
+        if action_input_ready
+        else {}
+    )
     return {
         "schema_version": (
             "onboard_route_guide.mf_parallel_successor_action_input.v1"
@@ -141758,6 +141974,9 @@ def _onboard_route_guide_completed_mf_parallel_successor_action_input(
             },
         },
         "action_input_ready": action_input_ready,
+        "action_input_missing_fields": missing_fields,
+        "copy_safe_body": copy_safe_body,
+        "entry_authority": authority,
         "omitted_fields": ["contract_execution_id"],
         "contract_execution_id_required": False,
         "contract_execution_id_omitted": True,
@@ -142056,6 +142275,7 @@ def _onboard_route_guide_completed_next_action(
     target_files: Sequence[str] = (),
     request_body: Mapping[str, Any] | None = None,
     onboard_service_continuation_authority: Mapping[str, Any] | None = None,
+    mf_parallel_entry_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
@@ -142218,8 +142438,40 @@ def _onboard_route_guide_completed_next_action(
                 project_id=project_id,
                 backlog_id=backlog_id,
                 target_files=target_files,
+                route_token_ref=route_token_ref,
                 request_body=request_body,
+                entry_authority=mf_parallel_entry_authority,
             )
+        )
+        enter_action_ready = bool(
+            successor_action_input.get("action_input_ready")
+        )
+        enter_action_input = (
+            dict(successor_action_input.get("copy_safe_body") or {})
+            if enter_action_ready
+            else {}
+        )
+        route_issue_required = not bool(str(route_token_ref or "").strip())
+        host_precursor_action = (
+            {
+                "schema_version": "guide.host_precursor_action.v1",
+                "source_of_authority": (
+                    "onboard_route_guide.completed_mf_parallel_route_issue"
+                ),
+                "action": "observer_route_context_issue",
+                "facade": "observer_route_context_issue",
+                "mcp_tool": "observer_route_context_issue",
+                "method": "POST",
+                "path": (
+                    "/api/projects/{project_id}/observer/route-context/issue"
+                ),
+                "body_source": "copy_safe_body",
+                "copy_safe_body": dict(action_input),
+                "refresh_after_success": True,
+                "raw_route_token_exposed": False,
+            }
+            if route_issue_required
+            else {}
         )
         return {
             **base,
@@ -142240,9 +142492,20 @@ def _onboard_route_guide_completed_next_action(
                 ),
                 "raw_session_token_persisted": False,
             },
-            "action_input_interface": "observer_route_context_issue",
-            "action_input": action_input,
+            "action_input_interface": "mf_parallel_enter",
+            "action_input": enter_action_input,
             "action_input_copy_safe": True,
+            "action_input_ready": enter_action_ready,
+            "action_input_missing_fields": list(
+                successor_action_input.get("action_input_missing_fields") or []
+            ),
+            "host_precursor_action": host_precursor_action,
+            "observer_route_context_issue": {
+                "required": route_issue_required,
+                "mcp_tool": "observer_route_context_issue",
+                "copy_safe_body": dict(action_input),
+                "bind_response_field": "route_token_ref",
+            },
             "successor_action_input_interface": "mf_parallel_enter",
             "successor_action_input": successor_action_input,
             "allowed_actions": list(action_input["allowed_actions"]),
@@ -142811,7 +143074,15 @@ def _onboard_guide_capsule_bounded_section(
     if measured <= _ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES:
         return projected
     if isinstance(overflow_fallback, Mapping):
-        fallback = _onboard_guide_capsule_bounded_copy(overflow_fallback)
+        # The fallback deliberately removes the large advisory siblings and
+        # retains only the executable body plus its binding.  Preserve the
+        # ordinary typed lane structure inside that smaller body; the section
+        # byte cap remains the hard boundary and oversized fallbacks still use
+        # the existing lossless encoded continuation below.
+        fallback = _onboard_guide_capsule_bounded_copy(
+            overflow_fallback,
+            max_depth=8,
+        )
         if isinstance(fallback, Mapping):
             fallback = dict(fallback)
             if (
@@ -146241,6 +146512,22 @@ def _onboard_route_guide_compact_service_response(
     action_input, action_input_path = (
         _onboard_guide_capsule_find_action_input(next_action)
     )
+    host_precursor_action = (
+        dict(next_action.get("host_precursor_action"))
+        if isinstance(next_action.get("host_precursor_action"), Mapping)
+        else {}
+    )
+    if host_precursor_action:
+        action_input = dict(
+            host_precursor_action.get("copy_safe_body") or {}
+        )
+        action_input_path = "host_precursor_action.copy_safe_body"
+    elif next_action.get("action_input_ready") is False:
+        # A nested advisory body must never be paired with a deferred facade.
+        # Only an explicit host precursor may remain executable while the
+        # selected Contract action is not ready.
+        action_input = {}
+        action_input_path = ""
     successor_action_input = (
         _onboard_guide_capsule_bounded_section(
             next_action.get("successor_action_input"),
@@ -146380,7 +146667,9 @@ def _onboard_route_guide_compact_service_response(
                 else None
             ),
         )
-        if canonical_body and action
+        if canonical_body
+        and action
+        and next_action.get("action_input_ready") is not False
         else {}
     )
     blocker_ids = _onboard_guide_capsule_blocker_ids(next_action)
@@ -146752,11 +147041,6 @@ def _onboard_route_guide_compact_service_response(
             ),
         )
     )
-    host_precursor_action = (
-        dict(next_action.get("host_precursor_action"))
-        if isinstance(next_action.get("host_precursor_action"), Mapping)
-        else {}
-    )
     direct_main_evidence_shapes = (
         _onboard_parentless_direct_main_compact_evidence_guidance(
             project_id=project_id,
@@ -146986,10 +147270,15 @@ def _onboard_route_guide_compact_service_response(
             {
                 "refresh_required": True,
                 "expected_contract_action": str(
-                    canonical_executable_action.get("action") or ""
+                    canonical_executable_action.get("action")
+                    or next_action.get("action")
+                    or ""
                 ),
                 "mcp_tool": str(
-                    canonical_executable_action.get("mcp_tool") or ""
+                    canonical_executable_action.get("mcp_tool")
+                    or next_action.get("mcp_tool")
+                    or next_action.get("interface")
+                    or ""
                 ),
             }
             if host_precursor_required
@@ -147964,6 +148253,23 @@ def _onboard_route_guide_service_response(
         body={},
         metadata={},
     )
+    mf_parallel_entry_authority = {}
+    if (
+        str(role or "").strip() == "observer"
+        and str(work_type or "").strip() in {"parallel_worker", "mf_parallel"}
+    ):
+        mf_parallel_entry_authority = (
+            _onboard_route_guide_completed_mf_parallel_entry_authority(
+                conn,
+                request_context=request_context,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                parent_record=record,
+                route_token_ref=route_token_ref,
+                target_files=target_files,
+                request_body=request_body,
+            )
+        )
     current_projection = _contract_chain_current_projection(
         conn,
         project_id=project_id,
@@ -148188,6 +148494,7 @@ def _onboard_route_guide_service_response(
                 onboard_service_continuation_authority=(
                     onboard_service_continuation_authority
                 ),
+                mf_parallel_entry_authority=mf_parallel_entry_authority,
             )
         elif runtime_resume.get("scheduler_eligible") is False:
             next_action = {}
@@ -148207,6 +148514,7 @@ def _onboard_route_guide_service_response(
                 onboard_service_continuation_authority=(
                     onboard_service_continuation_authority
                 ),
+                mf_parallel_entry_authority=mf_parallel_entry_authority,
             )
     terminal_supersession_action = (
         _mf_parallel_terminal_supersession_guide_action(

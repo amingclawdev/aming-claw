@@ -115175,13 +115175,29 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
     assert next_action["interface"] == "mf_parallel_enter"
     assert next_action["requires_route_token_ref"] is True
     assert next_action["requires_active_observer_session"] is True
-    assert next_action["action_input_interface"] == "observer_route_context_issue"
+    assert next_action["action_input_interface"] == "mf_parallel_enter"
     assert next_action["successor_action_input_interface"] == "mf_parallel_enter"
     assert (
         next_action["mf_parallel_enter_contract_execution_id_required"] is False
     )
-    assert compact["action_input_path"] == "action_input"
-    assert action_input == {
+    assert next_action["action_input_ready"] is False
+    assert set(next_action["action_input_missing_fields"]) == {
+        "observer_session_id",
+        "observer_route_token_ref",
+        "task_id",
+        "reason",
+        "metadata.required_worker_count",
+        "metadata.lane_intents",
+    }
+    assert compact["host_precursor_required"] is True
+    assert compact["canonical_executable_action"] == {}
+    assert compact["mcp_tool"] == "observer_route_context_issue"
+    assert compact["action_input_path"] == (
+        "host_precursor_action.copy_safe_body"
+    )
+    assert action_input == {}
+    route_issue_body = compact["host_precursor_action"]["copy_safe_body"]
+    assert route_issue_body == {
         "project_id": PID,
         "caller_role": "observer",
         "backlog_id": backlog_id,
@@ -115226,6 +115242,7 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
         "metadata.lane_intents",
     }
     assert successor_action_input["action_input_ready"] is False
+    assert successor_action_input["copy_safe_body"] == {}
     assert "metadata" not in successor_action_input["static_body"]
     assert "<typed lane_intents" not in json.dumps(
         successor_action_input["static_body"]
@@ -115239,8 +115256,8 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
     assert "session_token" not in successor_action_input["static_body"]
     assert "route_token" not in successor_action_input["static_body"]
     serialized = json.dumps(compact, sort_keys=True)
-    assert "session_token" not in json.dumps(action_input, sort_keys=True)
-    assert "route_token" not in json.dumps(action_input, sort_keys=True)
+    assert "session_token" not in json.dumps(route_issue_body, sort_keys=True)
+    assert "route_token" not in json.dumps(route_issue_body, sort_keys=True)
     assert compact["raw_session_token_exposed"] is False
     assert compact["raw_route_token_exposed"] is False
     assert len(serialized.encode("utf-8")) <= 16 * 1024
@@ -115264,7 +115281,10 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
         capsule["sections"]["next_action"]["successor_action_input"]
         == successor_action_input
     )
-    assert capsule["sections"]["action_input"]["body"] == action_input
+    assert capsule["sections"]["action_input"]["body"] == route_issue_body
+    assert capsule["sections"]["action_input"]["host_precursor_action"] == (
+        compact["host_precursor_action"]
+    )
     assert (
         capsule["sections"]["action_input"]["successor_body"]
         == successor_action_input
@@ -115287,9 +115307,12 @@ def test_onboard_route_guide_compact_mf_parallel_projects_copy_safe_route_issue_
         )
     )
     assert other["guide_capsule_ref"] != compact["guide_capsule_ref"]
-    assert other["action_input"]["backlog_id"] == other_backlog_id
-    assert other["action_input"]["task_id"] == server._onboard_service_execution_id(
-        PID, other_backlog_id
+    assert other["action_input"] == {}
+    assert other["host_precursor_action"]["copy_safe_body"]["backlog_id"] == (
+        other_backlog_id
+    )
+    assert other["host_precursor_action"]["copy_safe_body"]["task_id"] == (
+        server._onboard_service_execution_id(PID, other_backlog_id)
     )
     assert other["next_legal_action"]["successor_action_input"]["static_body"][
         "backlog_id"
@@ -115338,6 +115361,205 @@ def test_completed_onboard_mf_parallel_does_not_project_unverified_one_lane_read
     assert projected["dynamic_fields"]["metadata.required_worker_count"][
         "placeholder"
     ] == "<required_worker_count: exactly 2>"
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "observer_session_id",
+        "observer_route_token_ref",
+        "task_id",
+        "reason",
+        "metadata.required_worker_count",
+        "metadata.lane_intents",
+    ],
+)
+def test_completed_onboard_mf_parallel_enter_projection_requires_complete_body(
+    missing_field,
+):
+    request_body = {
+        "observer_session_id": "obs-mf-parallel-guide-ready",
+        "task_id": "mf-parallel-guide-ready",
+        "reason": "Run the exact two-lane bounded plan.",
+        "metadata": {
+            "required_worker_count": 2,
+            "lane_intents": [
+                {
+                    "task_id": "mf-parallel-guide-ready-source",
+                    "worker_id": "source",
+                    "worker_slot_id": "source",
+                    "owned_files": ["agent/governance/server.py"],
+                },
+                {
+                    "task_id": "mf-parallel-guide-ready-test",
+                    "worker_id": "test",
+                    "worker_slot_id": "test",
+                    "owned_files": [
+                        "agent/tests/test_graph_governance_api.py"
+                    ],
+                },
+            ],
+        },
+    }
+    route_token_ref = "rtok-mf-parallel-guide-ready"
+    if missing_field == "observer_route_token_ref":
+        route_token_ref = ""
+    elif missing_field.startswith("metadata."):
+        request_body["metadata"].pop(missing_field.split(".", 1)[1])
+    else:
+        request_body.pop(missing_field)
+
+    projected = (
+        server._onboard_route_guide_completed_mf_parallel_successor_action_input(
+            project_id=PID,
+            backlog_id="AC-MF-PARALLEL-GUIDE-COMPLETE-BODY",
+            target_files=[
+                "agent/governance/server.py",
+                "agent/tests/test_graph_governance_api.py",
+            ],
+            route_token_ref=route_token_ref,
+            request_body=request_body,
+        )
+    )
+
+    assert projected["action_input_ready"] is False
+    assert projected["copy_safe_body"] == {}
+    assert missing_field in projected["action_input_missing_fields"]
+
+
+@pytest.mark.parametrize(
+    ("invalid_case", "expected_proof_error"),
+    [
+        ("inactive_session", "observer_session_not_active"),
+        ("wrong_action_route", "route_token_ref_action_not_allowed"),
+        ("duplicate_identity", ""),
+        ("non_object_lane", ""),
+        ("out_of_scope_file", ""),
+    ],
+)
+def test_completed_onboard_mf_parallel_enter_projection_requires_verified_authority(
+    conn,
+    invalid_case,
+    expected_proof_error,
+):
+    backlog_id = (
+        "AC-MF-PARALLEL-GUIDE-VERIFIED-"
+        + invalid_case.upper().replace("_", "-")
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps(
+                [
+                    "agent/governance/server.py",
+                    "agent/tests/test_graph_governance_api.py",
+                ]
+            ),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    initial = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "mf_parallel",
+                "response_view": "compact",
+            },
+        )
+    )
+    route_issue_body = copy.deepcopy(
+        initial["host_precursor_action"]["copy_safe_body"]
+    )
+    if invalid_case == "wrong_action_route":
+        route_issue_body["allowed_actions"] = [
+            "onboard_route_guide",
+            "graph_query",
+        ]
+    issued = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=route_issue_body,
+        )
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id=f"obs-mf-parallel-guide-{invalid_case}",
+    )
+    if invalid_case == "inactive_session":
+        observer_session_id = f"obs-mf-parallel-guide-{invalid_case}-missing"
+    lane_intents: list[Any] = [
+        {
+            "task_id": f"mf-parallel-guide-{invalid_case}-source",
+            "worker_id": "source",
+            "worker_slot_id": "source",
+            "owned_files": ["agent/governance/server.py"],
+        },
+        {
+            "task_id": f"mf-parallel-guide-{invalid_case}-test",
+            "worker_id": "test",
+            "worker_slot_id": "test",
+            "owned_files": ["agent/tests/test_graph_governance_api.py"],
+        },
+    ]
+    if invalid_case == "duplicate_identity":
+        lane_intents[1]["task_id"] = lane_intents[0]["task_id"]
+    elif invalid_case == "non_object_lane":
+        lane_intents[1] = "not-a-typed-lane"
+    elif invalid_case == "out_of_scope_file":
+        lane_intents[1]["owned_files"] = ["agent/tests/out_of_scope.py"]
+
+    refreshed = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "mf_parallel",
+                "response_view": "compact",
+                "route_token_ref": issued["route_token_ref"],
+                "observer_session_id": observer_session_id,
+                "task_id": f"mf-parallel-guide-{invalid_case}",
+                "reason": "Project only a server-verified two-lane plan.",
+                "metadata": {
+                    "required_worker_count": 2,
+                    "lane_intents": lane_intents,
+                },
+            },
+        )
+    )
+
+    next_action = refreshed["next_legal_action"]
+    authority = next_action["successor_action_input"]["entry_authority"]
+    assert next_action["action_input_ready"] is False
+    assert "verified_entry_authority" in next_action[
+        "action_input_missing_fields"
+    ]
+    assert refreshed["canonical_executable_action"] == {}
+    assert refreshed["action_input"] == {}
+    assert refreshed["host_precursor_required"] is False
+    assert authority["evaluated"] is True
+    assert authority["accepted"] is False
+    assert authority["zero_write_projection"] is True
+    assert authority["caller_claims_trusted"] is False
+    if expected_proof_error:
+        assert authority["proof_error"] == expected_proof_error
+        assert authority["observer_proof_accepted"] is False
+    else:
+        assert authority["observer_proof_accepted"] is True
+        assert authority["lane_plan_conformance_accepted"] is False
+        assert authority["errors"]
 
 
 def test_onboard_route_guide_keeps_blocked_candidate_audit_only_without_direct_fix(
@@ -158253,7 +158475,11 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
             },
         )
     )
-    action_input = guide["action_input"]
+    assert guide["action_input"] == {}
+    assert guide["canonical_executable_action"] == {}
+    assert guide["host_precursor_required"] is True
+    assert guide["mcp_tool"] == "observer_route_context_issue"
+    route_issue_body = guide["host_precursor_action"]["copy_safe_body"]
     compact_next_action = guide["next_legal_action"]
     successor_action_input = compact_next_action["successor_action_input"]
     capsule = server.handle_project_onboard_route_guide_capsule(
@@ -158270,6 +158496,7 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
         )
     )
     assert capsule["ok"] is True
+    assert capsule["sections"]["action_input"]["body"] == route_issue_body
     assert (
         capsule["sections"]["next_action"]["successor_action_input"]
         == successor_action_input
@@ -158340,7 +158567,7 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
         _ctx(
             {"project_id": PID},
             method="POST",
-            body=action_input,
+            body=route_issue_body,
         )
     )
     assert issued["ok"] is True
@@ -158364,32 +158591,88 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
         server._onboard_service_execution_id(PID, backlog_id)
     )
 
-    enter_body = {
-        **projected_static_body,
-        "reason": "Start bounded row-first mf_parallel work from projected route.",
-        "task_id": "row-first-mf-parallel-worker",
+    reason = "Start bounded row-first mf_parallel work from projected route."
+    lane_intents = [
+        {
+            "task_id": "row-first-mf-parallel-source",
+            "worker_id": "source",
+            "worker_slot_id": "source",
+            "owned_files": ["agent/governance/server.py"],
+        },
+        {
+            "task_id": "row-first-mf-parallel-test",
+            "worker_id": "test",
+            "worker_slot_id": "test",
+            "owned_files": ["agent/tests/test_graph_governance_api.py"],
+        },
+    ]
+    refresh_body = {
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "mf_parallel",
+        "response_view": "compact",
+        "route_token_ref": issued["route_token_ref"],
         "observer_session_id": observer_session_id,
-        "observer_route_token_ref": issued["route_token_ref"],
+        "task_id": "row-first-mf-parallel-worker",
+        "reason": reason,
         "metadata": {
             "required_worker_count": 2,
-            "lane_intents": [
-                {
-                    "task_id": "row-first-mf-parallel-source",
-                    "worker_id": "source",
-                    "worker_slot_id": "source",
-                    "owned_files": ["agent/governance/server.py"],
-                },
-                {
-                    "task_id": "row-first-mf-parallel-test",
-                    "worker_id": "test",
-                    "worker_slot_id": "test",
-                    "owned_files": [
-                        "agent/tests/test_graph_governance_api.py"
-                    ],
-                },
-            ],
+            "lane_intents": lane_intents,
         },
     }
+    refreshed = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=refresh_body,
+        )
+    )
+    assert refreshed["host_precursor_required"] is False
+    assert refreshed["mcp_tool"] == "mf_parallel_enter"
+    assert refreshed["next_legal_action"]["action_input_ready"] is True
+    assert refreshed["next_legal_action"].get("action_input_missing_fields", []) == []
+    entry_authority = refreshed["next_legal_action"][
+        "successor_action_input"
+    ]["entry_authority"]
+    assert entry_authority["accepted"] is True
+    enter_body = refreshed["canonical_executable_action"]["copy_safe_body"]
+    assert enter_body == refreshed["action_input"] == refreshed["copy_safe_body"]
+    assert enter_body["reason"] == reason
+    assert enter_body["observer_session_id"] == observer_session_id
+    assert enter_body["observer_route_token_ref"] == issued["route_token_ref"]
+    assert enter_body["metadata"] == {
+        "required_worker_count": 2,
+        "lane_intents": lane_intents,
+    }
+    refreshed_capsule = server.handle_project_onboard_route_guide_capsule(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "guide_capsule_ref": refreshed["guide_capsule_ref"],
+                "sections": ["next_action", "action_input"],
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "mf_parallel",
+            },
+        )
+    )
+    refreshed_capsule_action = refreshed_capsule["sections"]["action_input"]
+    assert refreshed_capsule_action["schema_version"] == (
+        "onboard_route_guide.action_input_continuation.v1"
+    )
+    assert refreshed_capsule_action[
+        "canonical_executable_action"
+    ]["copy_safe_body"] == enter_body
+    full_refresh = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={**refresh_body, "response_view": "full"},
+        )
+    )
+    assert full_refresh["next_legal_action"]["action_input"] == enter_body
+    assert full_refresh["next_legal_action"]["action_input_ready"] is True
     assert "contract_execution_id" not in enter_body
     missing_waiver_body = dict(enter_body)
     missing_waiver_body.pop("onboard_service_waiver")
@@ -158413,12 +158696,27 @@ def test_row_first_guide_route_issue_enters_mf_parallel_without_target_execution
     )
 
     service_task_id = server._onboard_service_execution_id(PID, backlog_id)
-    assert action_input["task_id"] == service_task_id
+    assert route_issue_body["task_id"] == service_task_id
     assert entered["ok"] is True
     assert entered["parent_contract_execution_id"] == service_task_id
     assert entered["root_contract_execution_id"] == service_task_id
     assert entered["contract_execution_id"]
     assert entered["next_legal_action"]["id"] == "observer_prefill_child_contracts"
+    record = server._contract_runtime_store(conn).get(
+        entered["contract_execution_id"]
+    )
+    plan = record["metadata"]["observer_prefill_child_plan"]
+    assert plan["required_worker_count"] == 2
+    assert [lane["task_id"] for lane in plan["lanes"]] == [
+        lane["task_id"] for lane in lane_intents
+    ]
+    assert entry_authority["contract_execution_id"] == entered[
+        "contract_execution_id"
+    ]
+    assert entry_authority["plan_hash"] == plan["plan_hash"]
+    assert entry_authority["parent_route_binding_hash"] == plan[
+        "parent_route_binding"
+    ]["binding_hash"]
 
 
 def test_mf_parallel_enter_rev8_accepts_explicit_standalone_one_worker(conn):
