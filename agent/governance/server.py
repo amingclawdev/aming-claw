@@ -72589,7 +72589,7 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
                     task_id=task_id,
                     parent_task_id=_runtime_context_mf_sub_parent_task_id(context),
                     backlog_id=str(getattr(context, "backlog_id", "") or ""),
-                    fence_token=str(getattr(context, "fence_token", "") or ""),
+                    fence_token=body_fence_token,
                     explicit_trace_ids=_explicit_graph_trace_ids,
                 )
             )

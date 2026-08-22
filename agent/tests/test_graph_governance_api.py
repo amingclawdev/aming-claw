@@ -163971,6 +163971,7 @@ def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
     task_id = "fence-token-db-trace-task"
     parent_task_id = "fence-token-db-trace-parent"
     fence_token = "fence-db-graph-trace"
+    fence_token_verifier = runtime_context_secret_hash(fence_token)
     worktree_path = "/tmp/nonexistent-fence-token-db-trace"
     branch_ref = "refs/heads/f2/fence-token-db-trace"
     trace_id = "gqt-fence-token-db-trace"
@@ -163991,7 +163992,8 @@ def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
             backlog_id="AC-RUNTIME-CONTEXT-GRAPH-TRACE-EVIDENCE-FENCE-TOKEN-20260614",
             branch_ref=branch_ref,
             status="worktree_ready",
-            fence_token=fence_token,
+            fence_token="",
+            fence_token_verifier=fence_token_verifier,
             worktree_path=worktree_path,
             base_commit=target_commit,
             head_commit=target_commit,
@@ -164059,6 +164061,10 @@ def test_finish_gate_db_graph_trace_evidence_carries_fence_token(conn):
     assert graph_trace["worker_role"] == "mf_sub"
     assert graph_trace["missing_trace_ids"] == []
     assert graph_trace["identity_mismatches"] == []
+    persisted = get_branch_context(conn, PID, task_id)
+    assert persisted is not None
+    assert persisted.fence_token == ""
+    assert persisted.fence_token_verifier == fence_token_verifier
 
 
 def test_finish_gate_explicit_worker_trace_ignores_same_task_qa_trace(conn):
