@@ -56113,6 +56113,10 @@ def test_observer_graph_query_route_ref_projects_scope_and_rejects_overrides(con
         "visible_injection_manifest_hash",
     ):
         assert identity[field] == issued["route_token"][field]
+    assert identity["commit_sha"] == ""
+    assert identity["graph_basis"] == ""
+    assert identity["root_identity_hash"] == ""
+    assert identity["query_root_identity_hash"] == ""
 
     mismatch_cases = [
         ({"task_id": "wrong-task"}, "observer_graph_query_route_scope_mismatch"),
@@ -90019,6 +90023,199 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     )
     assert routed["next_legal_action"]["copy_safe_body"]["task_id"] == task_id
 
+    graph_query_body = copy.deepcopy(
+        routed["next_legal_action"]["graph_query_close_authority"]
+        ["copy_safe_graph_query"]["arguments"]
+    )
+    assert graph_query_body["snapshot_id"] == "active"
+    assert "commit_sha" not in graph_query_body
+    assert "project_root" not in graph_query_body
+    graph_query_trace.ensure_schema(conn)
+
+    def trace_count() -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM graph_query_traces WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+
+    _activate_basic_graph(
+        conn,
+        "full-direct-main-rev2-stale-active",
+        commit_sha="f" * 40,
+    )
+    before_stale_query = trace_count()
+    with pytest.raises(GovernanceError) as stale_graph_world:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(graph_query_body),
+            )
+        )
+    assert stale_graph_world.value.code == (
+        "observer_direct_main_graph_world_mismatch"
+    )
+    assert stale_graph_world.value.details["zero_write_rejection"] is True
+    assert trace_count() == before_stale_query
+
+    exact_snapshot_id = "full-direct-main-rev2-current-world"
+    _activate_basic_graph(
+        conn,
+        exact_snapshot_id,
+        commit_sha=parent_commit,
+    )
+    forged_graph_body = {
+        **copy.deepcopy(graph_query_body),
+        "commit_sha": "e" * 40,
+    }
+    before_forged_query = trace_count()
+    with pytest.raises(GovernanceError) as forged_graph_world:
+        server.handle_graph_governance_query(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=forged_graph_body,
+            )
+        )
+    assert forged_graph_world.value.code == (
+        "observer_direct_main_graph_world_mismatch"
+    )
+    assert trace_count() == before_forged_query
+
+    started_trace = server.handle_graph_governance_query_trace_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(graph_query_body),
+        )
+    )
+    started_trace_id = started_trace["trace"]["trace_id"]
+    started_world = conn.execute(
+        """SELECT snapshot_id, commit_sha, graph_basis, root_identity_json,
+                  root_identity_hash, query_root_identity_hash
+             FROM graph_query_traces WHERE trace_id = ?""",
+        (started_trace_id,),
+    ).fetchone()
+    assert started_world["snapshot_id"] == exact_snapshot_id
+    assert started_world["commit_sha"] == ""
+    assert started_world["graph_basis"] == ""
+    assert json.loads(started_world["root_identity_json"]) == {}
+    assert started_world["root_identity_hash"] == ""
+    assert started_world["query_root_identity_hash"] == ""
+
+    finished_without_query = server.handle_graph_governance_query_trace_finish(
+        _ctx_with_role(
+            {"project_id": PID, "trace_id": started_trace_id},
+            "observer",
+            method="POST",
+            body={"status": "complete", "reason": "zero-event-warranty"},
+        )
+    )
+    assert finished_without_query["trace"]["status"] == "complete"
+    assert finished_without_query["trace"]["event_count"] == 0
+    zero_event_body = _canonical_parentless_direct_main_pre_mutation_body(
+        append_base={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "route_token_ref": route_token_ref,
+        },
+        route_identity=route_identity,
+        allowed_files=row_files,
+        graph_trace_ids=[started_trace_id],
+        approval_ref="operator-direct-main-rev2-single-admission",
+    )
+    zero_event_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as zero_event_rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(zero_event_body),
+            )
+        )
+    assert zero_event_rejected.value.code == (
+        "parentless_direct_main_pre_mutation_authority_incomplete"
+    )
+    assert conn.total_changes == zero_event_changes
+    assert server._operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    ) == []
+
+    graph_only_route = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=row_files,
+        allowed_actions=["graph_query"],
+        evidence_refs=["timeline:direct-main-graph-only-route"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=graph_only_route["route_token_ref"],
+        token=graph_only_route["route_token"],
+    )
+    graph_only_query = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                **copy.deepcopy(graph_query_body),
+                "tool": "query_schema",
+                "args": {},
+                "route_token_ref": graph_only_route["route_token_ref"],
+            },
+        )
+    )
+    assert graph_only_query["ok"] is True
+    assert graph_only_query["graph_query_identity"]["commit_sha"] == ""
+    assert graph_only_query["graph_query_identity"]["root_identity_hash"] == ""
+
+    real_graph_query = server.handle_graph_governance_query(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(graph_query_body),
+        )
+    )
+    assert real_graph_query["ok"] is True
+    trace_id = real_graph_query["trace_id"]
+    direct_graph_identity = real_graph_query["graph_query_identity"]
+    assert direct_graph_identity["actor"] == "observer"
+    assert direct_graph_identity["qa_session_id"] == ""
+    assert direct_graph_identity["qa_scope_binding_ref"] == ""
+    assert direct_graph_identity["commit_sha"] == parent_commit
+    one_shot_world = conn.execute(
+        """SELECT snapshot_id, commit_sha, graph_basis, root_identity_json,
+                  root_identity_hash, query_root_identity_hash, status
+             FROM graph_query_traces WHERE trace_id = ?""",
+        (trace_id,),
+    ).fetchone()
+    assert one_shot_world["snapshot_id"] == exact_snapshot_id
+    assert one_shot_world["commit_sha"] == parent_commit
+    assert one_shot_world["graph_basis"] == ""
+    assert one_shot_world["status"] == "complete"
+    one_shot_root_identity = json.loads(one_shot_world["root_identity_json"])
+    assert one_shot_root_identity["schema_version"] == (
+        "graph_query.root_identity.v1"
+    )
+    assert one_shot_root_identity["query_root"] == str(project_root.resolve())
+    assert one_shot_root_identity["canonical_project_root"] == str(
+        project_root.resolve()
+    )
+    assert one_shot_world["root_identity_hash"] == server.stable_sha256(
+        one_shot_root_identity
+    )
+    assert one_shot_world["query_root_identity_hash"].startswith("sha256:")
+
     no_cex_changes = conn.total_changes
     with pytest.raises(GovernanceError) as no_cex_implementation:
         server.handle_task_timeline_append(
@@ -90054,7 +90251,7 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     assert no_cex_implementation.value.details["zero_write_rejection"] is True
     assert conn.total_changes == no_cex_changes
 
-    trace_id = "gqt-20260822-d1a2c3e4f5"
+    missing_trace_id = "gqt-20260822-d1a2c3e4f5"
     rejected_body = _canonical_parentless_direct_main_pre_mutation_body(
         append_base={
             "backlog_id": backlog_id,
@@ -90063,7 +90260,7 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         },
         route_identity=route_identity,
         allowed_files=row_files,
-        graph_trace_ids=[trace_id],
+        graph_trace_ids=[missing_trace_id],
         approval_ref="operator-direct-main-rev2-single-admission",
     )
     changes_before_rejection = conn.total_changes
@@ -90133,18 +90330,6 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         backlog_id=backlog_id,
     ) == []
 
-    _insert_observer_graph_query_trace(
-        conn,
-        trace_id=trace_id,
-        snapshot_id="full-direct-main-rev2-pre-mutation",
-        query_purpose="gate_validation",
-        backlog_id=backlog_id,
-        task_id=task_id,
-        route_identity=route_identity,
-        commit_sha=parent_commit,
-        target_project_root=str(project_root),
-    )
-    conn.commit()
     append_body = _canonical_parentless_direct_main_pre_mutation_body(
         append_base={
             "backlog_id": backlog_id,
@@ -105926,6 +106111,7 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     )
     assert graph_query_arguments == {
         "project_id": PID,
+        "snapshot_id": "active",
         "tool": "find_node_by_path",
         "args": {"path": "agent/governance/server.py"},
         "query_source": "observer",
@@ -105933,6 +106119,16 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
         "route_token_ref": route_token_ref,
         "backlog_id": backlog_id,
         "task_id": parent_execution_id,
+    }
+    assert graph_query_authority["server_derived_world_ref"] == {
+        "snapshot_selector": "active",
+        "commit_and_root_are_caller_inputs": False,
+        "commit_source": (
+            "operator_supervised_direct_main.pre_mutation_world_ref"
+        ),
+        "root_source": "registered_canonical_project_root",
+        "snapshot_commit_must_match_world_ref": True,
+        "mismatch_creates_trace": False,
     }
     assert graph_query_authority["exploration_only"]["query_purposes"] == [
         "inspect_node"
@@ -109960,6 +110156,7 @@ def test_onboard_contract_facade_starts_current_and_submits_source_backed_root(c
     assert copy_safe_query["raw_route_token_required"] is False
     assert copy_safe_query["arguments"] == {
         "project_id": PID,
+        "snapshot_id": "active",
         "tool": "find_node_by_path",
         "args": {"path": "agent/governance/server.py"},
         "query_source": "observer",

@@ -14712,6 +14712,375 @@ def _observer_graph_query_route_authority(
     return proof
 
 
+def _observer_parentless_direct_main_graph_world_authority(
+    conn,
+    *,
+    project_id: str,
+    body: dict[str, Any],
+    route_proof: Mapping[str, Any],
+    action: str,
+) -> dict[str, Any]:
+    """Bind strict Direct rev2 observer traces to the current server world."""
+
+    query_source = str(body.get("query_source") or "").strip().lower()
+    query_purpose = str(body.get("query_purpose") or "").strip().lower()
+    backlog_id = str(route_proof.get("backlog_id") or "").strip()
+    task_id = str(route_proof.get("task_id") or "").strip()
+    if not (
+        str(action or "").strip() == "graph-governance.query"
+        and not str(body.get("trace_id") or "").strip()
+        and query_source == "observer"
+        and query_purpose == "gate_validation"
+        and backlog_id
+        and task_id
+        == _operator_supervised_direct_main_execution_id(
+            project_id,
+            backlog_id,
+        )
+    ):
+        return {}
+
+    route_authority = _operator_supervised_direct_main_route_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=str(route_proof.get("route_token_ref") or ""),
+    )
+    if route_authority.get("accepted") is not True:
+        return {}
+
+    from . import graph_snapshot_store
+
+    world_ref = _operator_supervised_direct_main_world_ref(
+        project_id=project_id,
+    )
+    expected_commit = str(world_ref.get("base_commit") or "").strip().lower()
+    expected_root = str(
+        world_ref.get("target_project_root") or ""
+    ).strip()
+    requested_snapshot_id = str(body.get("snapshot_id") or "active").strip()
+    try:
+        active_snapshot_id = _resolve_graph_snapshot_id(
+            conn,
+            project_id,
+            "active",
+        )
+        resolved_snapshot_id = _resolve_graph_snapshot_id(
+            conn,
+            project_id,
+            requested_snapshot_id,
+        )
+        snapshot = graph_snapshot_store.get_graph_snapshot(
+            conn,
+            project_id,
+            resolved_snapshot_id,
+        ) or {}
+    except (KeyError, ValueError, ValidationError) as exc:
+        raise GovernanceError(
+            "observer_direct_main_graph_world_unavailable",
+            "Direct rev2 graph query requires the current active snapshot",
+            409,
+            {
+                "requested_snapshot_id": requested_snapshot_id,
+                "resolution_error": str(exc),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        ) from exc
+
+    snapshot_commit = str(snapshot.get("commit_sha") or "").strip().lower()
+    commit_claims = {
+        str(body.get(field) or "").strip().lower()
+        for field in (
+            "commit_sha",
+            "head_commit",
+            "base_commit",
+            "target_head_commit",
+        )
+        if str(body.get(field) or "").strip()
+    }
+    root_claims: dict[str, str] = {}
+    for field in (
+        "project_root",
+        "target_project_root",
+        "target_graph_root",
+        "workspace_path",
+        "repo_root",
+    ):
+        supplied = str(body.get(field) or "").strip()
+        if not supplied:
+            continue
+        try:
+            root_claims[field] = str(Path(supplied).expanduser().resolve())
+        except (OSError, RuntimeError):
+            root_claims[field] = supplied
+    world_mismatches: list[dict[str, Any]] = []
+    if world_ref.get("accepted") is not True:
+        world_mismatches.append(
+            {
+                "field": "pre_mutation_world_ref",
+                "expected": "accepted_server_world_ref",
+                "actual": str(world_ref.get("status") or "rejected"),
+            }
+        )
+    if resolved_snapshot_id != active_snapshot_id:
+        world_mismatches.append(
+            {
+                "field": "snapshot_id",
+                "expected": active_snapshot_id,
+                "actual": resolved_snapshot_id,
+            }
+        )
+    if not expected_commit or snapshot_commit != expected_commit:
+        world_mismatches.append(
+            {
+                "field": "snapshot_commit_sha",
+                "expected": expected_commit,
+                "actual": snapshot_commit,
+            }
+        )
+    if commit_claims and commit_claims != {expected_commit}:
+        world_mismatches.append(
+            {
+                "field": "caller_commit_claims",
+                "expected": [expected_commit],
+                "actual": sorted(commit_claims),
+            }
+        )
+    mismatched_roots = {
+        field: actual
+        for field, actual in root_claims.items()
+        if actual != expected_root
+    }
+    if mismatched_roots:
+        world_mismatches.append(
+            {
+                "field": "caller_root_claims",
+                "expected": expected_root,
+                "actual": mismatched_roots,
+            }
+        )
+    if world_mismatches:
+        raise GovernanceError(
+            "observer_direct_main_graph_world_mismatch",
+            (
+                "Direct rev2 graph query must use the exact current active "
+                "pre-mutation world"
+            ),
+            409,
+            {
+                "identity_mismatches": world_mismatches,
+                "requested_snapshot_id": requested_snapshot_id,
+                "active_snapshot_id": active_snapshot_id,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+
+    canonical_root = Path(expected_root).resolve()
+    try:
+        from .checkout_provenance import describe_checkout
+
+        checkout = describe_checkout(
+            canonical_root,
+            project_id=project_id,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise GovernanceError(
+            "observer_direct_main_graph_root_identity_invalid",
+            (
+                "Direct rev2 graph query could not verify the registered "
+                "pre-mutation checkout identity"
+            ),
+            409,
+            {
+                "root_identity_error": str(exc),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        ) from exc
+
+    checkout_git = (
+        checkout.get("git")
+        if isinstance(checkout.get("git"), Mapping)
+        else {}
+    )
+    checkout_identity = (
+        checkout.get("canonical_project_identity")
+        if isinstance(checkout.get("canonical_project_identity"), Mapping)
+        else {}
+    )
+    checkout_head = str(checkout.get("commit_sha") or "").strip().lower()
+    checkout_root = str(checkout.get("execution_root") or "").strip()
+    repository_identity_hash = stable_sha256(
+        {
+            "type": "git",
+            "project_id": project_id,
+            "git_common_dir": str(checkout_git.get("git_common_dir") or ""),
+            "remote_url": str(checkout_git.get("remote_url") or ""),
+        }
+    )
+    query_root_identity_hash = stable_sha256(
+        {
+            "execution_root": checkout_root,
+            "head_commit": checkout_head,
+            "checkout_identity": dict(checkout_identity),
+            "repository_identity_hash": repository_identity_hash,
+        }
+    )
+    root_identity = {
+        "schema_version": "graph_query.root_identity.v1",
+        "query_root": checkout_root,
+        "query_root_head_commit": checkout_head,
+        "query_root_identity_hash": query_root_identity_hash,
+        "canonical_project_root": checkout_root,
+        "canonical_head_commit": checkout_head,
+        "canonical_project_identity_hash": query_root_identity_hash,
+        "repository_identity_hash": repository_identity_hash,
+    }
+    root_mismatches = []
+    if checkout.get("is_git_worktree") is not True:
+        root_mismatches.append(
+            {
+                "field": "is_git_worktree",
+                "expected": True,
+                "actual": checkout.get("is_git_worktree"),
+            }
+        )
+    if checkout_root != str(canonical_root):
+        root_mismatches.append(
+            {
+                "field": "execution_root",
+                "expected": str(canonical_root),
+                "actual": checkout_root,
+            }
+        )
+    if checkout_head != expected_commit:
+        root_mismatches.append(
+            {
+                "field": "head_commit",
+                "expected": expected_commit,
+                "actual": checkout_head,
+            }
+        )
+    if root_mismatches:
+        raise GovernanceError(
+            "observer_direct_main_graph_root_identity_invalid",
+            (
+                "Direct rev2 graph query requires the registered checkout at "
+                "the exact pre-mutation commit"
+            ),
+            409,
+            {
+                "identity_mismatches": root_mismatches,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+
+    body["snapshot_id"] = active_snapshot_id
+    world_projection = {
+        "schema_version": (
+            "operator_supervised_direct_main.graph_world_projection.v1"
+        ),
+        "source": (
+            "operator_supervised_direct_main_world_ref+active_graph_snapshot"
+        ),
+        "verified": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "pre_mutation_world_ref": dict(world_ref),
+        "snapshot_id": active_snapshot_id,
+        "snapshot_commit_sha": snapshot_commit,
+        "root_identity": root_identity,
+        "root_identity_hash": stable_sha256(root_identity),
+        "query_root_identity_hash": query_root_identity_hash,
+        "canonical_project_identity_hash": query_root_identity_hash,
+        "repository_identity_hash": repository_identity_hash,
+        "zero_write_on_failure": True,
+    }
+    return {
+        "direct_main_graph_world_projection": world_projection,
+        "commit_sha": expected_commit,
+        "raw_route_token_persisted": False,
+    }
+
+
+def _observer_parentless_direct_main_bind_graph_trace_world(
+    conn,
+    *,
+    project_id: str,
+    trace_id: str,
+    observer_proof: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist the server-derived Direct world after one real query event."""
+
+    from . import graph_query_trace
+
+    projection = (
+        observer_proof.get("direct_main_graph_world_projection")
+        if isinstance(
+            observer_proof.get("direct_main_graph_world_projection"),
+            Mapping,
+        )
+        else {}
+    )
+    root_identity = (
+        projection.get("root_identity")
+        if isinstance(projection.get("root_identity"), Mapping)
+        else {}
+    )
+    if not (
+        projection.get("verified") is True
+        and projection.get("server_derived") is True
+        and trace_id
+        and root_identity
+    ):
+        return {}
+    root_identity_hash = stable_sha256(root_identity)
+    cursor = conn.execute(
+        """
+        UPDATE graph_query_traces
+           SET commit_sha = ?, root_identity_json = ?,
+               root_identity_hash = ?, query_root_identity_hash = ?,
+               canonical_project_identity_hash = ?,
+               repository_identity_hash = ?
+         WHERE project_id = ? AND trace_id = ?
+           AND query_source = 'observer'
+           AND query_purpose = 'gate_validation'
+           AND commit_sha = ?
+           AND EXISTS (
+               SELECT 1 FROM graph_query_events e
+                WHERE e.trace_id = graph_query_traces.trace_id
+           )
+        """,
+        (
+            str(projection.get("snapshot_commit_sha") or ""),
+            json.dumps(root_identity, sort_keys=True, separators=(",", ":")),
+            root_identity_hash,
+            str(projection.get("query_root_identity_hash") or ""),
+            str(projection.get("canonical_project_identity_hash") or ""),
+            str(projection.get("repository_identity_hash") or ""),
+            project_id,
+            trace_id,
+            str(projection.get("snapshot_commit_sha") or ""),
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise GovernanceError(
+            "observer_direct_main_graph_world_persistence_failed",
+            "Direct rev2 graph query world could not be bound atomically",
+            409,
+            {
+                "trace_id": trace_id,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    return graph_query_trace.get_trace(conn, project_id, trace_id)["trace"]
+
+
 def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, action: str) -> dict:
     query_source = str(body.get("query_source") or "api_debug").strip().lower().replace("-", "_")
     if query_source == "qa":
@@ -14998,6 +15367,15 @@ def _require_graph_query_capability(ctx: RequestContext, conn, body: dict, actio
             action=action,
         )
         if observer_proof:
+            observer_proof.update(
+                _observer_parentless_direct_main_graph_world_authority(
+                    conn,
+                    project_id=ctx.get_project_id(),
+                    body=body,
+                    route_proof=observer_proof,
+                    action=action,
+                )
+            )
             setattr(ctx, "_trusted_observer_graph_query_authority", observer_proof)
         return session
     if query_source != "mf_subagent":
@@ -82076,6 +82454,7 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
         mf_sub_proof = getattr(ctx, "_trusted_mf_sub_graph_query_authority", {})
         mf_sub_proof = mf_sub_proof if isinstance(mf_sub_proof, Mapping) else {}
         route_proof = mf_sub_proof or observer_proof
+        trace_proof = qa_proof
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
         try:
             with sqlite_write_lock():
@@ -82114,60 +82493,60 @@ def handle_graph_governance_query_trace_start(ctx: RequestContext):
                         route_proof.get("visible_injection_manifest_hash") or ""
                     ),
                     route_token_ref=str(route_proof.get("route_token_ref") or ""),
-                    commit_sha=str(qa_proof.get("commit_sha") or ""),
-                    graph_basis=str(qa_proof.get("graph_basis") or ""),
+                    commit_sha=str(trace_proof.get("commit_sha") or ""),
+                    graph_basis=str(trace_proof.get("graph_basis") or ""),
                     graph_basis_decision=(
-                        qa_proof.get("graph_basis_decision")
+                        trace_proof.get("graph_basis_decision")
                         if isinstance(
-                            qa_proof.get("graph_basis_decision"), Mapping
+                            trace_proof.get("graph_basis_decision"), Mapping
                         )
                         else None
                     ),
                     graph_basis_decision_hash=str(
-                        qa_proof.get("graph_basis_decision_hash") or ""
+                        trace_proof.get("graph_basis_decision_hash") or ""
                     ),
                     canonical_base_snapshot_id=str(
-                        qa_proof.get("canonical_base_snapshot_id") or ""
+                        trace_proof.get("canonical_base_snapshot_id") or ""
                     ),
-                    base_commit_sha=str(qa_proof.get("base_commit_sha") or ""),
+                    base_commit_sha=str(trace_proof.get("base_commit_sha") or ""),
                     candidate_commit_sha=str(
-                        qa_proof.get("candidate_commit_sha") or ""
+                        trace_proof.get("candidate_commit_sha") or ""
                     ),
                     changed_files=(
-                        list(qa_proof.get("changed_files") or [])
-                        if qa_proof.get("graph_basis")
+                        list(trace_proof.get("changed_files") or [])
+                        if trace_proof.get("graph_basis")
                         else None
                     ),
                     candidate_diff_hash=str(
-                        qa_proof.get("candidate_diff_hash") or ""
+                        trace_proof.get("candidate_diff_hash") or ""
                     ),
                     changed_files_source=str(
-                        qa_proof.get("changed_files_source") or ""
+                        trace_proof.get("changed_files_source") or ""
                     ),
                     candidate_overlay=(
-                        qa_proof.get("candidate_overlay")
-                        if isinstance(qa_proof.get("candidate_overlay"), Mapping)
+                        trace_proof.get("candidate_overlay")
+                        if isinstance(trace_proof.get("candidate_overlay"), Mapping)
                         else None
                     ),
                     candidate_overlay_hash=str(
-                        qa_proof.get("candidate_overlay_hash") or ""
+                        trace_proof.get("candidate_overlay_hash") or ""
                     ),
                     root_identity=(
-                        qa_proof.get("root_identity")
-                        if isinstance(qa_proof.get("root_identity"), Mapping)
+                        trace_proof.get("root_identity")
+                        if isinstance(trace_proof.get("root_identity"), Mapping)
                         else None
                     ),
                     root_identity_hash=str(
-                        qa_proof.get("root_identity_hash") or ""
+                        trace_proof.get("root_identity_hash") or ""
                     ),
                     query_root_identity_hash=str(
-                        qa_proof.get("query_root_identity_hash") or ""
+                        trace_proof.get("query_root_identity_hash") or ""
                     ),
                     canonical_project_identity_hash=str(
-                        qa_proof.get("canonical_project_identity_hash") or ""
+                        trace_proof.get("canonical_project_identity_hash") or ""
                     ),
                     repository_identity_hash=str(
-                        qa_proof.get("repository_identity_hash") or ""
+                        trace_proof.get("repository_identity_hash") or ""
                     ),
                     qa_session_id=str(qa_proof.get("qa_session_id") or ""),
                     qa_scope_binding_ref=str(
@@ -82612,6 +82991,7 @@ def handle_graph_governance_query(ctx: RequestContext):
             safe_ref_authority.get("fence_token_hash") or ""
         ).strip()
         route_proof = mf_sub_proof or observer_proof
+        trace_proof = qa_proof or observer_proof
         if root is None and (
             body.get("project_root")
             or body.get("target_project_root")
@@ -82620,14 +83000,14 @@ def handle_graph_governance_query(ctx: RequestContext):
             or body.get("repo_root")
         ):
             root = _graph_governance_project_root(project_id, body)
-        if qa_proof.get("graph_basis") == "exact_candidate_snapshot":
-            root_identity = qa_proof.get("root_identity")
+        if trace_proof.get("graph_basis") == "exact_candidate_snapshot":
+            root_identity = trace_proof.get("root_identity")
             if isinstance(root_identity, Mapping) and root_identity.get(
                 "query_root"
             ):
                 root = Path(str(root_identity["query_root"]))
-        elif root is None and qa_proof:
-            root_identity = qa_proof.get("root_identity")
+        elif root is None and trace_proof:
+            root_identity = trace_proof.get("root_identity")
             if isinstance(root_identity, Mapping) and root_identity.get("query_root"):
                 root = Path(str(root_identity["query_root"]))
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
@@ -82671,64 +83051,64 @@ def handle_graph_governance_query(ctx: RequestContext):
                         route_proof.get("visible_injection_manifest_hash") or ""
                     ),
                     route_token_ref=str(route_proof.get("route_token_ref") or ""),
-                    commit_sha=str(qa_proof.get("commit_sha") or ""),
-                    graph_basis=str(qa_proof.get("graph_basis") or ""),
+                    commit_sha=str(trace_proof.get("commit_sha") or ""),
+                    graph_basis=str(trace_proof.get("graph_basis") or ""),
                     graph_basis_decision=(
-                        qa_proof.get("graph_basis_decision")
+                        trace_proof.get("graph_basis_decision")
                         if isinstance(
-                            qa_proof.get("graph_basis_decision"), Mapping
+                            trace_proof.get("graph_basis_decision"), Mapping
                         )
                         else None
                     ),
                     graph_basis_decision_hash=str(
-                        qa_proof.get("graph_basis_decision_hash") or ""
+                        trace_proof.get("graph_basis_decision_hash") or ""
                     ),
                     canonical_base_snapshot_id=str(
-                        qa_proof.get("canonical_base_snapshot_id") or ""
+                        trace_proof.get("canonical_base_snapshot_id") or ""
                     ),
-                    base_commit_sha=str(qa_proof.get("base_commit_sha") or ""),
+                    base_commit_sha=str(trace_proof.get("base_commit_sha") or ""),
                     candidate_commit_sha=str(
-                        qa_proof.get("candidate_commit_sha") or ""
+                        trace_proof.get("candidate_commit_sha") or ""
                     ),
                     changed_files=(
-                        list(qa_proof.get("changed_files") or [])
-                        if qa_proof.get("graph_basis")
+                        list(trace_proof.get("changed_files") or [])
+                        if trace_proof.get("graph_basis")
                         else None
                     ),
                     candidate_diff_hash=str(
-                        qa_proof.get("candidate_diff_hash") or ""
+                        trace_proof.get("candidate_diff_hash") or ""
                     ),
                     changed_files_source=str(
-                        qa_proof.get("changed_files_source") or ""
+                        trace_proof.get("changed_files_source") or ""
                     ),
                     candidate_overlay=(
-                        qa_proof.get("candidate_overlay")
-                        if isinstance(qa_proof.get("candidate_overlay"), Mapping)
+                        trace_proof.get("candidate_overlay")
+                        if isinstance(trace_proof.get("candidate_overlay"), Mapping)
                         else None
                     ),
                     candidate_overlay_hash=str(
-                        qa_proof.get("candidate_overlay_hash") or ""
+                        trace_proof.get("candidate_overlay_hash") or ""
                     ),
                     root_identity=(
-                        qa_proof.get("root_identity")
-                        if isinstance(qa_proof.get("root_identity"), Mapping)
+                        trace_proof.get("root_identity")
+                        if isinstance(trace_proof.get("root_identity"), Mapping)
                         else None
                     ),
                     root_identity_hash=str(
-                        qa_proof.get("root_identity_hash") or ""
+                        trace_proof.get("root_identity_hash") or ""
                     ),
                     query_root_identity_hash=str(
-                        qa_proof.get("query_root_identity_hash") or ""
+                        trace_proof.get("query_root_identity_hash") or ""
                     ),
                     canonical_project_identity_hash=str(
-                        qa_proof.get("canonical_project_identity_hash") or ""
+                        trace_proof.get("canonical_project_identity_hash") or ""
                     ),
                     repository_identity_hash=str(
-                        qa_proof.get("repository_identity_hash") or ""
+                        trace_proof.get("repository_identity_hash") or ""
                     ),
                     candidate_sources=(
-                        qa_proof.get("_candidate_sources")
-                        if isinstance(qa_proof.get("_candidate_sources"), Mapping)
+                        trace_proof.get("_candidate_sources")
+                        if isinstance(trace_proof.get("_candidate_sources"), Mapping)
                         else None
                     ),
                     qa_session_id=str(qa_proof.get("qa_session_id") or ""),
@@ -82742,6 +83122,18 @@ def handle_graph_governance_query(ctx: RequestContext):
                     budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
                     project_root=root,
                 )
+                direct_world_trace = (
+                    _observer_parentless_direct_main_bind_graph_trace_world(
+                        conn,
+                        project_id=project_id,
+                        trace_id=str(result.get("trace_id") or ""),
+                        observer_proof=observer_proof,
+                    )
+                )
+                if direct_world_trace:
+                    result["graph_query_identity"] = dict(
+                        direct_world_trace.get("graph_query_identity") or {}
+                    )
                 if safe_ref_fence_hash:
                     result["mf_sub_graph_query_safe_ref_authority"] = dict(
                         safe_ref_authority
@@ -133479,6 +133871,7 @@ def _onboard_parentless_direct_main_graph_query_guidance(
     query_path = approved_target_files[0] if approved_target_files else ""
     arguments = {
         "project_id": str(project_id or "").strip(),
+        "snapshot_id": "active",
         "tool": "find_node_by_path",
         "args": {"path": query_path},
         "query_source": "observer",
@@ -133527,6 +133920,16 @@ def _onboard_parentless_direct_main_graph_query_guidance(
                 "server derives canonical backlog_id/task_id from route_token_ref "
                 "and rejects mismatched client claims"
             ),
+        },
+        "server_derived_world_ref": {
+            "snapshot_selector": "active",
+            "commit_and_root_are_caller_inputs": False,
+            "commit_source": (
+                "operator_supervised_direct_main.pre_mutation_world_ref"
+            ),
+            "root_source": "registered_canonical_project_root",
+            "snapshot_commit_must_match_world_ref": True,
+            "mismatch_creates_trace": False,
         },
         "exploration_only": {
             "query_purposes": ["inspect_node"],
