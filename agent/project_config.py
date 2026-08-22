@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sys
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -637,8 +638,8 @@ def load_project_config(workspace_path: Path) -> ProjectConfig:
       1. .aming-claw.yaml
       2. .aming-claw.json
 
-    Falls back to DEFAULT_CONFIG only when the project_id would be
-    'aming-claw' and no file is found (with a deprecation warning).
+    Falls back to an isolated DEFAULT_CONFIG copy only when the exact workspace
+    basename is 'aming-claw' and no file is found (with a deprecation warning).
 
     Raises FileNotFoundError for non-aming-claw projects with no config.
     """
@@ -660,15 +661,13 @@ def load_project_config(workspace_path: Path) -> ProjectConfig:
     if raw is None:
         # Attempt to derive project_id from workspace path basename
         basename = workspace_path.name.lower().replace("_", "-")
-        if basename == "aming-claw" or "aming-claw" in str(workspace_path).replace(
-            "\\", "/"
-        ):
+        if basename == "aming-claw":
             logger.warning(
                 "DEPRECATION: No .aming-claw.yaml found at %s; using hardcoded "
                 "DEFAULT_CONFIG. Please create a .aming-claw.yaml config file.",
                 workspace_path,
             )
-            return DEFAULT_CONFIG
+            return deepcopy(DEFAULT_CONFIG)
         raise FileNotFoundError(
             f"No .aming-claw.yaml or .aming-claw.json found at {workspace_path}"
         )

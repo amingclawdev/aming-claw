@@ -16,6 +16,7 @@ const PROJECT = clean(FLAGS["project-id"] || `daily-planner-lite-vibe-${RUN_ID}`
 const FIXTURE_ROOT = path.resolve(FLAGS["fixture-root"] || path.join(os.tmpdir(), "ac-vibe-queue-demo", RUN_ID));
 const PREVIEW_PORT = Number(FLAGS["preview-port"] || process.env.VIBE_QUEUE_PREVIEW_PORT || 4173);
 const RESET = FLAGS.reset === true || FLAGS["reset-fixture"] === true;
+const FIXTURE_GRAPH_EXCLUDE_PATHS = ["node_modules", "dist", "build", "coverage", ".aming-claw/e2e-artifacts"];
 
 function parseFlags(args) {
   const bool = new Set(["no-browser", "reset", "reset-fixture", "self-test"]);
@@ -129,6 +130,15 @@ function dashboardLinks() {
   };
 }
 
+function fixtureConfigOverride(projectId = PROJECT) {
+  return {
+    project_id: projectId,
+    language: "javascript",
+    testing: { unit_command: "npm test" },
+    graph: { exclude_paths: [...FIXTURE_GRAPH_EXCLUDE_PATHS] },
+  };
+}
+
 function runSelfTest() {
   const allowed = {
     event_type: "route_token_gate.project_bootstrap",
@@ -157,6 +167,10 @@ function runSelfTest() {
   const staleTimelineView = ["view", "timeline"].join("=");
   assert(dashboardLinks().timeline.includes("view=activity"), "self-test timeline link must use canonical activity view");
   assert(!dashboardLinks().timeline.includes(staleTimelineView), "self-test timeline link must not use stale timeline view");
+  const configOverride = fixtureConfigOverride("self-test-project");
+  assert(configOverride.project_id === "self-test-project", "self-test config override project mismatch");
+  assert(configOverride.language === "javascript", "self-test fixture language must be JavaScript");
+  assert(configOverride.testing?.unit_command === "npm test", "self-test fixture unit command must be npm test");
   console.log("VIBE QUEUE FIXTURE SELF TEST OK");
 }
 
@@ -295,10 +309,12 @@ async function main() {
       workspace_path: FIXTURE_ROOT,
       project_name: PROJECT,
       scan_depth: 4,
-      exclude_patterns: ["node_modules", "dist", "build", "coverage", ".aming-claw/e2e-artifacts"],
-      config_override: { project_id: PROJECT, graph: { exclude_paths: ["node_modules", "dist", "build", "coverage", ".aming-claw/e2e-artifacts"] } },
+      exclude_patterns: FIXTURE_GRAPH_EXCLUDE_PATHS,
+      config_override: fixtureConfigOverride(),
     });
     assert((bootstrap.project_id || PROJECT) === PROJECT, `bootstrap returned wrong project ${bootstrap.project_id}`);
+    assert(bootstrap.config?.language === "javascript", `bootstrap returned wrong language ${bootstrap.config?.language}`);
+    assert(bootstrap.config?.testing?.unit_command === "npm test", `bootstrap returned wrong unit command ${bootstrap.config?.testing?.unit_command}`);
     const status = await http("GET", `/api/graph-governance/${pid(PROJECT)}/status`);
     assert(status.active_snapshot_id, "active graph snapshot missing");
     const query = await http("POST", `/api/graph-governance/${pid(PROJECT)}/query`, {

@@ -17,6 +17,7 @@ if _agent_dir not in sys.path:
 
 from governance.graph_generator import detect_language, generate_graph
 from project_config import (
+    DEFAULT_CONFIG,
     ProjectConfig,
     effective_graph_exclude_roots,
     generate_default_config,
@@ -231,6 +232,33 @@ class TestBackwardCompatibility:
         )
         config = load_project_config(python_workspace)
         assert config.project_id == "test-proj"
+
+    def test_load_project_config_does_not_inherit_aming_claw_from_parent_path(self, tmp_path):
+        workspace = tmp_path / "aming-claw-demo-environments" / "daily-planner-lite"
+        workspace.mkdir(parents=True)
+
+        with pytest.raises(FileNotFoundError):
+            load_project_config(workspace)
+
+    def test_load_project_config_returns_isolated_aming_claw_fallbacks(self, tmp_path):
+        first_workspace = tmp_path / "first" / "aming-claw"
+        second_workspace = tmp_path / "second" / "aming-claw"
+        first_workspace.mkdir(parents=True)
+        second_workspace.mkdir(parents=True)
+
+        first = load_project_config(first_workspace)
+        first.project_id = "mutated-project"
+        first.testing.unit_command = "mutated-command"
+        first.graph.exclude_paths.append("mutated-path")
+        second = load_project_config(second_workspace)
+
+        assert first is not DEFAULT_CONFIG
+        assert second is not DEFAULT_CONFIG
+        assert first is not second
+        assert second.project_id == "aming-claw"
+        assert second.testing.unit_command == DEFAULT_CONFIG.testing.unit_command
+        assert "mutated-path" not in second.graph.exclude_paths
+        assert "mutated-path" not in DEFAULT_CONFIG.graph.exclude_paths
 
     def test_load_project_config_parses_governance_exclude_roots(self, python_workspace):
         (python_workspace / ".aming-claw.yaml").write_text(
