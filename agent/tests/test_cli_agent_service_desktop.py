@@ -1603,6 +1603,10 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
     guide, receipt_body, startup_body = _live_refreshing_host_startup_inputs(
         precursor_tool
     )
+    canonical_hash = "sha256:" + "d" * 64
+    guide["launch_text_hash"] = canonical_hash
+    receipt_body["receipt_hash"] = "<launch text hash>"
+    startup_body["launch_text_hash"] = "<launch text hash>"
     raw_session = "raw-live-host-session"
     raw_fence = "raw-live-host-fence"
     calls = []
@@ -1690,6 +1694,9 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
             assert body["session_token"] == raw_session
             assert body["fence_token"] == raw_fence
             assert body["session_token_ref"] == "wstok-live-after"
+            assert body["read_receipt_hash"] == canonical_hash
+            assert body["receipt_hash"] == canonical_hash
+            assert body["launch_text_hash"] == canonical_hash
             return {
                 "ok": True,
                 "status": "accepted",
@@ -1700,6 +1707,8 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
         assert body["session_token"] == raw_session
         assert body["fence_token"] == raw_fence
         assert body["read_receipt_event_id"] == "timeline:live-receipt"
+        assert body["read_receipt_hash"] == canonical_hash
+        assert body["launch_text_hash"] == canonical_hash
         assert body["contract_execution_id"] == startup_body["contract_execution_id"]
         assert body["target_project_root"] == startup_body["target_project_root"]
         assert body["worker_slot_id"] == startup_body["worker_slot_id"]
@@ -1718,7 +1727,6 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
             "worker_session_id": "live-host-session",
             "host_startup_id": "live-host-startup",
             "head_commit": "a" * 40,
-            "launch_text_hash": "sha256:" + "a" * 64,
         },
     )
 
@@ -1741,6 +1749,69 @@ def test_host_orchestration_refreshes_live_packet_without_caller_reconstruction(
     assert raw_fence not in json.dumps(result, sort_keys=True)
     assert all(raw_session not in json.dumps(body) for _name, body in calls)
     assert all(raw_fence not in json.dumps(body) for _name, body in calls)
+
+
+@pytest.mark.parametrize(
+    ("host_hashes", "argument_hash"),
+    [
+        ({"launch_text_hash": "sha256:" + "e" * 64}, ""),
+        ({"read_receipt_hash": "sha256:" + "e" * 64}, ""),
+        ({}, "sha256:" + "e" * 64),
+    ],
+)
+def test_host_orchestration_rejects_caller_hash_conflict_before_auth(
+    host_hashes, argument_hash
+) -> None:
+    guide, _receipt_body, _startup_body = _live_refreshing_host_startup_inputs(
+        "runtime_context_session_token_initial_join"
+    )
+    guide["launch_text_hash"] = "sha256:" + "d" * 64
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+                **host_hashes,
+            },
+            read_receipt_hash=argument_hash,
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("failure_mode", ["malformed", "ambiguous"])
+def test_host_orchestration_rejects_invalid_guide_hash_before_auth(
+    failure_mode,
+) -> None:
+    guide, _receipt_body, _startup_body = _live_refreshing_host_startup_inputs(
+        "runtime_context_session_token_initial_join"
+    )
+    guide["launch_text_hash"] = (
+        "not-a-launch-hash"
+        if failure_mode == "malformed"
+        else "sha256:" + "d" * 64
+    )
+    if failure_mode == "ambiguous":
+        guide["details"] = {"read_receipt_hash": "sha256:" + "e" * 64}
+    calls = []
+
+    with pytest.raises(GuidedRuntimeDispatchError):
+        orchestrate_runtime_context_host_startup(
+            worker_guide=guide,
+            tool_caller=lambda name, body: calls.append((name, body)),
+            host_identity={
+                "worker_session_id": "live-host-session",
+                "host_startup_id": "live-host-startup",
+                "head_commit": "a" * 40,
+            },
+        )
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(

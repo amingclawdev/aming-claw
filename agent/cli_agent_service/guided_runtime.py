@@ -86,7 +86,8 @@ _HOST_REPLACEMENT_FIELDS_BY_SOURCE = {
         target_project_root worktree_path branch branch_ref base_commit target_head_commit
         merge_queue_id observer_command_id route_id route_context_hash
         prompt_contract_id prompt_contract_hash route_token_ref
-        visible_injection_manifest_hash""".split()
+        visible_injection_manifest_hash read_receipt_hash receipt_hash
+        launch_text_hash""".split()
     ),
     "host_computed": frozenset(
         """project_id reason worker_session_id host_session_id host_startup_id
@@ -810,6 +811,51 @@ def _stable_json_hash(value: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def _canonical_worker_guide_launch_hash(value: Any) -> str:
+    """Read one canonical launch hash from the authenticated Guide packet."""
+
+    try:
+        applications = mcp_application_mapping_blocks(
+            value,
+            paths=_MCP_APPLICATION_ROOT_PATHS,
+        )
+    except ServiceError as exc:
+        raise GuidedRuntimeDispatchError(
+            "runtime context worker guide launch hash could not be decoded",
+            status="invalid_host_orchestration",
+        ) from exc
+
+    aliases = {"read_receipt_hash", "receipt_hash", "launch_text_hash"}
+    hashes: set[str] = set()
+
+    def collect(candidate: Any) -> None:
+        if isinstance(candidate, Mapping):
+            for key, nested in candidate.items():
+                if str(key) in aliases:
+                    text = _text(nested)
+                    if not text or _PLACEHOLDER.search(text):
+                        continue
+                    if not re.fullmatch(r"sha256:[0-9a-f]{64}", text):
+                        raise GuidedRuntimeDispatchError(
+                            "runtime context worker guide launch hash is invalid",
+                            status="invalid_host_orchestration",
+                        )
+                    hashes.add(text)
+                collect(nested)
+        elif isinstance(candidate, (list, tuple)):
+            for nested in candidate:
+                collect(nested)
+
+    for application in applications:
+        collect(application)
+    if len(hashes) > 1:
+        raise GuidedRuntimeDispatchError(
+            "runtime context worker guide launch hash is ambiguous",
+            status="invalid_host_orchestration",
+        )
+    return next(iter(hashes), "")
+
+
 def _host_runtime_values(
     guide: Mapping[str, Any],
     host_identity: Mapping[str, Any],
@@ -850,7 +896,25 @@ def _host_runtime_values(
             "runtime context host orchestration requires project_id",
             status="invalid_host_orchestration",
         )
-    receipt_hash = _text(
+    canonical_launch_hash = _canonical_worker_guide_launch_hash(guide)
+    caller_hashes = {
+        value
+        for value in (
+            _text(read_receipt_hash),
+            _text(supplied.get("read_receipt_hash")),
+            _text(supplied.get("launch_text_hash")),
+        )
+        if value
+    }
+    if canonical_launch_hash and any(
+        value != canonical_launch_hash for value in caller_hashes
+    ):
+        raise GuidedRuntimeDispatchError(
+            "runtime context host identity conflicts with canonical worker guide "
+            "launch hash",
+            status="invalid_host_orchestration",
+        )
+    receipt_hash = canonical_launch_hash or _text(
         read_receipt_hash or supplied.get("read_receipt_hash")
     ) or _stable_json_hash(
         {
@@ -911,13 +975,25 @@ def _host_runtime_values(
         "now_iso": timestamp,
         "read_receipt_hash": receipt_hash,
         "receipt_hash": receipt_hash,
-        "launch_text_hash": _text(supplied.get("launch_text_hash")) or receipt_hash,
+        "launch_text_hash": (
+            canonical_launch_hash
+            or _text(supplied.get("launch_text_hash"))
+            or receipt_hash
+        ),
         "head_commit": _text(supplied.get("head_commit")),
         "actual_cwd": assigned_worktree,
         "actual_git_root": assigned_worktree,
         "harness_type": _text(supplied.get("harness_type")) or "codex",
     }
     for field_name in _HOST_REPLACEMENT_FIELDS_BY_SOURCE["worker_guide"]:
+        if field_name in {
+            "read_receipt_hash",
+            "receipt_hash",
+            "launch_text_hash",
+        }:
+            if canonical_launch_hash:
+                values[field_name] = canonical_launch_hash
+            continue
         guide_value = _first_deep_text(guide, field_name)
         if field_name in {"agent_id", "actual_host_worker_id", "worker_id", "worker_slot_id"}:
             # Allocation identity is authoritative; host identity belongs in
