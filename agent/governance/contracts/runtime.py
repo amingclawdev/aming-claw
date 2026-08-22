@@ -3742,6 +3742,86 @@ def _record_is_complete(record: Mapping[str, Any]) -> bool:
     return guide.get("next_legal_action") is None
 
 
+def _pinned_terminal_no_pass_disposition(
+    definition: Mapping[str, Any],
+    lines: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Derive terminal no-PASS only from the pinned Contract policy and Fact."""
+
+    system_layer = (
+        definition.get("system_layer")
+        if isinstance(definition.get("system_layer"), Mapping)
+        else {}
+    )
+    policy = (
+        system_layer.get("terminal_outcome_policy")
+        if isinstance(system_layer.get("terminal_outcome_policy"), Mapping)
+        else {}
+    )
+    if not policy:
+        return {}
+    failure_statuses = {
+        "blocked",
+        "fail",
+        "failed",
+        "failure",
+        "rejected",
+    }
+    selected: tuple[int, Mapping[str, Any], str] | None = None
+    for index, line in enumerate(lines):
+        if not isinstance(line, Mapping):
+            continue
+        line_id = str(line.get("line_id") or "").strip()
+        status = str(line.get("status") or "").strip().lower()
+        if status not in failure_statuses:
+            continue
+        policy_field = (
+            "qa_failure"
+            if line_id == "qa_independent_verification"
+            else "authoritative_close_failure"
+            if line_id == "observer_close_ready"
+            else ""
+        )
+        if not policy_field or not str(policy.get(policy_field) or "").startswith(
+            "terminal_no_pass"
+        ):
+            continue
+        selected = (index, line, policy_field)
+    if selected is None:
+        return {}
+    source_index, source_line, policy_field = selected
+    disposition = {
+        "schema_version": "contract_runtime.pinned_terminal_no_pass_disposition.v1",
+        "status": "FAILED",
+        "readiness_state": "terminal_no_pass",
+        "disposition": "terminal_no_pass",
+        "terminal": True,
+        "scheduler_eligible": False,
+        "schedulable": False,
+        "current_eligible": False,
+        "close_eligible": False,
+        "closeable": False,
+        "resume_eligible": False,
+        "resumable": False,
+        "retry_eligible": False,
+        "write_eligible": False,
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "history_rewrite_allowed": False,
+        "repair_requires_separate_backlog_row": True,
+        "source_completed_line_index": source_index,
+        "source_stage_id": str(source_line.get("stage_id") or ""),
+        "source_line_id": str(source_line.get("line_id") or ""),
+        "source_status": str(source_line.get("status") or ""),
+        "source_line_hash": stable_sha256(dict(source_line)),
+        "policy_field": policy_field,
+        "policy_value": str(policy.get(policy_field) or ""),
+        "source_of_authority": "pinned_contract_terminal_outcome_policy",
+    }
+    disposition["disposition_hash"] = stable_sha256(disposition)
+    return disposition
+
+
 def _next_action_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
     guide = (
         record.get("runtime_guide")
@@ -8821,6 +8901,10 @@ class ContractRuntime:
         terminal_disposition = _audited_bypass_terminal_disposition(
             {**dict(record), "completed_lines": line_items}
         )
+        pinned_terminal_no_pass = _pinned_terminal_no_pass_disposition(
+            definition,
+            line_items,
+        )
         if terminal_disposition:
             guide["next_legal_action"] = None
             guide["terminal_disposition"] = terminal_disposition
@@ -8844,11 +8928,12 @@ class ContractRuntime:
                 state["bypass_recovery_fallback"] = dict(
                     recovery_fallback
                 )
-        _attach_failed_qa_rework_guidance(
-            guide,
-            line_items=line_items,
-            source_record=record,
-        )
+        if not pinned_terminal_no_pass:
+            _attach_failed_qa_rework_guidance(
+                guide,
+                line_items=line_items,
+                source_record=record,
+            )
         _attach_completed_line_evidence(guide, line_items)
         sanitized_projection: dict[str, Any] = {}
         if projection:
@@ -8874,6 +8959,37 @@ class ContractRuntime:
             record=record,
             reader_role=effective_actor_role,
         )
+        if pinned_terminal_no_pass:
+            guide["next_legal_action"] = None
+            guide.pop("writer_role_safe_copy_payload", None)
+            guide.pop("line_bypass_guidance", None)
+            guide.pop("failed_qa_rework", None)
+            guide.pop("post_projection_submit_line_guidance", None)
+            guide["terminal_disposition"] = dict(
+                pinned_terminal_no_pass
+            )
+            guide["readiness_state"] = "terminal_no_pass"
+            guide["disposition"] = "terminal_no_pass"
+            guide["scheduler_eligible"] = False
+            guide["resume_eligible"] = False
+            guide["retry_eligible"] = False
+            guide["write_eligible"] = False
+            state["readiness_state"] = "terminal_no_pass"
+            state["disposition"] = "terminal_no_pass"
+            state["terminal"] = True
+            state["scheduler_eligible"] = False
+            state["current_eligible"] = False
+            state["close_eligible"] = False
+            state["resume_eligible"] = False
+            state["retry_eligible"] = False
+            state["write_eligible"] = False
+            guide["runtime_guide_hash"] = stable_sha256(
+                {
+                    key: value
+                    for key, value in guide.items()
+                    if key != "runtime_guide_hash"
+                }
+            )
         retirement = self._terminal_retirement_for_record(record)
         if retirement is not None:
             retirement_result = ContractRetirementError(retirement).to_dict()
@@ -8906,6 +9022,13 @@ class ContractRuntime:
                     if key != "runtime_guide_hash"
                 }
             )
+        state["execution_state_hash"] = stable_sha256(
+            {
+                key: value
+                for key, value in state.items()
+                if key != "execution_state_hash"
+            }
+        )
         if retirement is not None:
             retirement_result = ContractRetirementError(retirement).to_dict()
             current_precheck = make_gate_decision(

@@ -98,6 +98,7 @@ from .contracts.write_gate import (
     _public_safe_runtime_guide_hash,
     contract_line_evidence_policy,
     mf_parallel_prefill_child_plan_errors,
+    operator_supervised_direct_main_runtime_binding_errors,
 )
 from .backlog_triage import (
     RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS,
@@ -12964,9 +12965,36 @@ def _qa_exact_candidate_direct_main_post_merge_provenance(
         direct_record = _contract_runtime_store(conn).get(task_id)
     except ContractRuntimeError:
         direct_record = {}
-    if not (
+    direct_metadata = (
+        direct_record.get("metadata")
+        if isinstance(direct_record.get("metadata"), Mapping)
+        else {}
+    )
+    strict_direct_binding = (
+        direct_metadata.get(
+            "operator_supervised_direct_main_runtime_binding"
+        )
+        if isinstance(
+            direct_metadata.get(
+                "operator_supervised_direct_main_runtime_binding"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    legacy_onboard_direct = bool(
         task_id.startswith("onboard-service-")
         and _onboard_service_record(direct_record)
+    )
+    strict_contract_direct = bool(
+        str(direct_record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(direct_record.get("revision") or "").strip() == "rev2"
+        and strict_direct_binding.get("strict_runtime_binding_required")
+        is True
+    )
+    if not (
+        (legacy_onboard_direct or strict_contract_direct)
         and str(direct_record.get("project_id") or "").strip() == project_id
         and str(direct_record.get("backlog_id") or "").strip() == backlog_id
         and not str(
@@ -84862,14 +84890,56 @@ def _current_full_reconcile_runtime_context_scope(
             route_bound_onboard_identity
             and route_bound_direct_main
         )
-        if route_bound_onboard_direct_main:
+        direct_metadata = (
+            contract_record.get("metadata")
+            if isinstance(contract_record.get("metadata"), Mapping)
+            else {}
+        )
+        strict_direct_binding = (
+            direct_metadata.get(
+                "operator_supervised_direct_main_runtime_binding"
+            )
+            if isinstance(
+                direct_metadata.get(
+                    "operator_supervised_direct_main_runtime_binding"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        route_bound_strict_direct_identity = bool(
+            contract_record
+            and str(contract_record.get("project_id") or "").strip()
+            == project_id
+            and str(contract_record.get("backlog_id") or "").strip()
+            == backlog_id
+            and str(contract_record.get("contract_id") or "").strip()
+            == "operator_supervised_direct_main"
+            and str(contract_record.get("revision") or "").strip()
+            == "rev2"
+            and strict_direct_binding.get(
+                "strict_runtime_binding_required"
+            )
+            is True
+            and str(contract_record.get("contract_execution_id") or "").strip()
+            == task_id
+            and route_task_id == task_id
+            and str(auth.get("role_source") or "").strip()
+            == "observer_session_route_token_ref"
+            and not claimed_runtime_context_id
+            and not merge_queue_id
+        )
+        route_bound_strict_direct_main = bool(
+            route_bound_strict_direct_identity and route_bound_direct_main
+        )
+        if route_bound_onboard_direct_main or route_bound_strict_direct_main:
             # operator_supervised_direct_main intentionally has no branch
             # runtime context. Its active observer session plus the exact
             # full-round route scope is the canonical authority. Returning no
             # runtime scope prevents direct-main provenance from masquerading
             # as parallel_branch_runtime_context evidence.
             return {}
-        if route_bound_onboard_identity:
+        if route_bound_onboard_identity or route_bound_strict_direct_identity:
             expected_actions = list(
                 _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
             )
@@ -84887,6 +84957,8 @@ def _current_full_reconcile_runtime_context_scope(
                     _onboard_contract_route_issue_target_files_from_record(
                         contract_record
                     )
+                    if route_bound_onboard_identity
+                    else list(strict_direct_binding.get("target_files") or [])
                 ),
                 "allowed_actions": expected_actions,
                 "evidence_refs": [
@@ -86768,6 +86840,37 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "head_commit": head_commit,
                 "target_commit_sha": target_commit,
             }
+        direct_main_qa_preflight_authority = (
+            _operator_supervised_direct_main_reconcile_qa_preflight_authority(
+                conn,
+                project_id=project_id,
+                target_commit=target_commit,
+                current_full_auth=current_full_auth,
+            )
+        )
+        if (
+            direct_main_qa_preflight_authority.get("applicable") is True
+            and direct_main_qa_preflight_authority.get("passed") is not True
+        ):
+            return 409, {
+                "ok": False,
+                "project_id": project_id,
+                "error": (
+                    "operator_supervised_direct_main_qa_before_reconcile_required"
+                ),
+                "message": (
+                    "Direct Main current-full reconcile requires one exact "
+                    "authenticated QA Fact before any graph mutation"
+                ),
+                "rebuild_started": False,
+                "snapshot_materialized": False,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "fail_closed": True,
+                "qa_preflight_authority": (
+                    direct_main_qa_preflight_authority
+                ),
+            }
         activate_requested = bool(body.get("activate", True))
         requested_identity = store.normalize_pending_scope_identity(
             ref_name=str(body.get("ref_name") or ""),
@@ -86814,6 +86917,13 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             current_full_auth,
             runtime_context_scope=runtime_context_scope,
         )
+        if direct_main_qa_preflight_authority.get("applicable") is True:
+            route_evidence = {
+                **route_evidence,
+                "direct_main_qa_preflight_authority": dict(
+                    direct_main_qa_preflight_authority
+                ),
+            }
         idempotency_scope = _current_full_reconcile_idempotency_scope(route_evidence)
         route_evidence = {
             **route_evidence,
@@ -133584,6 +133694,2743 @@ _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE_ALIASES = frozenset(
 )
 
 
+def _operator_supervised_direct_main_execution_id(
+    project_id: str,
+    backlog_id: str,
+) -> str:
+    """Return the only fresh Direct rev2 execution id for one bounded row."""
+
+    return _contract_runtime_stable_id(
+        "cex-direct-main",
+        project_id,
+        backlog_id,
+        "operator_supervised_direct_main",
+        "v1",
+        "rev2",
+    )
+
+
+def _operator_supervised_direct_main_strict_records(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> list[dict[str, Any]]:
+    runtime = _contract_runtime(conn)
+    records = runtime.store.list_by_backlog(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_id="operator_supervised_direct_main",
+    )
+    return [
+        dict(record)
+        for record in records
+        if str(record.get("revision") or "").strip() == "rev2"
+        and isinstance(record.get("metadata"), Mapping)
+        and record["metadata"].get(
+            "operator_supervised_direct_main_runtime_binding"
+        )
+    ]
+
+
+def _operator_supervised_direct_main_generic_crud_rejection(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the pinned Direct rev2 facade-only write policy."""
+
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    if not (
+        str(record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(record.get("revision") or "").strip() == "rev2"
+        and metadata.get("generic_crud_exposed") is False
+        and binding.get("strict_runtime_binding_required") is True
+    ):
+        return {}
+    result = _contract_runtime_unchanged_line_rejection(
+        record,
+        [
+            "operator_supervised_direct_main rev2 rejects agent-facing "
+            "generic ContractRuntime line writes; use the exact timeline facade"
+        ],
+    )
+    result.update(
+        {
+            "error": "operator_supervised_direct_main_generic_crud_forbidden",
+            "required_facade": "task_timeline_append",
+            "generic_contract_runtime_submit_line_allowed": False,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+        }
+    )
+    return result
+
+
+def _operator_supervised_direct_main_route_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    """Resolve the exact full-round route and closed backlog file fence."""
+
+    from . import observer_route_context
+
+    route_token_ref = str(route_token_ref or "").strip()
+    row_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
+    try:
+        route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+        )
+        route_error = ""
+    except observer_route_context.RouteTokenRefError as exc:
+        route = {}
+        route_error = str(exc)
+    allowed_actions = sorted(
+        {
+            str(action or "").strip()
+            for action in (route or {}).get("allowed_actions") or []
+            if str(action or "").strip()
+        }
+    )
+    expected_actions = sorted(
+        _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+    )
+    target_files = sorted(
+        {
+            str(path or "").strip()
+            for path in (route or {}).get("target_files") or []
+            if str(path or "").strip()
+        }
+    )
+    owned_files = sorted(
+        {
+            str(path or "").strip()
+            for path in (route or {}).get("owned_files") or []
+            if str(path or "").strip()
+        }
+    )
+    route_identity = {
+        field: str((route or {}).get(field) or "").strip()
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+            "route_token_ref",
+        )
+    }
+    accepted = bool(
+        route
+        and str(route.get("caller_role") or "").strip() == "observer"
+        and allowed_actions == expected_actions
+        and row_files
+        and target_files == row_files
+        and owned_files == row_files
+        and all(route_identity.values())
+    )
+    authority = {
+        "schema_version": (
+            "operator_supervised_direct_main.route_authority.v1"
+        ),
+        "accepted": accepted,
+        "status": "accepted" if accepted else "rejected",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "route_token_ref": route_token_ref,
+        "route_identity": route_identity,
+        "row_declared_files": row_files,
+        "route_target_files": target_files,
+        "route_owned_files": owned_files,
+        "allowed_actions": allowed_actions,
+        "expected_allowed_actions": expected_actions,
+        "route_resolution_error": route_error,
+        "zero_write_on_failure": True,
+        "historical_backfill_allowed": False,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _operator_supervised_direct_main_world_ref(
+    *,
+    project_id: str,
+) -> dict[str, Any]:
+    """Resolve the one canonical pre-mutation Git world for Direct rev2."""
+
+    try:
+        project_root = Path(
+            project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=True,
+            )
+        ).resolve()
+        top_level = _qa_git_bytes(
+            project_root,
+            ["rev-parse", "--show-toplevel"],
+        )
+        resolved_top_level = Path(
+            top_level.stdout.decode(
+                "utf-8", errors="surrogateescape"
+            ).strip()
+        ).resolve()
+        head = _qa_git_bytes(
+            project_root,
+            ["rev-parse", "--verify", "HEAD^{commit}"],
+        )
+        head_commit = head.stdout.decode(
+            "ascii", errors="ignore"
+        ).strip().lower()
+    except (OSError, TypeError, ValueError, _QACandidateOverlayError) as exc:
+        project_root = Path()
+        resolved_top_level = Path()
+        head_commit = ""
+        error = str(exc)
+    else:
+        error = ""
+    accepted = bool(
+        project_root
+        and resolved_top_level == project_root
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head_commit)
+    )
+    authority = {
+        "schema_version": (
+            "operator_supervised_direct_main.pre_mutation_world_ref.v1"
+        ),
+        "accepted": accepted,
+        "status": "accepted" if accepted else "rejected",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "target_project_root": str(project_root) if accepted else "",
+        "worktree_path": str(project_root) if accepted else "",
+        "base_commit": head_commit if accepted else "",
+        "target_head_commit": head_commit if accepted else "",
+        "repository_root_exact": bool(accepted),
+        "resolution_error": error,
+        "zero_write_on_failure": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _operator_supervised_direct_main_start_runtime(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    route_token_ref: str,
+    world_ref: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Start/read the fresh rev2 CEX after exact route closure is admitted."""
+
+    execution_id = _operator_supervised_direct_main_execution_id(
+        project_id,
+        backlog_id,
+    )
+    if str(task_id or "").strip() != execution_id:
+        raise GovernanceError(
+            "operator_supervised_direct_main_execution_identity_mismatch",
+            "Direct Main requires the exact deterministic rev2 execution id",
+            409,
+            {
+                "field": "task_id",
+                "expected": execution_id,
+                "actual": str(task_id or "").strip(),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    route_authority = _operator_supervised_direct_main_route_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        route_token_ref=route_token_ref,
+    )
+    if route_authority.get("accepted") is not True:
+        raise GovernanceError(
+            "operator_supervised_direct_main_route_binding_invalid",
+            "Direct Main route, task, actions, and file fence must be exact",
+            422,
+            {
+                **route_authority,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+
+    runtime = _contract_runtime(conn)
+    strict_records = _operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    if len(strict_records) > 1:
+        raise GovernanceError(
+            "operator_supervised_direct_main_execution_not_unique",
+            "Direct Main fresh row must resolve exactly one rev2 execution",
+            409,
+            {
+                "candidate_execution_ids": [
+                    str(record.get("contract_execution_id") or "")
+                    for record in strict_records
+                ],
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    if strict_records:
+        record = strict_records[0]
+        metadata = record.get("metadata") or {}
+        binding = metadata.get(
+            "operator_supervised_direct_main_runtime_binding"
+        ) or {}
+        if (
+            str(record.get("contract_execution_id") or "") != execution_id
+            or str(record.get("route_token_ref") or "") != route_token_ref
+            or dict(binding.get("route_identity") or {})
+            != dict(route_authority.get("route_identity") or {})
+        ):
+            raise GovernanceError(
+                "operator_supervised_direct_main_execution_binding_changed",
+                "Direct Main execution route binding is immutable",
+                409,
+                {
+                    "contract_execution_id": execution_id,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                },
+            )
+        return runtime.current_record(execution_id, actor_role="observer")
+
+    current_world_ref = _operator_supervised_direct_main_world_ref(
+        project_id=project_id,
+    )
+    if not (
+        world_ref.get("accepted") is True
+        and current_world_ref.get("accepted") is True
+        and stable_sha256(dict(world_ref))
+        == stable_sha256(dict(current_world_ref))
+    ):
+        raise GovernanceError(
+            "operator_supervised_direct_main_world_ref_changed",
+            "Direct Main pre-mutation world changed before execution start",
+            422,
+            {
+                "expected_world_ref": dict(world_ref),
+                "current_world_ref": current_world_ref,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    project_root = Path(str(world_ref["target_project_root"])).resolve()
+    head_commit = str(world_ref["base_commit"])
+    binding = {
+        "schema_version": (
+            "operator_supervised_direct_main.runtime_binding.v1"
+        ),
+        "strict_runtime_binding_required": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "route_identity": dict(route_authority["route_identity"]),
+        "owned_files": list(route_authority["row_declared_files"]),
+        "target_files": list(route_authority["row_declared_files"]),
+        "target_project_root": str(project_root),
+        "worktree_path": str(project_root),
+        "base_commit": head_commit,
+        "target_head_commit": head_commit,
+        "pre_mutation_world_ref": dict(world_ref),
+        "same_execution_retry_allowed": False,
+        "same_generation_retry_allowed": False,
+        "post_hoc_pass_backfill_allowed": False,
+    }
+    binding["binding_hash"] = stable_sha256(binding)
+    record = runtime.start_execution(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev2",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=execution_id,
+        root_contract_execution_id=execution_id,
+        contract_chain_id=_contract_runtime_stable_id(
+            "cchain-direct-main", project_id, backlog_id, "rev2"
+        ),
+        route_token_ref=route_token_ref,
+        role_binding={
+            "observer": "observer",
+            "qa": "qa",
+            "binding_source": (
+                "operator_supervised_direct_main_route_authority"
+            ),
+        },
+        backlog_lineage={
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": execution_id,
+        },
+        metadata={
+            "facade": "observer_direct_mutation_exception",
+            "generic_crud_exposed": False,
+            "operator_supervised_direct_main_runtime_binding": binding,
+            "operator_supervised_direct_main_route_authority": (
+                route_authority
+            ),
+        },
+    )
+    upsert_contract_chain_root_current_binding(conn, record)
+    return runtime.current_record(execution_id, actor_role="observer")
+
+
+def _operator_supervised_direct_main_pre_mutation_fingerprint(
+    event: Mapping[str, Any],
+) -> str:
+    """Hash the complete normalized request admitted by the public facade."""
+
+    admitted_payload = deepcopy(
+        dict(event.get("payload") or {})
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    for generated_key in (
+        "route_token_gate",
+        "route_action_scope_lineage",
+        "source_backed_contract_gate_authority",
+        "contract_gate_decision",
+        "agent_facing_decision_source",
+        "meta_contract_gate_decision_source",
+        "acceptance_scope_closure",
+        "observer_direct_pre_mutation_authority",
+        "direct_contract_runtime_binding",
+        "direct_contract_runtime_lineage",
+    ):
+        admitted_payload.pop(generated_key, None)
+    canonical = {
+        "schema_version": (
+            "operator_supervised_direct_main.pre_mutation_request.v1"
+        ),
+        "event": {
+            **{
+                key: deepcopy(event.get(key))
+                for key in (
+                    "project_id",
+                    "backlog_id",
+                    "task_id",
+                    "event_type",
+                    "event_kind",
+                    "phase",
+                    "status",
+                    "decision",
+                    "actor",
+                    "verification",
+                    "artifact_refs",
+                )
+            },
+            "payload": admitted_payload,
+        },
+        "server_admitted_canonical_request": True,
+        "generated_event_fields_included": False,
+    }
+    return stable_sha256(canonical)
+
+
+def _operator_supervised_direct_main_facade_action_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+    target_files: Sequence[str],
+    record: Mapping[str, Any],
+    runtime_next: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the existing public facade for one strict Direct rev2 line.
+
+    ContractRuntime remains the selector and evidence authority.  This helper
+    only projects its first missing line onto the already-existing graph or
+    timeline facade; it must never make the generic submit-line body executable
+    for a contract whose pinned Rule forbids agent-facing generic CRUD.
+    """
+
+    line_id = str(runtime_next.get("line_id") or "").strip()
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    route_identity = (
+        dict(binding.get("route_identity") or {})
+        if isinstance(binding.get("route_identity"), Mapping)
+        else {}
+    )
+    completed_lines = [
+        line
+        for line in (
+            record.get("completed_lines")
+            or (
+                record.get("execution_state", {}).get("completed_lines")
+                if isinstance(record.get("execution_state"), Mapping)
+                else []
+            )
+            or []
+        )
+        if isinstance(line, Mapping)
+    ]
+    implementation_commits = _runtime_context_service_dedupe(
+        [
+            str(line.get("commit_sha") or "").strip().lower()
+            for line in completed_lines
+            if str(line.get("line_id") or "").strip()
+            == "observer_implementation"
+            and re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(line.get("commit_sha") or "").strip().lower(),
+            )
+        ]
+    )
+    implementation_commit = (
+        implementation_commits[0]
+        if len(implementation_commits) == 1
+        else ""
+    )
+    base_projection = {
+        "schema_version": (
+            "onboard_route_guide.operator_supervised_direct_main."
+            "facade_action_projection.v1"
+        ),
+        "line_id": line_id,
+        "contract_execution_id": contract_execution_id,
+        "source_of_authority": "contract_runtime_first_missing_line",
+        "selector_owned_by_facade": False,
+        "transport_projected_by_facade": True,
+        "generic_contract_runtime_submit_line_allowed": False,
+        "generic_contract_runtime_payload_executable": False,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+    if line_id in {
+        "observer_bind_direct_scope",
+        "observer_graph_context",
+        "observer_direct_implementation_exception",
+    }:
+        guidance = _onboard_parentless_direct_main_pre_mutation_event_guidance(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+            route_token_ref=route_token_ref,
+            target_files=target_files,
+        )
+        missing = list(guidance.get("replace_before_submit") or [])
+        return {
+            **base_projection,
+            "facade_tool": "observer_direct_mutation_exception",
+            "action_input": deepcopy(
+                dict(guidance.get("arguments_template") or {})
+            ),
+            "copy_safe_body": deepcopy(
+                dict(guidance.get("arguments_template") or {})
+            ),
+            "action_input_ready": bool(
+                guidance.get("identity_ready") and not missing
+            ),
+            "action_input_missing_fields": missing,
+            "replace_before_submit": missing,
+            "graph_query_close_authority": (
+                _onboard_parentless_direct_main_graph_query_guidance(
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=contract_execution_id,
+                    route_token_ref=route_token_ref,
+                    target_files=target_files,
+                )
+            ),
+            "consumes_contract_runtime_lines": [
+                "observer_bind_direct_scope",
+                "observer_graph_context",
+                "observer_direct_implementation_exception",
+            ],
+        }
+
+    post_mutation = _onboard_parentless_direct_main_post_mutation_event_guidance(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        target_files=target_files,
+    )
+    if line_id == "observer_implementation":
+        template = dict(post_mutation.get("implementation") or {})
+        body = deepcopy(dict(template.get("arguments_template") or {}))
+        if isinstance(body.get("payload"), Mapping):
+            body["payload"] = {
+                **route_identity,
+                **dict(body["payload"]),
+            }
+        missing = list(template.get("replace_before_submit") or [])
+        return {
+            **base_projection,
+            "facade_tool": "task_timeline_append",
+            "action_input": body,
+            "copy_safe_body": deepcopy(body),
+            "action_input_ready": bool(
+                template.get("identity_ready") and not missing
+            ),
+            "action_input_missing_fields": missing,
+            "replace_before_submit": missing,
+            "same_value_replacements": deepcopy(
+                dict(template.get("same_value_replacements") or {})
+            ),
+            "consumes_contract_runtime_lines": [
+                "observer_implementation"
+            ],
+        }
+
+    if line_id in {"qa_graph_context", "qa_independent_verification"}:
+        commit_value = implementation_commit or (
+            "<replace with the exact Direct implementation commit>"
+        )
+        qa_principal = "<copy the authenticated QA principal_id>"
+        qa_graph_trace = "<copy a DB-verified QA graph_query trace_id>"
+        test_command = "<copy one or more exact QA commands that passed>"
+        body = {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": contract_execution_id,
+            "contract_execution_id": contract_execution_id,
+            "event_type": "qa.independent_verification",
+            "event_kind": "independent_verification",
+            "phase": "qa",
+            "status": "passed",
+            "actor": qa_principal,
+            "commit_sha": commit_value,
+            "verification": {
+                "tests_run": [test_command],
+                "diff_check": {"unexpected_files": []},
+                "live_regression": {"status": "passed"},
+            },
+            "payload": {
+                "graph_trace_ids": [qa_graph_trace],
+                "observer_impersonation": False,
+            },
+        }
+        missing = [
+            "actor",
+            "verification.tests_run",
+            "payload.graph_trace_ids",
+        ]
+        if not implementation_commit:
+            missing.append("commit_sha")
+        return {
+            **base_projection,
+            "facade_tool": "task_timeline_append",
+            "action_input": body,
+            "copy_safe_body": deepcopy(body),
+            "action_input_ready": not missing,
+            "action_input_missing_fields": missing,
+            "replace_before_submit": missing,
+            "qa_session_required": True,
+            "qa_authored": True,
+            "observer_may_submit": False,
+            "managed_qa_session_token_required": True,
+            "raw_qa_session_token_exposed": False,
+            "consumes_contract_runtime_lines": [
+                "qa_graph_context",
+                "qa_independent_verification",
+            ],
+        }
+
+    def close_ready_projection(
+        reconcile_authority: Mapping[str, Any],
+        *,
+        consumes_lines: Sequence[str],
+    ) -> dict[str, Any]:
+        template = dict(post_mutation.get("close_ready") or {})
+        body = deepcopy(dict(template.get("arguments_template") or {}))
+        close_commit_placeholder = "<replace with the exact closing HEAD commit>"
+        snapshot_placeholder = (
+            "<replace with the active current-HEAD full reconcile snapshot id>"
+        )
+        snapshot_id = str(
+            reconcile_authority.get("active_snapshot_id") or ""
+        ).strip()
+
+        def replace_exact(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {
+                    key: replace_exact(item) for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [replace_exact(item) for item in value]
+            if value == close_commit_placeholder and implementation_commit:
+                return implementation_commit
+            if value == snapshot_placeholder and snapshot_id:
+                return snapshot_id
+            return value
+
+        body = replace_exact(body)
+        if isinstance(body.get("payload"), Mapping):
+            body["payload"] = {
+                **route_identity,
+                **dict(body["payload"]),
+            }
+        missing = ["verification.test_results.commands"]
+        if not implementation_commit:
+            missing.append("commit_sha")
+        if not snapshot_id:
+            missing.extend(
+                [
+                    "verification.full_reconcile_snapshot.snapshot_id",
+                    "payload.full_reconcile_snapshot_id",
+                ]
+            )
+        return {
+            **base_projection,
+            "facade_tool": "task_timeline_append",
+            "action_input": body,
+            "copy_safe_body": deepcopy(body),
+            "action_input_ready": not missing,
+            "action_input_missing_fields": missing,
+            "replace_before_submit": missing,
+            "current_full_reconcile_authority": dict(reconcile_authority),
+            "consumes_contract_runtime_lines": list(consumes_lines),
+            "reconcile_line_materialized_by_close_facade": (
+                "observer_reconcile" in consumes_lines
+            ),
+        }
+
+    if line_id == "observer_reconcile":
+        reconcile_authority = (
+            _operator_supervised_direct_main_current_full_reconcile_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=contract_execution_id,
+                record=record,
+            )
+            if implementation_commit
+            else {}
+        )
+        if reconcile_authority:
+            return close_ready_projection(
+                reconcile_authority,
+                consumes_lines=[
+                    "observer_reconcile",
+                    "observer_close_ready",
+                ],
+            )
+        commit_value = implementation_commit or (
+            "<replace with the exact Direct implementation commit>"
+        )
+        body = {
+            "project_id": project_id,
+            "target_commit_sha": commit_value,
+            "activate": True,
+            "require_clean": True,
+            "semantic_enrich": False,
+            "backlog_id": backlog_id,
+            "task_id": contract_execution_id,
+            "contract_execution_id": contract_execution_id,
+            "observer_session_id": (
+                "<copy the active observer_session_id>"
+            ),
+            "observer_route_token_ref": route_token_ref,
+            "response_view": "compact",
+        }
+        missing = ["observer_session_id"]
+        if not implementation_commit:
+            missing.append("target_commit_sha")
+        return {
+            **base_projection,
+            "facade_tool": "graph_current_full_reconcile",
+            "action_input": body,
+            "copy_safe_body": deepcopy(body),
+            "action_input_ready": not missing,
+            "action_input_missing_fields": missing,
+            "replace_before_submit": missing,
+            "requires_current_runtime_qa_position": True,
+            "consumes_contract_runtime_lines": ["observer_reconcile"],
+        }
+
+    if line_id == "observer_close_ready":
+        reconcile_authority = (
+            _operator_supervised_direct_main_current_full_reconcile_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=contract_execution_id,
+                record=record,
+            )
+            if implementation_commit
+            else {}
+        )
+        return close_ready_projection(
+            reconcile_authority,
+            consumes_lines=["observer_close_ready"],
+        )
+
+    return {
+        **base_projection,
+        "facade_tool": "",
+        "action_input": {},
+        "copy_safe_body": {},
+        "action_input_ready": False,
+        "action_input_missing_fields": ["supported_direct_rev2_line_id"],
+        "status": "blocked_unknown_direct_rev2_line",
+    }
+
+
+def _operator_supervised_direct_main_public_runtime_record(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Hide the forbidden generic write body from the facade projection."""
+
+    public_record = deepcopy(dict(record))
+    runtime_guide = (
+        public_record.get("runtime_guide")
+        if isinstance(public_record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_action = (
+        dict(runtime_guide.get("next_legal_action") or {})
+        if isinstance(runtime_guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if next_action:
+        for field in (
+            "action_input",
+            "copy_safe_body",
+            "canonical_executable_action",
+            "writer_role_safe_copy_payload",
+        ):
+            next_action.pop(field, None)
+        next_action.update(
+            {
+                "executable": False,
+                "facade_projection_required": True,
+                "generic_contract_runtime_submit_line_allowed": False,
+                "generic_contract_runtime_payload_executable": False,
+            }
+        )
+        public_runtime_guide = dict(runtime_guide)
+        for field in (
+            "action_input",
+            "copy_safe_body",
+            "canonical_executable_action",
+            "writer_role_safe_copy_payload",
+        ):
+            public_runtime_guide.pop(field, None)
+        public_runtime_guide.update(
+            {
+                "generic_contract_runtime_submit_line_allowed": False,
+                "generic_contract_runtime_payload_executable": False,
+            }
+        )
+        public_record["runtime_guide"] = {
+            **public_runtime_guide,
+            "next_legal_action": next_action,
+        }
+    return public_record
+
+
+def _onboard_operator_supervised_direct_main_runtime_response(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+    role: str,
+    work_type: str,
+    response_view: str,
+) -> dict[str, Any]:
+    """Project the fresh Direct rev2 entrance without an onboard proxy.
+
+    Historical rows that already admitted the legacy parentless event retain
+    their old projection.  A fresh row instead receives the deterministic
+    Direct CEX identity before route issuance, so every later graph/timeline
+    Fact can bind to the source-backed ContractRuntime execution.
+    """
+
+    if not (
+        str(role or "").strip() == "observer"
+        and str(work_type or "").strip()
+        in {"direct_main", "operator_supervised_direct_main"}
+    ):
+        return {}
+    strict_records = _operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    historical_events = _onboard_parentless_direct_main_timeline_events(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        event_kind="observer_direct_implementation_exception",
+    )
+    if not strict_records and any(
+        _onboard_parentless_direct_main_event_is_accepted(event)
+        for event in historical_events
+    ):
+        return {}
+    if len(strict_records) > 1:
+        return {
+            "schema_version": (
+                "onboard_route_guide.operator_supervised_direct_main.v2"
+            ),
+            "ok": False,
+            "status": "blocked",
+            "error": (
+                "operator_supervised_direct_main_execution_not_unique"
+            ),
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "candidate_execution_ids": [
+                str(record.get("contract_execution_id") or "")
+                for record in strict_records
+            ],
+            "writes_performed": False,
+        }
+
+    execution_id = _operator_supervised_direct_main_execution_id(
+        project_id,
+        backlog_id,
+    )
+    target_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
+    persisted_ref = (
+        str(strict_records[0].get("route_token_ref") or "").strip()
+        if strict_records
+        else ""
+    )
+    requested_ref = str(route_token_ref or "").strip()
+    if strict_records and requested_ref and requested_ref != persisted_ref:
+        return {
+            "schema_version": (
+                "onboard_route_guide.operator_supervised_direct_main.v2"
+            ),
+            "ok": False,
+            "status": "blocked",
+            "error": "operator_supervised_direct_main_route_binding_changed",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "expected_route_token_ref": persisted_ref,
+            "requested_route_token_ref": requested_ref,
+            "writes_performed": False,
+            "zero_write_rejection": True,
+        }
+    effective_ref = persisted_ref if strict_records else requested_ref
+    route_authority = (
+        _operator_supervised_direct_main_route_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=execution_id,
+            route_token_ref=effective_ref,
+        )
+        if effective_ref
+        else {}
+    )
+    route_ready = bool(route_authority.get("accepted") is True)
+    if requested_ref and not route_ready and not strict_records:
+        return {
+            "schema_version": (
+                "onboard_route_guide.operator_supervised_direct_main.v2"
+            ),
+            "ok": False,
+            "status": "blocked",
+            "error": "operator_supervised_direct_main_route_not_registered",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "requested_route_token_ref": requested_ref,
+            "required_action": "observer_route_context_issue",
+            "writes_performed": False,
+            "zero_write_rejection": True,
+        }
+    route_issue_body = {
+        "project_id": project_id,
+        "caller_role": "observer",
+        "backlog_id": backlog_id,
+        "task_id": execution_id,
+        "target_files": target_files,
+        "owned_files": target_files,
+        "allowed_actions": list(
+            _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+        ),
+        "evidence_refs": [
+            f"backlog:{backlog_id}",
+            f"contract_runtime:{execution_id}",
+            "contract_definition:operator_supervised_direct_main.v1.rev2",
+        ],
+    }
+    if route_ready:
+        graph_guidance = _onboard_parentless_direct_main_graph_query_guidance(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=execution_id,
+            route_token_ref=effective_ref,
+            target_files=target_files,
+        )
+        pre_mutation = (
+            _onboard_parentless_direct_main_pre_mutation_event_guidance(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=execution_id,
+                route_token_ref=effective_ref,
+                target_files=target_files,
+            )
+        )
+        next_action: dict[str, Any] = {
+            "schema_version": "onboard_route_guide.next_action.v1",
+            "id": "operator_supervised_direct_main_graph_first",
+            "action": "observer_direct_mutation_exception",
+            "interface": "observer_direct_mutation_exception",
+            "mcp_tool": "observer_direct_mutation_exception",
+            "owner_role": "observer",
+            "requires_role": "observer",
+            "requires_graph_first": True,
+            "requires_operator_approval": True,
+            "requires_route_token_ref": True,
+            "action_input": dict(
+                pre_mutation.get("arguments_template") or {}
+            ),
+            "copy_safe_body": dict(
+                pre_mutation.get("arguments_template") or {}
+            ),
+            "action_input_ready": bool(pre_mutation.get("identity_ready")),
+            "graph_query_close_authority": graph_guidance,
+            "copy_safe_pre_mutation_event": pre_mutation,
+            "source_of_authority": (
+                "operator_supervised_direct_main.v1.rev2+route_registry"
+            ),
+        }
+    else:
+        next_action = {
+            "schema_version": "onboard_route_guide.next_action.v1",
+            "id": "operator_supervised_direct_main_route_issue",
+            "action": "observer_route_context_issue",
+            "interface": "observer_route_context_issue",
+            "mcp_tool": "observer_route_context_issue",
+            "owner_role": "observer",
+            "requires_role": "observer",
+            "action_input": dict(route_issue_body),
+            "copy_safe_body": dict(route_issue_body),
+            "action_input_ready": bool(target_files),
+            "action_input_missing_fields": [] if target_files else ["target_files"],
+            "source_of_authority": (
+                "operator_supervised_direct_main.v1.rev2+backlog_file_fence"
+            ),
+        }
+
+    current_record: dict[str, Any] = {}
+    if strict_records:
+        current_record = _contract_runtime(conn).current_record(
+            execution_id,
+            actor_role="observer",
+        )
+        runtime_next = (
+            current_record.get("runtime_guide", {}).get("next_legal_action")
+            if isinstance(current_record.get("runtime_guide"), Mapping)
+            else None
+        )
+        if isinstance(runtime_next, Mapping) and runtime_next:
+            line_id = str(runtime_next.get("line_id") or "").strip()
+            facade_projection = (
+                _operator_supervised_direct_main_facade_action_projection(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    contract_execution_id=execution_id,
+                    route_token_ref=effective_ref,
+                    target_files=target_files,
+                    record=current_record,
+                    runtime_next=runtime_next,
+                )
+            )
+            facade_tool = str(
+                facade_projection.get("facade_tool") or ""
+            ).strip()
+            public_runtime_next = dict(runtime_next)
+            for field in (
+                "action_input",
+                "copy_safe_body",
+                "canonical_executable_action",
+                "writer_role_safe_copy_payload",
+            ):
+                public_runtime_next.pop(field, None)
+            public_runtime_next.update(
+                {
+                    "executable": False,
+                    "facade_projection_required": True,
+                    "generic_contract_runtime_submit_line_allowed": False,
+                    "generic_contract_runtime_payload_executable": False,
+                }
+            )
+            next_action = {
+                **public_runtime_next,
+                "schema_version": "onboard_route_guide.next_action.v1",
+                "id": f"contract_runtime:{line_id}",
+                "action": facade_tool,
+                "interface": facade_tool,
+                "mcp_tool": facade_tool,
+                "owner_role": str(
+                    runtime_next.get("owner_role")
+                    or runtime_next.get("required_owner_role")
+                    or "observer"
+                ),
+                "requires_role": str(
+                    runtime_next.get("owner_role")
+                    or runtime_next.get("required_owner_role")
+                    or "observer"
+                ),
+                "action_input": deepcopy(
+                    dict(facade_projection.get("action_input") or {})
+                ),
+                "copy_safe_body": deepcopy(
+                    dict(facade_projection.get("copy_safe_body") or {})
+                ),
+                "action_input_ready": bool(
+                    facade_projection.get("action_input_ready")
+                ),
+                "action_input_missing_fields": list(
+                    facade_projection.get("action_input_missing_fields")
+                    or []
+                ),
+                "replace_before_submit": list(
+                    facade_projection.get("replace_before_submit") or []
+                ),
+                "facade_action_projection": facade_projection,
+                "contract_runtime_next_legal_action": public_runtime_next,
+                "source_of_authority": "contract_runtime_first_missing_line",
+                "selector_owned_by_facade": False,
+                "transport_projected_by_facade": True,
+                "generic_contract_runtime_submit_line_allowed": False,
+                "generic_contract_runtime_payload_executable": False,
+            }
+        else:
+            next_action = None
+
+    public_current_record = (
+        _operator_supervised_direct_main_public_runtime_record(current_record)
+        if current_record
+        else {}
+    )
+
+    return {
+        "schema_version": (
+            "onboard_route_guide.operator_supervised_direct_main.v2"
+        ),
+        "ok": True,
+        "response_view": str(response_view or "full"),
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "selected_role": "observer",
+        "selected_work_type": "operator_supervised_direct_main",
+        "selected_backlog_source": "backlog_row",
+        "contract_execution_id": execution_id,
+        "contract_id": "operator_supervised_direct_main",
+        "contract_version": "v1",
+        "contract_revision": "rev2",
+        "source_backed_contract_selected": True,
+        "onboard_service_proxy_selected": False,
+        "target_files": target_files,
+        "route_authority": dict(route_authority),
+        "observer_route_context_issue": {
+            "required": not route_ready,
+            "mcp_tool": "observer_route_context_issue",
+            "copy_safe_body": dict(route_issue_body),
+            "bind_response_field": "route_token_ref",
+        },
+        "next_legal_action": next_action,
+        "contract_runtime_current": public_current_record,
+        "position_skippable": False,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+    }
+
+
+def _operator_supervised_direct_main_bound_pre_mutation_events(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+) -> list[dict[str, Any]]:
+    from . import task_timeline
+
+    events = task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        limit=1000,
+    )
+    result: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        authority = (
+            payload.get("observer_direct_pre_mutation_authority")
+            if isinstance(
+                payload.get("observer_direct_pre_mutation_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        binding = (
+            payload.get("direct_contract_runtime_binding")
+            if isinstance(payload.get("direct_contract_runtime_binding"), Mapping)
+            else {}
+        )
+        if (
+            authority.get("accepted") is True
+            and authority.get("server_projected") is True
+            and str(binding.get("contract_execution_id") or "").strip()
+            == contract_execution_id
+            and str(binding.get("line_id") or "").strip()
+            == "observer_direct_implementation_exception"
+            and str(authority.get("pre_mutation_request_fingerprint") or "")
+            .strip()
+            .startswith("sha256:")
+        ):
+            result.append(event)
+    return result
+
+
+def _operator_supervised_direct_main_runtime_line_payload(
+    record: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    return {
+        **dict(payload),
+        "direct_runtime_binding_hash": str(binding.get("binding_hash") or ""),
+    }
+
+
+def _operator_supervised_direct_main_submit_runtime_line(
+    conn,
+    *,
+    contract_execution_id: str,
+    actor_role: str,
+    expected_stage_id: str,
+    expected_line_id: str,
+    expected_evidence_kind: str,
+    payload: Mapping[str, Any],
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime = _contract_runtime(conn)
+    record = runtime.current_record(
+        contract_execution_id,
+        actor_role=actor_role,
+    )
+    next_line = (
+        record.get("runtime_guide", {}).get("next_legal_action")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    actual = {
+        "stage_id": str((next_line or {}).get("stage_id") or "").strip(),
+        "line_id": str((next_line or {}).get("line_id") or "").strip(),
+        "evidence_kind": str(
+            (next_line or {}).get("evidence_kind") or ""
+        ).strip(),
+    }
+    expected = {
+        "stage_id": expected_stage_id,
+        "line_id": expected_line_id,
+        "evidence_kind": expected_evidence_kind,
+    }
+    if actual != expected:
+        raise GovernanceError(
+            "operator_supervised_direct_main_runtime_line_mismatch",
+            "Direct Main timeline adapter does not match the current Contract line",
+            409,
+            {
+                "contract_execution_id": contract_execution_id,
+                "expected": expected,
+                "actual": actual,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    body = {
+        "stage_id": expected_stage_id,
+        "line_id": expected_line_id,
+        "evidence_kind": expected_evidence_kind,
+        "payload": _operator_supervised_direct_main_runtime_line_payload(
+            record,
+            payload,
+        ),
+        **dict(extra or {}),
+    }
+    write = _contract_runtime_line_write_body(
+        record,
+        body,
+        actor_role=actor_role,
+    )
+    result = runtime.submit_line_write(
+        contract_execution_id,
+        write,
+        actor_role=actor_role,
+    )
+    if result.get("ok") is not True:
+        raise GovernanceError(
+            "operator_supervised_direct_main_runtime_line_rejected",
+            "Direct Main timeline evidence did not satisfy ContractRuntime",
+            422,
+            {
+                "contract_execution_id": contract_execution_id,
+                "stage_id": expected_stage_id,
+                "line_id": expected_line_id,
+                "decision": dict(result.get("decision") or {}),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    return dict(result["record"])
+
+
+def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
+    conn,
+    *,
+    project_id: str,
+    target_commit: str,
+    current_full_auth: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Require the exact Direct rev2 QA Fact before current-full mutates."""
+
+    from . import task_timeline
+
+    route_scope = (
+        current_full_auth.get("route_token_scope")
+        if isinstance(current_full_auth.get("route_token_scope"), Mapping)
+        else {}
+    )
+    backlog_id = str(route_scope.get("backlog_id") or "").strip()
+    task_id = str(route_scope.get("task_id") or "").strip()
+    try:
+        record = _contract_runtime_store(conn).get(task_id)
+    except ContractRuntimeError:
+        record = {}
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    applicable = bool(
+        str(record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(record.get("revision") or "").strip() == "rev2"
+        and binding.get("strict_runtime_binding_required") is True
+    )
+    if not applicable:
+        return {
+            "schema_version": (
+                "operator_supervised_direct_main."
+                "reconcile_qa_preflight_authority.v1"
+            ),
+            "applicable": False,
+            "status": "not_applicable",
+            "server_derived": True,
+            "caller_claims_trusted": False,
+        }
+
+    target_commit = str(target_commit or "").strip().lower()
+    missing: list[str] = []
+    route_identity = (
+        binding.get("route_identity")
+        if isinstance(binding.get("route_identity"), Mapping)
+        else {}
+    )
+    if not (
+        str(record.get("project_id") or "").strip() == project_id
+        and str(record.get("backlog_id") or "").strip() == backlog_id
+        and str(record.get("contract_execution_id") or "").strip() == task_id
+        and str(current_full_auth.get("route_token_ref") or "").strip()
+        == str(route_identity.get("route_token_ref") or "").strip()
+    ):
+        missing.append("direct_runtime_route_scope_exact")
+    implementation_commits = _runtime_context_service_dedupe(
+        [
+            str(line.get("commit_sha") or "").strip().lower()
+            for line in record.get("completed_lines") or []
+            if isinstance(line, Mapping)
+            and str(line.get("line_id") or "").strip()
+            == "observer_implementation"
+        ]
+    )
+    if implementation_commits != [target_commit]:
+        missing.append("exact_direct_implementation_commit")
+
+    completed_lines = [
+        line
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    qa_graph_lines = [
+        line
+        for line in completed_lines
+        if str(line.get("line_id") or "").strip() == "qa_graph_context"
+    ]
+    qa_verdict_lines = [
+        line
+        for line in completed_lines
+        if str(line.get("line_id") or "").strip()
+        == "qa_independent_verification"
+    ]
+    runtime_position = _runtime_current_state_from_record(record)
+    runtime_next = (
+        runtime_position.get("next_legal_action")
+        if isinstance(
+            runtime_position.get("next_legal_action"), Mapping
+        )
+        else {}
+    )
+    if not (
+        len(qa_graph_lines) == 1
+        and len(qa_verdict_lines) == 1
+        and str(qa_verdict_lines[0].get("commit_sha") or "")
+        .strip()
+        .lower()
+        == target_commit
+        and str(qa_verdict_lines[0].get("status") or "")
+        .strip()
+        .lower()
+        in {"accepted", "completed", "ok", "pass", "passed", "succeeded"}
+        and str(runtime_next.get("line_id") or "").strip()
+        == "observer_reconcile"
+    ):
+        missing.append("contract_runtime_qa_position_exact")
+
+    qa_candidates: list[dict[str, Any]] = []
+    for event in task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        limit=1000,
+    ):
+        if str(event.get("event_kind") or "").strip().lower() not in (
+            _QA_TIMELINE_VERIFICATION_EVENT_KINDS
+        ):
+            continue
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        authority = _contract_runtime_close_authority_first_deep_mapping(
+            payload,
+            "source_backed_contract_gate_authority",
+        )
+        proof = (
+            authority.get("qa_session_proof")
+            if isinstance(authority.get("qa_session_proof"), Mapping)
+            else {}
+        )
+        if not (
+            task_timeline._event_passed(event)
+            and str(event.get("commit_sha") or "").strip().lower()
+            == target_commit
+            and task_timeline._source_backed_qa_session_authority_valid(
+                authority,
+                conn=conn,
+            )
+            and str(proof.get("project_id") or "").strip() == project_id
+            and str(proof.get("backlog_id") or "").strip() == backlog_id
+            and str(proof.get("task_id") or "").strip() == task_id
+            and str(proof.get("commit_sha") or "").strip().lower()
+            == target_commit
+            and str(proof.get("snapshot_id") or "").strip()
+            and str(proof.get("snapshot_commit_sha") or "").strip().lower()
+            == target_commit
+        ):
+            continue
+        qa_candidates.append(
+            {
+                "qa_event_id": int(event.get("id") or 0),
+                "qa_event_ref": f"timeline:{int(event.get('id') or 0)}",
+                "qa_snapshot_id": str(proof.get("snapshot_id") or "").strip(),
+                "qa_session_id": str(
+                    proof.get("qa_session_id") or ""
+                ).strip(),
+                "qa_authority_hash": str(
+                    authority.get("authority_hash") or ""
+                ).strip(),
+            }
+        )
+    if len(qa_candidates) != 1:
+        missing.append("unique_authenticated_qa_before_reconcile")
+    qa_candidate = qa_candidates[0] if len(qa_candidates) == 1 else {}
+    runtime_qa_authority_hashes = {
+        str(
+            (
+                (line.get("payload") or {}).get("qa_authority")
+                if isinstance(line.get("payload"), Mapping)
+                and isinstance(
+                    (line.get("payload") or {}).get("qa_authority"),
+                    Mapping,
+                )
+                else {}
+            ).get("authority_hash")
+            or ""
+        ).strip()
+        for line in [*qa_graph_lines, *qa_verdict_lines]
+    }
+    if not (
+        len(qa_graph_lines) == 1
+        and len(qa_verdict_lines) == 1
+        and qa_candidate
+        and runtime_qa_authority_hashes
+        == {str(qa_candidate.get("qa_authority_hash") or "").strip()}
+    ):
+        missing.append("contract_runtime_qa_authority_exact")
+    qa_graph_line_hash = (
+        stable_sha256(dict(qa_graph_lines[0]))
+        if len(qa_graph_lines) == 1
+        else ""
+    )
+    qa_verdict_line_hash = (
+        stable_sha256(dict(qa_verdict_lines[0]))
+        if len(qa_verdict_lines) == 1
+        else ""
+    )
+    authority = {
+        "schema_version": (
+            "operator_supervised_direct_main."
+            "reconcile_qa_preflight_authority.v1"
+        ),
+        "applicable": True,
+        "passed": not missing,
+        "status": "passed" if not missing else "failed",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": task_id,
+        "target_commit_sha": target_commit,
+        **qa_candidate,
+        "qa_candidate_count": len(qa_candidates),
+        "contract_runtime_execution_state_revision": int(
+            runtime_position.get("execution_state_revision") or 0
+        ),
+        "contract_runtime_execution_state_hash": str(
+            runtime_position.get("execution_state_hash") or ""
+        ).strip(),
+        "contract_runtime_runtime_guide_hash": str(
+            runtime_position.get("runtime_guide_hash") or ""
+        ).strip(),
+        "contract_runtime_next_line_id": str(
+            runtime_next.get("line_id") or ""
+        ).strip(),
+        "contract_runtime_qa_graph_line_hash": qa_graph_line_hash,
+        "contract_runtime_qa_verdict_line_hash": qa_verdict_line_hash,
+        "missing_requirement_ids": missing,
+        "zero_write_on_failure": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _operator_supervised_direct_main_current_full_reconcile_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one exact Direct current-full provenance from existing Facts."""
+
+    from . import task_timeline
+
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    implementation_commits = _runtime_context_service_dedupe(
+        [
+            str(line.get("commit_sha") or "").strip().lower()
+            for line in record.get("completed_lines") or []
+            if isinstance(line, Mapping)
+            and str(line.get("line_id") or "").strip()
+            == "observer_implementation"
+            and re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(line.get("commit_sha") or "").strip().lower(),
+            )
+        ]
+    )
+    if len(implementation_commits) != 1:
+        return {}
+    implementation_commit = implementation_commits[0]
+    try:
+        project_root = Path(
+            project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=True,
+            )
+        ).resolve()
+    except Exception:
+        return {}
+    canonical_head = _git_head_commit(project_root).strip().lower()
+    if canonical_head != implementation_commit:
+        return {}
+    qa_candidates: list[dict[str, Any]] = []
+    for event in task_timeline.list_events(
+        conn,
+        project_id,
+        backlog_id=backlog_id,
+        task_id=contract_execution_id,
+        limit=1000,
+    ):
+        event_kind = str(event.get("event_kind") or "").strip().lower()
+        if event_kind not in _QA_TIMELINE_VERIFICATION_EVENT_KINDS:
+            continue
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        authority = _contract_runtime_close_authority_first_deep_mapping(
+            payload,
+            "source_backed_contract_gate_authority",
+        )
+        proof = (
+            authority.get("qa_session_proof")
+            if isinstance(authority.get("qa_session_proof"), Mapping)
+            else {}
+        )
+        if not (
+            task_timeline._event_passed(event)
+            and str(event.get("commit_sha") or "").strip().lower()
+            == implementation_commit
+            and task_timeline._source_backed_qa_session_authority_valid(
+                authority,
+                conn=conn,
+            )
+            and str(proof.get("project_id") or "").strip() == project_id
+            and str(proof.get("backlog_id") or "").strip() == backlog_id
+            and str(proof.get("task_id") or "").strip()
+            == contract_execution_id
+            and str(proof.get("commit_sha") or "").strip().lower()
+            == implementation_commit
+            and str(proof.get("snapshot_id") or "").strip()
+            and str(proof.get("snapshot_commit_sha") or "").strip().lower()
+            == implementation_commit
+        ):
+            continue
+        qa_candidates.append(
+            {
+                "event_id": int(event.get("id") or 0),
+                "event_ref": f"timeline:{int(event.get('id') or 0)}",
+                "snapshot_id": str(proof.get("snapshot_id") or "").strip(),
+                "snapshot_commit_sha": implementation_commit,
+                "qa_session_id": str(
+                    proof.get("qa_session_id") or ""
+                ).strip(),
+                "authority_hash": str(
+                    authority.get("authority_hash") or ""
+                ).strip(),
+            }
+        )
+    if len(qa_candidates) != 1:
+        return {}
+    qa_authority = qa_candidates[0]
+    current_qa_graph_lines = [
+        line
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "qa_graph_context"
+    ]
+    current_qa_verdict_lines = [
+        line
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip()
+        == "qa_independent_verification"
+    ]
+    current_qa_graph_line_hash = (
+        stable_sha256(dict(current_qa_graph_lines[0]))
+        if len(current_qa_graph_lines) == 1
+        else ""
+    )
+    current_qa_verdict_line_hash = (
+        stable_sha256(dict(current_qa_verdict_lines[0]))
+        if len(current_qa_verdict_lines) == 1
+        else ""
+    )
+    try:
+        rows = conn.execute(
+            """
+            SELECT *
+              FROM graph_current_full_reconcile_provenance
+             WHERE project_id = ? AND target_commit_sha = ?
+             ORDER BY reconcile_event_id DESC, created_at DESC,
+                      provenance_id DESC
+            """,
+            (project_id, implementation_commit),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    candidates: list[dict[str, Any]] = []
+    for raw_row in rows:
+        provenance = dict(raw_row)
+        route_evidence = _json_loads(
+            provenance.get("route_evidence_json"),
+            {},
+        )
+        marker = _json_loads(provenance.get("marker_json"), {})
+        qa_preflight = (
+            route_evidence.get("direct_main_qa_preflight_authority")
+            if isinstance(route_evidence, Mapping)
+            and isinstance(
+                route_evidence.get(
+                    "direct_main_qa_preflight_authority"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        reconcile_event_id = int(
+            provenance.get("reconcile_event_id") or 0
+        )
+        if not (
+            reconcile_event_id > 0
+            and int(qa_authority.get("event_id") or 0)
+            < reconcile_event_id
+            and isinstance(route_evidence, Mapping)
+            and isinstance(marker, Mapping)
+            and str(provenance.get("protected_action") or "").strip()
+            == "graph_current_full_reconcile"
+            and str(
+                provenance.get("protected_entrypoint") or ""
+            ).strip()
+            == (
+                "POST /api/graph-governance/{project_id}/"
+                "reconcile/current-full"
+            )
+            and str(provenance.get("provenance_hash") or "").strip()
+            == str(marker.get("provenance_hash") or "").strip()
+            and route_evidence.get("schema_version")
+            == "graph_current_full_reconcile.route_evidence.v1"
+            and route_evidence.get("protected_action")
+            == "graph_current_full_reconcile"
+            and route_evidence.get("raw_route_token_persisted") is False
+            and str(route_evidence.get("route_token_ref") or "").strip()
+            == str(
+                (binding.get("route_identity") or {}).get(
+                    "route_token_ref"
+                )
+                or ""
+            ).strip()
+            and qa_preflight.get("schema_version")
+            == (
+                "operator_supervised_direct_main."
+                "reconcile_qa_preflight_authority.v1"
+            )
+            and qa_preflight.get("applicable") is True
+            and qa_preflight.get("passed") is True
+            and int(qa_preflight.get("qa_event_id") or 0)
+            == int(qa_authority.get("event_id") or 0)
+            and str(qa_preflight.get("qa_snapshot_id") or "").strip()
+            == str(qa_authority.get("snapshot_id") or "").strip()
+            and str(qa_preflight.get("target_commit_sha") or "")
+            .strip()
+            .lower()
+            == implementation_commit
+            and str(
+                qa_preflight.get(
+                    "contract_runtime_qa_graph_line_hash"
+                )
+                or ""
+            ).strip()
+            == current_qa_graph_line_hash
+            and str(
+                qa_preflight.get(
+                    "contract_runtime_qa_verdict_line_hash"
+                )
+                or ""
+            ).strip()
+            == current_qa_verdict_line_hash
+            and str(
+                qa_preflight.get("contract_runtime_next_line_id")
+                or ""
+            ).strip()
+            == "observer_reconcile"
+            and str(qa_preflight.get("qa_authority_hash") or "").strip()
+            == str(qa_authority.get("authority_hash") or "").strip()
+            and str(qa_preflight.get("authority_hash") or "").strip()
+            == stable_sha256(
+                {
+                    key: value
+                    for key, value in qa_preflight.items()
+                    if key != "authority_hash"
+                }
+            )
+            and marker.get("schema_version")
+            == "current_full_reconcile.provenance.v2"
+            and marker.get("protected_action")
+            == "graph_current_full_reconcile"
+            and marker.get("activate") is True
+            and marker.get("normal_update_path") is True
+            and str(marker.get("target_commit_sha") or "").strip().lower()
+            == implementation_commit
+        ):
+            continue
+        route_scope = (
+            route_evidence.get("route_token_scope")
+            if isinstance(route_evidence.get("route_token_scope"), Mapping)
+            else {}
+        )
+        if not (
+            str(route_scope.get("project_id") or "").strip() == project_id
+            and str(route_scope.get("backlog_id") or "").strip()
+            == backlog_id
+            and str(route_scope.get("task_id") or "").strip()
+            == contract_execution_id
+        ):
+            continue
+        event_rows = conn.execute(
+            """
+            SELECT * FROM task_timeline_events
+             WHERE project_id = ? AND id = ?
+            """,
+            (project_id, reconcile_event_id),
+        ).fetchall()
+        if len(event_rows) != 1:
+            continue
+        event = dict(event_rows[0])
+        if not (
+            str(event.get("backlog_id") or "").strip() == backlog_id
+            and str(event.get("task_id") or "").strip()
+            == contract_execution_id
+            and str(event.get("event_type") or "").strip()
+            == "graph.reconcile"
+            and str(event.get("event_kind") or "").strip() == "reconcile"
+            and str(event.get("status") or "").strip().lower()
+            in {"accepted", "ok", "passed", "succeeded"}
+            and str(event.get("commit_sha") or "").strip().lower()
+            == implementation_commit
+        ):
+            continue
+        snapshot_id = str(provenance.get("snapshot_id") or "").strip()
+        snapshot_rows = conn.execute(
+            """
+            SELECT snapshot_id, commit_sha, status
+              FROM graph_snapshots
+             WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (project_id, snapshot_id),
+        ).fetchall()
+        if not (
+            len(snapshot_rows) == 1
+            and str(snapshot_rows[0]["commit_sha"] or "").strip().lower()
+            == implementation_commit
+            and str(snapshot_rows[0]["status"] or "").strip().lower()
+            == "active"
+            and str(marker.get("snapshot_id") or "").strip()
+            == snapshot_id
+        ):
+            continue
+        candidate = {
+            "schema_version": (
+                "operator_supervised_direct_main."
+                "current_full_reconcile_authority.v1"
+            ),
+            "server_derived": True,
+            "caller_claims_trusted": False,
+            "db_verified": True,
+            "current_full_reconcile": True,
+            "canonical_head_verified": True,
+            "active_snapshot_verified": True,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "target_commit_sha": implementation_commit,
+            "canonical_head_commit": canonical_head,
+            "active_snapshot_id": snapshot_id,
+            "active_snapshot_commit": implementation_commit,
+            "reconcile_event_ref": f"timeline:{reconcile_event_id}",
+            "reconcile_event_id": reconcile_event_id,
+            "reconcile_event_created_at": str(
+                provenance.get("reconcile_event_created_at") or ""
+            ).strip(),
+            "qa_event_ref": str(qa_authority.get("event_ref") or ""),
+            "qa_event_id": int(qa_authority.get("event_id") or 0),
+            "qa_snapshot_id": str(
+                qa_authority.get("snapshot_id") or ""
+            ),
+            "qa_snapshot_commit": implementation_commit,
+            "qa_session_id": str(
+                qa_authority.get("qa_session_id") or ""
+            ),
+            "qa_authority_hash": str(
+                qa_authority.get("authority_hash") or ""
+            ),
+            "qa_before_reconcile_verified": True,
+            "provenance_id": str(
+                provenance.get("provenance_id") or ""
+            ).strip(),
+            "provenance_hash": str(
+                provenance.get("provenance_hash") or ""
+            ).strip(),
+            "route_evidence": dict(route_evidence),
+            "current_full_reconcile_marker": dict(marker),
+        }
+        candidate["authority_hash"] = stable_sha256(candidate)
+        candidates.append(candidate)
+    unique = {stable_sha256(candidate): candidate for candidate in candidates}
+    return next(iter(unique.values())) if len(unique) == 1 else {}
+
+
+def _operator_supervised_direct_main_runtime_deployment_authority(
+    *,
+    project_id: str,
+    close_commit: str,
+) -> dict[str, Any]:
+    """Project self-runtime applicability and exact loaded-commit identity."""
+
+    close_commit = str(close_commit or "").strip().lower()
+    try:
+        project_root = Path(
+            project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=True,
+            )
+        ).resolve()
+    except Exception:
+        project_root = Path()
+    self_root = Path(__file__).resolve().parents[2]
+    applicable = bool(project_id == "aming-claw" or project_root == self_root)
+    authority: dict[str, Any] = {
+        "schema_version": (
+            "operator_supervised_direct_main.runtime_deployment_authority.v1"
+        ),
+        "applicable": applicable,
+        "status": "not_applicable",
+        "source": "governance_loaded_runtime_identity",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "project_root": str(project_root) if project_root else "",
+        "governance_runtime_root": str(self_root),
+        "close_commit": close_commit,
+        "loaded_commit": "",
+        "runtime_stale": None,
+        "runtime_stale_reasons": [],
+    }
+    if applicable:
+        runtime_identity = governance_loaded_runtime_identity(
+            get_server_version()
+        )
+        loaded_ref = str(runtime_identity.get("loaded_commit") or "").strip()
+        loaded_commit = ""
+        if loaded_ref:
+            loaded_commit = _git_output(
+                self_root,
+                ["rev-parse", "--verify", f"{loaded_ref}^{{commit}}"],
+            ).strip().lower()
+        passed = bool(
+            loaded_commit == close_commit
+            and runtime_identity.get("runtime_stale") is False
+        )
+        authority.update(
+            {
+                "passed": passed,
+                "status": "passed" if passed else "failed",
+                "loaded_commit": loaded_commit,
+                "runtime_stale": bool(
+                    runtime_identity.get("runtime_stale")
+                ),
+                "runtime_stale_reasons": list(
+                    runtime_identity.get("runtime_stale_reasons") or []
+                ),
+            }
+        )
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    record: Mapping[str, Any],
+    close_commit: str,
+) -> dict[str, Any]:
+    """Recheck the completed Direct rev2 Rule at the backlog-close boundary."""
+
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    if not (
+        str(record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(record.get("revision") or "").strip() == "rev2"
+        and binding.get("strict_runtime_binding_required") is True
+    ):
+        return {}
+
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    definition = _contract_runtime(conn)._load_pinned_definition(record)
+    expected_lines = [
+        (
+            str(stage.get("stage_id") or "").strip(),
+            str(line.get("line_id") or "").strip(),
+            str(line.get("evidence_kind") or "").strip(),
+            str(line.get("owner_role") or "").strip(),
+        )
+        for stage, line in iter_stage_lines(definition)
+    ]
+    completed_lines = [
+        dict(line)
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    actual_lines = [
+        (
+            str(line.get("stage_id") or "").strip(),
+            str(line.get("line_id") or "").strip(),
+            str(line.get("evidence_kind") or "").strip(),
+            str(line.get("actor_role") or "").strip(),
+        )
+        for line in completed_lines
+    ]
+    missing: list[str] = []
+    if actual_lines != expected_lines:
+        missing.append("exact_completed_direct_rev2_lines")
+
+    definition_identity = {
+        "contract_id": "operator_supervised_direct_main",
+        "revision": "rev2",
+    }
+    line_binding_errors = {
+        str(line.get("line_id") or "").strip(): errors
+        for line in completed_lines
+        if (
+            errors := operator_supervised_direct_main_runtime_binding_errors(
+                definition_identity,
+                record,
+                line,
+            )
+        )
+    }
+    if line_binding_errors:
+        missing.append("direct_runtime_binding_revalidation")
+
+    lines_by_id = {
+        str(line.get("line_id") or "").strip(): line
+        for line in completed_lines
+        if str(line.get("line_id") or "").strip()
+    }
+    close_commit = str(close_commit or "").strip().lower()
+    commit_line_ids = (
+        "observer_implementation",
+        "qa_independent_verification",
+        "observer_reconcile",
+        "observer_close_ready",
+    )
+    line_commits = {
+        line_id: str(lines_by_id.get(line_id, {}).get("commit_sha") or "")
+        .strip()
+        .lower()
+        for line_id in commit_line_ids
+    }
+    if not (
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", close_commit)
+        and set(line_commits.values()) == {close_commit}
+    ):
+        missing.append("exact_close_commit_across_direct_lines")
+
+    current_state = _runtime_current_state_from_record(record)
+    if current_state.get("next_legal_action"):
+        missing.append("direct_contract_runtime_complete")
+
+    runtime_deployment_authority = (
+        _operator_supervised_direct_main_runtime_deployment_authority(
+            project_id=project_id,
+            close_commit=close_commit,
+        )
+    )
+    close_line_payload = (
+        lines_by_id.get("observer_close_ready", {}).get("payload")
+        if isinstance(
+            lines_by_id.get("observer_close_ready", {}).get("payload"),
+            Mapping,
+        )
+        else {}
+    )
+    persisted_runtime_deployment_authority = (
+        close_line_payload.get("runtime_deployment_authority")
+        if isinstance(
+            close_line_payload.get("runtime_deployment_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    if not (
+        persisted_runtime_deployment_authority
+        and stable_sha256(dict(persisted_runtime_deployment_authority))
+        == stable_sha256(dict(runtime_deployment_authority))
+    ):
+        missing.append("runtime_deployment_authority_still_current")
+    if (
+        runtime_deployment_authority.get("applicable") is True
+        and runtime_deployment_authority.get("passed") is not True
+    ):
+        missing.append("governance_runtime_loaded_close_commit")
+
+    persisted_reconcile = (
+        lines_by_id.get("observer_reconcile", {}).get("payload")
+        if isinstance(
+            lines_by_id.get("observer_reconcile", {}).get("payload"),
+            Mapping,
+        )
+        else {}
+    )
+    persisted_reconcile_authority = (
+        persisted_reconcile.get("direct_current_full_reconcile_authority")
+        if isinstance(
+            persisted_reconcile.get("direct_current_full_reconcile_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    current_reconcile_authority = (
+        _operator_supervised_direct_main_current_full_reconcile_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            record=record,
+        )
+    )
+    if not (
+        current_reconcile_authority
+        and stable_sha256(dict(persisted_reconcile_authority))
+        == stable_sha256(dict(current_reconcile_authority))
+    ):
+        missing.append("current_full_reconcile_authority_still_current")
+
+    close_payload = (
+        lines_by_id.get("observer_close_ready", {}).get("payload")
+        if isinstance(
+            lines_by_id.get("observer_close_ready", {}).get("payload"),
+            Mapping,
+        )
+        else {}
+    )
+    close_verification = (
+        close_payload.get("verification")
+        if isinstance(close_payload.get("verification"), Mapping)
+        else {}
+    )
+    close_test_results = (
+        close_verification.get("test_results")
+        if isinstance(close_verification.get("test_results"), Mapping)
+        else {}
+    )
+    if not (
+        close_payload.get("schema_version")
+        == "operator_supervised_direct_main.close_ready_evidence.v1"
+        and close_verification.get("runtime_version_sync") is True
+        and close_verification.get("preflight_ok") is True
+        and str(
+            (close_verification.get("governance_redeploy") or {}).get("status")
+            if isinstance(close_verification.get("governance_redeploy"), Mapping)
+            else ""
+        ).strip().lower()
+        in {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+        and str(
+            (close_verification.get("live_regression") or {}).get("status")
+            if isinstance(close_verification.get("live_regression"), Mapping)
+            else ""
+        ).strip().lower()
+        in {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+        and str(close_test_results.get("status") or "").strip().lower()
+        in {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+        and str(close_test_results.get("commit_sha") or "").strip().lower()
+        == close_commit
+    ):
+        missing.append("direct_close_integrity_evidence")
+
+    passed = not missing
+    source_refs = [
+        f"contract_runtime:{contract_execution_id}",
+        *[
+            f"contract_runtime:{contract_execution_id}:line:{line_id}"
+            for _stage_id, line_id, _evidence_kind, _actor_role in expected_lines
+        ],
+    ]
+    if current_reconcile_authority:
+        source_refs.extend(
+            ref
+            for ref in (
+                str(current_reconcile_authority.get("reconcile_event_ref") or ""),
+                (
+                    "graph_snapshot:"
+                    + str(current_reconcile_authority.get("active_snapshot_id") or "")
+                ),
+                (
+                    "current_full_reconcile_provenance:"
+                    + str(current_reconcile_authority.get("provenance_id") or "")
+                ),
+            )
+            if ref and not ref.endswith(":")
+        )
+    gate = {
+        "schema_version": (
+            "operator_supervised_direct_main.close_authority_gate.v1"
+        ),
+        "accepted": passed,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "source": "source_backed_operator_supervised_direct_main_rev2",
+        "source_of_authority": "ContractRuntime",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "close_commit": close_commit,
+        "missing_requirement_ids": missing,
+        "source_refs": list(dict.fromkeys(source_refs)),
+        "completed_line_ids": [line[1] for line in actual_lines],
+        "line_binding_errors": line_binding_errors,
+        "current_full_reconcile_authority_hash": str(
+            current_reconcile_authority.get("authority_hash") or ""
+        ),
+        "runtime_deployment_authority": runtime_deployment_authority,
+        "checks": {
+            "exact_completed_lines": actual_lines == expected_lines,
+            "runtime_binding_revalidated": not line_binding_errors,
+            "close_commit_exact": set(line_commits.values()) == {close_commit},
+            "runtime_complete": not bool(current_state.get("next_legal_action")),
+            "current_full_reconcile_still_current": bool(
+                current_reconcile_authority
+                and stable_sha256(dict(persisted_reconcile_authority))
+                == stable_sha256(dict(current_reconcile_authority))
+            ),
+            "close_integrity_present": (
+                "direct_close_integrity_evidence" not in missing
+            ),
+            "runtime_deployment_current": (
+                not runtime_deployment_authority
+                or runtime_deployment_authority.get("passed") is True
+            ),
+        },
+    }
+    gate["gate_hash"] = stable_sha256(gate)
+    return gate
+
+
+def _operator_supervised_direct_main_apply_timeline_runtime(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    event_kind: str,
+    body: Mapping[str, Any],
+    normalized_payload: Mapping[str, Any],
+    pre_mutation_graph_trace_gate: Mapping[str, Any] | None = None,
+    pre_mutation_request_fingerprint: str = "",
+    trusted_qa_verification_authority: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Map accepted public timeline evidence onto the pinned Direct lines."""
+
+    runtime = _contract_runtime(conn)
+    try:
+        record = runtime.current_record(
+            contract_execution_id,
+            actor_role="observer",
+        )
+    except (ContractRuntimeError, StalePinnedContractExecutionError):
+        return {}
+    if not (
+        str(record.get("contract_id") or "")
+        == "operator_supervised_direct_main"
+        and str(record.get("revision") or "") == "rev2"
+        and isinstance(record.get("metadata"), Mapping)
+        and record["metadata"].get(
+            "operator_supervised_direct_main_runtime_binding"
+        )
+    ):
+        return {}
+    binding = record["metadata"][
+        "operator_supervised_direct_main_runtime_binding"
+    ]
+    event_key = str(event_kind or "").strip().lower().replace("-", "_")
+    line_refs: list[dict[str, Any]] = []
+
+    def submit(
+        actor_role: str,
+        stage_id: str,
+        line_id: str,
+        evidence_kind: str,
+        payload: Mapping[str, Any],
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        nonlocal record
+        if event_key == "observer_direct_implementation_exception":
+            existing_lines = [
+                line
+                for line in record.get("completed_lines") or []
+                if isinstance(line, Mapping)
+                and str(line.get("line_id") or "").strip() == line_id
+            ]
+            if existing_lines:
+                expected_payload = (
+                    _operator_supervised_direct_main_runtime_line_payload(
+                        record,
+                        payload,
+                    )
+                )
+                existing = existing_lines[0]
+                if not (
+                    len(existing_lines) == 1
+                    and str(existing.get("stage_id") or "").strip()
+                    == stage_id
+                    and str(existing.get("evidence_kind") or "").strip()
+                    == evidence_kind
+                    and str(existing.get("actor_role") or "").strip()
+                    == actor_role
+                    and stable_sha256(dict(existing.get("payload") or {}))
+                    == stable_sha256(expected_payload)
+                ):
+                    raise GovernanceError(
+                        "operator_supervised_direct_main_partial_admission_mismatch",
+                        (
+                            "Direct Main retry does not match its already "
+                            "persisted ContractRuntime admission prefix"
+                        ),
+                        409,
+                        {
+                            "contract_execution_id": contract_execution_id,
+                            "line_id": line_id,
+                            "zero_write_rejection": True,
+                            "writes_performed": False,
+                        },
+                    )
+                line_refs.append(
+                    {
+                        "stage_id": stage_id,
+                        "line_id": line_id,
+                        "evidence_kind": evidence_kind,
+                        "execution_state_revision": int(
+                            record.get("execution_state_revision") or 0
+                        ),
+                        "existing_line_reused": True,
+                    }
+                )
+                return
+        record = _operator_supervised_direct_main_submit_runtime_line(
+            conn,
+            contract_execution_id=contract_execution_id,
+            actor_role=actor_role,
+            expected_stage_id=stage_id,
+            expected_line_id=line_id,
+            expected_evidence_kind=evidence_kind,
+            payload=payload,
+            extra=extra,
+        )
+        line_refs.append(
+            {
+                "stage_id": stage_id,
+                "line_id": line_id,
+                "evidence_kind": evidence_kind,
+                "execution_state_revision": int(
+                    record.get("execution_state_revision") or 0
+                ),
+            }
+        )
+
+    if event_key == "observer_direct_implementation_exception":
+        graph_gate = dict(pre_mutation_graph_trace_gate or {})
+        graph_db = (
+            graph_gate.get("db_evidence")
+            if isinstance(graph_gate.get("db_evidence"), Mapping)
+            else {}
+        )
+        trace_ids = [
+            str(item).strip()
+            for item in graph_db.get("verified_trace_ids") or []
+            if str(item).strip()
+        ]
+        submit(
+            "observer",
+            "route_gate",
+            "observer_bind_direct_scope",
+            "contract_binding",
+            {
+                "schema_version": (
+                    "operator_supervised_direct_main.route_binding_evidence.v1"
+                ),
+                "direct_runtime_binding": dict(binding),
+            },
+        )
+        submit(
+            "observer",
+            "graph_first",
+            "observer_graph_context",
+            "graph_trace",
+            {
+                "schema_version": (
+                    "operator_supervised_direct_main.graph_context_evidence.v1"
+                ),
+                "graph_trace_ids": trace_ids,
+                "pre_implementation_graph_trace_gate": graph_gate,
+            },
+            {
+                "graph_trace_ids": trace_ids,
+                "query_source": "observer",
+                "query_purpose": "global_architecture_review",
+                "db_verified": True,
+            },
+        )
+        submit(
+            "observer",
+            "pre_mutation",
+            "observer_direct_implementation_exception",
+            "observer_direct_implementation_exception",
+            {
+                "schema_version": (
+                    "operator_supervised_direct_main.pre_mutation_evidence.v1"
+                ),
+                "pre_mutation_request_fingerprint": (
+                    pre_mutation_request_fingerprint
+                ),
+                "server_admitted_single_pre_mutation": True,
+                "same_generation_retry_allowed": False,
+                "route_identity": dict(binding.get("route_identity") or {}),
+                "graph_trace_ids": trace_ids,
+                "event": {
+                    "event_type": str(body.get("event_type") or ""),
+                    "event_kind": str(event_kind or ""),
+                    "phase": str(body.get("phase") or ""),
+                    "decision": str(body.get("decision") or ""),
+                    "status": str(body.get("status") or ""),
+                },
+            },
+        )
+    elif event_key == "implementation":
+        submit(
+            "observer",
+            "implementation",
+            "observer_implementation",
+            "implementation",
+            {
+                "schema_version": (
+                    "operator_supervised_direct_main.implementation_evidence.v1"
+                ),
+                **dict(normalized_payload),
+            },
+            {
+                "commit_sha": str(body.get("commit_sha") or "").strip(),
+                "changed_files": list(
+                    normalized_payload.get("changed_files") or []
+                ),
+                "test_results": dict(
+                    normalized_payload.get("test_results") or {}
+                ),
+            },
+        )
+    elif event_key in {
+        "verification",
+        "independent_verification",
+        "qa",
+        "qa_verification",
+    } and isinstance(trusted_qa_verification_authority, Mapping):
+        from . import task_timeline
+
+        qa_session_proof = dict(trusted_qa_verification_authority)
+        qa_authority = task_timeline.source_backed_qa_session_authority(
+            qa_session_proof
+        )
+        trace_ids = _runtime_context_service_dedupe(
+            [
+                str(item or "").strip()
+                for item in (
+                    qa_session_proof.get("graph_trace_ids")
+                    or normalized_payload.get("graph_trace_ids")
+                    or []
+                )
+            ]
+        )
+        submit(
+            "qa",
+            "qa_graph_context",
+            "qa_graph_context",
+            "graph_trace",
+            {
+                "schema_version": (
+                    "operator_supervised_direct_main.qa_graph_evidence.v1"
+                ),
+                "graph_trace_ids": trace_ids,
+                "qa_authority": qa_authority,
+            },
+            {
+                "graph_trace_ids": trace_ids,
+                "query_source": "qa",
+                "query_purpose": "independent_verification",
+                "db_verified": True,
+                "target_project_root": str(
+                    binding.get("target_project_root") or ""
+                ),
+            },
+        )
+        submit(
+            "qa",
+            "qa",
+            "qa_independent_verification",
+            "independent_verification",
+            {
+                "schema_version": (
+                    "operator_supervised_direct_main.qa_evidence.v1"
+                ),
+                "qa_authority": qa_authority,
+                "timeline_payload": dict(normalized_payload),
+            },
+            {
+                "commit_sha": str(body.get("commit_sha") or "").strip(),
+                "status": str(body.get("status") or "").strip(),
+            },
+        )
+    elif event_key in {"reconcile", "current_full_reconcile"}:
+        reconcile_authority = (
+            _operator_supervised_direct_main_current_full_reconcile_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=contract_execution_id,
+                record=record,
+            )
+        )
+        if not reconcile_authority:
+            raise GovernanceError(
+                "operator_supervised_direct_main_current_full_reconcile_required",
+                "Direct Main reconcile requires one exact active current-full provenance",
+                422,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                },
+            )
+        submit(
+            "observer",
+            "reconcile",
+            "observer_reconcile",
+            "current_full_reconcile",
+            {
+                "schema_version": (
+                    "operator_supervised_direct_main.reconcile_evidence.v1"
+                ),
+                "direct_current_full_reconcile_authority": (
+                    reconcile_authority
+                ),
+                "timeline_payload": dict(normalized_payload),
+                "verification": dict(body.get("verification") or {}),
+            },
+            {
+                "commit_sha": str(
+                    reconcile_authority.get("target_commit_sha") or ""
+                ).strip(),
+            },
+        )
+    elif event_key == "close_ready":
+        current_line = (
+            record.get("runtime_guide", {}).get("next_legal_action")
+            if isinstance(record.get("runtime_guide"), Mapping)
+            else {}
+        )
+        if str((current_line or {}).get("line_id") or "") == "observer_reconcile":
+            reconcile_authority = (
+                _operator_supervised_direct_main_current_full_reconcile_authority(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    contract_execution_id=contract_execution_id,
+                    record=record,
+                )
+            )
+            if not reconcile_authority:
+                raise GovernanceError(
+                    "operator_supervised_direct_main_current_full_reconcile_required",
+                    (
+                        "Direct Main close requires one exact active "
+                        "current-full provenance"
+                    ),
+                    422,
+                    {
+                        "contract_execution_id": contract_execution_id,
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                    },
+                )
+            submit(
+                "observer",
+                "reconcile",
+                "observer_reconcile",
+                "current_full_reconcile",
+                {
+                    "schema_version": (
+                        "operator_supervised_direct_main.reconcile_evidence.v1"
+                    ),
+                    "direct_current_full_reconcile_authority": (
+                        reconcile_authority
+                    ),
+                    "timeline_payload": dict(normalized_payload),
+                    "verification": dict(body.get("verification") or {}),
+                },
+                {
+                    "commit_sha": str(
+                        reconcile_authority.get("target_commit_sha") or ""
+                    ).strip(),
+                },
+            )
+        submit(
+            "observer",
+            "close_ready",
+            "observer_close_ready",
+            "close_ready",
+            {
+                "schema_version": (
+                    "operator_supervised_direct_main.close_ready_evidence.v1"
+                ),
+                "timeline_payload": dict(normalized_payload),
+                "verification": dict(body.get("verification") or {}),
+                "runtime_deployment_authority": dict(
+                    normalized_payload.get("runtime_deployment_authority")
+                    or {}
+                ),
+                "direct_close_ready_prewrite_authority": dict(
+                    normalized_payload.get(
+                        "direct_close_ready_prewrite_authority"
+                    )
+                    or {}
+                ),
+            },
+            {
+                "commit_sha": str(body.get("commit_sha") or "").strip(),
+                "status": str(body.get("status") or "").strip(),
+                "verification": dict(body.get("verification") or {}),
+            },
+        )
+    else:
+        return {}
+
+    current = runtime.current_record(
+        contract_execution_id,
+        actor_role="observer",
+    )
+    lineage = {
+        "schema_version": (
+            "operator_supervised_direct_main.timeline_runtime_lineage.v1"
+        ),
+        "source_of_authority": "ContractRuntime",
+        "contract_execution_id": contract_execution_id,
+        "definition_hash": str(current.get("definition_hash") or ""),
+        "definition_source_sha256": str(
+            current.get("definition_source_sha256") or ""
+        ),
+        "instruction_bundle_hash": str(
+            current.get("instruction_bundle_hash") or ""
+        ),
+        "authoritative_common_rule_join": dict(
+            current.get("authoritative_common_rule_join") or {}
+        ),
+        "completed_line_refs": line_refs,
+        "execution_state_revision": int(
+            current.get("execution_state_revision") or 0
+        ),
+        "runtime_guide_hash": str(
+            (current.get("runtime_guide") or {}).get("runtime_guide_hash")
+            or ""
+        ),
+        "timeline_facade_adapter": True,
+        "pass_synthesized": False,
+    }
+    lineage["lineage_hash"] = stable_sha256(lineage)
+    return lineage
+
+
 def _parentless_direct_main_test_results_template(
     *,
     commit_sha: str,
@@ -144544,6 +147391,19 @@ def _onboard_route_guide_service_response(
             "raw_route_token_required": False,
             "raw_route_token_exposed": False,
         }
+    direct_main_response = (
+        _onboard_operator_supervised_direct_main_runtime_response(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+            role=role,
+            work_type=work_type,
+            response_view=response_view,
+        )
+    )
+    if direct_main_response:
+        return direct_main_response
     preexisting_projection = _contract_chain_current_projection(
         conn,
         project_id=project_id,
@@ -162574,6 +165434,26 @@ def _contract_runtime_authoritative_close_verification(
     verification: Mapping[str, Any],
     runtime_projection: Mapping[str, Any],
 ) -> dict[str, Any]:
+    operator_direct_gate = (
+        runtime_projection.get(
+            "operator_supervised_direct_main_close_authority_gate"
+        )
+        if isinstance(
+            runtime_projection.get(
+                "operator_supervised_direct_main_close_authority_gate"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    operator_direct_gate_valid = bool(
+        operator_direct_gate.get("accepted")
+        and operator_direct_gate.get("passed")
+        and str(operator_direct_gate.get("schema_version") or "")
+        == "operator_supervised_direct_main.close_authority_gate.v1"
+        and str(operator_direct_gate.get("source") or "")
+        == "source_backed_operator_supervised_direct_main_rev2"
+    )
     completed_onboard_direct_gate = (
         runtime_projection.get("completed_onboard_direct_main_close_authority_gate")
         if isinstance(
@@ -162623,6 +165503,20 @@ def _contract_runtime_authoritative_close_verification(
         and any(
             bool(gate.get("passed"))
             for gate in (
+                operator_direct_gate,
+                mf_batch_parent_gate,
+                parentless_direct_gate,
+                direct_fix_gate,
+                mf_parallel_gate,
+            )
+        )
+    )
+    operator_direct_gate_ambiguous = bool(
+        operator_direct_gate_valid
+        and any(
+            bool(gate.get("passed"))
+            for gate in (
+                completed_onboard_direct_gate,
                 mf_batch_parent_gate,
                 parentless_direct_gate,
                 direct_fix_gate,
@@ -162632,7 +165526,12 @@ def _contract_runtime_authoritative_close_verification(
     )
     authority_gate = (
         {}
-        if completed_onboard_direct_gate_ambiguous
+        if (
+            completed_onboard_direct_gate_ambiguous
+            or operator_direct_gate_ambiguous
+        )
+        else operator_direct_gate
+        if operator_direct_gate_valid
         else completed_onboard_direct_gate
         if completed_onboard_direct_gate_valid
         else mf_batch_parent_gate
@@ -162646,7 +165545,18 @@ def _contract_runtime_authoritative_close_verification(
     if not bool(authority_gate.get("passed")):
         failed_authority_kind = ""
         failed_authority_gate: Mapping[str, Any] = {}
-        if completed_onboard_direct_gate_ambiguous:
+        if operator_direct_gate_ambiguous:
+            failed_authority_kind = "operator_supervised_direct_main"
+            failed_authority_gate = dict(operator_direct_gate)
+            failed_authority_gate.update(
+                {
+                    "accepted": False,
+                    "passed": False,
+                    "status": "ambiguous",
+                    "missing_requirement_ids": ["exclusive_close_authority_gate"],
+                }
+            )
+        elif completed_onboard_direct_gate_ambiguous:
             failed_authority_kind = "completed_onboard_direct_main"
             failed_authority_gate = dict(completed_onboard_direct_gate)
             failed_authority_gate.update(
@@ -162657,6 +165567,9 @@ def _contract_runtime_authoritative_close_verification(
                     "missing_requirement_ids": ["exclusive_close_authority_gate"],
                 }
             )
+        elif operator_direct_gate:
+            failed_authority_kind = "operator_supervised_direct_main"
+            failed_authority_gate = operator_direct_gate
         elif completed_onboard_direct_gate:
             failed_authority_kind = "completed_onboard_direct_main"
             failed_authority_gate = completed_onboard_direct_gate
@@ -162696,6 +165609,12 @@ def _contract_runtime_authoritative_close_verification(
                     "complete mf_batch parent children, merge queue, and close commit "
                     "evidence before closing the coordination row"
                 )
+            elif failed_authority_kind == "operator_supervised_direct_main":
+                next_action = (
+                    "complete the source-backed Direct rev2 route, graph-first, "
+                    "single pre-mutation, implementation, independent QA, "
+                    "current-full reconcile, and close-ready lines"
+                )
             elif failed_authority_kind == "completed_onboard_direct_main":
                 next_action = (
                     "complete the immutable pre-attempt onboard direct-main "
@@ -162722,6 +165641,8 @@ def _contract_runtime_authoritative_close_verification(
                 "label": (
                     "ContractRuntime mf_batch parent close authority"
                     if failed_authority_kind == "mf_batch_parent"
+                    else "ContractRuntime operator-supervised Direct rev2 close authority"
+                    if failed_authority_kind == "operator_supervised_direct_main"
                     else "ContractRuntime completed onboard direct-main close authority"
                     if failed_authority_kind == "completed_onboard_direct_main"
                     else "ContractRuntime parentless direct-main close authority"
@@ -162745,7 +165666,9 @@ def _contract_runtime_authoritative_close_verification(
             return result
         return dict(verification)
     authority_kind = (
-        "completed_onboard_direct_main"
+        "operator_supervised_direct_main"
+        if authority_gate is operator_direct_gate
+        else "completed_onboard_direct_main"
         if authority_gate is completed_onboard_direct_gate
         else "mf_batch_parent"
         if authority_gate is mf_batch_parent_gate
@@ -162756,7 +165679,9 @@ def _contract_runtime_authoritative_close_verification(
         else "mf_parallel"
     )
     source = (
-        "contract_runtime_completed_onboard_direct_main_immutable_preattempt"
+        "contract_runtime_source_backed_operator_supervised_direct_main_rev2"
+        if authority_kind == "operator_supervised_direct_main"
+        else "contract_runtime_completed_onboard_direct_main_immutable_preattempt"
         if authority_kind == "completed_onboard_direct_main"
         else "contract_runtime_mf_batch_parent_timeline_and_merge_queue"
         if authority_kind == "mf_batch_parent"
@@ -162767,7 +165692,10 @@ def _contract_runtime_authoritative_close_verification(
         else "contract_runtime_completed_mf_parallel_chain"
     )
     message = (
-        "backlog_close accepted server-derived completed onboard direct-main "
+        "backlog_close accepted the complete source-backed operator-supervised "
+        "Direct rev2 chain with current-full reconcile authority."
+        if authority_kind == "operator_supervised_direct_main"
+        else "backlog_close accepted server-derived completed onboard direct-main "
         "close authority with immutable pre-attempt evidence."
         if authority_kind == "completed_onboard_direct_main"
         else "backlog_close accepted server-derived mf_batch parent close authority "
@@ -162792,7 +165720,11 @@ def _contract_runtime_authoritative_close_verification(
     result["status"] = "passed"
     result["missing_event_kinds"] = []
     result["ignored_required_events"] = []
-    if authority_kind == "completed_onboard_direct_main":
+    if authority_kind == "operator_supervised_direct_main":
+        result[
+            "contract_runtime_operator_supervised_direct_main_close_authority_gate"
+        ] = dict(authority_gate)
+    elif authority_kind == "completed_onboard_direct_main":
         result[
             "contract_runtime_completed_onboard_direct_main_close_authority_gate"
         ] = dict(authority_gate)
@@ -162873,6 +165805,9 @@ def _contract_runtime_authoritative_close_verification(
         "has_independent_qa": True,
         "contract_runtime_mf_batch_parent_close_authority": (
             authority_kind == "mf_batch_parent"
+        ),
+        "contract_runtime_operator_supervised_direct_main_close_authority": (
+            authority_kind == "operator_supervised_direct_main"
         ),
         "contract_runtime_completed_onboard_direct_main_close_authority": (
             authority_kind == "completed_onboard_direct_main"
@@ -162995,6 +165930,7 @@ def _contract_runtime_close_authority_failure_details(
         missing_ids.append("contract_runtime_completed_lines")
 
     for gate_key in (
+        "operator_supervised_direct_main_close_authority_gate",
         "completed_onboard_direct_main_close_authority_gate",
         "mf_batch_parent_close_authority_gate",
         "parentless_direct_main_close_authority_gate",
@@ -163432,6 +166368,7 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
     task_id: str,
     trace_ids: Sequence[str],
     route_identity: Mapping[str, Any] | None = None,
+    world_ref: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     requested = _runtime_context_service_dedupe(
         [str(trace_id or "").strip() for trace_id in trace_ids]
@@ -163456,14 +166393,21 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
             placeholders = ",".join("?" for _ in requested)
             rows = conn.execute(
                 f"""
-                SELECT trace_id, project_id, backlog_id, task_id,
-                       query_source, query_purpose, actor, status,
-                       route_id, route_context_hash, prompt_contract_id,
-                       prompt_contract_hash, visible_injection_manifest_hash,
-                       route_token_ref
-                FROM graph_query_traces
-                WHERE trace_id IN ({placeholders})
-                ORDER BY created_at DESC, trace_id DESC
+                SELECT t.trace_id, t.project_id, t.backlog_id, t.task_id,
+                       t.query_source, t.query_purpose, t.actor, t.status,
+                       t.route_id, t.route_context_hash, t.prompt_contract_id,
+                       t.prompt_contract_hash,
+                       t.visible_injection_manifest_hash, t.route_token_ref,
+                       t.snapshot_id, t.commit_sha, t.graph_basis,
+                       t.root_identity_json, t.root_identity_hash,
+                       t.query_root_identity_hash,
+                       s.commit_sha AS snapshot_commit_sha
+                FROM graph_query_traces t
+                LEFT JOIN graph_snapshots s
+                  ON s.project_id = t.project_id
+                 AND s.snapshot_id = t.snapshot_id
+                WHERE t.trace_id IN ({placeholders})
+                ORDER BY t.created_at DESC, t.trace_id DESC
                 """,
                 tuple(requested),
             ).fetchall()
@@ -163473,6 +166417,14 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
     verified: list[str] = []
     seen_verified: set[str] = set()
     identity_mismatches: list[dict[str, str]] = []
+    accepted_snapshot_ids: set[str] = set()
+    expected_world_ref = dict(world_ref or {})
+    expected_root = str(
+        expected_world_ref.get("target_project_root") or ""
+    ).strip()
+    expected_commit = str(
+        expected_world_ref.get("base_commit") or ""
+    ).strip().lower()
     for row in rows:
         if isinstance(row, sqlite3.Row):
             trace_id = str(row["trace_id"] or "").strip()
@@ -163487,6 +166439,17 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
                 field: str(row[field] or "").strip()
                 for field in expected_route_identity
             }
+            snapshot_id = str(row["snapshot_id"] or "").strip()
+            trace_commit = str(row["commit_sha"] or "").strip().lower()
+            graph_basis = str(row["graph_basis"] or "").strip()
+            root_identity_json = str(row["root_identity_json"] or "{}")
+            root_identity_hash = str(row["root_identity_hash"] or "").strip()
+            query_root_identity_hash = str(
+                row["query_root_identity_hash"] or ""
+            ).strip()
+            snapshot_commit = str(
+                row["snapshot_commit_sha"] or ""
+            ).strip().lower()
         else:
             trace_id = str(row[0] or "").strip()
             row_project_id = str(row[1] or "").strip()
@@ -163500,6 +166463,13 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
                 field: str(row[index] or "").strip()
                 for index, field in enumerate(expected_route_identity, start=8)
             }
+            snapshot_id = str(row[14] or "").strip()
+            trace_commit = str(row[15] or "").strip().lower()
+            graph_basis = str(row[16] or "").strip()
+            root_identity_json = str(row[17] or "{}")
+            root_identity_hash = str(row[18] or "").strip()
+            query_root_identity_hash = str(row[19] or "").strip()
+            snapshot_commit = str(row[20] or "").strip().lower()
         if not trace_id:
             continue
         row_trace_ids.add(trace_id)
@@ -163578,18 +166548,87 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
                         "actual": actual,
                     }
                 )
+        try:
+            root_identity = json.loads(root_identity_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            root_identity = {}
+        query_root = str(
+            root_identity.get("query_root")
+            if isinstance(root_identity, Mapping)
+            else ""
+        ).strip()
+        canonical_project_root = str(
+            root_identity.get("canonical_project_root")
+            if isinstance(root_identity, Mapping)
+            else ""
+        ).strip()
+        if expected_world_ref:
+            world_fields = {
+                "snapshot_id": snapshot_id,
+                "trace_commit_sha": trace_commit,
+                "snapshot_commit_sha": snapshot_commit,
+                "query_root": query_root,
+                "canonical_project_root": canonical_project_root,
+                "root_identity_hash": root_identity_hash,
+                "query_root_identity_hash": query_root_identity_hash,
+            }
+            world_checks = {
+                "snapshot_id": bool(snapshot_id),
+                "trace_commit_sha": bool(
+                    expected_commit and trace_commit == expected_commit
+                ),
+                "snapshot_commit_sha": bool(
+                    expected_commit and snapshot_commit == expected_commit
+                ),
+                "query_root": bool(expected_root and query_root == expected_root),
+                "canonical_project_root": bool(
+                    expected_root and canonical_project_root == expected_root
+                ),
+                "root_identity_hash": bool(
+                    isinstance(root_identity, Mapping)
+                    and root_identity
+                    and root_identity_hash == stable_sha256(root_identity)
+                ),
+                "query_root_identity_hash": query_root_identity_hash.startswith(
+                    "sha256:"
+                ),
+            }
+            for field, matched in world_checks.items():
+                if matched:
+                    continue
+                expected = (
+                    expected_commit
+                    if field in {"trace_commit_sha", "snapshot_commit_sha"}
+                    else expected_root
+                    if field in {"query_root", "canonical_project_root"}
+                    else "present_and_server_verifiable"
+                )
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "field": field,
+                        "expected": expected,
+                        "actual": world_fields[field],
+                    }
+                )
         if mismatches:
             identity_mismatches.extend(mismatches)
             continue
         if trace_id not in seen_verified:
             seen_verified.add(trace_id)
             verified.append(trace_id)
+            accepted_snapshot_ids.add(snapshot_id)
     missing = [trace_id for trace_id in requested if trace_id not in row_trace_ids]
     db_verified = (
         bool(verified)
         and not missing
         and not identity_mismatches
         and set(requested).issubset(set(verified))
+        and len(accepted_snapshot_ids) == 1
+        and (
+            not expected_world_ref
+            or expected_world_ref.get("accepted") is True
+        )
     )
     return {
         "schema_version": "parentless_direct_main_graph_trace_db_evidence.v1",
@@ -163607,6 +166646,8 @@ def _contract_runtime_parentless_direct_main_graph_trace_db_evidence(
         "accepted_project_id": str(project_id or "").strip(),
         "accepted_backlog_id": str(backlog_id or "").strip(),
         "accepted_route_identity": expected_route_identity,
+        "accepted_world_ref": expected_world_ref,
+        "accepted_snapshot_ids": sorted(accepted_snapshot_ids),
         "source_details": {
             "graph_query_traces": bool(rows),
             "lookup": "trace_id",
@@ -163622,6 +166663,63 @@ def _contract_runtime_parentless_direct_main_selected_scope(
     route_token_ref: str = "",
     rebuild_if_missing: bool = True,
 ) -> dict[str, Any]:
+    strict_records = _operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    if strict_records:
+        execution_ids = _runtime_context_service_dedupe(
+            [
+                str(record.get("contract_execution_id") or "").strip()
+                for record in strict_records
+            ]
+        )
+        selected_execution_id = execution_ids[0] if len(execution_ids) == 1 else ""
+        return {
+            "schema_version": "parentless_direct_main_selected_scope.v2",
+            "resolved": bool(selected_execution_id),
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": selected_execution_id,
+            "selection_source": (
+                "source_backed_operator_supervised_direct_main_rev2"
+            ),
+            "candidate_execution_ids": execution_ids,
+            "source_backed_contract_required": True,
+            "onboard_service_proxy_authority": False,
+        }
+    prospective_execution_id = (
+        _operator_supervised_direct_main_execution_id(
+            project_id,
+            backlog_id,
+        )
+    )
+    prospective_route_authority = (
+        _operator_supervised_direct_main_route_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=prospective_execution_id,
+            route_token_ref=route_token_ref,
+        )
+        if str(route_token_ref or "").strip()
+        else {}
+    )
+    if prospective_route_authority.get("accepted") is True:
+        return {
+            "schema_version": "parentless_direct_main_selected_scope.v2",
+            "resolved": True,
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": prospective_execution_id,
+            "selection_source": (
+                "source_backed_operator_supervised_direct_main_rev2"
+            ),
+            "candidate_execution_ids": [prospective_execution_id],
+            "source_backed_contract_required": True,
+            "onboard_service_proxy_authority": False,
+        }
     projection = _contract_chain_current_projection(
         conn,
         project_id=project_id,
@@ -163667,6 +166765,8 @@ def _contract_runtime_parentless_direct_main_selected_scope(
         "backlog_id": backlog_id,
         "contract_execution_id": selected_execution_id,
         "selection_source": "backlog_contract_chain_current",
+        "source_backed_contract_required": False,
+        "onboard_service_proxy_authority": bool(selected_execution_id),
         "candidate_execution_ids": candidates,
         "projection_source": str(projection.get("projection_source") or ""),
     }
@@ -163716,6 +166816,30 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
         != task_id
     ):
         return {}
+    try:
+        selected_record = _contract_runtime(conn).store.get(task_id)
+    except ContractRuntimeError:
+        selected_record = {}
+    selected_metadata = (
+        selected_record.get("metadata")
+        if isinstance(selected_record.get("metadata"), Mapping)
+        else {}
+    )
+    strict_binding = (
+        selected_metadata.get(
+            "operator_supervised_direct_main_runtime_binding"
+        )
+        if isinstance(
+            selected_metadata.get(
+                "operator_supervised_direct_main_runtime_binding"
+            ),
+            Mapping,
+        )
+        and str(selected_record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(selected_record.get("revision") or "").strip() == "rev2"
+        else {}
+    )
 
     events = task_timeline.list_events(
         conn,
@@ -163850,6 +166974,19 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
     checks["close_ready_canonical_test_results"] = (
         close_ready_test_results_gate.get("passed") is True
     )
+    runtime_deployment_authority = (
+        _operator_supervised_direct_main_runtime_deployment_authority(
+            project_id=project_id,
+            close_commit=str(body.get("commit_sha") or "").strip(),
+        )
+        if strict_binding
+        else {}
+    )
+    if runtime_deployment_authority:
+        checks["runtime_deployment_current_if_applicable"] = bool(
+            runtime_deployment_authority.get("applicable") is False
+            or runtime_deployment_authority.get("passed") is True
+        )
     missing = [key for key, passed in checks.items() if not passed]
     aliases = {
         alias: task_timeline._event_has_evidence(prospective, {alias})
@@ -163887,6 +167024,7 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
         },
         "implementation_test_results_gate": implementation_test_results_gate,
         "close_ready_test_results_gate": close_ready_test_results_gate,
+        "runtime_deployment_authority": runtime_deployment_authority,
         "non_satisfying_aliases": [
             alias for alias, present in aliases.items() if present
         ],
@@ -163942,6 +167080,30 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         != task_id
     ):
         return {}
+    try:
+        selected_record = _contract_runtime(conn).store.get(task_id)
+    except ContractRuntimeError:
+        selected_record = {}
+    selected_metadata = (
+        selected_record.get("metadata")
+        if isinstance(selected_record.get("metadata"), Mapping)
+        else {}
+    )
+    strict_binding = (
+        selected_metadata.get(
+            "operator_supervised_direct_main_runtime_binding"
+        )
+        if isinstance(
+            selected_metadata.get(
+                "operator_supervised_direct_main_runtime_binding"
+            ),
+            Mapping,
+        )
+        and str(selected_record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(selected_record.get("revision") or "").strip() == "rev2"
+        else {}
+    )
     events = task_timeline.list_events(
         conn,
         project_id,
@@ -164013,6 +167175,14 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
                 for path in list(
                     direct_authority.get("row_declared_files") or []
                 )
+            ]
+        )
+    )
+    binding_files = sorted(
+        _runtime_context_service_dedupe(
+            [
+                str(path or "").strip()
+                for path in strict_binding.get("owned_files") or []
             ]
         )
     )
@@ -164240,6 +167410,64 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         if not worktree_clean:
             commit_missing.append("canonical_worktree_clean")
 
+    if strict_binding:
+        expected_root = str(
+            strict_binding.get("target_project_root") or ""
+        ).strip()
+        expected_worktree = str(
+            strict_binding.get("worktree_path") or ""
+        ).strip()
+        expected_base_commit = str(
+            strict_binding.get("base_commit") or ""
+        ).strip().lower()
+        if not (
+            expected_root
+            and expected_worktree == expected_root
+            and canonical_project_root == expected_root
+        ):
+            commit_missing.append(
+                "implementation_root_matches_runtime_binding"
+            )
+            commit_mismatches.append(
+                {
+                    "field": "target_project_root",
+                    "expected": expected_root,
+                    "actual": canonical_project_root,
+                }
+            )
+        if not (
+            expected_base_commit
+            and implementation_parent_commit == expected_base_commit
+        ):
+            commit_missing.append(
+                "implementation_parent_matches_runtime_base"
+            )
+            commit_mismatches.append(
+                {
+                    "field": "implementation_parent_commit",
+                    "expected": expected_base_commit,
+                    "actual": implementation_parent_commit,
+                }
+            )
+        if not (
+            binding_files
+            and binding_files == current_row_files
+            and binding_files == direct_row_files
+        ):
+            commit_missing.append(
+                "implementation_files_match_runtime_binding"
+            )
+            commit_mismatches.append(
+                {
+                    "field": "owned_files",
+                    "expected": binding_files,
+                    "actual": {
+                        "backlog": current_row_files,
+                        "pre_mutation": direct_row_files,
+                    },
+                }
+            )
+
     dirty_scope_gate = (
         _contract_runtime_parentless_direct_main_dirty_scope_authority(
             normalized_payload,
@@ -164284,6 +167512,24 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         commit_missing.append("unique_direct_main_pre_mutation_event")
     if not direct_route_identity_exact:
         commit_missing.append("implementation_route_matches_pre_mutation")
+    binding_route_identity = (
+        strict_binding.get("route_identity")
+        if isinstance(strict_binding.get("route_identity"), Mapping)
+        else {}
+    )
+    if strict_binding and dict(direct_identity) != dict(
+        binding_route_identity
+    ):
+        commit_missing.append(
+            "implementation_route_matches_runtime_binding"
+        )
+        commit_mismatches.append(
+            {
+                "field": "route_identity",
+                "expected": dict(binding_route_identity),
+                "actual": dict(direct_identity),
+            }
+        )
 
     route_row = None
     if route_token_ref:
@@ -164344,12 +167590,21 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         "resolved_commit_sha": resolved_commit,
         "canonical_head_commit": canonical_head_commit,
         "implementation_parent_commit": implementation_parent_commit,
+        "expected_runtime_base_commit": str(
+            strict_binding.get("base_commit") or ""
+        ).strip().lower(),
         "commit_trailers_exact": commit_trailers_exact,
         "canonical_commit_trailers": canonical_commit_trailers,
         "expected_commit_trailers": expected_commit_trailers,
         "commit_trailer_mismatches": commit_trailer_mismatches,
         "commit_trailer_source": "server_git_commit_trailers_only_unfolded",
         "canonical_project_root": canonical_project_root,
+        "expected_runtime_project_root": str(
+            strict_binding.get("target_project_root") or ""
+        ).strip(),
+        "runtime_binding_hash": str(
+            strict_binding.get("binding_hash") or ""
+        ).strip(),
         "repository_root_exact": repository_root_exact,
         "git_object_exists": bool(resolved_commit and resolved_commit == commit_sha),
         "worktree_clean": worktree_clean,
@@ -164435,6 +167690,7 @@ def _contract_runtime_parentless_direct_main_append_graph_trace_gate(
     route_gate: Mapping[str, Any],
     route_identity: Mapping[str, Any],
     event: Mapping[str, Any],
+    world_ref: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Re-derive direct-main graph authority before appending immutable evidence."""
 
@@ -164475,6 +167731,7 @@ def _contract_runtime_parentless_direct_main_append_graph_trace_gate(
         task_id=expected_task_id,
         trace_ids=valid_trace_ids,
         route_identity=route_identity,
+        world_ref=world_ref,
     )
     identity_mismatches: list[dict[str, str]] = []
     supplied_task_id = str(caller_task_id or "").strip()
@@ -164510,6 +167767,11 @@ def _contract_runtime_parentless_direct_main_append_graph_trace_gate(
     missing: list[str] = []
     if not selected_scope.get("resolved"):
         missing.append("parentless_direct_main_contract_runtime_scope")
+    if world_ref is not None and (
+        not isinstance(world_ref, Mapping)
+        or world_ref.get("accepted") is not True
+    ):
+        missing.append("pre_mutation_world_ref_exact")
     if not trace_ids:
         missing.append("graph_trace_ids_nonempty")
     if invalid_trace_ids:
@@ -168512,6 +171774,15 @@ def _contract_runtime_close_authority_projection(
                 )
             ),
         }
+    operator_supervised_direct_main_gate = (
+        _contract_runtime_operator_supervised_direct_main_close_authority_gate(
+            conn,
+            project_id=project_id,
+            backlog_id=bug_id,
+            record=record,
+            close_commit=close_commit,
+        )
+    )
     direct_fix_gate = _contract_runtime_direct_fix_close_authority_gate(
         chain_records,
         chain_projection=server_chain_projection,
@@ -168625,6 +171896,9 @@ def _contract_runtime_close_authority_projection(
         "execution_state_revision": current_state.get("execution_state_revision", 0),
         "execution_state_hash": current_state.get("execution_state_hash", ""),
         "next_legal_action": current_state.get("next_legal_action") or {},
+        "operator_supervised_direct_main_close_authority_gate": (
+            operator_supervised_direct_main_gate
+        ),
         "direct_fix_close_authority_gate": direct_fix_gate,
         "parentless_direct_main_close_authority_gate": parentless_direct_main_gate,
         "mf_parallel_close_authority_gate": mf_parallel_gate,
@@ -170155,6 +173429,40 @@ def handle_observer_direct_mutation_exception(ctx: RequestContext):
 
 @route("POST", "/api/task/{project_id}/timeline")
 def handle_task_timeline_append(ctx: RequestContext):
+    """Serialize the one mutable Direct rev2 admission scope."""
+
+    project_id = ctx.get_project_id()
+    backlog_id = str(ctx.body.get("backlog_id") or "").strip()
+    task_id = str(ctx.body.get("task_id") or "").strip()
+    event_tokens = {
+        str(ctx.body.get(key) or "")
+        .strip()
+        .lower()
+        .replace(".", "_")
+        .replace("-", "_")
+        for key in ("event_type", "event_kind")
+    }
+    strict_direct_admission = bool(
+        backlog_id
+        and task_id
+        == _operator_supervised_direct_main_execution_id(
+            project_id,
+            backlog_id,
+        )
+        and event_tokens.intersection(
+            {
+                "mf_observer_direct_implementation_exception",
+                "observer_direct_implementation_exception",
+            }
+        )
+    )
+    if strict_direct_admission:
+        with sqlite_write_lock():
+            return _handle_task_timeline_append(ctx)
+    return _handle_task_timeline_append(ctx)
+
+
+def _handle_task_timeline_append(ctx: RequestContext):
     """Append task timeline evidence from executor/agent code."""
     project_id = ctx.get_project_id()
     persisted_event_type = str(ctx.body.get("event_type") or "")
@@ -170193,6 +173501,10 @@ def handle_task_timeline_append(ctx: RequestContext):
         else {}
     )
     trusted_qa_verification_authority: dict[str, Any] = {}
+    direct_main_runtime_lineage: dict[str, Any] = {}
+    direct_main_pre_mutation_graph_trace_gate: dict[str, Any] = {}
+    direct_main_pre_mutation_request_fingerprint = ""
+    direct_main_pre_mutation_world_ref: dict[str, Any] = {}
 
     trusted_timeline_connection = getattr(
         ctx,
@@ -170750,6 +174062,23 @@ def handle_task_timeline_append(ctx: RequestContext):
                         "historical_backfill_allowed": False,
                     },
                 )
+            strict_direct_execution_id = (
+                _operator_supervised_direct_main_execution_id(
+                    project_id,
+                    str(ctx.body.get("backlog_id") or "").strip(),
+                )
+            )
+            strict_direct_record: dict[str, Any] = {}
+            strict_direct_requested = bool(
+                str(ctx.body.get("task_id") or "").strip()
+                == strict_direct_execution_id
+            )
+            if strict_direct_requested:
+                direct_main_pre_mutation_world_ref = (
+                    _operator_supervised_direct_main_world_ref(
+                        project_id=project_id,
+                    )
+                )
             pre_mutation_graph_trace_gate = (
                 _contract_runtime_parentless_direct_main_append_graph_trace_gate(
                     conn,
@@ -170763,6 +174092,11 @@ def handle_task_timeline_append(ctx: RequestContext):
                     route_gate=route_gate,
                     route_identity=direct_identity,
                     event=provisional_event,
+                    world_ref=(
+                        direct_main_pre_mutation_world_ref
+                        if strict_direct_requested
+                        else None
+                    ),
                 )
             )
             direct_authority_gate = (
@@ -170853,6 +174187,172 @@ def handle_task_timeline_append(ctx: RequestContext):
                         "historical_backfill_allowed": False,
                     },
                 )
+            if strict_direct_requested:
+                # Starting the exact CEX is itself a durable mutation.  Keep it
+                # after every route/file/graph prewrite Gate so a rejected
+                # first Direct request remains genuinely zero-write.
+                strict_direct_record = (
+                    _operator_supervised_direct_main_start_runtime(
+                        conn,
+                        project_id=project_id,
+                        backlog_id=str(
+                            ctx.body.get("backlog_id") or ""
+                        ).strip(),
+                        task_id=str(
+                            ctx.body.get("task_id") or ""
+                        ).strip(),
+                        route_token_ref=str(
+                            direct_identity.get("route_token_ref") or ""
+                        ).strip(),
+                        world_ref=direct_main_pre_mutation_world_ref,
+                    )
+                )
+            if strict_direct_record:
+                direct_main_pre_mutation_request_fingerprint = (
+                    _operator_supervised_direct_main_pre_mutation_fingerprint(
+                        provisional_event
+                    )
+                )
+                admitted_events = (
+                    _operator_supervised_direct_main_bound_pre_mutation_events(
+                        conn,
+                        project_id=project_id,
+                        backlog_id=str(
+                            ctx.body.get("backlog_id") or ""
+                        ).strip(),
+                        contract_execution_id=strict_direct_execution_id,
+                    )
+                )
+                if admitted_events:
+                    admitted_fingerprints = {
+                        str(
+                            (
+                                event.get("payload")
+                                if isinstance(event.get("payload"), Mapping)
+                                else {}
+                            )
+                            .get("observer_direct_pre_mutation_authority", {})
+                            .get("pre_mutation_request_fingerprint", "")
+                        ).strip()
+                        for event in admitted_events
+                    }
+                    if (
+                        len(admitted_events) == 1
+                        and admitted_fingerprints
+                        == {direct_main_pre_mutation_request_fingerprint}
+                    ):
+                        replay = dict(admitted_events[0])
+                        replay["idempotent_replay"] = True
+                        replay["writes_performed"] = False
+                        replay["mutation_performed"] = False
+                        replay["replay_source"] = (
+                            "operator_supervised_direct_main_single_admission"
+                        )
+                        return replay
+                    raise GovernanceError(
+                        "operator_supervised_direct_main_pre_mutation_already_admitted",
+                        (
+                            "Direct Main rev2 permits one immutable "
+                            "pre-mutation admission per execution"
+                        ),
+                        409,
+                        {
+                            "contract_execution_id": (
+                                strict_direct_execution_id
+                            ),
+                            "accepted_event_ids": [
+                                event.get("id") for event in admitted_events
+                            ],
+                            "accepted_request_fingerprints": sorted(
+                                admitted_fingerprints
+                            ),
+                            "requested_fingerprint": (
+                                direct_main_pre_mutation_request_fingerprint
+                            ),
+                            "zero_write_rejection": True,
+                            "writes_performed": False,
+                            "historical_backfill_allowed": False,
+                        },
+                    )
+                admitted_runtime_lines = [
+                    line
+                    for line in strict_direct_record.get("completed_lines") or []
+                    if isinstance(line, Mapping)
+                    and str(line.get("line_id") or "").strip()
+                    == "observer_direct_implementation_exception"
+                ]
+                if admitted_runtime_lines:
+                    runtime_fingerprints = {
+                        str(
+                            (
+                                line.get("payload")
+                                if isinstance(line.get("payload"), Mapping)
+                                else {}
+                            ).get("pre_mutation_request_fingerprint")
+                            or ""
+                        ).strip()
+                        for line in admitted_runtime_lines
+                    }
+                    if not (
+                        len(admitted_runtime_lines) == 1
+                        and runtime_fingerprints
+                        == {direct_main_pre_mutation_request_fingerprint}
+                    ):
+                        raise GovernanceError(
+                            "operator_supervised_direct_main_pre_mutation_already_admitted",
+                            (
+                                "Direct Main rev2 permits one immutable "
+                                "pre-mutation admission per execution"
+                            ),
+                            409,
+                            {
+                                "contract_execution_id": strict_direct_execution_id,
+                                "accepted_runtime_line_ids": [
+                                    str(line.get("line_id") or "")
+                                    for line in admitted_runtime_lines
+                                ],
+                                "accepted_request_fingerprints": sorted(
+                                    runtime_fingerprints
+                                ),
+                                "requested_fingerprint": (
+                                    direct_main_pre_mutation_request_fingerprint
+                                ),
+                                "zero_write_rejection": True,
+                                "writes_performed": False,
+                                "historical_backfill_allowed": False,
+                            },
+                        )
+                runtime_binding = (
+                    strict_direct_record.get("metadata", {}).get(
+                        "operator_supervised_direct_main_runtime_binding"
+                    )
+                    if isinstance(
+                        strict_direct_record.get("metadata"), Mapping
+                    )
+                    else {}
+                )
+                norm_payload["direct_contract_runtime_binding"] = {
+                    "schema_version": (
+                        "operator_supervised_direct_main."
+                        "timeline_binding.v1"
+                    ),
+                    "contract_execution_id": strict_direct_execution_id,
+                    "stage_id": "pre_mutation",
+                    "line_id": (
+                        "observer_direct_implementation_exception"
+                    ),
+                    "binding_hash": str(
+                        (runtime_binding or {}).get("binding_hash") or ""
+                    ),
+                    "server_derived": True,
+                    "caller_claims_trusted": False,
+                }
+                direct_authority_gate[
+                    "pre_mutation_request_fingerprint"
+                ] = direct_main_pre_mutation_request_fingerprint
+                direct_main_pre_mutation_graph_trace_gate = dict(
+                    pre_mutation_graph_trace_gate
+                )
             norm_payload["acceptance_scope_closure"] = acceptance_scope_closure
             norm_payload["observer_direct_pre_mutation_authority"] = {
                 "schema_version": (
@@ -170887,6 +174387,10 @@ def handle_task_timeline_append(ctx: RequestContext):
                 "missing_requirement_ids": [],
                 "historical_backfill_allowed": False,
             }
+            if direct_main_pre_mutation_request_fingerprint:
+                norm_payload["observer_direct_pre_mutation_authority"][
+                    "pre_mutation_request_fingerprint"
+                ] = direct_main_pre_mutation_request_fingerprint
         if source_authority:
             norm_payload.pop("meta_contract_gate", None)
             norm_payload["contract_gate_decision"] = (
@@ -171332,6 +174836,124 @@ def handle_task_timeline_append(ctx: RequestContext):
                     "historical_backfill_allowed": False,
                 },
             )
+        if direct_main_close_ready_prewrite_gate.get("applicable") is True:
+            norm_payload["direct_close_ready_prewrite_authority"] = dict(
+                direct_main_close_ready_prewrite_gate
+            )
+            runtime_deployment_authority = (
+                direct_main_close_ready_prewrite_gate.get(
+                    "runtime_deployment_authority"
+                )
+                if isinstance(
+                    direct_main_close_ready_prewrite_gate.get(
+                        "runtime_deployment_authority"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            if runtime_deployment_authority:
+                norm_payload["runtime_deployment_authority"] = dict(
+                    runtime_deployment_authority
+                )
+        direct_task_id = str(ctx.body.get("task_id") or "").strip()
+        expected_direct_task_id = (
+            _operator_supervised_direct_main_execution_id(
+                project_id,
+                str(ctx.body.get("backlog_id") or "").strip(),
+            )
+        )
+        if direct_task_id == expected_direct_task_id:
+            try:
+                direct_record = _contract_runtime_store(conn).get(
+                    direct_task_id
+                )
+            except ContractRuntimeError:
+                direct_record = {}
+            direct_guide = (
+                direct_record.get("runtime_guide")
+                if isinstance(direct_record.get("runtime_guide"), Mapping)
+                else {}
+            )
+            direct_next = (
+                direct_guide.get("next_legal_action")
+                if isinstance(
+                    direct_guide.get("next_legal_action"), Mapping
+                )
+                else {}
+            )
+            direct_owner_role = str(
+                direct_next.get("owner_role") or ""
+            ).strip()
+            if (
+                trusted_contract_runtime_actor_role
+                and direct_owner_role
+                and trusted_contract_runtime_actor_role
+                != direct_owner_role
+            ):
+                raise GovernanceError(
+                    "operator_supervised_direct_main_runtime_owner_mismatch",
+                    (
+                        "Direct Main timeline writer must match the current "
+                        "ContractRuntime owner"
+                    ),
+                    403,
+                    {
+                        "contract_execution_id": direct_task_id,
+                        "required_owner_role": direct_owner_role,
+                        "authenticated_actor_role": (
+                            trusted_contract_runtime_actor_role
+                        ),
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                    },
+                )
+            direct_main_runtime_lineage = (
+                _operator_supervised_direct_main_apply_timeline_runtime(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=str(
+                        ctx.body.get("backlog_id") or ""
+                    ).strip(),
+                    contract_execution_id=direct_task_id,
+                    event_kind=norm_event_kind,
+                    body=ctx.body or {},
+                    normalized_payload=norm_payload,
+                    pre_mutation_graph_trace_gate=(
+                        direct_main_pre_mutation_graph_trace_gate
+                    ),
+                    pre_mutation_request_fingerprint=(
+                        direct_main_pre_mutation_request_fingerprint
+                    ),
+                    trusted_qa_verification_authority=(
+                        trusted_qa_verification_authority
+                    ),
+                )
+            )
+            if direct_main_runtime_lineage:
+                norm_payload["direct_contract_runtime_lineage"] = dict(
+                    direct_main_runtime_lineage
+                )
+            else:
+                raise GovernanceError(
+                    "operator_supervised_direct_main_runtime_required",
+                    (
+                        "The deterministic Direct rev2 task accepts only "
+                        "timeline evidence consumed by its current ContractRuntime line"
+                    ),
+                    422,
+                    {
+                        "project_id": project_id,
+                        "backlog_id": str(
+                            ctx.body.get("backlog_id") or ""
+                        ).strip(),
+                        "contract_execution_id": direct_task_id,
+                        "event_kind": str(norm_event_kind or "").strip(),
+                        "required_facade": "task_timeline_append",
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                    },
+                )
         # The canonical Contract sequence gate is the first write precondition
         # for runtime-context worker evidence.  Persist route-gate audit only
         # after it accepts, otherwise an out-of-order read/startup would perform
@@ -171404,6 +175026,10 @@ def handle_task_timeline_append(ctx: RequestContext):
             result["meta_contract_gate_decision_source"] = False
         if canonical_contract_line:
             result["contract_runtime_canonical_line"] = canonical_contract_line
+        if direct_main_runtime_lineage:
+            result["direct_contract_runtime_lineage"] = dict(
+                direct_main_runtime_lineage
+            )
         return result
 
 
@@ -189569,7 +193195,14 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                 contract_execution_id=contract_execution_id,
                 record=record,
             )
-            if _onboard_service_record(record):
+            direct_crud_rejection = (
+                _operator_supervised_direct_main_generic_crud_rejection(
+                    record
+                )
+            )
+            if direct_crud_rejection:
+                result = direct_crud_rejection
+            elif _onboard_service_record(record):
                 record = _contract_runtime_read(
                     conn,
                     contract_execution_id=contract_execution_id,
@@ -189838,6 +193471,15 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
         response["close_authority_precheck"] = result[
             "close_authority_precheck"
         ]
+    for field in (
+        "error",
+        "required_facade",
+        "generic_contract_runtime_submit_line_allowed",
+        "zero_write_rejection",
+        "writes_performed",
+    ):
+        if field in result:
+            response[field] = result[field]
     response.update(_contract_runtime_qa_rejection_response_fields(result))
     return _contract_runtime_bounded_line_write_response(
         response,
@@ -190256,7 +193898,14 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                 contract_execution_id=contract_execution_id,
                 record=record,
             )
-            if _onboard_service_record(record):
+            direct_crud_rejection = (
+                _operator_supervised_direct_main_generic_crud_rejection(
+                    record
+                )
+            )
+            if direct_crud_rejection:
+                result = direct_crud_rejection
+            elif _onboard_service_record(record):
                 record = _contract_runtime_read(
                     conn,
                     contract_execution_id=contract_execution_id,
@@ -190510,6 +194159,15 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
         response["close_authority_precheck"] = result[
             "close_authority_precheck"
         ]
+    for field in (
+        "error",
+        "required_facade",
+        "generic_contract_runtime_submit_line_allowed",
+        "zero_write_rejection",
+        "writes_performed",
+    ):
+        if field in result:
+            response[field] = result[field]
     response.update(_contract_runtime_qa_rejection_response_fields(result))
     return response
 

@@ -377,12 +377,19 @@ def test_direct_main_rev2_starts_fresh_with_authoritative_common_rule_join():
         proposed_write,
         actor_role="observer",
     )
-    assert precheck["ok"] is True
+    assert precheck["ok"] is False
     assert precheck["would_mutate_completed_lines"] is False
-    assert written["ok"] is True
+    assert written["ok"] is False
     assert precheck["decision"] == written["decision"]
     assert precheck["record"]["authoritative_common_rule_join"] == join
     assert written["record"]["authoritative_common_rule_join"] == join
+    assert any(
+        "server-admitted immutable runtime binding" in error
+        for error in written["decision"]["errors"]
+    )
+    assert runtime.store.get(created["contract_execution_id"])[
+        "completed_lines"
+    ] == []
 
     rev1 = registry.get(
         "operator_supervised_direct_main",
@@ -457,13 +464,342 @@ def test_direct_main_rev2_fresh_world_warranty_rejects_bypass_authority():
         actor_role="observer",
     )
 
-    assert precheck["ok"] is True
+    assert precheck["ok"] is False
     assert precheck["would_mutate_completed_lines"] is False
-    assert written["ok"] is True
+    assert written["ok"] is False
     assert precheck["decision"] == written["decision"]
     assert precheck["record"]["authoritative_common_rule_join"] == join
     assert written["record"]["authoritative_common_rule_join"] == join
 
+
+def test_direct_main_rev2_strict_runtime_binding_is_authoritative_at_write_gate():
+    runtime = ContractRuntime(ContractDefinitionRegistry())
+    execution_id = "cex-direct-main-rev2-strict-binding"
+    backlog_id = "AC-DIRECT-MAIN-REV2-STRICT-BINDING"
+    route_identity = {
+        "route_id": "route-direct-main-rev2-strict-binding",
+        "route_context_hash": "sha256:" + "1" * 64,
+        "prompt_contract_id": "rprompt-direct-main-rev2-strict-binding",
+        "prompt_contract_hash": "sha256:" + "2" * 64,
+        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+        "route_token_ref": "rtok-direct-main-rev2-strict-binding",
+    }
+    binding = {
+        "schema_version": "operator_supervised_direct_main.runtime_binding.v1",
+        "strict_runtime_binding_required": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": "aming-claw",
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "route_identity": route_identity,
+        "owned_files": ["agent/governance/server.py"],
+        "target_files": ["agent/governance/server.py"],
+        "target_project_root": "/tmp/direct-main-rev2",
+        "worktree_path": "/tmp/direct-main-rev2",
+        "base_commit": "a" * 40,
+        "target_head_commit": "a" * 40,
+        "same_execution_retry_allowed": False,
+        "same_generation_retry_allowed": False,
+        "post_hoc_pass_backfill_allowed": False,
+    }
+    binding["binding_hash"] = server.stable_sha256(binding)
+    created = runtime.start_execution(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev2",
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=execution_id,
+        route_token_ref=route_identity["route_token_ref"],
+        metadata={
+            "operator_supervised_direct_main_runtime_binding": binding,
+        },
+    )
+    exact = {
+        "project_id": created["project_id"],
+        "backlog_id": created["backlog_id"],
+        "contract_execution_id": execution_id,
+        "definition_hash": created["definition_hash"],
+        "instruction_bundle_hash": created["instruction_bundle_hash"],
+        "execution_state_revision": created["execution_state_revision"],
+        "runtime_guide_hash": created["runtime_guide"]["runtime_guide_hash"],
+        "stage_id": "route_gate",
+        "line_id": "observer_bind_direct_scope",
+        "actor_role": "observer",
+        "evidence_kind": "contract_binding",
+        "payload": {
+            "direct_runtime_binding_hash": binding["binding_hash"],
+            "direct_runtime_binding": binding,
+        },
+    }
+    precheck = runtime.precheck_line_write(
+        execution_id,
+        exact,
+        actor_role="observer",
+    )
+    assert precheck["ok"] is True
+    before = runtime.store.get(execution_id)
+
+    tampered = deepcopy(exact)
+    tampered["payload"]["direct_runtime_binding_hash"] = (
+        "sha256:" + "f" * 64
+    )
+    rejected = runtime.submit_line_write(
+        execution_id,
+        tampered,
+        actor_role="observer",
+    )
+    assert rejected["ok"] is False
+    assert any(
+        "exact runtime binding hash" in error
+        for error in rejected["decision"]["errors"]
+    )
+    after = runtime.store.get(execution_id)
+    assert after["execution_state_revision"] == before["execution_state_revision"]
+    assert after["execution_state"]["completed_lines"] == []
+
+    accepted = runtime.submit_line_write(
+        execution_id,
+        exact,
+        actor_role="observer",
+    )
+    assert accepted["ok"] is True
+    assert accepted["record"]["execution_state_revision"] == (
+        before["execution_state_revision"] + 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("terminal_case", "failed_line_id", "policy_field"),
+    [
+        (
+            "failed_qa",
+            "qa_independent_verification",
+            "qa_failure",
+        ),
+        (
+            "failed_close",
+            "observer_close_ready",
+            "authoritative_close_failure",
+        ),
+    ],
+)
+def test_direct_main_rev2_terminal_failure_is_no_pass_not_rework(
+    terminal_case,
+    failed_line_id,
+    policy_field,
+):
+    runtime = ContractRuntime(ContractDefinitionRegistry())
+    execution_id = f"cex-direct-main-rev2-terminal-{terminal_case}"
+    backlog_id = f"AC-DIRECT-MAIN-REV2-TERMINAL-{terminal_case.upper()}"
+    route_identity = {
+        "route_id": f"route-direct-main-rev2-terminal-{terminal_case}",
+        "route_context_hash": "sha256:" + "1" * 64,
+        "prompt_contract_id": f"rprompt-direct-main-rev2-{terminal_case}",
+        "prompt_contract_hash": "sha256:" + "2" * 64,
+        "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+        "route_token_ref": f"rtok-direct-main-rev2-terminal-{terminal_case}",
+    }
+    binding = {
+        "schema_version": "operator_supervised_direct_main.runtime_binding.v1",
+        "strict_runtime_binding_required": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": "aming-claw",
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "route_identity": route_identity,
+        "owned_files": ["agent/governance/server.py"],
+        "target_files": ["agent/governance/server.py"],
+        "target_project_root": "/tmp/direct-main-terminal",
+        "worktree_path": "/tmp/direct-main-terminal",
+        "base_commit": "a" * 40,
+        "target_head_commit": "a" * 40,
+        "same_execution_retry_allowed": False,
+        "same_generation_retry_allowed": False,
+        "post_hoc_pass_backfill_allowed": False,
+    }
+    binding["binding_hash"] = server.stable_sha256(binding)
+    created = runtime.start_execution(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev2",
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=execution_id,
+        route_token_ref=route_identity["route_token_ref"],
+        metadata={
+            "generic_crud_exposed": False,
+            "operator_supervised_direct_main_runtime_binding": binding,
+        },
+    )
+    completed_line_specs = [
+        (
+            "route_gate",
+            "observer_bind_direct_scope",
+            "observer",
+            "contract_binding",
+            "completed",
+        ),
+        (
+            "graph_first",
+            "observer_graph_context",
+            "observer",
+            "graph_trace",
+            "completed",
+        ),
+        (
+            "pre_mutation",
+            "observer_direct_implementation_exception",
+            "observer",
+            "observer_direct_implementation_exception",
+            "completed",
+        ),
+        (
+            "implementation",
+            "observer_implementation",
+            "observer",
+            "implementation",
+            "completed",
+        ),
+        (
+            "qa_graph_context",
+            "qa_graph_context",
+            "qa",
+            "graph_trace",
+            "completed",
+        ),
+        (
+            "qa",
+            "qa_independent_verification",
+            "qa",
+            "independent_verification",
+            "failed" if terminal_case == "failed_qa" else "completed",
+        ),
+    ]
+    if terminal_case == "failed_close":
+        completed_line_specs.extend(
+            [
+                (
+                    "reconcile",
+                    "observer_reconcile",
+                    "observer",
+                    "current_full_reconcile",
+                    "completed",
+                ),
+            ]
+        )
+    completed_lines = [
+        {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": actor_role,
+            "evidence_kind": evidence_kind,
+            "status": status,
+            "payload": {"fixture": "accepted-runtime-line"},
+        }
+        for stage_id, line_id, actor_role, evidence_kind, status in (
+            completed_line_specs
+        )
+    ]
+    persisted = runtime.store.get(execution_id)
+    persisted["completed_lines"] = completed_lines
+    persisted["execution_state_revision"] = 7
+    runtime.store.update(execution_id, persisted)
+
+    if terminal_case == "failed_close":
+        preterminal = runtime.current_record(
+            execution_id,
+            actor_role="observer",
+        )
+        assert preterminal["runtime_guide"]["next_legal_action"][
+            "line_id"
+        ] == "observer_close_ready"
+        failed_close = runtime.submit_line_write(
+            execution_id,
+            server._contract_runtime_line_write_body(
+                preterminal,
+                {
+                    "stage_id": "close_ready",
+                    "line_id": "observer_close_ready",
+                    "evidence_kind": "close_ready",
+                    "status": "failed",
+                    "payload": {
+                        "direct_runtime_binding_hash": binding[
+                            "binding_hash"
+                        ],
+                        "timeline_payload": {
+                            "status": "failed",
+                            "reason": "authoritative close failed",
+                        },
+                    },
+                },
+                actor_role="observer",
+            ),
+            actor_role="observer",
+        )
+        assert failed_close["ok"] is True
+
+    terminal = runtime.current_record(execution_id, actor_role="observer")
+    disposition = terminal["runtime_guide"]["terminal_disposition"]
+    assert terminal["runtime_guide"]["next_legal_action"] is None
+    assert terminal["runtime_guide"]["readiness_state"] == "terminal_no_pass"
+    assert disposition["schema_version"] == (
+        "contract_runtime.pinned_terminal_no_pass_disposition.v1"
+    )
+    assert disposition["source_line_id"] == failed_line_id
+    assert disposition["policy_field"] == policy_field
+    assert disposition["authoritative_pass_synthesized"] is False
+    assert "failed_qa_rework" not in terminal["runtime_guide"]
+    assert "line_bypass_guidance" not in terminal["runtime_guide"]
+    assert terminal["execution_state"]["execution_state_hash"] == (
+        server.stable_sha256(
+            {
+                key: value
+                for key, value in terminal["execution_state"].items()
+                if key != "execution_state_hash"
+            }
+        )
+    )
+
+    before = runtime.store.get(execution_id)
+    rejected = runtime.submit_line_write(
+        execution_id,
+        {
+            "project_id": "aming-claw",
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "definition_hash": created["definition_hash"],
+            "instruction_bundle_hash": created["instruction_bundle_hash"],
+            "execution_state_revision": terminal[
+                "execution_state_revision"
+            ],
+            "runtime_guide_hash": terminal["runtime_guide"][
+                "runtime_guide_hash"
+            ],
+            "stage_id": (
+                "reconcile" if terminal_case == "failed_qa" else "close_ready"
+            ),
+            "line_id": (
+                "observer_reconcile"
+                if terminal_case == "failed_qa"
+                else "observer_close_ready"
+            ),
+            "actor_role": "observer",
+            "evidence_kind": (
+                "current_full_reconcile"
+                if terminal_case == "failed_qa"
+                else "close_ready"
+            ),
+        },
+        actor_role="observer",
+    )
+    assert rejected["ok"] is False
+    after = runtime.store.get(execution_id)
+    assert after == before
 
 def test_ordinary_direct_contract_has_no_retired_world_alias_or_dependency():
     definition = ContractDefinitionRegistry().get(

@@ -267,6 +267,13 @@ def validate_contract_write(
             write,
         )
     )
+    errors.extend(
+        operator_supervised_direct_main_runtime_binding_errors(
+            definition,
+            execution_state,
+            write,
+        )
+    )
 
     candidate_commit_policy = contract_line_evidence_policy(
         definition,
@@ -353,7 +360,23 @@ def validate_contract_write(
         _CURRENT_FULL_RECONCILE_POLICY_NAME,
         line_id=line_id,
     )
-    if reconcile_policy:
+    strict_direct_runtime = bool(
+        str(definition.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(definition.get("revision") or "").strip() == "rev2"
+        and isinstance(execution_state.get("metadata"), Mapping)
+        and isinstance(
+            execution_state["metadata"].get(
+                "operator_supervised_direct_main_runtime_binding"
+            ),
+            Mapping,
+        )
+        and execution_state["metadata"][
+            "operator_supervised_direct_main_runtime_binding"
+        ].get("strict_runtime_binding_required")
+        is True
+    )
+    if reconcile_policy and not strict_direct_runtime:
         _validate_reconcile_record_evidence(
             errors,
             write,
@@ -367,6 +390,320 @@ def validate_contract_write(
         errors=tuple(errors),
         identity_mismatches=tuple(identity_mismatches),
     )
+
+
+def operator_supervised_direct_main_runtime_binding_errors(
+    definition: Mapping[str, Any],
+    execution_state: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> list[str]:
+    """Keep every fresh Direct rev2 line bound to its admitted route Fact.
+
+    The HTTP/timeline adapters may enrich a request with DB-derived evidence,
+    but the authoritative ContractRuntime Gate still rechecks the immutable
+    execution binding.  Historical Direct records have no strict marker and
+    are intentionally not retrofitted.
+    """
+
+    if not (
+        str(definition.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(definition.get("revision") or "").strip() == "rev2"
+    ):
+        return []
+    metadata = (
+        execution_state.get("metadata")
+        if isinstance(execution_state.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    if binding.get("strict_runtime_binding_required") is not True:
+        return [
+            "operator_supervised_direct_main rev2 requires the server-admitted immutable runtime binding"
+        ]
+
+    binding_hash = str(binding.get("binding_hash") or "").strip()
+    unsigned_binding = {
+        key: value for key, value in binding.items() if key != "binding_hash"
+    }
+    required_route_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "route_token_ref",
+    )
+    route_identity = (
+        binding.get("route_identity")
+        if isinstance(binding.get("route_identity"), Mapping)
+        else {}
+    )
+    expected_files = sorted(
+        {
+            str(path).strip()
+            for path in binding.get("owned_files") or []
+            if str(path).strip()
+        }
+    )
+    errors: list[str] = []
+    if not (
+        binding.get("schema_version")
+        == "operator_supervised_direct_main.runtime_binding.v1"
+        and binding.get("server_derived") is True
+        and binding.get("caller_claims_trusted") is False
+        and str(binding.get("project_id") or "").strip()
+        == str(execution_state.get("project_id") or "").strip()
+        and str(binding.get("backlog_id") or "").strip()
+        == str(execution_state.get("backlog_id") or "").strip()
+        and str(binding.get("contract_execution_id") or "").strip()
+        == str(execution_state.get("contract_execution_id") or "").strip()
+        and expected_files
+        and expected_files
+        == sorted(
+            {
+                str(path).strip()
+                for path in binding.get("target_files") or []
+                if str(path).strip()
+            }
+        )
+        and all(str(route_identity.get(field) or "").strip() for field in required_route_fields)
+        and binding_hash
+        and binding_hash == stable_sha256(unsigned_binding)
+    ):
+        errors.append(
+            "operator_supervised_direct_main rev2 requires one complete immutable runtime binding"
+        )
+
+    payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}
+    if str(payload.get("direct_runtime_binding_hash") or "").strip() != binding_hash:
+        errors.append(
+            "operator_supervised_direct_main line must reference the exact runtime binding hash"
+        )
+
+    line_id = str(write.get("line_id") or "").strip()
+    if line_id == "observer_bind_direct_scope":
+        supplied = (
+            payload.get("direct_runtime_binding")
+            if isinstance(payload.get("direct_runtime_binding"), Mapping)
+            else {}
+        )
+        if dict(supplied) != dict(binding):
+            errors.append(
+                "operator_supervised_direct_main route line must equal the immutable runtime binding"
+            )
+    elif line_id == "observer_graph_context":
+        graph_gate = (
+            payload.get("pre_implementation_graph_trace_gate")
+            if isinstance(
+                payload.get("pre_implementation_graph_trace_gate"), Mapping
+            )
+            else {}
+        )
+        graph_db = (
+            graph_gate.get("db_evidence")
+            if isinstance(graph_gate.get("db_evidence"), Mapping)
+            else {}
+        )
+        trace_ids = [
+            str(item).strip()
+            for item in payload.get("graph_trace_ids") or []
+            if str(item).strip()
+        ]
+        if not (
+            graph_gate.get("passed") is True
+            and graph_db.get("db_verified") is True
+            and trace_ids
+            and trace_ids
+            == [
+                str(item).strip()
+                for item in graph_db.get("verified_trace_ids") or []
+                if str(item).strip()
+            ]
+        ):
+            errors.append(
+                "operator_supervised_direct_main graph line requires exact DB-verified pre-mutation traces"
+            )
+    elif line_id == "observer_direct_implementation_exception":
+        request_fingerprint = str(
+            payload.get("pre_mutation_request_fingerprint") or ""
+        ).strip()
+        if not (
+            request_fingerprint.startswith("sha256:")
+            and payload.get("server_admitted_single_pre_mutation") is True
+            and payload.get("same_generation_retry_allowed") is False
+        ):
+            errors.append(
+                "operator_supervised_direct_main pre-mutation line requires the single-admission request fingerprint"
+            )
+    elif line_id == "observer_reconcile":
+        authority = (
+            payload.get("direct_current_full_reconcile_authority")
+            if isinstance(
+                payload.get("direct_current_full_reconcile_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        authority_hash = str(authority.get("authority_hash") or "").strip()
+        unsigned_authority = {
+            key: value
+            for key, value in authority.items()
+            if key != "authority_hash"
+        }
+        implementation_commits = {
+            str(line.get("commit_sha") or "").strip().lower()
+            for line in execution_state.get("completed_lines") or []
+            if isinstance(line, Mapping)
+            and str(line.get("line_id") or "").strip()
+            == "observer_implementation"
+            and str(line.get("commit_sha") or "").strip()
+        }
+        commit_fields = {
+            str(authority.get(field) or "").strip().lower()
+            for field in (
+                "target_commit_sha",
+                "canonical_head_commit",
+                "active_snapshot_commit",
+            )
+        }
+        route_evidence = (
+            authority.get("route_evidence")
+            if isinstance(authority.get("route_evidence"), Mapping)
+            else {}
+        )
+        marker = (
+            authority.get("current_full_reconcile_marker")
+            if isinstance(
+                authority.get("current_full_reconcile_marker"), Mapping
+            )
+            else {}
+        )
+        if not (
+            authority.get("schema_version")
+            == (
+                "operator_supervised_direct_main."
+                "current_full_reconcile_authority.v1"
+            )
+            and authority.get("server_derived") is True
+            and authority.get("db_verified") is True
+            and authority.get("canonical_head_verified") is True
+            and authority.get("active_snapshot_verified") is True
+            and authority.get("current_full_reconcile") is True
+            and authority.get("qa_before_reconcile_verified") is True
+            and str(authority.get("project_id") or "").strip()
+            == str(execution_state.get("project_id") or "").strip()
+            and str(authority.get("backlog_id") or "").strip()
+            == str(execution_state.get("backlog_id") or "").strip()
+            and str(authority.get("contract_execution_id") or "").strip()
+            == str(execution_state.get("contract_execution_id") or "").strip()
+            and len(implementation_commits) == 1
+            and commit_fields == implementation_commits
+            and str(authority.get("active_snapshot_id") or "").strip()
+            and int(authority.get("qa_event_id") or 0) > 0
+            and int(authority.get("qa_event_id") or 0)
+            < int(authority.get("reconcile_event_id") or 0)
+            and str(authority.get("qa_event_ref") or "").strip()
+            == f"timeline:{int(authority.get('qa_event_id') or 0)}"
+            and str(authority.get("qa_snapshot_commit") or "")
+            .strip()
+            .lower()
+            in implementation_commits
+            and str(authority.get("qa_snapshot_id") or "").strip()
+            and str(authority.get("qa_authority_hash") or "").strip()
+            and route_evidence.get("schema_version")
+            == "graph_current_full_reconcile.route_evidence.v1"
+            and route_evidence.get("protected_action")
+            == "graph_current_full_reconcile"
+            and route_evidence.get("raw_route_token_persisted") is False
+            and str(route_evidence.get("route_token_ref") or "").strip()
+            == str(route_identity.get("route_token_ref") or "").strip()
+            and marker.get("schema_version")
+            == "current_full_reconcile.provenance.v2"
+            and marker.get("protected_action")
+            == "graph_current_full_reconcile"
+            and marker.get("activate") is True
+            and marker.get("normal_update_path") is True
+            and str(marker.get("snapshot_id") or "").strip()
+            == str(authority.get("active_snapshot_id") or "").strip()
+            and authority_hash
+            and authority_hash == stable_sha256(unsigned_authority)
+        ):
+            errors.append(
+                "operator_supervised_direct_main reconcile line requires exact current-full provenance"
+            )
+    elif line_id == "observer_close_ready":
+        close_status = str(write.get("status") or "").strip().lower()
+        terminal_policy = (
+            definition.get("system_layer", {}).get(
+                "terminal_outcome_policy", {}
+            )
+            if isinstance(definition.get("system_layer"), Mapping)
+            else {}
+        )
+        authoritative_close_failure = str(
+            terminal_policy.get("authoritative_close_failure") or ""
+        ).strip()
+        if close_status in {
+            "blocked",
+            "fail",
+            "failed",
+            "failure",
+            "rejected",
+        }:
+            if not authoritative_close_failure.startswith(
+                "terminal_no_pass"
+            ):
+                errors.append(
+                    "operator_supervised_direct_main failed close requires the pinned terminal no-PASS policy"
+                )
+            return errors
+        deployment = (
+            payload.get("runtime_deployment_authority")
+            if isinstance(
+                payload.get("runtime_deployment_authority"), Mapping
+            )
+            else {}
+        )
+        deployment_hash = str(
+            deployment.get("authority_hash") or ""
+        ).strip()
+        unsigned_deployment = {
+            key: value
+            for key, value in deployment.items()
+            if key != "authority_hash"
+        }
+        applicable = deployment.get("applicable")
+        if not (
+            deployment.get("schema_version")
+            == (
+                "operator_supervised_direct_main."
+                "runtime_deployment_authority.v1"
+            )
+            and applicable in {True, False}
+            and (
+                deployment.get("passed") is True
+                if applicable is True
+                else str(deployment.get("status") or "").strip()
+                == "not_applicable"
+                and "passed" not in deployment
+            )
+            and str(deployment.get("project_id") or "").strip()
+            == str(execution_state.get("project_id") or "").strip()
+            and deployment_hash
+            and deployment_hash == stable_sha256(unsigned_deployment)
+        ):
+            errors.append(
+                "operator_supervised_direct_main close line requires exact runtime deployment authority"
+            )
+    return errors
 
 
 def mf_parallel_prefill_child_plan_errors(

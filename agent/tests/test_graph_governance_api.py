@@ -9622,8 +9622,14 @@ def _persist_parallel_allocate_route_ref(
             "prompt_contract_hash": prompt_contract_hash,
             "visible_injection_manifest_hash": visible_injection_manifest_hash,
             "route_token_ref": route_token_ref,
-            "caller_role": "observer",
-            "allowed_actions": [
+                "caller_role": "observer",
+                "target_files": [
+                    "agent/tests/test_graph_governance_api.py"
+                ],
+                "owned_files": [
+                    "agent/tests/test_graph_governance_api.py"
+                ],
+                "allowed_actions": [
                 "parallel_branch_allocate",
                 "task_timeline_append",
             ],
@@ -9975,10 +9981,61 @@ def _insert_observer_graph_query_trace(
     task_id: str = "",
     status: str = "complete",
     route_identity: Mapping[str, Any] | None = None,
+    commit_sha: str = "",
+    target_project_root: str = "",
     created_at: str = "2026-07-04T10:00:00Z",
 ) -> None:
     graph_query_trace.ensure_schema(conn)
     route_identity = dict(route_identity or {})
+    if (
+        not commit_sha
+        and not target_project_root
+        and backlog_id
+        and task_id
+        == server._operator_supervised_direct_main_execution_id(
+            PID,
+            backlog_id,
+        )
+    ):
+        resolved_project_root = server.project_service.resolve_project_root(
+            PID,
+            None,
+            fallback_self=True,
+        )
+        resolved_root = Path(
+            resolved_project_root
+            or Path(server.__file__).resolve().parents[2]
+        ).resolve()
+        commit_sha = batch_jobs.git_commit(resolved_root)
+        target_project_root = str(resolved_root)
+        if snapshot_id == "scope-test-observer":
+            snapshot_id = f"full-{trace_id}"
+    root_identity: dict[str, Any] = {}
+    root_identity_hash = ""
+    query_root_identity_hash = ""
+    graph_basis = ""
+    if commit_sha and target_project_root:
+        canonical_root = str(Path(target_project_root).resolve())
+        store.create_graph_snapshot(
+            conn,
+            PID,
+            snapshot_id=snapshot_id,
+            commit_sha=commit_sha,
+            snapshot_kind="full",
+            graph_json=_graph(),
+        )
+        root_identity = {
+            "schema_version": "graph_query.root_identity.v1",
+            "query_root": canonical_root,
+            "query_root_head_commit": commit_sha,
+            "canonical_project_root": canonical_root,
+            "canonical_head_commit": commit_sha,
+        }
+        root_identity_hash = server.stable_sha256(root_identity)
+        query_root_identity_hash = _fake_sha(
+            f"observer-query-root:{canonical_root}:{commit_sha}"
+        )
+        graph_basis = "exact_snapshot"
     conn.execute(
         """
         INSERT INTO graph_query_traces
@@ -9987,9 +10044,11 @@ def _insert_observer_graph_query_trace(
            route_id, route_context_hash, prompt_contract_id,
            prompt_contract_hash, visible_injection_manifest_hash,
            route_token_ref, worker_role, fence_token, status, budget_json,
-           usage_json, artifact_path, created_at, updated_at)
+           usage_json, artifact_path, commit_sha, graph_basis,
+           root_identity_json, root_identity_hash,
+           query_root_identity_hash, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?)
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             trace_id,
@@ -10015,6 +10074,11 @@ def _insert_observer_graph_query_trace(
             "{}",
             "{}",
             "",
+            commit_sha,
+            graph_basis,
+            json.dumps(root_identity, sort_keys=True),
+            root_identity_hash,
+            query_root_identity_hash,
             created_at,
             created_at,
         ),
@@ -10876,8 +10940,10 @@ def test_direct_main_guide_action_input_and_rejection_are_canonical_zero_write(
             },
         )
     )
-    action_input = guide["action_input"]
-    assert guide["action_input_path"] == "action_input"
+    action_input = guide["next_legal_action"]["copy_safe_body"]
+    assert guide["next_legal_action"]["mcp_tool"] == (
+        "observer_direct_mutation_exception"
+    )
     assert action_input["event_type"] == (
         "mf.observer_direct_implementation_exception"
     )
@@ -89835,6 +89901,1075 @@ def _canonical_parentless_direct_main_implementation_body(
     }
 
 
+def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_premutation(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DIRECT-MAIN-REV2-SINGLE-ADMISSION-WARRANTY"
+    project_root = tmp_path / "direct-main-rev2-single-admission"
+    parent_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files = ?, test_files = ? WHERE bug_id = ?",
+        (
+            json.dumps([row_files[0]]),
+            json.dumps([row_files[1]]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    initial = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "view": "compact",
+            },
+        )
+    )
+    task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+    )
+    assert initial["contract_execution_id"] == task_id
+    assert initial["contract_id"] == "operator_supervised_direct_main"
+    assert initial["contract_revision"] == "rev2"
+    assert initial["onboard_service_proxy_selected"] is False
+    assert initial["next_legal_action"]["mcp_tool"] == (
+        "observer_route_context_issue"
+    )
+    issue_body = initial["next_legal_action"]["copy_safe_body"]
+    assert issue_body["task_id"] == task_id
+    assert sorted(issue_body["target_files"]) == sorted(row_files)
+    assert sorted(issue_body["owned_files"]) == sorted(row_files)
+    assert issue_body["allowed_actions"] == list(
+        server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+    )
+
+    route_token_ref = "rtok-direct-main-rev2-single-admission"
+    route_identity = {
+        "route_id": "route-direct-main-rev2-single-admission",
+        "route_context_hash": _fake_sha(
+            "route-direct-main-rev2-single-admission"
+        ),
+        "prompt_contract_id": "rprompt-direct-main-rev2-single-admission",
+        "prompt_contract_hash": _fake_sha(
+            "prompt-direct-main-rev2-single-admission"
+        ),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-direct-main-rev2-single-admission"
+        ),
+        "route_token_ref": route_token_ref,
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            **route_identity,
+            "caller_role": "observer",
+            "allowed_actions": list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+            "target_files": row_files,
+            "owned_files": row_files,
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [
+                f"backlog:{backlog_id}",
+                f"contract_runtime:{task_id}",
+            ],
+        },
+    )
+    routed = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": route_token_ref,
+                "view": "compact",
+            },
+        )
+    )
+    assert routed["next_legal_action"]["mcp_tool"] == (
+        "observer_direct_mutation_exception"
+    )
+    assert routed["next_legal_action"]["copy_safe_body"]["task_id"] == task_id
+
+    no_cex_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as no_cex_implementation:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "route_token_ref": route_token_ref,
+                    "event_type": "observer.implementation",
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "passed",
+                    "actor": "observer",
+                    "commit_sha": parent_commit,
+                    "payload": {
+                        **route_identity,
+                        "changed_files": row_files,
+                        "test_results": (
+                            _canonical_parentless_direct_main_test_results(
+                                parent_commit
+                            )
+                        ),
+                    },
+                },
+            )
+        )
+    assert no_cex_implementation.value.code == (
+        "operator_supervised_direct_main_runtime_required"
+    )
+    assert no_cex_implementation.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == no_cex_changes
+
+    trace_id = "gqt-20260822-d1a2c3e4f5"
+    rejected_body = _canonical_parentless_direct_main_pre_mutation_body(
+        append_base={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "route_token_ref": route_token_ref,
+        },
+        route_identity=route_identity,
+        allowed_files=row_files,
+        graph_trace_ids=[trace_id],
+        approval_ref="operator-direct-main-rev2-single-admission",
+    )
+    changes_before_rejection = conn.total_changes
+    with pytest.raises(GovernanceError) as graph_rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(rejected_body),
+            )
+        )
+    assert graph_rejected.value.code == (
+        "parentless_direct_main_pre_mutation_authority_incomplete"
+    )
+    assert graph_rejected.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == changes_before_rejection
+    assert server._operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    ) == []
+
+    wrong_world_trace_id = "gqt-20260822-deadbeef01"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=wrong_world_trace_id,
+        snapshot_id="full-direct-main-rev2-wrong-world",
+        query_purpose="gate_validation",
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_identity=route_identity,
+        commit_sha="f" * 40,
+        target_project_root=str(project_root),
+    )
+    wrong_world_body = _canonical_parentless_direct_main_pre_mutation_body(
+        append_base={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "route_token_ref": route_token_ref,
+        },
+        route_identity=route_identity,
+        allowed_files=row_files,
+        graph_trace_ids=[wrong_world_trace_id],
+        approval_ref="operator-direct-main-rev2-single-admission",
+    )
+    changes_before_wrong_world = conn.total_changes
+    with pytest.raises(GovernanceError) as wrong_world_rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=wrong_world_body,
+            )
+        )
+    assert wrong_world_rejected.value.code == (
+        "parentless_direct_main_pre_mutation_authority_incomplete"
+    )
+    assert wrong_world_rejected.value.details[
+        "pre_implementation_graph_trace_gate"
+    ]["db_evidence"]["identity_mismatches"]
+    assert conn.total_changes == changes_before_wrong_world
+    assert server._operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    ) == []
+
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        snapshot_id="full-direct-main-rev2-pre-mutation",
+        query_purpose="gate_validation",
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_identity=route_identity,
+        commit_sha=parent_commit,
+        target_project_root=str(project_root),
+    )
+    conn.commit()
+    append_body = _canonical_parentless_direct_main_pre_mutation_body(
+        append_base={
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "route_token_ref": route_token_ref,
+        },
+        route_identity=route_identity,
+        allowed_files=row_files,
+        graph_trace_ids=[trace_id],
+        approval_ref="operator-direct-main-rev2-single-admission",
+    )
+    first = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(append_body),
+        )
+    )
+    assert first["task_id"] == task_id
+    lineage = first["payload"]["direct_contract_runtime_lineage"]
+    assert [item["line_id"] for item in lineage["completed_line_refs"]] == [
+        "observer_bind_direct_scope",
+        "observer_graph_context",
+        "observer_direct_implementation_exception",
+    ]
+    record = server._contract_runtime(conn).store.get(task_id)
+    assert record["contract_id"] == "operator_supervised_direct_main"
+    assert record["revision"] == "rev2"
+    assert record["authoritative_common_rule_join"]["join_state"] == "resolved"
+    assert len(record["execution_state"]["completed_lines"]) == 3
+
+    generic_request = {
+        "project_id": PID,
+        "contract_execution_id": task_id,
+    }
+    generic_changes_before = conn.total_changes
+    generic_precheck = (
+        server.handle_project_contract_runtime_line_write_precheck(
+            _ctx_with_role(
+                generic_request,
+                "observer",
+                method="POST",
+                body={},
+            )
+        )
+    )
+    generic_submit = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            generic_request,
+            "observer",
+            method="POST",
+            body={},
+        )
+    )
+    for blocked in (generic_precheck, generic_submit):
+        assert blocked["ok"] is False
+        assert blocked["error"] == (
+            "operator_supervised_direct_main_generic_crud_forbidden"
+        )
+        assert blocked["required_facade"] == "task_timeline_append"
+        assert blocked["generic_contract_runtime_submit_line_allowed"] is False
+        assert blocked["zero_write_rejection"] is True
+    assert conn.total_changes == generic_changes_before
+    assert len(
+        server._contract_runtime(conn).store.get(task_id)[
+            "execution_state"
+        ]["completed_lines"]
+    ) == 3
+    post_premutation_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": route_token_ref,
+                "view": "compact",
+            },
+        )
+    )
+    assert post_premutation_guide["next_legal_action"]["line_id"] == (
+        "observer_implementation"
+    )
+    assert post_premutation_guide["next_legal_action"][
+        "source_of_authority"
+    ] == "contract_runtime_first_missing_line"
+    implementation_action = post_premutation_guide["next_legal_action"]
+    assert implementation_action["mcp_tool"] == "task_timeline_append"
+    assert implementation_action["copy_safe_body"]["event_kind"] == (
+        "implementation"
+    )
+    assert implementation_action["copy_safe_body"]["task_id"] == task_id
+    assert implementation_action["copy_safe_body"]["route_token_ref"] == (
+        route_token_ref
+    )
+    assert implementation_action["action_input_ready"] is False
+    assert "commit_sha" in implementation_action[
+        "action_input_missing_fields"
+    ]
+    assert implementation_action[
+        "generic_contract_runtime_submit_line_allowed"
+    ] is False
+    assert implementation_action[
+        "generic_contract_runtime_payload_executable"
+    ] is False
+    assert "copy_safe_body" not in implementation_action[
+        "contract_runtime_next_legal_action"
+    ]
+    assert "copy_safe_body" not in post_premutation_guide[
+        "contract_runtime_current"
+    ]["runtime_guide"]["next_legal_action"]
+    assert "writer_role_safe_copy_payload" not in post_premutation_guide[
+        "contract_runtime_current"
+    ]["runtime_guide"]
+    assert post_premutation_guide["contract_runtime_current"][
+        "runtime_guide"
+    ]["generic_contract_runtime_submit_line_allowed"] is False
+    route_drift_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": "rtok-direct-main-rev2-drift",
+            },
+        )
+    )
+    assert route_drift_guide["ok"] is False
+    assert route_drift_guide["error"] == (
+        "operator_supervised_direct_main_route_binding_changed"
+    )
+
+    replay = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(append_body),
+        )
+    )
+    assert replay["id"] == first["id"]
+    assert replay["idempotent_replay"] is True
+    assert replay["writes_performed"] is False
+    assert len(record["execution_state"]["completed_lines"]) == 3
+
+    # Crash-window warranty: ContractRuntime is the authority.  If its three
+    # admitted lines committed but the timeline projection did not, the exact
+    # request rematerializes that projection without writing another line.
+    conn.execute(
+        "DELETE FROM task_timeline_events WHERE project_id = ? AND id = ?",
+        (PID, first["id"]),
+    )
+    conn.commit()
+    recovered_projection = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(append_body),
+        )
+    )
+    assert recovered_projection["id"] != first["id"]
+    assert all(
+        item.get("existing_line_reused") is True
+        for item in recovered_projection["payload"][
+            "direct_contract_runtime_lineage"
+        ]["completed_line_refs"]
+    )
+    assert len(record["execution_state"]["completed_lines"]) == 3
+
+    conflicting = copy.deepcopy(append_body)
+    conflicting["payload"]["reason"] = "changed second admission"
+    with pytest.raises(GovernanceError) as exc:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=conflicting,
+            )
+        )
+    assert exc.value.code == (
+        "operator_supervised_direct_main_pre_mutation_already_admitted"
+    )
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_kind="observer_direct_implementation_exception",
+            limit=10,
+        )
+    ) == 1
+
+    unscoped = project_root / "unscoped-intermediate.txt"
+    unscoped.write_text("not part of the Direct row\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "unscoped-intermediate.txt"],
+        cwd=project_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "unscoped intermediate"],
+        cwd=project_root,
+        check=True,
+    )
+    wrong_parent = batch_jobs.git_commit(project_root)
+    wrong_parent_commit = _commit_test_git_files(
+        project_root,
+        row_files,
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_commit=wrong_parent,
+        ),
+    )
+    wrong_parent_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as wrong_parent_rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "route_token_ref": route_token_ref,
+                    "event_type": "observer.implementation",
+                    "event_kind": "implementation",
+                    "phase": "implementation",
+                    "status": "passed",
+                    "actor": "observer",
+                    "commit_sha": wrong_parent_commit,
+                    "payload": {
+                        **route_identity,
+                        "changed_files": row_files,
+                        "test_results": (
+                            _canonical_parentless_direct_main_test_results(
+                                wrong_parent_commit
+                            )
+                        ),
+                        "dirty_scope_check": {
+                            "allowed_files": row_files,
+                            "changed_files": row_files,
+                            "unexpected_files": [],
+                            "exact_match": True,
+                        },
+                    },
+                },
+            )
+        )
+    assert wrong_parent_rejected.value.code == (
+        "parentless_direct_main_implementation_test_evidence_incomplete"
+    )
+    assert "implementation_parent_matches_runtime_base" in (
+        wrong_parent_rejected.value.details["commit_prewrite_authority"][
+            "missing_requirement_ids"
+        ]
+    )
+    assert "implementation_parent_matches_runtime_base" in (
+        wrong_parent_rejected.value.details["missing_requirement_ids"]
+    )
+    assert conn.total_changes == wrong_parent_changes
+    subprocess.run(
+        ["git", "reset", "--hard", parent_commit],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+    )
+
+    implementation_commit = _commit_test_git_files(
+        project_root,
+        row_files,
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_commit=parent_commit,
+        ),
+    )
+    implementation = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "route_token_ref": route_token_ref,
+                "event_type": "observer.implementation",
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "passed",
+                "actor": "observer",
+                "commit_sha": implementation_commit,
+                "payload": {
+                    **route_identity,
+                    "changed_files": row_files,
+                    "test_results": (
+                        _canonical_parentless_direct_main_test_results(
+                            implementation_commit,
+                            command=(
+                                "pytest -q agent/tests/"
+                                "test_graph_governance_api.py"
+                            ),
+                        )
+                    ),
+                    "dirty_scope_check": {
+                        "allowed_files": row_files,
+                        "changed_files": row_files,
+                        "unexpected_files": [],
+                        "exact_match": True,
+                    },
+                },
+            },
+        )
+    )
+    assert implementation["payload"]["direct_contract_runtime_lineage"][
+        "completed_line_refs"
+    ][0]["line_id"] == "observer_implementation"
+    implemented_record = server._contract_runtime(conn).store.get(task_id)
+    assert len(implemented_record["execution_state"]["completed_lines"]) == 4
+    assert implemented_record["runtime_guide"]["next_legal_action"][
+        "line_id"
+    ] == "qa_graph_context"
+    post_implementation_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": route_token_ref,
+            },
+        )
+    )
+    assert post_implementation_guide["next_legal_action"]["line_id"] == (
+        "qa_graph_context"
+    )
+    assert post_implementation_guide["next_legal_action"][
+        "owner_role"
+    ] == "qa"
+    assert post_implementation_guide["next_legal_action"][
+        "requires_role"
+    ] == "qa"
+    qa_action = post_implementation_guide["next_legal_action"]
+    assert qa_action["mcp_tool"] == "task_timeline_append"
+    assert qa_action["copy_safe_body"]["event_type"] == (
+        "qa.independent_verification"
+    )
+    assert qa_action["copy_safe_body"]["event_kind"] == (
+        "independent_verification"
+    )
+    assert qa_action["copy_safe_body"]["commit_sha"] == (
+        implementation_commit
+    )
+    assert qa_action["copy_safe_body"]["actor"] == (
+        "<copy the authenticated QA principal_id>"
+    )
+    assert qa_action["facade_action_projection"]["qa_authored"] is True
+    assert qa_action["facade_action_projection"][
+        "observer_may_submit"
+    ] is False
+    assert qa_action[
+        "generic_contract_runtime_submit_line_allowed"
+    ] is False
+    monkeypatch.setitem(
+        server._GOVERNANCE_MANAGER_CERTIFICATES,
+        PID,
+        _test_manager_certificate(),
+    )
+    snapshot_id = "full-direct-main-rev2-current"
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: project_root,
+    )
+    observer_session_id = _insert_active_observer_session_ref(
+        conn,
+        session_id="obs-direct-main-rev2-single-admission",
+    )
+    reconcile_body = {
+        "target_commit_sha": implementation_commit,
+        "snapshot_id": snapshot_id,
+        "activate": True,
+        "semantic_enrich": False,
+        "run_id": "current-full-direct-main-rev2",
+        "expected_old_snapshot_id": (
+            "full-direct-main-rev2-single-admission"
+        ),
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "observer_session_id": observer_session_id,
+        "observer_route_token_ref": route_token_ref,
+    }
+    reconcile_changes_before_qa = conn.total_changes
+    blocked_reconcile_status, blocked_reconcile = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=copy.deepcopy(reconcile_body),
+            )
+        )
+    )
+    assert blocked_reconcile_status == 409
+    assert blocked_reconcile["error"] == (
+        "operator_supervised_direct_main_qa_before_reconcile_required"
+    )
+    assert blocked_reconcile["writes_performed"] is False
+    assert blocked_reconcile["snapshot_materialized"] is False
+    assert conn.total_changes == reconcile_changes_before_qa
+
+    qa_event = _append_authenticated_qa_verification(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        commit_sha=implementation_commit,
+        snapshot_id="full-direct-main-rev2-single-admission",
+        principal_id="qa:direct-main-rev2-single-admission",
+    )
+    assert [
+        item["line_id"]
+        for item in qa_event["payload"][
+            "direct_contract_runtime_lineage"
+        ]["completed_line_refs"]
+    ] == ["qa_graph_context", "qa_independent_verification"]
+    qa_record = server._contract_runtime(conn).store.get(task_id)
+    assert len(qa_record["execution_state"]["completed_lines"]) == 6
+    assert qa_record["runtime_guide"]["next_legal_action"]["line_id"] == (
+        "observer_reconcile"
+    )
+    qa_runtime_authority_record = copy.deepcopy(
+        server._contract_runtime(conn).store.get(task_id)
+    )
+
+    def assert_runtime_qa_tamper_blocks_reconcile(
+        tamper,
+        requirement_id,
+    ):
+        tampered = copy.deepcopy(qa_runtime_authority_record)
+        tamper(tampered["completed_lines"])
+        server._contract_runtime(conn).store.update(task_id, tampered)
+        changes_before_tampered_reconcile = conn.total_changes
+        status, response = (
+            server.handle_graph_governance_current_full_reconcile(
+                _ctx(
+                    {"project_id": PID},
+                    method="POST",
+                    body=copy.deepcopy(reconcile_body),
+                )
+            )
+        )
+        assert status == 409
+        assert response["error"] == (
+            "operator_supervised_direct_main_qa_before_reconcile_required"
+        )
+        assert requirement_id in response["qa_preflight_authority"][
+            "missing_requirement_ids"
+        ]
+        assert response["writes_performed"] is False
+        assert response["snapshot_materialized"] is False
+        assert conn.total_changes == changes_before_tampered_reconcile
+        server._contract_runtime(conn).store.update(
+            task_id,
+            copy.deepcopy(qa_runtime_authority_record),
+        )
+
+    assert_runtime_qa_tamper_blocks_reconcile(
+        lambda lines: lines.__setitem__(
+            slice(None),
+            [
+                line
+                for line in lines
+                if line.get("line_id") != "qa_graph_context"
+            ],
+        ),
+        "contract_runtime_qa_position_exact",
+    )
+
+    def tamper_runtime_qa_authority(lines):
+        for line in lines:
+            if line.get("line_id") == "qa_independent_verification":
+                line["payload"]["qa_authority"]["authority_hash"] = (
+                    _fake_sha("wrong-runtime-qa-authority")
+                )
+
+    assert_runtime_qa_tamper_blocks_reconcile(
+        tamper_runtime_qa_authority,
+        "contract_runtime_qa_authority_exact",
+    )
+    post_qa_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": route_token_ref,
+            },
+        )
+    )
+    assert post_qa_guide["next_legal_action"]["line_id"] == (
+        "observer_reconcile"
+    )
+    reconcile_action = post_qa_guide["next_legal_action"]
+    assert reconcile_action["mcp_tool"] == (
+        "graph_current_full_reconcile"
+    )
+    assert reconcile_action["copy_safe_body"]["target_commit_sha"] == (
+        implementation_commit
+    )
+    assert reconcile_action["copy_safe_body"][
+        "observer_route_token_ref"
+    ] == route_token_ref
+    assert reconcile_action["copy_safe_body"]["task_id"] == task_id
+    assert reconcile_action["action_input_missing_fields"] == [
+        "observer_session_id"
+    ]
+    assert reconcile_action[
+        "generic_contract_runtime_submit_line_allowed"
+    ] is False
+
+    monkeypatch.setattr(server, "_git_dirty_paths", lambda _root: [])
+
+    def fake_reconcile(_conn, project_id, _root, **kwargs):
+        store.create_graph_snapshot(
+            _conn,
+            project_id,
+            snapshot_id=snapshot_id,
+            commit_sha=implementation_commit,
+            snapshot_kind="full",
+            graph_json=_graph(),
+            notes=json.dumps({"run_id": kwargs.get("run_id", "")}),
+        )
+        _conn.commit()
+        return {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "projection_id": "semproj-direct-main-rev2-current",
+            "snapshot_status": "candidate",
+            "run_id": kwargs.get("run_id", ""),
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_state_only_full_reconcile",
+        fake_reconcile,
+    )
+    reconcile_status, reconcile = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=copy.deepcopy(reconcile_body),
+            )
+        )
+    )
+    assert reconcile_status == 201
+    assert reconcile["activated"] is True
+    assert reconcile["active_snapshot_id"] == snapshot_id
+    post_reconcile_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": route_token_ref,
+            },
+        )
+    )
+    post_reconcile_action = post_reconcile_guide["next_legal_action"]
+    assert post_reconcile_action["line_id"] == "observer_reconcile"
+    assert post_reconcile_action["mcp_tool"] == "task_timeline_append"
+    assert post_reconcile_action["copy_safe_body"]["event_kind"] == (
+        "close_ready"
+    )
+    assert post_reconcile_action["copy_safe_body"]["commit_sha"] == (
+        implementation_commit
+    )
+    assert post_reconcile_action["copy_safe_body"]["verification"][
+        "full_reconcile_snapshot"
+    ]["snapshot_id"] == snapshot_id
+    assert post_reconcile_action["facade_action_projection"][
+        "consumes_contract_runtime_lines"
+    ] == ["observer_reconcile", "observer_close_ready"]
+    assert post_reconcile_action["facade_action_projection"][
+        "reconcile_line_materialized_by_close_facade"
+    ] is True
+
+    external_runtime_authority = (
+        server._operator_supervised_direct_main_runtime_deployment_authority(
+            project_id=PID,
+            close_commit=implementation_commit,
+        )
+    )
+    assert external_runtime_authority["applicable"] is False
+    assert external_runtime_authority["status"] == "not_applicable"
+    assert "passed" not in external_runtime_authority
+
+    # Exercise the real self-runtime projection without changing the WorldRef
+    # used by this execution.  The close boundary below uses the same projected
+    # shape through a controllable deployment state so stale rejection and the
+    # accepted persisted/rechecked Fact remain in one world.
+    self_root = Path(server.__file__).resolve().parents[2]
+    runtime_identity = {
+        "loaded_commit": implementation_commit,
+        "loaded_pid": 12345,
+        "runtime_stale": True,
+        "runtime_stale_reasons": ["loaded_commit_differs_from_worktree"],
+    }
+    with monkeypatch.context() as self_runtime_patch:
+        self_runtime_patch.setattr(
+            server.project_service,
+            "resolve_project_root",
+            lambda *_args, **_kwargs: self_root,
+        )
+        self_runtime_patch.setattr(
+            server,
+            "governance_loaded_runtime_identity",
+            lambda *_args, **_kwargs: dict(runtime_identity),
+        )
+        self_runtime_patch.setattr(
+            server,
+            "_git_output",
+            lambda _root, _args: implementation_commit,
+        )
+        stale_projection = (
+            server._operator_supervised_direct_main_runtime_deployment_authority(
+                project_id=PID,
+                close_commit=implementation_commit,
+            )
+        )
+        assert stale_projection["applicable"] is True
+        assert stale_projection["passed"] is False
+        assert stale_projection["runtime_stale"] is True
+        assert "loaded_pid" not in stale_projection
+        runtime_identity["runtime_stale"] = False
+        runtime_identity["runtime_stale_reasons"] = []
+        loaded_projection = (
+            server._operator_supervised_direct_main_runtime_deployment_authority(
+                project_id=PID,
+                close_commit=implementation_commit,
+            )
+        )
+        assert loaded_projection["passed"] is True
+        assert "loaded_pid" not in loaded_projection
+
+    deployment_state = {"runtime_stale": True}
+
+    def projected_runtime_deployment_authority(*, project_id, close_commit):
+        passed = deployment_state["runtime_stale"] is False
+        authority = {
+            "schema_version": (
+                "operator_supervised_direct_main."
+                "runtime_deployment_authority.v1"
+            ),
+            "applicable": True,
+            "passed": passed,
+            "status": "passed" if passed else "failed",
+            "source": "governance_loaded_runtime_identity",
+            "server_derived": True,
+            "caller_claims_trusted": False,
+            "project_id": project_id,
+            "project_root": str(self_root),
+            "governance_runtime_root": str(self_root),
+            "close_commit": close_commit,
+            "loaded_commit": close_commit,
+            "runtime_stale": deployment_state["runtime_stale"],
+            "runtime_stale_reasons": (
+                ["loaded_commit_differs_from_worktree"]
+                if deployment_state["runtime_stale"]
+                else []
+            ),
+        }
+        authority["authority_hash"] = server.stable_sha256(authority)
+        return authority
+
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_runtime_deployment_authority",
+        projected_runtime_deployment_authority,
+    )
+    close_ready_body = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "route_token_ref": route_token_ref,
+        "event_type": "observer.close_ready",
+        "event_kind": "close_ready",
+        "phase": "close_ready",
+        "status": "passed",
+        "actor": "observer",
+        "commit_sha": implementation_commit,
+        "verification": {
+            "governance_redeploy": {"status": "passed"},
+            "runtime_version_sync": True,
+            "graph_reconciled": True,
+            "preflight_ok": True,
+            "live_regression": {"status": "passed"},
+            "test_results": (
+                _canonical_parentless_direct_main_test_results(
+                    implementation_commit
+                )
+            ),
+        },
+        "payload": {
+            **route_identity,
+            "close_commit": implementation_commit,
+        },
+    }
+    stale_close_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as stale_close_rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(close_ready_body),
+            )
+        )
+    assert stale_close_rejected.value.code == (
+        "parentless_direct_main_close_ready_canonical_evidence_incomplete"
+    )
+    assert "runtime_deployment_current_if_applicable" in (
+        stale_close_rejected.value.details["missing_requirement_ids"]
+    )
+    assert conn.total_changes == stale_close_changes
+    deployment_state["runtime_stale"] = False
+
+    close_ready = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(close_ready_body),
+        )
+    )
+    assert [
+        item["line_id"]
+        for item in close_ready["payload"][
+            "direct_contract_runtime_lineage"
+        ]["completed_line_refs"]
+    ] == ["observer_reconcile", "observer_close_ready"]
+    completed_record = server._contract_runtime(conn).store.get(task_id)
+    assert len(completed_record["execution_state"]["completed_lines"]) == 8
+    assert completed_record["runtime_guide"]["next_legal_action"] is None
+    completed_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": route_token_ref,
+            },
+        )
+    )
+    assert completed_guide["next_legal_action"] is None
+
+    close_authority = (
+        server._contract_runtime_operator_supervised_direct_main_close_authority_gate(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            record=completed_record,
+            close_commit=implementation_commit,
+        )
+    )
+    assert close_authority["passed"] is True, json.dumps(
+        close_authority,
+        indent=2,
+        sort_keys=True,
+    )
+    assert close_authority["missing_requirement_ids"] == []
+    tampered_record = copy.deepcopy(completed_record)
+    tampered_record["execution_state"]["completed_lines"][-1][
+        "commit_sha"
+    ] = parent_commit
+    tampered_record["completed_lines"][-1]["commit_sha"] = parent_commit
+    rejected_close_authority = (
+        server._contract_runtime_operator_supervised_direct_main_close_authority_gate(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            record=tampered_record,
+            close_commit=implementation_commit,
+        )
+    )
+    assert rejected_close_authority["passed"] is False
+    assert "exact_close_commit_across_direct_lines" in rejected_close_authority[
+        "missing_requirement_ids"
+    ]
+
+    closed = server.handle_backlog_close(
+        _ctx(
+            {"project_id": PID, "bug_id": backlog_id},
+            method="POST",
+            body={
+                "actor": "observer",
+                "commit": implementation_commit,
+                "contract_execution_id": task_id,
+                "route_token_ref": route_token_ref,
+            },
+        )
+    )
+    assert closed["ok"] is True
+    assert closed["status"] == "FIXED"
+
+
 def _canonical_parentless_direct_main_commit_message(
     *,
     backlog_id: str,
@@ -89899,9 +91034,12 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
     _insert_observer_graph_query_trace(
         conn,
         trace_id=graph_trace_id,
+        snapshot_id="full-direct-main-r2-pre-mutation",
         backlog_id=backlog_id,
         task_id=task_id,
         route_identity=route_identity,
+        commit_sha=stale_commit,
+        target_project_root=str(project_root),
     )
     server.handle_task_timeline_append(
         _ctx_with_role(
@@ -90583,6 +91721,7 @@ def _parentless_direct_main_pre_mutation_graph_scope(
     backlog_id: str,
     allowed_actions: list[str] | None = None,
     row_files: list[str] | None = None,
+    historical_onboard_service: bool = False,
 ) -> tuple[str, str, dict[str, str]]:
     declared_files = list(row_files or ["agent/governance/server.py"])
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -90609,6 +91748,12 @@ def _parentless_direct_main_pre_mutation_graph_scope(
         ),
     )
     conn.commit()
+    if historical_onboard_service:
+        server._onboard_service_materialize_parent_record(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+        )
     guide = server.handle_project_onboard_route_guide(
         _ctx_with_role(
             {"project_id": PID},
@@ -90617,14 +91762,23 @@ def _parentless_direct_main_pre_mutation_graph_scope(
             body={
                 "backlog_id": backlog_id,
                 "role": "observer",
-                "work_type": "operator_supervised_direct_main",
-                "route_token_ref": f"rtok-parent-{backlog_id.lower()}",
+                **(
+                    {"work_type": "operator_supervised_direct_main"}
+                    if not historical_onboard_service
+                    else {}
+                ),
             },
         )
     )
-    parent_execution_id = guide["contract_chain_current"][
-        "current_contract_execution_id"
-    ]
+    if historical_onboard_service:
+        parent_execution_id = guide["contract_chain_current"][
+            "current_contract_execution_id"
+        ]
+        assert parent_execution_id.startswith("onboard-service-")
+    else:
+        parent_execution_id = guide["contract_execution_id"]
+        assert guide["contract_id"] == "operator_supervised_direct_main"
+        assert guide["contract_revision"] == "rev2"
     route_token_ref = f"rtok-append-{backlog_id.lower()}"
     route_identity = {
         "route_id": f"route-{backlog_id.lower()}",
@@ -90644,18 +91798,48 @@ def _parentless_direct_main_pre_mutation_graph_scope(
             **route_identity,
             "caller_role": "observer",
             "allowed_actions": list(
-                allowed_actions or ["task_timeline_append"]
+                allowed_actions
+                or server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
             ),
+            "target_files": declared_files,
+            "owned_files": declared_files,
             "scope": {
                 "project_id": PID,
                 "backlog_id": backlog_id,
                 "task_id": parent_execution_id,
             },
             "expires_at": "2999-01-01T00:00:00Z",
-            "evidence_refs": [f"contract_runtime:{parent_execution_id}"],
+            "evidence_refs": [
+                f"backlog:{backlog_id}",
+                f"contract_runtime:{parent_execution_id}",
+            ],
         },
     )
     return parent_execution_id, route_token_ref, route_identity
+
+
+def _historical_parentless_direct_main_guide(
+    conn,
+    backlog_id: str,
+    *,
+    route_token_ref: str = "",
+) -> dict:
+    """Project an explicitly persisted legacy service-parent world."""
+
+    server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+    )
+    return server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={"backlog_id": backlog_id, "role": "observer"},
+        )
+    )
 
 
 def test_parentless_direct_main_dirty_scope_normalizes_order_as_exact_set(
@@ -90863,7 +92047,14 @@ def test_parentless_direct_main_pre_mutation_rejects_root_route_actions_that_clo
 
 def test_parentless_direct_main_pre_mutation_accepts_exact_full_round_root_actions(
     conn,
+    monkeypatch,
 ):
+    project_root = Path(server.__file__).resolve().parents[2]
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
     backlog_id = "AC-DIRECT-MAIN-ROOT-ACTION-ENTRY-CONTROL"
     parent_execution_id, route_token_ref, route_identity = (
         _parentless_direct_main_pre_mutation_graph_scope(
@@ -90929,6 +92120,7 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
         _parentless_direct_main_pre_mutation_graph_scope(
             conn,
             backlog_id=backlog_id,
+            historical_onboard_service=True,
         )
     )
     graph_trace_id = "gqt-20260812-c105e0ff01"
@@ -90939,6 +92131,7 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
         task_id=parent_execution_id,
         route_identity=route_identity,
     )
+    conn.commit()
     append_base = {
         "backlog_id": backlog_id,
         "task_id": parent_execution_id,
@@ -91691,6 +92884,7 @@ def test_parentless_direct_main_pre_mutation_rejects_retained_wrong_task_traces(
         _parentless_direct_main_pre_mutation_graph_scope(
             conn,
             backlog_id=backlog_id,
+            historical_onboard_service=True,
         )
     )
     retained_trace_ids = [
@@ -91765,6 +92959,7 @@ def test_parentless_direct_main_pre_mutation_accepts_contract_root_bound_trace(
         _parentless_direct_main_pre_mutation_graph_scope(
             conn,
             backlog_id=backlog_id,
+            historical_onboard_service=True,
         )
     )
     graph_trace_id = "gqt-20260727-7c0117e1aa"
@@ -102135,6 +103330,11 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         ),
     )
     conn.commit()
+    server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
     guide = server.handle_project_onboard_route_guide(
         _ctx_with_role(
             {"project_id": PID},
@@ -102143,8 +103343,6 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
             body={
                 "backlog_id": backlog_id,
                 "role": "observer",
-                "work_type": "operator_supervised_direct_main",
-                "route_token_ref": "rtok-parentless-direct-main-parent",
             },
         )
     )
@@ -102230,6 +103428,7 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         task_id=parent_execution_id,
         route_identity=route_identity,
     )
+    conn.commit()
     append_base = {
         "backlog_id": backlog_id,
         "task_id": parent_execution_id,
@@ -103825,6 +105024,299 @@ def test_backlog_close_accepts_parentless_direct_main_onboard_service_authority(
         assert later_qa_event["payload"]["route_token_ref"] not in public_close
 
 
+def test_direct_main_rev2_public_failed_close_is_one_terminal_no_pass_fact(
+    conn,
+):
+    backlog_id = "AC-DIRECT-MAIN-REV2-PUBLIC-FAILED-CLOSE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+    )
+    route_token_ref = "rtok-direct-main-rev2-public-failed-close"
+    route_identity = {
+        "route_id": "route-direct-main-rev2-public-failed-close",
+        "route_context_hash": _fake_sha(
+            "direct-main-rev2-public-failed-close"
+        ),
+        "prompt_contract_id": (
+            "rprompt-direct-main-rev2-public-failed-close"
+        ),
+        "prompt_contract_hash": _fake_sha(
+            "prompt-direct-main-rev2-public-failed-close"
+        ),
+        "visible_injection_manifest_hash": _fake_sha(
+            "visible-direct-main-rev2-public-failed-close"
+        ),
+        "route_token_ref": route_token_ref,
+    }
+    owned_files = ["agent/governance/server.py"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            **route_identity,
+            "caller_role": "observer",
+            "allowed_actions": list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+            "target_files": owned_files,
+            "owned_files": owned_files,
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [
+                f"backlog:{backlog_id}",
+                f"contract_runtime:{task_id}",
+            ],
+        },
+    )
+    binding = {
+        "schema_version": (
+            "operator_supervised_direct_main.runtime_binding.v1"
+        ),
+        "strict_runtime_binding_required": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": task_id,
+        "route_identity": route_identity,
+        "owned_files": owned_files,
+        "target_files": owned_files,
+        "target_project_root": "/tmp/direct-main-public-failed-close",
+        "worktree_path": "/tmp/direct-main-public-failed-close",
+        "base_commit": "a" * 40,
+        "target_head_commit": "a" * 40,
+        "same_execution_retry_allowed": False,
+        "same_generation_retry_allowed": False,
+        "post_hoc_pass_backfill_allowed": False,
+    }
+    binding["binding_hash"] = server.stable_sha256(binding)
+    runtime = server._contract_runtime(conn)
+    runtime.start_execution(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev2",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=task_id,
+        route_token_ref=route_token_ref,
+        metadata={
+            "generic_crud_exposed": False,
+            "operator_supervised_direct_main_runtime_binding": binding,
+        },
+    )
+    prior_lines = [
+        ("route_gate", "observer_bind_direct_scope", "observer", "contract_binding"),
+        ("graph_first", "observer_graph_context", "observer", "graph_trace"),
+        (
+            "pre_mutation",
+            "observer_direct_implementation_exception",
+            "observer",
+            "observer_direct_implementation_exception",
+        ),
+        ("implementation", "observer_implementation", "observer", "implementation"),
+        ("qa_graph_context", "qa_graph_context", "qa", "graph_trace"),
+        (
+            "qa",
+            "qa_independent_verification",
+            "qa",
+            "independent_verification",
+        ),
+        ("reconcile", "observer_reconcile", "observer", "current_full_reconcile"),
+    ]
+    persisted = runtime.store.get(task_id)
+    persisted["completed_lines"] = [
+        {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "actor_role": actor_role,
+            "evidence_kind": evidence_kind,
+            "status": "completed",
+            **(
+                {"commit_sha": "a" * 40}
+                if line_id == "observer_implementation"
+                else {}
+            ),
+            "payload": {"fixture": "accepted-runtime-line"},
+        }
+        for stage_id, line_id, actor_role, evidence_kind in prior_lines
+    ]
+    persisted["execution_state_revision"] = 8
+    runtime.store.update(task_id, persisted)
+    conn.commit()
+    assert runtime.current_record(task_id, actor_role="observer")[
+        "runtime_guide"
+    ]["next_legal_action"]["line_id"] == "observer_close_ready"
+    close_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": route_token_ref,
+                "view": "compact",
+            },
+        )
+    )
+    close_action = close_guide["next_legal_action"]
+    assert close_action["line_id"] == "observer_close_ready"
+    assert close_action["mcp_tool"] == "task_timeline_append"
+    assert close_action["copy_safe_body"]["event_kind"] == "close_ready"
+    assert close_action["copy_safe_body"]["commit_sha"] == "a" * 40
+    assert close_action["copy_safe_body"]["route_token_ref"] == (
+        route_token_ref
+    )
+    assert close_action[
+        "generic_contract_runtime_submit_line_allowed"
+    ] is False
+    assert "copy_safe_body" not in close_action[
+        "contract_runtime_next_legal_action"
+    ]
+
+    failed_body = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "route_token_ref": route_token_ref,
+        "event_type": "observer.close_ready",
+        "event_kind": "close_ready",
+        "phase": "close_ready",
+        "status": "failed",
+        "actor": "observer",
+        "commit_sha": "b" * 40,
+        "payload": {
+            "reason": "authoritative observer close failed",
+        },
+    }
+    wrong_route = copy.deepcopy(failed_body)
+    wrong_route["route_token_ref"] = "rtok-unregistered-failed-close"
+    before_wrong_route = runtime.store.get(task_id)
+    timeline_before_wrong_route = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError):
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=wrong_route,
+            )
+        )
+    assert runtime.store.get(task_id) == before_wrong_route
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == timeline_before_wrong_route
+
+    before_wrong_role = runtime.store.get(task_id)
+    timeline_before_wrong_role = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError):
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "qa",
+                method="POST",
+                body=copy.deepcopy(failed_body),
+            )
+        )
+    assert runtime.store.get(task_id) == before_wrong_role
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == timeline_before_wrong_role
+
+    accepted = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(failed_body),
+        )
+    )
+    assert accepted["status"] == "failed"
+    assert [
+        item["line_id"]
+        for item in accepted["payload"][
+            "direct_contract_runtime_lineage"
+        ]["completed_line_refs"]
+    ] == ["observer_close_ready"]
+    terminal = runtime.current_record(task_id, actor_role="observer")
+    assert terminal["runtime_guide"]["readiness_state"] == (
+        "terminal_no_pass"
+    )
+    assert terminal["runtime_guide"]["next_legal_action"] is None
+    assert terminal["runtime_guide"]["terminal_disposition"][
+        "policy_field"
+    ] == "authoritative_close_failure"
+    assert terminal["execution_state"]["execution_state_hash"] == (
+        server.stable_sha256(
+            {
+                key: value
+                for key, value in terminal["execution_state"].items()
+                if key != "execution_state_hash"
+            }
+        )
+    )
+    failed_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_kind="close_ready",
+        limit=10,
+    )
+    assert len(failed_events) == 1
+    assert failed_events[0]["status"] == "failed"
+
+    terminal_before_retry = runtime.store.get(task_id)
+    events_before_retry = list(failed_events)
+    with pytest.raises((GovernanceError, ContractRuntimeError)):
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(failed_body),
+            )
+        )
+    assert runtime.store.get(task_id) == terminal_before_retry
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_kind="close_ready",
+        limit=10,
+    ) == events_before_retry
+
+    generic = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": task_id,
+            },
+            "observer",
+            method="POST",
+            body={},
+        )
+    )
+    assert generic["ok"] is False
+    assert generic["error"] == (
+        "operator_supervised_direct_main_generic_crud_forbidden"
+    )
+    assert runtime.store.get(task_id) == terminal_before_retry
+
+
 def test_direct_main_rev2_fresh_world_warranty_requires_db_verified_qa(
     conn,
     monkeypatch,
@@ -103857,11 +105349,11 @@ def test_direct_main_rev2_fresh_world_warranty_requires_db_verified_qa(
                 "backlog_id": backlog_id,
                 "role": "observer",
                 "work_type": "operator_supervised_direct_main",
-                "route_token_ref": "rtok-direct-main-r2-parent",
             },
         )
     )
-    task_id = guide["contract_chain_current"]["current_contract_execution_id"]
+    task_id = guide["contract_execution_id"]
+    assert guide["onboard_service_proxy_selected"] is False
     route_token_ref = "rtok-direct-main-r2"
     route_identity = {
         "route_id": "route-direct-main-r2",
@@ -103878,36 +105370,37 @@ def test_direct_main_rev2_fresh_world_warranty_requires_db_verified_qa(
         token={
             **route_identity,
             "caller_role": "observer",
-            "allowed_actions": [
-                "graph_query",
-                "observer_direct_mutation_exception",
-                "task_timeline_append",
-                "run_tests",
-                "git_diff",
-                "graph_current_full_reconcile",
-                "backlog_close",
-                "merge",
-                "route_context",
-                "observer_direct_implementation_exception",
-                "current_full_reconcile",
-                "preflight_check",
+            "target_files": [
+                "agent/tests/test_graph_governance_api.py"
             ],
+            "owned_files": [
+                "agent/tests/test_graph_governance_api.py"
+            ],
+            "allowed_actions": list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
             "scope": {
                 "project_id": PID,
                 "backlog_id": backlog_id,
                 "task_id": task_id,
             },
             "expires_at": "2999-01-01T00:00:00Z",
-            "evidence_refs": [f"contract_runtime:{task_id}"],
+            "evidence_refs": [
+                f"backlog:{backlog_id}",
+                f"contract_runtime:{task_id}",
+            ],
         },
     )
     graph_trace_id = "gqt-20260821-d1ec7a1001"
     _insert_observer_graph_query_trace(
         conn,
         trace_id=graph_trace_id,
+        snapshot_id="full-direct-main-r2-pre-mutation",
         backlog_id=backlog_id,
         task_id=task_id,
         route_identity=route_identity,
+        commit_sha=parent_commit,
+        target_project_root=str(project_root),
     )
     append_base = {
         "backlog_id": backlog_id,
@@ -104107,19 +105600,7 @@ def test_parentless_direct_main_qa_timeline_accepts_explicit_service_parent_once
         lambda *_args, **_kwargs: project_root,
     )
     _insert_simple_mf_close_backlog(conn, backlog_id)
-    guide = server.handle_project_onboard_route_guide(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "operator_supervised_direct_main",
-                "route_token_ref": "rtok-parentless-qa-explicit-parent",
-            },
-        )
-    )
+    guide = _historical_parentless_direct_main_guide(conn, backlog_id)
     parent_execution_id = guide["contract_chain_current"][
         "current_contract_execution_id"
     ]
@@ -104421,18 +105902,10 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     )
     conn.commit()
 
-    guide = server.handle_project_onboard_route_guide(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "operator_supervised_direct_main",
-                "route_token_ref": route_token_ref,
-            },
-        )
+    guide = _historical_parentless_direct_main_guide(
+        conn,
+        backlog_id,
+        route_token_ref=route_token_ref,
     )
     parent_execution_id = guide["contract_chain_current"][
         "current_contract_execution_id"
@@ -104500,10 +105973,9 @@ def test_parentless_direct_main_guide_shapes_pass_only_the_narrow_close_gate(
     assert copy_safe_event["arguments_template"]["payload"][
         "operator_approval"
     ]["approved"] is True
-    next_copy_safe_event = guide["next_legal_action"][
-        "copy_safe_pre_mutation_event"
-    ]
-    assert next_copy_safe_event == copy_safe_event
+    assert "copy_safe_pre_mutation_event" not in (
+        guide.get("next_legal_action") or {}
+    )
     assert [step["id"] for step in template["ordered_close_path"]] == [
         "pre_mutation_exception",
         "commit_bound_implementation",
@@ -104976,19 +106448,7 @@ def test_parentless_direct_main_rejects_loose_operator_approval_shape(
     )
     conn.commit()
 
-    guide = server.handle_project_onboard_route_guide(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "operator_supervised_direct_main",
-                "route_token_ref": "rtok-parentless-direct-main-loose-parent",
-            },
-        )
-    )
+    guide = _historical_parentless_direct_main_guide(conn, backlog_id)
     parent_execution_id = guide["contract_chain_current"][
         "current_contract_execution_id"
     ]
@@ -105139,19 +106599,7 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
     )
     conn.commit()
 
-    guide = server.handle_project_onboard_route_guide(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "operator_supervised_direct_main",
-                "route_token_ref": "rtok-parentless-direct-main-active-child-parent",
-            },
-        )
-    )
+    guide = _historical_parentless_direct_main_guide(conn, backlog_id)
     parent_execution_id = guide["contract_chain_current"][
         "current_contract_execution_id"
     ]
@@ -105330,8 +106778,9 @@ def test_parentless_direct_main_root_close_ignores_active_child_worker_finish_ga
             body={
                 "backlog_id": backlog_id,
                 "reason": "Human approved row-scoped parallel work through onboard service.",
-                "task_id": "parentless-direct-main-active-child-task",
-                "observer_session_id": observer_session_id,
+                    "task_id": "parentless-direct-main-active-child-task",
+                    "contract_revision": "rev8",
+                    "observer_session_id": observer_session_id,
                 "observer_route_token_ref": parent_ref,
                 "onboard_service_waiver": True,
                 "owned_files": ["agent/governance/server.py"],
@@ -105799,19 +107248,7 @@ def test_parentless_direct_main_rejects_empty_or_fake_graph_trace_evidence(
             (json.dumps(["agent/governance/server.py"]), backlog_id),
         )
         conn.commit()
-        guide = server.handle_project_onboard_route_guide(
-            _ctx_with_role(
-                {"project_id": PID},
-                "observer",
-                method="POST",
-                body={
-                    "backlog_id": backlog_id,
-                    "role": "observer",
-                    "work_type": "operator_supervised_direct_main",
-                    "route_token_ref": f"{route_token_ref}-parent",
-                },
-            )
-        )
+        guide = _historical_parentless_direct_main_guide(conn, backlog_id)
         parent_execution_id = guide["contract_chain_current"][
             "current_contract_execution_id"
         ]
@@ -106157,19 +107594,7 @@ def test_parentless_direct_main_rejects_event_allowed_files_outside_row_scope(
         ),
     )
     conn.commit()
-    guide = server.handle_project_onboard_route_guide(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "operator_supervised_direct_main",
-                "route_token_ref": "rtok-parentless-direct-main-outside-parent",
-            },
-        )
-    )
+    guide = _historical_parentless_direct_main_guide(conn, backlog_id)
     parent_execution_id = guide["contract_chain_current"][
         "current_contract_execution_id"
     ]
@@ -106278,19 +107703,7 @@ def test_parentless_direct_main_requires_independent_qa_verification(
         (json.dumps(["agent/governance/server.py"]), backlog_id),
     )
     conn.commit()
-    guide = server.handle_project_onboard_route_guide(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "operator_supervised_direct_main",
-                "route_token_ref": "rtok-parentless-direct-main-self-parent",
-            },
-        )
-    )
+    guide = _historical_parentless_direct_main_guide(conn, backlog_id)
     parent_execution_id = guide["contract_chain_current"][
         "current_contract_execution_id"
     ]
@@ -106490,19 +107903,7 @@ def test_parentless_direct_main_rejects_copied_route_ref_without_source_authorit
     close_commit = "b16275118745006c8324dfcbeecea62c39e91936"
     route_token_ref = "rtok-parentless-direct-main-copied-ref"
     _insert_simple_mf_close_backlog(conn, backlog_id)
-    guide = server.handle_project_onboard_route_guide(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "operator_supervised_direct_main",
-                "route_token_ref": "rtok-parentless-direct-main-copied-parent",
-            },
-        )
-    )
+    guide = _historical_parentless_direct_main_guide(conn, backlog_id)
     parent_execution_id = guide["contract_chain_current"][
         "current_contract_execution_id"
     ]
@@ -110083,98 +111484,45 @@ def _assert_compact_capsule_fetches_every_advertised_section(
     assert fetched == set(available)
 
 
-def test_contract_bound_direct_main_capsule_mint_validate_hash_and_refresh_terminate(
+def test_contract_bound_direct_main_guide_does_not_use_generic_capsule(
     conn,
 ):
     backlog_id = "AC-CAPSULE-CONTRACT-BOUND-DIRECT-MAIN"
     _insert_simple_mf_close_backlog(conn, backlog_id)
-    request = _ctx_with_role(
-        {"project_id": PID},
-        "observer",
-        method="POST",
-        body={
-            "backlog_id": backlog_id,
-            "role": "observer",
-            "work_type": "direct_main",
-            "route_token_ref": "rtok-capsule-direct-main",
-            "response_view": "compact",
-        },
-    )
-
-    for _ in range(3):
-        compact = server.handle_project_onboard_route_guide(request)
-        current = server._onboard_guide_capsule_current_projection(
-            conn,
-            project_id=PID,
-            backlog_id=backlog_id,
-            route_token_ref="rtok-capsule-direct-main",
-        )
-        assert server._onboard_guide_capsule_projection_identity(current)[
-            "projection_hash"
-        ] == compact["projection_hash"]
-        assert (
-            server._onboard_guide_capsule_validate_current_projection(
-                conn,
-                project_id=PID,
-                guide_capsule_ref=compact["guide_capsule_ref"],
-            )
-            is None
-        )
-        _assert_compact_capsule_fetches_every_advertised_section(compact)
-
-    role_guidance = server.handle_project_onboard_route_guide_capsule(
-        _ctx(
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
             {"project_id": PID},
+            "observer",
             method="POST",
             body={
-                "guide_capsule_ref": compact["guide_capsule_ref"],
-                "sections": ["role_guidance"],
                 "backlog_id": backlog_id,
                 "role": "observer",
                 "work_type": "direct_main",
+                "response_view": "compact",
             },
         )
-    )["sections"]["role_guidance"]
-    shapes = role_guidance["direct_main_evidence_shapes"]
-    assert shapes["schema_version"].endswith("compact_evidence_shapes.v1")
-    assert shapes["immutable_allowed_files"]
-    assert shapes["pre_mutation"]["verification"]["dirty_scope"] == {
-        "allowed_files": "<copy immutable_allowed_files exactly>",
-        "exact_match": True,
-    }
-    changed_files_ref = shapes["implementation"]["payload"]["changed_files"]
-    assert changed_files_ref.startswith("<exact changed-files list; subset")
-    assert shapes["implementation"]["payload"]["dirty_scope_check"][
-        "allowed_files"
-    ] == "<copy immutable_allowed_files exactly>"
-    assert shapes["implementation"]["payload"]["dirty_scope_check"][
-        "changed_files"
-    ] == changed_files_ref
-    assert shapes["implementation"]["payload"]["test_results"][
-        "schema_version"
-    ] == "parentless_direct_main.test_results.v1"
-    assert shapes["implementation"]["payload"]["test_results"]["passed"] is True
-    assert (
-        "may be a strict subset of immutable_allowed_files"
-        in shapes["changed_files_rule"]
     )
-    assert shapes["close_ready"]["verification"]["runtime_sync"]["status"] == (
-        "passed"
+
+    assert guide["schema_version"] == (
+        "onboard_route_guide.operator_supervised_direct_main.v2"
     )
-    assert shapes["close_ready"]["verification"]["live_regression"]["status"] == (
-        "passed"
+    assert guide["contract_id"] == "operator_supervised_direct_main"
+    assert guide["contract_revision"] == "rev2"
+    assert guide["source_backed_contract_selected"] is True
+    assert guide["onboard_service_proxy_selected"] is False
+    assert "projection_hash" not in guide
+    assert "guide_capsule_ref" not in guide
+    next_action = guide["next_legal_action"]
+    assert next_action["mcp_tool"] == "observer_route_context_issue"
+    issue_body = next_action["copy_safe_body"]
+    assert issue_body["backlog_id"] == backlog_id
+    assert issue_body["task_id"] == guide["contract_execution_id"]
+    assert issue_body["allowed_actions"] == list(
+        server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
     )
-    assert shapes["close_ready"]["verification"]["test_results"].startswith(
-        "<copy implementation.payload.test_results"
+    assert sorted(issue_body["target_files"]) == sorted(
+        issue_body["owned_files"]
     )
-    assert shapes["close_ready"]["verification"]["graph_reconciled"] is True
-    assert shapes["close_ready"]["verification"]["preflight_ok"] is True
-    assert shapes["preclose_check"]["mcp_tool"] == "mf_timeline_precheck"
-    assert shapes["preclose_check"]["view"] == "full"
-    assert shapes["preclose_check"]["mutates_backlog_chain"] is False
-    assert shapes["preclose_check"]["required_before"] == "first backlog_close"
-    assert "build_assets_synced" in shapes["forbidden_aliases"]
-    assert len(json.dumps(role_guidance).encode("utf-8")) <= 6 * 1024
 
 
 @pytest.mark.parametrize(
@@ -113477,7 +114825,7 @@ def test_onboard_route_guide_fixed_complete_projection_suppresses_normal_continu
     assert "copy_safe_route_token_scope" not in alias_next_action
 
 
-def test_onboard_route_guide_direct_main_complete_projection_points_to_exception_flow(
+def test_onboard_route_guide_direct_main_fresh_projection_requires_route_issue(
     conn,
 ):
     backlog_id = "AC-ONBOARD-DIRECT-MAIN-COMPLETE-GRAPH-FIRST"
@@ -113491,45 +114839,21 @@ def test_onboard_route_guide_direct_main_complete_projection_points_to_exception
                 "backlog_id": backlog_id,
                 "role": "observer",
                 "work_type": "operator_supervised_direct_main",
-                "route_token_ref": "rtok-direct-main-complete",
             },
         )
     )
 
-    assert result["runtime_resume"]["readiness_state"] == "contract_complete"
+    assert result["schema_version"] == (
+        "onboard_route_guide.operator_supervised_direct_main.v2"
+    )
+    assert result["source_backed_contract_selected"] is True
+    assert result["onboard_service_proxy_selected"] is False
     next_action = result["next_legal_action"]
-    assert next_action["id"] == "operator_supervised_direct_main_graph_first"
-    assert next_action["action"] == "observer_direct_mutation_exception"
-    assert next_action["requires_graph_first"] is True
-    assert next_action["contract_complete_runtime_no_remaining_line"] is True
-    assert "graph_query first" in next_action["next_step"]
-    assert "enter the selected successor interface" not in next_action["next_step"]
-    graph_query_authority = next_action["graph_query_close_authority"]
-    assert graph_query_authority["recommended_query_source"] == "observer"
-    assert graph_query_authority["recommended_query_purpose"] == "gate_validation"
-    assert graph_query_authority["accepted_query_sources"] == sorted(
-        server._PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_SOURCES
-    )
-    assert graph_query_authority["accepted_query_purposes"] == sorted(
-        server._PARENTLESS_DIRECT_MAIN_GRAPH_QUERY_PURPOSES
-    )
-    assert graph_query_authority["copy_safe_graph_query"]["arguments"] == {
-        "project_id": PID,
-        "tool": "find_node_by_path",
-        "args": {"path": "agent/governance/server.py"},
-        "query_source": "observer",
-        "query_purpose": "gate_validation",
-        "route_token_ref": "rtok-direct-main-complete",
-        "backlog_id": backlog_id,
-        "task_id": result["runtime_resume"]["current_contract_execution_id"],
-    }
-    assert graph_query_authority["exploration_only"]["close_authoritative"] is False
-    assert graph_query_authority["ordering"][
-        "late_or_post_hoc_traces_accepted"
-    ] is False
-    issue_payload = result["agent_onboard_guidance"]["route_token_issue"][
-        "observer_route_context_issue_payload"
-    ]
+    assert next_action["id"] == "operator_supervised_direct_main_route_issue"
+    assert next_action["mcp_tool"] == "observer_route_context_issue"
+    issue_payload = next_action["copy_safe_body"]
+    assert issue_payload["task_id"] == result["contract_execution_id"]
+    assert issue_payload["backlog_id"] == backlog_id
     assert set(issue_payload["allowed_actions"]) == set(
         server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
     )
