@@ -136584,6 +136584,29 @@ def _operator_supervised_direct_main_runtime_deployment_authority(
     return authority
 
 
+def _operator_supervised_direct_main_runtime_sync_or_redeploy_passed(
+    verification: Mapping[str, Any],
+) -> bool:
+    """Return whether either Direct runtime deployment evidence item passed."""
+
+    return any(
+        str(evidence.get("status") or "").strip().lower()
+        in {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+        for evidence in (
+            (
+                verification.get("runtime_sync")
+                if isinstance(verification.get("runtime_sync"), Mapping)
+                else {}
+            ),
+            (
+                verification.get("governance_redeploy")
+                if isinstance(verification.get("governance_redeploy"), Mapping)
+                else {}
+            ),
+        )
+    )
+
+
 def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
     conn,
     *,
@@ -136776,22 +136799,9 @@ def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
         if isinstance(close_verification.get("test_results"), Mapping)
         else {}
     )
-    runtime_sync_or_redeploy_passed = any(
-        str(evidence.get("status") or "").strip().lower()
-        in {"accepted", "ok", "pass", "passed", "succeeded", "success"}
-        for evidence in (
-            (
-                close_verification.get("runtime_sync")
-                if isinstance(close_verification.get("runtime_sync"), Mapping)
-                else {}
-            ),
-            (
-                close_verification.get("governance_redeploy")
-                if isinstance(
-                    close_verification.get("governance_redeploy"), Mapping
-                )
-                else {}
-            ),
+    runtime_sync_or_redeploy_passed = (
+        _operator_supervised_direct_main_runtime_sync_or_redeploy_passed(
+            close_verification
         )
     )
     if not (
