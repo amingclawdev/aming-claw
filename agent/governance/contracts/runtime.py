@@ -9004,6 +9004,21 @@ class ContractRuntime:
             source_record=refreshed,
             projection=projection,
         )
+        # Compiled execution state intentionally omits record metadata. Supply
+        # it only to the authoritative write Gate so revision-specific Fact
+        # conformance also covers direct Runtime callers without publishing
+        # metadata as generic runtime state.
+        gate_state = {
+            **dict(gate_state),
+            "metadata": deepcopy(dict(refreshed.get("metadata") or {})),
+            # The rev10 dispatch Gate must prove custody against the admitted
+            # prefill Fact, not merely against its metadata projection.  Keep
+            # full line evidence internal to the Gate; it is still omitted
+            # from the generic compiled-state/public response surfaces.
+            "completed_lines": deepcopy(
+                list(refreshed.get("completed_lines") or [])
+            ),
+        }
         _bind_mf_parallel_atomic_lane_runtime_guide_hash(
             effective_write,
             gate_guide,
@@ -10717,6 +10732,13 @@ class ContractRuntime:
             source_record=refreshed,
             projection=projection,
         )
+        gate_state = {
+            **dict(gate_state),
+            "metadata": deepcopy(dict(refreshed.get("metadata") or {})),
+            "completed_lines": deepcopy(
+                list(refreshed.get("completed_lines") or [])
+            ),
+        }
         _bind_mf_parallel_atomic_lane_runtime_guide_hash(
             effective_write,
             gate_guide,

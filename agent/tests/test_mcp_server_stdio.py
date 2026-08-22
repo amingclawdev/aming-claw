@@ -2705,11 +2705,45 @@ def test_mf_parallel_enter_schemas_require_backlog_scope_and_worker_fence():
         assert metadata_schema["properties"]["required_worker_count"][
             "enum"
         ] == [1, 2]
+        lane_schema = metadata_schema["properties"]["lane_intents"]
+        assert lane_schema["minItems"] == 1
+        assert lane_schema["maxItems"] == 2
+        assert lane_schema["items"]["required"] == [
+            "task_id",
+            "worker_id",
+            "worker_slot_id",
+            "owned_files",
+        ]
+        assert lane_schema["items"]["additionalProperties"] is False
+        assert set(lane_schema["items"]["properties"]) == {
+            "task_id",
+            "worker_id",
+            "worker_slot_id",
+            "owned_files",
+        }
         assert {"required": ["backlog_id"]} in schema["anyOf"]
         assert {"required": ["bug_id"]} in schema["anyOf"]
         route_ref_any_of = schema["allOf"][0]["anyOf"]
         assert {"required": ["route_token_ref"]} in route_ref_any_of
         assert {"required": ["observer_route_token_ref"]} in route_ref_any_of
+
+
+def test_onboard_route_guide_schemas_accept_typed_mf_parallel_lane_intents():
+    for tools in (governance_mcp_server.TOOLS, runtime_mcp_tools):
+        guide = next(
+            tool for tool in tools if tool["name"] == "onboard_route_guide"
+        )
+        metadata_schema = guide["inputSchema"]["properties"]["metadata"]
+        lane_schema = metadata_schema["properties"]["lane_intents"]
+        assert lane_schema["minItems"] == 1
+        assert lane_schema["maxItems"] == 2
+        assert lane_schema["items"]["additionalProperties"] is False
+        assert set(lane_schema["items"]["properties"]) == {
+            "task_id",
+            "worker_id",
+            "worker_slot_id",
+            "owned_files",
+        }
 
 
 def test_mf_parallel_revise_schemas_require_observer_scope_and_bounded_count():

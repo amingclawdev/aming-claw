@@ -4947,7 +4947,37 @@ TOOLS: list[dict] = [
                         "required_worker_count": {
                             "type": "integer",
                             "enum": [1, 2],
-                        }
+                        },
+                        "lane_intents": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 2,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "task_id": {"type": "string"},
+                                    "worker_id": {"type": "string"},
+                                    "worker_slot_id": {"type": "string"},
+                                    "owned_files": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                                "required": [
+                                    "task_id",
+                                    "worker_id",
+                                    "worker_slot_id",
+                                    "owned_files",
+                                ],
+                                "additionalProperties": False,
+                            },
+                            "description": (
+                                "Observer-planned child identities and disjoint "
+                                "file fences. Route, worktree, branch, commit, and "
+                                "merge-queue authority remain server-derived."
+                            ),
+                        },
                     },
                 },
                 "response_view": {
@@ -5151,6 +5181,36 @@ TOOLS: list[dict] = [
                         "required_worker_count": {
                             "type": "integer",
                             "enum": [1, 2],
+                        },
+                        "lane_intents": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 2,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "task_id": {"type": "string"},
+                                    "worker_id": {"type": "string"},
+                                    "worker_slot_id": {"type": "string"},
+                                    "owned_files": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                                "required": [
+                                    "task_id",
+                                    "worker_id",
+                                    "worker_slot_id",
+                                    "owned_files",
+                                ],
+                                "additionalProperties": False,
+                            },
+                            "description": (
+                                "Observer-planned child identities and disjoint "
+                                "file fences. Route, worktree, branch, commit, and "
+                                "merge-queue authority remain server-derived."
+                            ),
                         },
                     },
                     "required": ["required_worker_count"],

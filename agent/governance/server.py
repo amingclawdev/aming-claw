@@ -97,6 +97,7 @@ from .contracts.schema import ContractDefinitionError, iter_stage_lines
 from .contracts.write_gate import (
     _public_safe_runtime_guide_hash,
     contract_line_evidence_policy,
+    mf_parallel_prefill_child_plan_errors,
 )
 from .backlog_triage import (
     RELEASE_OPERATOR_HEAD_QUEUE_MAX_ITEMS,
@@ -17476,6 +17477,59 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                     "writes_performed": False,
                 },
             )
+        contract_metadata = (
+            contract_record.get("metadata")
+            if isinstance(contract_record.get("metadata"), Mapping)
+            else {}
+        )
+        if (
+            str(contract_record.get("revision") or "").strip() == "rev10"
+            and contract_metadata.get("observer_prefill_child_plan_required")
+            is True
+        ):
+            admitted_plan = (
+                _contract_runtime_mf_parallel_admitted_prefill_child_plan(
+                    contract_record
+                )
+            )
+            if not admitted_plan:
+                raise GovernanceError(
+                    "parallel_branch_allocate_precheck_prefill_plan_missing",
+                    (
+                        "fresh mf_parallel rev10 allocation requires the "
+                        "accepted prefill child plan"
+                    ),
+                    422,
+                    {
+                        "contract_execution_id": contract_execution_id,
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                    },
+                )
+            lane_mismatches = (
+                _contract_runtime_mf_parallel_prefill_lane_mismatches(
+                    admitted_plan,
+                    copy_safe_bodies,
+                )
+            )
+            if lane_mismatches:
+                raise GovernanceError(
+                    "parallel_branch_allocate_precheck_prefill_lane_mismatch",
+                    (
+                        "allocation lane custody must equal the accepted "
+                        "mf_parallel rev10 prefill child plan"
+                    ),
+                    422,
+                    {
+                        "contract_execution_id": contract_execution_id,
+                        "plan_hash": str(
+                            admitted_plan.get("plan_hash") or ""
+                        ),
+                        "mismatches": lane_mismatches,
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                    },
+                )
         cardinality_policy = (
             _contract_runtime_mf_parallel_worker_cardinality_policy(
                 conn,
@@ -20853,6 +20907,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         or ""
     )
     worker_slot_id = str(ctx.body.get("worker_slot_id") or ctx.body.get("worker_id") or "")
+    worker_id = str(ctx.body.get("worker_id") or worker_slot_id)
     governance_project_id = str(
         ctx.body.get("governance_project_id")
         or ctx.body.get("backlog_project_id")
@@ -20909,11 +20964,82 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
             )
         )
         if rev8_allocation_record:
+            allocation_metadata = (
+                rev8_allocation_record.get("metadata")
+                if isinstance(
+                    rev8_allocation_record.get("metadata"), Mapping
+                )
+                else {}
+            )
             failed_qa_rework_intent = (
                 _parallel_branch_allocate_declares_failed_qa_rework(
                     ctx.body or {}
                 )
             )
+            strict_rev10_prefill = bool(
+                str(rev8_allocation_record.get("revision") or "").strip()
+                == "rev10"
+                and allocation_metadata.get(
+                    "observer_prefill_child_plan_required"
+                )
+                is True
+            )
+            if strict_rev10_prefill:
+                admitted_prefill_plan = (
+                    _contract_runtime_mf_parallel_admitted_prefill_child_plan(
+                        rev8_allocation_record
+                    )
+                )
+                if not admitted_prefill_plan:
+                    raise GovernanceError(
+                        "parallel_branch_allocate_prefill_plan_required",
+                        (
+                            "fresh mf_parallel rev10 allocation requires the "
+                            "accepted prefill child plan"
+                        ),
+                        409,
+                        {
+                            "contract_execution_id": str(
+                                rev8_allocation_record.get(
+                                    "contract_execution_id"
+                                )
+                                or ""
+                            ),
+                            "zero_write_rejection": True,
+                            "public_safe": True,
+                            "writes_performed": False,
+                            "mutation_performed": False,
+                        },
+                    )
+                if (
+                    not failed_qa_rework_intent
+                    and allocation_precheck_verification.get("verified")
+                    is not True
+                ):
+                    raise GovernanceError(
+                        "parallel_branch_allocate_precheck_receipt_required",
+                        (
+                            "fresh mf_parallel rev10 allocation requires the "
+                            "exact server-signed precheck receipt"
+                        ),
+                        409,
+                        {
+                            "contract_execution_id": str(
+                                rev8_allocation_record.get(
+                                    "contract_execution_id"
+                                )
+                                or ""
+                            ),
+                            "precheck_status": str(
+                                allocation_precheck_verification.get("status")
+                                or ""
+                            ),
+                            "zero_write_rejection": True,
+                            "public_safe": True,
+                            "writes_performed": False,
+                            "mutation_performed": False,
+                        },
+                    )
             cardinality_policy = (
                 _contract_runtime_mf_parallel_worker_cardinality_policy(
                     conn,
@@ -21158,7 +21284,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
         stage_task_id=str(ctx.body.get("stage_task_id") or task_id),
         stage_type=str(ctx.body.get("stage_type") or "mf_sub"),
         agent_id=allocation_owner,
-        worker_id=worker_slot_id,
+        worker_id=worker_id,
         allocation_owner=allocation_owner,
         worker_slot_id=worker_slot_id,
         governance_project_id=governance_project_id,
@@ -101063,10 +101189,24 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
     route_token_ref_bindings: list[dict[str, Any]] = []
     for lane_index, lane in enumerate(bounded_worker_lanes):
         lane_task_id = _exact_text(lane.get("task_id")) or worker_task_id
+        lane_worker_id = _exact_text(
+            lane.get("worker_id") or lane.get("worker_slot_id")
+        )
+        lane_worker_slot_id = _exact_text(
+            lane.get("worker_slot_id") or lane_worker_id
+        )
         lane_owned_files = _runtime_context_service_query_values(
             lane,
             "owned_files",
             "target_files",
+        )
+        lane_test_files = _runtime_context_service_query_values(
+            lane,
+            "test_files",
+        )
+        lane_test_commands = _runtime_context_service_query_values(
+            lane,
+            "test_commands",
         )
         issue_body = {
             "project_id": project_id,
@@ -101087,17 +101227,33 @@ def _contract_runtime_mf_sub_host_bridge_guidance(
             "parent_route_identity": dict(safe_parent_route_identity),
         }
         observer_route_context_issue_request_bodies.append(issue_body)
-        lane_template = dict(canonical_allocation_body)
-        lane_template.update(dict(lane))
-        lane_template["task_id"] = lane_task_id
-        lane_template["owned_files"] = list(lane_owned_files)
-        lane_template["target_files"] = list(lane_owned_files)
-        lane_template.pop("route_identity", None)
-        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
-            lane_template.pop(field, None)
-        lane_template["route_token_ref"] = (
-            f"<route_token_ref returned for lane[{lane_index}] task_id={lane_task_id}>"
-        )
+        # This is an input to the existing server-side allocation precheck, not
+        # a caller-authored allocation body.  Keep only the admitted planning
+        # identity/file fence plus Contract-derived defaults.  The precheck
+        # remains the sole authority for repository root, commits, worktree,
+        # branch, merge queue, and route identity.
+        lane_template = {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "successor_contract_execution_id": execution_id,
+            "current_contract_execution_id": execution_id,
+            "parent_task_id": execution_id,
+            "task_id": lane_task_id,
+            "worker_id": lane_worker_id,
+            "worker_slot_id": lane_worker_slot_id,
+            "agent_id": lane_worker_id,
+            "owned_files": list(lane_owned_files),
+            "target_files": list(lane_owned_files),
+            "test_files": list(lane_test_files),
+            "test_commands": list(lane_test_commands),
+            "profile_requirements": dict(profile_requirements),
+            "retry_policy": dict(retry_policy),
+            "route_token_ref": (
+                "<route_token_ref returned for "
+                f"lane[{lane_index}] task_id={lane_task_id}>"
+            ),
+        }
         atomic_precheck_lane_templates.append(lane_template)
         route_token_ref_bindings.append(
             {
@@ -101673,7 +101829,10 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Hydrate the pre-dispatch writer body from persisted allocation authority."""
 
-    projected = dict(record)
+    projected = _contract_runtime_apply_mf_parallel_prefill_plan_projection(
+        record
+    )
+    record = projected
     if not _is_mf_parallel_record_contract_id(
         str(record.get("contract_id") or "")
     ):
@@ -101739,6 +101898,15 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
 
     execution_id = str(record.get("contract_execution_id") or "").strip()
     backlog_id = str(record.get("backlog_id") or "").strip()
+    admitted_prefill_plan = (
+        _contract_runtime_mf_parallel_admitted_prefill_child_plan(record)
+    )
+    admitted_lanes_by_task_id = {
+        str(lane.get("task_id") or "").strip(): dict(lane)
+        for lane in admitted_prefill_plan.get("lanes") or []
+        if isinstance(lane, Mapping)
+        and str(lane.get("task_id") or "").strip()
+    }
     candidates: list[tuple[Any, dict[str, Any]]] = []
     for context in list_branch_contexts(conn, project_id):
         if str(getattr(context, "backlog_id", "") or "").strip() != backlog_id:
@@ -102037,8 +102205,11 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         observer_command_id = str(
             revision_body.get("observer_command_id") or execution_id
         ).strip()
-        dispatch_payloads.append(
-            {
+        context_task_id = str(
+            getattr(context, "task_id", "") or ""
+        ).strip()
+        admitted_lane = admitted_lanes_by_task_id.get(context_task_id, {})
+        dispatch_payload = {
                 "schema_version": "mf_parallel.dispatch_bounded_worker.v2",
                 "line_instance_id": (
                     "runtime_context:"
@@ -102047,9 +102218,7 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
                 "runtime_context_id": runtime_context_id_for_branch_context(
                     context
                 ),
-                "task_id": str(
-                    getattr(context, "task_id", "") or ""
-                ).strip(),
+                "task_id": context_task_id,
                 "parent_task_id": _runtime_context_mf_sub_parent_task_id(
                     context
                 ),
@@ -102090,7 +102259,14 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
                 "route_identity": dict(route_identity),
                 **dict(route_identity),
             }
-        )
+        if admitted_lane:
+            dispatch_payload["test_files"] = list(
+                admitted_lane.get("test_files") or []
+            )
+            dispatch_payload["test_commands"] = list(
+                admitted_lane.get("test_commands") or []
+            )
+        dispatch_payloads.append(dispatch_payload)
 
     required_fields = _runtime_context_service_dedupe(
         [
@@ -105381,6 +105557,7 @@ def _contract_runtime_compact_cli_next_action(
         "failed_qa_blocker",
         "canonical_executable_action",
         "accepted_dispatch_authority",
+        "per_lane_observer_route_context_issue",
     ):
         value = projected.get(key)
         if isinstance(value, Mapping):
@@ -112061,11 +112238,26 @@ def _resolve_contract_runtime_observer_proof(
             },
         )
 
+    nested_route_identity = (
+        resolved.get("route_identity")
+        if isinstance(resolved.get("route_identity"), Mapping)
+        else {}
+    )
+    route_identity = {
+        field: str(
+            nested_route_identity.get(field) or resolved.get(field) or ""
+        ).strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str(
+            nested_route_identity.get(field) or resolved.get(field) or ""
+        ).strip()
+    }
     return {
         "role": "observer",
         "role_source": "observer_session_route_token_ref",
         "observer_session_id": observer_session_id,
         "route_token_ref": route_token_ref,
+        "route_identity": route_identity,
     }
 
 
@@ -112161,6 +112353,19 @@ def _contract_runtime_bind_observer_dispatch_transport_proof(
 
     copy_payload["observer_session_id"] = observer_session_id
     copy_payload["observer_route_token_ref"] = route_token_ref
+    route_identity = (
+        observer_proof.get("route_identity")
+        if isinstance(observer_proof.get("route_identity"), Mapping)
+        else {}
+    )
+    if all(
+        str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ):
+        next_action["route_identity"] = {
+            field: str(route_identity.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
     safe_copy["copy_payload"] = copy_payload
     guide["writer_role_safe_copy_payload"] = safe_copy
     next_action["writer_role_safe_copy_payload"] = dict(safe_copy)
@@ -127470,7 +127675,9 @@ def _contract_runtime_mf_batch_child_worker_cardinality_authority(
     except sqlite3.Error:
         return {}
 
-    matches: list[tuple[dict[str, Any], Mapping[str, Any]]] = []
+    matches: list[
+        tuple[dict[str, Any], Mapping[str, Any], Mapping[str, Any]]
+    ] = []
     for raw_row in entered_rows:
         row = dict(raw_row)
         payload = _json_loads(row.get("payload_json"), {})
@@ -127536,11 +127743,39 @@ def _contract_runtime_mf_batch_child_worker_cardinality_authority(
             ):
                 child_matches.append(successor)
         if len(child_matches) == 1:
-            matches.append((row, payload))
+            matches.append((row, payload, child_matches[0]))
     if len(matches) != 1:
         return {}
 
-    entered_row, entered_payload = matches[0]
+    entered_row, entered_payload, entered_successor = matches[0]
+    successor_body = (
+        entered_successor.get("body")
+        if isinstance(entered_successor.get("body"), Mapping)
+        else {}
+    )
+    successor_metadata = (
+        successor_body.get("metadata")
+        if isinstance(successor_body.get("metadata"), Mapping)
+        else {}
+    )
+    raw_lane_intents = successor_metadata.get("lane_intents")
+    canonical_lane_intents = (
+        deepcopy(raw_lane_intents)
+        if isinstance(raw_lane_intents, list)
+        else []
+    )
+    lane_intents_authority_present = bool(
+        successor_metadata.get("required_worker_count") == 1
+        and len(canonical_lane_intents) == 1
+        and isinstance(canonical_lane_intents[0], Mapping)
+        and str(canonical_lane_intents[0].get("task_id") or "").strip()
+        == values["task_id"]
+    )
+    # Historical batch events predate typed lane intent persistence.  Their
+    # queue/cardinality lineage remains valid for historical reads, but they
+    # cannot authorize a fresh marker-enabled rev10 plan.
+    if raw_lane_intents is not None and not lane_intents_authority_present:
+        return {}
     authority = {
         "schema_version": (
             "contract_runtime.mf_batch_child_worker_cardinality_authority.v1"
@@ -127562,6 +127797,9 @@ def _contract_runtime_mf_batch_child_worker_cardinality_authority(
         "merge_queue_id": values["merge_queue_id"],
         "queue_item_id": canonical_queue_item_id,
         "batch_enter_event_id": int(entered_row.get("id") or 0),
+        "lane_intents": canonical_lane_intents,
+        "lane_intents_hash": stable_sha256(canonical_lane_intents),
+        "lane_intents_authority_present": lane_intents_authority_present,
         "required_worker_count": 1,
         "worker_count_policy": "exactly",
         "atomic_dispatch_required": False,
@@ -127678,6 +127916,715 @@ def _contract_runtime_mf_parallel_required_worker_count(
     ):
         return pinned_count
     return 1
+
+
+_MF_PARALLEL_PREFILL_CHILD_PLAN_SCHEMA = (
+    "mf_parallel.observer_prefill_child_plan.v1"
+)
+_MF_PARALLEL_PREFILL_PAYLOAD_SCHEMA = (
+    "mf_parallel.observer_prefill_child_contracts.v1"
+)
+_MF_PARALLEL_LANE_INTENT_FIELDS = frozenset(
+    {"task_id", "worker_id", "worker_slot_id", "owned_files"}
+)
+
+
+def _contract_runtime_mf_parallel_project_test_command_authority(
+    project_id: str,
+) -> dict[str, Any]:
+    """Freeze registered project test commands without accepting caller input."""
+
+    config, config_source = _registry_project_config(project_id)
+    if not config:
+        raise ValidationError(
+            "mf_parallel rev10 prefill requires registered project test commands",
+            {
+                "project_id": project_id,
+                "test_command_authority": "project_config.testing",
+                "reason": "registered project config snapshot is missing",
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+    testing = config.get("testing") if isinstance(config.get("testing"), Mapping) else {}
+    command_fields = {
+        "unit_command": _runtime_context_non_placeholder_text(
+            testing.get("unit_command")
+        ),
+        "e2e_command": _runtime_context_non_placeholder_text(
+            testing.get("e2e_command")
+        ),
+    }
+    e2e = testing.get("e2e") if isinstance(testing.get("e2e"), Mapping) else {}
+    e2e_auto_run = e2e.get("auto_run") is True
+    commands = list(
+        dict.fromkeys(
+            value
+            for field, value in command_fields.items()
+            if value and (field == "unit_command" or e2e_auto_run)
+        )
+    )
+    if not commands:
+        raise ValidationError(
+            "mf_parallel rev10 prefill requires registered project test commands",
+            {
+                "project_id": project_id,
+                "test_command_authority": "project_config.testing",
+                "missing_fields": [
+                    "testing.unit_command",
+                    "testing.e2e_command",
+                ],
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+    authority = {
+        "schema_version": "mf_parallel.project_test_command_authority.v1",
+        "project_id": project_id,
+        "source": "project_config.testing",
+        "config_source": str(
+            config.get("config_source") or config_source or "aming_claw_registry"
+        ).strip(),
+        "command_fields": command_fields,
+        "selection": {
+            "unit_command_selected": bool(command_fields["unit_command"]),
+            "e2e_command_selected": bool(
+                command_fields["e2e_command"] and e2e_auto_run
+            ),
+            "e2e_auto_run": e2e_auto_run,
+            "source": "project_config.testing.e2e.auto_run",
+        },
+        "test_commands": commands,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _contract_runtime_mf_parallel_build_prefill_child_plan(
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    parent_contract_execution_id: str,
+    root_contract_execution_id: str,
+    required_worker_count: int,
+    declared_files: Sequence[str],
+    row_test_files: Sequence[str],
+    acceptance_criteria: Sequence[Any],
+    acceptance_scope_closure: Mapping[str, Any],
+    test_command_authority: Mapping[str, Any],
+    parent_route_binding: Mapping[str, Any],
+    lane_intents: Any,
+    source: str = "authenticated_observer_mf_parallel_enter",
+) -> dict[str, Any]:
+    """Canonicalize the observer's minimal child plan without minting routes.
+
+    The observer owns the semantic lane split.  Every execution/materialization
+    field remains absent here so the existing route issue and allocation
+    precheck services stay authoritative for route, commit, worktree, branch,
+    and merge-queue materialization.
+    """
+
+    if not isinstance(lane_intents, list):
+        raise ValidationError(
+            "mf_parallel lane_intents must be an array",
+            {
+                "field": "metadata.lane_intents",
+                "required_worker_count": required_worker_count,
+                "writes_performed": False,
+            },
+        )
+    errors: list[str] = []
+    if len(lane_intents) != required_worker_count:
+        errors.append(
+            "lane_intents count must equal required_worker_count"
+        )
+    normalized_lanes: list[dict[str, Any]] = []
+    task_ids: list[str] = []
+    worker_ids: list[str] = []
+    worker_slot_ids: list[str] = []
+    all_lane_files: list[str] = []
+    test_file_set = set(_runtime_context_public_file_values(row_test_files))
+    command_authority = deepcopy(dict(test_command_authority))
+    authority_hash = str(command_authority.get("authority_hash") or "").strip()
+    unsigned_authority = {
+        key: value
+        for key, value in command_authority.items()
+        if key != "authority_hash"
+    }
+    test_commands = _runtime_context_service_query_values(
+        command_authority,
+        "test_commands",
+    )
+    if not (
+        command_authority.get("schema_version")
+        == "mf_parallel.project_test_command_authority.v1"
+        and str(command_authority.get("project_id") or "").strip()
+        == str(project_id or "").strip()
+        and command_authority.get("source") == "project_config.testing"
+        and test_commands
+        and authority_hash == stable_sha256(unsigned_authority)
+    ):
+        errors.append("project test command authority must be complete and exact")
+    for index, raw_lane in enumerate(lane_intents):
+        if not isinstance(raw_lane, Mapping):
+            errors.append(f"lane_intents[{index}] must be an object")
+            continue
+        forbidden = sorted(set(raw_lane) - _MF_PARALLEL_LANE_INTENT_FIELDS)
+        if forbidden:
+            errors.append(
+                f"lane_intents[{index}] contains forbidden fields: "
+                + ", ".join(forbidden)
+            )
+        task_id = _runtime_context_non_placeholder_text(
+            raw_lane.get("task_id")
+        )
+        worker_id = _runtime_context_non_placeholder_text(
+            raw_lane.get("worker_id")
+        )
+        worker_slot_id = _runtime_context_non_placeholder_text(
+            raw_lane.get("worker_slot_id")
+        )
+        for field, value in (
+            ("task_id", task_id),
+            ("worker_id", worker_id),
+            ("worker_slot_id", worker_slot_id),
+        ):
+            if not value:
+                errors.append(
+                    f"lane_intents[{index}].{field} must be concrete"
+                )
+        raw_owned_files = raw_lane.get("owned_files")
+        lane_files: list[str] = []
+        if not isinstance(raw_owned_files, list) or not raw_owned_files:
+            errors.append(
+                f"lane_intents[{index}].owned_files must be a non-empty array"
+            )
+        else:
+            for path_index, raw_path in enumerate(raw_owned_files):
+                path = _runtime_context_non_placeholder_text(raw_path)
+                path_parts = Path(path).parts if path else ()
+                if (
+                    not path
+                    or Path(path).is_absolute()
+                    or ".." in path_parts
+                ):
+                    errors.append(
+                        "lane_intents["
+                        f"{index}].owned_files[{path_index}] must be a concrete "
+                        "repo-relative path"
+                    )
+                    continue
+                lane_files.append(path)
+            if len(set(lane_files)) != len(lane_files):
+                errors.append(
+                    f"lane_intents[{index}].owned_files contains duplicates"
+                )
+        lane_files = sorted(set(lane_files))
+        lane_slug = _parallel_branch_allocate_slug(
+            f"{task_id}-{worker_id}"
+        )
+        if task_id and worker_id and not lane_slug:
+            errors.append(
+                f"lane_intents[{index}] identity cannot form a safe lane slug"
+            )
+        normalized_lanes.append(
+            {
+                "schema_version": "mf_parallel.child_lane_intent.v1",
+                "lane_index": index,
+                "task_id": task_id,
+                "worker_id": worker_id,
+                "worker_slot_id": worker_slot_id,
+                "owned_files": lane_files,
+                "target_files": lane_files,
+                "test_files": sorted(set(lane_files).intersection(test_file_set)),
+                "test_commands": list(test_commands),
+                "test_command_authority_hash": authority_hash,
+                "merge_queue_materialized": False,
+            }
+        )
+        task_ids.append(task_id)
+        worker_ids.append(worker_id)
+        worker_slot_ids.append(worker_slot_id)
+        all_lane_files.extend(lane_files)
+
+    for field, values in (
+        ("task_id", task_ids),
+        ("worker_id", worker_ids),
+        ("worker_slot_id", worker_slot_ids),
+    ):
+        concrete = [value for value in values if value]
+        if len(concrete) != len(set(concrete)):
+            errors.append(f"lane_intents require distinct {field}")
+    if len(all_lane_files) != len(set(all_lane_files)):
+        overlap = sorted(
+            path
+            for path in set(all_lane_files)
+            if all_lane_files.count(path) > 1
+        )
+        errors.append(
+            "lane_intents require disjoint owned_files: " + ", ".join(overlap)
+        )
+    declared_file_set = set(
+        _runtime_context_public_file_values(declared_files)
+    )
+    actual_file_set = set(all_lane_files)
+    missing_files = sorted(declared_file_set - actual_file_set)
+    extra_files = sorted(actual_file_set - declared_file_set)
+    if missing_files:
+        errors.append(
+            "lane_intents owned_files union is missing: "
+            + ", ".join(missing_files)
+        )
+    if extra_files:
+        errors.append(
+            "lane_intents owned_files union contains extra files: "
+            + ", ".join(extra_files)
+        )
+    if errors:
+        raise ValidationError(
+            "mf_parallel lane_intents do not conform to the frozen row scope",
+            {
+                "field": "metadata.lane_intents",
+                "errors": list(dict.fromkeys(errors)),
+                "required_worker_count": required_worker_count,
+                "row_declared_files": sorted(declared_file_set),
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+
+    route_binding = deepcopy(dict(parent_route_binding))
+    route_binding_hash = str(route_binding.get("binding_hash") or "").strip()
+    unsigned_route_binding = {
+        key: value
+        for key, value in route_binding.items()
+        if key != "binding_hash"
+    }
+    if not (
+        route_binding.get("schema_version")
+        == "mf_parallel.parent_route_binding.v1"
+        and str(route_binding.get("route_token_ref") or "").strip()
+        and isinstance(route_binding.get("route_identity"), Mapping)
+        and all(
+            str(route_binding["route_identity"].get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+        and route_binding_hash == stable_sha256(unsigned_route_binding)
+    ):
+        raise ValidationError(
+            "mf_parallel rev10 prefill requires the admitted parent route binding",
+            {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "contract_execution_id": contract_execution_id,
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        )
+    # A self-consistent hash is not sufficient route authority.  Prove that
+    # the frozen parent identity is consumable by the existing child-route
+    # lineage Gate before it can become an immutable prefill Fact.
+    from . import observer_route_context as _observer_route_context
+
+    try:
+        _observer_route_context.build_parent_route_lineage(
+            route_binding["route_identity"],
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    except ValueError as exc:
+        raise ValidationError(
+            "mf_parallel rev10 prefill requires a canonical parent route identity",
+            {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "contract_execution_id": contract_execution_id,
+                "route_identity_error": str(exc),
+                "writes_performed": False,
+                "mutation_performed": False,
+            },
+        ) from exc
+
+    plan = {
+        "schema_version": _MF_PARALLEL_PREFILL_CHILD_PLAN_SCHEMA,
+        "source": str(source or "").strip(),
+        "server_canonicalized": True,
+        "project_id": str(project_id or "").strip(),
+        "backlog_id": str(backlog_id or "").strip(),
+        "contract_execution_id": str(contract_execution_id or "").strip(),
+        "parent_contract_execution_id": str(
+            parent_contract_execution_id or ""
+        ).strip(),
+        "root_contract_execution_id": str(
+            root_contract_execution_id or ""
+        ).strip(),
+        "required_worker_count": required_worker_count,
+        "worker_count_policy": "exactly",
+        "atomic_dispatch_required": required_worker_count > 1,
+        "row_owned_files": sorted(declared_file_set),
+        "row_test_files": sorted(test_file_set),
+        "acceptance_criteria": deepcopy(list(acceptance_criteria)),
+        "acceptance_scope_closure": deepcopy(dict(acceptance_scope_closure)),
+        "parent_route_binding": route_binding,
+        "test_command_authority": command_authority,
+        "test_commands": list(test_commands),
+        "lanes": normalized_lanes,
+        "route_identity_materialized": False,
+        "runtime_context_materialized": False,
+        "worktree_materialized": False,
+        "allocation_authority": "parallel_branch_allocate_precheck",
+        "caller_materialization_authority_allowed": False,
+    }
+    plan["plan_hash"] = stable_sha256(plan)
+    return plan
+
+
+def _contract_runtime_mf_parallel_prefill_payload(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": _MF_PARALLEL_PREFILL_PAYLOAD_SCHEMA,
+        "child_plan": deepcopy(dict(plan)),
+        "child_plan_hash": str(plan.get("plan_hash") or "").strip(),
+    }
+
+
+def _contract_runtime_mf_parallel_prefill_plan_valid(
+    record: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> bool:
+    if not isinstance(plan, Mapping):
+        return False
+    write = {
+        "stage_id": "orchestration",
+        "line_id": "observer_prefill_child_contracts",
+        "evidence_kind": "contract_binding",
+        "payload": _contract_runtime_mf_parallel_prefill_payload(plan),
+    }
+    return not _contract_runtime_mf_parallel_prefill_plan_write_errors(
+        record,
+        write,
+    )
+
+
+def _contract_runtime_mf_parallel_admitted_prefill_child_plan(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the exact typed plan only after its prefill Fact was admitted."""
+
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    plan = (
+        metadata.get("observer_prefill_child_plan")
+        if isinstance(metadata.get("observer_prefill_child_plan"), Mapping)
+        else {}
+    )
+    if not (
+        metadata.get("observer_prefill_child_plan_required") is True
+        and _contract_runtime_mf_parallel_prefill_plan_valid(record, plan)
+    ):
+        return {}
+    expected_payload = _contract_runtime_mf_parallel_prefill_payload(plan)
+    for line in record.get("completed_lines") or []:
+        if not isinstance(line, Mapping):
+            continue
+        if (
+            str(line.get("stage_id") or "").strip() == "orchestration"
+            and str(line.get("line_id") or "").strip()
+            == "observer_prefill_child_contracts"
+            and str(line.get("evidence_kind") or "").strip()
+            == "contract_binding"
+            and isinstance(line.get("payload"), Mapping)
+            and stable_sha256(dict(line["payload"]))
+            == stable_sha256(expected_payload)
+        ):
+            return deepcopy(dict(plan))
+    return {}
+
+
+def _contract_runtime_mf_parallel_prefill_lane_mismatches(
+    plan: Mapping[str, Any],
+    lanes: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compare only semantic lane custody; materialization stays downstream."""
+
+    expected_lanes = [
+        lane for lane in plan.get("lanes") or [] if isinstance(lane, Mapping)
+    ]
+    mismatches: list[dict[str, Any]] = []
+    if len(lanes) != len(expected_lanes):
+        return [
+            {
+                "field": "lane_count",
+                "expected": len(expected_lanes),
+                "actual": len(lanes),
+            }
+        ]
+    for index, (expected, actual) in enumerate(
+        zip(expected_lanes, lanes, strict=True)
+    ):
+        for field in ("task_id", "worker_id", "worker_slot_id"):
+            expected_value = str(expected.get(field) or "").strip()
+            actual_value = str(actual.get(field) or "").strip()
+            if actual_value != expected_value:
+                mismatches.append(
+                    {
+                        "lane_index": index,
+                        "field": field,
+                        "expected": expected_value,
+                        "actual": actual_value,
+                    }
+                )
+        for field in ("owned_files", "test_files"):
+            expected_values = sorted(
+                _runtime_context_public_file_values(expected.get(field) or [])
+            )
+            actual_values = sorted(
+                _runtime_context_public_file_values(actual.get(field) or [])
+            )
+            if actual_values != expected_values:
+                mismatches.append(
+                    {
+                        "lane_index": index,
+                        "field": field,
+                        "expected": expected_values,
+                        "actual": actual_values,
+                    }
+                )
+        expected_commands = _runtime_context_service_query_values(
+            expected,
+            "test_commands",
+        )
+        actual_commands = _runtime_context_service_query_values(
+            actual,
+            "test_commands",
+        )
+        if actual_commands != expected_commands:
+            mismatches.append(
+                {
+                    "lane_index": index,
+                    "field": "test_commands",
+                    "expected": expected_commands,
+                    "actual": actual_commands,
+                }
+            )
+    return mismatches
+
+
+def _contract_runtime_apply_mf_parallel_prefill_plan_projection(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project only an admitted enter plan into prefill and dispatch Guides."""
+
+    projected = deepcopy(dict(record))
+    if (
+        not _is_mf_parallel_record_contract_id(
+            str(record.get("contract_id") or "")
+        )
+        or str(record.get("revision") or "").strip() != "rev10"
+    ):
+        return projected
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    if metadata.get("observer_prefill_child_plan_required") is not True:
+        return projected
+    guide = (
+        projected.get("runtime_guide")
+        if isinstance(projected.get("runtime_guide"), dict)
+        else {}
+    )
+    next_action = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), dict)
+        else {}
+    )
+    line_id = str(next_action.get("line_id") or "").strip()
+    if line_id not in {
+        "observer_prefill_child_contracts",
+        "observer_dispatch_bounded_workers",
+    }:
+        return projected
+    plan = (
+        metadata.get("observer_prefill_child_plan")
+        if isinstance(metadata.get("observer_prefill_child_plan"), Mapping)
+        else {}
+    )
+    plan_source = str(
+        plan.get("source")
+        or metadata.get("observer_prefill_child_plan_source")
+        or "ContractRuntime.metadata.observer_prefill_child_plan"
+    ).strip()
+    plan_valid = _contract_runtime_mf_parallel_prefill_plan_valid(
+        record,
+        plan,
+    )
+    safe_copy = (
+        guide.get("writer_role_safe_copy_payload")
+        if isinstance(guide.get("writer_role_safe_copy_payload"), dict)
+        else {}
+    )
+    if line_id == "observer_prefill_child_contracts":
+        if not plan_valid or not safe_copy:
+            guide.pop("writer_role_safe_copy_payload", None)
+            next_action.pop("writer_role_safe_copy_payload", None)
+            next_action.update(
+                {
+                    "status": "blocked_missing_prefill_child_plan",
+                    "actionable": False,
+                    "block_reason": (
+                        "rev10 prefill requires the typed child plan admitted "
+                        "by mf_parallel_enter"
+                    ),
+                }
+            )
+            guide["prefill_child_plan_projection"] = {
+                "schema_version": "mf_parallel.prefill_child_plan_projection.v1",
+                "status": "blocked_missing_admitted_plan",
+                "source_of_authority": plan_source,
+                "authorizes_write": False,
+            }
+        else:
+            copy_payload = dict(safe_copy.get("copy_payload") or {})
+            copy_payload["payload"] = _contract_runtime_mf_parallel_prefill_payload(
+                plan
+            )
+            safe_copy["copy_payload"] = copy_payload
+            guide["writer_role_safe_copy_payload"] = safe_copy
+            next_action["writer_role_safe_copy_payload"] = deepcopy(safe_copy)
+            next_action["actionable"] = True
+            guide["prefill_child_plan_projection"] = {
+                "schema_version": "mf_parallel.prefill_child_plan_projection.v1",
+                "status": "ready",
+                "source_of_authority": plan_source,
+                "plan_hash": str(plan.get("plan_hash") or ""),
+                "required_worker_count": int(
+                    plan.get("required_worker_count") or 0
+                ),
+                "authorizes_write": True,
+            }
+    else:
+        accepted_payload: Mapping[str, Any] = {}
+        completed_lines = record.get("completed_lines")
+        if not isinstance(completed_lines, list):
+            completed_lines = guide.get("completed_lines")
+        for line in completed_lines or []:
+            if not isinstance(line, Mapping):
+                continue
+            if (
+                str(line.get("stage_id") or "").strip() == "orchestration"
+                and str(line.get("line_id") or "").strip()
+                == "observer_prefill_child_contracts"
+                and str(line.get("evidence_kind") or "").strip()
+                == "contract_binding"
+                and isinstance(line.get("payload"), Mapping)
+            ):
+                accepted_payload = line["payload"]
+                break
+        expected_payload = (
+            _contract_runtime_mf_parallel_prefill_payload(plan)
+            if plan_valid
+            else {}
+        )
+        admitted = bool(
+            expected_payload
+            and stable_sha256(dict(accepted_payload))
+            == stable_sha256(expected_payload)
+        )
+        if not admitted:
+            guide.pop("writer_role_safe_copy_payload", None)
+            next_action.pop("writer_role_safe_copy_payload", None)
+            next_action.update(
+                {
+                    "status": "blocked_missing_admitted_prefill_child_plan",
+                    "actionable": False,
+                    "block_reason": (
+                        "dispatch cannot synthesize a child plan absent from "
+                        "the accepted prefill Fact"
+                    ),
+                }
+            )
+            guide["prefill_child_plan_projection"] = {
+                "schema_version": "mf_parallel.prefill_child_plan_projection.v1",
+                "status": "blocked_missing_admitted_plan",
+                "source_of_authority": (
+                    "completed_lines.observer_prefill_child_contracts"
+                ),
+                "authorizes_write": False,
+            }
+        else:
+            bounded_workers = [
+                {
+                    "task_id": str(lane.get("task_id") or "").strip(),
+                    "worker_id": str(lane.get("worker_id") or "").strip(),
+                    "worker_slot_id": str(
+                        lane.get("worker_slot_id") or ""
+                    ).strip(),
+                    "owned_files": list(lane.get("owned_files") or []),
+                    "target_files": list(lane.get("owned_files") or []),
+                    "test_files": list(lane.get("test_files") or []),
+                    "test_commands": list(lane.get("test_commands") or []),
+                }
+                for lane in plan.get("lanes") or []
+                if isinstance(lane, Mapping)
+            ]
+            parent_route_binding = (
+                plan.get("parent_route_binding")
+                if isinstance(plan.get("parent_route_binding"), Mapping)
+                else {}
+            )
+            parent_route_identity = (
+                parent_route_binding.get("route_identity")
+                if isinstance(
+                    parent_route_binding.get("route_identity"), Mapping
+                )
+                else {}
+            )
+            next_action.update(
+                {
+                    "bounded_workers": bounded_workers,
+                    "worker_count": len(bounded_workers),
+                    "required_worker_count": int(
+                        plan.get("required_worker_count") or 0
+                    ),
+                    "atomic_dispatch": bool(
+                        plan.get("atomic_dispatch_required") is True
+                    ),
+                    "source_of_authority": (
+                        "completed_lines.observer_prefill_child_contracts"
+                    ),
+                    **{
+                        field: str(parent_route_identity.get(field) or "").strip()
+                        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                    },
+                }
+            )
+            guide["prefill_child_plan_projection"] = {
+                "schema_version": "mf_parallel.prefill_child_plan_projection.v1",
+                "status": "admitted_plan_projected",
+                "source_of_authority": (
+                    "completed_lines.observer_prefill_child_contracts"
+                ),
+                "plan_hash": str(plan.get("plan_hash") or ""),
+                "required_worker_count": len(bounded_workers),
+                "authorizes_allocation_recipe": True,
+            }
+    guide["next_legal_action"] = next_action
+    projected["runtime_guide"] = guide
+    return projected
+
+
+def _contract_runtime_mf_parallel_prefill_plan_write_errors(
+    record: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> list[str]:
+    return mf_parallel_prefill_child_plan_errors(record, record, write)
 
 
 def _contract_runtime_mf_parallel_current_generation_worker_count(
@@ -127820,6 +128767,10 @@ def _contract_runtime_mf_parallel_worker_cardinality_policy(
         ),
         {},
     )
+    strict_prefill_topology = bool(
+        str(record.get("revision") or "").strip() == "rev10"
+        and metadata.get("observer_prefill_child_plan_required") is True
+    )
     return {
         "schema_version": "mf_parallel.effective_worker_cardinality_policy.v1",
         "source": (
@@ -127851,7 +128802,14 @@ def _contract_runtime_mf_parallel_worker_cardinality_policy(
         ),
         "selection_hash": str(selection.get("selection_hash") or ""),
         "latest_revision_id": str(latest_revision.get("revision_id") or ""),
-        "revision_contract": {
+        "revision_contract": ({
+            "status": "immutable_prefill_topology",
+            "actionable": False,
+            "source": "mf_parallel.v2.rev10.observer_prefill_child_plan",
+            "required_worker_count": required_worker_count,
+            "fresh_successor_required_for_topology_change": True,
+            "facade_projected": False,
+        } if strict_prefill_topology else {
             "interface": "mf_parallel_revise",
             "facade": "mf_parallel_revise",
             "mcp_tool": "mf_parallel_revise",
@@ -127895,7 +128853,7 @@ def _contract_runtime_mf_parallel_worker_cardinality_policy(
             "batch_parallelism_expansion": (
                 "add_independent_batch_rows_not_nested_child_workers"
             ),
-        },
+        }),
     }
 
 
@@ -137457,10 +138415,39 @@ def _onboard_route_guide_completed_mf_parallel_successor_action_input(
     project_id: str,
     backlog_id: str,
     target_files: Sequence[str],
+    request_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Copy-safe second-step mf_parallel_enter input projected after route issue."""
 
     scoped_target_files = _runtime_context_public_file_values(target_files)
+    request = request_body if isinstance(request_body, Mapping) else {}
+    request_metadata = (
+        request.get("metadata")
+        if isinstance(request.get("metadata"), Mapping)
+        else {}
+    )
+    required_worker_count = request_metadata.get("required_worker_count")
+    lane_intents = request_metadata.get("lane_intents")
+    supplied_lane_intents = (
+        deepcopy(lane_intents) if isinstance(lane_intents, list) else None
+    )
+    action_input_ready = bool(
+        required_worker_count == 2
+        and isinstance(supplied_lane_intents, list)
+        and len(supplied_lane_intents) == 2
+    )
+    static_body = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "onboard_service_waiver": True,
+        "target_files": scoped_target_files,
+        "owned_files": scoped_target_files,
+    }
+    if action_input_ready:
+        static_body["metadata"] = {
+            "required_worker_count": required_worker_count,
+            "lane_intents": supplied_lane_intents,
+        }
     return {
         "schema_version": (
             "onboard_route_guide.mf_parallel_successor_action_input.v1"
@@ -137470,13 +138457,7 @@ def _onboard_route_guide_completed_mf_parallel_successor_action_input(
             "onboard_route_guide.next_legal_action.successor_action_input"
         ),
         "copy_safe": True,
-        "static_body": {
-            "project_id": project_id,
-            "backlog_id": backlog_id,
-            "onboard_service_waiver": True,
-            "target_files": scoped_target_files,
-            "owned_files": scoped_target_files,
-        },
+        "static_body": static_body,
         "dynamic_fields": {
             "observer_session_id": {
                 "required": True,
@@ -137501,7 +138482,20 @@ def _onboard_route_guide_completed_mf_parallel_successor_action_input(
                 "placeholder": "<human_reason>",
                 "source": "caller_supplied_human_reason",
             },
+            "metadata.required_worker_count": {
+                "required": True,
+                "placeholder": "<required_worker_count: exactly 2>",
+                "source": "mf_parallel.v2.rev10.standalone_cardinality",
+            },
+            "metadata.lane_intents": {
+                "required": True,
+                "placeholder": (
+                    "<typed lane_intents matching required_worker_count>"
+                ),
+                "source": "authenticated_observer_child_plan",
+            },
         },
+        "action_input_ready": action_input_ready,
         "omitted_fields": ["contract_execution_id"],
         "contract_execution_id_required": False,
         "contract_execution_id_omitted": True,
@@ -137962,6 +138956,7 @@ def _onboard_route_guide_completed_next_action(
                 project_id=project_id,
                 backlog_id=backlog_id,
                 target_files=target_files,
+                request_body=request_body,
             )
         )
         return {
@@ -145746,6 +146741,29 @@ def _contract_runtime_existing_child_route_token_binding(
         if isinstance(metadata.get("route_token_ref_binding"), Mapping)
         else {}
     )
+    parent_route_identity = (
+        prior.get("parent_route_identity")
+        if isinstance(prior.get("parent_route_identity"), Mapping)
+        else {}
+    )
+    if not parent_route_identity and parent_route_token_ref:
+        from . import observer_route_context
+
+        try:
+            resolved_parent = observer_route_context.resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=parent_route_token_ref,
+                backlog_id=backlog_id,
+            ) or {}
+        except observer_route_context.RouteTokenRefError:
+            resolved_parent = {}
+        parent_route_identity = _route_token_parent_identity(
+            resolved_parent,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=parent_route_token_ref,
+        )
     return {
         **dict(prior),
         "schema_version": "contract_runtime.child_route_token_binding.v1",
@@ -145755,6 +146773,7 @@ def _contract_runtime_existing_child_route_token_binding(
         "route_token_ref": child_ref,
         "child_route_token_ref": child_ref,
         "parent_route_token_ref": str(parent_route_token_ref or "").strip(),
+        "parent_route_identity": dict(parent_route_identity),
         "child_contract_execution_id": child_id,
         "scope": dict(binding.get("scope") or {})
         if isinstance(binding.get("scope"), Mapping)
@@ -149590,6 +150609,9 @@ def _mf_parallel_successor_runtime_enter(
         successor_execution_id,
         actor_role=actor_role,
     )
+    successor = _contract_runtime_apply_mf_parallel_prefill_plan_projection(
+        successor
+    )
     successor_route_ref = str(successor.get("route_token_ref") or "")
     if successor_route_ref and isinstance(observer_proof, Mapping):
         successor = _contract_runtime_bind_observer_dispatch_transport_proof(
@@ -150036,6 +151058,14 @@ def _mf_parallel_terminal_supersession_route_authority(
         "accepted": accepted,
         "server_derived": True,
         "route_token_ref": route_ref if accepted else "",
+        "route_identity": (
+            {
+                field: str(resolved.get(field) or "").strip()
+                for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            }
+            if accepted
+            else {}
+        ),
         "expected_scope": {
             "project_id": project_id,
             "backlog_id": backlog_id,
@@ -150578,90 +151608,6 @@ def _mf_parallel_terminal_supersession_lane_records(
     return verified
 
 
-def _mf_parallel_terminal_fresh_dispatch_plan(
-    *,
-    project_id: str,
-    backlog_id: str,
-    fresh_contract_execution_id: str,
-    reservations: Sequence[Mapping[str, Any]],
-    base_commit: str,
-    target_head_commit: str,
-) -> dict[str, Any]:
-    """Project existing route-issue and allocation-precheck actions."""
-
-    route_issue_actions: list[dict[str, Any]] = []
-    lane_templates: list[dict[str, Any]] = []
-    for reservation in reservations:
-        lane_id = str(reservation.get("lane_id") or "")
-        task_id = str(reservation.get("task_id") or "")
-        worker_id = str(reservation.get("worker_id") or "")
-        worker_slot_id = str(reservation.get("worker_slot_id") or "")
-        owned_files = list(reservation.get("owned_files") or [])
-        route_issue_actions.append(
-            {
-                "lane_id": lane_id,
-                "mcp_tool": "observer_route_context_issue",
-                "copy_safe_body": {
-                    "project_id": project_id,
-                    "caller_role": "observer",
-                    "backlog_id": backlog_id,
-                    "task_id": fresh_contract_execution_id,
-                    "allowed_actions": [
-                        "parallel_branch_allocate",
-                        "task_timeline_append",
-                    ],
-                    "target_files": owned_files,
-                    "owned_files": owned_files,
-                    "evidence_refs": [
-                        f"contract_runtime:{fresh_contract_execution_id}",
-                        f"backlog:{backlog_id}",
-                        f"lane:{lane_id}",
-                    ],
-                },
-            }
-        )
-        lane_templates.append(
-            {
-                "lane_id": lane_id,
-                "task_id": task_id,
-                "backlog_id": backlog_id,
-                "contract_execution_id": fresh_contract_execution_id,
-                "worker_id": worker_id,
-                "worker_slot_id": worker_slot_id,
-                "owned_files": owned_files,
-                "route_token_ref_from": (
-                    f"route_issue_results.{lane_id}.route_token_ref"
-                ),
-            }
-        )
-    return {
-        "schema_version": "mf_parallel.terminal_fresh_dispatch_plan.v1",
-        "source": "existing_mf_parallel_allocation_happy_path",
-        "route_issue_actions": route_issue_actions,
-        "allocation_precheck_action": {
-            "mcp_tool": "parallel_branch_allocate_precheck",
-            "copy_safe_body_template": {
-                "project_id": project_id,
-                "base_commit": base_commit,
-                "target_head_commit": target_head_commit,
-                "expected_lane_count": 2,
-                "expected_worker_count": 2,
-                "lanes": lane_templates,
-            },
-            "substitution_rule": (
-                "replace each route_token_ref_from with only that lane's "
-                "observer_route_context_issue.route_token_ref; change no other field"
-            ),
-        },
-        "runtime_context_creation_authority": (
-            "parallel_branch_allocate_precheck_then_unchanged_allocate_bodies"
-        ),
-        "runtime_contexts_already_created": False,
-        "credentials_already_issued": False,
-        "manual_identity_composition_allowed": False,
-    }
-
-
 def _mf_parallel_terminal_supersession_enter(
     conn,
     *,
@@ -150834,6 +151780,58 @@ def _mf_parallel_terminal_supersession_enter(
                 409,
                 {"writes_performed": False, "fail_closed": True},
             ) from exc
+        fresh_metadata = (
+            fresh_record.get("metadata")
+            if isinstance(fresh_record.get("metadata"), Mapping)
+            else {}
+        )
+        persisted_plan = (
+            fresh_metadata.get("observer_prefill_child_plan")
+            if isinstance(
+                fresh_metadata.get("observer_prefill_child_plan"), Mapping
+            )
+            else {}
+        )
+        persisted_lane_intents = [
+            {
+                "task_id": str(lane.get("task_id") or "").strip(),
+                "worker_id": str(lane.get("worker_id") or "").strip(),
+                "worker_slot_id": str(
+                    lane.get("worker_slot_id") or ""
+                ).strip(),
+                "owned_files": sorted(lane.get("owned_files") or []),
+            }
+            for lane in persisted_plan.get("lanes") or []
+            if isinstance(lane, Mapping)
+        ]
+        expected_lane_intents = [
+            {
+                "task_id": str(lane.get("task_id") or "").strip(),
+                "worker_id": str(lane.get("worker_id") or "").strip(),
+                "worker_slot_id": str(
+                    lane.get("worker_slot_id") or ""
+                ).strip(),
+                "owned_files": sorted(lane.get("owned_files") or []),
+            }
+            for lane in policy.get("fresh_lanes") or []
+            if isinstance(lane, Mapping)
+        ]
+        if not (
+            fresh_metadata.get("observer_prefill_child_plan_required") is True
+            and str(persisted_plan.get("source") or "")
+            == "contract_terminal_supersession_policy"
+            and persisted_lane_intents == expected_lane_intents
+            and _contract_runtime_mf_parallel_prefill_plan_valid(
+                fresh_record,
+                persisted_plan,
+            )
+        ):
+            raise GovernanceError(
+                "mf_parallel_terminal_supersession_replay_incomplete",
+                "terminal receipt exists but the fresh rev10 prefill plan is missing or inconsistent",
+                409,
+                {"writes_performed": False, "fail_closed": True},
+            )
         lanes = _mf_parallel_terminal_supersession_lane_records(
             conn,
             project_id=project_id,
@@ -150852,16 +151850,6 @@ def _mf_parallel_terminal_supersession_enter(
             contract_execution_id=fresh_execution_id,
             actor_role=actor_role,
         )
-        fresh_dispatch_plan = _mf_parallel_terminal_fresh_dispatch_plan(
-            project_id=project_id,
-            backlog_id=backlog_id,
-            fresh_contract_execution_id=fresh_execution_id,
-            reservations=lanes,
-            base_commit=str(existing_marker.get("base_commit") or ""),
-            target_head_commit=str(
-                existing_marker.get("target_head_commit") or ""
-            ),
-        )
         return {
             "ok": True,
             "schema_version": "mf_parallel_enter.runtime_contract_response.v1",
@@ -150870,7 +151858,6 @@ def _mf_parallel_terminal_supersession_enter(
             "writes_performed": False,
             "terminal_supersession_receipt": existing_marker,
             "reserved_lanes": lanes,
-            "fresh_dispatch_plan": fresh_dispatch_plan,
             "contract_execution_id": fresh_execution_id,
             "successor_contract_execution_id": fresh_execution_id,
             "parent_contract_execution_id": str(
@@ -150947,6 +151934,65 @@ def _mf_parallel_terminal_supersession_enter(
     cardinality_selection["selection_hash"] = stable_sha256(
         cardinality_selection
     )
+    lane_intents = [
+        {
+            "task_id": str(lane.get("task_id") or "").strip(),
+            "worker_id": str(lane.get("worker_id") or "").strip(),
+            "worker_slot_id": str(
+                lane.get("worker_slot_id") or ""
+            ).strip(),
+            "owned_files": list(lane.get("owned_files") or []),
+        }
+        for lane in policy_lanes
+    ]
+    parent_route_binding = {
+        "schema_version": "mf_parallel.parent_route_binding.v1",
+        "source": "contract_terminal_supersession_policy",
+        "route_token_ref": route_token_ref,
+        "route_identity": {
+            field: str(
+                (route_authority.get("route_identity") or {}).get(field)
+                or ""
+            ).strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        },
+    }
+    parent_route_binding["binding_hash"] = stable_sha256(
+        parent_route_binding
+    )
+    row = conn.execute(
+        "SELECT test_files FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+    row_test_files = _string_list_field(_row_get(row, "test_files", ""))
+    prefill_child_plan = (
+        _contract_runtime_mf_parallel_build_prefill_child_plan(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=fresh_execution_id,
+            parent_contract_execution_id=str(
+                parent_record.get("contract_execution_id") or ""
+            ),
+            root_contract_execution_id=str(
+                parent_record.get("root_contract_execution_id")
+                or parent_record.get("contract_execution_id")
+                or ""
+            ),
+            required_worker_count=2,
+            declared_files=policy_files,
+            row_test_files=row_test_files,
+            acceptance_criteria=fresh_acceptance_criteria,
+            acceptance_scope_closure=fresh_acceptance_scope_closure,
+            test_command_authority=(
+                _contract_runtime_mf_parallel_project_test_command_authority(
+                    project_id
+                )
+            ),
+            parent_route_binding=parent_route_binding,
+            lane_intents=lane_intents,
+            source="contract_terminal_supersession_policy",
+        )
+    )
     lane_reservations = []
     for lane in policy_lanes:
         reservation_core = {
@@ -150988,13 +152034,20 @@ def _mf_parallel_terminal_supersession_enter(
         metadata={
             "owned_files": policy_files,
             "target_files": policy_files,
-            "test_files": [
-                path for path in policy_files if path.startswith("agent/tests/")
-            ],
+            "test_files": list(row_test_files),
             "required_worker_count": 2,
             "observer_worker_cardinality_selection": cardinality_selection,
             "observer_worker_cardinality_initial_selection": cardinality_selection,
             "observer_worker_cardinality_revisions": [],
+            "observer_prefill_child_plan_required": True,
+            "observer_prefill_child_plan": prefill_child_plan,
+            "observer_prefill_child_plan_source": (
+                "contract_terminal_supersession_policy"
+            ),
+            "terminal_supersession_enter_route_token_ref": route_token_ref,
+            "terminal_supersession_enter_route_identity": dict(
+                route_authority.get("route_identity") or {}
+            ),
             "terminal_supersession_request": expected_request,
             "terminal_supersession_request_hash": request_hash,
             "terminal_supersession_source_contract_execution_id": (
@@ -151145,16 +152198,6 @@ def _mf_parallel_terminal_supersession_enter(
     conn.commit()
 
     reserved_lanes = deepcopy(lane_reservations)
-    fresh_dispatch_plan = _mf_parallel_terminal_fresh_dispatch_plan(
-        project_id=project_id,
-        backlog_id=backlog_id,
-        fresh_contract_execution_id=fresh_execution_id,
-        reservations=reserved_lanes,
-        base_commit=str(expected_request.get("base_commit") or ""),
-        target_head_commit=str(
-            expected_request.get("target_head_commit") or ""
-        ),
-    )
     return {
         "ok": True,
         "schema_version": "mf_parallel_enter.runtime_contract_response.v1",
@@ -151164,7 +152207,6 @@ def _mf_parallel_terminal_supersession_enter(
         "event": event,
         "terminal_supersession_receipt": receipt,
         "reserved_lanes": reserved_lanes,
-        "fresh_dispatch_plan": fresh_dispatch_plan,
         "contract_execution_id": fresh_execution_id,
         "successor_contract_execution_id": fresh_execution_id,
         "parent_contract_execution_id": successor_runtime.get(
@@ -183397,6 +184439,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
         if isinstance(body.get("metadata"), Mapping)
         else {}
     )
+    caller_lane_intents = metadata.pop("lane_intents", None)
     terminal_supersession_request = (
         _mf_parallel_terminal_supersession_request(body, metadata)
     )
@@ -183901,6 +184944,10 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             and isinstance(existing_successor.get("metadata"), Mapping)
             else {}
         )
+        fresh_rev10_prefill_plan_required = bool(
+            existing_successor is None
+            and str(contract_revision or "rev10").strip() == "rev10"
+        )
         reported_acceptance = (
             existing_metadata.get("acceptance_criteria", [])
             if implementation_started
@@ -183927,6 +184974,94 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 implementation_started=implementation_started,
             )
         )
+        # Acceptance/behavior closure remains the earlier Gate: an invalid row
+        # must not be masked by a later fresh-rev10 planning-input diagnostic.
+        if fresh_rev10_prefill_plan_required and not observer_selected_cardinality:
+            raise ValidationError(
+                "fresh mf_parallel rev10 requires explicit worker cardinality",
+                {
+                    "field": "metadata.required_worker_count",
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                },
+            )
+        if (
+            fresh_rev10_prefill_plan_required
+            and required_worker_count == 1
+            and not batch_child_authority
+        ):
+            raise ValidationError(
+                "fresh mf_parallel rev10 standalone execution requires exactly two workers",
+                {
+                    "field": "metadata.required_worker_count",
+                    "expected": 2,
+                    "actual": 1,
+                    "one_worker_allowed_only_for": (
+                        "server_verified_mf_batch_parallel_child"
+                    ),
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                },
+            )
+        if (
+            fresh_rev10_prefill_plan_required
+            and required_worker_count == 2
+            and batch_child_authority
+        ):
+            raise ValidationError(
+                "fresh mf_parallel rev10 verified batch child requires exactly one worker",
+                {
+                    "field": "metadata.required_worker_count",
+                    "expected": 1,
+                    "actual": 2,
+                    "batch_child_authority_hash": str(
+                        batch_child_authority.get("authority_hash") or ""
+                    ),
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                },
+            )
+        if fresh_rev10_prefill_plan_required and batch_child_authority:
+            expected_lane_intents = batch_child_authority.get("lane_intents")
+            expected_lane_intents_hash = str(
+                batch_child_authority.get("lane_intents_hash") or ""
+            ).strip()
+            actual_lane_intents_hash = (
+                stable_sha256(caller_lane_intents)
+                if isinstance(caller_lane_intents, list)
+                else ""
+            )
+            if not (
+                isinstance(expected_lane_intents, list)
+                and len(expected_lane_intents) == 1
+                and expected_lane_intents_hash
+                == stable_sha256(expected_lane_intents)
+                == actual_lane_intents_hash
+            ):
+                raise ValidationError(
+                    "verified mf_batch child requires the exact server-authored lane intent",
+                    {
+                        "field": "metadata.lane_intents",
+                        "expected_source": (
+                            "mf_batch_parallel.entered.per_row_successors"
+                        ),
+                        "expected_lane_intents_hash": (
+                            expected_lane_intents_hash
+                        ),
+                        "actual_lane_intents_hash": actual_lane_intents_hash,
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                    },
+                )
+        if fresh_rev10_prefill_plan_required and caller_lane_intents is None:
+            raise ValidationError(
+                "fresh mf_parallel rev10 requires typed lane_intents",
+                {
+                    "field": "metadata.lane_intents",
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                },
+            )
         if onboard_service_waiver:
             parent_record = _onboard_service_materialize_parent_record(
                 conn,
@@ -183934,6 +185069,89 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 backlog_id=backlog_id,
                 route_token_ref=route_token_ref,
             )
+        successor_execution_id = _mf_parallel_execution_id(
+            project_id,
+            backlog_id,
+            str(parent_record.get("contract_execution_id") or ""),
+            task_id,
+            contract_execution_id=contract_execution_id,
+        )
+        strict_prefill_child_plan_required = bool(
+            fresh_rev10_prefill_plan_required
+            or existing_metadata.get("observer_prefill_child_plan_required")
+            is True
+        )
+        prefill_child_plan = (
+            deepcopy(dict(existing_metadata.get("observer_prefill_child_plan") or {}))
+            if strict_prefill_child_plan_required
+            and isinstance(existing_metadata.get("observer_prefill_child_plan"), Mapping)
+            else {}
+        )
+        if fresh_rev10_prefill_plan_required:
+            observer_proof = getattr(
+                ctx,
+                "_contract_runtime_observer_proof",
+                None,
+            )
+            route_identity = (
+                observer_proof.get("route_identity")
+                if isinstance(observer_proof, Mapping)
+                and isinstance(observer_proof.get("route_identity"), Mapping)
+                else {}
+            )
+            parent_route_binding = {
+                "schema_version": "mf_parallel.parent_route_binding.v1",
+                "source": "authenticated_observer_mf_parallel_enter",
+                "route_token_ref": route_token_ref,
+                "route_identity": {
+                    field: str(route_identity.get(field) or "").strip()
+                    for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                },
+            }
+            parent_route_binding["binding_hash"] = stable_sha256(
+                parent_route_binding
+            )
+            prefill_child_plan = (
+                _contract_runtime_mf_parallel_build_prefill_child_plan(
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    contract_execution_id=successor_execution_id,
+                    parent_contract_execution_id=str(
+                        parent_record.get("contract_execution_id") or ""
+                    ),
+                    root_contract_execution_id=str(
+                        parent_record.get("root_contract_execution_id")
+                        or parent_record.get("contract_execution_id")
+                        or ""
+                    ),
+                    required_worker_count=required_worker_count,
+                    declared_files=owned_scope_files,
+                    row_test_files=row_test_files,
+                    acceptance_criteria=acceptance_scope_criteria,
+                    acceptance_scope_closure=acceptance_scope_closure,
+                    test_command_authority=(
+                        _contract_runtime_mf_parallel_project_test_command_authority(
+                            project_id
+                        )
+                    ),
+                    parent_route_binding=parent_route_binding,
+                    lane_intents=caller_lane_intents,
+                )
+            )
+        metadata = {
+            **metadata,
+            "observer_prefill_child_plan_required": (
+                strict_prefill_child_plan_required
+            ),
+            "observer_prefill_child_plan": prefill_child_plan,
+            "observer_prefill_child_plan_source": (
+                "authenticated_observer_mf_parallel_enter"
+                if prefill_child_plan
+                else "missing_required_typed_lane_intents"
+                if strict_prefill_child_plan_required
+                else "legacy_implicit_compatibility"
+            ),
+        }
         successor_runtime = _mf_parallel_successor_runtime_enter(
             conn,
             project_id=project_id,
@@ -184260,6 +185478,31 @@ def handle_project_mf_parallel_revise(ctx: RequestContext):
             backlog_id=backlog_id,
             task_id=contract_execution_id,
         )
+        record_metadata = (
+            record.get("metadata")
+            if isinstance(record.get("metadata"), Mapping)
+            else {}
+        )
+        if (
+            str(record.get("revision") or "").strip() == "rev10"
+            and record_metadata.get("observer_prefill_child_plan_required")
+            is True
+        ):
+            raise GovernanceError(
+                "mf_parallel_rev10_prefill_topology_immutable",
+                (
+                    "fresh mf_parallel rev10 worker cardinality is frozen by "
+                    "the admitted prefill child plan"
+                ),
+                409,
+                {
+                    "contract_execution_id": contract_execution_id,
+                    "required_worker_count": required_worker_count,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                    "fresh_successor_required": True,
+                },
+            )
 
         cutoff = _contract_runtime_mf_parallel_allocation_or_dispatch_evidence(
             conn,
@@ -185407,6 +186650,18 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
             str(item.get("backlog_id") or ""): item
             for item in planned_items
         }
+        def batch_child_task_id(row_id: str, index: int) -> str:
+            return str(
+                queue_items_by_backlog.get(row_id, {}).get("task_id")
+                or f"{batch_id}:row:{index + 1}"
+            )
+
+        def batch_child_owned_files(row_id: str) -> list[str]:
+            return list(
+                queue_items_by_backlog.get(row_id, {}).get("owned_files")
+                or []
+            )
+
         per_row_successors = [
             {
                 "backlog_id": row_id,
@@ -185416,7 +186671,6 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                 "route_token_task_id_policy": "mf_parallel_successor_execution_id",
                 "route_token_allowed_actions": [
                     "mf_parallel_enter",
-                    "mf_parallel_revise",
                 ],
                 "acceptance_scope_closure": dict(
                     acceptance_scope_closures.get(row_id) or {}
@@ -185432,28 +186686,20 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                         "mf_batch_parallel.observer_worker_cardinality_input.v1"
                     ),
                     "input_path": "body.metadata.required_worker_count",
-                    "observer_must_select": True,
+                    "observer_must_select": False,
+                    "server_selected": True,
+                    "selection_source": (
+                        "mf_batch_parallel.durable_planned_row"
+                    ),
                     "recommended_worker_count": 1,
-                    "allowed_worker_counts": [1, 2],
+                    "allowed_worker_counts": [1],
                     "nested_worker_fanout_supported": False,
-                    "initial_two_worker_selection_supported": True,
+                    "initial_two_worker_selection_supported": False,
                     "revision_to_two_workers_supported": False,
-                    "selection_frozen_by": "mf_parallel_enter",
+                    "selection_frozen_by": "mf_batch_parallel_enter",
                     "caller_override_after_enter_allowed": False,
-                    "revision_entrypoint": {
-                        "interface": "mf_parallel_revise",
-                        "method": "POST",
-                        "path": (
-                            "/api/projects/{project_id}/mf-parallel/"
-                            "{contract_execution_id}/revise"
-                        ),
-                        "allowed_before": (
-                            "first_runtime_context_allocation_or_dispatch"
-                        ),
-                        "allowed_worker_counts": [1],
-                        "two_worker_expansion_supported": False,
-                        "accepted_revisions_append_only": True,
-                    },
+                    "revision_entrypoint_projected": False,
+                    "topology_immutable_after_enter": True,
                 },
                 "merge_queue": {
                     key: queue_items_by_backlog.get(row_id, {}).get(key)
@@ -185473,8 +186719,7 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                     "project_id": project_id,
                     "backlog_id": row_id,
                     "task_id": str(
-                        queue_items_by_backlog.get(row_id, {}).get("task_id")
-                        or f"{batch_id}:row:{index + 1}"
+                        batch_child_task_id(row_id, index)
                     ),
                     "parent_batch_id": batch_id,
                     # This successor body is generated by the accepted batch
@@ -185485,7 +186730,19 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
                         # row-scoped child may not inherit the batch parent's
                         # cardinality because nested worker fan-out has no
                         # durable nested merge queue/fan-in contract.
-                        "required_worker_count": 1
+                        "required_worker_count": 1,
+                        "lane_intents": [
+                            {
+                                "task_id": (
+                                    batch_child_task_id(row_id, index)
+                                ),
+                                "worker_id": (
+                                    f"{batch_child_task_id(row_id, index)}-worker"
+                                ),
+                                "worker_slot_id": "source",
+                                "owned_files": batch_child_owned_files(row_id),
+                            }
+                        ],
                     },
                     "owned_files": list(
                         queue_items_by_backlog.get(row_id, {}).get("owned_files")
@@ -188399,6 +189656,12 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                         write=write,
                         body=body,
                     )
+                    prefill_plan_errors = (
+                        _contract_runtime_mf_parallel_prefill_plan_write_errors(
+                            stored_record,
+                            write,
+                        )
+                    )
                     write, close_ready_binding_errors = (
                         _contract_runtime_bind_close_ready_worker_set(
                             conn,
@@ -188416,6 +189679,7 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
                         )
                     )
                     dispatch_errors = [
+                        *prefill_plan_errors,
                         *close_ready_binding_errors,
                         *dispatch_errors,
                     ]
@@ -189071,6 +190335,12 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                         write=write,
                         body=body,
                     )
+                    prefill_plan_errors = (
+                        _contract_runtime_mf_parallel_prefill_plan_write_errors(
+                            stored_record,
+                            write,
+                        )
+                    )
                     write, close_ready_binding_errors = (
                         _contract_runtime_bind_close_ready_worker_set(
                             conn,
@@ -189088,6 +190358,7 @@ def handle_project_contract_runtime_line_write_precheck(ctx: RequestContext):
                         )
                     )
                     dispatch_errors = [
+                        *prefill_plan_errors,
                         *close_ready_binding_errors,
                         *dispatch_errors,
                     ]

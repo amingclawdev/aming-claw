@@ -260,6 +260,13 @@ def validate_contract_write(
                 errors.append("evidence_kind mismatch")
 
     _validate_worker_receipt_hash_evidence(errors, write)
+    errors.extend(
+        mf_parallel_prefill_child_plan_errors(
+            definition,
+            execution_state,
+            write,
+        )
+    )
 
     candidate_commit_policy = contract_line_evidence_policy(
         definition,
@@ -360,6 +367,448 @@ def validate_contract_write(
         errors=tuple(errors),
         identity_mismatches=tuple(identity_mismatches),
     )
+
+
+def mf_parallel_prefill_child_plan_errors(
+    definition: Mapping[str, Any],
+    execution_state: Mapping[str, Any],
+    write: Mapping[str, Any],
+) -> list[str]:
+    """Enforce the fresh rev10 prefill Fact at the authoritative runtime Gate."""
+
+    if not (
+        str(definition.get("contract_id") or "").strip() == "mf_parallel.v2"
+        and str(definition.get("revision") or "").strip() == "rev10"
+        and str(write.get("line_id") or "").strip()
+        in {
+            "observer_prefill_child_contracts",
+            "observer_dispatch_bounded_workers",
+        }
+    ):
+        return []
+    metadata = (
+        execution_state.get("metadata")
+        if isinstance(execution_state.get("metadata"), Mapping)
+        else {}
+    )
+    # The marker distinguishes fresh post-fix executions from immutable
+    # historical rev10 records; old executions are not retroactively migrated.
+    if metadata.get("observer_prefill_child_plan_required") is not True:
+        return []
+    plan = (
+        metadata.get("observer_prefill_child_plan")
+        if isinstance(metadata.get("observer_prefill_child_plan"), Mapping)
+        else {}
+    )
+    selection = (
+        metadata.get("observer_worker_cardinality_selection")
+        if isinstance(
+            metadata.get("observer_worker_cardinality_selection"), Mapping
+        )
+        else {}
+    )
+    lanes = plan.get("lanes") if isinstance(plan.get("lanes"), list) else []
+    try:
+        required_count = int(selection.get("required_worker_count") or 0)
+    except (TypeError, ValueError):
+        required_count = 0
+
+    def concrete(value: Any) -> bool:
+        text = str(value or "").strip()
+        return bool(text and "<" not in text and ">" not in text)
+
+    lane_mappings = [lane for lane in lanes if isinstance(lane, Mapping)]
+    lane_files = [
+        str(path).strip()
+        for lane in lane_mappings
+        for path in lane.get("owned_files") or []
+        if str(path).strip()
+    ]
+    expected_files = sorted(
+        {
+            str(path).strip()
+            for field in ("owned_files", "target_files")
+            for path in metadata.get(field) or []
+            if str(path).strip()
+        }
+    )
+    identity_sets = [
+        [str(lane.get(field) or "").strip() for lane in lane_mappings]
+        for field in ("task_id", "worker_id", "worker_slot_id")
+    ]
+    command_authority = (
+        plan.get("test_command_authority")
+        if isinstance(plan.get("test_command_authority"), Mapping)
+        else {}
+    )
+    command_authority_hash = str(
+        command_authority.get("authority_hash") or ""
+    ).strip()
+    command_authority_unsigned = {
+        key: value
+        for key, value in command_authority.items()
+        if key != "authority_hash"
+    }
+    test_commands = [
+        str(item).strip()
+        for item in command_authority.get("test_commands") or []
+        if str(item).strip()
+    ]
+    route_binding = (
+        plan.get("parent_route_binding")
+        if isinstance(plan.get("parent_route_binding"), Mapping)
+        else {}
+    )
+    route_binding_hash = str(route_binding.get("binding_hash") or "").strip()
+    route_binding_unsigned = {
+        key: value
+        for key, value in route_binding.items()
+        if key != "binding_hash"
+    }
+    route_identity = (
+        route_binding.get("route_identity")
+        if isinstance(route_binding.get("route_identity"), Mapping)
+        else {}
+    )
+    route_id = str(route_identity.get("route_id") or "").strip()
+    canonical_route_identity = bool(
+        (
+            route_id.startswith("route-")
+            or route_id
+            in {
+                "event.route_prompt_context.preview",
+                "event.route_action.pre_mutation",
+            }
+        )
+        and str(route_identity.get("prompt_contract_id") or "")
+        .strip()
+        .startswith("rprompt-")
+        and str(route_identity.get("route_token_ref") or "")
+        .strip()
+        .startswith("rtok-")
+        and all(
+            str(route_identity.get(field) or "").strip().startswith("sha256:")
+            for field in (
+                "route_context_hash",
+                "prompt_contract_hash",
+                "visible_injection_manifest_hash",
+            )
+        )
+    )
+    selection_hash = str(selection.get("selection_hash") or "").strip()
+    selection_unsigned = {
+        key: value
+        for key, value in selection.items()
+        if key != "selection_hash"
+    }
+    batch_child_authority = (
+        selection.get("batch_child_authority")
+        if isinstance(selection.get("batch_child_authority"), Mapping)
+        else {}
+    )
+    batch_authority_hash = str(
+        batch_child_authority.get("authority_hash") or ""
+    ).strip()
+    batch_authority_unsigned = {
+        key: value
+        for key, value in batch_child_authority.items()
+        if key != "authority_hash"
+    }
+    authoritative_batch_lane_intents = (
+        batch_child_authority.get("lane_intents")
+        if isinstance(batch_child_authority.get("lane_intents"), list)
+        else []
+    )
+    authoritative_batch_lane_intent = (
+        authoritative_batch_lane_intents[0]
+        if len(authoritative_batch_lane_intents) == 1
+        and isinstance(authoritative_batch_lane_intents[0], Mapping)
+        else {}
+    )
+    batch_lane_intent_matches_plan = bool(
+        batch_child_authority.get("lane_intents_authority_present") is True
+        and len(lane_mappings) == 1
+        and authoritative_batch_lane_intent
+        and str(batch_child_authority.get("lane_intents_hash") or "").strip()
+        == stable_sha256(authoritative_batch_lane_intents)
+        and all(
+            str(lane_mappings[0].get(field) or "").strip()
+            == str(authoritative_batch_lane_intent.get(field) or "").strip()
+            for field in ("task_id", "worker_id", "worker_slot_id")
+        )
+        and sorted(
+            str(path).strip()
+            for path in lane_mappings[0].get("owned_files") or []
+            if str(path).strip()
+        )
+        == sorted(
+            str(path).strip()
+            for path in authoritative_batch_lane_intent.get("owned_files") or []
+            if str(path).strip()
+        )
+    )
+    standalone_cardinality = bool(
+        required_count == 2
+        and selection.get("batch_row_scoped_successor") is False
+        and not batch_child_authority
+        and selection.get("atomic_dispatch_required") is True
+    )
+    verified_batch_child_cardinality = bool(
+        required_count == 1
+        and selection.get("batch_row_scoped_successor") is True
+        and batch_child_authority.get("schema_version")
+        == "contract_runtime.mf_batch_child_worker_cardinality_authority.v1"
+        and batch_child_authority.get("server_derived") is True
+        and batch_child_authority.get("db_verified") is True
+        and str(batch_child_authority.get("project_id") or "").strip()
+        == str(execution_state.get("project_id") or "").strip()
+        and str(batch_child_authority.get("child_backlog_id") or "").strip()
+        == str(execution_state.get("backlog_id") or "").strip()
+        and int(batch_child_authority.get("required_worker_count") or 0) == 1
+        and batch_child_authority.get("worker_count_policy") == "exactly"
+        and batch_child_authority.get("atomic_dispatch_required") is False
+        and batch_child_authority.get(
+            "standalone_mf_parallel_policy_unchanged"
+        )
+        is True
+        and batch_lane_intent_matches_plan
+        and batch_authority_hash
+        == stable_sha256(batch_authority_unsigned)
+    )
+    required_route_fields = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "route_token_ref",
+        "visible_injection_manifest_hash",
+    )
+    persisted_route_binding = (
+        metadata.get("route_token_ref_binding")
+        if isinstance(metadata.get("route_token_ref_binding"), Mapping)
+        else {}
+    )
+    parent_route_refs = [
+        value
+        for value in (
+            str(metadata.get("enter_only_route_token_ref") or "").strip(),
+            str(metadata.get("parent_route_token_ref") or "").strip(),
+            str(
+                persisted_route_binding.get("parent_route_token_ref") or ""
+            ).strip(),
+            str(
+                metadata.get("terminal_supersession_enter_route_token_ref")
+                or ""
+            ).strip(),
+        )
+        if value
+    ]
+    expected_route_token_ref = (
+        parent_route_refs[0] if parent_route_refs else ""
+    )
+    persisted_parent_route_identity = (
+        persisted_route_binding.get("parent_route_identity")
+        if isinstance(
+            persisted_route_binding.get("parent_route_identity"), Mapping
+        )
+        else (
+            persisted_route_binding.get(
+                "observer_route_context_issue_payload"
+            )
+            or {}
+        ).get("parent_route_identity")
+        if isinstance(
+            (
+                persisted_route_binding.get(
+                    "observer_route_context_issue_payload"
+                )
+                or {}
+            ).get("parent_route_identity"),
+            Mapping,
+        )
+        else metadata.get("terminal_supersession_enter_route_identity")
+        if isinstance(
+            metadata.get("terminal_supersession_enter_route_identity"),
+            Mapping,
+        )
+        else {}
+    )
+    unsigned_plan = {
+        key: value for key, value in plan.items() if key != "plan_hash"
+    }
+    plan_complete = bool(
+        plan.get("schema_version") == "mf_parallel.observer_prefill_child_plan.v1"
+        and str(plan.get("source") or "").strip()
+        in {
+            "authenticated_observer_mf_parallel_enter",
+            "contract_terminal_supersession_policy",
+        }
+        and plan.get("server_canonicalized") is True
+        and str(plan.get("project_id") or "").strip()
+        == str(execution_state.get("project_id") or "").strip()
+        and str(plan.get("backlog_id") or "").strip()
+        == str(execution_state.get("backlog_id") or "").strip()
+        and str(plan.get("contract_execution_id") or "").strip()
+        == str(execution_state.get("contract_execution_id") or "").strip()
+        and selection.get("schema_version")
+        == "mf_parallel.observer_worker_cardinality_selection.v1"
+        and selection.get("observer_selected") is True
+        and selection.get("selection_frozen") is True
+        and selection.get("selection_frozen_at_enter") is True
+        and selection.get("worker_count_policy") == "exactly"
+        and selection_hash == stable_sha256(selection_unsigned)
+        and (standalone_cardinality or verified_batch_child_cardinality)
+        and int(plan.get("required_worker_count") or 0) == required_count
+        and plan.get("worker_count_policy") == "exactly"
+        and plan.get("atomic_dispatch_required") == (required_count == 2)
+        and len(lanes) == required_count
+        and len(lane_mappings) == required_count
+        and all(
+            values
+            and all(concrete(value) for value in values)
+            and len(values) == len(set(values))
+            for values in identity_sets
+        )
+        and all(lane.get("owned_files") for lane in lane_mappings)
+        and len(lane_files) == len(set(lane_files))
+        and sorted(set(lane_files)) == expected_files
+        and command_authority.get("schema_version")
+        == "mf_parallel.project_test_command_authority.v1"
+        and str(command_authority.get("project_id") or "").strip()
+        == str(execution_state.get("project_id") or "").strip()
+        and command_authority.get("source") == "project_config.testing"
+        and test_commands
+        and command_authority_hash == stable_sha256(command_authority_unsigned)
+        and list(plan.get("test_commands") or []) == test_commands
+        and all(
+            list(lane.get("test_commands") or []) == test_commands
+            and str(lane.get("test_command_authority_hash") or "").strip()
+            == command_authority_hash
+            for lane in lane_mappings
+        )
+        and route_binding.get("schema_version")
+        == "mf_parallel.parent_route_binding.v1"
+        and concrete(route_binding.get("route_token_ref"))
+        and all(concrete(route_identity.get(field)) for field in required_route_fields)
+        and canonical_route_identity
+        and bool(parent_route_refs)
+        and len(set(parent_route_refs)) == 1
+        and str(route_binding.get("route_token_ref") or "").strip()
+        == str(route_identity.get("route_token_ref") or "").strip()
+        == expected_route_token_ref
+        and all(
+            str(route_identity.get(field) or "").strip()
+            == str(persisted_parent_route_identity.get(field) or "").strip()
+            for field in required_route_fields
+        )
+        and route_binding_hash == stable_sha256(route_binding_unsigned)
+        and str(plan.get("plan_hash") or "").strip()
+        == stable_sha256(unsigned_plan)
+    )
+    if not plan_complete:
+        return [
+            "mf_parallel rev10 prefill requires one complete server-admitted typed child plan"
+        ]
+    line_id = str(write.get("line_id") or "").strip()
+    expected_payload = {
+        "schema_version": "mf_parallel.observer_prefill_child_contracts.v1",
+        "child_plan": dict(plan),
+        "child_plan_hash": str(plan.get("plan_hash") or "").strip(),
+    }
+    if line_id == "observer_dispatch_bounded_workers":
+        prefill_admitted = any(
+            isinstance(line, Mapping)
+            and str(line.get("stage_id") or "").strip() == "orchestration"
+            and str(line.get("line_id") or "").strip()
+            == "observer_prefill_child_contracts"
+            and str(line.get("evidence_kind") or "").strip()
+            == "contract_binding"
+            and isinstance(line.get("payload"), Mapping)
+            and stable_sha256(dict(line["payload"]))
+            == stable_sha256(expected_payload)
+            for line in execution_state.get("completed_lines") or []
+        )
+        if not prefill_admitted:
+            return [
+                "mf_parallel rev10 dispatch requires the accepted prefill child plan"
+            ]
+        dispatch_payload = (
+            write.get("payload")
+            if isinstance(write.get("payload"), Mapping)
+            else write
+        )
+        workers = (
+            dispatch_payload.get("bounded_workers")
+            if isinstance(dispatch_payload.get("bounded_workers"), list)
+            else []
+        )
+        worker_mappings = [
+            worker for worker in workers if isinstance(worker, Mapping)
+        ]
+
+        def normalized_files(value: Any) -> list[str]:
+            return sorted(
+                {
+                    str(item).strip()
+                    for item in value or []
+                    if str(item).strip()
+                }
+            )
+
+        def normalized_values(value: Any) -> list[str]:
+            return [
+                str(item).strip()
+                for item in value or []
+                if str(item).strip()
+            ]
+
+        workers_by_task_id = {
+            str(worker.get("task_id") or "").strip(): worker
+            for worker in worker_mappings
+            if str(worker.get("task_id") or "").strip()
+        }
+        lane_task_ids = {
+            str(lane.get("task_id") or "").strip()
+            for lane in lane_mappings
+            if str(lane.get("task_id") or "").strip()
+        }
+        lane_custody_matches = bool(
+            len(worker_mappings) == len(lane_mappings)
+            and len(workers_by_task_id) == len(worker_mappings)
+            and set(workers_by_task_id) == lane_task_ids
+            and all(
+                all(
+                    str(worker.get(field) or "").strip()
+                    == str(lane.get(field) or "").strip()
+                    for field in ("task_id", "worker_id", "worker_slot_id")
+                )
+                and normalized_files(worker.get("owned_files"))
+                == normalized_files(lane.get("owned_files"))
+                and normalized_files(worker.get("test_files"))
+                == normalized_files(lane.get("test_files"))
+                and normalized_values(worker.get("test_commands"))
+                == normalized_values(lane.get("test_commands"))
+                for lane in lane_mappings
+                for worker in [
+                    workers_by_task_id[str(lane.get("task_id") or "").strip()]
+                ]
+            )
+        )
+        if not lane_custody_matches:
+            return [
+                "mf_parallel rev10 dispatch lane custody must equal the accepted prefill child plan"
+            ]
+        return []
+    actual_payload = (
+        dict(write.get("payload"))
+        if isinstance(write.get("payload"), Mapping)
+        else {}
+    )
+    if stable_sha256(actual_payload) != stable_sha256(expected_payload):
+        return [
+            "mf_parallel rev10 prefill child plan must equal the exact mf_parallel_enter projection"
+        ]
+    return []
 
 
 def _validate_worker_receipt_hash_evidence(
