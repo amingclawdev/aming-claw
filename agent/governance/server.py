@@ -84011,6 +84011,7 @@ def _contract_timeline_scope_from_graph_body(body: Mapping[str, Any]) -> dict[st
     ).strip()
     task_id = str(
         body.get("task_id")
+        or body.get("contract_execution_id")
         or evidence.get("task_id")
         or evidence.get("parent_task_id")
         or backlog_id

@@ -90998,7 +90998,7 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         "run_id": "current-full-direct-main-rev2",
         "expected_old_snapshot_id": exact_snapshot_id,
         "backlog_id": backlog_id,
-        "task_id": task_id,
+        "contract_execution_id": task_id,
         "observer_session_id": observer_session_id,
         "observer_route_token_ref": route_token_ref,
     }
@@ -91219,6 +91219,15 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     assert reconcile_status == 201
     assert reconcile["activated"] is True
     assert reconcile["active_snapshot_id"] == snapshot_id
+    reconcile_event = conn.execute(
+        """SELECT backlog_id, task_id, event_type
+             FROM task_timeline_events
+            WHERE project_id = ? AND id = ?""",
+        (PID, int(reconcile["timeline_event_recorded"]["id"])),
+    ).fetchone()
+    assert reconcile_event["backlog_id"] == backlog_id
+    assert reconcile_event["task_id"] == task_id
+    assert reconcile_event["event_type"] == "graph.reconcile"
     current_full_authority = (
         server._operator_supervised_direct_main_current_full_reconcile_authority(
             conn,
