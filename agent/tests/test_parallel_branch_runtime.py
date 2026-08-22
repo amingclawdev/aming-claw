@@ -9369,6 +9369,53 @@ def test_merge_queue_accepts_route_gated_finish_checkpoint_without_raw_fence() -
     assert queued["queue_item"]["branch_head"] == "head-route-checkpoint"
 
 
+def test_merge_queue_finish_checkpoint_preserves_verifier_only_fence_custody() -> None:
+    conn = _runtime_conn()
+    verifier = runtime_context_secret_hash("worker-held-finish-fence")
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="T-route-checkpoint-verifier-only",
+            batch_id="PB-002",
+            branch_ref="refs/heads/codex/t-route-checkpoint-verifier-only",
+            status=STATE_VALIDATED,
+            fence_token="",
+            fence_token_verifier=verifier,
+            base_commit="base-route-checkpoint-verifier-only",
+            head_commit="head-route-checkpoint-verifier-only",
+            target_head_commit="target-route-checkpoint-verifier-only",
+            checkpoint_id="ckpt-route-checkpoint-verifier-only",
+            replay_source="mf_sub_finish_gate",
+        ),
+        now_iso=NOW,
+    )
+
+    queued = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="T-route-checkpoint-verifier-only",
+        merge_queue_id="mergeq-route-checkpoint-verifier-only",
+        require_finish_gate=True,
+        checkpoint_id="ckpt-route-checkpoint-verifier-only",
+        allow_finish_checkpoint_without_fence=True,
+        now_iso=NOW,
+    )
+
+    persisted = get_branch_context(
+        conn,
+        PROJECT_ID,
+        "T-route-checkpoint-verifier-only",
+    )
+    assert persisted is not None
+    assert queued["context"]["checkpoint_id"] == (
+        "ckpt-route-checkpoint-verifier-only"
+    )
+    assert persisted.fence_token == ""
+    assert persisted.fence_token_verifier == verifier
+    assert runtime_context_fence_token_verifier(persisted) == verifier
+
+
 def test_merge_queue_materialize_repairs_legacy_queued_finish_context() -> None:
     conn = _runtime_conn()
     upsert_branch_context(
