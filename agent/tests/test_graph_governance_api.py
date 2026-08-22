@@ -90195,7 +90195,9 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     assert direct_graph_identity["commit_sha"] == parent_commit
     one_shot_world = conn.execute(
         """SELECT snapshot_id, commit_sha, graph_basis, root_identity_json,
-                  root_identity_hash, query_root_identity_hash, status
+                  root_identity_hash, query_root_identity_hash, status,
+                  (SELECT COUNT(*) FROM graph_query_events
+                    WHERE trace_id = graph_query_traces.trace_id) AS event_count
              FROM graph_query_traces WHERE trace_id = ?""",
         (trace_id,),
     ).fetchone()
@@ -90203,6 +90205,7 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     assert one_shot_world["commit_sha"] == parent_commit
     assert one_shot_world["graph_basis"] == ""
     assert one_shot_world["status"] == "complete"
+    assert one_shot_world["event_count"] == 1
     one_shot_root_identity = json.loads(one_shot_world["root_identity_json"])
     assert one_shot_root_identity["schema_version"] == (
         "graph_query.root_identity.v1"
