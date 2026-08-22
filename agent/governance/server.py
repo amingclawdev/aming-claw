@@ -115622,6 +115622,7 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
     from .parallel_branch_runtime import (
         ACTIVE_MF_SUBAGENT_GRAPH_QUERY_STATES,
         MERGE_READY_INPUT_STATES,
+        runtime_context_fence_token_verifier,
     )
 
     execution_id = str(record.get("contract_execution_id") or "").strip()
@@ -115883,7 +115884,7 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
         in allowed_context_states
         and str(getattr(context, "backlog_id", "") or backlog_id).strip()
         == backlog_id
-        and str(getattr(context, "fence_token", "") or "").strip()
+        and runtime_context_fence_token_verifier(context)
     ):
         return {}
     expected_optional_claims = {

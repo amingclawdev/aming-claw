@@ -117,3 +117,14 @@ def test_implementation_bypass_continuation_accepts_bound_lane_task_event_id():
     assert '"line_instance_id":line_instance_id' in "".join(
         strict_audit_source.split()
     )
+
+
+def test_implementation_bypass_continuation_uses_persisted_fence_verifier():
+    anchor_source = "".join(
+        inspect.getsource(
+            server._contract_runtime_worker_implementation_bypass_continuation_anchor
+        ).split()
+    )
+
+    assert "runtime_context_fence_token_verifier(context)" in anchor_source
+    assert 'getattr(context,"fence_token","")' not in anchor_source
