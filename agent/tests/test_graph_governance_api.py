@@ -6576,6 +6576,7 @@ def _live_worker_commit_after_implementation_bypass_case(
     tmp_path,
     *,
     suffix: str,
+    persist_no_pass_generation: bool = False,
 ) -> dict[str, Any]:
     backlog_id = f"AC-WORKER-IMPLEMENTATION-LIVE-BYPASS-{suffix.upper()}"
     diagnostic_id = f"AC-CONTRACT-LINE-LIVE-BYPASS-{suffix.upper()}"
@@ -6755,8 +6756,6 @@ def _live_worker_commit_after_implementation_bypass_case(
         )
     )
     assert bypass["ok"] is True, json.dumps(bypass, indent=2, sort_keys=True)
-    # This helper intentionally models the immutable pre-generation v1 rows
-    # that exercise persisted worker-commit continuation compatibility.
     legacy_record = runtime.store.get(execution_id)
     implementation_bypass = next(
         line
@@ -6765,13 +6764,16 @@ def _live_worker_commit_after_implementation_bypass_case(
         and isinstance(line.get("payload"), dict)
         and line["payload"].get("bypass_identity") == bypass_identity
     )
-    implementation_bypass["payload"].pop("no_pass_generation", None)
-    runtime.store.update(
-        execution_id,
-        legacy_record,
-        expected_revision=int(legacy_record["execution_state_revision"]),
-    )
-    conn.commit()
+    if not persist_no_pass_generation:
+        # Most existing tests intentionally model immutable pre-generation v1
+        # rows.  Modern custody tests retain the server-persisted generation.
+        implementation_bypass["payload"].pop("no_pass_generation", None)
+        runtime.store.update(
+            execution_id,
+            legacy_record,
+            expected_revision=int(legacy_record["execution_state_revision"]),
+        )
+        conn.commit()
     assert implementation_bypass["actor_role"] == "observer"
     assert implementation_bypass["evidence_kind"] == "contract_line_bypass"
     assert implementation_bypass["line_instance_id"] == (
@@ -6951,16 +6953,20 @@ def _persisted_worker_commit_bypass_case(
     tmp_path,
     *,
     suffix: str,
+    persist_no_pass_generation: bool = False,
 ) -> dict[str, Any]:
     case = _live_worker_commit_after_implementation_bypass_case(
         conn,
         tmp_path,
         suffix=suffix,
+        persist_no_pass_generation=persist_no_pass_generation,
     )
     guide = case["record"]["runtime_guide"]
     revision = int(case["record"]["execution_state_revision"])
     worker_commit_diagnostic_id = (
-        f"AC-CONTRACT-LINE-WORKER-COMMIT-BYPASS-{suffix.upper()}"
+        case["diagnostic_id"]
+        if persist_no_pass_generation
+        else f"AC-CONTRACT-LINE-WORKER-COMMIT-BYPASS-{suffix.upper()}"
     )
     response = server.handle_project_contract_runtime_line_bypass(
         _ctx_with_role(
@@ -7021,6 +7027,196 @@ def _persisted_worker_commit_bypass_case(
         }
     )
     return case
+
+
+def test_inherited_worker_commit_bypass_persists_candidate_custody_on_one_no_pass_root(
+    conn,
+    tmp_path,
+):
+    case = _persisted_worker_commit_bypass_case(
+        conn,
+        tmp_path,
+        suffix="modern-inherited-custody",
+        persist_no_pass_generation=True,
+    )
+    implementation_generation = case["implementation_bypass"]["payload"][
+        "no_pass_generation"
+    ]
+    worker_commit = case["worker_commit_bypass"]
+    worker_generation = worker_commit["payload"]["no_pass_generation"]
+    continuation = worker_commit["payload"]["continuation_authority"]
+    inherited = continuation["inherited_no_pass_continuation"]
+
+    assert worker_generation["role"] == "inherited_gate"
+    assert worker_generation["generation_id"] == implementation_generation[
+        "generation_id"
+    ]
+    assert worker_generation["root_diagnostic_backlog_id"] == case[
+        "diagnostic_id"
+    ]
+    assert inherited == {
+        "schema_version": "contract_runtime.inherited_no_pass_continuation.v1",
+        "generation_id": implementation_generation["generation_id"],
+        "root_bypass_identity": implementation_generation[
+            "root_bypass_identity"
+        ],
+        "root_diagnostic_backlog_id": case["diagnostic_id"],
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+    }
+    _assert_worker_commit_bypass_continuation_v2(continuation, case)
+    assert worker_commit["commit_sha"] == case["candidate_commit"]
+    assert worker_commit["runtime_context_id"] == case["runtime_context_id"]
+    assert worker_commit["task_id"] == case["task_id"]
+    assert server._contract_runtime_server_candidate_commit(
+        conn,
+        project_id=PID,
+        record=case["record"],
+    ) == case["candidate_commit"]
+    assert conn.execute(
+        "SELECT COUNT(*) AS count FROM backlog_bugs WHERE bug_id = ?",
+        (case["diagnostic_id"],),
+    ).fetchone()["count"] == 1
+    inherited_link = next(
+        event
+        for event in case["worker_commit_response"]["timeline_events"]
+        if event["event_type"] == "contract_line_bypass_diagnostic_linked"
+    )
+    assert inherited_link["payload"]["diagnostic_created"] is False
+    assert inherited_link["payload"]["root_diagnostic_backlog_id"] == case[
+        "diagnostic_id"
+    ]
+
+
+def test_inherited_no_pass_continuation_is_position_bounded():
+    root = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "contract_line_bypass",
+        "status": "waived",
+        "no_pass_claim": True,
+        "line_instance_id": "runtime_context:mfrctx-position-bound",
+        "payload": {
+            "schema_version": "contract_line_bypass.v1",
+            "bypass_identity": "bypass:cex-position-bound:revision-2:worker_implementation",
+            "diagnostic_backlog_id": "AC-POSITION-BOUND-NO-PASS",
+            "disposition": "proceeded_with_exception",
+            "no_pass_claim": True,
+            "no_pass_generation": {
+                "schema_version": "contract_line_bypass_generation_link.v1",
+                "generation_id": "bypassgen-position-bound",
+                "role": "root",
+            },
+        },
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-POSITION-BOUND",
+        "contract_execution_id": "cex-position-bound",
+        "completed_lines": [
+            {"line_id": "worker_commit", "evidence_kind": "contract_line_bypass"},
+            root,
+        ],
+    }
+
+    assert server._contract_runtime_inherited_no_pass_continuation(
+        record,
+        before_completed_line_index=1,
+    ) == {}
+    inherited = server._contract_runtime_inherited_no_pass_continuation(
+        record,
+        before_completed_line_index=2,
+    )
+    assert inherited["generation_id"] == "bypassgen-position-bound"
+    assert inherited["root_bypass_identity"] == root["payload"][
+        "bypass_identity"
+    ]
+    assert inherited["root_diagnostic_backlog_id"] == root["payload"][
+        "diagnostic_backlog_id"
+    ]
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["wrong_commit", "wrong_lane", "dirty_worktree", "forged_root"],
+)
+def test_inherited_worker_commit_bypass_rejects_unverified_custody_zero_write(
+    conn,
+    tmp_path,
+    variant,
+):
+    case = _live_worker_commit_after_implementation_bypass_case(
+        conn,
+        tmp_path,
+        suffix=f"modern-inherited-{variant}",
+        persist_no_pass_generation=True,
+    )
+    record = case["record"]
+    guide = record["runtime_guide"]
+    revision = int(record["execution_state_revision"])
+    body = {
+        **case["request"],
+        "actor_role": "observer",
+        "bypass_identity": (
+            f"bypass:{case['execution_id']}:revision-{revision}:worker_commit"
+        ),
+        "execution_state_revision": revision,
+        "runtime_guide_hash": guide["runtime_guide_hash"],
+        "diagnostic_backlog_id": case["diagnostic_id"],
+        "classification": "system_logic",
+        "reason": "reject unverified inherited candidate custody",
+        "decision": "continue_with_audited_exception",
+    }
+    expected_exception = GovernanceError
+    if variant == "wrong_commit":
+        body["commit_sha"] = "f" * 40
+        body["evidence_refs"][0] = f"commit:{'f' * 40}"
+    elif variant == "wrong_lane":
+        body["runtime_context_id"] = "mfrctx-forged-other-lane"
+    elif variant == "dirty_worktree":
+        (case["worktree"] / "owned.py").write_text(
+            "uncommitted caller-authored custody\n",
+            encoding="utf-8",
+        )
+    else:
+        body["diagnostic_backlog_id"] = "AC-FORGED-NO-PASS-ROOT"
+        expected_exception = ValidationError
+
+    runtime = server._contract_runtime(conn)
+    before_record = runtime.store.get(case["execution_id"])
+    before_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=case["backlog_id"],
+        limit=1000,
+    )
+    before_diagnostics = conn.execute(
+        "SELECT COUNT(*) AS count FROM backlog_bugs WHERE mf_type = 'chain_rescue'"
+    ).fetchone()["count"]
+
+    with pytest.raises(expected_exception):
+        server.handle_project_contract_runtime_line_bypass(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": case["execution_id"],
+                },
+                "observer",
+                method="POST",
+                body=body,
+            )
+        )
+
+    assert runtime.store.get(case["execution_id"]) == before_record
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=case["backlog_id"],
+        limit=1000,
+    ) == before_events
+    assert conn.execute(
+        "SELECT COUNT(*) AS count FROM backlog_bugs WHERE mf_type = 'chain_rescue'"
+    ).fetchone()["count"] == before_diagnostics
 
 
 def test_persisted_worker_commit_bypass_remains_revalidated_no_pass_candidate_authority(
@@ -8280,6 +8476,7 @@ def test_worker_commit_bypass_v3_persists_open_diagnostic_and_revalidates_readba
         request=case["persisted_line"],
     )
     _assert_worker_commit_bypass_continuation_v3(authority, case)
+    assert "inherited_no_pass_continuation" not in authority
     assert authority["persisted_worker_commit_bypass_audit"][
         "diagnostic_backlog_id"
     ] == case["diagnostic_id"]

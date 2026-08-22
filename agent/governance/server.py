@@ -115915,6 +115915,57 @@ def _contract_runtime_strict_no_pass_bypass_audit(
         "disposition": "proceeded_with_exception",
         "no_pass_claim": True,
     }
+    generation_link = (
+        payload.get("no_pass_generation")
+        if isinstance(payload.get("no_pass_generation"), Mapping)
+        else {}
+    )
+    inherited_generation = bool(
+        str(generation_link.get("role") or "").strip() == "inherited_gate"
+    )
+    if inherited_generation:
+        active_generation = _contract_runtime_no_pass_generation(record)
+        if not (
+            active_generation.get("root_generation_persisted") is True
+            and str(generation_link.get("generation_id") or "").strip()
+            == str(active_generation.get("generation_id") or "").strip()
+            and str(
+                generation_link.get("root_bypass_identity") or ""
+            ).strip()
+            == str(
+                active_generation.get("root_bypass_identity") or ""
+            ).strip()
+            and str(
+                generation_link.get("root_diagnostic_backlog_id") or ""
+            ).strip()
+            == diagnostic_id
+            == str(
+                active_generation.get("root_diagnostic_backlog_id") or ""
+            ).strip()
+            and str(generation_link.get("root_line_id") or "").strip()
+            == str(active_generation.get("root_line_id") or "").strip()
+            and generation_link.get("diagnostic_created") is False
+            and generation_link.get("no_pass_claim") is True
+            and generation_link.get("authoritative_pass_synthesized") is False
+        ):
+            return {}
+        diagnostic_binding.update(
+            {
+                "line_id": str(
+                    active_generation.get("root_line_id") or ""
+                ).strip(),
+                "execution_state_revision": int(
+                    active_generation.get("root_execution_state_revision")
+                    or 0
+                ),
+                "bypass_identity": str(
+                    active_generation.get("root_bypass_identity") or ""
+                ).strip(),
+                "classification": str(
+                    active_generation.get("root_classification") or ""
+                ).strip(),
+            }
+        )
     try:
         diagnostic = conn.execute(
             "SELECT status, mf_type, chain_trigger_json, bypass_policy_json "
@@ -116005,7 +116056,11 @@ def _contract_runtime_strict_no_pass_bypass_audit(
         "record_blocker",
         actor_role,
         "proceeded_with_exception",
-        "linked_open_diagnostic_no_pass",
+        (
+            "inherited_root_diagnostic_no_pass"
+            if inherited_generation
+            else "linked_open_diagnostic_no_pass"
+        ),
         backlog_id,
         execution_id,
         expected_line_id,
@@ -116017,7 +116072,11 @@ def _contract_runtime_strict_no_pass_bypass_audit(
     )
     expected_diagnostic = list(expected_source)
     expected_diagnostic[2] = "open"
-    expected_diagnostic[3] = "keep_open_until_block_repaired"
+    expected_diagnostic[3] = (
+        "record_inherited_gate_reason_keep_root_open"
+        if inherited_generation
+        else "keep_open_until_block_repaired"
+    )
     source_event = source_events[0]
     diagnostic_event = diagnostic_events[0]
     source_event_id = _contract_runtime_projection_timeline_event_id(
@@ -116770,6 +116829,47 @@ def _contract_runtime_raw_current_chain_authority(
     return projection
 
 
+def _contract_runtime_inherited_no_pass_continuation(
+    record: Mapping[str, Any],
+    *,
+    before_completed_line_index: int,
+) -> dict[str, Any]:
+    """Project the existing modern no-PASS root without minting new custody."""
+
+    generation = _contract_runtime_no_pass_generation(record)
+    try:
+        root_index = int(generation.get("root_completed_line_index"))
+    except (TypeError, ValueError):
+        return {}
+    if not (
+        generation.get("root_generation_persisted") is True
+        and 0 <= root_index < int(before_completed_line_index)
+    ):
+        return {}
+    inherited = {
+        "schema_version": "contract_runtime.inherited_no_pass_continuation.v1",
+        "generation_id": str(generation.get("generation_id") or "").strip(),
+        "root_bypass_identity": str(
+            generation.get("root_bypass_identity") or ""
+        ).strip(),
+        "root_diagnostic_backlog_id": str(
+            generation.get("root_diagnostic_backlog_id") or ""
+        ).strip(),
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+    }
+    if not all(
+        inherited.get(field)
+        for field in (
+            "generation_id",
+            "root_bypass_identity",
+            "root_diagnostic_backlog_id",
+        )
+    ):
+        return {}
+    return inherited
+
+
 def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
     conn,
     *,
@@ -117315,6 +117415,12 @@ def _contract_runtime_normal_worker_commit_epoch_bypass_authority(
         "graph_epoch_transition_authority": graph_epoch,
         "canonical_owned_file_provenance": canonical_provenance,
     }
+    inherited_no_pass = _contract_runtime_inherited_no_pass_continuation(
+        record,
+        before_completed_line_index=stop,
+    )
+    if inherited_no_pass:
+        continuation["inherited_no_pass_continuation"] = inherited_no_pass
     if persisted_request:
         if not embedded_continuation or stable_sha256(
             embedded_continuation
@@ -117383,6 +117489,18 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
     completed = [
         line for line in record.get("completed_lines") or [] if isinstance(line, Mapping)
     ]
+
+    def bind_inherited_no_pass_generation(
+        continuation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Join modern no-PASS lineage to server-derived candidate custody."""
+
+        if not inherited_no_pass:
+            return dict(continuation)
+        return {
+            **dict(continuation),
+            "inherited_no_pass_continuation": dict(inherited_no_pass),
+        }
     stop = len(completed)
     persisted_request = False
     for index, line in enumerate(completed):
@@ -117390,6 +117508,10 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
             stop = index
             persisted_request = True
             break
+    inherited_no_pass = _contract_runtime_inherited_no_pass_continuation(
+        record,
+        before_completed_line_index=stop,
+    )
     requested_runtime_context_id = _timeline_first_deep_text(
         request, "runtime_context_id"
     )
@@ -117556,7 +117678,7 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
             for key, value in bypass_anchor.items()
             if key != "context"
         }
-        continuation = {
+        continuation = bind_inherited_no_pass_generation({
             "schema_version": (
                 "contract_runtime.worker_commit_bypass_continuation.v2"
             ),
@@ -117589,7 +117711,9 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
             "historical_lineage_stale": False,
             "canonical_historical_commit_sha": "",
             "implementation_bypass_anchor": public_anchor,
-        }
+        })
+        if not continuation:
+            return {}
         if persisted_request:
             embedded_continuation = (
                 payload.get("continuation_authority")
@@ -117619,7 +117743,7 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
         )
     )
     if epoch_transition:
-        return epoch_transition
+        return bind_inherited_no_pass_generation(epoch_transition)
     runtime_context_id = _timeline_first_deep_text(
         implementation, "runtime_context_id"
     )
@@ -117704,7 +117828,7 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
         return {}
     if historical_lineage_stale and _active_failed_qa_line_index(completed[:stop]) < 0:
         return {}
-    return {
+    return bind_inherited_no_pass_generation({
         "schema_version": "contract_runtime.worker_commit_bypass_continuation.v1",
         "server_derived": True,
         "db_verified": True,
@@ -117735,7 +117859,7 @@ def _contract_runtime_worker_commit_bypass_continuation_authority(
         "clean_worktree": True,
         "historical_lineage_stale": historical_lineage_stale,
         "canonical_historical_commit_sha": canonical_historical_commit_sha,
-    }
+    })
 
 
 def _contract_runtime_server_candidate_commit(
@@ -194290,25 +194414,7 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
                     )
             body["diagnostic_backlog_id"] = diagnostic_id
             continuation_authority = {}
-            if (
-                str(body.get("line_id") or "").strip() == "worker_commit"
-                and inherit_no_pass_generation
-            ):
-                continuation_authority = {
-                    "schema_version": (
-                        "contract_runtime.inherited_no_pass_continuation.v1"
-                    ),
-                    "generation_id": str(
-                        no_pass_generation.get("generation_id") or ""
-                    ),
-                    "root_bypass_identity": str(
-                        no_pass_generation.get("root_bypass_identity") or ""
-                    ),
-                    "root_diagnostic_backlog_id": root_diagnostic_id,
-                    "no_pass_claim": True,
-                    "authoritative_pass_synthesized": False,
-                }
-            elif str(body.get("line_id") or "").strip() == "worker_commit":
+            if str(body.get("line_id") or "").strip() == "worker_commit":
                 continuation_authority = (
                     _contract_runtime_worker_commit_bypass_continuation_authority(
                         conn,
