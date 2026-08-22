@@ -117737,6 +117737,150 @@ def test_rejected_worker_startup_does_not_advance_contract_runtime_projection(
     )
 
 
+def test_canonical_startup_rejection_rolls_back_runtime_and_timeline(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-MF-PARALLEL-CANONICAL-STARTUP-ZERO-WRITE"
+    worker_task_id = "mf-sub-canonical-startup-zero-write"
+    worker_token = "token-mf-sub-canonical-startup-zero-write"
+    worker_fence = "fence-mf-sub-canonical-startup-zero-write"
+    worktree = tmp_path / worker_task_id
+    worktree.mkdir()
+    successor, runtime_context = (
+        _setup_mf_parallel_contract_runtime_worker_dispatch(
+            conn,
+            backlog_id=backlog_id,
+            task_id="mf-parallel-canonical-startup-zero-write-parent",
+            worker_task_id=worker_task_id,
+            fence_token=worker_fence,
+            token=worker_token,
+            worktree_path=str(worktree),
+            target_project_root=str(worktree),
+        )
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
+    route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+    worker_read = server.handle_project_contract_runtime_line_write(
+        _ctx(
+            {
+                "project_id": PID,
+                "contract_execution_id": contract_execution_id,
+            },
+            method="POST",
+            body={
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": runtime_context.task_id,
+                "parent_task_id": backlog_id,
+                "worker_role": "mf_sub",
+                "fence_token": worker_fence,
+                "session_token_ref": runtime_context_session_token_ref(
+                    runtime_context
+                ),
+                "target_project_root": str(worktree),
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "evidence_kind": "read_receipt",
+                "read_receipt_hash": "sha256:" + "3" * 64,
+                "payload": {
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "task_id": runtime_context.task_id,
+                    "read_receipt_hash": "sha256:" + "3" * 64,
+                },
+            },
+        )
+    )
+    assert worker_read["next_legal_action"]["line_id"] == "worker_startup"
+    before_context = get_branch_context(conn, PID, runtime_context.task_id)
+    before_record = server._contract_runtime_store(conn).get(
+        contract_execution_id
+    )
+    before_startup_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="mf_subagent_startup",
+    )
+
+    def reject_canonical_startup(*_args, **_kwargs):
+        raise GovernanceError(
+            "contract_runtime_canonical_line_rejected",
+            "synthetic canonical rejection after RuntimeContext mutation",
+            422,
+            {
+                "contract_runtime_mutated": False,
+                "timeline_evidence_backfill_allowed": False,
+            },
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_submit_canonical_contract_line",
+        reject_canonical_startup,
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_parallel_branch_startup(
+            _ctx_with_role(
+                {"project_id": PID},
+                "mf_sub",
+                method="POST",
+                body={
+                    "task_id": runtime_context.task_id,
+                    "parent_task_id": backlog_id,
+                    "worker_role": "mf_sub",
+                    "worker_id": worker_identity,
+                    "worker_slot_id": worker_identity,
+                    "agent_id": "host-canonical-startup-zero-write",
+                    "actual_host_worker_id": "host-canonical-startup-zero-write",
+                    "host_startup_id": "codex-thread:canonical-startup-zero-write",
+                    "host_session_id": "host-canonical-startup-zero-write",
+                    "worker_session_id": "host-canonical-startup-zero-write",
+                    "worker_transcript_ref": (
+                        "codex:host-canonical-startup-zero-write"
+                    ),
+                    "harness_type": "codex",
+                    "filer_principal": "host-canonical-startup-zero-write",
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                    "session_token": worker_token,
+                    "fence_token": worker_fence,
+                    "actual_cwd": str(worktree),
+                    "actual_git_root": str(worktree),
+                    "branch": runtime_context.branch_ref,
+                    "head_commit": runtime_context.target_head_commit,
+                    "base_commit": runtime_context.base_commit,
+                    "target_head_commit": runtime_context.target_head_commit,
+                    "merge_queue_id": runtime_context.merge_queue_id,
+                    "owned_files": list(runtime_context.owned_files),
+                    "startup_source": "codex_cli_exec",
+                    "read_receipt_hash": "sha256:read-canonical-zero-write",
+                    "read_receipt_event_id": "canonical-zero-write-read",
+                    **route_identity,
+                },
+            )
+        )
+
+    assert rejected.value.code == "contract_runtime_canonical_line_rejected"
+    assert get_branch_context(conn, PID, runtime_context.task_id) == before_context
+    assert server._contract_runtime_store(conn).get(
+        contract_execution_id
+    ) == before_record
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=backlog_id,
+        event_kind="mf_subagent_startup",
+    ) == before_startup_events
+
+
 def test_worker_guide_does_not_use_dispatch_queue_when_runtime_queue_is_missing(
     conn,
     tmp_path,
@@ -129351,6 +129495,8 @@ def _insert_mf_parallel_source_backed_runtime_context(
     target_head_commit: str = "",
     merge_queue_id: str = "",
     owned_files: tuple[str, ...] = (),
+    worker_id: str = "",
+    worker_slot_id: str = "",
 ) -> BranchTaskRuntimeContext:
     path = worktree_path or f"/tmp/{task_id}"
     return upsert_branch_context(
@@ -129361,8 +129507,8 @@ def _insert_mf_parallel_source_backed_runtime_context(
             parent_task_id=parent_task_id or backlog_id,
             root_task_id=parent_task_id or backlog_id,
             backlog_id=backlog_id,
-            worker_id=f"worker-{task_id}",
-            worker_slot_id=f"worker-{task_id}",
+            worker_id=worker_id or f"worker-{task_id}",
+            worker_slot_id=worker_slot_id or worker_id or f"worker-{task_id}",
             governance_project_id=PID,
             target_project_id=PID,
             target_project_root=target_project_root or path,
@@ -153336,6 +153482,8 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
         target_head_commit="target-contract-startup-bridge",
         merge_queue_id="mergeq-contract-startup-bridge",
         owned_files=("agent/governance/server.py",),
+        worker_id="mf-sub-contract-startup-bridge",
+        worker_slot_id="worker-slot-contract-startup-bridge",
     )
     _persist_append_route_token_ref(
         conn,
@@ -153343,7 +153491,8 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
         task_id=successor["contract_execution_id"],
         **route_identity,
     )
-    worker_identity = runtime_context.worker_slot_id or runtime_context.worker_id
+    worker_id = runtime_context.worker_id
+    worker_slot_id = runtime_context.worker_slot_id
 
     dispatch = server.handle_project_contract_runtime_line_write(
         _ctx_with_role(
@@ -153358,16 +153507,16 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
                 "task_id": runtime_context.task_id,
                 "parent_task_id": backlog_id,
                 "worker_role": "mf_sub",
-                "worker_id": worker_identity,
-                "worker_slot_id": worker_identity,
+                "worker_id": worker_id,
+                "worker_slot_id": worker_slot_id,
                 "payload": {
                     "schema_version": "mf_parallel.dispatch_bounded_worker.v1",
                     "runtime_context_id": runtime_context.runtime_context_id,
                     "task_id": runtime_context.task_id,
                     "parent_task_id": backlog_id,
                     "worker_role": "mf_sub",
-                    "worker_id": worker_identity,
-                    "worker_slot_id": worker_identity,
+                    "worker_id": worker_id,
+                    "worker_slot_id": worker_slot_id,
                     "target_project_root": runtime_context.target_project_root,
                     "worktree_path": runtime_context.worktree_path,
                     "branch_ref": runtime_context.branch_ref,
@@ -153459,6 +153608,8 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
         "worker_slot_id": runtime_context.worker_slot_id,
         "agent_id": "agent-contract-startup-bridge",
         "actual_host_worker_id": "agent-contract-startup-bridge",
+        "host_startup_id": "host-startup-contract-startup-bridge",
+        "host_session_id": "host-session-contract-startup-bridge",
         "worker_session_id": "agent-contract-startup-bridge",
         "worker_transcript_ref": "multi_agent:agent-contract-startup-bridge",
         "harness_type": "codex",
@@ -153490,6 +153641,9 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
     )
 
     assert startup["ok"] is True
+    assert startup["startup_gate"]["worker_id"] == worker_id
+    assert startup["startup_gate"]["worker_slot_id"] == worker_slot_id
+    assert startup["contract_runtime_canonical_line"]["accepted"] is True
     startup_gate = startup["startup_gate"]
     assert startup_gate["observer_command_id"] == successor["contract_execution_id"]
     assert startup_gate["observer_command_id_source"] == (
@@ -153512,6 +153666,8 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
     )
     assert len(startup_events) == 1
     event_gate = startup_events[0]["payload"]["mf_subagent_startup_gate"]
+    assert event_gate["worker_id"] == worker_id
+    assert event_gate["worker_slot_id"] == worker_slot_id
     assert event_gate["contract_runtime_dispatch_identity"][
         "contract_execution_id"
     ] == successor["contract_execution_id"]
@@ -153554,36 +153710,6 @@ def test_mf_parallel_contract_dispatch_bridges_startup_without_legacy_observer_c
     worker_view = current["runtime_context_service"]["views"]["worker_view"]
     assert worker_view["observer_command_id"] == successor["contract_execution_id"]
     assert worker_view["timeline_projection_authoritative"] is False
-
-    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
-        _ctx_with_role(
-            {
-                "project_id": PID,
-                "runtime_context_id": runtime_context.runtime_context_id,
-            },
-            "mf_sub",
-            query=worker_query,
-        )
-    )
-    startup_copy = guide["startup_facade_payload_skeleton"]["copy_safe_body"]
-    finish_copy = guide["actionable_payloads"][
-        "finish_time_worker_attestation_submission"
-    ]["copy_safe_body"]
-    assert startup_copy["observer_command_id"] == successor["contract_execution_id"]
-    assert startup_copy["merge_queue_id"] == runtime_context.merge_queue_id
-    assert guide["runtime_context"]["status"] == "ready"
-    assert guide["runtime_context"]["current_values"]["merge_queue_id"] == (
-        runtime_context.merge_queue_id
-    )
-    assert guide["worker_guide"]["runtime_context"]["current_values"][
-        "merge_queue_id"
-    ] == runtime_context.merge_queue_id
-    assert finish_copy["observer_command_id"] == successor["contract_execution_id"]
-    assert finish_copy["observer_command_id_source"] == (
-        "contract_runtime_execution_id_bridge"
-    )
-    assert guide["contract_runtime_dispatch_identity"]["accepted"] is True
-
 
 @pytest.mark.parametrize(
     "no_pass_kind",

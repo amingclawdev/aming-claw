@@ -73017,6 +73017,23 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                     worker_slot_id = str(
                         runtime_context.worker_slot_id or worker_id
                     )
+                    # The host startup gate historically used the worker slot
+                    # as its ``worker_id`` compatibility value.  ContractRuntime
+                    # rev10 keeps the logical worker id and the allocated slot
+                    # as distinct identities, so project both values from the
+                    # authoritative RuntimeContext before persisting either the
+                    # timeline event or the canonical Contract line.
+                    startup_gate_payload = dict(startup_gate_payload)
+                    startup_gate_payload.update(
+                        {
+                            "worker_id": worker_id,
+                            "worker_slot_id": worker_slot_id,
+                        }
+                    )
+                    event_payload["mf_subagent_startup_gate"] = (
+                        startup_gate_payload
+                    )
+                    result["startup_gate"] = startup_gate_payload
                     target_project_root = (
                         _runtime_context_effective_target_project_root(
                             runtime_context
@@ -73225,6 +73242,8 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
                                 "task_id": runtime_context.task_id,
                                 "parent_task_id": parent_task_id,
                                 "worker_role": "mf_sub",
+                                "worker_id": worker_id,
+                                "worker_slot_id": worker_slot_id,
                             },
                         )
                     )
@@ -73272,6 +73291,11 @@ def handle_graph_governance_parallel_branch_startup(ctx: RequestContext):
             conn.commit()
             return result
     except Exception as exc:
+        # Startup mutates RuntimeContext before the canonical Contract line is
+        # submitted.  A rejected line must therefore explicitly roll back the
+        # whole facade transaction; connection-close behavior is not accepted
+        # as durable zero-write authority.
+        conn.rollback()
         converted = _parallel_branch_runtime_governance_error(
             exc,
             endpoint="parallel-branches/startup",
