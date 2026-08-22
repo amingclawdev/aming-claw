@@ -135607,6 +135607,86 @@ def _operator_supervised_direct_main_submit_runtime_line(
     return dict(result["record"])
 
 
+def _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
+    proof: Mapping[str, Any],
+    *,
+    target_commit: str,
+) -> bool:
+    """Match one DB-verified QA graph basis to the Direct reconcile target."""
+
+    target_commit = str(target_commit or "").strip().lower()
+    full_commit = r"[0-9a-f]{40}|[0-9a-f]{64}"
+    if not re.fullmatch(full_commit, target_commit):
+        return False
+
+    graph_basis = str(proof.get("graph_basis") or "").strip()
+    snapshot_commit = str(
+        proof.get("snapshot_commit_sha") or ""
+    ).strip().lower()
+    base_commit = str(proof.get("base_commit_sha") or "").strip().lower()
+    candidate_commit = str(
+        proof.get("candidate_commit_sha") or ""
+    ).strip().lower()
+    candidate_diff_hash = str(
+        proof.get("candidate_diff_hash") or ""
+    ).strip().lower()
+    changed_files = proof.get("changed_files")
+    changed_files_source = str(
+        proof.get("changed_files_source") or ""
+    ).strip()
+    nonempty_diff = bool(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", candidate_diff_hash)
+        and candidate_diff_hash
+        != f"sha256:{hashlib.sha256(b'').hexdigest()}"
+    )
+    bounded_changes = bool(
+        isinstance(changed_files, list)
+        and changed_files
+        and all(str(path or "").strip() for path in changed_files)
+    )
+
+    if graph_basis == "canonical_base_plus_candidate_diff":
+        return bool(
+            re.fullmatch(full_commit, base_commit)
+            and snapshot_commit == base_commit
+            and base_commit != target_commit
+            and candidate_commit == target_commit
+            and nonempty_diff
+            and bounded_changes
+            and changed_files_source == "server_git_diff_name_status_z_m"
+            and re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(proof.get("candidate_overlay_hash") or "")
+                .strip()
+                .lower(),
+            )
+        )
+
+    if graph_basis != "exact_candidate_snapshot":
+        return False
+    comparison_base = str(
+        proof.get("comparison_base_commit_sha") or ""
+    ).strip().lower()
+    return bool(
+        snapshot_commit == target_commit
+        and base_commit == target_commit
+        and candidate_commit == target_commit
+        and proof.get("comparison_authority_required") is True
+        and re.fullmatch(full_commit, comparison_base)
+        and comparison_base != target_commit
+        and str(proof.get("comparison_base_commit_source") or "").strip()
+        == _QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
+        and str(
+            proof.get("comparison_base_commit_lineage_source") or ""
+        ).strip()
+        == _QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+        and nonempty_diff
+        and bounded_changes
+        and changed_files_source
+        == "server_runtime_context_base_to_exact_candidate_diff"
+    )
+
+
 def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
     conn,
     *,
@@ -135767,8 +135847,10 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
             and str(proof.get("commit_sha") or "").strip().lower()
             == target_commit
             and str(proof.get("snapshot_id") or "").strip()
-            and str(proof.get("snapshot_commit_sha") or "").strip().lower()
-            == target_commit
+            and _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
+                proof,
+                target_commit=target_commit,
+            )
         ):
             continue
         qa_candidates.append(
@@ -135947,8 +136029,10 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             and str(proof.get("commit_sha") or "").strip().lower()
             == implementation_commit
             and str(proof.get("snapshot_id") or "").strip()
-            and str(proof.get("snapshot_commit_sha") or "").strip().lower()
-            == implementation_commit
+            and _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
+                proof,
+                target_commit=implementation_commit,
+            )
         ):
             continue
         qa_candidates.append(
@@ -135956,7 +136040,9 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 "event_id": int(event.get("id") or 0),
                 "event_ref": f"timeline:{int(event.get('id') or 0)}",
                 "snapshot_id": str(proof.get("snapshot_id") or "").strip(),
-                "snapshot_commit_sha": implementation_commit,
+                "snapshot_commit_sha": str(
+                    proof.get("snapshot_commit_sha") or ""
+                ).strip().lower(),
                 "qa_session_id": str(
                     proof.get("qa_session_id") or ""
                 ).strip(),

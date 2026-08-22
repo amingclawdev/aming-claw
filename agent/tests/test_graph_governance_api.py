@@ -22184,8 +22184,10 @@ def _append_authenticated_qa_verification(
     snapshot_id: str,
     principal_id: str = "qa:direct-main",
     verification: dict[str, Any] | None = None,
+    activate_graph: bool = True,
 ) -> dict:
-    _activate_basic_graph(conn, snapshot_id, commit_sha=commit_sha)
+    if activate_graph:
+        _activate_basic_graph(conn, snapshot_id, commit_sha=commit_sha)
     qa_scope_binding_ref = server._qa_scope_binding_ref(
         project_id=PID,
         backlog_id=backlog_id,
@@ -22255,6 +22257,75 @@ def _append_authenticated_qa_verification(
     )
     qa_timeline_ctx._session = dict(qa_graph_ctx._session)
     return server.handle_task_timeline_append(qa_timeline_ctx)
+
+
+def test_direct_main_reconcile_qa_candidate_target_identity_is_basis_bounded():
+    target_commit = "c" * 40
+    parent_commit = "b" * 40
+    nonempty_diff_hash = _fake_sha("direct-base-diff")
+    base_diff_proof = {
+        "graph_basis": "canonical_base_plus_candidate_diff",
+        "snapshot_commit_sha": parent_commit,
+        "base_commit_sha": parent_commit,
+        "candidate_commit_sha": target_commit,
+        "candidate_diff_hash": nonempty_diff_hash,
+        "changed_files": ["agent/governance/server.py"],
+        "changed_files_source": "server_git_diff_name_status_z_m",
+        "candidate_overlay_hash": _fake_sha("direct-overlay"),
+    }
+    assert server._operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
+        base_diff_proof,
+        target_commit=target_commit,
+    ) is True
+    for field, invalid_value in (
+        ("snapshot_commit_sha", target_commit),
+        ("base_commit_sha", target_commit),
+        ("candidate_commit_sha", parent_commit),
+        ("candidate_diff_hash", "sha256:" + hashlib.sha256(b"").hexdigest()),
+        ("changed_files", []),
+        ("changed_files_source", "caller_claim"),
+        ("candidate_overlay_hash", ""),
+    ):
+        invalid = {**base_diff_proof, field: invalid_value}
+        assert server._operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
+            invalid,
+            target_commit=target_commit,
+        ) is False
+
+    exact_proof = {
+        "graph_basis": "exact_candidate_snapshot",
+        "snapshot_commit_sha": target_commit,
+        "base_commit_sha": target_commit,
+        "candidate_commit_sha": target_commit,
+        "comparison_authority_required": True,
+        "comparison_base_commit_sha": parent_commit,
+        "comparison_base_commit_source": (
+            server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
+        ),
+        "comparison_base_commit_lineage_source": (
+            server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+        ),
+        "candidate_diff_hash": nonempty_diff_hash,
+        "changed_files": ["agent/governance/server.py"],
+        "changed_files_source": (
+            "server_runtime_context_base_to_exact_candidate_diff"
+        ),
+    }
+    assert server._operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
+        exact_proof,
+        target_commit=target_commit,
+    ) is True
+    for field, invalid_value in (
+        ("comparison_authority_required", False),
+        ("comparison_base_commit_sha", target_commit),
+        ("comparison_base_commit_source", "caller_claim"),
+        ("comparison_base_commit_lineage_source", "caller_claim"),
+    ):
+        invalid = {**exact_proof, field: invalid_value}
+        assert server._operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
+            invalid,
+            target_commit=target_commit,
+        ) is False
 
 
 def _append_observer_materialized_qa_verification(
@@ -90925,9 +90996,7 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         "activate": True,
         "semantic_enrich": False,
         "run_id": "current-full-direct-main-rev2",
-        "expected_old_snapshot_id": (
-            "full-direct-main-rev2-single-admission"
-        ),
+        "expected_old_snapshot_id": exact_snapshot_id,
         "backlog_id": backlog_id,
         "task_id": task_id,
         "observer_session_id": observer_session_id,
@@ -90956,9 +91025,27 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         backlog_id=backlog_id,
         task_id=task_id,
         commit_sha=implementation_commit,
-        snapshot_id="full-direct-main-rev2-single-admission",
+        snapshot_id=exact_snapshot_id,
         principal_id="qa:direct-main-rev2-single-admission",
+        activate_graph=False,
     )
+    qa_authority = qa_event["payload"][
+        "source_backed_contract_gate_authority"
+    ]
+    qa_proof = qa_authority["qa_session_proof"]
+    assert qa_proof["graph_basis"] == (
+        "canonical_base_plus_candidate_diff"
+    )
+    assert qa_proof["snapshot_commit_sha"] == parent_commit
+    assert qa_proof["base_commit_sha"] == parent_commit
+    assert qa_proof["candidate_commit_sha"] == implementation_commit
+    assert qa_proof["candidate_diff_hash"] != (
+        "sha256:" + hashlib.sha256(b"").hexdigest()
+    )
+    assert server._operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
+        qa_proof,
+        target_commit=implementation_commit,
+    ) is True
     assert [
         item["line_id"]
         for item in qa_event["payload"][
@@ -91102,6 +91189,19 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     assert reconcile_status == 201
     assert reconcile["activated"] is True
     assert reconcile["active_snapshot_id"] == snapshot_id
+    current_full_authority = (
+        server._operator_supervised_direct_main_current_full_reconcile_authority(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            contract_execution_id=task_id,
+            record=server._contract_runtime(conn).store.get(task_id),
+        )
+    )
+    assert current_full_authority["qa_snapshot_id"] == exact_snapshot_id
+    assert current_full_authority["qa_snapshot_commit"] == (
+        implementation_commit
+    )
     post_reconcile_guide = server.handle_project_onboard_route_guide(
         _ctx_with_role(
             {"project_id": PID},
