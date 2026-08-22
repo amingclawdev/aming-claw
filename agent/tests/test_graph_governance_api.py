@@ -92081,6 +92081,208 @@ def test_parentless_direct_main_implementation_prewrite_requires_existing_exact_
     assert conn.total_changes == changes_before
 
 
+def test_parentless_direct_main_implementation_accepts_exact_route_renewal_descendant(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DIRECT-MAIN-IMPLEMENTATION-ROUTE-RENEWAL"
+    project_root = tmp_path / "implementation-route-renewal"
+    parent_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    task_id, immutable_route_ref, immutable_route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+        )
+    )
+    graph_trace_id = "gqt-20260822-d1a2e3c4b5"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        snapshot_id="full-direct-main-route-renewal",
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_identity=immutable_route_identity,
+        commit_sha=parent_commit,
+        target_project_root=str(project_root),
+    )
+    direct_event = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_canonical_parentless_direct_main_pre_mutation_body(
+                append_base={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "route_token_ref": immutable_route_ref,
+                },
+                route_identity=immutable_route_identity,
+                allowed_files=["agent/governance/server.py"],
+                graph_trace_ids=[graph_trace_id],
+            ),
+        )
+    )
+    candidate_commit = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_commit=parent_commit,
+        ),
+    )
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=immutable_route_ref,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        caller_role="observer",
+        allowed_actions=list(
+            server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+        ),
+        target_files=["agent/governance/server.py"],
+        owned_files=["agent/governance/server.py"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 22, 1, 0, tzinfo=timezone.utc),
+    )
+    active_route_ref = renewed["route_token_ref"]
+    active_route_identity = renewed["route_identity"]
+    active_route = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=active_route_ref,
+        now=datetime(2099, 8, 22, 1, 1, tzinfo=timezone.utc),
+    )
+    canonical_lineage = copy.deepcopy(active_route["route_lineage"])
+    forged_lineage = copy.deepcopy(canonical_lineage)
+    forged_lineage["renewal_proof"]["scope"]["task_id"] = (
+        "cex-unrelated-direct-main"
+    )
+    conn.execute(
+        "UPDATE observer_route_token_refs SET route_lineage_json=? "
+        "WHERE project_id=? AND route_token_ref=?",
+        (json.dumps(forged_lineage, sort_keys=True), PID, active_route_ref),
+    )
+    conn.commit()
+
+    implementation_body = _canonical_parentless_direct_main_implementation_body(
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=active_route_ref,
+        route_identity=active_route_identity,
+        commit_sha=candidate_commit,
+    )
+    events_before = len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            limit=1000,
+        )
+    )
+    changes_before = conn.total_changes
+    with pytest.raises(GovernanceError) as forged_rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(implementation_body),
+            )
+        )
+    forged_authority = forged_rejected.value.details[
+        "commit_prewrite_authority"
+    ]["active_route_authority"]
+    assert forged_authority["passed"] is False
+    assert forged_authority["resolution_error_code"] == (
+        "route_token_ref_renewal_scope_mismatch"
+    )
+    assert forged_rejected.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == changes_before
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            limit=1000,
+        )
+    ) == events_before
+
+    conn.execute(
+        "UPDATE observer_route_token_refs SET route_lineage_json=? "
+        "WHERE project_id=? AND route_token_ref=?",
+        (json.dumps(canonical_lineage, sort_keys=True), PID, active_route_ref),
+    )
+    conn.commit()
+    accepted = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(implementation_body),
+        )
+    )
+    authority = accepted["payload"][
+        "direct_main_implementation_commit_prewrite_authority"
+    ]
+    active_authority = authority["active_route_authority"]
+    assert authority["passed"] is True
+    assert authority["route_token_ref"] == active_route_ref
+    assert authority["direct_route_identity_exact"] is True
+    assert authority["route_scope_exact"] is True
+    assert active_authority["passed"] is True
+    assert active_authority["renewal_used"] is True
+    assert active_authority["immutable_route_identity"] == (
+        immutable_route_identity
+    )
+    assert active_authority["active_route_identity"] == active_route_identity
+    assert active_authority["route_token_ref_chain"] == [
+        immutable_route_ref,
+        active_route_ref,
+    ]
+    assert active_authority["edge_types"] == ["renewal"]
+    assert active_authority["historical_pre_mutation_event_rewritten"] is False
+    assert server._observer_root_route_identity_from_event(direct_event) == (
+        immutable_route_identity
+    )
+    assert active_authority["authority_hash"] == server.stable_sha256(
+        {
+            key: value
+            for key, value in active_authority.items()
+            if key != "authority_hash"
+        }
+    )
+
+    reconcile_preflight = (
+        server._operator_supervised_direct_main_reconcile_qa_preflight_authority(
+            conn,
+            project_id=PID,
+            target_commit=candidate_commit,
+            current_full_auth={
+                "route_token_ref": active_route_ref,
+                "route_token_scope": {
+                    "project_id": PID,
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                },
+            },
+        )
+    )
+    assert reconcile_preflight["active_route_authority"]["passed"] is True
+    assert "direct_runtime_route_scope_exact" not in (
+        reconcile_preflight["missing_requirement_ids"]
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "mismatch_key"),
     [

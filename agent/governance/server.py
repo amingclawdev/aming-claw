@@ -135688,6 +135688,181 @@ def _operator_supervised_direct_main_reconcile_qa_candidate_matches_target(
     )
 
 
+def _operator_supervised_direct_main_active_route_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    immutable_route_identity: Mapping[str, Any],
+    active_route_token_ref: str,
+    expected_files: Sequence[str] = (),
+    required_action: str = "task_timeline_append",
+) -> dict[str, Any]:
+    """Project an active Direct ref from the existing append-scope resolver."""
+
+    immutable_identity = {
+        field: str(immutable_route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    immutable_ref = immutable_identity.get("route_token_ref", "")
+    presented_ref = str(active_route_token_ref or "").strip()
+    canonical_files = sorted(
+        _runtime_context_service_dedupe(
+            [str(path or "").strip() for path in expected_files]
+        )
+    )
+    active_identity: dict[str, str] = {}
+    resolution: dict[str, Any] = {}
+    if (
+        presented_ref
+        and _observer_root_route_identity_complete(immutable_identity)
+    ):
+        active_identity, resolution = (
+            _contract_runtime_resolve_append_scoped_child_route(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=task_id,
+                route_token_ref=immutable_ref,
+                supplied_route_authority=immutable_identity,
+                required_actions=(required_action,),
+                required_caller_role="observer",
+            )
+        )
+
+    renewal = (
+        dict(resolution.get("renewal_resolution"))
+        if isinstance(resolution.get("renewal_resolution"), Mapping)
+        else {}
+    )
+    renewal_used = bool(renewal)
+    requested_identity = (
+        renewal.get("requested_route_identity")
+        if isinstance(renewal.get("requested_route_identity"), Mapping)
+        else {}
+    )
+    chain_refs = [
+        str(item or "").strip()
+        for item in (renewal.get("route_token_ref_chain") or [])
+        if str(item or "").strip()
+    ]
+    edge_types = [
+        str(item or "").strip()
+        for item in (renewal.get("edge_types") or [])
+        if str(item or "").strip()
+    ]
+    renewal_exact = bool(
+        renewal.get("schema_version")
+        == "route_token_ref_exact_renewal_descendant_resolution.v1"
+        and renewal.get("status") == "resolved_active_descendant"
+        and renewal.get("registry_verified") is True
+        and renewal.get("exact_scope_verified") is True
+        and renewal.get("writes_performed") is False
+        and renewal.get("raw_route_token_exposed") is False
+        and all(
+            str(requested_identity.get(field) or "").strip()
+            == immutable_identity[field]
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        )
+        and len(chain_refs) >= 2
+        and chain_refs[0] == immutable_ref
+        and chain_refs[-1]
+        == str(active_identity.get("route_token_ref") or "").strip()
+        and len(edge_types) == len(chain_refs) - 1
+        and all(
+            edge in {"renewal", "same_scope_reissue"}
+            for edge in edge_types
+        )
+    )
+    identity_resolution_exact = bool(
+        resolution.get("status") == "resolved_append_scoped_ref"
+        and _observer_root_route_identity_complete(active_identity)
+        and presented_ref
+        == str(active_identity.get("route_token_ref") or "").strip()
+        and (
+            renewal_exact
+            if renewal_used
+            else active_identity == immutable_identity
+        )
+    )
+    scope_exact = bool(
+        identity_resolution_exact
+        and resolution.get("scope")
+        == {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+        }
+    )
+    missing: list[str] = []
+    if not _observer_root_route_identity_complete(immutable_identity):
+        missing.append("immutable_direct_route_identity_complete")
+    if not presented_ref:
+        missing.append("active_direct_route_token_ref")
+    if resolution.get("status") != "resolved_append_scoped_ref":
+        missing.append("active_direct_route_renewal_lineage_verified")
+    if not identity_resolution_exact:
+        missing.append("active_direct_route_matches_immutable_binding")
+    if not scope_exact:
+        missing.append("active_direct_route_scope_exact")
+    missing = list(dict.fromkeys(missing))
+    authority = {
+        "schema_version": (
+            "operator_supervised_direct_main.active_route_authority.v1"
+        ),
+        "passed": not missing,
+        "status": "passed" if not missing else "failed",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "source": "contract_runtime.append_scoped_child_route_resolution",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "required_action": required_action,
+        "immutable_route_identity": immutable_identity,
+        "active_route_identity": dict(active_identity),
+        "presented_route_token_ref": presented_ref,
+        "renewal_used": renewal_used,
+        "route_token_ref_chain": (
+            chain_refs or ([immutable_ref] if active_identity else [])
+        ),
+        "edge_types": edge_types,
+        "identity_resolution_exact": identity_resolution_exact,
+        "scope_exact": scope_exact,
+        "registry_verified": bool(
+            resolution.get("status") == "resolved_append_scoped_ref"
+            and (not renewal_used or renewal.get("registry_verified") is True)
+        ),
+        "expected_files": canonical_files,
+        "resolution_error_code": str(
+            resolution.get("error_code") or ""
+        ).strip(),
+        "resolution_error_details": resolution,
+        "missing_requirement_ids": missing,
+        "identity_mismatches": (
+            []
+            if not missing
+            else [
+                {
+                    "field": "active_route_authority",
+                    "expected": {
+                        "immutable_route_token_ref": immutable_ref,
+                        "active_same_scope_descendant": presented_ref,
+                    },
+                    "actual": dict(active_identity),
+                }
+            ]
+        ),
+        "historical_pre_mutation_event_rewritten": False,
+        "writes_performed": False,
+        "zero_write_on_failure": True,
+        "raw_route_token_exposed": False,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
     conn,
     *,
@@ -135748,12 +135923,24 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
         if isinstance(binding.get("route_identity"), Mapping)
         else {}
     )
+    active_route_authority = (
+        _operator_supervised_direct_main_active_route_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            immutable_route_identity=route_identity,
+            active_route_token_ref=str(
+                current_full_auth.get("route_token_ref") or ""
+            ),
+            expected_files=list(binding.get("owned_files") or []),
+        )
+    )
     if not (
         str(record.get("project_id") or "").strip() == project_id
         and str(record.get("backlog_id") or "").strip() == backlog_id
         and str(record.get("contract_execution_id") or "").strip() == task_id
-        and str(current_full_auth.get("route_token_ref") or "").strip()
-        == str(route_identity.get("route_token_ref") or "").strip()
+        and active_route_authority.get("passed") is True
     ):
         missing.append("direct_runtime_route_scope_exact")
     implementation_commits = _runtime_context_service_dedupe(
@@ -135917,6 +136104,7 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
         "backlog_id": backlog_id,
         "contract_execution_id": task_id,
         "target_commit_sha": target_commit,
+        "active_route_authority": active_route_authority,
         **qa_candidate,
         "qa_candidate_count": len(qa_candidates),
         "contract_runtime_execution_state_revision": int(
@@ -168488,12 +168676,22 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         if len(direct_events) == 1
         else {}
     )
+    active_route_authority = (
+        _operator_supervised_direct_main_active_route_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            immutable_route_identity=direct_identity,
+            active_route_token_ref=route_token_ref,
+            expected_files=current_row_files,
+        )
+        if len(direct_events) == 1
+        else {}
+    )
     direct_route_identity_exact = bool(
         len(direct_events) == 1
-        and route_token_ref
-        and route_token_ref
-        == str(direct_identity.get("route_token_ref") or "").strip()
-        and _observer_root_route_identity_complete(direct_identity)
+        and active_route_authority.get("identity_resolution_exact") is True
     )
     if len(direct_events) != 1:
         commit_missing.append("unique_direct_main_pre_mutation_event")
@@ -168518,42 +168716,9 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
             }
         )
 
-    route_row = None
-    if route_token_ref:
-        route_row = conn.execute(
-            """
-            SELECT backlog_id, task_id, caller_role, allowed_actions_json,
-                   scope_json, status
-              FROM observer_route_token_refs
-             WHERE project_id = ? AND route_token_ref = ?
-            """,
-            (project_id, route_token_ref),
-        ).fetchone()
-    try:
-        registered_actions = set(
-            json.loads(route_row["allowed_actions_json"] or "[]")
-        )
-        registered_scope = json.loads(route_row["scope_json"] or "{}")
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        registered_actions = set()
-        registered_scope = {}
     route_scope_exact = bool(
-        route_row
-        and str(route_row["status"] or "").strip() == "active"
-        and str(route_row["caller_role"] or "").strip() == "observer"
-        and str(route_row["backlog_id"] or "").strip() == backlog_id
-        and str(route_row["task_id"] or "").strip() == task_id
-        and "task_timeline_append" in registered_actions
-        and isinstance(registered_scope, Mapping)
-        and {
-            key: str(registered_scope.get(key) or "").strip()
-            for key in ("project_id", "backlog_id", "task_id")
-        }
-        == {
-            "project_id": project_id,
-            "backlog_id": backlog_id,
-            "task_id": task_id,
-        }
+        active_route_authority.get("scope_exact") is True
+        and active_route_authority.get("passed") is True
     )
     if not route_scope_exact:
         commit_missing.append("implementation_route_registry_scope_exact")
@@ -168600,6 +168765,7 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         "route_token_ref": route_token_ref,
         "route_scope_exact": route_scope_exact,
         "direct_route_identity_exact": direct_route_identity_exact,
+        "active_route_authority": active_route_authority,
         "direct_pre_mutation_event_count": len(direct_events),
         "prior_implementation_event_count": len(
             prior_implementation_events
