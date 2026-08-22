@@ -91020,6 +91020,36 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     assert blocked_reconcile["snapshot_materialized"] is False
     assert conn.total_changes == reconcile_changes_before_qa
 
+    candidate_only_body = copy.deepcopy(reconcile_body)
+    candidate_only_body.update(
+        {
+            "activate": False,
+            "snapshot_id": "full-direct-main-rev2-preqa-candidate",
+            "run_id": "current-full-direct-main-rev2-preqa-candidate",
+        }
+    )
+    candidate_only_body.pop("expected_old_snapshot_id", None)
+    candidate_only_status, candidate_only = (
+        server.handle_graph_governance_current_full_reconcile(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=candidate_only_body,
+            )
+        )
+    )
+    assert candidate_only_status == 201
+    assert candidate_only["current_full_reconcile"] is True
+    assert candidate_only["candidate_only"] is True
+    assert candidate_only["exact_candidate_snapshot"] is True
+    assert candidate_only["candidate_snapshot_id"] == (
+        "full-direct-main-rev2-preqa-candidate"
+    )
+    assert candidate_only["activated"] is False
+    assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == (
+        exact_snapshot_id
+    )
+
     qa_event = _append_authenticated_qa_verification(
         conn,
         backlog_id=backlog_id,

@@ -87275,6 +87275,7 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "head_commit": head_commit,
                 "target_commit_sha": target_commit,
             }
+        activate_requested = bool(body.get("activate", True))
         direct_main_qa_preflight_authority = (
             _operator_supervised_direct_main_reconcile_qa_preflight_authority(
                 conn,
@@ -87284,7 +87285,8 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             )
         )
         if (
-            direct_main_qa_preflight_authority.get("applicable") is True
+            activate_requested
+            and direct_main_qa_preflight_authority.get("applicable") is True
             and direct_main_qa_preflight_authority.get("passed") is not True
         ):
             return 409, {
@@ -87306,7 +87308,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     direct_main_qa_preflight_authority
                 ),
             }
-        activate_requested = bool(body.get("activate", True))
         requested_identity = store.normalize_pending_scope_identity(
             ref_name=str(body.get("ref_name") or ""),
             branch_ref=str(body.get("branch_ref") or ""),
