@@ -46898,7 +46898,9 @@ def test_parallel_branch_finish_gate_records_validated_checkpoint(conn):
     assert finished["context"]["head_commit"] == "head-finish"
 
 
-def test_parallel_branch_finish_gate_bridges_verifier_only_fence_in_process(conn):
+def test_parallel_branch_finish_gate_verifier_only_fence_is_process_local_and_stale_fails_first(
+    conn, monkeypatch
+):
     task_id = "finish-verifier-only-task"
     backlog_id = "FEAT-FINISH-VERIFIER-ONLY"
     fence_token = "fence-finish-verifier-only"
@@ -46934,39 +46936,77 @@ def test_parallel_branch_finish_gate_bridges_verifier_only_fence_in_process(conn
         head_commit="head-finish-verifier-only",
     )
 
+    finish_body = {
+        "project_id": PID,
+        "task_id": task_id,
+        "backlog_id": backlog_id,
+        "branch_ref": branch_ref,
+        "worktree_path": worktree_path,
+        "base_commit": "base-finish-verifier-only",
+        "target_head_commit": "target-finish-verifier-only",
+        "head_commit": "head-finish-verifier-only",
+        "status": "succeeded",
+        "changed_files": ["agent/governance/server.py"],
+        "test_results": {"status": "passed", "command": "pytest -q"},
+        "checkpoint_id": "ckpt-finish-verifier-only",
+        "fence_token": fence_token,
+        "agent_id": "codex-subagent-verifier-only",
+        "now_iso": "2026-08-22T18:31:00Z",
+        "evidence": _finish_gate_evidence(
+            fence_token=fence_token,
+            worktree_path=worktree_path,
+            branch_ref=branch_ref,
+            head_commit="head-finish-verifier-only",
+        ),
+    }
+    legacy_validation_contexts = []
+    validate_finish_gate = server._runtime_context_validate_finish_gate_test_results
+
+    def capture_legacy_validation_context(
+        payload, *, context, validator, validation_error
+    ):
+        legacy_validation_contexts.append(context)
+        return validate_finish_gate(
+            payload,
+            context=context,
+            validator=validator,
+            validation_error=validation_error,
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_validate_finish_gate_test_results",
+        capture_legacy_validation_context,
+    )
+    before_stale_fence = "\n".join(conn.iterdump())
+    status, rejected = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={**finish_body, "fence_token": "stale-verifier-only-fence"},
+        )
+    )
+
+    assert status == 422
+    assert rejected["code"] == "stale_fence_token_mismatch"
+    assert legacy_validation_contexts == []
+    assert "\n".join(conn.iterdump()) == before_stale_fence
+
     finished = server.handle_graph_governance_parallel_branch_finish_gate(
         _ctx_with_role(
             {"project_id": PID},
             "mf_sub",
             method="POST",
-            body={
-                "project_id": PID,
-                "task_id": task_id,
-                "backlog_id": backlog_id,
-                "branch_ref": branch_ref,
-                "worktree_path": worktree_path,
-                "base_commit": "base-finish-verifier-only",
-                "target_head_commit": "target-finish-verifier-only",
-                "head_commit": "head-finish-verifier-only",
-                "status": "succeeded",
-                "changed_files": ["agent/governance/server.py"],
-                "test_results": {"status": "passed", "command": "pytest -q"},
-                "checkpoint_id": "ckpt-finish-verifier-only",
-                "fence_token": fence_token,
-                "agent_id": "codex-subagent-verifier-only",
-                "now_iso": "2026-08-22T18:31:00Z",
-                "evidence": _finish_gate_evidence(
-                    fence_token=fence_token,
-                    worktree_path=worktree_path,
-                    branch_ref=branch_ref,
-                    head_commit="head-finish-verifier-only",
-                ),
-            },
+            body=finish_body,
         )
     )
 
     assert finished["ok"] is True
     assert finished["context"]["status"] == "validated"
+    assert len(legacy_validation_contexts) == 1
+    assert legacy_validation_contexts[0].fence_token == fence_token
+    assert legacy_validation_contexts[0].fence_token_verifier == fence_token_verifier
     persisted = get_branch_context(conn, PID, task_id)
     assert persisted is not None
     assert persisted.fence_token == ""
