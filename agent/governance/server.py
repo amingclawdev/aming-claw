@@ -136309,17 +136309,29 @@ def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
         if isinstance(close_verification.get("test_results"), Mapping)
         else {}
     )
+    runtime_sync_or_redeploy_passed = any(
+        str(evidence.get("status") or "").strip().lower()
+        in {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+        for evidence in (
+            (
+                close_verification.get("runtime_sync")
+                if isinstance(close_verification.get("runtime_sync"), Mapping)
+                else {}
+            ),
+            (
+                close_verification.get("governance_redeploy")
+                if isinstance(
+                    close_verification.get("governance_redeploy"), Mapping
+                )
+                else {}
+            ),
+        )
+    )
     if not (
         close_payload.get("schema_version")
         == "operator_supervised_direct_main.close_ready_evidence.v1"
-        and close_verification.get("runtime_version_sync") is True
+        and runtime_sync_or_redeploy_passed
         and close_verification.get("preflight_ok") is True
-        and str(
-            (close_verification.get("governance_redeploy") or {}).get("status")
-            if isinstance(close_verification.get("governance_redeploy"), Mapping)
-            else ""
-        ).strip().lower()
-        in {"accepted", "ok", "pass", "passed", "succeeded", "success"}
         and str(
             (close_verification.get("live_regression") or {}).get("status")
             if isinstance(close_verification.get("live_regression"), Mapping)

@@ -91030,33 +91030,18 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         "_operator_supervised_direct_main_runtime_deployment_authority",
         projected_runtime_deployment_authority,
     )
-    close_ready_body = {
-        "backlog_id": backlog_id,
-        "task_id": task_id,
-        "route_token_ref": route_token_ref,
-        "event_type": "observer.close_ready",
-        "event_kind": "close_ready",
-        "phase": "close_ready",
-        "status": "passed",
-        "actor": "observer",
-        "commit_sha": implementation_commit,
-        "verification": {
-            "governance_redeploy": {"status": "passed"},
-            "runtime_version_sync": True,
-            "graph_reconciled": True,
-            "preflight_ok": True,
-            "live_regression": {"status": "passed"},
-            "test_results": (
-                _canonical_parentless_direct_main_test_results(
-                    implementation_commit
-                )
-            ),
-        },
-        "payload": {
-            **route_identity,
-            "close_commit": implementation_commit,
-        },
-    }
+    close_ready_body = copy.deepcopy(
+        post_reconcile_action["copy_safe_body"]
+    )
+    close_ready_body["verification"]["test_results"] = (
+        _canonical_parentless_direct_main_test_results(
+            implementation_commit
+        )
+    )
+    assert close_ready_body["verification"]["runtime_sync"]["status"] == (
+        "passed"
+    )
+    assert "runtime_version_sync" not in close_ready_body["verification"]
     stale_close_changes = conn.total_changes
     with pytest.raises(GovernanceError) as stale_close_rejected:
         server.handle_task_timeline_append(
@@ -91123,6 +91108,31 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         sort_keys=True,
     )
     assert close_authority["missing_requirement_ids"] == []
+    missing_runtime_sync_record = copy.deepcopy(completed_record)
+    close_line = next(
+        line
+        for line in missing_runtime_sync_record["completed_lines"]
+        if line.get("line_id") == "observer_close_ready"
+    )
+    close_line["payload"]["verification"]["runtime_sync"]["status"] = (
+        "failed"
+    )
+    close_line["payload"]["verification"]["governance_redeploy"][
+        "status"
+    ] = "failed"
+    rejected_runtime_sync_authority = (
+        server._contract_runtime_operator_supervised_direct_main_close_authority_gate(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            record=missing_runtime_sync_record,
+            close_commit=implementation_commit,
+        )
+    )
+    assert rejected_runtime_sync_authority["passed"] is False
+    assert "direct_close_integrity_evidence" in (
+        rejected_runtime_sync_authority["missing_requirement_ids"]
+    )
     tampered_record = copy.deepcopy(completed_record)
     tampered_record["execution_state"]["completed_lines"][-1][
         "commit_sha"
