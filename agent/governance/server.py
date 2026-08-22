@@ -10769,10 +10769,39 @@ def _qa_exact_candidate_direct_main_events(
     backlog_id: str,
     task_id: str,
 ) -> list[dict[str, Any]]:
-    """Return accepted direct-main boundaries for one exact onboard task."""
+    """Return accepted Direct boundaries for one exact legacy or rev2 task."""
 
-    expected_task_id = _onboard_service_execution_id(project_id, backlog_id)
-    if not backlog_id or task_id != expected_task_id:
+    if not backlog_id:
+        return []
+    legacy_task_id = _onboard_service_execution_id(project_id, backlog_id)
+    strict_task_id = _operator_supervised_direct_main_execution_id(
+        project_id,
+        backlog_id,
+    )
+    if task_id == strict_task_id:
+        strict_records = _operator_supervised_direct_main_strict_records(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+        if len(strict_records) != 1:
+            return []
+        strict_record = strict_records[0]
+        if not (
+            str(strict_record.get("project_id") or "").strip() == project_id
+            and str(strict_record.get("backlog_id") or "").strip()
+            == backlog_id
+            and str(
+                strict_record.get("contract_execution_id") or ""
+            ).strip()
+            == strict_task_id
+            and str(strict_record.get("contract_id") or "").strip()
+            == "operator_supervised_direct_main"
+            and str(strict_record.get("version") or "").strip() == "v1"
+            and str(strict_record.get("revision") or "").strip() == "rev2"
+        ):
+            return []
+    elif task_id != legacy_task_id:
         return []
     by_id: dict[int, dict[str, Any]] = {}
     for event_kind in (
@@ -11221,6 +11250,20 @@ def _qa_exact_candidate_comparison_authority_required(
 
     task_id = str(proof.get("task_id") or "").strip()
     backlog_id = str(proof.get("backlog_id") or "").strip()
+    strict_task_id = (
+        _operator_supervised_direct_main_execution_id(
+            project_id,
+            backlog_id,
+        )
+        if backlog_id
+        else ""
+    )
+    # The deterministic strict Direct task identity is only a requirement
+    # selector, never comparison authority.  Missing, mismatched, or ambiguous
+    # rev2 records must therefore fail closed instead of silently degrading to
+    # an unmanaged self-comparison snapshot.
+    if strict_task_id and task_id == strict_task_id:
+        return True
     context = get_branch_context(conn, project_id, task_id) if task_id else None
     if context is not None:
         return bool(

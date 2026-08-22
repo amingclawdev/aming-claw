@@ -105901,6 +105901,28 @@ def test_direct_main_rev2_fresh_world_warranty_requires_db_verified_qa(
             },
         )
     )
+    strict_proof = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "commit_sha": close_commit,
+    }
+    assert server._qa_exact_candidate_comparison_authority_required(
+        conn,
+        project_id=PID,
+        proof=strict_proof,
+    ) is True
+    strict_comparison = (
+        server._qa_exact_candidate_runtime_comparison_authority(
+            conn,
+            project_id=PID,
+            proof=strict_proof,
+        )
+    )
+    assert strict_comparison == {
+        "commit_sha": parent_commit,
+        "source": server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
+        "lineage_source": server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE,
+    }
     events_before = task_timeline.list_events(
         conn,
         PID,
@@ -105973,6 +105995,34 @@ def test_direct_main_rev2_fresh_world_warranty_requires_db_verified_qa(
         commit_sha=close_commit,
         snapshot_id="full-direct-main-r2",
         principal_id="qa:direct-main-r2",
+    )
+    qa_trace_row = conn.execute(
+        """
+        SELECT changed_files_json, candidate_diff_hash, changed_files_source,
+               root_identity_json
+          FROM graph_query_traces
+         WHERE project_id = ? AND backlog_id = ? AND task_id = ?
+           AND candidate_commit_sha = ? AND query_source = 'qa'
+         ORDER BY created_at DESC, trace_id DESC
+         LIMIT 1
+        """,
+        (PID, backlog_id, task_id, close_commit),
+    ).fetchone()
+    assert qa_trace_row is not None
+    assert json.loads(qa_trace_row["changed_files_json"]) == [
+        "agent/tests/test_graph_governance_api.py"
+    ]
+    assert qa_trace_row["candidate_diff_hash"] != (
+        "sha256:" + hashlib.sha256(b"").hexdigest()
+    )
+    assert qa_trace_row["changed_files_source"] == (
+        "server_runtime_context_base_to_exact_candidate_diff"
+    )
+    qa_root_identity = json.loads(qa_trace_row["root_identity_json"])
+    assert qa_root_identity["comparison_authority_required"] is True
+    assert qa_root_identity["comparison_base_commit_sha"] == parent_commit
+    assert qa_root_identity["comparison_base_commit_source"] == (
+        server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
     )
     authority = qa_event["payload"]["source_backed_contract_gate_authority"]
     assert authority["source"] == "server_qa_session_verification"
@@ -167145,6 +167195,217 @@ def test_exact_candidate_direct_main_runtime_comparison_base_uses_server_lineage
         "server_runtime_context_base_to_exact_candidate_diff"
     )
     assert exact_context["candidate_diff_hash"].startswith("sha256:")
+
+
+def test_exact_candidate_direct_main_events_require_unique_strict_rev2_record(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-DIRECT-MAIN-STRICT-REV2-SELECTOR"
+    strict_task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+    )
+    legacy_task_id = server._onboard_service_execution_id(PID, backlog_id)
+    event = {
+        "id": 90101,
+        "event_kind": "observer_direct_implementation_exception",
+        "status": "accepted",
+    }
+    monkeypatch.setattr(
+        server,
+        "_onboard_parentless_direct_main_timeline_events",
+        lambda *_args, **_kwargs: [copy.deepcopy(event)],
+    )
+    monkeypatch.setattr(
+        server,
+        "_onboard_parentless_direct_main_event_is_accepted",
+        lambda _event: True,
+    )
+    records = [
+        {
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": strict_task_id,
+            "contract_id": "operator_supervised_direct_main",
+            "version": "v1",
+            "revision": "rev2",
+            "metadata": {
+                "operator_supervised_direct_main_runtime_binding": {
+                    "strict_runtime_binding_required": True,
+                }
+            },
+        }
+    ]
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_strict_records",
+        lambda *_args, **_kwargs: copy.deepcopy(records),
+    )
+
+    assert server._qa_exact_candidate_direct_main_events(
+        object(),
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=strict_task_id,
+    ) == [event]
+
+    second_record = copy.deepcopy(records[0])
+    second_record["contract_execution_id"] = "cex-second-rev2-record"
+    records.append(second_record)
+    assert server._qa_exact_candidate_direct_main_events(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=strict_task_id,
+    ) == []
+
+    records.clear()
+    assert server._qa_exact_candidate_direct_main_events(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=strict_task_id,
+    ) == []
+    assert server._qa_exact_candidate_comparison_authority_required(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": backlog_id,
+            "task_id": strict_task_id,
+            "commit_sha": "c" * 40,
+        },
+    ) is True
+
+    assert server._qa_exact_candidate_direct_main_events(
+        object(),
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=legacy_task_id,
+    ) == [event]
+    assert server._qa_exact_candidate_direct_main_events(
+        object(),
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id="cex-unrelated-direct-task",
+    ) == []
+
+
+@pytest.mark.parametrize("strict_record_state", ["missing", "ambiguous"])
+def test_exact_candidate_strict_direct_record_gap_rejects_graph_query_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    strict_record_state,
+):
+    backlog_id = f"AC-DIRECT-MAIN-STRICT-RECORD-{strict_record_state.upper()}"
+    strict_task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+    )
+    project_root = tmp_path / f"strict-record-{strict_record_state}"
+    candidate_commit = _init_test_git_repo(project_root)
+    _activate_basic_graph(
+        conn,
+        f"full-strict-record-{strict_record_state}",
+        commit_sha=candidate_commit,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    strict_record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": strict_task_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev2",
+    }
+    strict_records = (
+        []
+        if strict_record_state == "missing"
+        else [
+            strict_record,
+            {
+                **strict_record,
+                "contract_execution_id": "cex-second-strict-rev2-record",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_strict_records",
+        lambda *_args, **_kwargs: copy.deepcopy(strict_records),
+    )
+
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=strict_task_id,
+        commit_sha=candidate_commit,
+    )
+    qa_scope = [
+        f"backlog:{backlog_id}",
+        f"task:{strict_task_id}",
+        f"commit:{candidate_commit}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn,
+        f"qa:strict-record-{strict_record_state}",
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    qa_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": backlog_id,
+            "task_id": strict_task_id,
+            "commit_sha": candidate_commit,
+            "project_root": str(project_root),
+        },
+    )
+    qa_ctx._session.update(
+        {
+            "session_id": registered["session_id"],
+            "principal_id": f"qa:strict-record-{strict_record_state}",
+            "scope": qa_scope,
+        }
+    )
+    graph_query_trace.ensure_schema(conn)
+    conn.commit()
+    trace_count_before = conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0]
+    changes_before = conn.total_changes
+
+    with pytest.raises(GovernanceError) as blocked:
+        server.handle_graph_governance_query(qa_ctx)
+
+    assert blocked.value.code == (
+        "qa_exact_candidate_comparison_authority_rejected"
+    )
+    assert blocked.value.details["machine_reason"] == (
+        "exact_candidate_comparison_base_required"
+    )
+    assert blocked.value.details["zero_write_rejection"] is True
+    assert blocked.value.details["writes_performed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM graph_query_traces WHERE project_id = ?",
+        (PID,),
+    ).fetchone()[0] == trace_count_before
+    assert conn.total_changes == changes_before
 
 
 def test_exact_candidate_observer_direct_main_accepts_route_action_scope_lineage(
