@@ -72625,10 +72625,25 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             )
             if parent_route_lineage:
                 _sanitized_body["parent_route_lineage"] = parent_route_lineage
+            legacy_validation_context = context
+            if (
+                not str(getattr(context, "fence_token", "") or "").strip()
+                and str(
+                    getattr(context, "fence_token_verifier", "") or ""
+                ).strip()
+            ):
+                # The request fence was already matched against the durable
+                # verifier above.  Give the legacy validator that same value
+                # only through this process-local context copy; durable
+                # RuntimeContext custody remains verifier-only.
+                legacy_validation_context = replace(
+                    context,
+                    fence_token=body_fence_token,
+                )
             try:
                 gate = _runtime_context_validate_finish_gate_test_results(
                     _sanitized_body,
-                    context=context,
+                    context=legacy_validation_context,
                     validator=validate_mf_subagent_finish_gate,
                     validation_error=MfSubagentContractError,
                 )

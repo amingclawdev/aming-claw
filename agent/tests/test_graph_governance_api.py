@@ -46898,6 +46898,81 @@ def test_parallel_branch_finish_gate_records_validated_checkpoint(conn):
     assert finished["context"]["head_commit"] == "head-finish"
 
 
+def test_parallel_branch_finish_gate_bridges_verifier_only_fence_in_process(conn):
+    task_id = "finish-verifier-only-task"
+    backlog_id = "FEAT-FINISH-VERIFIER-ONLY"
+    fence_token = "fence-finish-verifier-only"
+    worktree_path = "/tmp/nonexistent-finish-verifier-only-task"
+    branch_ref = "refs/heads/codex/finish-verifier-only-task"
+    fence_token_verifier = runtime_context_secret_hash(fence_token)
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-finish-verifier-only",
+            task_id=task_id,
+            backlog_id=backlog_id,
+            branch_ref=branch_ref,
+            status="worktree_ready",
+            fence_token="",
+            fence_token_verifier=fence_token_verifier,
+            worktree_path=worktree_path,
+            base_commit="base-finish-verifier-only",
+            head_commit="base-finish-verifier-only",
+            target_head_commit="target-finish-verifier-only",
+            merge_queue_id="mergeq-api-finish-verifier-only",
+        ),
+        now_iso="2026-08-22T18:30:00Z",
+    )
+    _record_finish_startup_event(
+        conn,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        fence_token=fence_token,
+        worktree_path=worktree_path,
+        branch_ref=branch_ref,
+        head_commit="head-finish-verifier-only",
+    )
+
+    finished = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx_with_role(
+            {"project_id": PID},
+            "mf_sub",
+            method="POST",
+            body={
+                "project_id": PID,
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "branch_ref": branch_ref,
+                "worktree_path": worktree_path,
+                "base_commit": "base-finish-verifier-only",
+                "target_head_commit": "target-finish-verifier-only",
+                "head_commit": "head-finish-verifier-only",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish-verifier-only",
+                "fence_token": fence_token,
+                "agent_id": "codex-subagent-verifier-only",
+                "now_iso": "2026-08-22T18:31:00Z",
+                "evidence": _finish_gate_evidence(
+                    fence_token=fence_token,
+                    worktree_path=worktree_path,
+                    branch_ref=branch_ref,
+                    head_commit="head-finish-verifier-only",
+                ),
+            },
+        )
+    )
+
+    assert finished["ok"] is True
+    assert finished["context"]["status"] == "validated"
+    persisted = get_branch_context(conn, PID, task_id)
+    assert persisted is not None
+    assert persisted.fence_token == ""
+    assert persisted.fence_token_verifier == fence_token_verifier
+
+
 def test_parallel_branch_finish_gate_preserves_strict_no_pass_results(conn):
     task_id = "finish-no-pass-task"
     backlog_id = "FEAT-FINISH-GATE-NO-PASS"
