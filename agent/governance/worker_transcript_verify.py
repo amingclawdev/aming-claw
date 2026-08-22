@@ -518,7 +518,6 @@ def verify_worker_transcript(payload: Mapping[str, Any]) -> dict[str, Any]:
     runtime_fields = {
         "task_id": _text(payload.get("task_id")),
         "runtime_context_id": _text(payload.get("runtime_context_id")),
-        "fence_token": _text(payload.get("fence_token")),
         "worktree_path": _text(
             payload.get("worktree_path")
             or payload.get("assigned_worktree")

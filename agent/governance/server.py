@@ -32075,7 +32075,7 @@ def _runtime_context_server_bounded_mapping(
     serialized_bytes = _runtime_context_server_read_serialized_bytes(value)
     if serialized_bytes <= _RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES:
         return deepcopy(dict(value))
-    return {
+    projected = {
         **_runtime_context_server_scalar_projection(value),
         "bounded_projection": True,
         "source_field": field,
@@ -32083,6 +32083,12 @@ def _runtime_context_server_bounded_mapping(
         "source_serialized_bytes": serialized_bytes,
         "semantic_truncation_performed": False,
     }
+    writer_safe_copy = value.get("writer_role_safe_copy_payload")
+    if isinstance(writer_safe_copy, Mapping):
+        projected["writer_role_safe_copy_payload"] = deepcopy(
+            dict(writer_safe_copy)
+        )
+    return projected
 
 
 def _runtime_context_server_access_audit_truth(
@@ -32868,6 +32874,11 @@ def _runtime_context_worker_guide_paged_value(
                 for key, child in submit_line_guidance.items()
                 if isinstance(child, (str, int, float, bool, type(None)))
             }
+        writer_safe_copy = value.get("writer_role_safe_copy_payload")
+        if isinstance(writer_safe_copy, Mapping):
+            inline["writer_role_safe_copy_payload"] = deepcopy(
+                dict(writer_safe_copy)
+            )
         remaining_count = max(0, len(value) - len(inline))
     elif isinstance(value, (list, tuple)):
         inline_items = []
@@ -115824,7 +115835,7 @@ def _contract_runtime_worker_implementation_bypass_continuation_anchor(
             line=bypass_line,
             expected_line_id="worker_implementation",
             expected_blocked_evidence_kind="implementation",
-            expected_event_task_ids={execution_id},
+            expected_event_task_ids={execution_id, task_id},
             runtime_context_id=runtime_context_id,
             task_id=task_id,
             line_instance_id=line_instance_id,
