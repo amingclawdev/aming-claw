@@ -146039,6 +146039,15 @@ def _onboard_worker_read_runtime_facade_projection(
             projection_key: facade_projection,
         }
 
+    latest_revision_payload = _runtime_context_latest_contract_revision_payload(
+        conn,
+        context,
+    )
+    source_backed_launch_text_hash = (
+        _runtime_context_source_backed_launch_text_hash(
+            latest_revision_payload
+        )
+    )
     actionable = _runtime_context_worker_recovery_payloads(
         project_id=project_id,
         main_worktree=_runtime_context_registered_main_worktree(project_id),
@@ -146067,6 +146076,7 @@ def _onboard_worker_read_runtime_facade_projection(
             str(getattr(context, "fence_token", "") or "")
         ),
         session_token_ref=session_token_ref,
+        launch_text_hash=source_backed_launch_text_hash,
         contract_execution_id=execution_id,
         contract_chain_id=str(record.get("contract_chain_id") or ""),
         parent_contract_execution_id=str(

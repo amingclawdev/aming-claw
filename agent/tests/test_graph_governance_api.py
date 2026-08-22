@@ -164688,6 +164688,7 @@ def test_compact_worker_read_bridges_outer_atomic_ticket_to_exact_lane_zero_writ
     conn,
     monkeypatch,
 ):
+    launch_text_hash = "sha256:" + "a" * 64
     monkeypatch.setattr(
         server,
         "_runtime_context_worker_worktree_liveness",
@@ -164696,6 +164697,13 @@ def test_compact_worker_read_bridges_outer_atomic_ticket_to_exact_lane_zero_writ
             "status": "ready",
             "valid": True,
             "reason_code": "worktree_ready",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_contract_revision_payload",
+        lambda *_args, **_kwargs: {
+            "payload": {"launch_text_hash": launch_text_hash}
         },
     )
     server_file = "agent/governance/server.py"
@@ -164780,6 +164788,12 @@ def test_compact_worker_read_bridges_outer_atomic_ticket_to_exact_lane_zero_writ
     assert projected["copy_safe_body"]["route_token_ref"] == selected_worker[
         "route_token_ref"
     ]
+    assert projected["copy_safe_body"]["read_receipt_hash"] == launch_text_hash
+    assert projected["copy_safe_body"]["launch_text_hash"] == launch_text_hash
+    assert "<worker-computed-read-receipt-hash>" not in json.dumps(
+        projected["copy_safe_body"],
+        sort_keys=True,
+    )
     assert other_worker["runtime_context_id"] not in json.dumps(
         projected,
         sort_keys=True,
