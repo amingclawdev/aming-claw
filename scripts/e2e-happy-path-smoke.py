@@ -138,6 +138,35 @@ def offline_preflight(repo_root: Path) -> dict[str, Any]:
         )
         for world in REFERENCE_WORLDS
     ]
+    common_rule_ids = set(
+        (
+            (gate_map.get("source_inventory") or {}).get("common_rule_package")
+            or {}
+        ).get("rule_ids")
+        or []
+    )
+    lanes = gate_map.get("lanes") or {}
+    direct_lane = lanes.get("direct_main") or {}
+    parallel_lane = lanes.get("mf_parallel") or {}
+    batch_lane = lanes.get("mf_batch_parallel") or {}
+
+    def lane_rule_refs(lane: Mapping[str, Any], field: str) -> set[str]:
+        return {
+            str(rule_ref)
+            for mapping in lane.get("gate_mappings") or []
+            for rule_ref in mapping.get(field) or []
+        }
+
+    direct_closure = direct_lane.get("common_rule_closure") or {}
+    direct_mapped = lane_rule_refs(direct_lane, "rule_refs") & common_rule_ids
+    direct_unvalidated_joined = set(
+        direct_closure.get("unvalidated_joined_rule_ids") or []
+    )
+    parallel_closure = parallel_lane.get("common_rule_closure") or {}
+    parallel_mapped = lane_rule_refs(parallel_lane, "rule_refs") & common_rule_ids
+    batch_closure = batch_lane.get("common_rule_closure") or {}
+    batch_authoritative = lane_rule_refs(batch_lane, "rule_refs")
+    batch_candidates = lane_rule_refs(batch_lane, "unjoined_candidate_rule_refs")
     checks = {
         "pyproject_version": f'version = "{RELEASE_VERSION}"' in pyproject,
         "codex_manifest_version": _base_version(codex.get("version"))
@@ -179,6 +208,36 @@ def offline_preflight(repo_root: Path) -> dict[str, Any]:
         "gate_map_schema": gate_map.get("schema_version")
         == "aming_claw.contract_rule_gate_map.happy_path.v1",
         "gate_map_world_identity": map_world_identities == script_world_identities,
+        "gate_map_direct_common_rule_closure": (
+            direct_closure.get("join_state") == "resolved"
+            and direct_closure.get("closure_status")
+            == "contract_applicability_gap"
+            and direct_mapped == set(direct_closure.get("mapped_rule_ids") or [])
+            and direct_mapped.isdisjoint(direct_unvalidated_joined)
+            and direct_mapped | direct_unvalidated_joined == common_rule_ids
+            and direct_unvalidated_joined == {"AC-COMMON-MERGE-ORDERED"}
+            and direct_closure.get("server_inference_allowed") is False
+            and direct_closure.get("disposition") == "CONTRACT_UPDATE"
+        ),
+        "gate_map_parallel_common_rule_closure": (
+            parallel_closure.get("join_state") == "resolved"
+            and parallel_closure.get("closure_status") == "complete"
+            and parallel_mapped
+            == set(parallel_closure.get("mapped_rule_ids") or [])
+            == common_rule_ids
+            and not (parallel_closure.get("explicit_non_applicability") or [])
+        ),
+        "gate_map_batch_common_rules_are_unjoined_candidates": (
+            batch_closure.get("join_state")
+            == "missing_source_backed_parent_contract"
+            and batch_closure.get("closure_status") == "authority_gap"
+            and not (batch_authoritative & common_rule_ids)
+            and batch_candidates
+            == set(batch_closure.get("unjoined_candidate_rule_ids") or [])
+            and batch_candidates.issubset(common_rule_ids)
+            and batch_closure.get("server_inference_allowed") is False
+            and batch_closure.get("disposition") == "CONTRACT_UPDATE"
+        ),
         "world_count": len(REFERENCE_WORLDS) == 3,
         "worlds_are_independent": all(
             item.get("simultaneous_environment") is False for item in map_worlds

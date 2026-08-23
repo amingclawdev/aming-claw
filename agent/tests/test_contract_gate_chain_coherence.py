@@ -308,13 +308,13 @@ def test_happy_path_gate_map_pins_three_independent_historical_worlds() -> None:
     )
     assert gate_map["audit_position"] == {
         "project_id": "aming-claw",
-        "audited_code_commit": "6a180ddc9a5de6e0500be4d1de62b781c1a3967a",
-        "graph_snapshot_id": "full-6a180ddc9a5d-ed83e4d871fe",
+        "audited_code_commit": "5de2f28e8e4cfead4b3451edf9aa0af21f8c6ac3",
+        "graph_snapshot_id": "full-5de2f28e8e4c-direct-retry",
         "graph_snapshot_kind": "full",
         "graph_snapshot_status": "active",
         "graph_stale": False,
         "pending_scope_reconcile_count": 0,
-        "graph_query_trace_id": "gqt-20260823-3ba0104ea6",
+        "graph_query_trace_id": "gqt-20260823-024720bf7b",
     }
     worlds = gate_map["historical_reference_worlds"]
     assert [world["lane"] for world in worlds] == [
@@ -349,7 +349,6 @@ def test_happy_path_gate_map_keeps_rule_gate_guide_authority_explicit() -> None:
     assert common["omitted_rules_apply"] is False
     assert common["server_inference_allowed"] is False
 
-    mapped_rule_refs = set()
     for lane in gate_map["lanes"].values():
         for mapping in lane["gate_mappings"]:
             assert mapping["rule_refs"]
@@ -365,9 +364,126 @@ def test_happy_path_gate_map_keeps_rule_gate_guide_authority_explicit() -> None:
             implementation_path = REPO_ROOT / mapping["implementation_file"]
             implementation = implementation_path.read_text(encoding="utf-8")
             assert f"def {mapping['validator_symbol']}(" in implementation
-            mapped_rule_refs.update(mapping["rule_refs"])
 
-    assert set(common["rule_ids"]).issubset(mapped_rule_refs)
+    common_rule_ids = set(common["rule_ids"])
+    registry = ContractDefinitionRegistry()
+    source_backed_lanes = {
+        "direct_main": (
+            "operator_supervised_direct_main.v1.rev2",
+            _direct_definition(),
+        ),
+        "mf_parallel": (
+            "mf_parallel.v2.rev10",
+            registry.get("mf_parallel.v2", version="v2", revision="rev10"),
+        ),
+    }
+    for lane_name, (contract_ref_prefix, definition) in source_backed_lanes.items():
+        lane = gate_map["lanes"][lane_name]
+        rule_refs = {
+            rule_ref
+            for mapping in lane["gate_mappings"]
+            for rule_ref in mapping["rule_refs"]
+        }
+        expected_contract_lines = {
+            f"{contract_ref_prefix}:{line['line_id']}"
+            for stage in definition["rule_layer"]["stages"]
+            for line in stage["lines"]
+        }
+        mapped_contract_lines = {
+            rule_ref
+            for rule_ref in rule_refs
+            if rule_ref.startswith(f"{contract_ref_prefix}:")
+        }
+
+        assert mapped_contract_lines == expected_contract_lines
+
+    direct = gate_map["lanes"]["direct_main"]
+    direct_closure = direct["common_rule_closure"]
+    direct_mapped_common_rules = {
+        rule_ref
+        for mapping in direct["gate_mappings"]
+        for rule_ref in mapping["rule_refs"]
+        if rule_ref in common_rule_ids
+    }
+    direct_unvalidated_joined_rules = set(
+        direct_closure["unvalidated_joined_rule_ids"]
+    )
+    assert direct_closure["join_state"] == "resolved"
+    assert direct_closure["closure_status"] == "contract_applicability_gap"
+    assert direct_mapped_common_rules == set(direct_closure["mapped_rule_ids"])
+    assert direct_mapped_common_rules.isdisjoint(direct_unvalidated_joined_rules)
+    assert direct_mapped_common_rules | direct_unvalidated_joined_rules == (
+        common_rule_ids
+    )
+    assert direct_unvalidated_joined_rules == {"AC-COMMON-MERGE-ORDERED"}
+    assert direct_closure["server_inference_allowed"] is False
+    assert direct_closure["disposition"] == "CONTRACT_UPDATE"
+
+    parallel = gate_map["lanes"]["mf_parallel"]
+    parallel_closure = parallel["common_rule_closure"]
+    parallel_mapped_common_rules = {
+        rule_ref
+        for mapping in parallel["gate_mappings"]
+        for rule_ref in mapping["rule_refs"]
+        if rule_ref in common_rule_ids
+    }
+    assert parallel_closure["join_state"] == "resolved"
+    assert parallel_closure["closure_status"] == "complete"
+    assert parallel_mapped_common_rules == set(
+        parallel_closure["mapped_rule_ids"]
+    ) == common_rule_ids
+    assert parallel_closure["explicit_non_applicability"] == []
+
+    parallel_predicates = {
+        mapping["predicate_id"]: mapping for mapping in parallel["gate_mappings"]
+    }
+    expected_temporal_validators = {
+        "parallel.prefill_child_contracts": (
+            "mf_parallel.v2.rev10:observer_prefill_child_contracts",
+            "_contract_runtime_mf_parallel_prefill_plan_write_errors",
+        ),
+        "parallel.atomic_dispatch": (
+            "mf_parallel.v2.rev10:observer_dispatch_bounded_workers",
+            "_contract_runtime_bind_mf_parallel_dispatch_authority",
+        ),
+        "parallel.worker_finish_time_attestation": (
+            "mf_parallel.v2.rev10:worker_finish_time_attestation",
+            "handle_graph_governance_runtime_context_finish_time_worker_attestation",
+        ),
+        "parallel.worker_finish_gate": (
+            "mf_parallel.v2.rev10:worker_finish_gate",
+            "handle_graph_governance_runtime_context_finish_gate",
+        ),
+    }
+    for predicate_id, (line_ref, validator_symbol) in (
+        expected_temporal_validators.items()
+    ):
+        mapping = parallel_predicates[predicate_id]
+        assert line_ref in mapping["rule_refs"]
+        assert mapping["validator_symbol"] == validator_symbol
+
+    batch = gate_map["lanes"]["mf_batch_parallel"]
+    batch_closure = batch["common_rule_closure"]
+    batch_authoritative_rule_refs = {
+        rule_ref
+        for mapping in batch["gate_mappings"]
+        for rule_ref in mapping["rule_refs"]
+    }
+    batch_unjoined_candidates = {
+        rule_ref
+        for mapping in batch["gate_mappings"]
+        for rule_ref in mapping.get("unjoined_candidate_rule_refs", [])
+    }
+    assert batch_authoritative_rule_refs.isdisjoint(common_rule_ids)
+    assert batch_closure["join_state"] == "missing_source_backed_parent_contract"
+    assert batch_closure["closure_status"] == "authority_gap"
+    assert batch_closure["mapped_rule_ids"] == []
+    assert batch_closure["server_inference_allowed"] is False
+    assert batch_closure["disposition"] == "CONTRACT_UPDATE"
+    assert batch_unjoined_candidates == set(
+        batch_closure["unjoined_candidate_rule_ids"]
+    )
+    assert batch_unjoined_candidates.issubset(common_rule_ids)
     assert gate_map["orphan_predicate_audit"]["accepted_orphan_predicates"] == []
     orphan_candidate = gate_map["orphan_predicate_audit"]["candidates"][0]
     assert orphan_candidate["drift_gym_case"] == "DC-042"
@@ -449,7 +565,7 @@ def test_happy_path_map_separates_batch_gap_and_release_warranty() -> None:
     assert warranty["historical_reference_worlds_are_warranty"] is False
     assert warranty["combined_environment_claimed"] is False
     assert warranty["current_status"] == "INSUFFICIENT_EVIDENCE"
-    assert outcome["direct_main"] == "NO_RULE_CHANGE"
+    assert outcome["direct_main"] == "CONTRACT_UPDATE"
     assert outcome["mf_parallel"] == "NO_RULE_CHANGE"
     assert outcome["mf_parallel_failed_host_probe"] == "TRANSPORT_ONLY"
     assert outcome["mf_batch_parallel_parent"] == "CONTRACT_UPDATE"
