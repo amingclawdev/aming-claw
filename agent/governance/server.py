@@ -166636,21 +166636,113 @@ def _contract_runtime_bind_close_ready_worker_set(
     record: Mapping[str, Any],
     write: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[str]]:
-    """Materialize the multi-lane retained envelope before precheck/submit."""
+    """Materialize the server-owned close identity before precheck/submit."""
 
     effective = dict(write)
-    if (
+    if not (
         str(effective.get("line_id") or "").strip()
-        != "observer_close_ready"
-        or not _is_mf_parallel_postmerge_revision(record)
-        or _contract_runtime_mf_parallel_current_generation_worker_count(
-            record,
-            conn=conn,
-            project_id=project_id,
-        )
-        <= 1
+        == "observer_close_ready"
+        and _is_mf_parallel_postmerge_revision(record)
     ):
         return effective, []
+    required_count = _contract_runtime_mf_parallel_current_generation_worker_count(
+        record,
+        conn=conn,
+        project_id=project_id,
+    )
+    if required_count == 1:
+        latest_merge = next(
+            (
+                line
+                for line in reversed(record.get("completed_lines") or [])
+                if isinstance(line, Mapping)
+                and str(line.get("line_id") or "").strip()
+                == "observer_merge"
+            ),
+            {},
+        )
+        identity = _contract_runtime_durable_merge_identity(latest_merge)
+        if identity.get("identity_status") != "resolved":
+            return effective, [
+                "contract_runtime.observer_close_ready_retained_contract_envelope"
+            ]
+        execution_id = str(record.get("contract_execution_id") or "").strip()
+        identity_values = {
+            "runtime_context_id": str(
+                identity.get("runtime_context_id") or ""
+            ).strip(),
+            "worker_task_id": str(identity.get("task_id") or "").strip(),
+            "parent_task_id": str(
+                identity.get("parent_task_id") or ""
+            ).strip(),
+        }
+        if not execution_id or not all(identity_values.values()):
+            return effective, [
+                "contract_runtime.observer_close_ready_retained_contract_envelope"
+            ]
+        payload = (
+            dict(effective.get("payload"))
+            if isinstance(effective.get("payload"), Mapping)
+            else {}
+        )
+        effective.setdefault("task_id", execution_id)
+        effective.setdefault("contract_execution_id", execution_id)
+        payload.setdefault("contract_execution_id", execution_id)
+        for field, value in identity_values.items():
+            effective.setdefault(field, value)
+            payload.setdefault(field, value)
+        effective["payload"] = payload
+        prospective = dict(record)
+        prospective["completed_lines"] = [
+            *[
+                line
+                for line in record.get("completed_lines") or []
+                if isinstance(line, Mapping)
+            ],
+            effective,
+        ]
+        bound_identity = _contract_runtime_server_line_identity(prospective)
+        expected_claims = {
+            "task_id": execution_id,
+            "contract_execution_id": execution_id,
+            **identity_values,
+        }
+        if (
+            any(
+                str(effective.get(field) or "").strip() != expected
+                for field, expected in expected_claims.items()
+            )
+            or any(
+                str(payload.get(field) or "").strip() != expected
+                for field, expected in {
+                    "contract_execution_id": execution_id,
+                    **identity_values,
+                }.items()
+            )
+            or (
+                str(payload.get("task_id") or "").strip()
+                and str(payload.get("task_id") or "").strip()
+                not in {execution_id, identity_values["worker_task_id"]}
+            )
+            or bound_identity.get("identity_status") != "resolved"
+            or any(
+                str(bound_identity.get(field) or "").strip()
+                != str(identity.get(field) or "").strip()
+                for field in (
+                    "runtime_context_id",
+                    "task_id",
+                    "parent_task_id",
+                )
+            )
+        ):
+            return effective, [
+                "contract_runtime.observer_close_ready_retained_contract_envelope_mismatch"
+            ]
+        return effective, []
+    if required_count <= 1:
+        return effective, [
+            "contract_runtime.observer_close_ready_retained_contract_envelope"
+        ]
     authority = _contract_runtime_close_ready_worker_set_authority(
         conn,
         project_id=project_id,

@@ -96690,6 +96690,104 @@ def test_standalone_close_ready_actual_facades_bind_worker_set_then_submit(
     assert store.current["runtime_guide"]["next_legal_action"] is None
 
 
+def test_single_worker_close_ready_binds_durable_merge_identity(monkeypatch):
+    fixture = _retained_close_ready_authority_fixture()
+    record = fixture["record"]
+    record["revision"] = "rev10"
+    write = {
+        key: copy.deepcopy(value)
+        for key, value in fixture["write"].items()
+        if key not in {"runtime_context_id", "task_id"}
+    }
+    write["payload"] = {
+        "close_readiness": copy.deepcopy(
+            fixture["write"]["payload"]["close_readiness"]
+        )
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_current_generation_worker_count",
+        lambda *_args, **_kwargs: 1,
+    )
+    immutable_record_hash = server.stable_sha256(record)
+    immutable_write_hash = server.stable_sha256(write)
+
+    effective, errors = server._contract_runtime_bind_close_ready_worker_set(
+        object(), project_id=PID, record=record, write=write
+    )
+
+    assert errors == []
+    assert server.stable_sha256(record) == immutable_record_hash
+    assert server.stable_sha256(write) == immutable_write_hash
+    assert effective["task_id"] == record["contract_execution_id"]
+    assert effective["runtime_context_id"] == fixture["merge"][
+        "runtime_context_id"
+    ]
+    assert effective["worker_task_id"] == fixture["merge"]["task_id"]
+    assert effective["parent_task_id"] == fixture["merge"]["parent_task_id"]
+    assert effective["payload"] == {
+        "close_readiness": fixture["write"]["payload"]["close_readiness"],
+        "contract_execution_id": record["contract_execution_id"],
+        "runtime_context_id": fixture["merge"]["runtime_context_id"],
+        "worker_task_id": fixture["merge"]["task_id"],
+        "parent_task_id": fixture["merge"]["parent_task_id"],
+    }
+    prospective = copy.deepcopy(record)
+    prospective["completed_lines"].append(effective)
+    assert server._contract_runtime_server_line_identity(prospective) == {
+        "runtime_context_id": fixture["merge"]["runtime_context_id"],
+        "task_id": fixture["merge"]["task_id"],
+        "parent_task_id": fixture["merge"]["parent_task_id"],
+        "identity_status": "resolved",
+        "identity_source_line_id": "observer_close_ready",
+    }
+
+
+@pytest.mark.parametrize(
+    ("container", "field"),
+    [
+        ("top", "task_id"),
+        ("top", "contract_execution_id"),
+        ("top", "runtime_context_id"),
+        ("top", "worker_task_id"),
+        ("top", "parent_task_id"),
+        ("payload", "contract_execution_id"),
+        ("payload", "runtime_context_id"),
+        ("payload", "worker_task_id"),
+        ("payload", "parent_task_id"),
+        ("payload", "task_id"),
+    ],
+)
+def test_single_worker_close_ready_rejects_caller_identity_drift(
+    monkeypatch,
+    container,
+    field,
+):
+    fixture = _retained_close_ready_authority_fixture()
+    record = fixture["record"]
+    record["revision"] = "rev10"
+    write = copy.deepcopy(fixture["write"])
+    target = write if container == "top" else write["payload"]
+    target[field] = "cross-scope-identity"
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_current_generation_worker_count",
+        lambda *_args, **_kwargs: 1,
+    )
+    immutable_record_hash = server.stable_sha256(record)
+    immutable_write_hash = server.stable_sha256(write)
+
+    _effective, errors = server._contract_runtime_bind_close_ready_worker_set(
+        object(), project_id=PID, record=record, write=write
+    )
+
+    assert errors == [
+        "contract_runtime.observer_close_ready_retained_contract_envelope_mismatch"
+    ]
+    assert server.stable_sha256(record) == immutable_record_hash
+    assert server.stable_sha256(write) == immutable_write_hash
+
+
 def _insert_non_mf_backlog(conn, backlog_id: str) -> None:
     conn.execute(
         """INSERT INTO backlog_bugs
