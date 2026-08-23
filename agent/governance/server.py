@@ -166666,6 +166666,37 @@ def _contract_runtime_bind_close_ready_worker_set(
             return effective, [
                 "contract_runtime.observer_close_ready_retained_contract_envelope"
             ]
+        merge_payload = (
+            latest_merge.get("payload")
+            if isinstance(latest_merge.get("payload"), Mapping)
+            else {}
+        )
+        durable_merge = (
+            merge_payload.get("durable_merge_authority")
+            if isinstance(
+                merge_payload.get("durable_merge_authority"), Mapping
+            )
+            else {}
+        )
+        server_close_commit = str(
+            durable_merge.get("merge_commit")
+            or durable_merge.get("target_head_after_merge")
+            or ""
+        ).strip()
+        merge_line_commit = _contract_runtime_close_authority_explicit_commit(
+            latest_merge
+        )
+        if not (
+            re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", server_close_commit)
+            and merge_line_commit
+            and _contract_runtime_authority_commit_matches(
+                server_close_commit,
+                merge_line_commit,
+            )
+        ):
+            return effective, [
+                "contract_runtime.observer_close_ready_close_commit"
+            ]
         execution_id = str(record.get("contract_execution_id") or "").strip()
         identity_values = {
             "runtime_context_id": str(
@@ -166685,9 +166716,44 @@ def _contract_runtime_bind_close_ready_worker_set(
             if isinstance(effective.get("payload"), Mapping)
             else {}
         )
+        commit_containers: list[Mapping[str, Any]] = [effective, payload]
+        for key in (
+            "close_evidence",
+            "close_readiness",
+            "merge_evidence",
+            "reconcile_evidence",
+            "verification",
+            "artifact_refs",
+        ):
+            nested = payload.get(key)
+            if isinstance(nested, Mapping):
+                commit_containers.append(nested)
+        caller_commit_claims = {
+            str(container.get(field) or "").strip()
+            for container in commit_containers
+            for field in (
+                "commit_sha",
+                "commit",
+                "merge_commit",
+                "close_commit",
+                "close_commit_sha",
+                "head_commit",
+                "target_head_commit",
+                "verified_commit",
+            )
+            if str(container.get(field) or "").strip()
+        }
+        if caller_commit_claims and caller_commit_claims != {
+            server_close_commit
+        }:
+            return effective, [
+                "contract_runtime.observer_close_ready_retained_contract_envelope_mismatch"
+            ]
+        effective["commit_sha"] = server_close_commit
         effective.setdefault("task_id", execution_id)
         effective.setdefault("contract_execution_id", execution_id)
         payload.setdefault("contract_execution_id", execution_id)
+        payload["close_commit"] = server_close_commit
         for field, value in identity_values.items():
             effective.setdefault(field, value)
             payload.setdefault(field, value)

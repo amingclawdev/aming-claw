@@ -96690,14 +96690,16 @@ def test_standalone_close_ready_actual_facades_bind_worker_set_then_submit(
     assert store.current["runtime_guide"]["next_legal_action"] is None
 
 
-def test_single_worker_close_ready_binds_durable_merge_identity(monkeypatch):
+def test_single_worker_close_ready_binds_durable_merge_identity_and_commit(
+    monkeypatch,
+):
     fixture = _retained_close_ready_authority_fixture()
     record = fixture["record"]
     record["revision"] = "rev10"
     write = {
         key: copy.deepcopy(value)
         for key, value in fixture["write"].items()
-        if key not in {"runtime_context_id", "task_id"}
+        if key not in {"commit_sha", "runtime_context_id", "task_id"}
     }
     write["payload"] = {
         "close_readiness": copy.deepcopy(
@@ -96719,6 +96721,9 @@ def test_single_worker_close_ready_binds_durable_merge_identity(monkeypatch):
     assert errors == []
     assert server.stable_sha256(record) == immutable_record_hash
     assert server.stable_sha256(write) == immutable_write_hash
+    assert effective["commit_sha"] == fixture["merge"][
+        "merged_commit_sha"
+    ]
     assert effective["task_id"] == record["contract_execution_id"]
     assert effective["runtime_context_id"] == fixture["merge"][
         "runtime_context_id"
@@ -96728,6 +96733,7 @@ def test_single_worker_close_ready_binds_durable_merge_identity(monkeypatch):
     assert effective["payload"] == {
         "close_readiness": fixture["write"]["payload"]["close_readiness"],
         "contract_execution_id": record["contract_execution_id"],
+        "close_commit": fixture["merge"]["merged_commit_sha"],
         "runtime_context_id": fixture["merge"]["runtime_context_id"],
         "worker_task_id": fixture["merge"]["task_id"],
         "parent_task_id": fixture["merge"]["parent_task_id"],
@@ -96741,6 +96747,32 @@ def test_single_worker_close_ready_binds_durable_merge_identity(monkeypatch):
         "identity_status": "resolved",
         "identity_source_line_id": "observer_close_ready",
     }
+    observed: dict[str, str] = {}
+
+    def capture_close_commit(_records, *, close_commit, **_kwargs):
+        observed["close_commit"] = close_commit
+        return {"passed": True, "missing_requirement_ids": []}
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_bind_close_reconcile_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(record),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_close_authority_gate",
+        capture_close_commit,
+    )
+    precheck = server._contract_runtime_mf_parallel_close_ready_precheck(
+        record,
+        effective,
+        conn=object(),
+        project_id=PID,
+    )
+    assert precheck["passed"] is True
+    assert observed["close_commit"] == fixture["merge"][
+        "merged_commit_sha"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -96756,6 +96788,8 @@ def test_single_worker_close_ready_binds_durable_merge_identity(monkeypatch):
         ("payload", "worker_task_id"),
         ("payload", "parent_task_id"),
         ("payload", "task_id"),
+        ("top", "commit_sha"),
+        ("payload", "close_commit"),
     ],
 )
 def test_single_worker_close_ready_rejects_caller_identity_drift(
@@ -96783,6 +96817,46 @@ def test_single_worker_close_ready_rejects_caller_identity_drift(
 
     assert errors == [
         "contract_runtime.observer_close_ready_retained_contract_envelope_mismatch"
+    ]
+    assert server.stable_sha256(record) == immutable_record_hash
+    assert server.stable_sha256(write) == immutable_write_hash
+
+
+def test_single_worker_close_ready_rejects_missing_durable_merge_commit(
+    monkeypatch,
+):
+    fixture = _retained_close_ready_authority_fixture()
+    record = fixture["record"]
+    record["revision"] = "rev10"
+    merge_line = record["completed_lines"][0]
+    merge_line["commit_sha"] = ""
+    durable = merge_line["payload"]["durable_merge_authority"]
+    durable["merge_commit"] = ""
+    durable["target_head_after_merge"] = ""
+    write = {
+        key: copy.deepcopy(value)
+        for key, value in fixture["write"].items()
+        if key not in {"commit_sha", "runtime_context_id", "task_id"}
+    }
+    write["payload"] = {
+        "close_readiness": copy.deepcopy(
+            fixture["write"]["payload"]["close_readiness"]
+        )
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_current_generation_worker_count",
+        lambda *_args, **_kwargs: 1,
+    )
+    immutable_record_hash = server.stable_sha256(record)
+    immutable_write_hash = server.stable_sha256(write)
+
+    _effective, errors = server._contract_runtime_bind_close_ready_worker_set(
+        object(), project_id=PID, record=record, write=write
+    )
+
+    assert errors == [
+        "contract_runtime.observer_close_ready_close_commit"
     ]
     assert server.stable_sha256(record) == immutable_record_hash
     assert server.stable_sha256(write) == immutable_write_hash
