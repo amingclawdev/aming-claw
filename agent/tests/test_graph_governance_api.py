@@ -15392,12 +15392,14 @@ def _current_full_parent_terminal_resume_fixture(monkeypatch, tmp_path, suffix):
     assert first_status == 201
     snapshot_id = first["snapshot_id"]
 
-    child_task_id = f"{batch_id}:row:2"
+    child_task_id = f"{batch_id}:row:1"
     child_backlog_id = f"AC-CHILD-TERMINAL-{suffix.upper()}"
     runtime_context_id = f"mfrctx-parent-terminal-{suffix}"
     runtime_parent_task_id = f"cex-parent-terminal-{suffix}"
     merge_queue_id = f"mq-parent-terminal-{suffix}"
     queue_item_id = f"mqitem-parent-terminal-{suffix}"
+    final_queue_item_id = f"mqitem-parent-terminal-final-{suffix}"
+    child_landing_head = "c" * 40
     upsert_branch_context(
         connection,
         BranchTaskRuntimeContext(
@@ -15424,6 +15426,22 @@ def _current_full_parent_terminal_resume_fixture(monkeypatch, tmp_path, suffix):
             task_id=child_task_id,
             backlog_id=child_backlog_id,
             branch_ref=f"refs/heads/codex/{child_task_id}",
+            queue_index=1,
+            status=STATE_MERGED,
+            snapshot_id=snapshot_id,
+            merge_commit=child_landing_head,
+            target_head_after_merge=child_landing_head,
+        ),
+    )
+    upsert_merge_queue_item(
+        connection,
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=final_queue_item_id,
+            task_id=f"{batch_id}:row:2",
+            backlog_id=f"AC-CHILD-TERMINAL-FINAL-{suffix.upper()}",
+            branch_ref=f"refs/heads/codex/{batch_id}:row:2",
             queue_index=2,
             status=STATE_MERGED,
             snapshot_id=snapshot_id,
@@ -15443,6 +15461,8 @@ def _current_full_parent_terminal_resume_fixture(monkeypatch, tmp_path, suffix):
             current_head=head,
             merge_queue_id=merge_queue_id,
             merge_cursor=2,
+            merged_prefix=(queue_item_id, final_queue_item_id),
+            remaining_queue_item_ids=(),
             reconcile_state="reconciled",
             status=parallel_branch_runtime.INTEGRATION_EPOCH_CLOSED,
             snapshot_id=snapshot_id,
@@ -15490,6 +15510,7 @@ def _current_full_parent_terminal_resume_fixture(monkeypatch, tmp_path, suffix):
         "runtime_parent_task_id": runtime_parent_task_id,
         "merge_queue_id": merge_queue_id,
         "queue_item_id": queue_item_id,
+        "child_landing_head": child_landing_head,
     }
 
 
@@ -15524,6 +15545,9 @@ def test_current_full_existing_snapshot_resumes_from_canonical_batch_parent_read
             "runtime_parent_task_id"
         ]
         assert authority["canonical_parent_task_id"] == fixture["batch_id"]
+        assert authority["child_landing_commit_sha"] == fixture[
+            "child_landing_head"
+        ]
         assert authority["terminal_parent_scope"] == {
             "project_id": PID,
             "backlog_id": fixture["parent_backlog_id"],
@@ -15547,6 +15571,8 @@ def test_current_full_existing_snapshot_resumes_from_canonical_batch_parent_read
         "parent_root_mismatch",
         "cross_epoch",
         "wrong_queue_snapshot",
+        "missing_prefix_member",
+        "extra_merged_outside_prefix",
         "ambiguous_queue_child",
     ],
 )
@@ -15599,6 +15625,42 @@ def test_current_full_parent_snapshot_resume_wrong_or_ambiguous_lineage_is_read_
                 "SET snapshot_id = 'full-foreign' "
                 "WHERE project_id = ? AND merge_queue_id = ?",
                 (PID, fixture["merge_queue_id"]),
+            )
+        elif mutation == "missing_prefix_member":
+            connection.execute(
+                "UPDATE parallel_branch_integration_epochs "
+                "SET merge_cursor = 1, merged_prefix_json = ? "
+                "WHERE project_id = ? AND batch_id = ?",
+                (
+                    json.dumps(
+                        [
+                            "mqitem-parent-terminal-final-"
+                            + mutation
+                        ]
+                    ),
+                    PID,
+                    fixture["batch_id"],
+                ),
+            )
+        elif mutation == "extra_merged_outside_prefix":
+            upsert_merge_queue_item(
+                connection,
+                MergeQueueItem(
+                    project_id=PID,
+                    merge_queue_id=fixture["merge_queue_id"],
+                    queue_item_id=fixture["queue_item_id"] + "-outside-prefix",
+                    task_id=fixture["child_task_id"] + "-outside-prefix",
+                    backlog_id=fixture["child_backlog_id"] + "-outside-prefix",
+                    branch_ref=(
+                        f"refs/heads/codex/{fixture['child_task_id']}"
+                        "-outside-prefix"
+                    ),
+                    queue_index=3,
+                    status=STATE_MERGED,
+                    snapshot_id=fixture["snapshot_id"],
+                    merge_commit=fixture["head"],
+                    target_head_after_merge=fixture["head"],
+                ),
             )
         else:
             upsert_merge_queue_item(

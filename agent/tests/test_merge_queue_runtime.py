@@ -3023,6 +3023,193 @@ def test_final_reconcile_accepts_active_snapshot_when_semantic_projection_is_ski
     }
 
 
+def test_final_batch_reconcile_projects_custody_to_every_merged_prefix_child() -> None:
+    conn = _runtime_conn()
+    batch_id = "batch-two-row-final-custody"
+    queue_id = "mq-two-row-final-custody"
+    intermediate_head = "1" * 40
+    final_head = "2" * 40
+    row1 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-two-row-1",
+        task_id="task-two-row-1",
+        backlog_id="AC-TWO-ROW-1",
+        branch_ref="refs/heads/codex/two-row-1",
+        queue_index=1,
+        status=STATE_MERGED,
+        target_ref=TARGET_REF,
+        branch_head="a" * 40,
+        current_target_head="0" * 40,
+        merge_commit=intermediate_head,
+        target_head_after_merge=intermediate_head,
+        snapshot_id="full-intermediate-custody",
+        projection_id="sem-intermediate-custody",
+    )
+    row2 = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="item-two-row-2",
+        task_id="task-two-row-2",
+        backlog_id="AC-TWO-ROW-2",
+        branch_ref="refs/heads/codex/two-row-2",
+        queue_index=2,
+        status=STATE_MERGED,
+        target_ref=TARGET_REF,
+        branch_head="b" * 40,
+        current_target_head=intermediate_head,
+        merge_commit=final_head,
+        target_head_after_merge=final_head,
+    )
+    upsert_merge_queue_items(conn, [row1, row2])
+    for item, target_head in (
+        (row1, intermediate_head),
+        (row2, final_head),
+    ):
+        upsert_branch_context(
+            conn,
+            BranchTaskRuntimeContext(
+                project_id=PROJECT_ID,
+                batch_id=batch_id,
+                task_id=item.task_id,
+                backlog_id=item.backlog_id,
+                branch_ref=item.branch_ref,
+                status=STATE_MERGED,
+                head_commit=item.branch_head,
+                target_head_commit=target_head,
+                snapshot_id=(
+                    "full-intermediate-custody"
+                    if item is row1
+                    else ""
+                ),
+                projection_id=(
+                    "sem-intermediate-custody"
+                    if item is row1
+                    else ""
+                ),
+                merge_queue_id=queue_id,
+            ),
+        )
+    upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            epoch_id="epoch-two-row-final-custody",
+            coordination_backlog_id="AC-TWO-ROW-PARENT",
+            target_ref=TARGET_REF,
+            base_head="0" * 40,
+            current_head=final_head,
+            merge_queue_id=queue_id,
+            merge_cursor=2,
+            merged_prefix=(row1.queue_item_id, row2.queue_item_id),
+            remaining_queue_item_ids=(),
+            reconcile_state="pending",
+            status=pbr.INTEGRATION_EPOCH_RECONCILE_PENDING,
+            last_merge_commit=final_head,
+        ),
+    )
+
+    recorded = record_merge_queue_graph_epoch_after_reconcile(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit=final_head,
+        snapshot_id="full-two-row-final-custody",
+        projection_id="",
+        merge_queue_id=queue_id,
+    )
+
+    assert recorded["updated_count"] == 2
+    assert recorded["context_updated_count"] == 2
+    assert recorded["batch_merged_prefix_custody"] == {
+        "applied": True,
+        "batch_id": batch_id,
+        "merged_prefix_count": 2,
+        "candidate_and_merge_provenance_rewritten": False,
+    }
+    persisted = {
+        item.queue_item_id: item
+        for item in list_merge_queue_items(
+            conn, PROJECT_ID, queue_id, target_ref=TARGET_REF
+        )
+    }
+    assert persisted[row1.queue_item_id].snapshot_id == (
+        "full-two-row-final-custody"
+    )
+    assert persisted[row2.queue_item_id].snapshot_id == (
+        "full-two-row-final-custody"
+    )
+    assert persisted[row1.queue_item_id].branch_head == "a" * 40
+    assert persisted[row1.queue_item_id].merge_commit == intermediate_head
+    assert persisted[row1.queue_item_id].target_head_after_merge == (
+        intermediate_head
+    )
+    assert persisted[row2.queue_item_id].branch_head == "b" * 40
+    assert persisted[row2.queue_item_id].merge_commit == final_head
+    for item in (row1, row2):
+        context = get_branch_context(conn, PROJECT_ID, item.task_id)
+        assert context is not None
+        assert context.target_head_commit == final_head
+        assert context.snapshot_id == "full-two-row-final-custody"
+
+    # A same-world idempotent parent replay repairs a prefix projection written
+    # by an older runtime without altering the child's ordered landing proof.
+    conn.execute(
+        "UPDATE parallel_branch_merge_queue_items SET snapshot_id = '' "
+        "WHERE project_id = ? AND queue_item_id = ?",
+        (PROJECT_ID, row1.queue_item_id),
+    )
+    conn.execute(
+        "UPDATE parallel_branch_runtime_contexts "
+        "SET snapshot_id = '', target_head_commit = ? "
+        "WHERE project_id = ? AND task_id = ?",
+        (intermediate_head, PROJECT_ID, row1.task_id),
+    )
+    replayed = record_merge_queue_graph_epoch_after_reconcile(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit=final_head,
+        snapshot_id="full-two-row-final-custody",
+        projection_id="",
+    )
+    repaired_row1 = get_merge_queue_item(
+        conn, PROJECT_ID, queue_id, row1.queue_item_id
+    )
+    repaired_context = get_branch_context(conn, PROJECT_ID, row1.task_id)
+    assert replayed["batch_merged_prefix_custody"]["applied"] is True
+    assert repaired_row1 is not None
+    assert repaired_row1.snapshot_id == "full-two-row-final-custody"
+    assert repaired_row1.merge_commit == intermediate_head
+    assert repaired_context is not None
+    assert repaired_context.target_head_commit == final_head
+    assert repaired_context.snapshot_id == "full-two-row-final-custody"
+
+    conn.execute(
+        "UPDATE parallel_branch_runtime_contexts "
+        "SET snapshot_id = 'full-context-only-stale', "
+        "projection_id = 'sem-context-only-stale', "
+        "target_head_commit = ? "
+        "WHERE project_id = ? AND task_id = ?",
+        (intermediate_head, PROJECT_ID, row1.task_id),
+    )
+    context_only_replay = record_merge_queue_graph_epoch_after_reconcile(
+        conn,
+        project_id=PROJECT_ID,
+        target_head_commit=final_head,
+        snapshot_id="full-two-row-final-custody",
+        projection_id="",
+        queue_item_id=row1.queue_item_id,
+    )
+    context_only_repaired = get_branch_context(conn, PROJECT_ID, row1.task_id)
+    assert context_only_replay["updated_count"] == 0
+    assert context_only_replay["context_updated_count"] == 1
+    assert context_only_replay["status"] == "recorded"
+    assert context_only_repaired is not None
+    assert context_only_repaired.target_head_commit == final_head
+    assert context_only_repaired.snapshot_id == "full-two-row-final-custody"
+    assert context_only_repaired.projection_id == ""
+
+
 def test_child_close_waits_for_final_barrier_and_never_releases_epoch() -> None:
     conn = _runtime_conn()
     open_epoch = upsert_integration_epoch(

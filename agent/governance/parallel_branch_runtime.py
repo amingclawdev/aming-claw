@@ -14320,12 +14320,71 @@ def record_merge_queue_graph_epoch_after_reconcile(
     result["semantic_projection_optional"] = True
     result["projection_status"] = "recorded" if projection else "skipped"
 
+    # A final batch reconcile represents the canonical world produced by the
+    # whole merged prefix, not only the last item whose individual merge commit
+    # happens to equal that world.  Resolve that frozen epoch before selecting
+    # rows so every member can receive the same final graph custody while its
+    # own branch/candidate/merge commit evidence remains unchanged.
+    batch_epoch: IntegrationEpoch | None = None
+    if activation_completed:
+        epoch_clauses = [
+            "project_id = ?",
+            "status IN (?, ?)",
+        ]
+        epoch_params: list[Any] = [
+            project,
+            INTEGRATION_EPOCH_RECONCILE_PENDING,
+            INTEGRATION_EPOCH_CLOSED,
+        ]
+        if queue_id:
+            epoch_clauses.append("merge_queue_id = ?")
+            epoch_params.append(queue_id)
+        candidate_epochs = [
+            _integration_epoch_from_row(row)
+            for row in conn.execute(
+                f"""
+                SELECT * FROM parallel_branch_integration_epochs
+                WHERE {' AND '.join(epoch_clauses)}
+                ORDER BY created_at, batch_id
+                """,
+                epoch_params,
+            ).fetchall()
+        ]
+        eligible_epochs = [
+            epoch
+            for epoch in candidate_epochs
+            if epoch.status
+            in {
+                INTEGRATION_EPOCH_RECONCILE_PENDING,
+                INTEGRATION_EPOCH_CLOSED,
+            }
+            and not epoch.remaining_queue_item_ids
+            and bool(epoch.merged_prefix)
+            and _commit_ref_unambiguously_matches(
+                epoch.reconciled_target_head or epoch.current_head,
+                target,
+            )
+            and (
+                epoch.status != INTEGRATION_EPOCH_CLOSED
+                or epoch.snapshot_id == snapshot
+            )
+            and (not item_id or item_id in epoch.merged_prefix)
+        ]
+        if len(eligible_epochs) == 1:
+            batch_epoch = eligible_epochs[0]
+            queue_id = batch_epoch.merge_queue_id
+            result["merge_queue_id"] = queue_id
+    batch_prefix_item_ids = (
+        set(batch_epoch.merged_prefix) if batch_epoch is not None else set()
+    )
+
     clauses = [
         "project_id = ?",
         "status = ?",
-        "(snapshot_id = '' OR projection_id = '')",
     ]
     params: list[Any] = [project, STATE_MERGED]
+    if batch_epoch is None:
+        clauses.append("(snapshot_id = '' OR projection_id = '')")
     if queue_id:
         clauses.append("merge_queue_id = ?")
         params.append(queue_id)
@@ -14347,53 +14406,102 @@ def record_merge_queue_graph_epoch_after_reconcile(
     explicit_item = bool(item_id)
     for row in rows:
         item = _merge_queue_item_from_row(row)
-        if not _merge_queue_item_matches_reconciled_head(
-            item,
-            target,
-            explicit_queue_item=explicit_item,
+        final_batch_prefix_member = bool(
+            batch_epoch is not None
+            and item.merge_queue_id == batch_epoch.merge_queue_id
+            and item.queue_item_id in batch_prefix_item_ids
+        )
+        if not final_batch_prefix_member and not (
+            _merge_queue_item_matches_reconciled_head(
+                item,
+                target,
+                explicit_queue_item=explicit_item,
+            )
         ):
             continue
-        next_snapshot = item.snapshot_id or snapshot
-        next_projection = item.projection_id or projection
-        if next_snapshot == item.snapshot_id and next_projection == item.projection_id:
-            continue
-        saved_item = upsert_merge_queue_item(
-            conn,
-            replace(
-                item,
-                current_target_head=item.current_target_head or target,
-                target_head_after_merge=item.target_head_after_merge or target,
-                snapshot_id=next_snapshot,
-                projection_id=next_projection,
-            ),
-            now_iso=now,
+        next_snapshot = (
+            snapshot if final_batch_prefix_member else item.snapshot_id or snapshot
         )
-        updated_items.append(
-            {
-                "merge_queue_id": saved_item.merge_queue_id,
-                "queue_item_id": saved_item.queue_item_id,
-                "task_id": saved_item.task_id,
-                "snapshot_id": saved_item.snapshot_id,
-                "projection_id": saved_item.projection_id,
-            }
+        next_projection = (
+            projection
+            if final_batch_prefix_member
+            else item.projection_id or projection
         )
+        item_projection_changed = bool(
+            next_snapshot != item.snapshot_id
+            or next_projection != item.projection_id
+        )
+        saved_item = item
+        if item_projection_changed:
+            saved_item = upsert_merge_queue_item(
+                conn,
+                replace(
+                    item,
+                    current_target_head=item.current_target_head or target,
+                    target_head_after_merge=item.target_head_after_merge or target,
+                    snapshot_id=next_snapshot,
+                    projection_id=next_projection,
+                ),
+                now_iso=now,
+            )
+            updated_items.append(
+                {
+                    "merge_queue_id": saved_item.merge_queue_id,
+                    "queue_item_id": saved_item.queue_item_id,
+                    "task_id": saved_item.task_id,
+                    "snapshot_id": saved_item.snapshot_id,
+                    "projection_id": saved_item.projection_id,
+                }
+            )
 
         context = get_branch_context(conn, project, saved_item.task_id)
         if context is None:
             continue
-        if context.snapshot_id and context.projection_id:
+        if (
+            not final_batch_prefix_member
+            and context.snapshot_id
+            and context.projection_id
+        ):
             continue
-        if context.target_head_commit and not _commit_ref_unambiguously_matches(
-            context.target_head_commit, target
+        if (
+            not final_batch_prefix_member
+            and context.target_head_commit
+            and not _commit_ref_unambiguously_matches(
+                context.target_head_commit, target
+            )
+        ):
+            continue
+        next_context_target_head = (
+            target
+            if final_batch_prefix_member
+            else context.target_head_commit or target
+        )
+        next_context_snapshot = (
+            snapshot
+            if final_batch_prefix_member
+            else context.snapshot_id or snapshot
+        )
+        next_context_projection = (
+            projection
+            if final_batch_prefix_member
+            else context.projection_id or projection
+        )
+        if (
+            context.target_head_commit == next_context_target_head
+            and context.snapshot_id == next_context_snapshot
+            and context.projection_id == next_context_projection
+            and context.merge_queue_id == saved_item.merge_queue_id
+            and context.merge_preview_id
+            == (saved_item.merge_preview_id or context.merge_preview_id)
         ):
             continue
         saved_context = upsert_branch_context(
             conn,
             replace(
                 context,
-                target_head_commit=context.target_head_commit or target,
-                snapshot_id=context.snapshot_id or snapshot,
-                projection_id=context.projection_id or projection,
+                target_head_commit=next_context_target_head,
+                snapshot_id=next_context_snapshot,
+                projection_id=next_context_projection,
                 merge_queue_id=saved_item.merge_queue_id,
                 merge_preview_id=saved_item.merge_preview_id or context.merge_preview_id,
             ),
@@ -14409,10 +14517,18 @@ def record_merge_queue_graph_epoch_after_reconcile(
 
     result["updated_count"] = len(updated_items)
     result["context_updated_count"] = len(updated_contexts)
+    result["batch_merged_prefix_custody"] = {
+        "applied": batch_epoch is not None,
+        "batch_id": batch_epoch.batch_id if batch_epoch is not None else "",
+        "merged_prefix_count": len(batch_prefix_item_ids),
+        "candidate_and_merge_provenance_rewritten": False,
+    }
     result["queue_items"] = updated_items
     result["contexts"] = updated_contexts
-    result["status"] = "recorded" if updated_items else "skipped"
-    if not updated_items:
+    result["status"] = (
+        "recorded" if updated_items or updated_contexts else "skipped"
+    )
+    if not updated_items and not updated_contexts:
         result["skipped_reason"] = "no_matching_merged_queue_item_missing_graph_epoch"
     if activation_completed:
         epoch = mark_integration_epoch_reconciled(

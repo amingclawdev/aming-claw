@@ -87163,7 +87163,9 @@ def _current_full_reconcile_parent_terminal_resume_authority(
         epoch_rows = conn.execute(
             """
             SELECT batch_id, coordination_backlog_id, merge_queue_id,
-                   reconcile_state, status, snapshot_id, reconciled_target_head
+                   merge_cursor, merged_prefix_json,
+                   remaining_queue_item_ids_json, reconcile_state, status,
+                   snapshot_id, reconciled_target_head
             FROM parallel_branch_integration_epochs
             WHERE project_id = ? AND batch_id = ? AND merge_queue_id = ?
             """,
@@ -87178,6 +87180,20 @@ def _current_full_reconcile_parent_terminal_resume_authority(
             "integration_epoch_match_count": len(epoch_rows),
         }
     epoch = dict(epoch_rows[0])
+    merged_prefix = _json_loads(epoch.get("merged_prefix_json"), [])
+    merged_prefix = [
+        str(value or "").strip()
+        for value in merged_prefix
+        if str(value or "").strip()
+    ] if isinstance(merged_prefix, list) else []
+    remaining_queue_item_ids = _json_loads(
+        epoch.get("remaining_queue_item_ids_json"), []
+    )
+    remaining_queue_item_ids = [
+        str(value or "").strip()
+        for value in remaining_queue_item_ids
+        if str(value or "").strip()
+    ] if isinstance(remaining_queue_item_ids, list) else []
     coordination_backlog_id = str(
         epoch.get("coordination_backlog_id") or ""
     ).strip()
@@ -87188,8 +87204,44 @@ def _current_full_reconcile_parent_terminal_resume_authority(
         or str(epoch.get("snapshot_id") or "").strip() != snapshot_id
         or str(epoch.get("reconciled_target_head") or "").strip()
         != target_commit_sha
+        or remaining_queue_item_ids
+        or len(merged_prefix) != int(epoch.get("merge_cursor") or 0)
     ):
         return {"valid": False, "reason": "integration_epoch_lineage_mismatch"}
+
+    prefix_rows = conn.execute(
+        """
+        SELECT queue_item_id, status, snapshot_id
+        FROM parallel_branch_merge_queue_items
+        WHERE project_id = ? AND merge_queue_id = ?
+        """,
+        (project_id, current_scope["merge_queue_id"]),
+    ).fetchall()
+    queue_rows_by_id = {
+        str(row["queue_item_id"] or "").strip(): dict(row)
+        for row in prefix_rows
+        if str(row["queue_item_id"] or "").strip()
+    }
+    prefix_rows_by_id = {
+        queue_item_id: queue_rows_by_id[queue_item_id]
+        for queue_item_id in merged_prefix
+        if queue_item_id in queue_rows_by_id
+    }
+    merged_queue_item_ids = {
+        queue_item_id
+        for queue_item_id, row in queue_rows_by_id.items()
+        if str(row.get("status") or "").strip() == "merged"
+    }
+    if (
+        len(prefix_rows_by_id) != len(merged_prefix)
+        or merged_queue_item_ids != set(merged_prefix)
+        or any(
+            str(row.get("status") or "").strip() != "merged"
+            or str(row.get("snapshot_id") or "").strip() != snapshot_id
+            for row in prefix_rows_by_id.values()
+        )
+    ):
+        return {"valid": False, "reason": "integration_epoch_prefix_custody_mismatch"}
 
     try:
         queue_rows = conn.execute(
@@ -87216,13 +87268,18 @@ def _current_full_reconcile_parent_terminal_resume_authority(
             "merge_queue_child_match_count": len(queue_rows),
         }
     queue_item = dict(queue_rows[0])
+    queue_item_id = str(queue_item.get("queue_item_id") or "").strip()
+    child_landing_commit = str(queue_item.get("merge_commit") or "").strip()
+    child_target_head_after_merge = str(
+        queue_item.get("target_head_after_merge") or ""
+    ).strip()
     if (
         str(queue_item.get("status") or "").strip() != "merged"
         or str(queue_item.get("snapshot_id") or "").strip() != snapshot_id
-        or str(queue_item.get("merge_commit") or "").strip()
-        != target_commit_sha
-        or str(queue_item.get("target_head_after_merge") or "").strip()
-        != target_commit_sha
+        or not queue_item_id
+        or merged_prefix.count(queue_item_id) != 1
+        or not child_landing_commit
+        or child_landing_commit != child_target_head_after_merge
     ):
         return {"valid": False, "reason": "merge_queue_child_lineage_mismatch"}
 
@@ -87258,7 +87315,8 @@ def _current_full_reconcile_parent_terminal_resume_authority(
         "child_task_id": current_scope["task_id"],
         "child_backlog_id": current_scope["backlog_id"],
         "merge_queue_id": current_scope["merge_queue_id"],
-        "queue_item_id": str(queue_item.get("queue_item_id") or "").strip(),
+        "queue_item_id": queue_item_id,
+        "child_landing_commit_sha": child_landing_commit,
         "snapshot_id": snapshot_id,
         "target_commit_sha": target_commit_sha,
         "history_rewritten": False,
