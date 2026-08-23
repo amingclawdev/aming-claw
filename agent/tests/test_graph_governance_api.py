@@ -178613,6 +178613,385 @@ def test_bounded_replacement_preserves_exact_pre_rotation_graph_trace(
     assert current["bounded_replacement_trace_authority"] == {}
 
 
+def _bounded_two_segment_graph_trace_case(conn, monkeypatch):
+    case = _bounded_replacement_graph_trace_case(conn, monkeypatch)
+    candidate_server = case["server"]
+
+    def baseline(timeline_count, contract_count, suffix):
+        value = {
+            "schema_version": (
+                "runtime_context.rejoin_worker_write_baseline.v1"
+            ),
+            "runtime_context_id": case["runtime_context_id"],
+            "contract_execution_id": case["parent_task_id"],
+            "timeline_worker_write_count": timeline_count,
+            "timeline_worker_write_hash": _fake_sha(
+                f"two-segment-timeline-{suffix}"
+            ),
+            "contract_runtime_completed_line_count": contract_count,
+            "contract_runtime_completed_lines_hash": _fake_sha(
+                f"two-segment-contract-{suffix}"
+            ),
+        }
+        value["stage_checkpoint_id"] = (
+            candidate_server._runtime_context_rejoin_stage_checkpoint(value)[
+                "stage_checkpoint_id"
+            ]
+        )
+        return value
+
+    trace_baseline = baseline(2, 4, "trace")
+    source_baseline = baseline(3, 6, "source")
+    current_baseline = baseline(3, 7, "current")
+    intermediate_fence = "fence-bounded-replacement-intermediate"
+
+    trace_payload = copy.deepcopy(case["ordinary"]["payload"])
+    trace_payload["bounded_replacement_worker_write_baseline"] = (
+        trace_baseline
+    )
+    trace_payload["rejoin_stage_checkpoint_id"] = trace_baseline[
+        "stage_checkpoint_id"
+    ]
+    conn.execute(
+        "UPDATE task_timeline_events SET payload_json = ?, created_at = ? "
+        "WHERE id = ?",
+        (
+            json.dumps(trace_payload, sort_keys=True),
+            "2026-08-14T07:20:00Z",
+            case["ordinary"]["id"],
+        ),
+    )
+
+    source_payload = copy.deepcopy(trace_payload)
+    source_payload["fence_token_hash"] = runtime_context_secret_hash(
+        intermediate_fence
+    )
+    source_payload["bounded_replacement_worker_write_baseline"] = (
+        source_baseline
+    )
+    source_payload["rejoin_stage_checkpoint_id"] = source_baseline[
+        "stage_checkpoint_id"
+    ]
+    intermediate = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=case["task_id"],
+        backlog_id=case["backlog_id"],
+        event_type="observer.runtime_context_session_token_rejoin",
+        event_kind="observer_command",
+        phase="runtime_context_recovery",
+        status="accepted",
+        actor="coordinator",
+        payload=source_payload,
+    )
+
+    replacement_payload = copy.deepcopy(case["replacement"]["payload"])
+    replacement_payload["bounded_replacement_worker_write_baseline"] = (
+        source_baseline
+    )
+    replacement_payload["rejoin_stage_checkpoint_id"] = source_baseline[
+        "stage_checkpoint_id"
+    ]
+    replacement_authority = replacement_payload[
+        "bounded_replacement_rejoin_authority"
+    ]
+    replacement_authority["source_event_ref"] = (
+        f"timeline:{intermediate['id']}"
+    )
+    replacement_authority["expected_worker_write_baseline"] = (
+        source_baseline
+    )
+    replacement_authority["actual_worker_write_baseline"] = source_baseline
+    replacement_event_id = int(intermediate["id"]) + 100
+    conn.execute(
+        "UPDATE task_timeline_events SET id = ?, payload_json = ?, "
+        "created_at = ? WHERE id = ?",
+        (
+            replacement_event_id,
+            json.dumps(replacement_payload, sort_keys=True),
+            "2026-08-14T07:40:00Z",
+            case["replacement"]["id"],
+        ),
+    )
+    conn.execute(
+        "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+        ("2026-08-14T07:35:00Z", intermediate["id"]),
+    )
+    conn.commit()
+    intermediate["payload"] = source_payload
+    intermediate["created_at"] = "2026-08-14T07:35:00Z"
+    case["replacement"]["id"] = replacement_event_id
+    case["replacement"]["payload"] = replacement_payload
+    case["replacement"]["created_at"] = "2026-08-14T07:40:00Z"
+
+    prefix = [
+        {
+            "stage_id": "orchestration",
+            "line_id": "observer_prefill_child_contracts",
+            "evidence_kind": "contract_binding",
+            "actor_role": "observer",
+        },
+        {
+            "stage_id": "dispatch",
+            "line_id": "observer_dispatch_bounded_workers",
+            "evidence_kind": "dispatch_bounded_worker",
+            "actor_role": "observer",
+        },
+        {
+            "stage_id": "worker_read",
+            "line_id": "worker_read_runtime_guide",
+            "evidence_kind": "read_receipt",
+            "status": "accepted",
+            "actor_role": "mf_sub",
+        },
+        {
+            "stage_id": "worker_startup",
+            "line_id": "worker_startup",
+            "evidence_kind": "mf_subagent_startup",
+            "status": "passed",
+            "actor_role": "mf_sub",
+        },
+    ]
+    graph_context = {
+        "stage_id": "worker_context",
+        "line_id": "worker_graph_context",
+        "evidence_kind": "graph_trace",
+        "actor_role": "mf_sub",
+        "runtime_context_id": case["runtime_context_id"],
+        "task_id": case["task_id"],
+        "graph_trace_ids": [case["trace_id"]],
+    }
+    pre_rejoin_implementation = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "line_instance_id": "worker_implementation:pre-rejoin",
+        "evidence_kind": "implementation",
+        "status": "passed",
+        "actor_role": "mf_sub",
+        "runtime_context_id": case["runtime_context_id"],
+        "task_id": case["task_id"],
+        "graph_trace_ids": [case["trace_id"]],
+    }
+    post_replacement_implementation = {
+        **pre_rejoin_implementation,
+        "line_instance_id": "worker_implementation:post-replacement",
+    }
+    record = {
+        "contract_execution_id": case["parent_task_id"],
+        "contract_id": "mf_parallel_child",
+        "completed_lines": [
+            *prefix,
+            graph_context,
+            pre_rejoin_implementation,
+            post_replacement_implementation,
+        ],
+        "runtime_guide": {
+            "next_legal_action": {
+                "line_id": "worker_commit",
+                "runtime_context_id": case["runtime_context_id"],
+                "task_id": case["task_id"],
+            }
+        },
+    }
+    monkeypatch.setattr(
+        candidate_server,
+        "_runtime_context_rejoin_worker_write_baseline",
+        lambda *_args, **_kwargs: copy.deepcopy(current_baseline),
+    )
+    monkeypatch.setattr(
+        candidate_server,
+        "_runtime_context_legacy_rejoin_verified_relation",
+        lambda *_args, **_kwargs: "advanced",
+    )
+    monkeypatch.setattr(
+        candidate_server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(get=lambda _execution_id: record),
+    )
+    case.update(
+        {
+            "trace_baseline": trace_baseline,
+            "source_baseline": source_baseline,
+            "current_baseline": current_baseline,
+            "intermediate": intermediate,
+            "intermediate_fence": intermediate_fence,
+            "record": record,
+        }
+    )
+    return case
+
+
+def test_bounded_replacement_preserves_exact_two_segment_graph_trace_chain(
+    conn,
+    monkeypatch,
+):
+    case = _bounded_two_segment_graph_trace_case(conn, monkeypatch)
+    candidate_server = case["server"]
+    before_dump = "\n".join(conn.iterdump())
+
+    authority = (
+        candidate_server._runtime_context_bounded_replacement_graph_trace_authority(
+            conn,
+            project_id=PID,
+            context=case["context"],
+            runtime_context_id=case["runtime_context_id"],
+            task_id=case["task_id"],
+            parent_task_id=case["parent_task_id"],
+            backlog_id=case["backlog_id"],
+            current_fence_token=case["current_fence"],
+            trace={
+                "trace_id": case["trace_id"],
+                "fence_token": case["prior_fence"],
+                "created_at": "2026-08-14T07:30:00Z",
+                "backlog_id": case["backlog_id"],
+                "snapshot_id": case["snapshot_id"],
+                **case["route_identity"],
+            },
+        )
+    )
+    assert authority["accepted"] is True, authority["errors"]
+    assert authority["authority_path"] == "canonical_two_segment_rejoin"
+    assert authority["trace_source_event_ref"] == (
+        f"timeline:{case['ordinary']['id']}"
+    )
+    assert authority["source_event_ref"] == (
+        f"timeline:{case['intermediate']['id']}"
+    )
+    projected = candidate_server._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PID,
+        runtime_context_id=case["runtime_context_id"],
+        task_id=case["task_id"],
+        parent_task_id=case["parent_task_id"],
+        backlog_id=case["backlog_id"],
+        fence_token=case["current_fence"],
+        explicit_trace_ids=[case["trace_id"]],
+        strict_explicit_trace_ids=True,
+    )
+    assert projected["db_verified"] is True, projected[
+        "identity_mismatches"
+    ]
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "duplicate_trace_issuance",
+        "extra_intermediate",
+        "source_checkpoint_delta",
+        "contract_graph_stage",
+        "pre_rejoin_trace_binding",
+        "event_order",
+        "source_route_identity",
+    ),
+)
+def test_bounded_replacement_two_segment_trace_chain_drift_fails_closed(
+    conn,
+    monkeypatch,
+    drift,
+):
+    case = _bounded_two_segment_graph_trace_case(conn, monkeypatch)
+    if drift == "duplicate_trace_issuance":
+        task_timeline.record_event(
+            conn,
+            project_id=PID,
+            task_id=case["task_id"],
+            backlog_id=case["backlog_id"],
+            event_type="observer.runtime_context_session_token_rejoin",
+            event_kind="observer_command",
+            phase="runtime_context_recovery",
+            status="accepted",
+            actor="coordinator",
+            payload=copy.deepcopy(case["ordinary"]["payload"]),
+        )
+    elif drift == "extra_intermediate":
+        extra_payload = copy.deepcopy(case["intermediate"]["payload"])
+        extra_payload["fence_token_hash"] = _fake_sha(
+            "two-segment-extra-intermediate-fence"
+        )
+        extra = task_timeline.record_event(
+            conn,
+            project_id=PID,
+            task_id=case["task_id"],
+            backlog_id=case["backlog_id"],
+            event_type="observer.runtime_context_session_token_rejoin",
+            event_kind="observer_command",
+            phase="runtime_context_recovery",
+            status="accepted",
+            actor="coordinator",
+            payload=extra_payload,
+        )
+        conn.execute(
+            "UPDATE task_timeline_events SET id = ?, created_at = ? "
+            "WHERE id = ?",
+            (
+                int(case["intermediate"]["id"]) + 1,
+                "2026-08-14T07:37:00Z",
+                extra["id"],
+            ),
+        )
+    elif drift == "source_checkpoint_delta":
+        payload = copy.deepcopy(case["intermediate"]["payload"])
+        bad_baseline = copy.deepcopy(case["source_baseline"])
+        bad_baseline["contract_runtime_completed_line_count"] += 1
+        bad_baseline.pop("stage_checkpoint_id", None)
+        bad_baseline["stage_checkpoint_id"] = (
+            case["server"]._runtime_context_rejoin_stage_checkpoint(
+                bad_baseline
+            )["stage_checkpoint_id"]
+        )
+        payload["bounded_replacement_worker_write_baseline"] = bad_baseline
+        payload["rejoin_stage_checkpoint_id"] = bad_baseline[
+            "stage_checkpoint_id"
+        ]
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (
+                json.dumps(payload, sort_keys=True),
+                case["intermediate"]["id"],
+            ),
+        )
+    elif drift == "contract_graph_stage":
+        case["record"]["completed_lines"][4]["stage_id"] = "worker_startup"
+    elif drift == "pre_rejoin_trace_binding":
+        case["record"]["completed_lines"][5]["graph_trace_ids"] = [
+            "gqt-cross-lane"
+        ]
+    elif drift == "event_order":
+        conn.execute(
+            "UPDATE task_timeline_events SET created_at = ? WHERE id = ?",
+            ("2026-08-14T07:36:00Z", case["ordinary"]["id"]),
+        )
+    elif drift == "source_route_identity":
+        payload = copy.deepcopy(case["intermediate"]["payload"])
+        payload["route_identity"]["route_id"] = "route-cross-lane"
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (
+                json.dumps(payload, sort_keys=True),
+                case["intermediate"]["id"],
+            ),
+        )
+    conn.commit()
+
+    before_changes = conn.total_changes
+    projected = case["server"]._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PID,
+        runtime_context_id=case["runtime_context_id"],
+        task_id=case["task_id"],
+        parent_task_id=case["parent_task_id"],
+        backlog_id=case["backlog_id"],
+        fence_token=case["current_fence"],
+        explicit_trace_ids=[case["trace_id"]],
+        strict_explicit_trace_ids=True,
+    )
+    assert projected["db_verified"] is False
+    assert case["trace_id"] not in projected["verified_trace_ids"]
+    assert conn.total_changes == before_changes
+
+
 def test_bounded_replacement_trace_survives_immediate_worker_commit_successor(
     conn,
     monkeypatch,

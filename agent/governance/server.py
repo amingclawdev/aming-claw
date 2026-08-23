@@ -23557,7 +23557,7 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
     current_fence_token: str,
     trace: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Verify one immutable pre-rotation trace through one bounded replacement."""
+    """Verify one immutable trace through the exact bounded replacement chain."""
 
     from .parallel_branch_runtime import runtime_context_secret_hash
 
@@ -23734,7 +23734,7 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
         value = event.get("payload")
         return value if isinstance(value, Mapping) else {}
 
-    def accepted_event(
+    def event_identity_matches(
         event: Mapping[str, Any],
         *,
         kind: str,
@@ -23770,8 +23770,75 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
                 == str(route_identity.get(field) or "").strip()
                 for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
             )
-            and audited_checkpoint_matches(payload)
         )
+
+    def accepted_event(
+        event: Mapping[str, Any],
+        *,
+        kind: str,
+        fence_hash: str,
+    ) -> bool:
+        return bool(
+            event_identity_matches(
+                event,
+                kind=kind,
+                fence_hash=fence_hash,
+            )
+            and audited_checkpoint_matches(event_payload(event))
+        )
+
+    def verified_prefix_checkpoint_matches(
+        payload: Mapping[str, Any],
+    ) -> bool:
+        prior_baseline = payload.get(
+            "bounded_replacement_worker_write_baseline"
+        )
+        prior_checkpoint = _runtime_context_rejoin_stage_checkpoint(
+            prior_baseline if isinstance(prior_baseline, Mapping) else {}
+        )
+        return bool(
+            prior_checkpoint
+            and str(payload.get("rejoin_stage_checkpoint_id") or "").strip()
+            == str(prior_checkpoint.get("stage_checkpoint_id") or "").strip()
+            and _runtime_context_legacy_rejoin_verified_relation(
+                conn,
+                project_id=project_id,
+                context=context,
+                timeline_events=timeline_events,
+                prior_baseline=(
+                    prior_baseline
+                    if isinstance(prior_baseline, Mapping)
+                    else {}
+                ),
+                current_baseline=current_baseline,
+            )
+            == "advanced"
+        )
+
+    def line_graph_trace_ids(line: Mapping[str, Any]) -> list[str]:
+        values: list[str] = []
+
+        def collect(value: Any, *, trace_value: bool = False) -> None:
+            if isinstance(value, Mapping):
+                for key, nested in value.items():
+                    collect(
+                        nested,
+                        trace_value=(
+                            trace_value
+                            or str(key)
+                            in _PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_KEYS
+                        ),
+                    )
+            elif isinstance(value, (list, tuple, set)):
+                for nested in value:
+                    collect(nested, trace_value=trace_value)
+            elif trace_value:
+                text = str(value or "").strip()
+                if text and text not in values:
+                    values.append(text)
+
+        collect(line)
+        return values
 
     replacements = [
         event
@@ -23824,35 +23891,229 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
     ):
         return reject("bounded replacement authority is not canonical")
 
-    ordinary = [
-        event
+    source_payloads = [
+        (event, event_payload(event))
         for event in timeline_events
         if str(event.get("id") or "").strip() == source_event_id
-        and accepted_event(
+    ]
+    source_fence_hash = (
+        str(source_payloads[0][1].get("fence_token_hash") or "").strip()
+        if len(source_payloads) == 1
+        else ""
+    )
+    ordinary = [
+        event
+        for event, _payload in source_payloads
+        if accepted_event(
             event,
             kind="ordinary_initial_rejoin",
-            fence_hash=trace_fence_hash,
+            fence_hash=source_fence_hash,
         )
     ]
-    if len(ordinary) != 1:
-        return reject("ordinary issuance audit is missing or ambiguous")
-    ordinary_created_at = str(ordinary[0].get("created_at") or "").strip()
-    replacement_created_at = str(replacement.get("created_at") or "").strip()
-    if not (
-        ordinary_created_at
-        and replacement_created_at
-        and ordinary_created_at <= trace_created_at <= replacement_created_at
+    if (
+        len(ordinary) != 1
+        or not source_fence_hash
+        or source_fence_hash == current_fence_hash
     ):
-        return reject("trace was not created between issuance and replacement")
+        return reject("ordinary issuance audit is missing or ambiguous")
+    source_ordinary = ordinary[0]
+    ordinary_created_at = str(
+        source_ordinary.get("created_at") or ""
+    ).strip()
+    replacement_created_at = str(replacement.get("created_at") or "").strip()
+    source_event_number = int(source_ordinary.get("id") or 0)
+    replacement_event_number = int(replacement.get("id") or 0)
+    trace_source_event_ref = source_event_ref
+    authority_path = "direct_one_rotation"
+
+    if source_fence_hash == trace_fence_hash:
+        if not (
+            ordinary_created_at
+            and replacement_created_at
+            and source_event_number > 0
+            and source_event_number < replacement_event_number
+            and ordinary_created_at
+            <= trace_created_at
+            <= replacement_created_at
+        ):
+            return reject(
+                "trace was not created between issuance and replacement"
+            )
+    else:
+        # The canonical resumed-worker path has two strictly bounded audited
+        # segments: the trace's issuance checkpoint, then exactly one ordinary
+        # rejoin after worker_graph_context + worker_implementation, followed by
+        # that ordinary event's bounded replacement.  Both historical
+        # checkpoints must remain cryptographically verified prefixes of the
+        # current worker_commit predecessor; arbitrary historical traces never
+        # qualify.
+        if checkpoint_mode != "immediate_worker_commit_successor":
+            return reject(
+                "two-segment trace authority requires worker_commit successor"
+            )
+        trace_ordinary = [
+            event
+            for event in timeline_events
+            if event_identity_matches(
+                event,
+                kind="ordinary_initial_rejoin",
+                fence_hash=trace_fence_hash,
+            )
+            and verified_prefix_checkpoint_matches(event_payload(event))
+        ]
+        if len(trace_ordinary) != 1:
+            return reject(
+                "trace issuance prefix audit is missing or ambiguous"
+            )
+        trace_source = trace_ordinary[0]
+        trace_source_payload = event_payload(trace_source)
+        trace_source_created_at = str(
+            trace_source.get("created_at") or ""
+        ).strip()
+        trace_source_event_number = int(trace_source.get("id") or 0)
+        if not (
+            trace_source_created_at
+            and ordinary_created_at
+            and replacement_created_at
+            and 0 < trace_source_event_number < source_event_number
+            < replacement_event_number
+            and trace_source_created_at
+            <= trace_created_at
+            <= ordinary_created_at
+            <= replacement_created_at
+        ):
+            return reject("two-segment trace audit order is invalid")
+
+        trace_source_baseline = trace_source_payload.get(
+            "bounded_replacement_worker_write_baseline"
+        )
+        source_baseline = event_payload(source_ordinary).get(
+            "bounded_replacement_worker_write_baseline"
+        )
+        trace_source_checkpoint = _runtime_context_rejoin_stage_checkpoint(
+            trace_source_baseline
+            if isinstance(trace_source_baseline, Mapping)
+            else {}
+        )
+        source_checkpoint = _runtime_context_rejoin_stage_checkpoint(
+            source_baseline if isinstance(source_baseline, Mapping) else {}
+        )
+        if not trace_source_checkpoint or not source_checkpoint:
+            return reject("two-segment trace checkpoints are invalid")
+        trace_timeline_count = int(
+            trace_source_checkpoint["timeline_worker_write_count"]
+        )
+        source_timeline_count = int(
+            source_checkpoint["timeline_worker_write_count"]
+        )
+        trace_contract_count = int(
+            trace_source_checkpoint["contract_runtime_completed_line_count"]
+        )
+        source_contract_count = int(
+            source_checkpoint["contract_runtime_completed_line_count"]
+        )
+        if not (
+            source_timeline_count == trace_timeline_count + 1
+            and source_contract_count == trace_contract_count + 2
+        ):
+            return reject(
+                "two-segment trace checkpoints do not contain the exact "
+                "graph-context and implementation advance"
+            )
+
+        completed_lines = dict(_contract_runtime_completed_lines(record))
+        graph_context_line = completed_lines.get(trace_contract_count)
+        pre_rejoin_implementation = completed_lines.get(
+            trace_contract_count + 1
+        )
+        if not (
+            isinstance(graph_context_line, Mapping)
+            and isinstance(pre_rejoin_implementation, Mapping)
+            and str(graph_context_line.get("stage_id") or "").strip()
+            == "worker_context"
+            and str(graph_context_line.get("line_id") or "").strip()
+            == "worker_graph_context"
+            and str(graph_context_line.get("evidence_kind") or "").strip()
+            == "graph_trace"
+            and str(graph_context_line.get("actor_role") or "").strip()
+            == "mf_sub"
+            and _worker_commit_text(
+                graph_context_line,
+                "runtime_context_id",
+            )
+            == runtime_context_id
+            and _worker_commit_text(graph_context_line, "task_id") == task_id
+            and set(line_graph_trace_ids(graph_context_line)) == {trace_id}
+            and str(pre_rejoin_implementation.get("stage_id") or "").strip()
+            == "worker_implementation"
+            and str(pre_rejoin_implementation.get("line_id") or "").strip()
+            == "worker_implementation"
+            and str(
+                pre_rejoin_implementation.get("evidence_kind") or ""
+            ).strip()
+            == "implementation"
+            and str(
+                pre_rejoin_implementation.get("actor_role") or ""
+            ).strip()
+            == "mf_sub"
+        ):
+            return reject(
+                "two-segment Contract graph-context/implementation prefix "
+                "is not canonical"
+            )
+        pre_rejoin_lineage = _worker_implementation_lineage(
+            record,
+            pre_rejoin_implementation,
+        )
+        if not (
+            pre_rejoin_lineage.get("runtime_context_id")
+            == runtime_context_id
+            and pre_rejoin_lineage.get("task_id") == task_id
+            and set(pre_rejoin_lineage.get("graph_trace_ids") or [])
+            == {trace_id}
+        ):
+            return reject(
+                "two-segment pre-rejoin implementation does not bind trace"
+            )
+
+        ordinary_window = [
+            event
+            for event in timeline_events
+            if (
+                trace_source_event_number
+                <= int(event.get("id") or 0)
+                <= replacement_event_number
+                and event_identity_matches(
+                    event,
+                    kind="ordinary_initial_rejoin",
+                    fence_hash=str(
+                        event_payload(event).get("fence_token_hash") or ""
+                    ).strip(),
+                )
+            )
+        ]
+        if [int(event.get("id") or 0) for event in ordinary_window] != [
+            trace_source_event_number,
+            source_event_number,
+        ]:
+            return reject(
+                "two-segment trace audit has an extra or missing ordinary rejoin"
+            )
+        trace_source_event_ref = (
+            f"timeline:{trace_source.get('id', '')}"
+        )
+        authority_path = "canonical_two_segment_rejoin"
 
     projection.update(
         {
             "accepted": True,
             "errors": [],
             "source_event_ref": source_event_ref,
+            "trace_source_event_ref": trace_source_event_ref,
             "replacement_event_ref": f"timeline:{replacement.get('id', '')}",
             "stage_checkpoint_id": current_checkpoint["stage_checkpoint_id"],
             "checkpoint_mode": checkpoint_mode,
+            "authority_path": authority_path,
             "implementation_lineage_ref": str(
                 implementation_lineage.get("implementation_lineage_ref") or ""
             ).strip(),
