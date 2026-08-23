@@ -71,6 +71,8 @@ from .contracts.runtime import (
     _active_failed_qa_line_index,
     _contains_contract_completion_blocker,
     _contract_runtime_no_pass_generation,
+    _enrich_line_instance_fields,
+    _enrich_qa_evidence_provenance,
     _line_evidence_from_write,
     _worker_commit_completed_implementation,
     _worker_commit_text,
@@ -136153,6 +136155,47 @@ def _operator_supervised_direct_main_runtime_line_payload(
     }
 
 
+def _operator_supervised_direct_main_expected_line_evidence(
+    record: Mapping[str, Any],
+    *,
+    actor_role: str,
+    stage_id: str,
+    line_id: str,
+    evidence_kind: str,
+    payload: Mapping[str, Any],
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rebuild the exact persisted line produced by the Direct adapter.
+
+    This is used only for crash-window recovery after ContractRuntime accepted
+    a line but before the public timeline event committed.  Reuse is legal only
+    when every persisted field matches the write that the facade would submit;
+    a line-id match alone is never retry authority.
+    """
+
+    body = {
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "evidence_kind": evidence_kind,
+        "payload": _operator_supervised_direct_main_runtime_line_payload(
+            record,
+            payload,
+        ),
+        **dict(extra or {}),
+    }
+    write = _contract_runtime_line_write_body(
+        record,
+        body,
+        actor_role=actor_role,
+    )
+    # ContractRuntime derives these two safe persisted surfaces immediately
+    # before Gate evaluation.  Mirror that deterministic normalization so the
+    # comparison covers the complete completed-line evidence, including QA.
+    _enrich_line_instance_fields(write)
+    _enrich_qa_evidence_provenance(write, actor_role)
+    return _line_evidence_from_write(write, actor_role)
+
+
 def _operator_supervised_direct_main_submit_runtime_line(
     conn,
     *,
@@ -137543,58 +137586,129 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
         extra: Mapping[str, Any] | None = None,
     ) -> None:
         nonlocal record
-        if event_key == "observer_direct_implementation_exception":
-            existing_lines = [
-                line
-                for line in record.get("completed_lines") or []
-                if isinstance(line, Mapping)
-                and str(line.get("line_id") or "").strip() == line_id
-            ]
-            if existing_lines:
-                expected_payload = (
-                    _operator_supervised_direct_main_runtime_line_payload(
-                        record,
-                        payload,
-                    )
-                )
-                existing = existing_lines[0]
-                if not (
-                    len(existing_lines) == 1
-                    and str(existing.get("stage_id") or "").strip()
-                    == stage_id
-                    and str(existing.get("evidence_kind") or "").strip()
-                    == evidence_kind
-                    and str(existing.get("actor_role") or "").strip()
-                    == actor_role
-                    and stable_sha256(dict(existing.get("payload") or {}))
-                    == stable_sha256(expected_payload)
-                ):
-                    raise GovernanceError(
-                        "operator_supervised_direct_main_partial_admission_mismatch",
-                        (
-                            "Direct Main retry does not match its already "
-                            "persisted ContractRuntime admission prefix"
-                        ),
-                        409,
-                        {
-                            "contract_execution_id": contract_execution_id,
-                            "line_id": line_id,
-                            "zero_write_rejection": True,
-                            "writes_performed": False,
-                        },
-                    )
-                line_refs.append(
+        existing_lines = [
+            line
+            for line in record.get("completed_lines") or []
+            if isinstance(line, Mapping)
+            and str(line.get("line_id") or "").strip() == line_id
+        ]
+        if existing_lines:
+            from . import task_timeline
+
+            materialized_events = task_timeline.list_events(
+                conn,
+                project_id,
+                backlog_id=backlog_id,
+                task_id=contract_execution_id,
+                event_kind=str(event_kind or "").strip(),
+                limit=2,
+            )
+            if materialized_events:
+                raise GovernanceError(
+                    "operator_supervised_direct_main_timeline_already_materialized",
+                    (
+                        "Direct Main completed-line reuse is limited to the "
+                        "missing-timeline crash window"
+                    ),
+                    409,
                     {
-                        "stage_id": stage_id,
+                        "contract_execution_id": contract_execution_id,
                         "line_id": line_id,
-                        "evidence_kind": evidence_kind,
-                        "execution_state_revision": int(
-                            record.get("execution_state_revision") or 0
-                        ),
-                        "existing_line_reused": True,
-                    }
+                        "existing_timeline_event_ids": [
+                            int(item.get("id") or item.get("event_id") or 0)
+                            for item in materialized_events
+                        ],
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                    },
                 )
-                return
+            expected_line = (
+                _operator_supervised_direct_main_expected_line_evidence(
+                    record,
+                    actor_role=actor_role,
+                    stage_id=stage_id,
+                    line_id=line_id,
+                    evidence_kind=evidence_kind,
+                    payload=payload,
+                    extra=extra,
+                )
+            )
+            existing_line = dict(existing_lines[0])
+            existing_payload = (
+                existing_line.get("payload")
+                if isinstance(existing_line.get("payload"), Mapping)
+                else {}
+            )
+            expected_payload = (
+                dict(expected_line.get("payload"))
+                if isinstance(expected_line.get("payload"), Mapping)
+                else {}
+            )
+            # These two fields are server projections captured at the first
+            # admission.  Their current-state diagnostics legitimately advance
+            # with ContractRuntime, so reconstruct the original complete write
+            # from the durable line.  Caller route/contract identity fields and
+            # every other payload/top-level field remain exact comparisons.
+            for projected_once_field in (
+                "route_token_gate",
+                "source_backed_contract_gate_authority",
+            ):
+                if (
+                    projected_once_field in existing_payload
+                    and projected_once_field in expected_payload
+                ):
+                    expected_payload[projected_once_field] = (
+                        existing_payload[projected_once_field]
+                    )
+            if expected_payload:
+                expected_line["payload"] = expected_payload
+            if not (
+                len(existing_lines) == 1
+                and stable_sha256(existing_line)
+                == stable_sha256(expected_line)
+            ):
+                mismatched_fields = sorted(
+                    key
+                    for key in set(existing_line) | set(expected_line)
+                    if stable_sha256(existing_line.get(key))
+                    != stable_sha256(expected_line.get(key))
+                )
+                mismatched_payload_fields = sorted(
+                    key
+                    for key in set(existing_payload) | set(expected_payload)
+                    if stable_sha256(existing_payload.get(key))
+                    != stable_sha256(expected_payload.get(key))
+                )
+                raise GovernanceError(
+                    "operator_supervised_direct_main_partial_admission_mismatch",
+                    (
+                        "Direct Main retry does not match its already "
+                        "persisted ContractRuntime admission prefix"
+                    ),
+                    409,
+                    {
+                        "contract_execution_id": contract_execution_id,
+                        "line_id": line_id,
+                        "mismatched_fields": mismatched_fields,
+                        "mismatched_payload_fields": (
+                            mismatched_payload_fields
+                        ),
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                    },
+                )
+            line_refs.append(
+                {
+                    "stage_id": stage_id,
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                    "execution_state_revision": int(
+                        record.get("execution_state_revision") or 0
+                    ),
+                    "existing_line_reused": True,
+                }
+            )
+            return
         record = _operator_supervised_direct_main_submit_runtime_line(
             conn,
             contract_execution_id=contract_execution_id,
@@ -176852,11 +176966,39 @@ def _handle_task_timeline_append(ctx: RequestContext):
             direct_owner_role = str(
                 direct_next.get("owner_role") or ""
             ).strip()
+            direct_event_owner_role = (
+                "qa"
+                if norm_event_kind
+                in {
+                    "verification",
+                    "independent_verification",
+                    "qa",
+                    "qa_verification",
+                }
+                else (
+                    "observer"
+                    if norm_event_kind
+                    in {
+                        "observer_direct_implementation_exception",
+                        "implementation",
+                        "reconcile",
+                        "current_full_reconcile",
+                        "close_ready",
+                    }
+                    else ""
+                )
+            )
+            exact_historical_line_retry_role = bool(
+                direct_event_owner_role
+                and trusted_contract_runtime_actor_role
+                == direct_event_owner_role
+            )
             if (
                 trusted_contract_runtime_actor_role
                 and direct_owner_role
                 and trusted_contract_runtime_actor_role
                 != direct_owner_role
+                and not exact_historical_line_retry_role
             ):
                 raise GovernanceError(
                     "operator_supervised_direct_main_runtime_owner_mismatch",

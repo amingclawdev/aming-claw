@@ -9258,6 +9258,88 @@ def test_contract_runtime_line_write_body_preserves_safe_qa_evidence_only():
     }.isdisjoint(write)
 
 
+def test_direct_main_retry_evidence_covers_complete_persisted_write():
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-DIRECT-MAIN-COMPLETE-RETRY-EVIDENCE",
+        "contract_execution_id": "cex-direct-main-complete-retry-evidence",
+        "definition_hash": _fake_sha("direct-main-retry-definition"),
+        "instruction_bundle_hash": _fake_sha("direct-main-retry-instructions"),
+        "execution_state": {"execution_state_revision": 5},
+        "runtime_guide": {
+            "runtime_guide_hash": _fake_sha("direct-main-retry-guide"),
+            "next_legal_action": {
+                "stage_id": "implementation",
+                "line_id": "observer_implementation",
+                "evidence_kind": "implementation",
+            },
+        },
+        "metadata": {
+            "operator_supervised_direct_main_runtime_binding": {
+                "binding_hash": _fake_sha("direct-main-retry-binding"),
+            },
+        },
+    }
+    kwargs = {
+        "actor_role": "observer",
+        "stage_id": "implementation",
+        "line_id": "observer_implementation",
+        "evidence_kind": "implementation",
+        "payload": {
+            "schema_version": (
+                "operator_supervised_direct_main.implementation_evidence.v1"
+            ),
+            "reason": "exact retry",
+        },
+        "extra": {
+            "commit_sha": "a" * 40,
+            "changed_files": ["agent/governance/server.py"],
+            "test_results": {"passed": True, "commands": ["pytest -q"]},
+        },
+    }
+    baseline = server._operator_supervised_direct_main_expected_line_evidence(
+        record,
+        **kwargs,
+    )
+    assert baseline["commit_sha"] == "a" * 40
+    assert baseline["changed_files"] == ["agent/governance/server.py"]
+    assert baseline["test_results"]["passed"] is True
+
+    mutations = []
+    for key, value in (
+        ("actor_role", "qa"),
+        ("stage_id", "qa"),
+        ("line_id", "qa_independent_verification"),
+        ("evidence_kind", "independent_verification"),
+    ):
+        changed = copy.deepcopy(kwargs)
+        changed[key] = value
+        mutations.append(changed)
+    changed_payload = copy.deepcopy(kwargs)
+    changed_payload["payload"]["reason"] = "different retry"
+    mutations.append(changed_payload)
+    changed_commit = copy.deepcopy(kwargs)
+    changed_commit["extra"]["commit_sha"] = "b" * 40
+    mutations.append(changed_commit)
+    changed_files = copy.deepcopy(kwargs)
+    changed_files["extra"]["changed_files"] = [
+        "agent/tests/test_graph_governance_api.py"
+    ]
+    mutations.append(changed_files)
+    changed_tests = copy.deepcopy(kwargs)
+    changed_tests["extra"]["test_results"]["commands"] = ["pytest -q other"]
+    mutations.append(changed_tests)
+
+    for changed in mutations:
+        assert (
+            server._operator_supervised_direct_main_expected_line_evidence(
+                record,
+                **changed,
+            )
+            != baseline
+        )
+
+
 def _persist_append_route_token_ref(
     conn: sqlite3.Connection,
     *,
@@ -91324,6 +91406,76 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     assert implemented_record["runtime_guide"]["next_legal_action"][
         "line_id"
     ] == "qa_graph_context"
+
+    # Crash-window warranty applies to every Direct line, not only the
+    # pre-mutation prefix.  A changed request is a zero-write rejection; the
+    # exact implementation request then rematerializes one missing timeline
+    # event without appending a second ContractRuntime line.
+    conn.execute(
+        "DELETE FROM task_timeline_events WHERE project_id = ? AND id = ?",
+        (PID, implementation["id"]),
+    )
+    conn.commit()
+    conflicting_implementation = copy.deepcopy(implementation_body)
+    conflicting_implementation["payload"]["reason"] = (
+        "different partial-admission retry"
+    )
+    changes_before_conflict = conn.total_changes
+    with pytest.raises(GovernanceError) as partial_admission_conflict:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=conflicting_implementation,
+            )
+        )
+    assert partial_admission_conflict.value.code == (
+        "operator_supervised_direct_main_partial_admission_mismatch"
+    )
+    assert partial_admission_conflict.value.details[
+        "zero_write_rejection"
+    ] is True
+    assert partial_admission_conflict.value.details["writes_performed"] is False
+    assert conn.total_changes == changes_before_conflict
+
+    recovered_implementation = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=copy.deepcopy(implementation_body),
+        )
+    )
+    assert recovered_implementation["id"] != implementation["id"]
+    assert recovered_implementation["payload"][
+        "direct_contract_runtime_lineage"
+    ]["completed_line_refs"] == [
+        {
+            "stage_id": "implementation",
+            "line_id": "observer_implementation",
+            "evidence_kind": "implementation",
+            "execution_state_revision": 5,
+            "existing_line_reused": True,
+        }
+    ]
+    implemented_record = server._contract_runtime(conn).store.get(task_id)
+    assert len(implemented_record["execution_state"]["completed_lines"]) == 4
+    assert sum(
+        1
+        for line in implemented_record["execution_state"]["completed_lines"]
+        if line.get("line_id") == "observer_implementation"
+    ) == 1
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_kind="implementation",
+            limit=10,
+        )
+    ) == 1
     post_implementation_guide = server.handle_project_onboard_route_guide(
         _ctx_with_role(
             {"project_id": PID},
