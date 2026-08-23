@@ -23643,14 +23643,87 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
         if isinstance(record.get("runtime_guide"), Mapping)
         else {}
     )
+    next_line_id = str(next_action.get("line_id") or "").strip()
     if not (
-        str(next_action.get("line_id") or "").strip()
-        == "worker_implementation"
+        next_line_id in {"worker_implementation", "worker_commit"}
         and str(next_action.get("runtime_context_id") or runtime_context_id).strip()
         == runtime_context_id
         and str(next_action.get("task_id") or task_id).strip() == task_id
     ):
         return reject("ContractRuntime advanced beyond worker_implementation")
+
+    trace_id = str(trace.get("trace_id") or "").strip()
+    implementation_lineage: dict[str, Any] = {}
+    checkpoint_mode = "pre_worker_implementation"
+    if next_line_id == "worker_commit":
+        implementation = _worker_commit_completed_implementation(
+            record,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+        if implementation is None:
+            return reject("worker_commit successor lacks canonical implementation")
+        implementation_lineage = _worker_implementation_lineage(
+            record,
+            implementation,
+        )
+        if trace_id not in set(
+            implementation_lineage.get("graph_trace_ids") or []
+        ):
+            return reject(
+                "worker_commit successor does not bind the immutable trace"
+            )
+        checkpoint_mode = "immediate_worker_commit_successor"
+
+    def checkpoint_relation_matches(
+        prior_baseline: Mapping[str, Any] | None,
+    ) -> bool:
+        if checkpoint_mode == "pre_worker_implementation":
+            return (
+                _runtime_context_rejoin_checkpoint_relation(
+                    prior_baseline,
+                    current_baseline,
+                )
+                == "exact"
+            )
+        relation = _runtime_context_legacy_rejoin_verified_relation(
+            conn,
+            project_id=project_id,
+            context=context,
+            timeline_events=timeline_events,
+            prior_baseline=(
+                prior_baseline
+                if isinstance(prior_baseline, Mapping)
+                else {}
+            ),
+            current_baseline=current_baseline,
+        )
+        prior_checkpoint = _runtime_context_rejoin_stage_checkpoint(
+            prior_baseline
+        )
+        if relation != "advanced" or not prior_checkpoint:
+            return False
+        return bool(
+            int(prior_checkpoint["timeline_worker_write_count"])
+            == int(current_checkpoint["timeline_worker_write_count"])
+            and int(prior_checkpoint["contract_runtime_completed_line_count"])
+            + 1
+            == int(current_checkpoint["contract_runtime_completed_line_count"])
+        )
+
+    def audited_checkpoint_matches(payload: Mapping[str, Any]) -> bool:
+        prior_baseline = payload.get(
+            "bounded_replacement_worker_write_baseline"
+        )
+        prior_checkpoint = _runtime_context_rejoin_stage_checkpoint(
+            prior_baseline if isinstance(prior_baseline, Mapping) else {}
+        )
+        return bool(
+            prior_checkpoint
+            and checkpoint_relation_matches(prior_baseline)
+            and str(payload.get("rejoin_stage_checkpoint_id") or "").strip()
+            == str(prior_checkpoint.get("stage_checkpoint_id") or "").strip()
+        )
 
     worker_id = str(getattr(context, "worker_id", "") or "").strip()
     worker_slot_id = str(
@@ -23697,13 +23770,7 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
                 == str(route_identity.get(field) or "").strip()
                 for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
             )
-            and _runtime_context_rejoin_checkpoint_relation(
-                payload.get("bounded_replacement_worker_write_baseline"),
-                current_baseline,
-            )
-            == "exact"
-            and str(payload.get("rejoin_stage_checkpoint_id") or "").strip()
-            == str(current_checkpoint.get("stage_checkpoint_id") or "").strip()
+            and audited_checkpoint_matches(payload)
         )
 
     replacements = [
@@ -23742,14 +23809,15 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
         and int(authority.get("replacement_generation") or 0) == 1
         and not authority.get("errors")
         and not authority.get("identity_mismatches")
+        and checkpoint_relation_matches(
+            authority.get("expected_worker_write_baseline")
+        )
+        and checkpoint_relation_matches(
+            authority.get("actual_worker_write_baseline")
+        )
         and _runtime_context_rejoin_checkpoint_relation(
             authority.get("expected_worker_write_baseline"),
-            current_baseline,
-        )
-        == "exact"
-        and _runtime_context_rejoin_checkpoint_relation(
             authority.get("actual_worker_write_baseline"),
-            current_baseline,
         )
         == "exact"
         and source_event_id
@@ -23784,6 +23852,10 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
             "source_event_ref": source_event_ref,
             "replacement_event_ref": f"timeline:{replacement.get('id', '')}",
             "stage_checkpoint_id": current_checkpoint["stage_checkpoint_id"],
+            "checkpoint_mode": checkpoint_mode,
+            "implementation_lineage_ref": str(
+                implementation_lineage.get("implementation_lineage_ref") or ""
+            ).strip(),
             "trace_fence_hash": trace_fence_hash,
             "current_fence_hash": current_fence_hash,
             "snapshot_id": str(trace.get("snapshot_id") or "").strip(),

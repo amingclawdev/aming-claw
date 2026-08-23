@@ -178613,6 +178613,198 @@ def test_bounded_replacement_preserves_exact_pre_rotation_graph_trace(
     assert current["bounded_replacement_trace_authority"] == {}
 
 
+def test_bounded_replacement_trace_survives_immediate_worker_commit_successor(
+    conn,
+    monkeypatch,
+):
+    case = _bounded_replacement_graph_trace_case(conn, monkeypatch)
+    candidate_server = case["server"]
+    prior_baseline = copy.deepcopy(
+        case["replacement"]["payload"][
+            "bounded_replacement_worker_write_baseline"
+        ]
+    )
+    current_baseline = {
+        **prior_baseline,
+        "contract_runtime_completed_line_count": (
+            int(prior_baseline["contract_runtime_completed_line_count"]) + 1
+        ),
+        "contract_runtime_completed_lines_hash": _fake_sha(
+            "bounded-contract-baseline-plus-worker-implementation"
+        ),
+    }
+    current_baseline.pop("stage_checkpoint_id", None)
+    current_baseline["stage_checkpoint_id"] = (
+        candidate_server._runtime_context_rejoin_stage_checkpoint(
+            current_baseline
+        )["stage_checkpoint_id"]
+    )
+    implementation = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "line_instance_id": "worker_implementation:1",
+        "evidence_kind": "implementation",
+        "status": "passed",
+        "actor_role": "mf_sub",
+        "runtime_context_id": case["runtime_context_id"],
+        "task_id": case["task_id"],
+        "graph_trace_ids": [case["trace_id"]],
+    }
+    record = {
+        "contract_execution_id": case["parent_task_id"],
+        "contract_id": "mf_parallel_child",
+        "completed_lines": [implementation],
+        "runtime_guide": {
+            "next_legal_action": {
+                "line_id": "worker_commit",
+                "runtime_context_id": case["runtime_context_id"],
+                "task_id": case["task_id"],
+            }
+        },
+    }
+    monkeypatch.setattr(
+        candidate_server,
+        "_runtime_context_rejoin_worker_write_baseline",
+        lambda *_args, **_kwargs: copy.deepcopy(current_baseline),
+    )
+    monkeypatch.setattr(
+        candidate_server,
+        "_runtime_context_legacy_rejoin_verified_relation",
+        lambda *_args, **_kwargs: "advanced",
+    )
+    monkeypatch.setattr(
+        candidate_server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(get=lambda _execution_id: record),
+    )
+
+    before_dump = "\n".join(conn.iterdump())
+    projected = candidate_server._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PID,
+        runtime_context_id=case["runtime_context_id"],
+        task_id=case["task_id"],
+        parent_task_id=case["parent_task_id"],
+        backlog_id=case["backlog_id"],
+        fence_token=case["current_fence"],
+        explicit_trace_ids=[case["trace_id"]],
+        strict_explicit_trace_ids=True,
+    )
+    assert projected["db_verified"] is True, projected["identity_mismatches"]
+    authority = projected["bounded_replacement_trace_authority"][
+        case["trace_id"]
+    ]
+    assert authority["checkpoint_mode"] == "immediate_worker_commit_successor"
+    assert authority["implementation_lineage_ref"].startswith(
+        "contract-runtime:worker-implementation:sha256:"
+    )
+    assert authority["trace_rows_mutated"] is False
+    assert authority["timeline_backfill_performed"] is False
+    assert authority["pass_synthesized"] is False
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ("implementation_trace", "extra_contract_line", "timeline_write"),
+)
+def test_bounded_replacement_worker_commit_successor_drift_fails_closed(
+    conn,
+    monkeypatch,
+    drift,
+):
+    case = _bounded_replacement_graph_trace_case(conn, monkeypatch)
+    candidate_server = case["server"]
+    prior_baseline = copy.deepcopy(
+        case["replacement"]["payload"][
+            "bounded_replacement_worker_write_baseline"
+        ]
+    )
+    current_baseline = {
+        **prior_baseline,
+        "timeline_worker_write_count": (
+            int(prior_baseline["timeline_worker_write_count"])
+            + (1 if drift == "timeline_write" else 0)
+        ),
+        "timeline_worker_write_hash": (
+            _fake_sha("unexpected-timeline-write")
+            if drift == "timeline_write"
+            else prior_baseline["timeline_worker_write_hash"]
+        ),
+        "contract_runtime_completed_line_count": (
+            int(prior_baseline["contract_runtime_completed_line_count"])
+            + (2 if drift == "extra_contract_line" else 1)
+        ),
+        "contract_runtime_completed_lines_hash": _fake_sha(
+            "bounded-contract-successor-drift"
+        ),
+    }
+    current_baseline.pop("stage_checkpoint_id", None)
+    current_baseline["stage_checkpoint_id"] = (
+        candidate_server._runtime_context_rejoin_stage_checkpoint(
+            current_baseline
+        )["stage_checkpoint_id"]
+    )
+    implementation = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "line_instance_id": "worker_implementation:1",
+        "evidence_kind": "implementation",
+        "status": "passed",
+        "actor_role": "mf_sub",
+        "runtime_context_id": case["runtime_context_id"],
+        "task_id": case["task_id"],
+        "graph_trace_ids": [
+            "gqt-cross-lane"
+            if drift == "implementation_trace"
+            else case["trace_id"]
+        ],
+    }
+    record = {
+        "contract_execution_id": case["parent_task_id"],
+        "contract_id": "mf_parallel_child",
+        "completed_lines": [implementation],
+        "runtime_guide": {
+            "next_legal_action": {
+                "line_id": "worker_commit",
+                "runtime_context_id": case["runtime_context_id"],
+                "task_id": case["task_id"],
+            }
+        },
+    }
+    monkeypatch.setattr(
+        candidate_server,
+        "_runtime_context_rejoin_worker_write_baseline",
+        lambda *_args, **_kwargs: copy.deepcopy(current_baseline),
+    )
+    monkeypatch.setattr(
+        candidate_server,
+        "_runtime_context_legacy_rejoin_verified_relation",
+        lambda *_args, **_kwargs: "advanced",
+    )
+    monkeypatch.setattr(
+        candidate_server,
+        "_contract_runtime_store",
+        lambda _conn: SimpleNamespace(get=lambda _execution_id: record),
+    )
+
+    before_changes = conn.total_changes
+    projected = candidate_server._runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=PID,
+        runtime_context_id=case["runtime_context_id"],
+        task_id=case["task_id"],
+        parent_task_id=case["parent_task_id"],
+        backlog_id=case["backlog_id"],
+        fence_token=case["current_fence"],
+        explicit_trace_ids=[case["trace_id"]],
+        strict_explicit_trace_ids=True,
+    )
+    assert projected["db_verified"] is False
+    assert case["trace_id"] not in projected["verified_trace_ids"]
+    assert conn.total_changes == before_changes
+
+
 @pytest.mark.parametrize(
     "drift",
     (
@@ -178621,7 +178813,7 @@ def test_bounded_replacement_preserves_exact_pre_rotation_graph_trace(
         "checkpoint_drift",
         "nonaccepted_replacement",
         "post_rotation_trace",
-        "snapshot_drift",
+        "snapshot_commit_drift",
         "fence_hash_drift",
     ),
 )
@@ -178668,11 +178860,11 @@ def test_bounded_replacement_graph_trace_negatives_fail_closed(
             "UPDATE graph_query_traces SET created_at = ? WHERE trace_id = ?",
             ("2026-08-14T07:41:00Z", case["trace_id"]),
         )
-    elif drift == "snapshot_drift":
-        _activate_basic_graph(
-            conn,
-            "scope-bounded-replacement-stale-successor",
-            commit_sha=case["target_commit"],
+    elif drift == "snapshot_commit_drift":
+        conn.execute(
+            "UPDATE graph_snapshots SET commit_sha = ? "
+            "WHERE snapshot_id = ?",
+            ("b" * 40, case["snapshot_id"]),
         )
     elif drift == "fence_hash_drift":
         conn.execute(
