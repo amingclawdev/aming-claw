@@ -24076,28 +24076,40 @@ def _runtime_context_bounded_replacement_graph_trace_authority(
                 "two-segment pre-rejoin implementation does not bind trace"
             )
 
-        ordinary_window = [
+        accepted_rejoin_kinds = {
+            "ordinary_initial_rejoin",
+            "bounded_replacement_rejoin",
+            "special_authority_rejoin",
+        }
+        rejoin_window = [
             event
             for event in timeline_events
             if (
                 trace_source_event_number
                 <= int(event.get("id") or 0)
                 <= replacement_event_number
+                and str(
+                    event_payload(event).get("bounded_rejoin_kind") or ""
+                ).strip()
+                in accepted_rejoin_kinds
                 and event_identity_matches(
                     event,
-                    kind="ordinary_initial_rejoin",
+                    kind=str(
+                        event_payload(event).get("bounded_rejoin_kind") or ""
+                    ).strip(),
                     fence_hash=str(
                         event_payload(event).get("fence_token_hash") or ""
                     ).strip(),
                 )
             )
         ]
-        if [int(event.get("id") or 0) for event in ordinary_window] != [
+        if [int(event.get("id") or 0) for event in rejoin_window] != [
             trace_source_event_number,
             source_event_number,
+            replacement_event_number,
         ]:
             return reject(
-                "two-segment trace audit has an extra or missing ordinary rejoin"
+                "two-segment trace audit has an extra or missing accepted rejoin"
             )
         trace_source_event_ref = (
             f"timeline:{trace_source.get('id', '')}"

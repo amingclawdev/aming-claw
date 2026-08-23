@@ -178879,6 +178879,8 @@ def test_bounded_replacement_preserves_exact_two_segment_graph_trace_chain(
     (
         "duplicate_trace_issuance",
         "extra_intermediate",
+        "extra_bounded_replacement",
+        "extra_special_rejoin",
         "source_checkpoint_delta",
         "contract_graph_stage",
         "pre_rejoin_trace_binding",
@@ -178905,10 +178907,21 @@ def test_bounded_replacement_two_segment_trace_chain_drift_fails_closed(
             actor="coordinator",
             payload=copy.deepcopy(case["ordinary"]["payload"]),
         )
-    elif drift == "extra_intermediate":
+    elif drift in {
+        "extra_intermediate",
+        "extra_bounded_replacement",
+        "extra_special_rejoin",
+    }:
         extra_payload = copy.deepcopy(case["intermediate"]["payload"])
+        if drift == "extra_bounded_replacement":
+            extra_payload = copy.deepcopy(case["replacement"]["payload"])
+        elif drift == "extra_special_rejoin":
+            extra_payload["bounded_rejoin_kind"] = (
+                "special_authority_rejoin"
+            )
+            extra_payload["special_authority_rejoin"] = True
         extra_payload["fence_token_hash"] = _fake_sha(
-            "two-segment-extra-intermediate-fence"
+            f"two-segment-{drift}-fence"
         )
         extra = task_timeline.record_event(
             conn,
