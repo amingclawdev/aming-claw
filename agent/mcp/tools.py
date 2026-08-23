@@ -4230,75 +4230,100 @@ TOOLS: list[dict] = [
     },
     {
         "name": "observer_command_next",
-        "description": "Claim the next allowed observer command using a registered session token.",
+        "description": "Claim the next allowed observer command using a registered session token or managed opaque observer session ref.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
                 "session_id": {"type": "string"},
                 "session_token": {"type": "string"},
+                "observer_session_token_ref": {"type": "string"},
             },
-            "required": ["project_id", "session_id", "session_token"],
+            "required": ["project_id", "session_id"],
+            "anyOf": [
+                {"required": ["session_token"]},
+                {"required": ["observer_session_token_ref"]},
+            ],
         },
     },
     {
         "name": "observer_command_claim",
-        "description": "Claim a specific observer command, or the next allowed command, using a registered session token.",
+        "description": "Claim a specific observer command, or the next allowed command, using a registered session token or managed opaque observer session ref.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
                 "session_id": {"type": "string"},
                 "session_token": {"type": "string"},
+                "observer_session_token_ref": {"type": "string"},
                 "command_id": {"type": "string"},
             },
-            "required": ["project_id", "session_id", "session_token"],
+            "required": ["project_id", "session_id"],
+            "anyOf": [
+                {"required": ["session_token"]},
+                {"required": ["observer_session_token_ref"]},
+            ],
         },
     },
     {
         "name": "observer_command_takeover",
-        "description": "Take over a claimed observer command whose owner session is stale, closed, revoked, or missing.",
+        "description": "Take over a claimed observer command whose owner session is stale, closed, revoked, or missing, using a registered session token or managed opaque observer session ref.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
                 "session_id": {"type": "string"},
                 "session_token": {"type": "string"},
+                "observer_session_token_ref": {"type": "string"},
                 "command_id": {"type": "string"},
                 "reason": {"type": "string"},
             },
-            "required": ["project_id", "session_id", "session_token", "command_id", "reason"],
+            "required": ["project_id", "session_id", "command_id", "reason"],
+            "anyOf": [
+                {"required": ["session_token"]},
+                {"required": ["observer_session_token_ref"]},
+            ],
         },
     },
     {
         "name": "observer_command_complete",
-        "description": "Complete a claimed observer command. Requires the same claimed session token.",
+        "description": "Complete a claimed observer command using the same claimed session token or its managed opaque observer session ref.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
                 "session_id": {"type": "string"},
                 "session_token": {"type": "string"},
+                "observer_session_token_ref": {"type": "string"},
                 "command_id": {"type": "string"},
                 "result": {"type": "object"},
             },
-            "required": ["project_id", "session_id", "session_token", "command_id"],
+            "required": ["project_id", "session_id", "command_id"],
+            "anyOf": [
+                {"required": ["session_token"]},
+                {"required": ["observer_session_token_ref"]},
+            ],
         },
     },
     {
         "name": "observer_command_fail",
-        "description": "Fail a claimed observer command. Requires the same claimed session token.",
+        "description": "Fail a claimed observer command using the same claimed session token or its managed opaque observer session ref.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
                 "session_id": {"type": "string"},
                 "session_token": {"type": "string"},
+                "observer_session_token_ref": {"type": "string"},
                 "command_id": {"type": "string"},
                 "error": {"type": "string"},
                 "result": {"type": "object"},
             },
-            "required": ["project_id", "session_id", "session_token", "command_id"],
+            "required": ["project_id", "session_id", "command_id"],
+            "anyOf": [
+                {"required": ["session_token"]},
+                {"required": ["observer_session_token_ref"]},
+            ],
         },
     },
     {
@@ -7939,41 +7964,56 @@ class ToolDispatcher:
 
         if name == "observer_command_next":
             pid = args["project_id"]
+            session_id, raw_token, error = self._observer_session_auth_for_ref(args)
+            if error:
+                return error
             return self._api(
                 "POST",
                 f"/api/projects/{pid}/observer-commands/next",
-                {"session_id": args["session_id"], "session_token": args["session_token"]},
+                {"session_id": session_id, "session_token": raw_token},
             )
 
         if name == "observer_command_claim":
             pid = args["project_id"]
-            body = {"session_id": args["session_id"], "session_token": args["session_token"]}
+            session_id, raw_token, error = self._observer_session_auth_for_ref(args)
+            if error:
+                return error
+            body = {"session_id": session_id, "session_token": raw_token}
             if args.get("command_id"):
                 body["command_id"] = args["command_id"]
             return self._api("POST", f"/api/projects/{pid}/observer-commands/claim", body)
 
         if name == "observer_command_takeover":
             pid = args["project_id"]
+            session_id, raw_token, error = self._observer_session_auth_for_ref(args)
+            if error:
+                return error
             cid = urllib.parse.quote(str(args["command_id"]), safe="")
             body = {
-                "session_id": args["session_id"],
-                "session_token": args["session_token"],
+                "session_id": session_id,
+                "session_token": raw_token,
                 "reason": args["reason"],
             }
             return self._api("POST", f"/api/projects/{pid}/observer-commands/{cid}/takeover", body)
 
         if name == "observer_command_complete":
             pid = args["project_id"]
+            session_id, raw_token, error = self._observer_session_auth_for_ref(args)
+            if error:
+                return error
             cid = urllib.parse.quote(str(args["command_id"]), safe="")
-            body = {"session_id": args["session_id"], "session_token": args["session_token"]}
+            body = {"session_id": session_id, "session_token": raw_token}
             if args.get("result"):
                 body["result"] = args["result"]
             return self._api("POST", f"/api/projects/{pid}/observer-commands/{cid}/complete", body)
 
         if name == "observer_command_fail":
             pid = args["project_id"]
+            session_id, raw_token, error = self._observer_session_auth_for_ref(args)
+            if error:
+                return error
             cid = urllib.parse.quote(str(args["command_id"]), safe="")
-            body = {"session_id": args["session_id"], "session_token": args["session_token"]}
+            body = {"session_id": session_id, "session_token": raw_token}
             if args.get("error"):
                 body["error"] = args["error"]
             if args.get("result"):

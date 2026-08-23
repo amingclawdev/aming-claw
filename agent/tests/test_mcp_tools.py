@@ -2664,6 +2664,34 @@ def test_mcp_observer_hotfix_enter_schema_exposes_observer_route_refs():
     ]
 
 
+def test_mcp_observer_command_schemas_accept_managed_session_refs():
+    auth_any_of = [
+        {"required": ["session_token"]},
+        {"required": ["observer_session_token_ref"]},
+    ]
+    required_by_name = {
+        "observer_command_next": {"project_id", "session_id"},
+        "observer_command_claim": {"project_id", "session_id"},
+        "observer_command_takeover": {
+            "project_id",
+            "session_id",
+            "command_id",
+            "reason",
+        },
+        "observer_command_complete": {"project_id", "session_id", "command_id"},
+        "observer_command_fail": {"project_id", "session_id", "command_id"},
+    }
+
+    for name, expected_required in required_by_name.items():
+        schema = next(tool for tool in TOOLS if tool.get("name") == name)[
+            "inputSchema"
+        ]
+        assert schema["properties"]["observer_session_token_ref"]["type"] == "string"
+        assert set(schema["required"]) == expected_required
+        assert "session_token" not in schema["required"]
+        assert schema["anyOf"] == auth_any_of
+
+
 def test_mcp_managed_observer_session_ref_heartbeats_and_strips_hotfix_auth():
     raw_token = "observer-secret-must-stay-process-local"
 
@@ -2780,6 +2808,120 @@ def test_mcp_managed_observer_session_ref_heartbeats_and_strips_hotfix_auth():
         },
     )
     assert stale["error"] == "observer_session_token_ref_unknown"
+
+
+def test_mcp_managed_observer_session_ref_routes_observer_commands():
+    raw_token = "observer-command-secret-must-stay-process-local"
+
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, method, path, body=None):
+            self.calls.append((method, path, body))
+            if path.endswith("/observer-sessions/register"):
+                return {
+                    "ok": True,
+                    "session_id": "obs-managed-command",
+                    "session_token": raw_token,
+                }
+            return {"ok": True}
+
+    recorder = Recorder()
+    dispatcher = ToolDispatcher(
+        api_fn=recorder,
+        worker_pool=None,
+        manager_api_fn=recorder,
+        workspace="/repo",
+    )
+    registered = dispatcher.dispatch(
+        "observer_session_register",
+        {
+            "project_id": "aming-claw",
+            "observer_kind": "codex",
+            "session_label": "managed-command",
+        },
+    )
+    token_ref = registered["observer_session_token_ref"]
+    common = {
+        "project_id": "aming-claw",
+        "session_id": "obs-managed-command",
+        "observer_session_token_ref": token_ref,
+    }
+
+    results = [
+        dispatcher.dispatch("observer_command_next", common),
+        dispatcher.dispatch(
+            "observer_command_claim", {**common, "command_id": "cmd-claim"}
+        ),
+        dispatcher.dispatch(
+            "observer_command_takeover",
+            {**common, "command_id": "cmd-stale", "reason": "bounded takeover"},
+        ),
+        dispatcher.dispatch(
+            "observer_command_complete",
+            {**common, "command_id": "cmd-complete", "result": {"ok": True}},
+        ),
+        dispatcher.dispatch(
+            "observer_command_fail",
+            {**common, "command_id": "cmd-fail", "error": "bounded failure"},
+        ),
+    ]
+
+    assert recorder.calls[1:] == [
+        (
+            "POST",
+            "/api/projects/aming-claw/observer-commands/next",
+            {"session_id": "obs-managed-command", "session_token": raw_token},
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/observer-commands/claim",
+            {
+                "session_id": "obs-managed-command",
+                "session_token": raw_token,
+                "command_id": "cmd-claim",
+            },
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/observer-commands/cmd-stale/takeover",
+            {
+                "session_id": "obs-managed-command",
+                "session_token": raw_token,
+                "reason": "bounded takeover",
+            },
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/observer-commands/cmd-complete/complete",
+            {
+                "session_id": "obs-managed-command",
+                "session_token": raw_token,
+                "result": {"ok": True},
+            },
+        ),
+        (
+            "POST",
+            "/api/projects/aming-claw/observer-commands/cmd-fail/fail",
+            {
+                "session_id": "obs-managed-command",
+                "session_token": raw_token,
+                "error": "bounded failure",
+            },
+        ),
+    ]
+    for result in results:
+        serialized = json.dumps(result, sort_keys=True)
+        assert raw_token not in serialized
+        assert token_ref not in serialized
+
+    call_count = len(recorder.calls)
+    ambiguous = dispatcher.dispatch(
+        "observer_command_next", {**common, "session_token": raw_token}
+    )
+    assert ambiguous["error"] == "observer_session_auth_ambiguous"
+    assert len(recorder.calls) == call_count
 
 
 def test_active_runtime_context_tools_are_read_only_and_route_to_current_service():
