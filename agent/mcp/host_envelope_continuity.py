@@ -44,6 +44,7 @@ CONTINUATION_TOOLS = frozenset(
         "runtime_context_current",
         "runtime_context_worker_guide",
         "runtime_context_read_receipt",
+        "contract_runtime_submit_line",
         "parallel_branch_startup",
         "runtime_context_implementation_evidence",
         "runtime_context_worker_commit",
@@ -575,6 +576,11 @@ class ManagedHostEnvelopeContinuity:
 
         entry = self._entry_for(request_args)
         if entry is None:
+            if tool_name == "contract_runtime_submit_line":
+                # This generic facade also serves observer and QA writers.
+                # Borrow worker auth only when an exact managed worker entry
+                # exists; otherwise preserve the server's role gate.
+                return send(request_args)
             candidate_binding = {
                 field: _text(request_args.get(field))
                 for field in ("project_id", "runtime_context_id", "task_id")

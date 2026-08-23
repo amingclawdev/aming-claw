@@ -327,6 +327,54 @@ def test_managed_mcp_post_startup_envelope_submits_worker_line_then_acks_finish(
     assert calls[-1]["fence_token"] == raw_fence
     assert continuity.pending_count() == 1
 
+    call_count = len(calls)
+    wrong_contract_scope = continuity.dispatch(
+        "contract_runtime_submit_line",
+        {
+            **identity,
+            "route_id": "route-other-managed-post-startup",
+            "actor_role": "mf_sub",
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "line_instance_id": (
+                f"runtime_context:{identity['runtime_context_id']}"
+            ),
+            "evidence_kind": "implementation",
+        },
+        lambda args: calls.append(dict(args)),
+    )
+    assert wrong_contract_scope["error"] == (
+        "managed_host_envelope_scope_mismatch"
+    )
+    assert wrong_contract_scope["mismatched_fields"] == ["route_id"]
+    assert wrong_contract_scope["http_request_performed"] is False
+    assert len(calls) == call_count
+
+    contract_line = continuity.dispatch(
+        "contract_runtime_submit_line",
+        {
+            **identity,
+            "actor_role": "mf_sub",
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "line_instance_id": (
+                f"runtime_context:{identity['runtime_context_id']}"
+            ),
+            "evidence_kind": "implementation",
+        },
+        lambda args: calls.append(dict(args))
+        or {
+            "ok": True,
+            "status": "accepted",
+            "session_token": raw_session,
+            "fence_token": raw_fence,
+        },
+    )
+    assert contract_line == {"ok": True, "status": "accepted"}
+    assert calls[-1]["session_token"] == raw_session
+    assert calls[-1]["fence_token"] == raw_fence
+    assert continuity.pending_count() == 1
+
     finished = continuity.dispatch(
         "runtime_context_finish_gate",
         {
@@ -342,7 +390,9 @@ def test_managed_mcp_post_startup_envelope_submits_worker_line_then_acks_finish(
         "runtime_context_finish_gate"
     )
     assert continuity.pending_count() == 0
-    serialized = json.dumps([issued, implementation, finished], sort_keys=True)
+    serialized = json.dumps(
+        [issued, implementation, contract_line, finished], sort_keys=True
+    )
     assert raw_session not in serialized
     assert raw_fence not in serialized
 
@@ -4705,6 +4755,7 @@ def test_mcp_contract_runtime_generic_tools_route_to_facade():
     dispatcher.dispatch(
         "contract_runtime_submit_line",
         {
+            "__aming_managed_host_envelope_continuity_bypass": True,
             "project_id": "aming-claw",
             "contract_execution_id": "cex-onboard",
             "execution_state_revision": 1,
