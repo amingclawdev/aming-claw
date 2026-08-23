@@ -10163,6 +10163,31 @@ def _qa_demo_control_marker_is_server_generated(
     return False
 
 
+def _qa_filter_authenticated_demo_control_metadata_entries(
+    query_root: Path,
+    *,
+    project_id: str,
+    dirty_entries: Sequence[bytes],
+) -> tuple[list[bytes], list[str]]:
+    """Project the one authenticated demo marker rule at clean-root gates."""
+
+    retained_entries = list(dirty_entries)
+    ignored_paths: list[str] = []
+    demo_marker_entry = f"?? {DEMO_ENVIRONMENT_MARKER}".encode("utf-8")
+    if (
+        demo_marker_entry in retained_entries
+        and _qa_demo_control_marker_is_server_generated(
+            query_root,
+            project_id=project_id,
+        )
+    ):
+        retained_entries = [
+            item for item in retained_entries if item != demo_marker_entry
+        ]
+        ignored_paths.append(DEMO_ENVIRONMENT_MARKER)
+    return retained_entries, ignored_paths
+
+
 def _qa_checkout_root_identity(
     *,
     project_id: str,
@@ -10370,13 +10395,14 @@ def _qa_checkout_root_identity(
                 query_root=str(query_root),
             )
         dirty_entries = [item for item in status.stdout.split(b"\0") if item]
-        demo_marker_entry = f"?? {DEMO_ENVIRONMENT_MARKER}".encode("utf-8")
-        if demo_marker_entry in dirty_entries and _qa_demo_control_marker_is_server_generated(
+        (
+            dirty_entries,
+            ignored_demo_control_metadata_paths,
+        ) = _qa_filter_authenticated_demo_control_metadata_entries(
             query_root,
             project_id=project_id,
-        ):
-            dirty_entries = [item for item in dirty_entries if item != demo_marker_entry]
-            ignored_demo_control_metadata_paths.append(DEMO_ENVIRONMENT_MARKER)
+            dirty_entries=dirty_entries,
+        )
         registered_allocator_roots = {
             Path(path).resolve()
             for path in registered_allocator_worktree_paths
@@ -169013,6 +169039,7 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
     expected_commit_trailers: dict[str, str] = {}
     commit_trailer_mismatches: dict[str, dict[str, Any]] = {}
     commit_trailers_exact = False
+    ignored_demo_control_metadata_paths: list[str] = []
     verified_changed_files_source = (
         "server_git_single_parent_to_implementation_diff_name_status_z_m"
     )
@@ -169208,9 +169235,23 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         try:
             status = _qa_git_bytes(
                 root,
-                ["status", "--porcelain=v1", "--untracked-files=all"],
+                [
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                ],
             )
-            worktree_clean = status.returncode == 0 and not status.stdout
+            dirty_entries = [item for item in status.stdout.split(b"\0") if item]
+            (
+                dirty_entries,
+                ignored_demo_control_metadata_paths,
+            ) = _qa_filter_authenticated_demo_control_metadata_entries(
+                root,
+                project_id=project_id,
+                dirty_entries=dirty_entries,
+            )
+            worktree_clean = status.returncode == 0 and not dirty_entries
         except _QACandidateOverlayError:
             worktree_clean = False
         if not worktree_clean:
@@ -169391,6 +169432,9 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         "repository_root_exact": repository_root_exact,
         "git_object_exists": bool(resolved_commit and resolved_commit == commit_sha),
         "worktree_clean": worktree_clean,
+        "ignored_demo_control_metadata_paths": (
+            ignored_demo_control_metadata_paths
+        ),
         "verified_changed_files": verified_changed_files,
         "verified_changed_files_source": verified_changed_files_source,
         "route_token_ref": route_token_ref,

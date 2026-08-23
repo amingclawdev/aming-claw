@@ -90460,8 +90460,23 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     tmp_path,
 ):
     backlog_id = "AC-DIRECT-MAIN-REV2-SINGLE-ADMISSION-WARRANTY"
-    project_root = tmp_path / "direct-main-rev2-single-admission"
+    demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
+    project_root = demo_root / "direct-main-rev2-single-admission"
     parent_commit = _init_test_git_repo(project_root)
+    environment = {
+        "id": "direct-main-rev2-single-admission",
+        "template_id": "daily-planner-lite",
+        "project_id": PID,
+        "fixture_root": str(project_root),
+        "created_at": "2026-08-23T00:00:00Z",
+    }
+    server._write_demo_environment_marker(environment, PID)
+    server._write_demo_environment_registry(PID, [environment])
+    monkeypatch.setattr(
+        server.project_service,
+        "project_exists",
+        lambda project_id: project_id == PID,
+    )
     monkeypatch.setattr(
         server.project_service,
         "resolve_project_root",
@@ -91168,43 +91183,70 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
             parent_commit=parent_commit,
         ),
     )
+    implementation_body = {
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "route_token_ref": route_token_ref,
+        "event_type": "observer.implementation",
+        "event_kind": "implementation",
+        "phase": "implementation",
+        "status": "passed",
+        "actor": "observer",
+        "commit_sha": implementation_commit,
+        "payload": {
+            **route_identity,
+            "changed_files": row_files,
+            "test_results": (
+                _canonical_parentless_direct_main_test_results(
+                    implementation_commit,
+                    command=(
+                        "pytest -q agent/tests/"
+                        "test_graph_governance_api.py"
+                    ),
+                )
+            ),
+            "dirty_scope_check": {
+                "allowed_files": row_files,
+                "changed_files": row_files,
+                "unexpected_files": [],
+                "exact_match": True,
+            },
+        },
+    }
+    unrelated_dirty = project_root / "unrelated-dirty.txt"
+    unrelated_dirty.write_text("still blocks Direct Main\n", encoding="utf-8")
+    dirty_changes_before = conn.total_changes
+    with pytest.raises(GovernanceError) as dirty_rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=copy.deepcopy(implementation_body),
+            )
+        )
+    assert "canonical_worktree_clean" in dirty_rejected.value.details[
+        "missing_requirement_ids"
+    ]
+    assert dirty_rejected.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == dirty_changes_before
+    unrelated_dirty.unlink()
+
     implementation = server.handle_task_timeline_append(
         _ctx_with_role(
             {"project_id": PID},
             "observer",
             method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "task_id": task_id,
-                "route_token_ref": route_token_ref,
-                "event_type": "observer.implementation",
-                "event_kind": "implementation",
-                "phase": "implementation",
-                "status": "passed",
-                "actor": "observer",
-                "commit_sha": implementation_commit,
-                "payload": {
-                    **route_identity,
-                    "changed_files": row_files,
-                    "test_results": (
-                        _canonical_parentless_direct_main_test_results(
-                            implementation_commit,
-                            command=(
-                                "pytest -q agent/tests/"
-                                "test_graph_governance_api.py"
-                            ),
-                        )
-                    ),
-                    "dirty_scope_check": {
-                        "allowed_files": row_files,
-                        "changed_files": row_files,
-                        "unexpected_files": [],
-                        "exact_match": True,
-                    },
-                },
-            },
+            body=implementation_body,
         )
     )
+    commit_authority = implementation["payload"][
+        "direct_main_implementation_commit_prewrite_authority"
+    ]
+    assert commit_authority["worktree_clean"] is True
+    assert commit_authority["ignored_demo_control_metadata_paths"] == [
+        server.DEMO_ENVIRONMENT_MARKER
+    ]
     assert implementation["payload"]["direct_contract_runtime_lineage"][
         "completed_line_refs"
     ][0]["line_id"] == "observer_implementation"
