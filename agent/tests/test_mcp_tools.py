@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.governance import mcp_server as governance_mcp_server
+from agent.mcp import server as plugin_mcp_server
 from agent.mcp import tools as mcp_tools
 from agent.mcp.schema_contract import (
     MCP_TOOL_SCHEMA_VERSION,
@@ -2066,6 +2068,185 @@ def test_mcp_graph_current_full_reconcile_invalid_view_is_local_zero_write(
     )
     assert mirror == direct
     assert calls == []
+
+
+def test_mcp_runtime_context_finish_gate_bounds_durable_success_without_retry():
+    huge = "raw-finish-projection-must-not-escape" * 20_000
+    raw_result = {
+        "ok": True,
+        "schema_version": "runtime_context.write_facade_response.v1",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-FINISH-GATE-BOUNDED",
+        "runtime_context_id": "mfrctx-finish-bounded",
+        "task_id": "worker-finish-bounded",
+        "parent_task_id": "cex-finish-bounded",
+        "action": "finish_gate",
+        "request_id": "req-finish-bounded",
+        "timeline_event": {
+            "id": "92",
+            "event_ref": "timeline:92",
+            "event_type": "mf_subagent.finish_gate",
+            "event_kind": "mf_subagent_finish_gate",
+            "phase": "finish_gate",
+            "status": "passed",
+            "task_id": "worker-finish-bounded",
+            "backlog_id": "AC-FINISH-GATE-BOUNDED",
+        },
+        "gate": {
+            "schema_version": "mf_subagent_finish_gate.v1",
+            "status": "passed",
+            "ok": True,
+            "checkpoint_id": "ckpt-finish-bounded",
+            "validated_head_commit": "a" * 40,
+            "recursive_projection": huge,
+        },
+        "context": {
+            "runtime_context_id": "mfrctx-finish-bounded",
+            "task_id": "worker-finish-bounded",
+            "parent_task_id": "cex-finish-bounded",
+            "backlog_id": "AC-FINISH-GATE-BOUNDED",
+            "status": "validated",
+            "checkpoint_id": "ckpt-finish-bounded",
+            "head_commit": "a" * 40,
+            "recursive_projection": huge,
+        },
+        "contract_runtime_canonical_line": {
+            "accepted": True,
+            "status": "completed",
+            "contract_execution_id": "cex-finish-bounded",
+            "runtime_context_id": "mfrctx-finish-bounded",
+            "task_id": "worker-finish-bounded",
+            "stage_id": "worker_finish",
+            "line_id": "worker_finish_gate",
+            "execution_state_revision": 22,
+            "execution_state_hash": "sha256:" + ("b" * 64),
+            "contract_runtime_mutated": True,
+            "next_legal_action": {
+                "id": "qa_independent_verification",
+                "action": "record_independent_qa",
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "owner_role": "qa",
+                "contract_execution_id": "cex-finish-bounded",
+                "recursive_projection": huge,
+            },
+            "recursive_projection": huge,
+        },
+        "recursive_projection": huge,
+    }
+
+    class LargeFinishRecorder(_Recorder):
+        def api(self, method, path, data=None, **_kwargs):
+            self.calls.append((method, path, data))
+            return raw_result
+
+    result = _dispatcher(LargeFinishRecorder()).dispatch(
+        "runtime_context_finish_gate",
+        {
+            "project_id": "aming-claw",
+            "runtime_context_id": "mfrctx-finish-bounded",
+            "checkpoint_id": "ckpt-finish-bounded",
+        },
+    )
+
+    assert result["schema_version"] == (
+        "runtime_context.finish_gate.compact_response.v1"
+    )
+    assert result["bounded_response"] is True
+    assert result["checkpoint_id"] == "ckpt-finish-bounded"
+    assert result["request_id"] == "req-finish-bounded"
+    assert result["writes_performed"] is True
+    assert result["mutation_performed"] is True
+    assert result["write_disposition"] == "written"
+    assert result["safe_retry"] is False
+    assert result["timeline_event"]["event_ref"] == "timeline:92"
+    assert result["contract_runtime_canonical_line"][
+        "execution_state_revision"
+    ] == 22
+    assert result["next_legal_action"]["line_id"] == (
+        "qa_independent_verification"
+    )
+    assert len(json.dumps(result).encode()) < 64 * 1024
+    assert "raw-finish-projection-must-not-escape" not in json.dumps(result)
+
+    explicit_zero = mcp_tools._runtime_context_finish_gate_compact_result(
+        {
+            **raw_result,
+            "ok": False,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+        }
+    )
+    assert explicit_zero["current_request_mutation_proven"] is False
+    assert explicit_zero["writes_performed"] is False
+    assert explicit_zero["mutation_performed"] is False
+    assert explicit_zero["write_disposition"] == "not_written"
+
+
+def test_mcp_stdio_oversize_fallback_preserves_explicit_durable_write_truth(
+    monkeypatch,
+):
+    tool_result = {
+        "ok": True,
+        "request_id": "req-stdio-durable-write",
+        "writes_performed": True,
+        "mutation_performed": True,
+        "safe_retry": False,
+        "oversized": "x" * 8_000,
+    }
+    message = {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "result": {
+            "content": [
+                {"type": "text", "text": json.dumps(tool_result)}
+            ]
+        },
+    }
+    stdout = io.StringIO()
+    monkeypatch.setattr(plugin_mcp_server.sys, "stdout", stdout)
+
+    plugin_mcp_server._write(message, max_serialized_bytes=1_024)
+
+    fallback = json.loads(stdout.getvalue())
+    data = fallback["error"]["data"]
+    assert fallback["error"]["message"] == "mcp_response_frame_too_large"
+    assert data["writes_performed"] is True
+    assert data["mutation_performed"] is True
+    assert data["write_disposition"] == "written"
+    assert data["safe_retry"] is False
+    assert data["retry_same_world_allowed"] is False
+
+
+def test_mcp_stdio_oversize_fallback_keeps_unknown_write_truth_ambiguous(
+    monkeypatch,
+):
+    message = {
+        "jsonrpc": "2.0",
+        "id": 18,
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {"ok": True, "oversized_read": "x" * 8_000}
+                    ),
+                }
+            ]
+        },
+    }
+    stdout = io.StringIO()
+    monkeypatch.setattr(plugin_mcp_server.sys, "stdout", stdout)
+
+    plugin_mcp_server._write(message, max_serialized_bytes=1_024)
+
+    data = json.loads(stdout.getvalue())["error"]["data"]
+    assert data["write_disposition"] == "ambiguous"
+    assert "writes_performed" not in data
+    assert "mutation_performed" not in data
+    assert data["safe_retry"] is False
+    assert data["retry_same_world_allowed"] is False
 
 
 def test_mcp_contract_runtime_submit_line_bounds_success_and_preserves_write_truth():

@@ -54,6 +54,7 @@ _WORKER_GUIDE_MANAGED_MAX_SERIALIZED_BYTES = 256 * 1024
 _MANAGED_RUNTIME_READ_COMPACT_TRIGGER_BYTES = 64 * 1024
 _MANAGED_RUNTIME_READ_INLINE_BYTES = 24 * 1024
 _PARALLEL_BRANCH_STARTUP_COMPACT_TRIGGER_BYTES = 64 * 1024
+_RUNTIME_CONTEXT_FINISH_GATE_COMPACT_TRIGGER_BYTES = 64 * 1024
 _OBSERVER_RUNTIME_TEXT_PREPARE_COMPACT_TRIGGER_BYTES = 64 * 1024
 _OBSERVER_RUNTIME_TEXT_PREPARE_CONTINUATION_MAX_ENCODED_BYTES = 192 * 1024
 _WORKER_AUTH_ENV_FIELDS = {
@@ -1445,6 +1446,254 @@ def _contract_runtime_submit_line_compact_result(
         "explicit_write_flag": explicit_write,
         "explicit_zero_write_flag": explicit_zero_write,
     }
+    return compact
+
+
+def _runtime_context_finish_gate_compact_result(value: Any) -> Any:
+    """Bound a successful finish-gate response without erasing its write.
+
+    The finish facade commits the timeline checkpoint and canonical Contract
+    line before returning its refreshed projections. Those projections can
+    grow beyond the stdio frame, so retain the durable identities and omit the
+    recursive bodies at the MCP adapter boundary.
+    """
+
+    if not isinstance(value, dict):
+        return value
+    try:
+        serialized_bytes = len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception:
+        return value
+    if serialized_bytes <= _RUNTIME_CONTEXT_FINISH_GATE_COMPACT_TRIGGER_BYTES:
+        return value
+
+    def project(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+        return _parallel_branch_startup_public_fields(value, fields)
+
+    timeline_event = project(
+        value.get("timeline_event") or value.get("timeline_event_recorded"),
+        (
+            "id",
+            "event_id",
+            "event_ref",
+            "event_type",
+            "event_kind",
+            "phase",
+            "status",
+            "task_id",
+            "backlog_id",
+            "created_at",
+        ),
+    )
+    gate = project(
+        value.get("gate"),
+        (
+            "schema_version",
+            "gate_kind",
+            "status",
+            "ok",
+            "allowed",
+            "close_satisfying",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "checkpoint_id",
+            "validated_head_commit",
+            "runtime_status",
+            "merge_queue_ready",
+            "no_pass",
+            "overall_release_pass_claimed",
+        ),
+    )
+    context = project(
+        value.get("context"),
+        (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "backlog_id",
+            "status",
+            "checkpoint_id",
+            "replay_source",
+            "head_commit",
+            "branch_ref",
+            "worktree_path",
+            "fence_token_hash",
+            "fence_token_redacted",
+        ),
+    )
+    canonical_fields = (
+        "schema_version",
+        "accepted",
+        "canonical",
+        "status",
+        "source_of_authority",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "stage_id",
+        "line_id",
+        "evidence_kind",
+        "line_instance_id",
+        "execution_state_revision",
+        "execution_state_hash",
+        "runtime_guide_hash",
+        "contract_runtime_mutated",
+        "required_by_pinned_definition",
+    )
+    canonical_line = project(
+        value.get("contract_runtime_canonical_line"), canonical_fields
+    )
+    canonical_handoff_line = project(
+        value.get("contract_runtime_canonical_handoff_line"), canonical_fields
+    )
+
+    successful_event = bool(
+        (timeline_event.get("id") or timeline_event.get("event_id"))
+        and str(timeline_event.get("status") or "").strip().lower()
+        in {
+            "accepted",
+            "complete",
+            "completed",
+            "passed",
+            "persisted",
+            "recorded",
+            "succeeded",
+            "success",
+        }
+    )
+    accepted_canonical_line = bool(
+        canonical_line.get("accepted") is True
+        or canonical_line.get("contract_runtime_mutated") is True
+        or canonical_handoff_line.get("accepted") is True
+        or canonical_handoff_line.get("contract_runtime_mutated") is True
+    )
+    explicit_write = bool(
+        value.get("writes_performed") is True
+        or value.get("mutation_performed") is True
+        or value.get("current_request_mutation_proven") is True
+        or value.get("server_mutation_accepted") is True
+    )
+    explicit_zero_write = bool(
+        value.get("zero_write_rejection") is True
+        or (
+            value.get("writes_performed") is False
+            and value.get("mutation_performed") is False
+        )
+    )
+    current_request_mutated = bool(
+        not explicit_zero_write
+        and (explicit_write or successful_event or accepted_canonical_line)
+    )
+    checkpoint_id = str(
+        gate.get("checkpoint_id") or context.get("checkpoint_id") or ""
+    ).strip()
+
+    next_action_source = value.get("next_legal_action")
+    if not next_action_source:
+        raw_handoff = value.get("contract_runtime_canonical_handoff_line")
+        if isinstance(raw_handoff, dict):
+            next_action_source = raw_handoff.get("next_legal_action")
+    if not next_action_source:
+        raw_finish = value.get("contract_runtime_canonical_line")
+        if isinstance(raw_finish, dict):
+            next_action_source = raw_finish.get("next_legal_action")
+    next_legal_action = project(
+        next_action_source,
+        (
+            "schema_version",
+            "id",
+            "action",
+            "interface",
+            "mcp_tool",
+            "status",
+            "stage_id",
+            "line_id",
+            "evidence_kind",
+            "owner_role",
+            "contract_execution_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "source",
+            "precedence",
+        ),
+    )
+
+    compact: dict[str, Any] = {
+        "schema_version": "runtime_context.finish_gate.compact_response.v1",
+        "response_view": "compact",
+        "bounded_response": True,
+        "source_serialized_bytes": serialized_bytes,
+        **project(
+            value,
+            (
+                "ok",
+                "status",
+                "error",
+                "code",
+                "message",
+                "project_id",
+                "backlog_id",
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+                "action",
+                "request_id",
+                "status_code",
+                "zero_write_rejection",
+                "http_request_performed",
+            ),
+        ),
+        "checkpoint_id": checkpoint_id,
+        "current_request_mutation_proven": current_request_mutated,
+        "write_disposition": (
+            "written"
+            if current_request_mutated
+            else "not_written"
+            if explicit_zero_write
+            else "ambiguous"
+        ),
+        "safe_retry": False if current_request_mutated else bool(
+            value.get("safe_retry") is True and explicit_zero_write
+        ),
+        "semantic_truncation_performed": False,
+        "raw_recursive_projections_omitted": True,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    if current_request_mutated:
+        compact["writes_performed"] = True
+        compact["mutation_performed"] = True
+    elif explicit_zero_write:
+        compact["writes_performed"] = False
+        compact["mutation_performed"] = False
+    if timeline_event:
+        compact["timeline_event"] = timeline_event
+    if gate:
+        compact["gate"] = gate
+    if context:
+        compact["context"] = context
+    if canonical_line:
+        compact["contract_runtime_canonical_line"] = canonical_line
+    if canonical_handoff_line:
+        compact[
+            "contract_runtime_canonical_handoff_line"
+        ] = canonical_handoff_line
+    if next_legal_action:
+        compact["next_legal_action"] = next_legal_action
     return compact
 
 
@@ -8994,11 +9243,16 @@ class ToolDispatcher:
                 }
                 else args
             )
-            return self._api(
+            result = self._api(
                 "POST",
                 f"/api/graph-governance/{pid}/runtime-contexts/"
                 f"{runtime_context_id}/{suffix_by_name[name]}",
                 _runtime_context_write_body(request_args),
+            )
+            return (
+                _runtime_context_finish_gate_compact_result(result)
+                if name == "runtime_context_finish_gate"
+                else result
             )
 
         if name == "parallel_branch_allocate_precheck":

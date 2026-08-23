@@ -156,24 +156,37 @@ def _write(
     line = json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
     serialized_bytes = len(line.encode("utf-8"))
     if serialized_bytes > max_serialized_bytes:
+        write_truth = _mcp_response_explicit_write_truth(msg)
         source_hash = hashlib.sha256(line.encode("utf-8")).hexdigest()
         req_id = msg.get("id") if isinstance(msg, dict) else None
+        error_data = {
+            "error": "mcp_response_frame_too_large",
+            "serialized_bytes": serialized_bytes,
+            "max_serialized_bytes": max_serialized_bytes,
+            "detail_ref": f"mcp-response-frame:sha256:{source_hash}",
+            "page_ref": f"mcp-response-frame:sha256:{source_hash}",
+            "write_disposition": (
+                "written"
+                if write_truth is True
+                else "not_written"
+                if write_truth is False
+                else "ambiguous"
+            ),
+            "safe_retry": False,
+            "retry_same_world_allowed": False,
+            "semantic_truncation_performed": False,
+            "raw_secret_exposed": False,
+        }
+        if write_truth is not None:
+            error_data["writes_performed"] = write_truth
+            error_data["mutation_performed"] = write_truth
         bounded_error = {
             "jsonrpc": "2.0",
             "id": req_id,
             "error": {
                 "code": INTERNAL_ERROR,
                 "message": "mcp_response_frame_too_large",
-                "data": {
-                    "error": "mcp_response_frame_too_large",
-                    "serialized_bytes": serialized_bytes,
-                    "max_serialized_bytes": max_serialized_bytes,
-                    "detail_ref": f"mcp-response-frame:sha256:{source_hash}",
-                    "page_ref": f"mcp-response-frame:sha256:{source_hash}",
-                    "writes_performed": False,
-                    "semantic_truncation_performed": False,
-                    "raw_secret_exposed": False,
-                },
+                "data": error_data,
             },
         }
         line = json.dumps(
@@ -184,6 +197,67 @@ def _write(
     with _stdout_lock:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
+
+
+def _mcp_response_explicit_write_truth(message: Any) -> bool | None:
+    """Read only explicit top-level mutation truth from an MCP tool result."""
+
+    def mapping_write_truth(value: Any) -> bool | None:
+        if not isinstance(value, dict):
+            return None
+        explicit_write = any(
+            value.get(field) is True
+            for field in (
+                "writes_performed",
+                "mutation_performed",
+                "current_request_mutation_proven",
+                "server_mutation_accepted",
+                "context_mutated",
+            )
+        )
+        explicit_zero_write = bool(
+            value.get("zero_write_rejection") is True
+            or (
+                "writes_performed" in value
+                and "mutation_performed" in value
+                and value.get("writes_performed") is False
+                and value.get("mutation_performed") is False
+            )
+        )
+        if explicit_write and explicit_zero_write:
+            return None
+        if explicit_write:
+            return True
+        if explicit_zero_write:
+            return False
+        compact = value.get("compact_result")
+        return mapping_write_truth(compact)
+
+    if not isinstance(message, dict):
+        return None
+    result = message.get("result")
+    direct_truth = mapping_write_truth(result)
+    if direct_truth is not None:
+        return direct_truth
+    if not isinstance(result, dict):
+        return None
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.lstrip().startswith(("{", "[")):
+            continue
+        try:
+            decoded = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        decoded_truth = mapping_write_truth(decoded)
+        if decoded_truth is not None:
+            return decoded_truth
+    return None
 
 
 def _response(
