@@ -6032,6 +6032,67 @@ def _worker_implementation_test_results_finish_compatible(value: Any) -> bool:
     return bool(worker_implementation_test_results_validation(value)["accepted"])
 
 
+def _worker_implementation_atomic_advance_errors(
+    record: Mapping[str, Any],
+    written_line: Mapping[str, Any],
+) -> list[str]:
+    """Reject an implementation before persistence if its lane cannot advance.
+
+    The implementation facade is one atomic action: an accepted canonical line
+    must appear in the authoritative compiled completion set, and the same lane
+    may not remain on ``worker_implementation``. A sibling lane may still be
+    the next implementation instance in a multi-worker contract.
+    """
+
+    if str(written_line.get("line_id") or "").strip() != "worker_implementation":
+        return []
+    expected_instance = str(
+        written_line.get("line_instance_id")
+        or f"runtime_context:{_worker_commit_text(written_line, 'runtime_context_id')}"
+    ).strip()
+    state = (
+        record.get("execution_state")
+        if isinstance(record.get("execution_state"), Mapping)
+        else {}
+    )
+    completed = state.get("completed_lines")
+    completed = completed if isinstance(completed, list) else []
+    completion_consumed = any(
+        isinstance(item, Mapping)
+        and str(item.get("stage_id") or "").strip()
+        == str(written_line.get("stage_id") or "").strip()
+        and str(item.get("line_id") or "").strip()
+        == "worker_implementation"
+        and str(item.get("line_instance_id") or "").strip()
+        == expected_instance
+        for item in completed
+    )
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_action = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    same_lane_still_current = bool(
+        str(next_action.get("stage_id") or "").strip()
+        == str(written_line.get("stage_id") or "").strip()
+        and str(next_action.get("line_id") or "").strip()
+        == "worker_implementation"
+        and str(next_action.get("line_instance_id") or "").strip()
+        == expected_instance
+    )
+    errors: list[str] = []
+    if not completion_consumed:
+        errors.append("worker_implementation_not_completion_satisfying")
+    if same_lane_still_current:
+        errors.append("worker_implementation_atomic_lane_not_advanced")
+    return errors
+
+
 def _worker_commit_has_finish_compatible_implementation_results(
     implementation: Mapping[str, Any],
     *,
@@ -6839,6 +6900,14 @@ def _line_status_allows_contract_completion(
             source_line_index=source_line_index,
         )
     )
+    canonical_owned_lane_nonrelease = bool(
+        line_id == "worker_implementation"
+        and _worker_implementation_canonical_owned_lane_nonrelease_completion(
+            line,
+            source_record=source_record,
+            source_line_index=source_line_index,
+        )
+    )
     canonical_no_pass = bool(
         line_id == "qa_independent_verification"
         and _qa_independent_verification_canonical_no_pass_completion(
@@ -6851,15 +6920,27 @@ def _line_status_allows_contract_completion(
         line_id == "qa_independent_verification"
         and _authenticated_qa_pass_with_baseline_observations(line)
     )
+    verification_evidence: Any = line.get("verification")
+    if line_id == "worker_implementation":
+        payload = (
+            line.get("payload")
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        verification_evidence = {
+            "top_level": line.get("verification"),
+            "payload": payload.get("verification"),
+        }
     if _contains_contract_completion_blocker(line.get("qa_evidence_provenance")):
         return False
     if (
         not (
             canonical_no_pass
             or canonical_rework_baseline
+            or canonical_owned_lane_nonrelease
             or authenticated_observation_pass
         )
-        and _contains_contract_completion_blocker(line.get("verification"))
+        and _contains_contract_completion_blocker(verification_evidence)
     ):
         return False
     if line_id == "qa_independent_verification":
@@ -6901,6 +6982,69 @@ def _line_status_allows_contract_completion(
         if _qa_independent_verification_summary_reports_failure(line):
             return False
     return True
+
+
+def _worker_implementation_canonical_owned_lane_nonrelease_completion(
+    line: Mapping[str, Any],
+    *,
+    source_record: Mapping[str, Any] | None,
+    source_line_index: int,
+) -> bool:
+    """Accept only the existing exact owned-lane non-release result shapes.
+
+    An implementation may prove its owned requirements while also recording a
+    separately bounded baseline or sibling-system block. Those two shapes are
+    already validated by ``worker_implementation_test_results_validation``.
+    Reuse that authority here instead of letting a nested diagnostic failure
+    contradict the write Gate after the canonical line has been appended.
+    Persisted source membership and authenticated worker provenance prevent a
+    generic failure-bearing mapping from becoming completion authority.
+    """
+
+    if not isinstance(source_record, Mapping):
+        return False
+    persisted_index = _source_record_completed_line_index(line, source_record)
+    if persisted_index < 0 or source_line_index != persisted_index:
+        return False
+    if (
+        str(line.get("line_id") or "").strip() != "worker_implementation"
+        or str(line.get("actor_role") or "").strip() != "mf_sub"
+        or str(line.get("evidence_kind") or "").strip() != "implementation"
+    ):
+        return False
+    validation = worker_implementation_test_results_validation(
+        line,
+        evidence_envelope=True,
+    )
+    if validation.get("accepted") is not True or str(
+        validation.get("result_kind") or ""
+    ) not in {
+        "known_baseline_no_pass",
+        "owned_lane_pass_with_unrelated_block",
+    }:
+        return False
+    payload = (
+        line.get("payload")
+        if isinstance(line.get("payload"), Mapping)
+        else {}
+    )
+    provenance = (
+        payload.get("worker_evidence_provenance")
+        if isinstance(payload.get("worker_evidence_provenance"), Mapping)
+        else {}
+    )
+    return bool(
+        str(provenance.get("schema_version") or "")
+        == "runtime_context.worker_provenance.v1"
+        and provenance.get("verified") is True
+        and provenance.get("worker_owned") is True
+        and provenance.get("observer_impersonation") is False
+        and str(provenance.get("worker_role") or "") == "mf_sub"
+        and str(provenance.get("runtime_context_id") or "").strip()
+        == _worker_commit_text(line, "runtime_context_id")
+        and str(provenance.get("task_id") or "").strip()
+        == _worker_commit_text(line, "task_id")
+    )
 
 
 def _worker_implementation_canonical_baseline_completion(
@@ -9201,6 +9345,34 @@ class ContractRuntime:
             actor_role=effective_actor_role,
             completed_lines=completed_lines,
         )
+        result_record = deepcopy(refreshed)
+        if use_completed_line_projection:
+            projected_after_write = list(projected_completed_lines)
+            projected_after_write.append(written_line)
+            result_record = self._record_view(
+                refreshed,
+                actor_role=effective_actor_role,
+                completed_lines=projected_after_write,
+                projection=projection,
+            )
+        implementation_postcondition_errors = (
+            _worker_implementation_atomic_advance_errors(
+                result_record,
+                written_line,
+            )
+        )
+        if implementation_postcondition_errors:
+            return {
+                "schema_version": "contract_runtime_write_result.v1",
+                "ok": False,
+                "decision": WriteGateDecision(
+                    ok=False,
+                    errors=tuple(implementation_postcondition_errors),
+                ).to_dict(),
+                "record": gate_record,
+                "zero_contract_runtime_write": True,
+                "worker_implementation_atomic_advance": False,
+            }
         try:
             self.store.update(
                 contract_execution_id,
@@ -9214,16 +9386,6 @@ class ContractRuntime:
                 "decision": WriteGateDecision(ok=False, errors=(str(exc),)).to_dict(),
                 "record": self.store.get(contract_execution_id),
             }
-        result_record = deepcopy(refreshed)
-        if use_completed_line_projection:
-            projected_after_write = list(projected_completed_lines)
-            projected_after_write.append(written_line)
-            result_record = self.projected_record(
-                contract_execution_id,
-                actor_role=effective_actor_role,
-                completed_lines=projected_after_write,
-                projection=projection,
-            )
         return {
             "schema_version": "contract_runtime_write_result.v1",
             "ok": True,

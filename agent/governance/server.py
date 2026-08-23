@@ -69,6 +69,7 @@ from .contracts.runtime import (
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
     _active_failed_qa_line,
     _active_failed_qa_line_index,
+    _contains_contract_completion_blocker,
     _contract_runtime_no_pass_generation,
     _line_evidence_from_write,
     _worker_commit_completed_implementation,
@@ -70674,8 +70675,47 @@ def _runtime_context_require_worker_implementation_test_results(
         evidence_envelope=True,
     )
     projected = validation.get("canonical_test_results")
-    if validation.get("accepted") is True and isinstance(projected, Mapping):
+    verification_values = tuple(
+        value
+        for value in (
+            body.get("verification"),
+            payload.get("verification"),
+        )
+        if isinstance(value, Mapping)
+    )
+    verification_blocks_completion = any(
+        _contains_contract_completion_blocker(value)
+        for value in verification_values
+    )
+    exact_nonrelease_result = str(
+        validation.get("result_kind") or ""
+    ) in {
+        "known_baseline_no_pass",
+        "owned_lane_pass_with_unrelated_block",
+    }
+    if (
+        validation.get("accepted") is True
+        and isinstance(projected, Mapping)
+        and (
+            not verification_blocks_completion
+            or exact_nonrelease_result
+        )
+    ):
         return dict(projected)
+
+    if validation.get("accepted") is True and verification_blocks_completion:
+        validation = {
+            **dict(validation),
+            "accepted": False,
+            "field": "verification",
+            "reason": (
+                "passing_test_results_conflict_with_blocking_verification"
+            ),
+            "remediation": (
+                "move unrelated diagnostics to risk/summary or use the exact "
+                "owned-lane non-release test_results shape"
+            ),
+        }
 
     actual = {
         "present": supplied_present,
@@ -70739,11 +70779,37 @@ def _runtime_context_require_worker_implementation_test_results(
                     "baseline_passed": "<nonnegative count not above full_passed>",
                     "overall_release_pass_claimed": False,
                 },
+                "unrelated_system_block": {
+                    "status": (
+                        "passed_with_unrelated_system_block_recorded"
+                    ),
+                    "required_passed": "<positive owned-lane test count>",
+                    "unrelated_system_blocks": (
+                        "<positive unrelated diagnostic count>"
+                    ),
+                    "tests": [
+                        {
+                            "name": "<owned-lane check>",
+                            "command": "<exact command>",
+                            "status": "passed",
+                        },
+                        {
+                            "name": "<unrelated diagnostic>",
+                            "command": "<exact command>",
+                            "status": "blocked_unrelated",
+                            "detail": "<bounded unrelated failure detail>",
+                        },
+                    ],
+                    "no_pass": True,
+                    "passed": False,
+                    "overall_release_pass_claimed": False,
+                },
                 "parallel_sibling_dependency": {
                     "test_results_policy": (
                         "report only owned-lane test outcomes in test_results"
                     ),
                     "record_dependency_in": ["risk", "summary"],
+                    "blocking_verification_requires_exact_nonrelease_shape": True,
                     "partial_sibling_blocked_is_finish_compatible": False,
                     "synthesize_pass": False,
                 },

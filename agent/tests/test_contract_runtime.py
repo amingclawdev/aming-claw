@@ -30,6 +30,7 @@ from agent.governance.contracts.runtime import (
     _line_status_allows_contract_completion,
     _mf_parallel_worker_commit_errors,
     _project_record_state,
+    _worker_implementation_atomic_advance_errors,
     _worker_commit_completed_implementation,
     terminal_supersession_receipt_for_record,
 )
@@ -155,6 +156,47 @@ def test_contract_runtime_pins_and_exposes_one_common_rule_join_for_precheck_wri
         == join["authority_hash"]
     )
     assert precheck["decision"] == written["decision"]
+
+
+def test_worker_implementation_atomic_advance_requires_compiler_consumption():
+    runtime_context_id = "mfrctx-atomic-advance"
+    line = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+        "runtime_context_id": runtime_context_id,
+    }
+    stalled = {
+        "execution_state": {"completed_lines": []},
+        "runtime_guide": {"next_legal_action": dict(line)},
+    }
+    assert _worker_implementation_atomic_advance_errors(stalled, line) == [
+        "worker_implementation_not_completion_satisfying",
+        "worker_implementation_atomic_lane_not_advanced",
+    ]
+
+    advanced_to_sibling = {
+        "execution_state": {
+            "completed_lines": [
+                {
+                    "stage_id": "worker_implementation",
+                    "line_id": "worker_implementation",
+                    "line_instance_id": f"runtime_context:{runtime_context_id}",
+                }
+            ]
+        },
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "worker_implementation",
+                "line_id": "worker_implementation",
+                "line_instance_id": "runtime_context:mfrctx-sibling",
+            }
+        },
+    }
+    assert (
+        _worker_implementation_atomic_advance_errors(advanced_to_sibling, line)
+        == []
+    )
 
 
 def test_contract_runtime_rejects_digest_mismatch_before_execution_mutation(

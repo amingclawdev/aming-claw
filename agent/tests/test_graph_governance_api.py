@@ -32141,6 +32141,172 @@ def test_runtime_context_implementation_evidence_rejects_invalid_test_results_be
 
 
 @pytest.mark.parametrize(
+    "verification_envelope",
+    [
+        {
+            "verification": {
+                "full_suite": {
+                    "status": "failed",
+                    "passed": 12,
+                    "failed": 3,
+                    "candidate_new_failures": 0,
+                }
+            }
+        },
+        {
+            "verification": {},
+            "payload": {
+                "verification": {
+                    "full_suite": {
+                        "status": "failed",
+                        "passed": 12,
+                        "failed": 3,
+                        "candidate_new_failures": 0,
+                    }
+                }
+            },
+        },
+    ],
+)
+def test_runtime_context_implementation_rejects_pass_with_blocking_verification_before_db(
+    monkeypatch,
+    verification_envelope,
+):
+    def reject_db_access(_project_id):
+        raise AssertionError("contradictory implementation evidence reached DB")
+
+    monkeypatch.setattr(server, "get_connection", reject_db_access)
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": "mfrctx-conflicting-verification",
+                },
+                method="POST",
+                body={
+                    "task_id": "worker-conflicting-verification",
+                    "test_results": {"status": "passed", "passed": True},
+                    **verification_envelope,
+                },
+            )
+        )
+
+    assert rejected.value.code == (
+        "worker_implementation_test_results_not_finish_compatible"
+    )
+    validation = rejected.value.details["validation"]
+    assert validation["field"] == "verification"
+    assert validation["reason"] == (
+        "passing_test_results_conflict_with_blocking_verification"
+    )
+    assert rejected.value.details["zero_db_access"] is True
+    assert rejected.value.details["zero_contract_runtime_write"] is True
+    assert rejected.value.details["zero_timeline_write"] is True
+    guide = rejected.value.details["copy_safe_test_results_guide"]
+    assert guide["unrelated_system_block"]["status"] == (
+        "passed_with_unrelated_system_block_recorded"
+    )
+
+
+def test_worker_implementation_completion_accepts_only_exact_nonrelease_verification_exception():
+    runtime_context_id = "mfrctx-owned-lane-nonrelease"
+    task_id = "worker-owned-lane-nonrelease"
+    test_results = {
+        "status": "passed_with_unrelated_system_block_recorded",
+        "required_passed": 1,
+        "unrelated_system_blocks": 1,
+        "tests": [
+            {
+                "name": "focused",
+                "command": "pytest -q focused",
+                "status": "passed",
+            },
+            {
+                "name": "sibling diagnostic",
+                "command": "pytest -q",
+                "status": "blocked_unrelated",
+                "detail": "three failures belong to the sibling lane",
+            },
+        ],
+        "no_pass": True,
+        "passed": False,
+        "overall_release_pass_claimed": False,
+    }
+    provenance = {
+        "schema_version": "runtime_context.worker_provenance.v1",
+        "verified": True,
+        "worker_owned": True,
+        "observer_impersonation": False,
+        "worker_role": "mf_sub",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+    }
+    line = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+        "actor_role": "mf_sub",
+        "evidence_kind": "implementation",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "status": "passed",
+        "test_results": copy.deepcopy(test_results),
+        "verification": {
+            "full_suite": {
+                "status": "blocked_unrelated",
+                "passed": 12,
+                "failed": 3,
+                "candidate_new_failures": 0,
+            }
+        },
+        "payload": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "test_results": copy.deepcopy(test_results),
+            "worker_evidence_provenance": provenance,
+        },
+    }
+    source_record = {"completed_lines": [line]}
+    assert _line_status_allows_contract_completion(
+        line,
+        source_record=source_record,
+        source_line_index=0,
+    ) is True
+
+    contradictory_pass = copy.deepcopy(line)
+    contradictory_pass["test_results"] = {
+        "status": "passed",
+        "passed": True,
+    }
+    contradictory_pass["payload"]["test_results"] = {
+        "status": "passed",
+        "passed": True,
+    }
+    assert _line_status_allows_contract_completion(
+        contradictory_pass,
+        source_record={"completed_lines": [contradictory_pass]},
+        source_line_index=0,
+    ) is False
+
+    nested_contradictory_pass = copy.deepcopy(contradictory_pass)
+    nested_contradictory_pass["verification"] = {}
+    nested_contradictory_pass["payload"]["verification"] = {
+        "full_suite": {
+            "status": "failed",
+            "passed": 12,
+            "failed": 3,
+            "candidate_new_failures": 0,
+        }
+    }
+    assert _line_status_allows_contract_completion(
+        nested_contradictory_pass,
+        source_record={"completed_lines": [nested_contradictory_pass]},
+        source_line_index=0,
+    ) is False
+
+
+@pytest.mark.parametrize(
     ("test_results", "invalid_field", "reason", "received_type"),
     [
         (
@@ -170553,8 +170719,13 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
             }
         ],
     }
+    class EmptyDirectMainStore:
+        def list_by_backlog(self, **_kwargs):
+            return []
+
     class FakeRuntime:
         def __init__(self):
+            self.store = EmptyDirectMainStore()
             self.accepted_writes = []
             self.submit_attempts = []
             self.active_record = copy.deepcopy(record)
@@ -170680,9 +170851,35 @@ def test_runtime_context_implementation_facade_binds_non_planner_lane_writer_has
             self.accepted_writes.append(copy.deepcopy(write))
             accepted_record = copy.deepcopy(self.active_record)
             accepted_record["execution_state_revision"] += 1
-            accepted_record["execution_state"][
-                "execution_state_revision"
-            ] = accepted_record["execution_state_revision"]
+            accepted_record["execution_state"] = {
+                "execution_state_revision": accepted_record[
+                    "execution_state_revision"
+                ],
+                "execution_state_hash": _fake_sha(
+                    "implementation-two-worker-state-after"
+                ),
+                "completed_lines": [
+                    {
+                        "stage_id": "worker_implementation",
+                        "line_id": "worker_implementation",
+                        "line_instance_id": authenticated_lane[
+                            "line_instance_id"
+                        ],
+                    }
+                ],
+            }
+            accepted_record["runtime_guide"] = {
+                "runtime_guide_hash": _fake_sha(
+                    "implementation-two-worker-reader-after"
+                ),
+                "next_legal_action": {
+                    "stage_id": "worker_implementation",
+                    "line_id": "worker_implementation",
+                    "actor_role": "mf_sub",
+                    "evidence_kind": "implementation",
+                    **lanes[0],
+                },
+            }
             return {
                 "ok": True,
                 "decision": {"ok": True, "errors": []},
@@ -171048,12 +171245,30 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
             body={
                 "actor": "operator",
                 "reason": "Exercise the inactive atomic worker lane.",
+                "contract_revision": "rev8",
                 "backlog_id": backlog_id,
                 "task_id": parent_task_id,
                 "route_token_ref": "rtok-implementation-writer-hash-r2-root",
                 "worker_fence": {
                     "fence_token": "fence-implementation-writer-hash-r2-root",
                     "owned_files": list(owned_paths),
+                },
+                "metadata": {
+                    "required_worker_count": 2,
+                    "lane_intents": [
+                        {
+                            "task_id": worker_specs[0][0],
+                            "worker_id": "source",
+                            "worker_slot_id": "source",
+                            "owned_files": [owned_paths[0]],
+                        },
+                        {
+                            "task_id": worker_specs[1][0],
+                            "worker_id": "test",
+                            "worker_slot_id": "test",
+                            "owned_files": [owned_paths[1]],
+                        },
+                    ],
                 },
                 "owned_files": list(owned_paths),
             },
@@ -171483,10 +171698,51 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
     implementation_record = runtime.store.get(execution_id)
     implementation_line = implementation_record["completed_lines"][-1]
     assert implementation_line["line_id"] == "worker_implementation"
+    implementation_instance = (
+        f"runtime_context:{inactive_context.runtime_context_id}"
+    )
+    assert sum(
+        1
+        for line in implementation_record["completed_lines"]
+        if line.get("stage_id") == "worker_implementation"
+        and line.get("line_id") == "worker_implementation"
+        and line.get("line_instance_id") == implementation_instance
+    ) == 1
+    assert any(
+        item.get("stage_id") == "worker_implementation"
+        and item.get("line_id") == "worker_implementation"
+        and item.get("line_instance_id") == implementation_instance
+        for item in implementation_record["execution_state"]["completed_lines"]
+    )
     for field in writer_binding_fields:
         assert implementation_line["payload"][field] == implementation_body[field]
         if field in implementation_line:
             assert implementation_line[field] == implementation_body[field]
+    post_implementation_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": inactive_context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": execution_id,
+                    "session_token": inactive_token,
+                    "session_token_ref": session_ref,
+                    "fence_token": inactive_fence,
+                    "target_project_root": inactive_context.target_project_root,
+                    "view": "all",
+                },
+            )
+        )
+    )
+    assert post_implementation_guide["worker_guide"]["next_legal_action"] == (
+        "record_worker_commit"
+    )
+    assert post_implementation_guide["contract_runtime_next_legal_action"][
+        "line_id"
+    ] == "worker_commit"
     implementation_lineage = _worker_implementation_lineage(
         implementation_record,
         implementation_line,
