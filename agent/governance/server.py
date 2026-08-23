@@ -127202,6 +127202,16 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
         str(selected.get("line_id") or "").strip()
         == "observer_reconcile"
     )
+    restore_reconcile_lane_projection_metadata = selected_line_pending
+    aggregate_identity = {
+        field: str(aggregate.get(field) or "").strip()
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "merge_queue_id",
+        )
+    }
     if selected_line_pending:
         runtime_context_projection = (
             _contract_runtime_authoritative_runtime_context_projection(
@@ -127253,6 +127263,63 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
             merge_queue_id = str(
                 authority.get("merge_queue_id") or ""
             ).strip()
+            terminal_current_full = authority.get(
+                "terminal_current_full_reconcile_authority"
+            )
+            terminal_current_full = (
+                terminal_current_full
+                if isinstance(terminal_current_full, Mapping)
+                else {}
+            )
+            shared_batch = terminal_current_full.get(
+                "shared_batch_reconcile_authority"
+            )
+            shared_batch = (
+                shared_batch if isinstance(shared_batch, Mapping) else {}
+            )
+            task_only_shared_reconcile = bool(
+                _contract_runtime_shared_batch_postmerge_qa_activation_verified(
+                    terminal_current_full
+                )
+                and not str(
+                    authority.get("reconcile_runtime_context_id") or ""
+                ).strip()
+                and not str(
+                    shared_batch.get("coordination_runtime_context_id") or ""
+                ).strip()
+                and str(authority.get("reconcile_task_id") or "").strip()
+                == str(
+                    shared_batch.get("coordination_reconcile_task_id") or ""
+                ).strip()
+            )
+            stored_aggregate_identity = terminal_current_full.get(
+                "aggregate_final_merge_identity"
+            )
+            stored_aggregate_identity = (
+                stored_aggregate_identity
+                if isinstance(stored_aggregate_identity, Mapping)
+                else {}
+            )
+            stored_line_instance_id = str(
+                terminal_current_full.get("reconcile_line_instance_id") or ""
+            ).strip()
+            stored_lane_identity_source = str(
+                terminal_current_full.get("reconcile_lane_identity_source")
+                or ""
+            ).strip()
+            stored_projection_metadata_claimed = bool(
+                stored_aggregate_identity
+                or stored_line_instance_id
+                or stored_lane_identity_source
+            )
+            stored_projection_metadata_verified = bool(
+                stored_projection_metadata_claimed
+                and stored_aggregate_identity == aggregate_identity
+                and stored_line_instance_id
+                == f"runtime_context:{runtime_context_id}"
+                and stored_lane_identity_source
+                == "RuntimeContext.current_values"
+            )
             if not (
                 line_index > int(
                     aggregate.get("dispatch_completed_line_index") or -1
@@ -127327,14 +127394,24 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
                 and str(
                     authority.get("reconcile_event_created_at") or ""
                 ).strip()
-                and str(
-                    authority.get("reconcile_runtime_context_id") or ""
-                ).strip()
-                == runtime_context_id
-                and str(
-                    authority.get("reconcile_task_id") or ""
-                ).strip()
-                == task_id
+                and (
+                    (
+                        str(
+                            authority.get("reconcile_runtime_context_id")
+                            or ""
+                        ).strip()
+                        == runtime_context_id
+                        and str(
+                            authority.get("reconcile_task_id") or ""
+                        ).strip()
+                        == task_id
+                    )
+                    or task_only_shared_reconcile
+                )
+                and (
+                    not stored_projection_metadata_claimed
+                    or stored_projection_metadata_verified
+                )
             ):
                 continue
             receipt_candidates.append(
@@ -127343,11 +127420,19 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
                     "task_id": task_id,
                     "parent_task_id": parent_task_id,
                     "merge_queue_id": merge_queue_id,
+                    "restore_reconcile_lane_projection_metadata": (
+                        stored_projection_metadata_verified
+                    ),
                 }
             )
         if len(receipt_candidates) != 1:
             return aggregate
         current_values = receipt_candidates[0]
+        restore_reconcile_lane_projection_metadata = bool(
+            current_values.get(
+                "restore_reconcile_lane_projection_metadata"
+            )
+        )
     runtime_context_id = str(
         current_values.get("runtime_context_id") or ""
     ).strip()
@@ -127418,27 +127503,23 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
         return aggregate
 
     selected_context = matches[0]
-    aggregate_identity = {
-        field: str(aggregate.get(field) or "").strip()
-        for field in (
-            "runtime_context_id",
-            "task_id",
-            "parent_task_id",
-            "merge_queue_id",
-        )
-    }
     reconcile_merge = {
         **aggregate,
-        "aggregate_final_merge_identity": aggregate_identity,
         "runtime_context_id": runtime_context_id,
         "task_id": task_id,
         "parent_task_id": parent_task_id,
         "merge_queue_id": merge_queue_id,
-        "reconcile_line_instance_id": line_instance_id,
-        "reconcile_lane_identity_source": (
-            "RuntimeContext.current_values"
-        ),
     }
+    if restore_reconcile_lane_projection_metadata:
+        reconcile_merge.update(
+            {
+                "aggregate_final_merge_identity": aggregate_identity,
+                "reconcile_line_instance_id": line_instance_id,
+                "reconcile_lane_identity_source": (
+                    "RuntimeContext.current_values"
+                ),
+            }
+        )
     timeline_events = _runtime_context_service_timeline_events(
         conn,
         project_id=project_id,

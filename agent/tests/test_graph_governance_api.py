@@ -21057,14 +21057,16 @@ def _mf_batch_child_postmerge_qa_world(
     reconcile_at_intermediate_commit: bool = False,
     persist_contract_post_worker_lines: bool = True,
     record_legacy_candidate_qa_receipts: bool = False,
+    contract_revision: str = "rev9",
 ):
     """Build one real two-child ``mf_batch_parallel`` post-merge world.
 
-    Both children are driven the way rev9 actually drives them: bounded
-    dispatch, worker lines, an ordered live lane merge per child recorded on
-    the child's own task timeline, then exactly one batch/parent-scoped
-    ``final_batch_reconcile`` on the coordination backlog.  Every authority is
-    derived by the shipped server code from durable SQLite state - runtime
+    Both children are driven the way post-merge revisions actually drive
+    them: bounded dispatch, worker lines, and an ordered live lane merge per
+    child recorded on the child's own task timeline, then exactly one
+    batch/parent-scoped ``final_batch_reconcile`` on the coordination backlog.
+    Every authority is derived by the shipped server code from durable SQLite
+    state - runtime
     contexts, the durable merge queue, the closed integration epoch, the
     activated graph snapshot and its current-full reconcile provenance.  No
     authority producer is patched and no reconcile identity is hand-fed onto a
@@ -21477,7 +21479,7 @@ def _mf_batch_child_postmerge_qa_world(
     definition = contract_runtime.registry.get(
         "mf_parallel.v2",
         version="v2",
-        revision="rev9",
+        revision=contract_revision,
         include_deprecated=True,
     )
     instruction_bundle = resolve_instruction_bundle(
@@ -21524,7 +21526,7 @@ def _mf_batch_child_postmerge_qa_world(
             "backlog_id": _BATCH_QA_CHILD_BACKLOGS[index],
             "contract_id": "mf_parallel.v2",
             "version": "v2",
-            "revision": "rev9",
+            "revision": contract_revision,
             "definition_hash": definition["definition_hash"],
             "definition_source_sha256": definition.get("source_sha256") or "",
             "instruction_bundle_hash": instruction_bundle[
@@ -21784,24 +21786,29 @@ def _batch_qa_bind_qa_graph_line(world, index):
     )
 
 
+@pytest.mark.parametrize("contract_revision", ["rev9", "rev10"])
 def test_mf_batch_child_postmerge_qa_accepts_batch_scoped_reconcile(
     conn,
     tmp_path,
     monkeypatch,
+    contract_revision,
 ):
-    """Regression: every mf_batch_parallel child was blocked before QA.
+    """A task-only batch reconcile remains valid after line consumption.
 
     ``final_batch_reconcile`` prescribes a batch/parent-scoped reconcile, so
     the only reconcile event a batch child can ever have is scoped to the
-    batch task and the coordination backlog.  The child post-merge QA gate
-    resolved reconcile authority only from the child's own task/backlog
-    timeline, and the shared-batch projection that is supposed to cover that
-    case could not resolve any child's lane merge in a rev8/rev9 world, so
-    ``qa_graph_context`` was unsatisfiable for both children.  Before the fix
-    this test fails with ``postmerge_reconcile_event_unverified``.
+    batch task and the coordination backlog.  Rev9 covers the original shared
+    authority path; rev10 also proves the persisted receipt can recover each
+    child lane after ``observer_reconcile`` advances.  Before this fix that
+    rev10 path blocked ``qa_graph_context``.
     """
 
-    world = _mf_batch_child_postmerge_qa_world(conn, tmp_path, monkeypatch)
+    world = _mf_batch_child_postmerge_qa_world(
+        conn,
+        tmp_path,
+        monkeypatch,
+        contract_revision=contract_revision,
+    )
 
     # The batch reconcile is parent-scoped by construction: it is recorded on
     # the coordination backlog and the batch task, never on either child.
