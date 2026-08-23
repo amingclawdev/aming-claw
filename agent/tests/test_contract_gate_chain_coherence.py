@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from agent.governance.contracts import (
     ContractDefinitionRegistry,
     build_execution_state,
@@ -23,6 +26,16 @@ EXPECTED_DIRECT_MAIN_CHAIN = [
     ("reconcile", "observer_reconcile", "observer", "current_full_reconcile"),
     ("close_ready", "observer_close_ready", "observer", "close_ready"),
 ]
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+HAPPY_PATH_GATE_MAP = (
+    REPO_ROOT / "docs/dev/contract-rule-gate-map.happy_path.v1.json"
+)
+
+
+def _happy_path_gate_map():
+    return json.loads(HAPPY_PATH_GATE_MAP.read_text(encoding="utf-8"))
 
 
 def _direct_definition():
@@ -285,3 +298,160 @@ def test_mf_parallel_rev10_keeps_nominal_chain_and_forbids_commit_backedge() -> 
         if successor.get("contract_id") == "mf_parallel.v2"
     }
     assert successor_modes == {"same_contract_append_only_failed_qa_rework"}
+
+
+def test_happy_path_gate_map_pins_three_independent_historical_worlds() -> None:
+    gate_map = _happy_path_gate_map()
+
+    assert gate_map["schema_version"] == (
+        "aming_claw.contract_rule_gate_map.happy_path.v1"
+    )
+    assert gate_map["audit_position"] == {
+        "project_id": "aming-claw",
+        "audited_code_commit": "6a180ddc9a5de6e0500be4d1de62b781c1a3967a",
+        "graph_snapshot_id": "full-6a180ddc9a5d-ed83e4d871fe",
+        "graph_snapshot_kind": "full",
+        "graph_snapshot_status": "active",
+        "graph_stale": False,
+        "pending_scope_reconcile_count": 0,
+        "graph_query_trace_id": "gqt-20260823-3ba0104ea6",
+    }
+    worlds = gate_map["historical_reference_worlds"]
+    assert [world["lane"] for world in worlds] == [
+        "direct_main",
+        "mf_parallel",
+        "mf_batch_parallel",
+    ]
+    assert [world["commit_sha"] for world in worlds] == [
+        "8a6ef43d2454a8f02586f30380a41d6e16a37210",
+        "c18af8b3df4971a6beb2c8b07b793dbad1ae6e70",
+        "170425064c5e8cdb27e7c86c06b9f2ccaf1b72ee",
+    ]
+    assert [world["snapshot_id"] for world in worlds] == [
+        "full-8a6ef43-a390",
+        "full-c18af8b-2540",
+        "full-1704250-9d45",
+    ]
+    assert all(world["simultaneous_environment"] is False for world in worlds)
+    assert all(world["current_contract_certificate"] is False for world in worlds)
+    assert all(world["formal_no_pass"] is False for world in worlds)
+
+
+def test_happy_path_gate_map_keeps_rule_gate_guide_authority_explicit() -> None:
+    gate_map = _happy_path_gate_map()
+    authority = gate_map["authority_model"]
+    common = gate_map["source_inventory"]["common_rule_package"]
+
+    assert "selected source-backed Contract revision" in authority["rule_authority"]
+    assert "cannot invent a Rule" in authority["gate_authority"]
+    assert "one legal Entrance or a typed refusal" in authority["guide_authority"]
+    assert "never produces PASS" in authority["bypass_authority"]
+    assert common["omitted_rules_apply"] is False
+    assert common["server_inference_allowed"] is False
+
+    mapped_rule_refs = set()
+    for lane in gate_map["lanes"].values():
+        for mapping in lane["gate_mappings"]:
+            assert mapping["rule_refs"]
+            assert mapping["validator_symbol"]
+            assert mapping["fact_selectors"]
+            assert mapping["expected"]
+            assert mapping["actual"]
+            assert mapping["verdict"] == mapping["disposition"]
+            assert mapping["authority_class"] in {
+                "rule_validation",
+                "template_validation_only",
+            }
+            implementation_path = REPO_ROOT / mapping["implementation_file"]
+            implementation = implementation_path.read_text(encoding="utf-8")
+            assert f"def {mapping['validator_symbol']}(" in implementation
+            mapped_rule_refs.update(mapping["rule_refs"])
+
+    assert set(common["rule_ids"]).issubset(mapped_rule_refs)
+    assert gate_map["orphan_predicate_audit"]["accepted_orphan_predicates"] == []
+    orphan_candidate = gate_map["orphan_predicate_audit"]["candidates"][0]
+    assert orphan_candidate["drift_gym_case"] == "DC-042"
+    assert orphan_candidate["disposition"] == "TRANSPORT_ONLY"
+    assert orphan_candidate["rule_change"] is False
+    assert orphan_candidate["bypass_used"] is False
+
+
+def test_happy_path_gate_map_has_four_fail_closed_conformance_classes() -> None:
+    gate_map = _happy_path_gate_map()
+    classes = gate_map["conformance_classes"]
+
+    assert set(classes) == {
+        "missing_validator",
+        "under_validation",
+        "mis_validation",
+        "orphan_predicate",
+    }
+    assert all(item["pass_allowed"] is False for item in classes.values())
+    assert set(classes["orphan_predicate"]["allowed_dispositions"]) == {
+        "ROLLBACK",
+        "CONTRACT_UPDATE",
+        "GUIDE_UPDATE",
+        "TRANSPORT_ONLY",
+    }
+
+
+def test_happy_path_global_traces_are_seam_complete_and_terminal() -> None:
+    gate_map = _happy_path_gate_map()
+
+    for lane_name, lane in gate_map["lanes"].items():
+        trace = lane["global_trace"]
+        assert trace
+        assert trace[0]["consumes"] == []
+        assert trace[-1]["produces"] == [lane["terminal_base_case"]]
+        assert lane["terminal_base_case"] == "terminal_fixed"
+        assert lane["bypass_in_nominal_trace"] is False
+        for previous, current in zip(trace, trace[1:]):
+            assert set(current["consumes"]).issubset(previous["produces"]), (
+                lane_name,
+                previous["stage"],
+                current["stage"],
+            )
+
+    direct = gate_map["lanes"]["direct_main"]
+    parallel = gate_map["lanes"]["mf_parallel"]
+    batch = gate_map["lanes"]["mf_batch_parallel"]
+    assert direct["concurrency_topology"]["kind"] == "serial"
+    assert parallel["concurrency_topology"] == {
+        "kind": "fan_out_fan_in",
+        "fan_out": 2,
+        "fan_in": 2,
+        "ordered_merge": True,
+        "reconcile_after_fan_in": True,
+        "qa_after_reconcile": True,
+    }
+    assert batch["concurrency_topology"]["ordered_merge"] is True
+    assert batch["concurrency_topology"]["durable_epoch"] is True
+    assert batch["concurrency_topology"]["single_final_reconcile"] is True
+    assert batch["concurrency_topology"]["atomic_parent_close"] is True
+
+
+def test_happy_path_map_separates_batch_gap_and_release_warranty() -> None:
+    gate_map = _happy_path_gate_map()
+    batch_contract = gate_map["lanes"]["mf_batch_parallel"]["contract"]
+    warranty = gate_map["release_warranty_policy"]
+    outcome = gate_map["audit_outcome"]
+
+    assert batch_contract["source_backed_parent_definition_found"] is False
+    assert batch_contract["authority_status"] == "gap"
+    assert batch_contract["disposition"] == "CONTRACT_UPDATE"
+    assert warranty["required_lane_order"] == [
+        "direct_main",
+        "mf_parallel",
+        "mf_batch_parallel",
+    ]
+    assert warranty["parent_wip_limit"] == 1
+    assert warranty["fresh_receipts_required"] is True
+    assert warranty["historical_reference_worlds_are_warranty"] is False
+    assert warranty["combined_environment_claimed"] is False
+    assert warranty["current_status"] == "INSUFFICIENT_EVIDENCE"
+    assert outcome["direct_main"] == "NO_RULE_CHANGE"
+    assert outcome["mf_parallel"] == "NO_RULE_CHANGE"
+    assert outcome["mf_parallel_failed_host_probe"] == "TRANSPORT_ONLY"
+    assert outcome["mf_batch_parallel_parent"] == "CONTRACT_UPDATE"
+    assert outcome["new_gate_predicates_authorized"] is False
+    assert outcome["bypass_used"] is False

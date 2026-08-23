@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Deterministic v2 happy-path evidence replay.
+"""Deterministic v3 happy-path evidence replay.
 
 The smoke has two complementary layers:
 
-* HTTP replay reads the durable, independently verified mf_parallel and
-  mf_batch_parallel worlds and proves that their close commits, graph
-  snapshots, and no-bypass timelines still agree.
+* HTTP replay reads three independent historical Direct Main, mf_parallel,
+  and mf_batch_parallel worlds and proves that each world's close commit,
+  immutable graph snapshot, and no-bypass timeline still agree. These are
+  compatibility witnesses, not one simultaneous current-release warranty.
 * ``--run-regressions`` creates isolated temporary governance worlds through
   the production route handlers and replays the merge/reconcile/close
   authority nodes that made those worlds possible.
@@ -30,7 +31,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 RELEASE_VERSION = "0.2.1"
-SCHEMA_VERSION = "aming_claw.happy_path_smoke.v2"
+SCHEMA_VERSION = "aming_claw.happy_path_smoke.v3"
 
 
 @dataclass(frozen=True)
@@ -38,24 +39,38 @@ class World:
     lane: str
     project_id: str
     close_commit: str
+    snapshot_id: str
+    graph_sha256: str
     backlog_ids: tuple[str, ...]
 
 
 REFERENCE_WORLDS = (
     World(
+        lane="direct_main",
+        project_id="daily-planner-v2-direct-253d7f62-20260808t200221z",
+        close_commit="8a6ef43d2454a8f02586f30380a41d6e16a37210",
+        snapshot_id="full-8a6ef43-a390",
+        graph_sha256="bd0d18ed960ed26a2e09ca5d7af3a2d09e8881126afcc7c971d4b8568992f0f5",
+        backlog_ids=("DP-V2-DIRECT-253D7F62-R1-20260808",),
+    ),
+    World(
         lane="mf_parallel",
-        project_id="daily-planner-parallel-2184372f-20260806t203120z",
-        close_commit="d56d1074a9b89b1f5cdf6b8abdb6f9cebe16fd9f",
-        backlog_ids=("DP-E2E-CLOSEGRADE-PARALLEL-2184372F-R1-20260806",),
+        project_id="daily-planner-v2-parallel-r3-20260809t050248z",
+        close_commit="c18af8b3df4971a6beb2c8b07b793dbad1ae6e70",
+        snapshot_id="full-c18af8b-2540",
+        graph_sha256="bdb607afe83572f0db97516e1c0e961d7c77f0506c90f89d3bd79037e7ae6405",
+        backlog_ids=("DP-V2-PARALLEL-R8-20260809",),
     ),
     World(
         lane="mf_batch_parallel",
-        project_id="daily-planner-batch-45824720-20260807t032549z",
-        close_commit="4ec1e18e538218fe481fc87a9a92dcd09c2a9d21",
+        project_id="daily-planner-v2-batch-530a9121-20260809t043433z",
+        close_commit="170425064c5e8cdb27e7c86c06b9f2ccaf1b72ee",
+        snapshot_id="full-1704250-9d45",
+        graph_sha256="0e3b24753ff1bd655d850c8da84b17417c311611651ffa42430a6dd2303dbc97",
         backlog_ids=(
-            "DP-E2E3-BATCH-MODELS-45824720-R1-20260807",
-            "DP-E2E3-BATCH-PLANNER-45824720-R1-20260807",
-            "DP-E2E3-BATCH-COORD-45824720-R1-20260807",
+            "DP-V2-BATCH-MODELS-530A9121-R2-20260809",
+            "DP-V2-BATCH-PLANNER-530A9121-R2-20260809",
+            "DP-V2-BATCH-COORD-530A9121-R2-20260809",
         ),
     ),
 )
@@ -97,6 +112,32 @@ def offline_preflight(repo_root: Path) -> dict[str, Any]:
     managed_profile_runtime = (
         repo_root / "agent" / "governance" / "contract_state_runtime.py"
     ).read_text(encoding="utf-8")
+    gate_map = _read_json(
+        repo_root / "docs/dev/contract-rule-gate-map.happy_path.v1.json"
+    )
+    map_worlds = gate_map.get("historical_reference_worlds") or []
+    map_world_identities = [
+        (
+            item.get("lane"),
+            item.get("project_id"),
+            item.get("commit_sha"),
+            item.get("snapshot_id"),
+            str(item.get("snapshot_sha256") or "").removeprefix("sha256:"),
+            tuple(item.get("backlog_ids") or []),
+        )
+        for item in map_worlds
+    ]
+    script_world_identities = [
+        (
+            world.lane,
+            world.project_id,
+            world.close_commit,
+            world.snapshot_id,
+            world.graph_sha256,
+            world.backlog_ids,
+        )
+        for world in REFERENCE_WORLDS
+    ]
     checks = {
         "pyproject_version": f'version = "{RELEASE_VERSION}"' in pyproject,
         "codex_manifest_version": _base_version(codex.get("version"))
@@ -135,7 +176,19 @@ def offline_preflight(repo_root: Path) -> dict[str, Any]:
         in compose,
         "compose_isolated_volume": "governance-demo-data:/app/shared-volume"
         in compose,
-        "world_count": len(REFERENCE_WORLDS) == 2,
+        "gate_map_schema": gate_map.get("schema_version")
+        == "aming_claw.contract_rule_gate_map.happy_path.v1",
+        "gate_map_world_identity": map_world_identities == script_world_identities,
+        "world_count": len(REFERENCE_WORLDS) == 3,
+        "worlds_are_independent": all(
+            item.get("simultaneous_environment") is False for item in map_worlds
+        ),
+        "combined_environment_not_claimed": (
+            (gate_map.get("release_warranty_policy") or {}).get(
+                "combined_environment_claimed"
+            )
+            is False
+        ),
     }
     failures = [name for name, passed in checks.items() if not passed]
     if failures:
@@ -235,40 +288,39 @@ def replay_reference_world(
             }
         )
 
-    graph = _http_json(
+    snapshot = _http_json(
         base_url,
-        f"/api/graph-governance/{urllib.parse.quote(world.project_id)}/status",
+        f"/api/graph-governance/{urllib.parse.quote(world.project_id)}/"
+        f"snapshots/{urllib.parse.quote(world.snapshot_id)}/summary",
         timeout,
     )
-    graph_stale = (
-        ((graph.get("current_state") or {}).get("graph_stale") or {}).get(
-            "is_stale"
-        )
-        if isinstance(graph.get("current_state"), Mapping)
-        else None
-    )
-    if graph.get("graph_snapshot_commit") != world.close_commit:
+    if snapshot.get("snapshot_id") != world.snapshot_id:
         raise SmokeFailure(
-            f"{world.lane} graph commit={graph.get('graph_snapshot_commit')!r}, "
+            f"{world.lane} snapshot id={snapshot.get('snapshot_id')!r}, "
+            f"expected {world.snapshot_id}"
+        )
+    if snapshot.get("commit_sha") != world.close_commit:
+        raise SmokeFailure(
+            f"{world.lane} snapshot commit={snapshot.get('commit_sha')!r}, "
             f"expected {world.close_commit}"
         )
-    if graph_stale is not False:
-        raise SmokeFailure(f"{world.lane} graph is stale: {graph_stale!r}")
-    if int(graph.get("pending_scope_reconcile_count") or 0) != 0:
-        raise SmokeFailure(f"{world.lane} has pending scope reconcile rows")
-    snapshot_id = str(graph.get("active_snapshot_id") or "")
-    if not snapshot_id:
-        raise SmokeFailure(f"{world.lane} has no active graph snapshot")
+    if snapshot.get("graph_sha256") != world.graph_sha256:
+        raise SmokeFailure(
+            f"{world.lane} graph digest={snapshot.get('graph_sha256')!r}, "
+            f"expected {world.graph_sha256}"
+        )
 
     return {
         "lane": world.lane,
         "project_id": world.project_id,
         "close_commit": world.close_commit,
         "backlogs": backlog_evidence,
-        "graph_snapshot_id": snapshot_id,
-        "graph_commit": graph.get("graph_snapshot_commit"),
-        "graph_stale": False,
-        "pending_scope_reconcile_count": 0,
+        "graph_snapshot_id": world.snapshot_id,
+        "graph_commit": snapshot.get("commit_sha"),
+        "graph_sha256": snapshot.get("graph_sha256"),
+        "historical_snapshot_may_be_superseded": True,
+        "simultaneous_environment": False,
+        "current_release_warranty": False,
         "bypass": False,
     }
 
@@ -348,6 +400,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "passed": False,
             "preflight": offline_preflight(repo_root),
             "reference_worlds": [],
+            "reference_worlds_are_independent": True,
+            "combined_environment_claimed": False,
+            "current_release_warranty_claimed": False,
             "route_regressions": {"status": "not_requested"},
             "raw_credentials_required": False,
             "writes_performed_by_http_replay": False,
