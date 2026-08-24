@@ -145171,6 +145171,8 @@ def test_compact_worker_and_onboard_finish_facades_share_bounded_authority(
         assert onboard_attestation["status"] == (
             "current_worker_runtime_facade_ready"
         )
+        assert onboard_attestation["selected_work_type"] == "parallel_worker"
+        assert onboard_attestation["selected_task_id"] == worker_task_id
         assert len(json.dumps(onboard_attestation).encode("utf-8")) <= (
             candidate_server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
         )
@@ -145240,6 +145242,10 @@ def test_compact_worker_and_onboard_finish_facades_share_bounded_authority(
             "worker_finish_time_attestation requires "
             "runtime_context_finish_time_worker_attestation"
         ]
+        assert rejected["generic_contract_runtime_submit_line_allowed"] is False
+        assert rejected["required_facade"] == (
+            "runtime_context_finish_time_worker_attestation"
+        )
         assert runtime.store.get(execution_id) == generic_before
 
         attestation_body = copy.deepcopy(
@@ -145385,6 +145391,8 @@ def test_compact_worker_and_onboard_finish_facades_share_bounded_authority(
         assert onboard_finish["status"] == (
             "current_worker_runtime_facade_ready"
         )
+        assert onboard_finish["selected_work_type"] == "parallel_worker"
+        assert onboard_finish["selected_task_id"] == worker_task_id
         assert len(json.dumps(onboard_finish).encode("utf-8")) <= (
             candidate_server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
         )
