@@ -1685,34 +1685,51 @@ def test_direct_main_rev1_is_exact_auditable_and_dependency_blocked() -> None:
     )
 
 
-def test_direct_main_rev2_template_and_task_selection_are_source_backed() -> None:
+def test_direct_main_rev3_template_and_task_selection_are_source_backed() -> None:
     registry = ContractDefinitionRegistry()
     definition = registry.resolve_for_new_execution(
         "operator_supervised_direct_main",
         version="v1",
+    )
+    rev2 = registry.get(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev2",
     )
     template = get_contract_template("operator_supervised_direct_main")
 
     assert template["template_id"] == "operator_supervised_direct_main.v1"
     assert template["source"] == {
         "type": "source_controlled",
-        "path": "contract_definitions/operator_supervised_direct_main.v1.rev2.json",
+        "path": "contract_definitions/operator_supervised_direct_main.v1.rev3.json",
         "authority": "contract_definition",
         "template_is_authoritative": False,
         "contract_id": "operator_supervised_direct_main",
         "version": "v1",
-        "revision": "rev2",
+        "revision": "rev3",
         "definition_hash": (
-            "sha256:ea169f8dd6c5badd7e7ba774fb0636739608dee4844d6aa775e9538dbbbe5ca2"
+            "sha256:39789c8180777162b3d1fd3aac401f0cfe58aa5e30c3a0c046ccc5ed1d9ba1a4"
         ),
         "definition_source_sha256": (
-            "sha256:a98b860023b33cebaabc3d76d30c3a2c779532bd642bc8eb1a4ae7917540bef0"
+            "sha256:38ba51f29e3d2a1cde67cd7a34dafa4ee0018ac760f97c40a0805725fd34c2e7"
         ),
     }
-    assert definition["revision"] == "rev2"
+    assert definition["revision"] == "rev3"
     assert definition["status"] == "active"
-    assert registry.get("direct_main")["revision"] == "rev2"
-    assert registry.get("direct_main.v1")["revision"] == "rev2"
+    assert registry.get("direct_main")["revision"] == "rev3"
+    assert registry.get("direct_main.v1")["revision"] == "rev3"
+    assert rev2["source_sha256"] == (
+        "sha256:a98b860023b33cebaabc3d76d30c3a2c779532bd642bc8eb1a4ae7917540bef0"
+    )
+    assert "AC-COMMON-MERGE-ORDERED" in rev2["metadata"][
+        "common_rule_applicability"
+    ]["rule_ids"]
+    assert "AC-COMMON-MERGE-ORDERED" not in definition["metadata"][
+        "common_rule_applicability"
+    ]["rule_ids"]
+    assert definition["metadata"]["previous_revision"] == (
+        "operator_supervised_direct_main.v1.rev2"
+    )
     assert is_new_execution_allowed(definition) is True
     assert template["source"]["definition_hash"] == definition["definition_hash"]
     assert template["source"]["definition_source_sha256"] == definition[
@@ -1734,6 +1751,6 @@ def test_direct_main_rev2_template_and_task_selection_are_source_backed() -> Non
         {"task_type": "operator_supervised_direct_main"},
     ):
         resolved = resolve_contract_template(**query)
-        assert resolved["source"]["revision"] == "rev2"
+        assert resolved["source"]["revision"] == "rev3"
         assert resolved["activation_policy"]["activation_ready"] is True
         assert resolved["activation_policy"]["new_execution_allowed"] is True

@@ -39,14 +39,14 @@
   },
   "source": {
     "type": "source_controlled",
-    "path": "contract_definitions/operator_supervised_direct_main.v1.rev2.json",
+    "path": "contract_definitions/operator_supervised_direct_main.v1.rev3.json",
     "authority": "contract_definition",
     "template_is_authoritative": false,
     "contract_id": "operator_supervised_direct_main",
     "version": "v1",
-    "revision": "rev2",
-    "definition_hash": "sha256:ea169f8dd6c5badd7e7ba774fb0636739608dee4844d6aa775e9538dbbbe5ca2",
-    "definition_source_sha256": "sha256:a98b860023b33cebaabc3d76d30c3a2c779532bd642bc8eb1a4ae7917540bef0"
+    "revision": "rev3",
+    "definition_hash": "sha256:39789c8180777162b3d1fd3aac401f0cfe58aa5e30c3a0c046ccc5ed1d9ba1a4",
+    "definition_source_sha256": "sha256:38ba51f29e3d2a1cde67cd7a34dafa4ee0018ac760f97c40a0805725fd34c2e7"
   },
   "activation_policy": {
     "schema_version": "contract_activation_dependency.v1",
@@ -70,7 +70,7 @@
       "code": "contract_activation_ready",
       "status": "accepted",
       "classification": "source_backed_dependency_resolved",
-      "message": "operator_supervised_direct_main v1 rev2 pins the accepted common Rule package and allows only fresh explicitly bound executions",
+      "message": "operator_supervised_direct_main v1 rev3 pins the accepted common Rule package with serial-lane applicability and allows only fresh explicitly bound executions",
       "authorizes_write": false,
       "activation_ready": true,
       "new_execution_allowed": true
@@ -90,7 +90,6 @@
       "AC-COMMON-CREDENTIAL-NO-RAW-PERSISTENCE",
       "AC-COMMON-COMMIT-IMMUTABLE-WORKER",
       "AC-COMMON-QA-ROLE-SEPARATION",
-      "AC-COMMON-MERGE-ORDERED",
       "AC-COMMON-GRAPH-EXACT-ACTIVE-PREFLIGHT",
       "AC-COMMON-CLOSE-INTEGRITY"
     ],
@@ -104,7 +103,7 @@
   "gate_policy": {
     "schema_version": "operator_supervised_direct_main_gate_policy.v1",
     "non_authoritative_template_mirror": true,
-    "authority": "contract_definitions/operator_supervised_direct_main.v1.rev2.json",
+    "authority": "contract_definitions/operator_supervised_direct_main.v1.rev3.json",
     "fail_closed": true,
     "activation_ready": true,
     "entry_allowed": true,

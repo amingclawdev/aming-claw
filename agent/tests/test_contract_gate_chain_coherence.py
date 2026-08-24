@@ -42,7 +42,7 @@ def _direct_definition():
     return ContractDefinitionRegistry().get(
         "operator_supervised_direct_main",
         version="v1",
-        revision="rev2",
+        revision="rev3",
     )
 
 
@@ -186,21 +186,59 @@ def test_direct_main_rev1_dependency_join_remains_immutable_and_fail_closed() ->
     assert resolved_join["server_inference_allowed"] is False
 
 
-def test_direct_main_rev2_rule_gate_and_guide_join_one_explicit_authority() -> None:
+def test_direct_main_rev2_common_rule_overapplication_remains_immutable() -> None:
     registry = ContractDefinitionRegistry()
-    definition = _direct_definition()
-    template = get_contract_template("operator_supervised_direct_main.v1")
+    definition = registry.get(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev2",
+    )
     package = registry.common_rule_package()
     join = registry.resolve_common_rule_applicability(definition)
 
     assert definition["status"] == "active"
     assert definition["revision"] == "rev2"
+    assert definition["source_sha256"] == (
+        "sha256:a98b860023b33cebaabc3d76d30c3a2c779532bd642bc8eb1a4ae7917540bef0"
+    )
     assert join["authoritative"] is True
     assert join["join_state"] == "resolved"
     assert join["package_id"] == package["package_id"]
     assert join["package_version"] == package["package_version"]
     assert join["package_digest"] == package["package_digest"]
     assert join["rule_ids"] == package["rule_ids"]
+    assert "AC-COMMON-MERGE-ORDERED" in join["rule_ids"]
+    assert join["scopes"] == ["operator_supervised_direct_main"]
+    assert join["omitted_rules_apply"] is False
+    assert join["server_inference_allowed"] is False
+
+
+def test_direct_main_rev3_rule_gate_and_guide_join_serial_authority() -> None:
+    registry = ContractDefinitionRegistry()
+    definition = _direct_definition()
+    rev2 = registry.get(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev2",
+    )
+    template = get_contract_template("operator_supervised_direct_main.v1")
+    package = registry.common_rule_package()
+    join = registry.resolve_common_rule_applicability(definition)
+    expected_rule_ids = [
+        rule_id
+        for rule_id in package["rule_ids"]
+        if rule_id != "AC-COMMON-MERGE-ORDERED"
+    ]
+
+    assert definition["status"] == "active"
+    assert definition["revision"] == "rev3"
+    assert registry.get("direct_main", version="v1")["revision"] == "rev3"
+    assert join["authoritative"] is True
+    assert join["join_state"] == "resolved"
+    assert join["package_id"] == package["package_id"]
+    assert join["package_version"] == package["package_version"]
+    assert join["package_digest"] == package["package_digest"]
+    assert join["rule_ids"] == expected_rule_ids
     assert join["scopes"] == ["operator_supervised_direct_main"]
     assert join["omitted_rules_apply"] is False
     assert join["server_inference_allowed"] is False
@@ -214,10 +252,23 @@ def test_direct_main_rev2_rule_gate_and_guide_join_one_explicit_authority() -> N
         "package_id": package["package_id"],
         "package_version": package["package_version"],
         "package_digest": package["package_digest"],
-        "applicable_rule_count": len(package["rule_ids"]),
+        "applicable_rule_count": len(expected_rule_ids),
         "new_revision_required_after_resolution": False,
     }
-    assert template["source"]["revision"] == "rev2"
+    assert definition["rule_layer"] == rev2["rule_layer"]
+    assert definition["system_layer"]["retry_policy"] == rev2["system_layer"][
+        "retry_policy"
+    ]
+    assert definition["system_layer"]["terminal_outcome_policy"] == rev2[
+        "system_layer"
+    ]["terminal_outcome_policy"]
+    correction = definition["metadata"]["applicability_correction"]
+    assert correction["removed_rule_ids"] == ["AC-COMMON-MERGE-ORDERED"]
+    assert correction["rev2_mutated_in_place"] is False
+    assert correction["execution_semantics_changed"] is False
+    assert correction["gate_predicate_added"] is False
+    assert correction["server_inference_allowed"] is False
+    assert template["source"]["revision"] == "rev3"
     assert template["source"]["definition_hash"] == definition["definition_hash"]
     assert template["source"]["definition_source_sha256"] == definition[
         "source_sha256"
@@ -370,7 +421,11 @@ def test_happy_path_gate_map_keeps_rule_gate_guide_authority_explicit() -> None:
     source_backed_lanes = {
         "direct_main": (
             "operator_supervised_direct_main.v1.rev2",
-            _direct_definition(),
+            registry.get(
+                "operator_supervised_direct_main",
+                version="v1",
+                revision="rev2",
+            ),
         ),
         "mf_parallel": (
             "mf_parallel.v2.rev10",

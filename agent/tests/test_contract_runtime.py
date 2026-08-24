@@ -442,7 +442,41 @@ def test_direct_main_rev2_starts_fresh_with_authoritative_common_rule_join():
     assert registry.resolve_common_rule_applicability(rev1)["authoritative"] is False
 
 
-def test_direct_main_rev2_fresh_world_warranty_rejects_bypass_authority():
+def test_direct_main_rev3_fresh_selection_does_not_rebind_pinned_rev2():
+    registry = ContractDefinitionRegistry()
+    runtime = ContractRuntime(registry)
+    pinned_rev2 = runtime.start_execution(
+        "direct_main",
+        version="v1",
+        revision="rev2",
+        project_id="aming-claw",
+        backlog_id="AC-DIRECT-MAIN-PINNED-REV2",
+        actor_role="observer",
+        contract_execution_id="cex-direct-main-pinned-rev2",
+    )
+    fresh_rev3 = runtime.start_execution(
+        "direct_main",
+        version="v1",
+        project_id="aming-claw",
+        backlog_id="AC-DIRECT-MAIN-FRESH-REV3",
+        actor_role="observer",
+        contract_execution_id="cex-direct-main-fresh-rev3",
+    )
+
+    assert pinned_rev2["revision"] == "rev2"
+    assert fresh_rev3["revision"] == "rev3"
+    assert pinned_rev2["definition_hash"] != fresh_rev3["definition_hash"]
+    assert runtime.store.get("cex-direct-main-pinned-rev2")["revision"] == "rev2"
+    assert runtime.store.get("cex-direct-main-fresh-rev3")["revision"] == "rev3"
+    assert "AC-COMMON-MERGE-ORDERED" in pinned_rev2[
+        "authoritative_common_rule_join"
+    ]["rule_ids"]
+    assert "AC-COMMON-MERGE-ORDERED" not in fresh_rev3[
+        "authoritative_common_rule_join"
+    ]["rule_ids"]
+
+
+def test_direct_main_rev3_demo_bypass_to_end_stays_no_pass_audit_only():
     registry = ContractDefinitionRegistry()
     runtime = ContractRuntime(registry)
 
@@ -450,9 +484,9 @@ def test_direct_main_rev2_fresh_world_warranty_rejects_bypass_authority():
         "direct_main",
         version="v1",
         project_id="aming-claw",
-        backlog_id="AC-DIRECT-MAIN-REV2-FRESH-WORLD-WARRANTY",
+        backlog_id="AC-DIRECT-MAIN-REV3-FRESH-WORLD-WARRANTY",
         actor_role="observer",
-        contract_execution_id="cex-direct-main-rev2-fresh-world-warranty",
+        contract_execution_id="cex-direct-main-rev3-fresh-world-warranty",
     )
 
     definition = registry.get("direct_main", version="v1")
@@ -460,11 +494,16 @@ def test_direct_main_rev2_fresh_world_warranty_rejects_bypass_authority():
     join = created["authoritative_common_rule_join"]
     rules = {rule["rule_id"]: rule for rule in package["rules"]}
 
-    assert created["revision"] == definition["revision"] == "rev2"
+    expected_rule_ids = [
+        rule_id
+        for rule_id in package["rule_ids"]
+        if rule_id != "AC-COMMON-MERGE-ORDERED"
+    ]
+    assert created["revision"] == definition["revision"] == "rev3"
     assert definition["status"] == "active"
     assert join["package_digest"] == package["package_digest"]
-    assert join["rule_ids"] == package["rule_ids"]
-    assert join["rule_ids"] == list(rules)
+    assert join["rule_ids"] == expected_rule_ids
+    assert set(join["rule_ids"]) == set(rules) - {"AC-COMMON-MERGE-ORDERED"}
     assert join["omitted_rules_apply"] is False
     assert join["server_inference_allowed"] is False
     assert (
@@ -482,36 +521,66 @@ def test_direct_main_rev2_fresh_world_warranty_rejects_bypass_authority():
         "AC-COMMON-CLOSE-INTEGRITY"
     ]["gate_obligation"]
 
-    proposed_write = {
-        "project_id": created["project_id"],
-        "backlog_id": created["backlog_id"],
-        "contract_execution_id": created["contract_execution_id"],
-        "definition_hash": created["definition_hash"],
-        "instruction_bundle_hash": created["instruction_bundle_hash"],
-        "execution_state_revision": created["execution_state_revision"],
-        "runtime_guide_hash": created["runtime_guide"]["runtime_guide_hash"],
-        "stage_id": "route_gate",
-        "line_id": "observer_bind_direct_scope",
-        "actor_role": "observer",
-        "evidence_kind": "contract_binding",
-    }
-    precheck = runtime.precheck_line_write(
-        created["contract_execution_id"],
-        proposed_write,
-        actor_role="observer",
-    )
-    written = runtime.submit_line_write(
-        created["contract_execution_id"],
-        proposed_write,
-        actor_role="observer",
-    )
+    record = created
+    expected_lines = [
+        ("route_gate", "observer_bind_direct_scope", "observer"),
+        ("graph_first", "observer_graph_context", "observer"),
+        (
+            "pre_mutation",
+            "observer_direct_implementation_exception",
+            "observer",
+        ),
+        ("implementation", "observer_implementation", "observer"),
+        ("qa_graph_context", "qa_graph_context", "qa"),
+        ("qa", "qa_independent_verification", "qa"),
+        ("reconcile", "observer_reconcile", "observer"),
+        ("close_ready", "observer_close_ready", "observer"),
+    ]
+    for index, (stage_id, line_id, actor_role) in enumerate(expected_lines, 1):
+        guide = runtime.current_guide(
+            created["contract_execution_id"], actor_role=actor_role
+        )
+        assert guide["next_legal_action"]["stage_id"] == stage_id
+        assert guide["next_legal_action"]["line_id"] == line_id
+        bypassed = runtime.bypass_current_line(
+            created["contract_execution_id"],
+            {
+                "bypass_identity": (
+                    f"bypass:{created['contract_execution_id']}:{index}:{line_id}"
+                ),
+                "stage_id": stage_id,
+                "line_id": line_id,
+                "execution_state_revision": record[
+                    "execution_state_revision"
+                ],
+                "runtime_guide_hash": guide["runtime_guide_hash"],
+                "diagnostic_backlog_id": (
+                    "AC-DIRECT-MAIN-REV3-FRESH-WORLD-WARRANTY"
+                ),
+                "classification": "direct_main_demo_bypass_probe",
+                "reason": "exercise the explicit no-PASS bypass path",
+                "decision": "continue the bounded demo probe as audit only",
+                "evidence_refs": [
+                    "backlog:AC-DIRECT-MAIN-REV3-FRESH-WORLD-WARRANTY"
+                ],
+            },
+            actor_role=actor_role,
+        )
+        assert bypassed["ok"] is True, (index, bypassed["decision"])
+        assert bypassed["decision"]["no_pass_claim"] is True
+        assert bypassed["written_line"]["status"] == "waived"
+        assert bypassed["written_line"]["no_pass_claim"] is True
+        assert bypassed["record"]["authoritative_common_rule_join"] == join
+        record = bypassed["record"]
 
-    assert precheck["ok"] is False
-    assert precheck["would_mutate_completed_lines"] is False
-    assert written["ok"] is False
-    assert precheck["decision"] == written["decision"]
-    assert precheck["record"]["authoritative_common_rule_join"] == join
-    assert written["record"]["authoritative_common_rule_join"] == join
+    assert len(record["completed_lines"]) == len(expected_lines)
+    assert {line["status"] for line in record["completed_lines"]} == {"waived"}
+    assert all(line["no_pass_claim"] for line in record["completed_lines"])
+    assert record["runtime_guide"]["next_legal_action"] in ({}, None)
+    assert record["runtime_guide"].get("close_eligible") is not True
+    assert not record["runtime_guide"].get("close_authority")
+    assert "terminal_disposition" not in record["runtime_guide"]
+    assert '"PASS"' not in json.dumps(record["runtime_guide"], sort_keys=True)
 
 
 def test_direct_main_rev2_strict_runtime_binding_is_authoritative_at_write_gate():
