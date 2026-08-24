@@ -234,6 +234,110 @@ def test_batch_planned_item_binding_without_runtime_fails_closed(
     assert bindings == {}, case
 
 
+def test_batch_read_model_preserves_server_order_identity_without_replacement_authority() -> None:
+    conn = _runtime_conn()
+    batch_id = "mf-batch-parallel-read-model-identity"
+    merge_queue_id = "mq-batch-read-model-identity"
+    queue_item_id = "mqitem-server-row-2"
+    planned_task_id = f"{batch_id}:row:2"
+    runtime_task_id = "cex-batch-read-model-row-2"
+    backlog_id = "AC-BATCH-READ-MODEL-ROW-2"
+
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            backlog_id=backlog_id,
+            task_id=runtime_task_id,
+            branch_ref="refs/heads/codex/batch-read-model-row-2",
+            status=STATE_WORKTREE_READY,
+            merge_queue_id=merge_queue_id,
+            ref_name="main",
+        ),
+        now_iso=NOW,
+    )
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=queue_item_id,
+            backlog_id=backlog_id,
+            task_id=planned_task_id,
+            branch_ref="",
+            queue_index=2,
+            status="planned",
+            target_ref="refs/heads/main",
+        ),
+        now_iso=NOW,
+    )
+    parallel_branch_runtime.upsert_batch_merge_runtime(
+        conn,
+        BatchMergeRuntime(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            target_ref="refs/heads/main",
+            batch_base_commit="base-batch-read-model",
+            current_target_head="target-batch-read-model",
+            items=(
+                BatchMergeItem(
+                    task_id=planned_task_id,
+                    branch_ref="",
+                    worktree_path="",
+                    queue_index=2,
+                    status="planned",
+                    branch_head="",
+                    merge_queue_id=merge_queue_id,
+                ),
+            ),
+        ),
+        now_iso=NOW,
+    )
+    parallel_branch_runtime.upsert_integration_epoch(
+        conn,
+        parallel_branch_runtime.IntegrationEpoch(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            epoch_id="epoch-batch-read-model",
+            coordination_backlog_id="AC-BATCH-READ-MODEL-PARENT",
+            target_ref="refs/heads/main",
+            base_head="base-batch-read-model",
+            current_head="target-batch-read-model",
+            merge_queue_id=merge_queue_id,
+            merge_cursor=1,
+            merged_prefix=(queue_item_id,),
+            remaining_queue_item_ids=(),
+        ),
+        now_iso=NOW,
+    )
+
+    read_model = parallel_branch_runtime.build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=batch_id,
+        merge_queue_id=merge_queue_id,
+        target_ref="refs/heads/main",
+        now_iso=NOW,
+    ).to_dict()
+
+    assert read_model["batch_id"] == batch_id
+    assert len(read_model["branch_lanes"]) == 1
+    lane = read_model["branch_lanes"][0]
+    assert lane["batch_id"] == batch_id
+    assert lane["task_id"] == runtime_task_id
+    assert lane["backlog_id"] == backlog_id
+    assert lane["merge_queue_id"] == merge_queue_id
+    assert len(read_model["merge_queue"]["rows"]) == 1
+    queue_row = read_model["merge_queue"]["rows"][0]
+    assert queue_row["backlog_id"] == backlog_id
+    assert queue_row["task_id"] == runtime_task_id
+    assert queue_row["merge_queue_id"] == merge_queue_id
+    assert queue_row["queue_item_id"] == queue_item_id
+    assert queue_row["queue_index"] == 2
+    assert read_model["integration_epoch"]["merged_prefix"] == [queue_item_id]
+
+
 def test_generation_restart_requires_signed_governance_failure_disposition() -> None:
     runtime = BatchMergeRuntime(
         project_id=PROJECT_ID,
