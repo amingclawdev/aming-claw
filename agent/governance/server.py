@@ -169179,41 +169179,28 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
     if not implementation:
         return {}
 
-    structured_requirements = {
-        "runtime_sync_or_governance_redeploy": {
-            "governance_redeploy",
-            "redeploy",
-            "redeployed",
-            "runtime_sync",
-            "runtime_version_sync",
-            "version_sync",
-            "runtime_match",
-        },
-        "live_regression": {
-            "live_regression",
-            "live_regression_evidence",
-            "regression",
-            "smoke_test",
-        },
-    }
-
-    def passed_structured_evidence(keys: set[str]) -> bool:
-        for value in task_timeline._event_field_values(prospective, keys):
-            if isinstance(value, Mapping):
-                if value.get("passed") is True or task_timeline._truthy(
-                    value.get("status")
-                    or value.get("decision")
-                    or value.get("result")
-                ):
-                    return True
-                continue
-            if task_timeline._truthy(value):
-                return True
-        return False
-
+    close_ready_verification = (
+        body.get("verification")
+        if isinstance(body.get("verification"), Mapping)
+        else {}
+    )
+    live_regression = (
+        close_ready_verification.get("live_regression")
+        if isinstance(
+            close_ready_verification.get("live_regression"), Mapping
+        )
+        else {}
+    )
     checks = {
-        requirement_id: passed_structured_evidence(keys)
-        for requirement_id, keys in structured_requirements.items()
+        "runtime_sync_or_governance_redeploy": (
+            _operator_supervised_direct_main_runtime_sync_or_redeploy_passed(
+                close_ready_verification
+            )
+        ),
+        "live_regression": (
+            str(live_regression.get("status") or "").strip().lower()
+            in {"accepted", "ok", "pass", "passed", "succeeded", "success"}
+        ),
     }
     checks["graph_reconciled"] = any(
         task_timeline._truthy(value) and not isinstance(value, Mapping)
@@ -169222,12 +169209,8 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
             {"graph_reconciled", "scope_reconciled"},
         )
     )
-    checks["preflight_ok"] = any(
-        task_timeline._truthy(value) and not isinstance(value, Mapping)
-        for value in task_timeline._event_field_values(
-            prospective,
-            {"preflight_ok", "preflight_passed"},
-        )
+    checks["preflight_ok"] = (
+        close_ready_verification.get("preflight_ok") is True
     )
     implementation_payload = (
         implementation.get("payload")
@@ -169240,11 +169223,6 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
             expected_commit=str(implementation.get("commit_sha") or ""),
             field="implementation.payload.test_results",
         )
-    )
-    close_ready_verification = (
-        body.get("verification")
-        if isinstance(body.get("verification"), Mapping)
-        else {}
     )
     close_ready_test_results_gate = (
         _contract_runtime_parentless_direct_main_test_results_gate(
@@ -169291,15 +169269,18 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
         "missing_requirement_ids": missing,
         "canonical_requirements": {
             "runtime_sync_or_governance_redeploy": sorted(
-                structured_requirements[
-                    "runtime_sync_or_governance_redeploy"
+                [
+                    "close_ready.verification.governance_redeploy",
+                    "close_ready.verification.runtime_sync",
                 ]
             ),
-            "live_regression": sorted(
-                structured_requirements["live_regression"]
-            ),
+            "live_regression": [
+                "close_ready.verification.live_regression"
+            ],
             "graph_reconciled": ["graph_reconciled=true"],
-            "preflight_ok": ["preflight_ok=true"],
+            "preflight_ok": [
+                "close_ready.verification.preflight_ok=true"
+            ],
             "implementation_canonical_test_results": [
                 "implementation.payload.test_results"
             ],

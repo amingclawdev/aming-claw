@@ -93778,6 +93778,111 @@ def test_parentless_direct_main_close_ready_aliases_reject_before_any_write(
             limit=1000,
         )
     ) == event_count_before
+    payload_only_close_integrity = {
+        **append_base,
+        "event_type": "observer.close_ready",
+        "event_kind": "close_ready",
+        "phase": "close_ready",
+        "status": "passed",
+        "actor": "observer",
+        "commit_sha": commit_sha,
+        "verification": {"test_results": canonical_test_results},
+        "payload": {
+            **route_identity,
+            "governance_redeploy": {"status": "passed"},
+            "live_regression": {"status": "passed"},
+            "graph_reconciled": True,
+            "preflight_ok": True,
+        },
+    }
+    with pytest.raises(GovernanceError) as noncanonical_location:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=payload_only_close_integrity,
+            )
+        )
+    assert noncanonical_location.value.code == (
+        "parentless_direct_main_close_ready_canonical_evidence_incomplete"
+    )
+    assert noncanonical_location.value.details[
+        "missing_requirement_ids"
+    ] == [
+        "runtime_sync_or_governance_redeploy",
+        "live_regression",
+        "preflight_ok",
+    ]
+    assert noncanonical_location.value.details["zero_write_rejection"] is True
+    assert noncanonical_location.value.details["writes_performed"] is False
+    assert len(
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=backlog_id,
+            task_id=parent_execution_id,
+            limit=1000,
+        )
+    ) == event_count_before
+    for noncanonical_verification, expected_missing in (
+        (
+            {
+                "wrapper": {
+                    "runtime_sync": {"status": "passed"},
+                    "live_regression": {"status": "passed"},
+                    "preflight_ok": True,
+                },
+                "test_results": canonical_test_results,
+            },
+            [
+                "runtime_sync_or_governance_redeploy",
+                "live_regression",
+                "preflight_ok",
+            ],
+        ),
+        (
+            {
+                "runtime_sync": {"passed": True},
+                "live_regression": {"passed": True},
+                "preflight_ok": True,
+                "test_results": canonical_test_results,
+            },
+            [
+                "runtime_sync_or_governance_redeploy",
+                "live_regression",
+            ],
+        ),
+    ):
+        with pytest.raises(GovernanceError) as rejected_shape:
+            server.handle_task_timeline_append(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body={
+                        **payload_only_close_integrity,
+                        "verification": noncanonical_verification,
+                    },
+                )
+            )
+        assert rejected_shape.value.code == (
+            "parentless_direct_main_close_ready_canonical_evidence_incomplete"
+        )
+        assert rejected_shape.value.details[
+            "missing_requirement_ids"
+        ] == expected_missing
+        assert rejected_shape.value.details["zero_write_rejection"] is True
+        assert rejected_shape.value.details["writes_performed"] is False
+        assert len(
+            task_timeline.list_events(
+                conn,
+                PID,
+                backlog_id=backlog_id,
+                task_id=parent_execution_id,
+                limit=1000,
+            )
+        ) == event_count_before
     with pytest.raises(GovernanceError) as rejected:
         server.handle_task_timeline_append(
             _ctx_with_role(
