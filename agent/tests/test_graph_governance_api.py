@@ -144331,6 +144331,386 @@ def _record_source_backed_worker_authority(
     return execution_id, context, runtime, worker_session_id
 
 
+def test_compact_worker_and_onboard_finish_facades_share_bounded_authority(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    candidate_server, _ = _preload_candidate_server_module()
+    monkeypatch.setattr(
+        candidate_server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+    backlog_id = "AC-COMPACT-FINISH-FACADE-BOUNDED-AUTHORITY"
+    worker_task_id = "compact-finish-facade-worker"
+    worker_token = "compact-finish-facade-token"
+    worker_fence = "compact-finish-facade-fence"
+    graph_trace_id = "gqt-compact-finish-facade"
+    owned_file = "agent/governance/server.py"
+    worker_root = tmp_path / worker_task_id
+    base_commit, worker_commit = _source_backed_worker_git_fixture(
+        worker_root,
+        owned_file,
+    )
+    (
+        execution_id,
+        runtime_context,
+        runtime,
+        _worker_session_id,
+    ) = _record_source_backed_worker_authority(
+        candidate_server,
+        conn,
+        backlog_id=backlog_id,
+        worker_task_id=worker_task_id,
+        worker_token=worker_token,
+        worker_fence=worker_fence,
+        graph_trace_id=graph_trace_id,
+        owned_file=owned_file,
+        worker_root=worker_root,
+        base_commit=base_commit,
+        worker_commit=worker_commit,
+        test_results={
+            "status": "passed",
+            "passed": True,
+            "commands": ["pytest -q compact-finish-facade"],
+        },
+    )
+    assert runtime.store.get(execution_id)["parent_contract_execution_id"]
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            agent_id=runtime_context.worker_id,
+            allocation_owner=runtime_context.worker_id,
+            actual_host_worker_id=runtime_context.worker_id,
+            host_startup_id=f"startup-{worker_task_id}",
+            host_session_id=f"session-{worker_task_id}",
+            lease_id=f"lease-{worker_task_id}",
+            lease_expires_at="2099-01-01T00:00:00Z",
+        ),
+    )
+    persisted_route_identity = {
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        contract_version="mf_parallel.v2",
+        payload={
+            "schema_version": "parallel_branch_allocate_contract_revision.v1",
+            "source": "parallel_branch_allocate",
+            "source_of_truth": "Contract/Revision/Event",
+            "contract_execution_id": execution_id,
+            "successor_contract_execution_id": execution_id,
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "route_identity": persisted_route_identity,
+        },
+        route_gate={
+            "schema_version": "parallel_branch_allocate_route_gate.v1",
+            "allowed_action": "parallel_branch_allocate",
+            "caller_role": "observer",
+            "decision": "allocated",
+            "source": "parallel_branch_allocate",
+            **persisted_route_identity,
+        },
+        route_identity=persisted_route_identity,
+        route_evidence_type="parallel_branch_allocate",
+        actor="parallel_branch_allocate",
+        now_iso="2099-01-01T00:00:00Z",
+    )
+    conn.commit()
+    path = {
+        "project_id": PID,
+        "runtime_context_id": runtime_context.runtime_context_id,
+    }
+    query = {
+        "parent_task_id": execution_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "target_project_root": str(worker_root),
+    }
+
+    full_attestation = (
+        candidate_server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(path, "mf_sub", query={**query, "view": "all"})
+        )
+    )["canonical_executable_actions"]["attestation"]
+    query.update(
+        {
+            field: full_attestation["copy_safe_body"][field]
+            for field in candidate_server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+    )
+
+    def must_not_call(*_args, **_kwargs):
+        raise AssertionError("compact finish projection must stay bounded")
+
+    with monkeypatch.context() as bounded_patch:
+        bounded_patch.setattr(
+            candidate_server,
+            "_runtime_context_projection_response",
+            must_not_call,
+        )
+        bounded_patch.setattr(
+            candidate_server,
+            "_runtime_context_worker_guide_response",
+            must_not_call,
+        )
+        changes_before_reads = conn.total_changes
+        compact_attestation = (
+            candidate_server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+                _ctx_with_role(path, "mf_sub", query={**query, "view": "compact"})
+            )
+        )
+        attestation_action = compact_attestation[
+            "canonical_executable_action"
+        ]
+        assert attestation_action["mcp_tool"] == (
+            "runtime_context_finish_time_worker_attestation"
+        ), json.dumps(
+            {
+                "next_legal_action": compact_attestation.get(
+                    "next_legal_action"
+                ),
+                "contract_runtime_next_legal_action": compact_attestation.get(
+                    "contract_runtime_next_legal_action"
+                ),
+                "blocking_reasons": compact_attestation.get(
+                    "blocking_reasons"
+                ),
+                "canonical_executable_action": attestation_action,
+            },
+            sort_keys=True,
+            default=str,
+        )
+        assert attestation_action["copy_safe_body"] == full_attestation[
+            "copy_safe_body"
+        ]
+        assert candidate_server._stable_public_hash(
+            attestation_action
+        ) == candidate_server._stable_public_hash(full_attestation), json.dumps(
+            {
+                "full_action": full_attestation,
+                "compact_action": attestation_action,
+            },
+            sort_keys=True,
+            default=str,
+        )
+        assert compact_attestation["full_worker_guide_builder_called"] is False
+        assert compact_attestation["full_runtime_projection_called"] is False
+
+        projected_attestation = (
+            candidate_server._onboard_worker_read_runtime_facade_projection(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                next_action=compact_attestation[
+                    "contract_runtime_next_legal_action"
+                ],
+                current_projection={"contract_execution_id": execution_id},
+                runtime_resume={},
+                requested_task_id=worker_task_id,
+                requested_route_token_ref=attestation_action[
+                    "copy_safe_body"
+                ]["route_token_ref"],
+            )
+        )
+        assert projected_attestation.get("actionable") is True, json.dumps(
+            projected_attestation,
+            sort_keys=True,
+            default=str,
+        )
+        onboard_attestation = (
+            candidate_server._onboard_route_guide_compact_service_response(
+                project_id=PID,
+                backlog_id=backlog_id,
+                role="mf_sub",
+                work_type="mf_parallel",
+                record={"contract_execution_id": execution_id},
+                next_action=projected_attestation,
+                current_projection={"contract_execution_id": execution_id},
+                runtime_resume={},
+                target_files=[owned_file],
+                projection_degraded=False,
+                requested_task_id=worker_task_id,
+            )
+        )
+        assert onboard_attestation["status"] == (
+            "current_worker_runtime_facade_ready"
+        )
+        assert len(json.dumps(onboard_attestation).encode("utf-8")) <= (
+            candidate_server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+        )
+        onboard_attestation_action = onboard_attestation[
+            "canonical_executable_action"
+        ]
+        assert onboard_attestation_action["mcp_tool"] == (
+            "runtime_context_finish_time_worker_attestation"
+        )
+        assert onboard_attestation_action["copy_safe_body"] == (
+            attestation_action["copy_safe_body"]
+        )
+        assert candidate_server._stable_public_hash(
+            onboard_attestation_action
+        ) == candidate_server._stable_public_hash(attestation_action), json.dumps(
+            {
+                "runtime_context_action": attestation_action,
+                "onboard_action": onboard_attestation_action,
+            },
+            sort_keys=True,
+            default=str,
+        )
+        assert conn.total_changes == changes_before_reads
+
+        generic_before = copy.deepcopy(runtime.store.get(execution_id))
+        rejected = (
+            candidate_server.handle_project_contract_runtime_line_write(
+                _ctx(
+                    {
+                        "project_id": PID,
+                        "contract_execution_id": execution_id,
+                    },
+                    method="POST",
+                    body={
+                        "runtime_context_id": (
+                            runtime_context.runtime_context_id
+                        ),
+                        "task_id": worker_task_id,
+                        "parent_task_id": execution_id,
+                        "worker_role": "mf_sub",
+                        "fence_token": worker_fence,
+                        "session_token_ref": (
+                            runtime_context_session_token_ref(
+                                runtime_context
+                            )
+                        ),
+                        "target_project_root": str(worker_root),
+                        "stage_id": "worker_attestation",
+                        "line_id": "worker_finish_time_attestation",
+                        "evidence_kind": (
+                            "record_finish_time_worker_attestation"
+                        ),
+                        "payload": {
+                            "runtime_context_id": (
+                                runtime_context.runtime_context_id
+                            ),
+                            "task_id": worker_task_id,
+                            "parent_task_id": execution_id,
+                            "status": "passed",
+                        },
+                    },
+                )
+            )
+        )
+        assert rejected["ok"] is False
+        assert rejected["decision"]["errors"] == [
+            "worker_finish_time_attestation requires "
+            "runtime_context_finish_time_worker_attestation"
+        ]
+        assert runtime.store.get(execution_id) == generic_before
+
+        attestation_body = copy.deepcopy(
+            attestation_action["copy_safe_body"]
+        )
+        attestation_body.update(
+            {"session_token": worker_token, "fence_token": worker_fence}
+        )
+        attestation = candidate_server.handle_graph_governance_runtime_context_finish_time_worker_attestation(
+            _ctx_with_role(path, "mf_sub", method="POST", body=attestation_body)
+        )
+        assert attestation["ok"] is True
+        finish_changes_before_reads = conn.total_changes
+
+        compact_finish = (
+            candidate_server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+                _ctx_with_role(path, "mf_sub", query={**query, "view": "compact"})
+            )
+        )
+        finish_action = compact_finish["canonical_executable_action"]
+        assert finish_action["mcp_tool"] == "runtime_context_finish_gate"
+        projected_finish = (
+            candidate_server._onboard_worker_read_runtime_facade_projection(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                next_action=compact_finish[
+                    "contract_runtime_next_legal_action"
+                ],
+                current_projection={"contract_execution_id": execution_id},
+                runtime_resume={},
+                requested_task_id=worker_task_id,
+                requested_route_token_ref=finish_action[
+                    "copy_safe_body"
+                ]["route_token_ref"],
+            )
+        )
+        onboard_finish = (
+            candidate_server._onboard_route_guide_compact_service_response(
+                project_id=PID,
+                backlog_id=backlog_id,
+                role="mf_sub",
+                work_type="mf_parallel",
+                record={"contract_execution_id": execution_id},
+                next_action=projected_finish,
+                current_projection={"contract_execution_id": execution_id},
+                runtime_resume={},
+                target_files=[owned_file],
+                projection_degraded=False,
+                requested_task_id=worker_task_id,
+            )
+        )
+        assert onboard_finish["status"] == (
+            "current_worker_runtime_facade_ready"
+        )
+        assert len(json.dumps(onboard_finish).encode("utf-8")) <= (
+            candidate_server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+        )
+        onboard_finish_action = onboard_finish[
+            "canonical_executable_action"
+        ]
+        assert onboard_finish_action["mcp_tool"] == (
+            "runtime_context_finish_gate"
+        )
+        assert onboard_finish_action["copy_safe_body"] == (
+            finish_action["copy_safe_body"]
+        )
+        assert candidate_server._stable_public_hash(
+            onboard_finish_action
+        ) == candidate_server._stable_public_hash(finish_action)
+        assert conn.total_changes == finish_changes_before_reads
+
+    full_finish = (
+        candidate_server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(path, "mf_sub", query={**query, "view": "all"})
+        )
+    )["canonical_executable_actions"]["finish"]
+    assert finish_action["copy_safe_body"] == full_finish["copy_safe_body"]
+    assert candidate_server._stable_public_hash(
+        finish_action
+    ) == candidate_server._stable_public_hash(full_finish)
+    finish_body = copy.deepcopy(finish_action["copy_safe_body"])
+    finish_body.update(
+        {
+            "session_token": worker_token,
+            "fence_token": worker_fence,
+            "checkpoint_id": "ckpt-compact-finish-facade",
+            "graph_trace_ids": [graph_trace_id],
+        }
+    )
+    finished = candidate_server.handle_graph_governance_runtime_context_finish_gate(
+        _ctx_with_role(path, "mf_sub", method="POST", body=finish_body)
+    )
+    assert finished["ok"] is True
+    assert finished["context"]["status"] == "validated"
+
+
 def test_worker_generated_python_cache_allows_commit_attestation_and_finish(
     conn,
     tmp_path,
@@ -177541,6 +177921,8 @@ def test_guide_capsule_retains_only_exact_host_realized_auth_placeholders():
         "session_token": "<host-realized session_token>",
         "safe_ref": "session-token-ref:copy-safe",
     }
+
+
 
 
 def test_guide_literal_stage_facades_have_one_executable_copy_safe_body():

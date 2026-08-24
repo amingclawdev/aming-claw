@@ -34452,6 +34452,28 @@ def _runtime_context_worker_guide_early_compact_response(
         contract_runtime_next_action=contract_next_action,
     )
     canonical_actions = dict(coverage.get("actions") or {})
+    current_finish_action = _runtime_context_current_finish_facade_action(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        contract_next_action=contract_next_action,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        target_project_root=target_project_root,
+        session_token_ref=session_token_ref,
+        route_identity=route_identity,
+    )
+    if current_finish_action:
+        current_finish_stage = (
+            "attestation"
+            if str(contract_next_action.get("line_id") or "").strip()
+            == "worker_finish_time_attestation"
+            else "finish"
+        )
+        canonical_actions[current_finish_stage] = current_finish_action
     if "reissue" in next_legal_action:
         reissue = actionable_payloads.get("session_token_reissue_submission")
         if isinstance(reissue, Mapping) and isinstance(
@@ -34627,6 +34649,556 @@ def _runtime_context_worker_guide_early_compact_response(
             requested_view="compact",
         )
     return compact
+
+
+def _runtime_context_finish_submission_bundle(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    target_project_root: str,
+    session_token_ref_placeholder: str,
+    route_identity: Mapping[str, Any],
+    finish_attestation_hint: Mapping[str, Any],
+    timeline_refs: Mapping[str, Any],
+    graph_trace_refs: Mapping[str, Any],
+    worker_scope_files: Sequence[str],
+    finish_hint_source_backed_resolution: Mapping[str, Any],
+    finish_contract_execution_id: str,
+    canonical_observer_command_id: str,
+    canonical_dispatch_projection_fields: Mapping[str, Any],
+    finish_submission_head_commit: str,
+    current_branch_head_commit: str,
+    row_scoped_finish_head_projection: Mapping[str, Any],
+    contract_worker_commit_required: bool,
+) -> dict[str, Any]:
+    """Assemble the one RuntimeContext finish facade from resolved source facts.
+
+    ContractRuntime selects the current line outside this pure projection.  Full,
+    compact, and Onboard reads all reuse this bundle and therefore cannot mint
+    competing attestation or finish-gate bodies.
+    """
+
+    finish_hint_source_backed_blocked = bool(
+        finish_hint_source_backed_resolution.get("fail_closed")
+    )
+    finish_gate_path = (
+        "/api/graph-governance/{project_id}/runtime-contexts/"
+        "{runtime_context_id}/finish-gate"
+    )
+    finish_attestation_path = (
+        "/api/graph-governance/{project_id}/runtime-contexts/"
+        "{runtime_context_id}/finish-time-worker-attestation"
+    )
+    finish_attestation_concrete_path = (
+        f"/api/graph-governance/{project_id}/runtime-contexts/"
+        f"{runtime_context_id}/finish-time-worker-attestation"
+    )
+    session_token_env = "AMING_WORKER_SESSION_TOKEN"
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    session_token_placeholder = (
+        f"<read from env:{session_token_env} at submission time>"
+    )
+    fence_token_placeholder = (
+        f"<read from env:{fence_token_env} at submission time>"
+    )
+    hinted_test_results = (
+        dict(finish_attestation_hint.get("test_results"))
+        if isinstance(finish_attestation_hint.get("test_results"), Mapping)
+        else {}
+    )
+    test_worker_scope = bool(worker_scope_files) and all(
+        str(path or "").startswith(("agent/tests/", "tests/"))
+        for path in worker_scope_files
+    )
+    if finish_hint_source_backed_blocked:
+        hinted_test_results = {}
+    elif test_worker_scope:
+        hinted_test_results = (
+            _runtime_context_finish_attestation_project_test_results(
+                hinted_test_results
+            )
+        )
+    elif _runtime_context_finish_attestation_no_pass_results_accepted(
+        hinted_test_results
+    ):
+        hinted_test_results = (
+            _runtime_context_finish_attestation_test_results_payload(
+                hinted_test_results
+            )
+        )
+    hinted_graph_trace_ids = [
+        str(item)
+        for item in (
+            finish_attestation_hint.get("graph_trace_ids")
+            or graph_trace_refs.get("verified_trace_ids")
+            or graph_trace_refs.get("trace_ids")
+            or []
+        )
+        if str(item or "").strip()
+    ]
+    hinted_changed_files = [
+        str(item)
+        for item in finish_attestation_hint.get("changed_files") or []
+        if str(item or "").strip()
+    ]
+    attestation_changed_files = hinted_changed_files or list(worker_scope_files)
+    attestation_owned_files = list(worker_scope_files) or attestation_changed_files
+    hinted_worker_session_id = str(
+        finish_attestation_hint.get("worker_session_id") or ""
+    ).strip()
+    hinted_filer_principal = str(
+        finish_attestation_hint.get("filer_principal")
+        or hinted_worker_session_id
+        or ""
+    ).strip()
+    hinted_worker_transcript_ref = str(
+        finish_attestation_hint.get("worker_transcript_ref")
+        or finish_attestation_hint.get("transcript_ref")
+        or ""
+    ).strip()
+    hinted_worker_transcript_path = str(
+        finish_attestation_hint.get("worker_transcript_path")
+        or finish_attestation_hint.get("transcript_path")
+        or ""
+    ).strip()
+    finish_time_attestation_event_ref = str(
+        finish_attestation_hint.get("finish_time_attestation_event_ref") or ""
+    ).strip()
+    finish_time_transcript_can_be_inferred = bool(
+        finish_time_attestation_event_ref
+        or finish_attestation_hint.get("implementation_event_ref")
+        or timeline_refs.get("latest_implementation_event_ref")
+    )
+    finish_time_worker_transcript_identity = (
+        hinted_worker_transcript_ref or hinted_worker_transcript_path
+        if finish_time_transcript_can_be_inferred
+        else ""
+    )
+    finish_attestation_transcript_readiness = {
+        "schema_version": (
+            "runtime_context.finish_time_transcript_readiness.v1"
+        ),
+        "status": (
+            "ready"
+            if finish_time_worker_transcript_identity
+            else "worker_must_supply_before_finish_time_attestation"
+        ),
+        "required_before": [
+            "implementation_and_tests",
+            "finish_time_worker_attestation",
+        ],
+        "required_fields": [
+            "worker_session_id",
+            "filer_principal",
+            "worker_transcript_ref or worker_transcript_path",
+            "harness_type",
+        ],
+        "copy_safe_sources": [
+            "runtime_context_worker_guide.worker_guide.write_guides.startup",
+            (
+                "runtime_context_worker_guide.actionable_payloads."
+                "startup_facade_payload_skeleton.copy_safe_body"
+            ),
+            (
+                "runtime_context_worker_guide.actionable_payloads."
+                "finish_time_worker_attestation_submission.copy_safe_body"
+            ),
+        ],
+        "if_unavailable": (
+            "stop before implementation edits and ask the observer to re-dispatch "
+            "or provide a worker host envelope that includes a verifiable "
+            "transcript ref/path"
+        ),
+        "happy_path_ref_only_supported": True,
+        "raw_transcript_required": False,
+    }
+    hinted_read_receipt_event_id = str(
+        finish_attestation_hint.get("read_receipt_event_id")
+        or _runtime_context_timeline_event_id(
+            finish_attestation_hint.get("read_receipt_event_ref") or ""
+        )
+        or ""
+    ).strip()
+    hinted_read_receipt_hash = str(
+        finish_attestation_hint.get("read_receipt_hash")
+        or timeline_refs.get("read_receipt_hash")
+        or ""
+    ).strip()
+    hinted_observer_command_id = str(
+        canonical_observer_command_id
+        or finish_attestation_hint.get("observer_command_id")
+        or timeline_refs.get("observer_command_id")
+        or ""
+    ).strip()
+    finish_contract_execution_id = str(
+        finish_contract_execution_id or parent_task_id or ""
+    ).strip()
+    finish_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str(route_identity.get(field) or "").strip()
+    }
+    finish_attestation_body = {
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "contract_execution_id": finish_contract_execution_id,
+        "worker_role": "mf_sub",
+        "target_project_root": target_project_root,
+        "session_token": session_token_placeholder,
+        "session_token_ref": session_token_ref_placeholder,
+        "fence_token": fence_token_placeholder,
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "worker_session_id": (
+            hinted_worker_session_id or "<actual worker-owned session id>"
+        ),
+        "filer_principal": (
+            hinted_filer_principal or "<same value as worker_session_id>"
+        ),
+        "worker_transcript_ref": (
+            hinted_worker_transcript_ref
+            or "<host transcript ref, e.g. codex:<session-id>>"
+        ),
+        "harness_type": str(finish_attestation_hint.get("harness_type") or "codex"),
+        "finish_time_transcript_readiness": (
+            finish_attestation_transcript_readiness
+        ),
+        "graph_trace_ids": hinted_graph_trace_ids
+        or ["<worker-owned-graph-query-trace-id>"],
+        "read_receipt_event_id": (
+            hinted_read_receipt_event_id or "<accepted-read-receipt-event-id>"
+        ),
+        "read_receipt_hash": (
+            hinted_read_receipt_hash or "<accepted-read-receipt-hash>"
+        ),
+        "observer_command_id": (
+            hinted_observer_command_id
+            or "<claimed execute_backlog_row command id>"
+        ),
+        **canonical_dispatch_projection_fields,
+        "head_commit": str(
+            finish_attestation_hint.get("head_commit")
+            or finish_submission_head_commit
+            or "<row-scoped-worker-implementation-head-commit>"
+        ),
+        "current_branch_head_commit": current_branch_head_commit,
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
+        "changed_files": attestation_changed_files or ["<owned-file>"],
+        "owned_files": attestation_owned_files or ["<owned-file>"],
+        "target_files": list(worker_scope_files),
+        "scope": {
+            "owned_files": list(worker_scope_files),
+            "target_files": list(worker_scope_files),
+        },
+        "actual_cwd": str(
+            finish_attestation_hint.get("actual_cwd") or target_project_root
+        ),
+        "actual_git_root": str(
+            finish_attestation_hint.get("actual_git_root") or target_project_root
+        ),
+        "test_results": (
+            hinted_test_results
+            or (
+                {}
+                if finish_hint_source_backed_blocked
+                else {
+                    "status": "<worker-provided passed status>",
+                    "passed": "<true only after worker-owned tests pass>",
+                    "commands": ["<worker-owned test command evidence>"],
+                }
+            )
+        ),
+        **finish_route_identity,
+    }
+    if hinted_worker_transcript_path:
+        finish_attestation_body["worker_transcript_path"] = hinted_worker_transcript_path
+    finish_attestation_missing = [
+        field
+        for field, value in {
+            "observer_command_id": hinted_observer_command_id,
+            "test_results": hinted_test_results,
+            "graph_trace_ids": hinted_graph_trace_ids,
+            "read_receipt_event_id": hinted_read_receipt_event_id,
+            "read_receipt_hash": hinted_read_receipt_hash,
+            "worker_session_id": hinted_worker_session_id,
+            "filer_principal": hinted_filer_principal,
+            "worker_transcript_ref_or_path": finish_time_worker_transcript_identity,
+        }.items()
+        if not value
+    ]
+    if _runtime_context_non_placeholder_text(
+        finish_attestation_body.get("worker_transcript_ref")
+    ) or _runtime_context_non_placeholder_text(
+        finish_attestation_body.get("worker_transcript_path")
+    ):
+        finish_attestation_missing = [
+            field
+            for field in finish_attestation_missing
+            if field != "worker_transcript_ref_or_path"
+        ]
+    finish_attestation_actionable_body = (
+        {} if finish_hint_source_backed_blocked else finish_attestation_body
+    )
+    finish_attestation_submission = {
+        "schema_version": (
+            "runtime_context.finish_time_worker_attestation_submission.v1"
+        ),
+        "action": "record_finish_time_worker_attestation",
+        "name": "record_finish_time_worker_attestation",
+        "next_legal_action": "record_finish_time_worker_attestation",
+        "method": "POST",
+        "endpoint": "runtime_context.finish_time_worker_attestation",
+        "path": finish_attestation_path,
+        "concrete_path": finish_attestation_concrete_path,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "contract_execution_id": finish_contract_execution_id,
+        "target_project_root": target_project_root,
+        "status": (
+            finish_hint_source_backed_resolution.get("status")
+            if finish_hint_source_backed_blocked
+            else "ready"
+        ),
+        "actionable": not finish_hint_source_backed_blocked,
+        "source_backed_implementation_resolution": dict(
+            finish_hint_source_backed_resolution
+        ),
+        "body": finish_attestation_actionable_body,
+        "copy_safe_body": dict(finish_attestation_actionable_body),
+        "body_source": "copy_safe_body",
+        "copy_rule": (
+            (
+                "Stop: source-backed implementation evidence is invalid or conflicts "
+                "with its timeline alias; no finish body is actionable."
+            )
+            if finish_hint_source_backed_blocked
+            else (
+                "POST exactly copy_safe_body to "
+                "runtime_context.finish_time_worker_attestation; do not hand-build "
+                "this body or omit literal fields."
+            )
+        ),
+        "required_literal_fields": {
+            "harness_type": "codex",
+        },
+        "missing_required_fields": finish_attestation_missing,
+        "source_refs": {
+            "implementation_event_ref": str(
+                finish_attestation_hint.get("implementation_event_ref") or ""
+            ),
+            "startup_event_ref": str(
+                finish_attestation_hint.get("startup_event_ref") or ""
+            ),
+            "read_receipt_event_ref": str(
+                finish_attestation_hint.get("read_receipt_event_ref") or ""
+            ),
+            "graph_trace_ids": hinted_graph_trace_ids,
+        },
+        "reminders": {
+            "sequence": (
+                "Refresh current-state/worker-guide, then POST this body only "
+                "from the mf_sub worker session."
+            ),
+            "required_top_level_fields": [
+                "observer_command_id",
+                "read_receipt_hash",
+                "read_receipt_event_id",
+                "worker_session_id",
+                "filer_principal",
+                "worker_transcript_ref or worker_transcript_path",
+                "harness_type",
+                "graph_trace_ids",
+                "test_results",
+            ],
+            "field_shape": (
+                "Keep these lineage fields at the POST body top level. Nested "
+                "self_attestation/artifact_refs copies are tolerated only as a "
+                "recovery source, not the preferred happy-path shape."
+            ),
+            "harness_type_literal": (
+                "Codex workers must keep top-level harness_type='codex' exactly "
+                "as supplied in copy_safe_body."
+            ),
+            "do_not_hand_build_body": (
+                "Copy finish_time_worker_attestation_submission.copy_safe_body "
+                "and fill only worker-owned evidence placeholders."
+            ),
+            "head_scope": (
+                "Use row_scoped_finish_head_projection.submission_head_commit "
+                "for this row. current_branch_head_commit is informational when "
+                "successor repairs continue on the same branch."
+            ),
+            **(
+                {
+                    "contract_worker_commit_order": (
+                        "Create the implementation commit, record its exact clean HEAD "
+                        "through runtime_context.worker_commit, then submit finish-time "
+                        "worker attestation."
+                    )
+                }
+                if contract_worker_commit_required
+                else {
+                    "precommit_finish_order": (
+                        "Leave worker changes uncommitted until finish-time worker "
+                        "attestation and finish gate pass; only then create the worker "
+                        "git commit."
+                    )
+                }
+            ),
+            "transcript_identity_before_edit": (
+                "Before implementation edits, ensure startup evidence already "
+                "contains worker_session_id, filer_principal, harness_type, and "
+                "worker_transcript_ref or worker_transcript_path. If not, stop "
+                "before editing instead of discovering the gap at finish-time."
+            ),
+            "transcript_readiness": finish_attestation_transcript_readiness,
+            "observer_must_not_author": True,
+            "raw_tokens_exposed": False,
+            "test_results_source": (
+                "worker implementation/startup timeline evidence when present"
+            ),
+        },
+        "privacy_boundary": {
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+        },
+    }
+    finish_gate_submission_template = {
+        "schema_version": "runtime_context.finish_gate_submission.template.v1",
+        "action": "record_finish_gate",
+        "name": "record_finish_gate",
+        "next_legal_action": "record_finish_gate",
+        "method": "POST",
+        "endpoint": "runtime_context.finish_gate",
+        "path": finish_gate_path,
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "fence_token": "<same fence_token from the worker launch envelope>",
+        "session_token": "<current runtime_context_session_token>",
+        "session_token_ref": session_token_ref_placeholder,
+        "target_project_root": target_project_root,
+        "checkpoint_id": "<finish-gate-checkpoint-id>",
+        "head_commit": (
+            finish_submission_head_commit
+            or "<row-scoped-worker-implementation-head-commit>"
+        ),
+        "current_branch_head_commit": current_branch_head_commit,
+        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
+        "changed_files": list(worker_scope_files) or ["<owned-file>"],
+        "owned_files": list(worker_scope_files) or ["<owned-file>"],
+        "status": "review_ready",
+        "test_results": {"status": "passed", "passed": True},
+        "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
+        "read_receipt_event_id": "<accepted-read-receipt-event-id>",
+        "read_receipt_hash": "<accepted-read-receipt-hash>",
+        "observer_command_id": (
+            hinted_observer_command_id
+            or "<same observer_command_id used for finish-time attestation>"
+        ),
+        **canonical_dispatch_projection_fields,
+        **finish_route_identity,
+        "finish_time_worker_self_attestation": (
+            "<finish_time_worker_self_attestation returned by "
+            "finish-time-worker-attestation>"
+        ),
+        "body": {
+            "project_id": project_id,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "contract_execution_id": finish_contract_execution_id,
+            "fence_token": "<same fence_token from the worker launch envelope>",
+            "session_token": "<current runtime_context_session_token>",
+            "session_token_ref": session_token_ref_placeholder,
+            "target_project_root": target_project_root,
+            "checkpoint_id": "<finish-gate-checkpoint-id>",
+            "head_commit": (
+                finish_submission_head_commit
+                or "<row-scoped-worker-implementation-head-commit>"
+            ),
+            "current_branch_head_commit": current_branch_head_commit,
+            "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
+            "changed_files": list(worker_scope_files) or ["<owned-file>"],
+            "owned_files": list(worker_scope_files) or ["<owned-file>"],
+            "status": "review_ready",
+            "test_results": {"status": "passed", "passed": True},
+            "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
+            "read_receipt_event_id": "<accepted-read-receipt-event-id>",
+            "read_receipt_hash": "<accepted-read-receipt-hash>",
+            "observer_command_id": (
+                hinted_observer_command_id
+                or "<same observer_command_id used for finish-time attestation>"
+            ),
+            **canonical_dispatch_projection_fields,
+            **finish_route_identity,
+            "finish_time_worker_self_attestation": (
+                "<finish_time_worker_self_attestation returned by "
+                "finish-time-worker-attestation>"
+            ),
+        },
+        "reminders": {
+            "sequence": (
+                "After finish-time-worker-attestation succeeds, refresh "
+                "current-state/worker-guide and POST this finish-gate facade."
+            ),
+            "required_top_level_fields": [
+                "observer_command_id",
+                "read_receipt_hash",
+                "read_receipt_event_id",
+                "finish_time_worker_self_attestation",
+            ],
+            "head_scope": (
+                "Do not replace head_commit with current_branch_head_commit when "
+                "row_scoped_finish_head_projection.status is "
+                "branch_head_scope_mismatch."
+            ),
+            **(
+                {
+                    "contract_worker_commit_order": (
+                        "This finish gate consumes the exact ContractRuntime worker_commit. "
+                        "If HEAD or the worktree drifted afterward, stop and report it."
+                    )
+                }
+                if contract_worker_commit_required
+                else {
+                    "precommit_finish_order": (
+                        "This finish gate must pass before the worker creates its git "
+                        "commit. If the runtime blocks, stop and report the blocker."
+                    )
+                }
+            ),
+            "canonical_finish_gate_required": True,
+            "raw_finish_time_attestation_alone_close_satisfying": False,
+        },
+    }
+    finish_gate_submission_template["copy_safe_body"] = dict(
+        finish_gate_submission_template["body"]
+    )
+    finish_gate_submission_template["post_body"] = dict(
+        finish_gate_submission_template["copy_safe_body"]
+    )
+    finish_gate_submission_template["body_source"] = "copy_safe_body"
+    finish_gate_submission_template["copy_rule"] = (
+        "POST exactly copy_safe_body/body to runtime_context.finish_gate; "
+        "do not post the wrapper object itself."
+    )
+    return {
+        "transcript_readiness": finish_attestation_transcript_readiness,
+        "missing_required_fields": list(finish_attestation_missing),
+        "finish_time_worker_attestation_submission": (
+            finish_attestation_submission
+        ),
+        "finish_gate_submission_template": finish_gate_submission_template,
+    }
+
 
 
 def _runtime_context_worker_guide_response(
@@ -35489,261 +36061,52 @@ def _runtime_context_worker_guide_response(
             },
         },
     }
-    finish_gate_path = (
-        "/api/graph-governance/{project_id}/runtime-contexts/"
-        "{runtime_context_id}/finish-gate"
-    )
-    finish_attestation_path = (
-        "/api/graph-governance/{project_id}/runtime-contexts/"
-        "{runtime_context_id}/finish-time-worker-attestation"
-    )
-    finish_attestation_concrete_path = (
-        f"/api/graph-governance/{project_id}/runtime-contexts/"
-        f"{runtime_context_id}/finish-time-worker-attestation"
-    )
-    session_token_env = "AMING_WORKER_SESSION_TOKEN"
-    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
-    session_token_placeholder = (
-        f"<read from env:{session_token_env} at submission time>"
-    )
-    fence_token_placeholder = (
-        f"<read from env:{fence_token_env} at submission time>"
-    )
-    hinted_test_results = (
-        dict(finish_attestation_hint.get("test_results"))
-        if isinstance(finish_attestation_hint.get("test_results"), Mapping)
-        else {}
-    )
-    test_worker_scope = bool(worker_scope_files) and all(
-        str(path or "").startswith(("agent/tests/", "tests/"))
-        for path in worker_scope_files
-    )
-    if finish_hint_source_backed_blocked:
-        hinted_test_results = {}
-    elif test_worker_scope:
-        hinted_test_results = (
-            _runtime_context_finish_attestation_project_test_results(
-                hinted_test_results
-            )
-        )
-    elif _runtime_context_finish_attestation_no_pass_results_accepted(
-        hinted_test_results
-    ):
-        hinted_test_results = (
-            _runtime_context_finish_attestation_test_results_payload(
-                hinted_test_results
-            )
-        )
-    hinted_graph_trace_ids = [
-        str(item)
-        for item in (
-            finish_attestation_hint.get("graph_trace_ids")
-            or graph_trace_refs.get("verified_trace_ids")
-            or graph_trace_refs.get("trace_ids")
-            or []
-        )
-        if str(item or "").strip()
-    ]
-    hinted_changed_files = [
-        str(item)
-        for item in finish_attestation_hint.get("changed_files") or []
-        if str(item or "").strip()
-    ]
-    attestation_changed_files = hinted_changed_files or list(worker_scope_files)
-    attestation_owned_files = list(worker_scope_files) or attestation_changed_files
-    hinted_worker_session_id = str(
-        finish_attestation_hint.get("worker_session_id") or ""
-    ).strip()
-    hinted_filer_principal = str(
-        finish_attestation_hint.get("filer_principal")
-        or hinted_worker_session_id
-        or ""
-    ).strip()
-    hinted_worker_transcript_ref = str(
-        finish_attestation_hint.get("worker_transcript_ref")
-        or finish_attestation_hint.get("transcript_ref")
-        or ""
-    ).strip()
-    hinted_worker_transcript_path = str(
-        finish_attestation_hint.get("worker_transcript_path")
-        or finish_attestation_hint.get("transcript_path")
-        or ""
-    ).strip()
-    finish_time_attestation_event_ref = str(
-        finish_attestation_hint.get("finish_time_attestation_event_ref") or ""
-    ).strip()
-    finish_time_transcript_can_be_inferred = bool(
-        finish_time_attestation_event_ref
-        or finish_attestation_hint.get("implementation_event_ref")
-        or timeline_refs.get("latest_implementation_event_ref")
-    )
-    finish_time_worker_transcript_identity = (
-        hinted_worker_transcript_ref or hinted_worker_transcript_path
-        if finish_time_transcript_can_be_inferred
-        else ""
-    )
-    finish_attestation_transcript_readiness = {
-        "schema_version": (
-            "runtime_context.finish_time_transcript_readiness.v1"
-        ),
-        "status": (
-            "ready"
-            if finish_time_worker_transcript_identity
-            else "worker_must_supply_before_finish_time_attestation"
-        ),
-        "required_before": [
-            "implementation_and_tests",
-            "finish_time_worker_attestation",
-        ],
-        "required_fields": [
-            "worker_session_id",
-            "filer_principal",
-            "worker_transcript_ref or worker_transcript_path",
-            "harness_type",
-        ],
-        "copy_safe_sources": [
-            "runtime_context_worker_guide.worker_guide.write_guides.startup",
-            (
-                "runtime_context_worker_guide.actionable_payloads."
-                "startup_facade_payload_skeleton.copy_safe_body"
-            ),
-            (
-                "runtime_context_worker_guide.actionable_payloads."
-                "finish_time_worker_attestation_submission.copy_safe_body"
-            ),
-        ],
-        "if_unavailable": (
-            "stop before implementation edits and ask the observer to re-dispatch "
-            "or provide a worker host envelope that includes a verifiable "
-            "transcript ref/path"
-        ),
-        "happy_path_ref_only_supported": True,
-        "raw_transcript_required": False,
-    }
-    hinted_read_receipt_event_id = str(
-        finish_attestation_hint.get("read_receipt_event_id")
-        or _runtime_context_timeline_event_id(
-            finish_attestation_hint.get("read_receipt_event_ref") or ""
-        )
-        or ""
-    ).strip()
-    hinted_read_receipt_hash = str(
-        finish_attestation_hint.get("read_receipt_hash")
-        or timeline_refs.get("read_receipt_hash")
-        or ""
-    ).strip()
-    hinted_observer_command_id = str(
-        canonical_observer_command_id
-        or finish_attestation_hint.get("observer_command_id")
-        or timeline_refs.get("observer_command_id")
-        or ""
-    ).strip()
     finish_contract_execution_id = str(
         contract_runtime_execution_resolution.get("contract_execution_id")
         or contract_runtime_current_state.get("contract_execution_id")
         or parent_task_id
         or ""
     ).strip()
-    finish_route_identity = {
-        field: str(route_identity.get(field) or "").strip()
-        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
-        if str(route_identity.get(field) or "").strip()
-    }
-    finish_attestation_body = {
-        "project_id": project_id,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "contract_execution_id": finish_contract_execution_id,
-        "worker_role": "mf_sub",
-        "target_project_root": target_project_root,
-        "session_token": session_token_placeholder,
-        "session_token_ref": session_token_ref_placeholder,
-        "fence_token": fence_token_placeholder,
-        "session_token_env": session_token_env,
-        "fence_token_env": fence_token_env,
-        "worker_session_id": (
-            hinted_worker_session_id or "<actual worker-owned session id>"
+    finish_bundle = _runtime_context_finish_submission_bundle(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        target_project_root=target_project_root,
+        session_token_ref_placeholder=session_token_ref_placeholder,
+        route_identity=route_identity,
+        finish_attestation_hint=finish_attestation_hint,
+        timeline_refs=timeline_refs,
+        graph_trace_refs=graph_trace_refs,
+        worker_scope_files=worker_scope_files,
+        finish_hint_source_backed_resolution=(
+            finish_hint_source_backed_resolution
         ),
-        "filer_principal": (
-            hinted_filer_principal or "<same value as worker_session_id>"
+        finish_contract_execution_id=finish_contract_execution_id,
+        canonical_observer_command_id=canonical_observer_command_id,
+        canonical_dispatch_projection_fields=(
+            canonical_dispatch_projection_fields
         ),
-        "worker_transcript_ref": (
-            hinted_worker_transcript_ref
-            or "<host transcript ref, e.g. codex:<session-id>>"
-        ),
-        "harness_type": str(finish_attestation_hint.get("harness_type") or "codex"),
-        "finish_time_transcript_readiness": (
-            finish_attestation_transcript_readiness
-        ),
-        "graph_trace_ids": hinted_graph_trace_ids
-        or ["<worker-owned-graph-query-trace-id>"],
-        "read_receipt_event_id": (
-            hinted_read_receipt_event_id or "<accepted-read-receipt-event-id>"
-        ),
-        "read_receipt_hash": (
-            hinted_read_receipt_hash or "<accepted-read-receipt-hash>"
-        ),
-        "observer_command_id": (
-            hinted_observer_command_id
-            or "<claimed execute_backlog_row command id>"
-        ),
-        **canonical_dispatch_projection_fields,
-        "head_commit": str(
-            finish_attestation_hint.get("head_commit")
-            or finish_submission_head_commit
-            or "<row-scoped-worker-implementation-head-commit>"
-        ),
-        "current_branch_head_commit": current_branch_head_commit,
-        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
-        "changed_files": attestation_changed_files or ["<owned-file>"],
-        "owned_files": attestation_owned_files or ["<owned-file>"],
-        "actual_cwd": str(
-            finish_attestation_hint.get("actual_cwd") or target_project_root
-        ),
-        "actual_git_root": str(
-            finish_attestation_hint.get("actual_git_root") or target_project_root
-        ),
-        "test_results": (
-            hinted_test_results
-            or (
-                {}
-                if finish_hint_source_backed_blocked
-                else {
-                    "status": "<worker-provided passed status>",
-                    "passed": "<true only after worker-owned tests pass>",
-                    "commands": ["<worker-owned test command evidence>"],
-                }
-            )
-        ),
-        **finish_route_identity,
-    }
-    if hinted_worker_transcript_path:
-        finish_attestation_body["worker_transcript_path"] = hinted_worker_transcript_path
-    finish_attestation_missing = [
-        field
-        for field, value in {
-            "observer_command_id": hinted_observer_command_id,
-            "test_results": hinted_test_results,
-            "graph_trace_ids": hinted_graph_trace_ids,
-            "read_receipt_event_id": hinted_read_receipt_event_id,
-            "read_receipt_hash": hinted_read_receipt_hash,
-            "worker_session_id": hinted_worker_session_id,
-            "filer_principal": hinted_filer_principal,
-            "worker_transcript_ref_or_path": finish_time_worker_transcript_identity,
-        }.items()
-        if not value
-    ]
-    if _runtime_context_non_placeholder_text(
-        finish_attestation_body.get("worker_transcript_ref")
-    ) or _runtime_context_non_placeholder_text(
-        finish_attestation_body.get("worker_transcript_path")
-    ):
-        finish_attestation_missing = [
-            field
-            for field in finish_attestation_missing
-            if field != "worker_transcript_ref_or_path"
-        ]
+        finish_submission_head_commit=finish_submission_head_commit,
+        current_branch_head_commit=current_branch_head_commit,
+        row_scoped_finish_head_projection=row_scoped_finish_head_projection,
+        contract_worker_commit_required=contract_worker_commit_required,
+    )
+    finish_attestation_submission = dict(
+        finish_bundle["finish_time_worker_attestation_submission"]
+    )
+    finish_gate_submission_template = dict(
+        finish_bundle["finish_gate_submission_template"]
+    )
+    finish_gate_path = str(
+        finish_gate_submission_template.get("path") or ""
+    )
+    finish_attestation_missing = list(
+        finish_bundle["missing_required_fields"]
+    )
+    finish_attestation_transcript_readiness = dict(
+        finish_bundle["transcript_readiness"]
+    )
     qa_verification_guide = _runtime_context_qa_verification_guide(
         project_id=project_id,
         runtime_context_id=runtime_context_id,
@@ -35756,256 +36119,6 @@ def _runtime_context_worker_guide_response(
         target_files=worker_scope_files,
         route_identity=route_identity,
         contract_runtime_state=contract_runtime_current_state,
-    )
-    finish_attestation_actionable_body = (
-        {} if finish_hint_source_backed_blocked else finish_attestation_body
-    )
-    finish_attestation_submission = {
-        "schema_version": (
-            "runtime_context.finish_time_worker_attestation_submission.v1"
-        ),
-        "action": "record_finish_time_worker_attestation",
-        "name": "record_finish_time_worker_attestation",
-        "next_legal_action": "record_finish_time_worker_attestation",
-        "method": "POST",
-        "endpoint": "runtime_context.finish_time_worker_attestation",
-        "path": finish_attestation_path,
-        "concrete_path": finish_attestation_concrete_path,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "contract_execution_id": finish_contract_execution_id,
-        "target_project_root": target_project_root,
-        "status": (
-            finish_hint_source_backed_resolution.get("status")
-            if finish_hint_source_backed_blocked
-            else "ready"
-        ),
-        "actionable": not finish_hint_source_backed_blocked,
-        "source_backed_implementation_resolution": dict(
-            finish_hint_source_backed_resolution
-        ),
-        "body": finish_attestation_actionable_body,
-        "copy_safe_body": dict(finish_attestation_actionable_body),
-        "body_source": "copy_safe_body",
-        "copy_rule": (
-            (
-                "Stop: source-backed implementation evidence is invalid or conflicts "
-                "with its timeline alias; no finish body is actionable."
-            )
-            if finish_hint_source_backed_blocked
-            else (
-                "POST exactly copy_safe_body to "
-                "runtime_context.finish_time_worker_attestation; do not hand-build "
-                "this body or omit literal fields."
-            )
-        ),
-        "required_literal_fields": {
-            "harness_type": "codex",
-        },
-        "missing_required_fields": finish_attestation_missing,
-        "source_refs": {
-            "implementation_event_ref": str(
-                finish_attestation_hint.get("implementation_event_ref") or ""
-            ),
-            "startup_event_ref": str(
-                finish_attestation_hint.get("startup_event_ref") or ""
-            ),
-            "read_receipt_event_ref": str(
-                finish_attestation_hint.get("read_receipt_event_ref") or ""
-            ),
-            "graph_trace_ids": hinted_graph_trace_ids,
-        },
-        "reminders": {
-            "sequence": (
-                "Refresh current-state/worker-guide, then POST this body only "
-                "from the mf_sub worker session."
-            ),
-            "required_top_level_fields": [
-                "observer_command_id",
-                "read_receipt_hash",
-                "read_receipt_event_id",
-                "worker_session_id",
-                "filer_principal",
-                "worker_transcript_ref or worker_transcript_path",
-                "harness_type",
-                "graph_trace_ids",
-                "test_results",
-            ],
-            "field_shape": (
-                "Keep these lineage fields at the POST body top level. Nested "
-                "self_attestation/artifact_refs copies are tolerated only as a "
-                "recovery source, not the preferred happy-path shape."
-            ),
-            "harness_type_literal": (
-                "Codex workers must keep top-level harness_type='codex' exactly "
-                "as supplied in copy_safe_body."
-            ),
-            "do_not_hand_build_body": (
-                "Copy finish_time_worker_attestation_submission.copy_safe_body "
-                "and fill only worker-owned evidence placeholders."
-            ),
-            "head_scope": (
-                "Use row_scoped_finish_head_projection.submission_head_commit "
-                "for this row. current_branch_head_commit is informational when "
-                "successor repairs continue on the same branch."
-            ),
-            **(
-                {
-                    "contract_worker_commit_order": (
-                        "Create the implementation commit, record its exact clean HEAD "
-                        "through runtime_context.worker_commit, then submit finish-time "
-                        "worker attestation."
-                    )
-                }
-                if contract_worker_commit_required
-                else {
-                    "precommit_finish_order": (
-                        "Leave worker changes uncommitted until finish-time worker "
-                        "attestation and finish gate pass; only then create the worker "
-                        "git commit."
-                    )
-                }
-            ),
-            "transcript_identity_before_edit": (
-                "Before implementation edits, ensure startup evidence already "
-                "contains worker_session_id, filer_principal, harness_type, and "
-                "worker_transcript_ref or worker_transcript_path. If not, stop "
-                "before editing instead of discovering the gap at finish-time."
-            ),
-            "transcript_readiness": finish_attestation_transcript_readiness,
-            "observer_must_not_author": True,
-            "raw_tokens_exposed": False,
-            "test_results_source": (
-                "worker implementation/startup timeline evidence when present"
-            ),
-        },
-        "privacy_boundary": {
-            "raw_session_token_exposed": False,
-            "raw_fence_token_exposed": False,
-            "raw_route_token_exposed": False,
-        },
-    }
-    finish_gate_submission_template = {
-        "schema_version": "runtime_context.finish_gate_submission.template.v1",
-        "action": "record_finish_gate",
-        "name": "record_finish_gate",
-        "next_legal_action": "record_finish_gate",
-        "method": "POST",
-        "endpoint": "runtime_context.finish_gate",
-        "path": finish_gate_path,
-        "project_id": project_id,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "fence_token": "<same fence_token from the worker launch envelope>",
-        "session_token": "<current runtime_context_session_token>",
-        "session_token_ref": session_token_ref_placeholder,
-        "target_project_root": target_project_root,
-        "checkpoint_id": "<finish-gate-checkpoint-id>",
-        "head_commit": (
-            finish_submission_head_commit
-            or "<row-scoped-worker-implementation-head-commit>"
-        ),
-        "current_branch_head_commit": current_branch_head_commit,
-        "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
-        "changed_files": list(worker_scope_files) or ["<owned-file>"],
-        "owned_files": list(worker_scope_files) or ["<owned-file>"],
-        "status": "review_ready",
-        "test_results": {"status": "passed", "passed": True},
-        "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
-        "read_receipt_event_id": "<accepted-read-receipt-event-id>",
-        "read_receipt_hash": "<accepted-read-receipt-hash>",
-        "observer_command_id": (
-            hinted_observer_command_id
-            or "<same observer_command_id used for finish-time attestation>"
-        ),
-        **canonical_dispatch_projection_fields,
-        **finish_route_identity,
-        "finish_time_worker_self_attestation": (
-            "<finish_time_worker_self_attestation returned by "
-            "finish-time-worker-attestation>"
-        ),
-        "body": {
-            "project_id": project_id,
-            "runtime_context_id": runtime_context_id,
-            "task_id": task_id,
-            "parent_task_id": parent_task_id,
-            "contract_execution_id": finish_contract_execution_id,
-            "fence_token": "<same fence_token from the worker launch envelope>",
-            "session_token": "<current runtime_context_session_token>",
-            "session_token_ref": session_token_ref_placeholder,
-            "target_project_root": target_project_root,
-            "checkpoint_id": "<finish-gate-checkpoint-id>",
-            "head_commit": (
-                finish_submission_head_commit
-                or "<row-scoped-worker-implementation-head-commit>"
-            ),
-            "current_branch_head_commit": current_branch_head_commit,
-            "row_scoped_finish_head_projection": row_scoped_finish_head_projection,
-            "changed_files": list(worker_scope_files) or ["<owned-file>"],
-            "owned_files": list(worker_scope_files) or ["<owned-file>"],
-            "status": "review_ready",
-            "test_results": {"status": "passed", "passed": True},
-            "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
-            "read_receipt_event_id": "<accepted-read-receipt-event-id>",
-            "read_receipt_hash": "<accepted-read-receipt-hash>",
-            "observer_command_id": (
-                hinted_observer_command_id
-                or "<same observer_command_id used for finish-time attestation>"
-            ),
-            **canonical_dispatch_projection_fields,
-            **finish_route_identity,
-            "finish_time_worker_self_attestation": (
-                "<finish_time_worker_self_attestation returned by "
-                "finish-time-worker-attestation>"
-            ),
-        },
-        "reminders": {
-            "sequence": (
-                "After finish-time-worker-attestation succeeds, refresh "
-                "current-state/worker-guide and POST this finish-gate facade."
-            ),
-            "required_top_level_fields": [
-                "observer_command_id",
-                "read_receipt_hash",
-                "read_receipt_event_id",
-                "finish_time_worker_self_attestation",
-            ],
-            "head_scope": (
-                "Do not replace head_commit with current_branch_head_commit when "
-                "row_scoped_finish_head_projection.status is "
-                "branch_head_scope_mismatch."
-            ),
-            **(
-                {
-                    "contract_worker_commit_order": (
-                        "This finish gate consumes the exact ContractRuntime worker_commit. "
-                        "If HEAD or the worktree drifted afterward, stop and report it."
-                    )
-                }
-                if contract_worker_commit_required
-                else {
-                    "precommit_finish_order": (
-                        "This finish gate must pass before the worker creates its git "
-                        "commit. If the runtime blocks, stop and report the blocker."
-                    )
-                }
-            ),
-            "canonical_finish_gate_required": True,
-            "raw_finish_time_attestation_alone_close_satisfying": False,
-        },
-    }
-    finish_gate_submission_template["copy_safe_body"] = dict(
-        finish_gate_submission_template["body"]
-    )
-    finish_gate_submission_template["post_body"] = dict(
-        finish_gate_submission_template["copy_safe_body"]
-    )
-    finish_gate_submission_template["body_source"] = "copy_safe_body"
-    finish_gate_submission_template["copy_rule"] = (
-        "POST exactly copy_safe_body/body to runtime_context.finish_gate; "
-        "do not post the wrapper object itself."
     )
     write_guides = {
         "read_receipt": {
@@ -41763,6 +41876,485 @@ def _runtime_context_anonymous_token_free_fallback(
         and str(session.get("principal_id") or "") == "anonymous"
         and str(session.get("role") or "").strip().lower() == "coordinator"
     )
+
+
+def _runtime_context_bounded_finish_facade_payload(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    contract_next_action: Mapping[str, Any],
+    context: Any,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    target_project_root: str,
+    session_token_ref: str,
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the current finish facade from bounded durable authorities only.
+
+    This is a projection helper, not another ordering or validation authority:
+    ContractRuntime selects the line, while existing RuntimeContext validators
+    supply the worker commit, implementation, receipt, dispatch, and route
+    facts.  In particular, this helper must never construct the recursive
+    current-state or full Worker Guide projections.
+    """
+
+    line_id = str(contract_next_action.get("line_id") or "").strip()
+    expected_action = {
+        "worker_finish_time_attestation": (
+            "record_finish_time_worker_attestation"
+        ),
+        "worker_finish_gate": "record_mf_subagent_finish_gate",
+    }.get(line_id, "")
+    if not expected_action:
+        return {}
+
+    contract_projection = _runtime_context_contract_runtime_worker_projection(
+        conn,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        context=context,
+    )
+    persisted_next_action = (
+        contract_projection.get("contract_runtime_next_legal_action")
+        if isinstance(
+            contract_projection.get("contract_runtime_next_legal_action"),
+            Mapping,
+        )
+        else {}
+    )
+    if not _runtime_context_finish_facade_line_is_exact(
+        contract_runtime_next_legal_action=persisted_next_action,
+        expected_line_id=line_id,
+        expected_action=expected_action,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    ):
+        return {}
+    # Managed compact reads intentionally page owner/role metadata while
+    # retaining the current writer-role copy payload.  Treat that input as an
+    # exact selector only: the re-read ContractRuntime projection above stays
+    # authoritative for ordering, role, revision, and writer hash.
+    required_selector_fields = (
+        "action",
+        "stage_id",
+        "line_id",
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+    )
+    if any(
+        not str(contract_next_action.get(field) or "").strip()
+        or str(contract_next_action.get(field) or "").strip()
+        != str(persisted_next_action.get(field) or "").strip()
+        for field in required_selector_fields
+    ):
+        return {}
+    for field in (
+        "execution_state_revision",
+        "runtime_guide_hash",
+        "owner_role",
+        "allowed_writer_roles",
+    ):
+        if field in contract_next_action and (
+            contract_next_action.get(field) != persisted_next_action.get(field)
+        ):
+            return {}
+    requested_writer = contract_next_action.get(
+        "writer_role_safe_copy_payload"
+    )
+    persisted_writer = persisted_next_action.get(
+        "writer_role_safe_copy_payload"
+    )
+    if not isinstance(requested_writer, Mapping) or not isinstance(
+        persisted_writer,
+        Mapping,
+    ):
+        return {}
+    if _stable_public_hash(requested_writer) != _stable_public_hash(
+        persisted_writer
+    ):
+        return {}
+    contract_next_action = persisted_next_action
+
+    timeline_events = _runtime_context_service_timeline_events(
+        conn,
+        project_id=project_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
+    timeline_refs, _startup, _finish, _close = (
+        _runtime_context_service_timeline_refs(
+            conn,
+            project_id=project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            timeline_events=timeline_events,
+            runtime_context_id=runtime_context_id,
+            parent_task_id=parent_task_id,
+        )
+    )
+    finish_hint = (
+        dict(timeline_refs.get("finish_time_worker_attestation_hint") or {})
+        if isinstance(
+            timeline_refs.get("finish_time_worker_attestation_hint"),
+            Mapping,
+        )
+        else {}
+    )
+    source_implementation = (
+        dict(contract_projection.get("worker_implementation_evidence") or {})
+        if isinstance(
+            contract_projection.get("worker_implementation_evidence"),
+            Mapping,
+        )
+        else {}
+    )
+    if (
+        source_implementation
+        and source_implementation.get("accepted") is not True
+    ):
+        return {}
+    finish_hint, source_resolution = (
+        _runtime_context_finish_hint_from_source_backed_implementation(
+            finish_hint,
+            timeline_refs,
+            source_implementation,
+        )
+    )
+    if source_resolution.get("fail_closed"):
+        return {}
+
+    revision_payload = _runtime_context_latest_contract_revision_payload(
+        conn,
+        context,
+    )
+    from . import batch_jobs
+
+    try:
+        finish_order = _runtime_context_contract_worker_commit_projection(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            revision_payload=revision_payload,
+            body={"contract_execution_id": contract_execution_id},
+            source="runtime_context.bounded_finish_facade_projection",
+        )
+    except (batch_jobs.BatchJobError, OSError):
+        return {}
+    if finish_order.get("blocked"):
+        return {}
+    contract_worker_commit_required = bool(
+        finish_order.get("canonical_worker_commit_required")
+    )
+    worker_id = str(
+        getattr(context, "worker_id", "")
+        or getattr(context, "worker_slot_id", "")
+        or task_id
+    ).strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    worker_scope_files = _runtime_context_collect_worker_scope_files(
+        task_id=task_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        latest_revision_payload=revision_payload,
+        sources=[
+            {
+                "owned_files": list(
+                    getattr(context, "owned_files", ()) or ()
+                ),
+                "target_files": list(
+                    getattr(context, "target_files", ()) or ()
+                ),
+            },
+            finish_order,
+            source_implementation,
+        ],
+    )
+    worktree_path = str(
+        getattr(context, "worktree_path", "") or target_project_root
+    ).strip()
+    current_branch_head_commit = _runtime_context_git_head_commit(
+        worktree_path,
+        target_project_root,
+    )
+    contract_state = (
+        contract_projection.get("contract_runtime_current_state")
+        if isinstance(
+            contract_projection.get("contract_runtime_current_state"),
+            Mapping,
+        )
+        else {}
+    )
+    row_scoped_finish_head_projection = (
+        _runtime_context_row_scoped_finish_head_projection(
+            row_scoped_implementation_head_commit=str(
+                finish_hint.get("head_commit")
+                or timeline_refs.get("head_commit")
+                or timeline_refs.get("commit_sha")
+                or ""
+            ),
+            runtime_context_head_commit=str(
+                getattr(context, "head_commit", "") or ""
+            ),
+            current_branch_head_commit=current_branch_head_commit,
+            base_commit=str(getattr(context, "base_commit", "") or ""),
+            target_head_commit=str(
+                getattr(context, "target_head_commit", "") or ""
+            ),
+            implementation_event_ref=str(
+                finish_hint.get("implementation_event_ref")
+                or timeline_refs.get("latest_implementation_event_ref")
+                or ""
+            ),
+            worktree_path=worktree_path,
+            target_project_root=target_project_root,
+            contract_worker_commit_required=contract_worker_commit_required,
+            canonical_worker_commit_head=str(
+                finish_order.get("worker_commit_sha") or ""
+            ),
+            same_lane_worker_commit_recovery=(
+                contract_state.get("same_lane_worker_commit_recovery")
+                if isinstance(contract_state, Mapping)
+                else {}
+            ),
+        )
+    )
+    finish_submission_head_commit = str(
+        timeline_refs.get("worker_commit_sha")
+        or finish_order.get("worker_commit_sha")
+        or row_scoped_finish_head_projection.get("submission_head_commit")
+        or ""
+    ).strip()
+    if (
+        contract_worker_commit_required
+        and row_scoped_finish_head_projection.get("status")
+        != "worker_commit_recorded"
+    ):
+        return {}
+
+    dispatch_identity = _contract_runtime_dispatch_identity_for_execution(
+        conn,
+        contract_execution_id=contract_execution_id,
+        context=context,
+    )
+    if dispatch_identity.get("accepted") is not True:
+        return {}
+    dispatch_fields = _contract_runtime_dispatch_identity_projection_fields(
+        dispatch_identity
+    )
+    observer_command_id = str(
+        dispatch_identity.get("observer_command_id") or ""
+    ).strip()
+    safe_route_identity = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str(route_identity.get(field) or "").strip()
+    }
+    if not observer_command_id or not safe_route_identity:
+        return {}
+
+    bounded_graph_trace_refs = {
+        "verified_trace_ids": list(
+            source_implementation.get("graph_trace_ids")
+            or finish_order.get("graph_trace_ids")
+            or []
+        )
+    }
+    finish_bundle = _runtime_context_finish_submission_bundle(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        target_project_root=target_project_root,
+        session_token_ref_placeholder=session_token_ref,
+        route_identity=safe_route_identity,
+        finish_attestation_hint=finish_hint,
+        timeline_refs=timeline_refs,
+        graph_trace_refs=bounded_graph_trace_refs,
+        worker_scope_files=worker_scope_files,
+        finish_hint_source_backed_resolution=source_resolution,
+        finish_contract_execution_id=contract_execution_id,
+        canonical_observer_command_id=observer_command_id,
+        canonical_dispatch_projection_fields=dispatch_fields,
+        finish_submission_head_commit=finish_submission_head_commit,
+        current_branch_head_commit=current_branch_head_commit,
+        row_scoped_finish_head_projection=row_scoped_finish_head_projection,
+        contract_worker_commit_required=contract_worker_commit_required,
+    )
+    if finish_bundle["missing_required_fields"]:
+        return {}
+    attestation_submission = dict(
+        finish_bundle["finish_time_worker_attestation_submission"]
+    )
+    attestation_body = dict(
+        attestation_submission.get("copy_safe_body") or {}
+    )
+    required_body_values = {
+        "head_commit": attestation_body.get("head_commit"),
+        "changed_files": attestation_body.get("changed_files"),
+        "owned_files": attestation_body.get("owned_files"),
+        "test_results": attestation_body.get("test_results"),
+        "graph_trace_ids": attestation_body.get("graph_trace_ids"),
+        "worker_session_id": attestation_body.get("worker_session_id"),
+        "filer_principal": attestation_body.get("filer_principal"),
+        "worker_transcript_ref_or_path": (
+            attestation_body.get("worker_transcript_ref")
+            or attestation_body.get("worker_transcript_path")
+        ),
+        "read_receipt_event_id": attestation_body.get(
+            "read_receipt_event_id"
+        ),
+        "read_receipt_hash": attestation_body.get("read_receipt_hash"),
+    }
+    if any(not value for value in required_body_values.values()):
+        return {}
+    if (
+        str(attestation_body.get("filer_principal") or "").strip()
+        != str(attestation_body.get("worker_session_id") or "").strip()
+    ):
+        return {}
+
+    if line_id == "worker_finish_time_attestation":
+        return _runtime_context_finish_facade_payload_skeleton(
+            attestation_submission,
+            schema_version=(
+                "runtime_context."
+                "finish_time_worker_attestation_facade_payload_skeleton.v1"
+            ),
+        )
+
+    gate_template = dict(
+        finish_bundle["finish_gate_submission_template"]
+    )
+    materialized_gate = _runtime_context_materialized_finish_gate_submission(
+        gate_template,
+        finish_attestation_hint=finish_hint,
+    )
+    gate_skeleton = _runtime_context_finish_facade_payload_skeleton(
+        materialized_gate,
+        schema_version="runtime_context.finish_gate_facade_payload_skeleton.v1",
+    )
+    if not gate_skeleton:
+        return {}
+    durable_authority = _runtime_context_finish_guide_authority_projection(
+        finish_gate_submission=gate_skeleton,
+        contract_runtime_next_legal_action=contract_next_action,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    if not durable_authority:
+        return {}
+    gate_skeleton["durable_finish_authority"] = durable_authority
+    return gate_skeleton
+
+
+def _runtime_context_current_finish_facade_action(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    contract_next_action: Mapping[str, Any],
+    context: Any,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    target_project_root: str,
+    session_token_ref: str,
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the existing source-backed finish facade for the current line."""
+
+    line_id = str(contract_next_action.get("line_id") or "").strip()
+    stage = {
+        "worker_finish_time_attestation": "attestation",
+        "worker_finish_gate": "finish",
+    }.get(line_id, "")
+    if not stage:
+        return {}
+    expected_tool = (
+        "runtime_context_finish_time_worker_attestation"
+        if stage == "attestation"
+        else "runtime_context_finish_gate"
+    )
+    source = _runtime_context_bounded_finish_facade_payload(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        contract_next_action=contract_next_action,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        session_token_ref=session_token_ref,
+        target_project_root=target_project_root,
+        route_identity=route_identity,
+    )
+    if not source:
+        return {}
+    finish_source_key = (
+        "finish_time_worker_attestation_submission"
+        if stage == "attestation"
+        else "finish_gate_facade_payload_skeleton"
+    )
+    coverage = _runtime_context_guide_executable_actions(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        # Finish facade lineage is projected by the existing full-guide
+        # source adapter.  ContractRuntime parentage is not a second facade
+        # identity input on this bounded selection path.
+        parent_contract_execution_id="",
+        actionable_payloads={finish_source_key: deepcopy(dict(source))},
+        graph_copy_safe_body={},
+        qa_verification_guide={},
+        contract_runtime_next_action=contract_next_action,
+    )
+    action = dict((coverage.get("actions") or {}).get(stage) or {})
+    body = (
+        action.get("copy_safe_body")
+        if isinstance(action.get("copy_safe_body"), Mapping)
+        else {}
+    )
+    expected_identity = {
+        "project_id": project_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "target_project_root": target_project_root,
+    }
+    identity_mismatches = [
+        field
+        for field, expected in expected_identity.items()
+        if expected and str(body.get(field) or "").strip() != expected
+    ]
+    route_mismatches = [
+        field
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        if str(route_identity.get(field) or "").strip()
+        and str(body.get(field) or "").strip()
+        != str(route_identity.get(field) or "").strip()
+    ]
+    if (
+        str(action.get("mcp_tool") or "").strip() != expected_tool
+        or not body
+        or identity_mismatches
+        or route_mismatches
+    ):
+        return {}
+    return deepcopy(dict(action))
 
 
 def _runtime_context_scoped_mf_sub_session(
@@ -146240,6 +146832,201 @@ _ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS = frozenset(
 )
 
 
+def _onboard_worker_finish_runtime_facade_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    next_action: Mapping[str, Any],
+    current_projection: Mapping[str, Any],
+    runtime_resume: Mapping[str, Any],
+    requested_task_id: str = "",
+    requested_route_token_ref: str = "",
+) -> dict[str, Any]:
+    """Bind current finish worker lines to their existing RuntimeContext facade."""
+
+    projected = dict(next_action)
+    selected_line = str(projected.get("line_id") or "").strip()
+    expected_tool = {
+        "worker_finish_time_attestation": (
+            "runtime_context_finish_time_worker_attestation"
+        ),
+        "worker_finish_gate": "runtime_context_finish_gate",
+    }.get(selected_line, "")
+    if not expected_tool:
+        return projected
+
+    projection_key = "worker_finish_runtime_facade_projection"
+
+    def blocked(reason: str, fields: Sequence[str] = ()) -> dict[str, Any]:
+        return {
+            **projected,
+            "actionable": False,
+            projection_key: {
+                "schema_version": (
+                    "onboard_route_guide.worker_finish_runtime_facade_projection.v1"
+                ),
+                "status": "blocked",
+                "blocker_id": "worker_finish_runtime_facade_projection_incomplete",
+                "reason": reason,
+                "missing_or_mismatched_fields": list(fields),
+                "selected_contract_line": selected_line,
+                "required_facade": expected_tool,
+                "fail_closed": True,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "raw_session_token_exposed": False,
+                "raw_fence_token_exposed": False,
+                "raw_route_token_exposed": False,
+            },
+        }
+
+    if conn is None:
+        return blocked("runtime_context_connection_unavailable")
+    execution_id = _onboard_route_guide_target_contract_execution_id(
+        next_action=projected,
+        current_projection=current_projection,
+        runtime_resume=runtime_resume,
+    )
+    if not execution_id:
+        return blocked(
+            "contract_execution_identity_unavailable",
+            ["contract_execution_id"],
+        )
+    try:
+        record = _contract_runtime_store(conn).get(execution_id)
+    except ContractRuntimeError:
+        return blocked("contract_execution_not_found", ["contract_execution_id"])
+    if (
+        str(record.get("project_id") or "").strip() != project_id
+        or str(record.get("backlog_id") or "").strip() != backlog_id
+    ):
+        return blocked("contract_execution_scope_mismatch", ["project_id", "backlog_id"])
+
+    runtime_context_id = str(projected.get("runtime_context_id") or "").strip()
+    task_id = str(projected.get("task_id") or "").strip()
+    explicit_task_id = str(requested_task_id or "").strip()
+    if explicit_task_id and task_id and explicit_task_id != task_id:
+        return blocked("runtime_context_explicit_task_scope_mismatch", ["task_id"])
+    task_id = explicit_task_id or task_id
+    if not runtime_context_id or not task_id:
+        return blocked(
+            "runtime_context_identity_unavailable",
+            [
+                field
+                for field, value in (
+                    ("runtime_context_id", runtime_context_id),
+                    ("task_id", task_id),
+                )
+                if not value
+            ],
+        )
+
+    from .parallel_branch_runtime import (
+        get_branch_context_by_runtime_context_id,
+        runtime_context_session_token_ref,
+    )
+
+    context = get_branch_context_by_runtime_context_id(
+        conn,
+        project_id,
+        runtime_context_id,
+    )
+    if context is None:
+        return blocked("runtime_context_not_found", ["runtime_context_id"])
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    context_mismatches = [
+        field
+        for field, expected, actual in (
+            ("project_id", project_id, str(getattr(context, "project_id", "") or "")),
+            ("backlog_id", backlog_id, str(getattr(context, "backlog_id", "") or "")),
+            ("runtime_context_id", runtime_context_id, str(getattr(context, "runtime_context_id", "") or "")),
+            ("task_id", task_id, str(getattr(context, "task_id", "") or "")),
+            ("parent_task_id", execution_id, parent_task_id),
+        )
+        if not expected or expected != actual
+    ]
+    if context_mismatches:
+        return blocked(
+            "runtime_context_scope_mismatch",
+            list(dict.fromkeys(context_mismatches)),
+        )
+
+    route_identity = _runtime_context_worker_projected_route_identity(
+        conn,
+        context,
+    )
+    expected_route_token_ref = str(
+        route_identity.get("route_token_ref") or ""
+    ).strip()
+    supplied_route_token_ref = str(requested_route_token_ref or "").strip()
+    if supplied_route_token_ref and supplied_route_token_ref != expected_route_token_ref:
+        return blocked(
+            "runtime_context_explicit_task_route_identity_mismatch",
+            ["route_token_ref"],
+        )
+    target_project_root = _runtime_context_effective_target_project_root(context)
+    session_token_ref = runtime_context_session_token_ref(context)
+    action = _runtime_context_current_finish_facade_action(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=execution_id,
+        contract_next_action=projected,
+        context=context,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        target_project_root=target_project_root,
+        session_token_ref=session_token_ref,
+        route_identity=route_identity,
+    )
+    if not action or str(action.get("mcp_tool") or "").strip() != expected_tool:
+        return blocked(
+            "source_backed_runtime_context_facade_unavailable",
+            ["canonical_executable_action"],
+        )
+    body = dict(action.get("copy_safe_body") or {})
+    facade_projection = {
+        "schema_version": (
+            "onboard_route_guide.worker_finish_runtime_facade_projection.v1"
+        ),
+        "status": "ready",
+        "source": (
+            "ContractRuntime.next_legal_action+RuntimeContext.canonical_executable_action"
+        ),
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "selected_contract_line": selected_line,
+        "required_facade": expected_tool,
+        "session_token_ref": session_token_ref,
+        "route_authority_source": "persisted_worker_route_identity",
+        "contract_runtime_ordering_preserved": True,
+        "zero_write_projection": True,
+        "raw_session_token_exposed": False,
+        "raw_fence_token_exposed": False,
+        "raw_route_token_exposed": False,
+    }
+    return {
+        **projected,
+        "action": str(action.get("action") or projected.get("action") or ""),
+        "interface": str(action.get("facade") or expected_tool),
+        "facade": str(action.get("facade") or expected_tool),
+        "mcp_tool": expected_tool,
+        "method": str(action.get("method") or "POST"),
+        "path": str(action.get("path") or ""),
+        "body_source": "copy_safe_body",
+        "action_input": body,
+        "copy_safe_body": body,
+        "actionable": True,
+        "host_realization": dict(action.get("host_realization") or {}),
+        "canonical_executable_action": deepcopy(dict(action)),
+        projection_key: facade_projection,
+    }
+
+
 def _onboard_worker_read_runtime_facade_projection(
     conn,
     *,
@@ -146251,10 +147038,24 @@ def _onboard_worker_read_runtime_facade_projection(
     requested_task_id: str = "",
     requested_route_token_ref: str = "",
 ) -> dict[str, Any]:
-    """Join worker read/startup/graph lines to one RuntimeContext facade."""
+    """Join worker lifecycle lines to their existing RuntimeContext facade."""
 
     projected = dict(next_action)
     selected_line = str(projected.get("line_id") or "").strip()
+    if selected_line in {
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+    }:
+        return _onboard_worker_finish_runtime_facade_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            next_action=projected,
+            current_projection=current_projection,
+            runtime_resume=runtime_resume,
+            requested_task_id=requested_task_id,
+            requested_route_token_ref=requested_route_token_ref,
+        )
     if selected_line not in {
         "worker_read_runtime_guide",
         "worker_startup",
@@ -148011,19 +148812,34 @@ def _onboard_route_guide_compact_service_response(
         )
         else {}
     )
+    worker_finish_projection = (
+        next_action.get("worker_finish_runtime_facade_projection")
+        if isinstance(
+            next_action.get("worker_finish_runtime_facade_projection"),
+            Mapping,
+        )
+        else {}
+    )
     selected_contract_line = str(next_action.get("line_id") or "").strip()
     worker_runtime_selected = selected_contract_line in {
         "worker_read_runtime_guide",
         "worker_startup",
         "worker_graph_context",
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
     }
     worker_runtime_projection = (
-        worker_startup_projection
-        if selected_contract_line == "worker_startup"
+        worker_finish_projection
+        if selected_contract_line
+        in {"worker_finish_time_attestation", "worker_finish_gate"}
         else (
-            worker_graph_projection
-            if selected_contract_line == "worker_graph_context"
-            else worker_read_projection
+            worker_startup_projection
+            if selected_contract_line == "worker_startup"
+            else (
+                worker_graph_projection
+                if selected_contract_line == "worker_graph_context"
+                else worker_read_projection
+            )
         )
     )
     worker_runtime_ready = (
@@ -148073,8 +148889,26 @@ def _onboard_route_guide_compact_service_response(
         or identity.get("contract_execution_id")
         or ""
     ).strip()
+    source_canonical_executable_action = (
+        next_action.get("canonical_executable_action")
+        if isinstance(
+            next_action.get("canonical_executable_action"),
+            Mapping,
+        )
+        else {}
+    )
+    finish_runtime_selected = selected_contract_line in {
+        "worker_finish_time_attestation",
+        "worker_finish_gate",
+    }
     canonical_executable_action = (
-        _guide_canonical_executable_action(
+        deepcopy(dict(source_canonical_executable_action))
+        if (
+            finish_runtime_selected
+            and worker_runtime_ready
+            and source_canonical_executable_action
+        )
+        else _guide_canonical_executable_action(
             project_id=project_id,
             backlog_id=action_backlog_id,
             contract_execution_id=action_contract_execution_id,
@@ -148309,6 +149143,9 @@ def _onboard_route_guide_compact_service_response(
             ),
             "worker_graph_runtime_facade_projection": dict(
                 worker_graph_projection
+            ),
+            "worker_finish_runtime_facade_projection": dict(
+                worker_finish_projection
             ),
             "runtime_context_recovery_authority": dict(
                 runtime_context_recovery_authority
@@ -148670,6 +149507,68 @@ def _onboard_route_guide_compact_service_response(
         ).get("mcp_tool")
         or ""
     )
+    if (
+        finish_runtime_selected
+        and worker_runtime_ready
+        and not host_precursor_required
+        and canonical_executable_action
+    ):
+        # The RuntimeContext finish facade is already the one canonical,
+        # bounded action. Return it once, unchanged, for every body size.
+        worker_facade_response = {
+            "schema_version": _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION,
+            "ok": True,
+            "response_view": "compact",
+            "status": "current_worker_runtime_facade_ready",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "selected_role": selected_role,
+            "selected_work_type": selected_work_type,
+            "selected_task_id": str(identity.get("selected_task_id") or ""),
+            "source_of_authority": source_of_authority,
+            "contract_execution_id": identity["contract_execution_id"],
+            "execution_state_revision": identity["execution_state_revision"],
+            "projection_hash": identity["projection_hash"],
+            "next_legal_action": next_action_projection,
+            "canonical_executable_action": canonical_executable_action,
+            "canonical_executable_action_path": (
+                "canonical_executable_action"
+            ),
+            "facade": public_facade,
+            "mcp_tool": public_mcp_tool,
+            "actionable": True,
+            "action_input_path": (
+                "canonical_executable_action.copy_safe_body"
+            ),
+            "guide_capsule_ref": entry["guide_capsule_ref"],
+            "worker_finish_runtime_facade_projection": dict(
+                worker_finish_projection
+            ),
+            "projection_degraded": projection_degraded,
+            "max_serialized_bytes": (
+                _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+            ),
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+            "advisory_only": True,
+            "authorizes_write": False,
+            "satisfies_gate": False,
+            "synthesizes_pass": False,
+            "serialized_bytes": 0,
+        }
+        worker_facade_response["serialized_bytes"] = (
+            _onboard_guide_capsule_serialized_bytes(
+                worker_facade_response
+            )
+        )
+        if (
+            _onboard_guide_capsule_serialized_bytes(
+                worker_facade_response
+            )
+            <= _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+        ):
+            return worker_facade_response
     response = {
         "schema_version": _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION,
         "ok": True,
