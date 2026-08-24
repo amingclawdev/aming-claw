@@ -8794,6 +8794,11 @@ class ContractRuntime:
         )
         if start_precheck.decision == "block" and _enforce_start_precheck(definition):
             raise ContractRuntimeError("; ".join(start_precheck.errors))
+        if _guide_bound_server_projection_only(definition):
+            raise ContractRuntimeError(
+                "guide_bound_server_projected_batch_parent: generic "
+                "ContractRuntime execution is not the Batch runtime path"
+            )
         instruction_bundle = resolve_instruction_bundle(
             definition,
             root=self.instruction_root,
@@ -11215,20 +11220,53 @@ def _source_bytes_sha256(value: bytes) -> str:
 
 
 def _enforce_start_precheck(definition: Mapping[str, Any]) -> bool:
-    """Hard-block the first migrated source-backed root policy.
+    """Hard-block the finitely migrated source-backed root policies.
 
     The broader Gate Kernel rollout runs in shadow mode for existing facades so
     contract_add/update/hotfix can be migrated without breaking legacy tests in
-    one step. Parallel worker orchestration is already designed as a successor,
-    and dogfood exposed it as the unsafe root path, so enforce that one now.
+    one step. Parallel worker and Batch parent orchestration are guide-bound
+    successors, so their declared root denials are authoritative now.
     """
 
     contract_id = str(definition.get("contract_id") or "")
     aliases = {str(item) for item in definition.get("compat_aliases") or []}
     return (
         contract_id == "mf_parallel"
+        or contract_id == "mf_batch_parallel.v1"
         or "mf_parallel.v2" in aliases
         or "mf_parallel.v1" in aliases
+        or "mf_batch_parallel" in aliases
+    )
+
+
+def _guide_bound_server_projection_only(definition: Mapping[str, Any]) -> bool:
+    """Keep the finite Batch definition on its declared existing server facade."""
+
+    contract_id = str(definition.get("contract_id") or "").strip()
+    aliases = {str(item).strip() for item in definition.get("compat_aliases") or []}
+    system_layer = (
+        definition.get("system_layer")
+        if isinstance(definition.get("system_layer"), Mapping)
+        else {}
+    )
+    entrypoint = (
+        system_layer.get("entrypoint_policy")
+        if isinstance(system_layer.get("entrypoint_policy"), Mapping)
+        else {}
+    )
+    metadata = definition.get("metadata")
+    gate_bindings = (
+        metadata.get("gate_bindings")
+        if isinstance(metadata, Mapping)
+        and isinstance(metadata.get("gate_bindings"), Mapping)
+        else {}
+    )
+    return (
+        (contract_id == "mf_batch_parallel.v1" or "mf_batch_parallel" in aliases)
+        and entrypoint.get("allow_root_start") is False
+        and entrypoint.get("requires_parent_execution") is True
+        and gate_bindings.get("new_predicates_added") is False
+        and gate_bindings.get("hidden_server_inference_allowed") is False
     )
 
 

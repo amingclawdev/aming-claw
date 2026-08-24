@@ -132635,6 +132635,9 @@ def _onboard_service_verified_mf_batch_entry_binding(
         "action_input.metadata.initial_two_worker_selection_supported": True,
         "action_input.metadata.revision_to_two_workers_supported": False,
         "action_input_hash": stable_sha256(action_input),
+        "source_contract_authority": (
+            _mf_batch_parallel_source_contract_authority()
+        ),
         "missing_fields": recomputed_missing,
         "ready": not recomputed_missing,
     }
@@ -132667,6 +132670,7 @@ def _onboard_service_verified_mf_batch_entry_binding(
             action_metadata.get("revision_to_two_workers_supported")
         ),
         "action_input_hash": binding.get("action_input_hash"),
+        "source_contract_authority": binding.get("source_contract_authority"),
         "missing_fields": list(binding.get("missing_fields") or []),
         "ready": binding.get("ready"),
     }
@@ -132836,6 +132840,9 @@ def _onboard_service_bind_mf_batch_entry_contract(
         "source": "onboard_route_guide_service",
         "action_input": action_input,
         "action_input_hash": stable_sha256(action_input),
+        "source_contract_authority": (
+            _mf_batch_parallel_source_contract_authority()
+        ),
         "ready": not missing_fields,
         "missing_fields": missing_fields,
         "parent_contract_execution_id": _onboard_service_execution_id(
@@ -155286,10 +155293,166 @@ MF_PARALLEL_CONTRACT_ID = "mf_parallel.v2"
 MF_PARALLEL_RECORD_CONTRACT_ID = "mf_parallel"
 MF_BATCH_PARALLEL_CONTRACT_ID = "mf_batch_parallel.v1"
 MF_BATCH_PARALLEL_RECORD_CONTRACT_ID = "mf_batch_parallel"
+_MF_BATCH_SOURCE_CONTRACT_AUTHORITY_SCHEMA = (
+    "mf_batch_parallel.source_contract_authority.v1"
+)
 MF_PARALLEL_RECORD_CONTRACT_IDS = frozenset(
     {MF_PARALLEL_RECORD_CONTRACT_ID, MF_PARALLEL_CONTRACT_ID}
 )
 MF_PARALLEL_POSTMERGE_REVISION_FAMILY = frozenset({"rev8", "rev9", "rev10"})
+
+
+def _mf_batch_parallel_source_contract_authority(
+    *,
+    contract_id: str = MF_BATCH_PARALLEL_CONTRACT_ID,
+    version: str = "v1",
+    revision: str = "",
+) -> dict[str, Any]:
+    """Project one exact Batch source revision into the existing service path."""
+
+    if revision:
+        definition = _CONTRACT_DEFINITION_REGISTRY.get(
+            contract_id,
+            version=version,
+            revision=revision,
+        )
+    else:
+        definition = _CONTRACT_DEFINITION_REGISTRY.resolve_for_new_execution(
+            contract_id,
+            version=version,
+        )
+    metadata = (
+        definition.get("metadata")
+        if isinstance(definition.get("metadata"), Mapping)
+        else {}
+    )
+    system_layer = (
+        definition.get("system_layer")
+        if isinstance(definition.get("system_layer"), Mapping)
+        else {}
+    )
+    entrypoint_policy = (
+        system_layer.get("entrypoint_policy")
+        if isinstance(system_layer.get("entrypoint_policy"), Mapping)
+        else {}
+    )
+    if (
+        entrypoint_policy.get("allow_root_start") is not False
+        or entrypoint_policy.get("requires_parent_execution") is not True
+    ):
+        raise ContractRuntimeError(
+            "mf_batch_parallel source entrypoint is not guide-bound"
+        )
+    gate_bindings = (
+        metadata.get("gate_bindings")
+        if isinstance(metadata.get("gate_bindings"), Mapping)
+        else {}
+    )
+    if (
+        gate_bindings.get("new_predicates_added") is not False
+        or gate_bindings.get("hidden_server_inference_allowed") is not False
+    ):
+        raise ContractRuntimeError(
+            "mf_batch_parallel source definition must bind existing Gates only"
+        )
+    resolved_common_rule_authority = (
+        _CONTRACT_DEFINITION_REGISTRY.resolve_common_rule_applicability(definition)
+    )
+    if resolved_common_rule_authority.get("authoritative") is not True:
+        raise ContractRuntimeError(
+            "mf_batch_parallel common Rule authority is not resolved"
+        )
+    common_rule_authority = {
+        key: resolved_common_rule_authority.get(key)
+        for key in (
+            "schema_version",
+            "declared",
+            "join_state",
+            "authoritative",
+            "package_id",
+            "package_version",
+            "package_digest",
+            "rule_ids",
+            "scopes",
+            "omitted_rules_apply",
+            "server_inference_allowed",
+            "activation_allowed",
+            "authority_hash",
+        )
+    }
+    authority = {
+        "schema_version": _MF_BATCH_SOURCE_CONTRACT_AUTHORITY_SCHEMA,
+        "source": "ContractDefinitionRegistry",
+        "contract_id": str(definition.get("contract_id") or ""),
+        "version": str(definition.get("version") or ""),
+        "revision": str(definition.get("revision") or ""),
+        "definition_hash": str(definition.get("definition_hash") or ""),
+        "definition_source_sha256": str(definition.get("source_sha256") or ""),
+        "common_rule_authority": common_rule_authority,
+        "gate_bindings_hash": stable_sha256(gate_bindings),
+        "entrypoint_policy": dict(entrypoint_policy),
+        "entrypoint_policy_hash": stable_sha256(entrypoint_policy),
+        "runtime_execution_mode": "guide_bound_server_projected_batch_parent",
+        "generic_contract_runtime_execution_allowed": False,
+        "parent_close_revalidates_exact_pinned_revision": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "authoritative": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _mf_batch_parallel_source_contract_authority_revalidation(
+    raw_authority: Any,
+) -> dict[str, Any]:
+    """Re-resolve an event's exact pinned revision; never substitute latest."""
+
+    authority = dict(raw_authority) if isinstance(raw_authority, Mapping) else {}
+    contract_id = str(authority.get("contract_id") or "").strip()
+    version = str(authority.get("version") or "").strip()
+    revision = str(authority.get("revision") or "").strip()
+    if not (contract_id and version and revision):
+        return {
+            "accepted": False,
+            "status": "missing",
+            "actual_authority_hash": str(authority.get("authority_hash") or ""),
+            "expected_authority_hash": "",
+            "pinned_contract_id": contract_id,
+            "pinned_version": version,
+            "pinned_revision": revision,
+        }
+    try:
+        expected = _mf_batch_parallel_source_contract_authority(
+            contract_id=contract_id,
+            version=version,
+            revision=revision,
+        )
+    except (ContractRuntimeError, ValueError, OSError) as exc:
+        return {
+            "accepted": False,
+            "status": "unresolvable",
+            "reason": str(exc),
+            "actual_authority_hash": str(authority.get("authority_hash") or ""),
+            "expected_authority_hash": "",
+            "pinned_contract_id": contract_id,
+            "pinned_version": version,
+            "pinned_revision": revision,
+        }
+    accepted = stable_sha256(authority) == stable_sha256(expected)
+    return {
+        "accepted": accepted,
+        "status": "passed" if accepted else "mismatch",
+        "actual_authority_hash": str(authority.get("authority_hash") or ""),
+        "expected_authority_hash": str(expected.get("authority_hash") or ""),
+        "pinned_contract_id": contract_id,
+        "pinned_version": version,
+        "pinned_revision": revision,
+        "definition_hash": str(expected.get("definition_hash") or ""),
+        "definition_source_sha256": str(
+            expected.get("definition_source_sha256") or ""
+        ),
+    }
 
 
 def _is_mf_parallel_record_contract_id(contract_id: str) -> bool:
@@ -173340,7 +173503,14 @@ def _contract_runtime_mf_batch_parent_close_authority_gate(
         batch_id = str(payload.get("batch_id") or "").strip()
         merge_queue_id = _contract_runtime_mf_batch_parent_merge_queue_id(payload)
         child_ids = _contract_runtime_mf_batch_parent_child_ids(payload)
+        source_authority_revalidation = (
+            _mf_batch_parallel_source_contract_authority_revalidation(
+                payload.get("source_backed_contract_authority")
+            )
+        )
         missing: list[str] = []
+        if source_authority_revalidation.get("accepted") is not True:
+            missing.append("source_backed_parent_contract_authority")
         if len(child_ids) < 2:
             missing.append("batch_child_backlog_ids")
         if not merge_queue_id:
@@ -173465,6 +173635,15 @@ def _contract_runtime_mf_batch_parent_close_authority_gate(
             for ref in (
                 f"contract_runtime:{requested_execution_id}",
                 _contract_runtime_mf_batch_parent_event_ref(event),
+                (
+                    "contract_definition:"
+                    f"{source_authority_revalidation.get('pinned_contract_id')}@"
+                    f"{source_authority_revalidation.get('pinned_version')}#"
+                    f"{source_authority_revalidation.get('pinned_revision')}:"
+                    f"{source_authority_revalidation.get('definition_hash')}"
+                    if source_authority_revalidation.get("accepted") is True
+                    else ""
+                ),
                 *[
                     f"merge_queue_item:{merge_queue_id}:{summary['queue_item_id']}"
                     for summary in queue_item_summaries
@@ -173491,6 +173670,9 @@ def _contract_runtime_mf_batch_parent_close_authority_gate(
             "source_refs": list(dict.fromkeys(source_refs)),
             "checks": {
                 "has_mf_batch_parent_contract_binding": True,
+                "source_backed_parent_contract_authority": (
+                    source_authority_revalidation.get("accepted") is True
+                ),
                 "child_backlogs_present": not missing_child_ids,
                 "child_backlogs_fixed": not unclosed_child_ids,
                 "merge_queue_items_present": not missing_queue_child_ids,
@@ -173505,6 +173687,9 @@ def _contract_runtime_mf_batch_parent_close_authority_gate(
             "missing_merge_queue_item_backlog_ids": missing_queue_child_ids,
             "unmerged_merge_queue_item_backlog_ids": unmerged_queue_child_ids,
             "close_commit_match_sources": list(dict.fromkeys(commit_match_sources)),
+            "source_contract_authority_revalidation": (
+                source_authority_revalidation
+            ),
         }
         if queue_query_error:
             gate["merge_queue_query_error"] = queue_query_error
@@ -192775,6 +192960,9 @@ def handle_project_mf_batch_parallel_enter(ctx: RequestContext):
             "onboard_service": ONBOARD_ROUTE_GUIDE_SERVICE_ID,
             "guide_action_input_hash": str(
                 entry_binding.get("action_input_hash") or ""
+            ),
+            "source_backed_contract_authority": dict(
+                entry_binding.get("source_contract_authority") or {}
             ),
             "preflight_gate": preflight_gate,
             "acceptance_scope_closures": acceptance_scope_closures,

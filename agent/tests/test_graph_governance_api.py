@@ -103774,6 +103774,54 @@ def test_backlog_close_accepts_mf_batch_parent_onboard_service_authority(
     )
     parent_execution_id = entered["parent_contract_execution_id"]
     assert parent_execution_id.startswith("onboard-service-")
+    source_authority = entered["event"]["payload"][
+        "source_backed_contract_authority"
+    ]
+    assert source_authority == (
+        server._mf_batch_parallel_source_contract_authority()
+    )
+    parent_record = server._contract_runtime_store(conn).get(parent_execution_id)
+    assert parent_record["metadata"]["mf_batch_parallel_entry_binding"][
+        "source_contract_authority"
+    ] == source_authority
+    assert source_authority["revision"] == "rev1"
+    assert source_authority["common_rule_authority"]["authoritative"] is True
+    assert source_authority["runtime_execution_mode"] == (
+        "guide_bound_server_projected_batch_parent"
+    )
+    assert source_authority["generic_contract_runtime_execution_allowed"] is False
+    assert source_authority["entrypoint_policy"]["allow_root_start"] is False
+    assert source_authority["entrypoint_policy"][
+        "requires_parent_execution"
+    ] is True
+    exact_revision_calls: list[tuple[str, str, str]] = []
+    real_registry = server._CONTRACT_DEFINITION_REGISTRY
+
+    class ExactRevisionRegistry:
+        def get(self, contract_id, *, version, revision):
+            exact_revision_calls.append((contract_id, version, revision))
+            return real_registry.get(
+                contract_id,
+                version=version,
+                revision=revision,
+            )
+
+        def resolve_common_rule_applicability(self, definition):
+            return real_registry.resolve_common_rule_applicability(definition)
+
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(
+            server,
+            "_CONTRACT_DEFINITION_REGISTRY",
+            ExactRevisionRegistry(),
+        )
+        pinned_revalidation = (
+            server._mf_batch_parallel_source_contract_authority_revalidation(
+                source_authority
+            )
+        )
+    assert pinned_revalidation["accepted"] is True
+    assert exact_revision_calls == [("mf_batch_parallel.v1", "v1", "rev1")]
     merge_queue_id = entered["merge_queue_plan"]["merge_queue_id"]
     items = list_merge_queue_items(conn, PID, merge_queue_id)
     assert {item.backlog_id for item in items} == {child_a, child_b}
@@ -103821,6 +103869,36 @@ def test_backlog_close_accepts_mf_batch_parent_onboard_service_authority(
         )
         == {}
     )
+    historical_event = copy.deepcopy(entered["event"])
+    historical_event["payload"].pop("source_backed_contract_authority")
+    historical_gate = server._contract_runtime_mf_batch_parent_close_authority_gate(
+        conn=conn,
+        project_id=PID,
+        bug_id=backlog_id,
+        requested_execution_id=parent_execution_id,
+        close_commit=close_commit,
+        timeline_events=[historical_event],
+    )
+    assert historical_gate["passed"] is False
+    assert "source_backed_parent_contract_authority" in historical_gate[
+        "missing_requirement_ids"
+    ]
+    tampered_event = copy.deepcopy(entered["event"])
+    tampered_event["payload"]["source_backed_contract_authority"][
+        "authority_hash"
+    ] = "sha256:caller-tamper"
+    tampered_gate = server._contract_runtime_mf_batch_parent_close_authority_gate(
+        conn=conn,
+        project_id=PID,
+        bug_id=backlog_id,
+        requested_execution_id=parent_execution_id,
+        close_commit=close_commit,
+        timeline_events=[tampered_event],
+    )
+    assert tampered_gate["passed"] is False
+    assert tampered_gate["source_contract_authority_revalidation"]["status"] == (
+        "mismatch"
+    )
 
     monkeypatch.setattr(
         server,
@@ -103855,9 +103933,13 @@ def test_backlog_close_accepts_mf_batch_parent_onboard_service_authority(
     assert gate["merge_queue_id"] == merge_queue_id
     assert gate["child_backlog_ids"] == [child_a, child_b]
     assert gate["checks"]["child_backlogs_fixed"] is True
+    assert gate["checks"]["source_backed_parent_contract_authority"] is True
     assert gate["checks"]["merge_queue_items_merged"] is True
     assert gate["checks"]["close_commit_matches_batch_result"] is True
     assert gate["checks"]["rejects_stale_contract_state_lane"] is True
+    assert gate["source_contract_authority_revalidation"]["pinned_revision"] == (
+        "rev1"
+    )
     assert precheck["can_close"] is True
     assert precheck["timeline_gate"][
         "contract_runtime_mf_batch_parent_close_authority_gate"
@@ -163104,6 +163186,22 @@ def test_mf_batch_parallel_enter_blocks_without_preflight_target_head(conn):
     assert "target_head_commit" in guide["next_legal_action"][
         "action_input_missing_fields"
     ]
+    assert action_input == {}
+    incomplete_attempt = server._mf_batch_parallel_entry_action_input_contract(
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+        request_body={
+            "backlog_id": backlog_id,
+            "backlog_ids": [child_a, child_b],
+            "reason": "Human approved multi-row fan-out through onboard service.",
+            "task_id": "batch-parallel-onboard-service-blocked",
+            "observer_session_id": observer_session_id,
+            "observer_route_token_ref": route_token_ref,
+            "target_head_commit": "",
+            "graph_snapshot_id": "scope-batch-preflight-blocked",
+        },
+    )
     queue_count_before = conn.execute(
         "SELECT COUNT(*) FROM parallel_branch_merge_queue_items"
     ).fetchone()[0]
@@ -163118,7 +163216,7 @@ def test_mf_batch_parallel_enter_blocks_without_preflight_target_head(conn):
             _ctx(
                 {"project_id": PID},
                 method="POST",
-                body=action_input,
+                body=incomplete_attempt,
             )
         )
     assert exc.value.code == "mf_batch_parallel_guide_binding_required"

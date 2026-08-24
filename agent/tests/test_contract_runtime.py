@@ -22,8 +22,8 @@ from agent.governance.contracts.registry import (
 from agent.governance.contracts.runtime import (
     ContractRetirementError,
     ContractRuntime,
+    ContractRuntimeError,
     SQLiteContractExecutionStore,
-    StalePinnedContractExecutionError,
     WriteGateDecision,
     _active_failed_qa_line,
     _contract_completion_satisfying_lines,
@@ -477,8 +477,9 @@ def test_direct_main_rev3_fresh_selection_does_not_rebind_pinned_rev2():
     ]["rule_ids"]
 
 
-def test_mf_batch_parallel_rev1_fresh_execution_is_source_pinned_and_immutable(
+def test_mf_batch_parallel_rev1_generic_root_start_is_zero_write(
     tmp_path,
+    monkeypatch,
 ):
     source_path = (
         Path(__file__).resolve().parents[1]
@@ -494,48 +495,44 @@ def test_mf_batch_parallel_rev1_fresh_execution_is_source_pinned_and_immutable(
     )
     registry = ContractDefinitionRegistry(tmp_path)
     runtime = ContractRuntime(registry)
-    created = runtime.start_execution(
-        "mf_batch_parallel",
-        version="v1",
-        project_id="aming-claw",
-        backlog_id="AC-MF-BATCH-REV1-FRESH-PIN",
-        actor_role="observer",
-        contract_execution_id="cex-mf-batch-rev1-fresh-pin",
-    )
-    pinned_hash = created["definition_hash"]
-    pinned_source_hash = created["definition_source_sha256"]
-    package = registry.common_rule_package()
+    with pytest.raises(ContractRuntimeError, match="contract_root_start_denied"):
+        runtime.start_execution(
+            "mf_batch_parallel",
+            version="v1",
+            project_id="aming-claw",
+            backlog_id="AC-MF-BATCH-REV1-ROOT-DENIED",
+            actor_role="observer",
+            contract_execution_id="cex-mf-batch-rev1-root-denied",
+        )
 
-    assert created["contract_id"] == "mf_batch_parallel.v1"
-    assert created["revision"] == "rev1"
-    assert created["authoritative_common_rule_join"]["rule_ids"] == package[
-        "rule_ids"
-    ]
-    assert created["authoritative_common_rule_join"]["scopes"] == [
-        "mf_batch_parallel"
-    ]
-    assert created["execution_state"]["next_action"]["line_id"] == (
-        "observer_bind_batch_parent"
-    )
+    with pytest.raises(ContractRuntimeError, match="unknown contract execution"):
+        runtime.store.get("cex-mf-batch-rev1-root-denied")
 
-    payload["instruction_layer"]["inline"].append(
-        "fixture-only source drift after the execution is pinned"
+    monkeypatch.setattr(
+        runtime,
+        "_parent_contract_identity",
+        lambda _execution_id: {
+            "contract_id": "onboard_route_guide",
+            "version": "service",
+        },
     )
-    temp_definition.write_text(
-        json.dumps(payload, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    reloaded = registry.get("mf_batch_parallel", version="v1")
-    with pytest.raises(StalePinnedContractExecutionError):
-        runtime.current_record("cex-mf-batch-rev1-fresh-pin")
-    persisted = runtime.store.get("cex-mf-batch-rev1-fresh-pin")
-
-    assert reloaded["definition_hash"] != pinned_hash
-    assert reloaded["source_sha256"] != pinned_source_hash
-    assert persisted["definition_hash"] == pinned_hash
-    assert persisted["definition_source_sha256"] == pinned_source_hash
-    assert persisted["revision"] == "rev1"
-    assert persisted["completed_lines"] == []
+    with pytest.raises(
+        ContractRuntimeError,
+        match="guide_bound_server_projected_batch_parent",
+    ):
+        runtime.start_execution(
+            "mf_batch_parallel",
+            version="v1",
+            project_id="aming-claw",
+            backlog_id="AC-MF-BATCH-REV1-GENERIC-SUCCESSOR-DENIED",
+            actor_role="observer",
+            contract_execution_id="cex-mf-batch-rev1-generic-successor-denied",
+            parent_contract_execution_id="onboard-service-parent",
+            root_contract_execution_id="onboard-service-parent",
+            contract_chain_id="cchain-onboard-service-parent",
+        )
+    with pytest.raises(ContractRuntimeError, match="unknown contract execution"):
+        runtime.store.get("cex-mf-batch-rev1-generic-successor-denied")
 
 
 def test_mf_batch_parallel_rev1_failed_qa_rework_is_append_only_generation() -> None:
