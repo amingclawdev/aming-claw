@@ -46405,6 +46405,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
     execution_id = "cex-postmerge-recovery-exact"
     runtime_context_id = "mfrctx-postmerge-recovery-exact"
     merge_queue_id = "mq-postmerge-recovery-exact"
+    target_ref = "refs/heads/codex/postmerge-recovery-target"
     baseline_snapshot_id = "full-postmerge-recovery-baseline"
     baseline_commit = "b" * 40
     candidate_commit = "a" * 40
@@ -46425,6 +46426,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
             parent_task_id=execution_id,
             runtime_context_id=runtime_context_id,
             merge_queue_id=merge_queue_id,
+            ref_name="codex/postmerge-recovery-target",
             branch_ref="refs/heads/codex/postmerge-recovery-exact",
             target_project_root=str(worker_root),
             status=STATE_VALIDATED,
@@ -46432,6 +46434,20 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
             base_commit=baseline_commit,
             head_commit=candidate_commit,
             target_head_commit=candidate_commit,
+        ),
+    )
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=f"{merge_queue_id}:{task_id}",
+            backlog_id=backlog_id,
+            task_id=task_id,
+            branch_ref="",
+            queue_index=1,
+            status="planned",
+            target_ref=target_ref,
         ),
     )
     _activate_basic_graph(
@@ -46619,15 +46635,17 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
         "_graph_governance_project_root",
         lambda *_args, **_kwargs: canonical_root,
     )
-    monkeypatch.setattr(
-        server,
-        "_git_output",
-        lambda _root, argv: (
-            recovery_head_commit
-            if argv[-1] == "refs/heads/main"
-            else candidate_commit
-        ),
-    )
+    resolved_target_refs: list[str] = []
+
+    def fake_git_output(_root, argv):
+        if argv == ["rev-parse", "refs/heads/codex/postmerge-recovery-exact"]:
+            return candidate_commit
+        if argv == ["rev-parse", "--verify", target_ref]:
+            resolved_target_refs.append(argv[-1])
+            return recovery_head_commit
+        raise AssertionError(f"unexpected git ref lookup: {argv}")
+
+    monkeypatch.setattr(server, "_git_output", fake_git_output)
     monkeypatch.setattr(
         server,
         "_git_clean_worktree_verified",
@@ -46658,6 +46676,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
         "task_id": task_id,
         "merge_queue_id": merge_queue_id,
         "runtime_context_id": runtime_context_id,
+        "target_ref": "refs/heads/main",
         "audited_postmerge_recovery": {
             "source_contract_execution_id": execution_id,
             "runtime_context_id": runtime_context_id,
@@ -46677,6 +46696,68 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
     assert authority.merged_commit == recovery_head_commit
     assert authority.no_pass_claim is True
     assert authority.authoritative_pass_synthesized is False
+    assert resolved_target_refs == [target_ref]
+
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+           SET target_ref = 'refs/heads/main'
+         WHERE project_id = ? AND merge_queue_id = ? AND task_id = ?
+        """,
+        (PID, merge_queue_id, task_id),
+    )
+    conn.commit()
+    with pytest.raises(GovernanceError) as target_ref_mismatch:
+        server._audited_postmerge_recovery_authority(
+            conn,
+            project_id=PID,
+            body=body,
+            route_gate=recovery_gate,
+        )
+    assert target_ref_mismatch.value.code == (
+        "audited_postmerge_recovery_scope_mismatch"
+    )
+    conn.execute(
+        """
+        UPDATE parallel_branch_merge_queue_items
+           SET target_ref = ?
+         WHERE project_id = ? AND merge_queue_id = ? AND task_id = ?
+        """,
+        (target_ref, PID, merge_queue_id, task_id),
+    )
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=f"{merge_queue_id}:{task_id}:ambiguous",
+            backlog_id=backlog_id,
+            task_id=task_id,
+            branch_ref="",
+            queue_index=2,
+            status="planned",
+            target_ref=target_ref,
+        ),
+    )
+    conn.commit()
+    with pytest.raises(GovernanceError) as ambiguous_target_ref:
+        server._audited_postmerge_recovery_authority(
+            conn,
+            project_id=PID,
+            body=body,
+            route_gate=recovery_gate,
+        )
+    assert ambiguous_target_ref.value.code == (
+        "audited_postmerge_recovery_scope_mismatch"
+    )
+    conn.execute(
+        """
+        DELETE FROM parallel_branch_merge_queue_items
+         WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (PID, merge_queue_id, f"{merge_queue_id}:{task_id}:ambiguous"),
+    )
+    conn.commit()
     forged_trigger = {
         "merged_commit": candidate_commit,
         "recovery_head_commit": "e" * 40,
@@ -46908,7 +46989,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
                 merge_queue_id=merge_queue_id,
                 queue_item_id=queued["queue_item"]["queue_item_id"],
                 task_id=task_id,
-                target_ref="refs/heads/main",
+                target_ref=target_ref,
                 status="merged",
                 merge_commit=recovery_head_commit,
                 target_head_before_merge=recovery_head_commit,
@@ -46968,7 +47049,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
                             "branch_ref": (
                                 "refs/heads/codex/postmerge-recovery-exact"
                             ),
-                            "target_ref": "refs/heads/main",
+                            "target_ref": target_ref,
                             "dry_run": False,
                             "allow_target_ref_mutation": True,
                             "contract_actor": "observer",
@@ -46996,7 +47077,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
                         "branch_ref": (
                             "refs/heads/codex/postmerge-recovery-exact"
                         ),
-                        "target_ref": "refs/heads/main",
+                        "target_ref": target_ref,
                         "dry_run": False,
                         "allow_target_ref_mutation": True,
                         "contract_actor": "observer",
@@ -47039,7 +47120,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
                         "branch_ref": (
                             "refs/heads/codex/postmerge-recovery-exact"
                         ),
-                        "target_ref": "refs/heads/main",
+                        "target_ref": target_ref,
                         "dry_run": False,
                         "allow_target_ref_mutation": True,
                         "contract_actor": "observer",
@@ -47079,7 +47160,7 @@ def test_server_derives_postmerge_recovery_only_from_exact_no_pass_evidence(
         merge_queue_id=merge_queue_id,
         queue_item_id=queued["queue_item"]["queue_item_id"],
         task_id=task_id,
-        target_ref="refs/heads/main",
+        target_ref=target_ref,
         status="merged",
         merge_commit=recovery_head_commit,
         target_head_before_merge=recovery_head_commit,
@@ -145936,6 +146017,111 @@ def test_eabf_current_worker_guide_projects_executable_finish_alias_chain(
     assert finished["context"]["status"] == "validated"
 
 
+def test_rejoin_pre_finish_returns_host_envelope_without_finish_only_expansion(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    candidate_server, candidate_server_path = _preload_candidate_server_module()
+    assert Path(candidate_server.__file__).resolve() == candidate_server_path
+    monkeypatch.setattr(
+        candidate_server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+    backlog_id = "AC-REJOIN-PRE-FINISH-ENVELOPE"
+    worker_task_id = "rejoin-pre-finish-envelope-worker"
+    worker_token = "rejoin-pre-finish-envelope-token"
+    worker_fence = "rejoin-pre-finish-envelope-fence"
+    worker_root = tmp_path / worker_task_id
+    owned_file = "agent/governance/server.py"
+    base_commit, worker_commit = _source_backed_worker_git_fixture(
+        worker_root,
+        owned_file,
+    )
+    (
+        contract_execution_id,
+        runtime_context,
+        _runtime,
+        _worker_session_id,
+    ) = _record_source_backed_worker_authority(
+        candidate_server,
+        conn,
+        backlog_id=backlog_id,
+        worker_task_id=worker_task_id,
+        worker_token=worker_token,
+        worker_fence=worker_fence,
+        graph_trace_id="gqt-rejoin-pre-finish-envelope",
+        owned_file=owned_file,
+        worker_root=worker_root,
+        base_commit=base_commit,
+        worker_commit=worker_commit,
+        test_results={
+            "status": "passed",
+            "passed": True,
+            "commands": ["python -m pytest -q focused-pre-finish-rejoin"],
+        },
+    )
+    refreshed = get_branch_context(conn, PID, worker_task_id)
+    assert refreshed is not None
+    route_identity = candidate_server._runtime_context_latest_route_identity(
+        conn,
+        refreshed,
+    )
+    path = {
+        "project_id": PID,
+        "runtime_context_id": runtime_context.runtime_context_id,
+    }
+    rejoin_body = {
+        "runtime_context_id": refreshed.runtime_context_id,
+        "contract_execution_id": contract_execution_id,
+        "task_id": worker_task_id,
+        "parent_task_id": contract_execution_id,
+        "target_project_root": str(worker_root),
+        "worker_id": refreshed.worker_id,
+        "worker_slot_id": refreshed.worker_slot_id,
+        "agent_id": refreshed.actual_host_worker_id,
+        "allocation_owner": refreshed.allocation_owner,
+        "actual_host_worker_id": refreshed.actual_host_worker_id,
+        "worker_session_id": refreshed.host_session_id,
+        "host_session_id": refreshed.host_session_id,
+        "session_token_ref": runtime_context_session_token_ref(refreshed),
+        "reason": "recover the host envelope before the finish position",
+        **route_identity,
+    }
+    monkeypatch.setattr(
+        candidate_server,
+        "_runtime_context_worker_recovery_details",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pre-finish rejoin expanded the finish-only Guide")
+        ),
+    )
+
+    rejoined = candidate_server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            path,
+            "coordinator",
+            method="POST",
+            body=rejoin_body,
+        )
+    )
+
+    assert next(iter(rejoined)) == "host_envelope"
+    assert rejoined["host_envelope"]["runtime_context_id"] == (
+        refreshed.runtime_context_id
+    )
+    assert rejoined["immediate_finish_facade_projection"] == {
+        "status": "not_applicable_at_current_position",
+        "source": "runtime_context_service_timeline_refs",
+        "durable_finish_authority_present": False,
+        "host_envelope_returned": True,
+        "access_audit_recorded": False,
+    }
+    assert "immediate_authenticated_worker_guide" not in rejoined
+    for alias in candidate_server._RUNTIME_CONTEXT_FINISH_FACADE_ALIASES:
+        assert alias not in rejoined
+
+
 def test_rejoin_same_response_projects_finish_gate_for_ordinary_and_bounded_loss(
     conn,
     tmp_path,
@@ -145993,6 +146179,7 @@ def test_rejoin_same_response_projects_finish_gate_for_ordinary_and_bounded_loss
         "session_token": worker_token,
         "session_token_ref": runtime_context_session_token_ref(runtime_context),
         "target_project_root": str(worker_root),
+        "view": "all",
     }
     guide = candidate_server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
         _ctx_with_role(path, "mf_sub", query=query)

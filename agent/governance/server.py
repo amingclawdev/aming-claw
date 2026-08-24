@@ -61153,59 +61153,85 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             actor=str(session.get("principal_id") or "observer"),
             payload=audit_payload,
         )
-        # The raw host envelope and its next copy-safe worker facade must be
-        # consumable by the same host invocation.  Materialize only after this
-        # accepted rejoin audit is visible in the transaction, using the same
-        # durable guide path that a later ref-only read would use.
-        refreshed_context = get_branch_context_by_runtime_context_id(
-            conn,
-            project_id,
-            runtime_context_id,
+        # The host envelope is the rejoin authority at every position.  The
+        # finish facade is only its position-specific Guide projection, so do
+        # not make an earlier Graph/implementation rejoin wait for a full
+        # finish-only current/Guide expansion before the MCP adapter can stage
+        # the already accepted envelope.
+        immediate_finish_projection_required = bool(
+            _finish_gate
+            or validated_missing_finish_rejoin_authority.get("eligible") is True
+            or result.get("validated_missing_finish_auth_only_rejoin") is True
         )
-        try:
-            immediate_recovery = _runtime_context_worker_recovery_details(
-                ctx,
+        immediate_recovery: dict[str, Any] = {}
+        immediate_actionable_payloads: dict[str, Any] = {}
+        if immediate_finish_projection_required:
+            # At a durable finish position, the raw host envelope and its next
+            # copy-safe worker facade must remain consumable by the same host
+            # invocation.  Materialize only after this accepted rejoin audit is
+            # visible in the transaction, using the same durable Guide path
+            # that a later ref-only read would use.
+            refreshed_context = get_branch_context_by_runtime_context_id(
                 conn,
-                project_id=project_id,
-                runtime_context_id=runtime_context_id,
-                task_id=str(result.get("task_id") or context.task_id or ""),
-                parent_task_id=str(
-                    result.get("parent_task_id") or parent_task_id or ""
-                ),
-                fence_token=str(result.get("fence_token") or ""),
-                session_token=str(result.get("session_token") or ""),
-                session_token_ref=str(result.get("session_token_ref") or ""),
-                target_project_root=(
-                    _runtime_context_effective_target_project_root(
-                        refreshed_context or context
-                    )
-                ),
-                route_identity=safe_route_identity,
-                reason="post_rejoin_same_invocation_finish_projection",
-                context=refreshed_context or context,
+                project_id,
+                runtime_context_id,
             )
-        except Exception:
-            # The envelope must not escape if its same-invocation projection
-            # could not be computed after the durable write.  Roll back the
-            # rotated context and accepted audit together.
-            conn.rollback()
-            legacy_template_repair_transaction = ""
-            raise
-        immediate_actionable_payloads = {
-            alias: deepcopy(immediate_recovery.get(alias) or {})
-            for alias in _RUNTIME_CONTEXT_FINISH_FACADE_ALIASES
-            if immediate_recovery.get(alias)
-        }
-        immediate_projection_diagnostics = (
-            (immediate_recovery.get("diagnostics") or {}).get(
-                "finish_facade_projection"
+            try:
+                immediate_recovery = _runtime_context_worker_recovery_details(
+                    ctx,
+                    conn,
+                    project_id=project_id,
+                    runtime_context_id=runtime_context_id,
+                    task_id=str(
+                        result.get("task_id") or context.task_id or ""
+                    ),
+                    parent_task_id=str(
+                        result.get("parent_task_id") or parent_task_id or ""
+                    ),
+                    fence_token=str(result.get("fence_token") or ""),
+                    session_token=str(result.get("session_token") or ""),
+                    session_token_ref=str(
+                        result.get("session_token_ref") or ""
+                    ),
+                    target_project_root=(
+                        _runtime_context_effective_target_project_root(
+                            refreshed_context or context
+                        )
+                    ),
+                    route_identity=safe_route_identity,
+                    reason="post_rejoin_same_invocation_finish_projection",
+                    context=refreshed_context or context,
+                )
+            except Exception:
+                # At the finish position, never let the envelope escape when
+                # its same-invocation facade could not be computed.  Roll back
+                # the rotation and accepted audit together.
+                conn.rollback()
+                legacy_template_repair_transaction = ""
+                raise
+            immediate_actionable_payloads = {
+                alias: deepcopy(immediate_recovery.get(alias) or {})
+                for alias in _RUNTIME_CONTEXT_FINISH_FACADE_ALIASES
+                if immediate_recovery.get(alias)
+            }
+            immediate_projection_diagnostics = (
+                (immediate_recovery.get("diagnostics") or {}).get(
+                    "finish_facade_projection"
+                )
+                if isinstance(immediate_recovery.get("diagnostics"), Mapping)
+                else {}
             )
-            if isinstance(immediate_recovery.get("diagnostics"), Mapping)
-            else {}
-        )
-        result["immediate_finish_facade_projection"] = deepcopy(
-            immediate_projection_diagnostics or {}
-        )
+            result["immediate_finish_facade_projection"] = deepcopy(
+                immediate_projection_diagnostics or {}
+            )
+        else:
+            result["immediate_finish_facade_projection"] = {
+                "status": "not_applicable_at_current_position",
+                "source": "runtime_context_service_timeline_refs",
+                "durable_finish_authority_present": False,
+                "host_envelope_returned": True,
+                "access_audit_recorded": False,
+            }
         if immediate_actionable_payloads:
             immediate_worker_guide = {
                 "schema_version": (
@@ -76722,6 +76748,7 @@ def _audited_postmerge_recovery_authority(
     from .parallel_branch_runtime import (
         AuditedPostmergeRecoveryAuthority,
         get_branch_context,
+        list_merge_queue_items,
     )
 
     def _safe_int(value: Any, default: int = -1) -> int:
@@ -77053,10 +77080,61 @@ def _audited_postmerge_recovery_authority(
             422,
         )
 
+    queue_items = [
+        item
+        for item in list_merge_queue_items(conn, project_id, merge_queue_id)
+        if str(item.task_id or "").strip() == task_id
+        and str(item.backlog_id or "").strip() == backlog_id
+    ]
+    runtime_target_ref = _parallel_branch_allocate_normalized_target_ref(
+        getattr(context, "ref_name", "")
+    )
+    queue_target_ref = (
+        _parallel_branch_allocate_normalized_target_ref(queue_items[0].target_ref)
+        if len(queue_items) == 1
+        else ""
+    )
+    if not (
+        len(queue_items) == 1
+        and queue_target_ref
+        and runtime_target_ref
+        and queue_target_ref == runtime_target_ref
+    ):
+        raise GovernanceError(
+            "audited_postmerge_recovery_scope_mismatch",
+            (
+                "recovery requires one exact durable queue item whose target "
+                "ref matches the persisted runtime context"
+            ),
+            422,
+            {
+                "merge_queue_id": merge_queue_id,
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "durable_queue_item_count": len(queue_items),
+                "durable_target_refs": sorted(
+                    {
+                        _parallel_branch_allocate_normalized_target_ref(
+                            item.target_ref
+                        )
+                        for item in queue_items
+                        if _parallel_branch_allocate_normalized_target_ref(
+                            item.target_ref
+                        )
+                    }
+                ),
+                "runtime_context_target_ref": runtime_target_ref,
+                "caller_target_ref_trusted": False,
+            },
+        )
+
     canonical_root = _graph_governance_project_root(project_id, {})
     branch_ref = str(getattr(context, "branch_ref", "") or "").strip()
     branch_commit = _git_output(canonical_root, ["rev-parse", branch_ref]).lower()
-    target_commit = _git_output(canonical_root, ["rev-parse", "refs/heads/main"]).lower()
+    target_commit = _git_output(
+        canonical_root,
+        ["rev-parse", "--verify", queue_target_ref],
+    ).lower()
     target_clean = _git_clean_worktree_verified(canonical_root)
     candidate_clean = bool(
         context_root.is_dir()
