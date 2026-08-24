@@ -94,6 +94,15 @@ _CANDIDATE_COMMIT_POLICY_NAME = "candidate_commit_evidence_policy"
 _CURRENT_FULL_RECONCILE_POLICY_NAME = "current_full_reconcile_evidence_policy"
 _QA_GRAPH_BASIS_DECISION_SCHEMA_VERSION = "qa_review_graph.basis_decision.v1"
 
+_DIRECT_ROUTE_IDENTITY_FIELDS = (
+    "route_id",
+    "route_context_hash",
+    "prompt_contract_id",
+    "prompt_contract_hash",
+    "visible_injection_manifest_hash",
+    "route_token_ref",
+)
+
 
 @dataclass(frozen=True)
 class WriteGateDecision:
@@ -110,6 +119,162 @@ class WriteGateDecision:
                 dict(item) for item in self.identity_mismatches
             ],
         }
+
+
+def _operator_supervised_direct_main_frozen_active_route_authority_valid(
+    authority: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    immutable_route_identity: Mapping[str, Any],
+    active_route_token_ref: str,
+    expected_files: tuple[str, ...] | list[str],
+) -> bool:
+    """Validate the frozen route Fact without resolving live route state."""
+
+    persisted = dict(authority) if isinstance(authority, Mapping) else {}
+
+    def identity(value: Any) -> dict[str, str]:
+        if not isinstance(value, Mapping):
+            return {}
+        return {
+            field: str(value.get(field) or "").strip()
+            for field in _DIRECT_ROUTE_IDENTITY_FIELDS
+        }
+
+    immutable = identity(immutable_route_identity)
+    frozen_immutable = identity(persisted.get("immutable_route_identity"))
+    frozen_active = identity(persisted.get("active_route_identity"))
+    immutable_ref = immutable.get("route_token_ref", "")
+    active_ref = str(active_route_token_ref or "").strip()
+    chain = [
+        str(item or "").strip()
+        for item in (persisted.get("route_token_ref_chain") or [])
+    ]
+    edges = [
+        str(item or "").strip()
+        for item in (persisted.get("edge_types") or [])
+    ]
+    renewal_used = persisted.get("renewal_used") is True
+    resolution = (
+        persisted.get("resolution_error_details")
+        if isinstance(persisted.get("resolution_error_details"), Mapping)
+        else {}
+    )
+    renewal = (
+        resolution.get("renewal_resolution")
+        if isinstance(resolution.get("renewal_resolution"), Mapping)
+        else {}
+    )
+    exact_scope = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+    resolution_common_exact = bool(
+        resolution.get("schema_version")
+        == "contract_runtime.append_scoped_child_route_resolution.v1"
+        and resolution.get("status") == "resolved_append_scoped_ref"
+        and str(resolution.get("caller_role") or "").strip() == "observer"
+        and str(resolution.get("field") or "").strip() == "allowed_actions"
+        and list(resolution.get("expected") or []) == ["task_timeline_append"]
+        and "task_timeline_append" in list(resolution.get("actual") or [])
+        and resolution.get("public_safe") is True
+        and identity(resolution.get("child_route_identity")) == frozen_active
+        and str(resolution.get("route_token_ref") or "").strip()
+        == immutable_ref
+        and str(resolution.get("requested_route_token_ref") or "").strip()
+        == immutable_ref
+        and str(resolution.get("resolved_route_token_ref") or "").strip()
+        == active_ref
+        and resolution.get("scope") == exact_scope
+        and resolution.get("writes_performed") is False
+        and resolution.get("raw_route_token_exposed") is False
+    )
+    resolution_links_exact = bool(
+        (
+            renewal.get("schema_version")
+            == "route_token_ref_exact_renewal_descendant_resolution.v1"
+            and renewal.get("status") == "resolved_active_descendant"
+            and renewal.get("registry_verified") is True
+            and renewal.get("exact_scope_verified") is True
+            and renewal.get("writes_performed") is False
+            and renewal.get("raw_route_token_exposed") is False
+            and identity(renewal.get("requested_route_identity")) == immutable
+            and identity(renewal.get("resolved_route_identity"))
+            == frozen_active
+            and str(renewal.get("requested_route_token_ref") or "").strip()
+            == immutable_ref
+            and str(renewal.get("resolved_route_token_ref") or "").strip()
+            == active_ref
+            and renewal.get("scope") == exact_scope
+            and list(renewal.get("route_token_ref_chain") or []) == chain
+            and list(renewal.get("edge_types") or []) == edges
+        )
+        if renewal_used
+        else not renewal and frozen_active == immutable
+    )
+    lineage_links_exact = bool(
+        chain
+        and all(chain)
+        and chain[0] == immutable_ref
+        and chain[-1] == active_ref
+        and len(edges) == len(chain) - 1
+        and all(edge in {"renewal", "same_scope_reissue"} for edge in edges)
+        and (len(chain) >= 2 if renewal_used else chain == [immutable_ref])
+        and (renewal_used or not edges)
+    )
+    canonical_files = sorted(
+        {
+            str(path or "").strip()
+            for path in expected_files
+            if str(path or "").strip()
+        }
+    )
+    return bool(
+        persisted.get("schema_version")
+        == "operator_supervised_direct_main.active_route_authority.v1"
+        and persisted.get("passed") is True
+        and str(persisted.get("status") or "").strip() == "passed"
+        and persisted.get("server_derived") is True
+        and persisted.get("caller_claims_trusted") is False
+        and str(persisted.get("source") or "").strip()
+        == "contract_runtime.append_scoped_child_route_resolution"
+        and persisted.get("identity_resolution_exact") is True
+        and persisted.get("scope_exact") is True
+        and persisted.get("registry_verified") is True
+        and persisted.get("historical_pre_mutation_event_rewritten") is False
+        and not str(persisted.get("resolution_error_code") or "").strip()
+        and persisted.get("writes_performed") is False
+        and persisted.get("zero_write_on_failure") is True
+        and persisted.get("raw_route_token_exposed") is False
+        and not list(persisted.get("missing_requirement_ids") or [])
+        and not list(persisted.get("identity_mismatches") or [])
+        and str(persisted.get("project_id") or "").strip() == project_id
+        and str(persisted.get("backlog_id") or "").strip() == backlog_id
+        and str(persisted.get("task_id") or "").strip() == task_id
+        and str(persisted.get("required_action") or "").strip()
+        == "task_timeline_append"
+        and list(persisted.get("expected_files") or []) == canonical_files
+        and frozen_immutable == immutable
+        and all(frozen_immutable.values())
+        and all(frozen_active.values())
+        and frozen_active.get("route_token_ref") == active_ref
+        and str(persisted.get("presented_route_token_ref") or "").strip()
+        == active_ref
+        and lineage_links_exact
+        and resolution_common_exact
+        and resolution_links_exact
+        and str(persisted.get("authority_hash") or "").strip()
+        == stable_sha256(
+            {
+                key: value
+                for key, value in persisted.items()
+                if key != "authority_hash"
+            }
+        )
+    )
 
 
 def bounded_qa_graph_decision_errors(
@@ -589,6 +754,51 @@ def operator_supervised_direct_main_runtime_binding_errors(
             if isinstance(authority.get("route_evidence"), Mapping)
             else {}
         )
+        qa_preflight = (
+            route_evidence.get("direct_main_qa_preflight_authority")
+            if isinstance(
+                route_evidence.get("direct_main_qa_preflight_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        active_route_authority = (
+            qa_preflight.get("active_route_authority")
+            if isinstance(qa_preflight.get("active_route_authority"), Mapping)
+            else {}
+        )
+        qa_preflight_hash = str(
+            qa_preflight.get("authority_hash") or ""
+        ).strip()
+        qa_graph_lines = [
+            line
+            for line in execution_state.get("completed_lines") or []
+            if isinstance(line, Mapping)
+            and str(line.get("line_id") or "").strip()
+            == "qa_graph_context"
+        ]
+        qa_verdict_lines = [
+            line
+            for line in execution_state.get("completed_lines") or []
+            if isinstance(line, Mapping)
+            and str(line.get("line_id") or "").strip()
+            == "qa_independent_verification"
+        ]
+        frozen_route_authority_valid = (
+            _operator_supervised_direct_main_frozen_active_route_authority_valid(
+                active_route_authority,
+                project_id=str(execution_state.get("project_id") or "").strip(),
+                backlog_id=str(execution_state.get("backlog_id") or "").strip(),
+                task_id=str(
+                    execution_state.get("contract_execution_id") or ""
+                ).strip(),
+                immutable_route_identity=route_identity,
+                active_route_token_ref=str(
+                    route_evidence.get("route_token_ref") or ""
+                ).strip(),
+                expected_files=list(binding.get("owned_files") or []),
+            )
+        )
         marker = (
             authority.get("current_full_reconcile_marker")
             if isinstance(
@@ -633,8 +843,65 @@ def operator_supervised_direct_main_runtime_binding_errors(
             and route_evidence.get("protected_action")
             == "graph_current_full_reconcile"
             and route_evidence.get("raw_route_token_persisted") is False
-            and str(route_evidence.get("route_token_ref") or "").strip()
-            == str(route_identity.get("route_token_ref") or "").strip()
+            and frozen_route_authority_valid
+            and qa_preflight.get("schema_version")
+            == (
+                "operator_supervised_direct_main."
+                "reconcile_qa_preflight_authority.v1"
+            )
+            and qa_preflight.get("applicable") is True
+            and qa_preflight.get("passed") is True
+            and str(qa_preflight.get("status") or "").strip() == "passed"
+            and qa_preflight.get("server_derived") is True
+            and qa_preflight.get("caller_claims_trusted") is False
+            and str(qa_preflight.get("project_id") or "").strip()
+            == str(execution_state.get("project_id") or "").strip()
+            and str(qa_preflight.get("backlog_id") or "").strip()
+            == str(execution_state.get("backlog_id") or "").strip()
+            and str(
+                qa_preflight.get("contract_execution_id") or ""
+            ).strip()
+            == str(execution_state.get("contract_execution_id") or "").strip()
+            and str(qa_preflight.get("target_commit_sha") or "")
+            .strip()
+            .lower()
+            in implementation_commits
+            and int(qa_preflight.get("qa_event_id") or 0)
+            == int(authority.get("qa_event_id") or 0)
+            and str(qa_preflight.get("qa_event_ref") or "").strip()
+            == str(authority.get("qa_event_ref") or "").strip()
+            and str(qa_preflight.get("qa_snapshot_id") or "").strip()
+            == str(authority.get("qa_snapshot_id") or "").strip()
+            and str(qa_preflight.get("qa_session_id") or "").strip()
+            == str(authority.get("qa_session_id") or "").strip()
+            and str(qa_preflight.get("qa_authority_hash") or "").strip()
+            == str(authority.get("qa_authority_hash") or "").strip()
+            and int(qa_preflight.get("qa_candidate_count") or 0) == 1
+            and str(
+                qa_preflight.get("contract_runtime_next_line_id") or ""
+            ).strip()
+            == "observer_reconcile"
+            and len(qa_graph_lines) == 1
+            and len(qa_verdict_lines) == 1
+            and str(
+                qa_preflight.get("contract_runtime_qa_graph_line_hash") or ""
+            ).strip()
+            == stable_sha256(dict(qa_graph_lines[0]))
+            and str(
+                qa_preflight.get("contract_runtime_qa_verdict_line_hash") or ""
+            ).strip()
+            == stable_sha256(dict(qa_verdict_lines[0]))
+            and not list(qa_preflight.get("missing_requirement_ids") or [])
+            and qa_preflight.get("zero_write_on_failure") is True
+            and qa_preflight_hash
+            and qa_preflight_hash
+            == stable_sha256(
+                {
+                    key: value
+                    for key, value in qa_preflight.items()
+                    if key != "authority_hash"
+                }
+            )
             and marker.get("schema_version")
             == "current_full_reconcile.provenance.v2"
             and marker.get("protected_action")

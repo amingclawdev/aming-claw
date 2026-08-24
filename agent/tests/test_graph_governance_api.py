@@ -90786,7 +90786,7 @@ def _canonical_parentless_direct_main_implementation_body(
     ids=[
         "fresh-rev3",
         "pinned-rev2",
-        "renewed-rev3-no-pass-diagnostic",
+        "renewed-rev3-current-full-pass",
     ],
 )
 def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_premutation(
@@ -92113,6 +92113,71 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
         assert current_full_authority["route_evidence"][
             "route_token_ref"
         ] == route_token_ref
+        tampered_reconcile_authority = copy.deepcopy(
+            current_full_authority
+        )
+        tampered_preflight = tampered_reconcile_authority[
+            "route_evidence"
+        ]["direct_main_qa_preflight_authority"]
+        tampered_active_route = tampered_preflight[
+            "active_route_authority"
+        ]
+        tampered_active_route["edge_types"] = ["unrelated_reissue"]
+        tampered_active_route["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in tampered_active_route.items()
+                if key != "authority_hash"
+            }
+        )
+        tampered_preflight["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in tampered_preflight.items()
+                if key != "authority_hash"
+            }
+        )
+        tampered_reconcile_authority["authority_hash"] = (
+            server.stable_sha256(
+                {
+                    key: value
+                    for key, value in tampered_reconcile_authority.items()
+                    if key != "authority_hash"
+                }
+            )
+        )
+        tampered_reconcile_changes = conn.total_changes
+        with pytest.raises(GovernanceError) as tampered_reconcile_rejected:
+            server._operator_supervised_direct_main_submit_runtime_line(
+                conn,
+                contract_execution_id=task_id,
+                actor_role="observer",
+                expected_stage_id="reconcile",
+                expected_line_id="observer_reconcile",
+                expected_evidence_kind="current_full_reconcile",
+                payload={
+                    "schema_version": (
+                        "operator_supervised_direct_main."
+                        "reconcile_evidence.v1"
+                    ),
+                    "direct_current_full_reconcile_authority": (
+                        tampered_reconcile_authority
+                    ),
+                    "timeline_payload": {},
+                    "verification": {},
+                },
+                extra={"commit_sha": implementation_commit},
+            )
+        assert tampered_reconcile_rejected.value.code == (
+            "operator_supervised_direct_main_runtime_line_rejected"
+        )
+        assert tampered_reconcile_rejected.value.details["decision"][
+            "errors"
+        ] == [
+            "operator_supervised_direct_main reconcile line requires "
+            "exact current-full provenance"
+        ]
+        assert conn.total_changes == tampered_reconcile_changes
         first_current_full_authority_hash = current_full_authority[
             "authority_hash"
         ]
@@ -92336,114 +92401,16 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
         # intentionally earlier runtime-deployment rejection exercised by the
         # two baseline cases.
         deployment_state["runtime_stale"] = False
-    with pytest.raises(GovernanceError) as stale_close_rejected:
-        server.handle_task_timeline_append(
-            _ctx_with_role(
-                {"project_id": PID},
-                "observer",
-                method="POST",
-                body=copy.deepcopy(close_ready_body),
+    if not route_renewal:
+        with pytest.raises(GovernanceError) as stale_close_rejected:
+            server.handle_task_timeline_append(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body=copy.deepcopy(close_ready_body),
+                )
             )
-        )
-    if route_renewal:
-        assert stale_close_rejected.value.code == (
-            "operator_supervised_direct_main_runtime_line_rejected"
-        )
-        assert stale_close_rejected.value.details["decision"]["errors"] == [
-            "operator_supervised_direct_main reconcile line requires "
-            "exact current-full provenance"
-        ]
-        blocked_record = server._contract_runtime(conn).current_record(
-            task_id,
-            actor_role="observer",
-        )
-        bypass_route = (
-            observer_route_context.issue_observer_write_route_context(
-                project_id=PID,
-                backlog_id=backlog_id,
-                task_id=task_id,
-                target_files=row_files,
-                allowed_actions=["contract_runtime_bypass_line"],
-                evidence_refs=[
-                    f"backlog:{backlog_id}",
-                    f"contract_runtime:{task_id}",
-                    f"current_full_reconcile:{provenance_id}",
-                ],
-            )
-        )
-        observer_route_context.persist_route_token_ref(
-            conn,
-            project_id=PID,
-            route_token_ref=bypass_route["route_token_ref"],
-            token=bypass_route["route_token"],
-        )
-        bypass_result = server.handle_project_contract_runtime_line_bypass(
-            _ctx_with_role(
-                {
-                    "project_id": PID,
-                    "contract_execution_id": task_id,
-                },
-                "observer",
-                method="POST",
-                body={
-                    "bypass_identity": (
-                        f"bypass:{task_id}:revision-"
-                        f"{blocked_record['execution_state_revision']}:"
-                        "reconcile:observer_reconcile"
-                    ),
-                    "stage_id": "reconcile",
-                    "line_id": "observer_reconcile",
-                    "execution_state_revision": blocked_record[
-                        "execution_state_revision"
-                    ],
-                    "runtime_guide_hash": blocked_record["runtime_guide"][
-                        "runtime_guide_hash"
-                    ],
-                    "classification": "system_logic",
-                    "reason": (
-                        "existing reconcile Gate compares active renewal "
-                        "ref literally with immutable binding"
-                    ),
-                    "decision": "proceed_with_no_pass_diagnostic",
-                    "evidence_refs": [
-                        f"contract_runtime:{task_id}",
-                        f"current_full_reconcile:{provenance_id}",
-                    ],
-                    "route_token_ref": bypass_route["route_token_ref"],
-                },
-            )
-        )
-        assert bypass_result["ok"] is True, json.dumps(
-            bypass_result,
-            indent=2,
-            sort_keys=True,
-        )
-        assert bypass_result["written_line"]["no_pass_claim"] is True
-        diagnostic_row = conn.execute(
-            "SELECT status, chain_trigger_json, target_files, test_files "
-            "FROM backlog_bugs "
-            "WHERE bug_id = ?",
-            (bypass_result["diagnostic_backlog_id"],),
-        ).fetchone()
-        source_file_fence = conn.execute(
-            "SELECT target_files, test_files FROM backlog_bugs "
-            "WHERE bug_id = ?",
-            (backlog_id,),
-        ).fetchone()
-        assert diagnostic_row["status"] == "OPEN"
-        assert diagnostic_row["target_files"] == source_file_fence[
-            "target_files"
-        ]
-        assert diagnostic_row["test_files"] == source_file_fence[
-            "test_files"
-        ]
-        assert json.loads(diagnostic_row["chain_trigger_json"])[
-            "line_id"
-        ] == "observer_reconcile"
-        assert bypass_result["runtime_guide"]["next_legal_action"][
-            "line_id"
-        ] == "observer_close_ready"
-    else:
         assert stale_close_rejected.value.code == (
             "parentless_direct_main_close_ready_canonical_evidence_incomplete"
         ), json.dumps(
@@ -92465,35 +92432,6 @@ def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_prem
             body=copy.deepcopy(close_ready_body),
         )
     )
-    if route_renewal:
-        bypassed_record = server._contract_runtime(conn).store.get(task_id)
-        bypassed_lines = {
-            line["line_id"]: line
-            for line in bypassed_record["completed_lines"]
-        }
-        assert bypassed_lines["observer_reconcile"].get(
-            "no_pass_claim"
-        ) is True, json.dumps(
-            bypassed_lines["observer_reconcile"],
-            indent=2,
-            sort_keys=True,
-        )
-        assert bypassed_lines["observer_close_ready"][
-            "evidence_kind"
-        ] == "close_ready"
-        assert bypassed_record["runtime_guide"]["next_legal_action"] is None
-        no_pass_close_authority = (
-            server._contract_runtime_operator_supervised_direct_main_close_authority_gate(
-                conn,
-                project_id=PID,
-                backlog_id=backlog_id,
-                record=bypassed_record,
-                close_commit=implementation_commit,
-            )
-        )
-        assert no_pass_close_authority["passed"] is False
-        assert no_pass_close_authority["status"] == "failed"
-        return
     assert [
         item["line_id"]
         for item in close_ready["payload"][
@@ -93475,6 +93413,19 @@ def test_parentless_direct_main_implementation_accepts_exact_route_renewal_desce
         indent=2,
         sort_keys=True,
     )
+    assert (
+        contract_write_gate.
+        _operator_supervised_direct_main_frozen_active_route_authority_valid(
+            frozen_authority,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            immutable_route_identity=immutable_route_identity,
+            active_route_token_ref=active_route_ref,
+            expected_files=["agent/governance/server.py"],
+        )
+        is True
+    )
 
     def tampered_authority(path, value, *, rehash=True):
         candidate = copy.deepcopy(frozen_authority)
@@ -93523,6 +93474,18 @@ def test_parentless_direct_main_implementation_accepts_exact_route_renewal_desce
         tampered_authority(("edge_types",), ["unrelated_reissue"]),
     ):
         assert persisted_authority_valid(candidate) is False
+        assert not (
+            contract_write_gate.
+            _operator_supervised_direct_main_frozen_active_route_authority_valid(
+                candidate,
+                project_id=PID,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                immutable_route_identity=immutable_route_identity,
+                active_route_token_ref=active_route_ref,
+                expected_files=["agent/governance/server.py"],
+            )
+        )
 
 
 @pytest.mark.parametrize(
