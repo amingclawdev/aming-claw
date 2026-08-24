@@ -73101,6 +73101,7 @@ def test_runtime_context_worker_guide_route_projection_fails_closed_on_ambiguous
         descendant["route_lineage"]["renewal_proof"]
     )
     sibling_proof["route_token_ref"] = sibling["route_token_ref"]
+    sibling_proof["route_identity"] = _route_identity_from_issued_route(sibling)
     sibling_token["route_lineage"] = {"renewal_proof": sibling_proof}
     observer_route_context.persist_route_token_ref(
         conn,
