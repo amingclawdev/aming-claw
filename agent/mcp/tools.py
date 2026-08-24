@@ -3302,19 +3302,24 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
             "join_reason": {"type": "string"},
             "rejoin_reason": {"type": "string"},
             "ttl_seconds": {"type": "integer"},
-            "timeout_seconds": {
-                "type": "integer",
-                "minimum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS,
-                "maximum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS,
-                "default": _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS,
-                "description": (
-                    "MCP-to-governance transport timeout only; never forwarded "
-                    "in the RuntimeContext write body."
-                ),
-            },
             "now_iso": {"type": "string"},
         }
     )
+    return properties
+
+
+def _runtime_context_host_issuance_schema_properties() -> dict[str, Any]:
+    properties = _runtime_context_write_schema_properties()
+    properties["timeout_seconds"] = {
+        "type": "integer",
+        "minimum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS,
+        "maximum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS,
+        "default": _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS,
+        "description": (
+            "MCP-to-governance transport timeout only; never forwarded in the "
+            "RuntimeContext write body."
+        ),
+    }
     return properties
 
 
@@ -3344,7 +3349,7 @@ def _runtime_context_write_body(args: dict) -> dict:
     return {
         key: value
         for key, value in args.items()
-        if key not in {"project_id", "timeout_seconds"} and value is not None
+        if key != "project_id" and value is not None
     }
 
 
@@ -6664,7 +6669,7 @@ TOOLS: list[dict] = [
         "description": "Observer/host-adapter facade that issues the first audited worker host envelope before mf_sub read-receipt/startup lineage exists. Does not persist raw tokens.",
         "inputSchema": {
             "type": "object",
-            "properties": _runtime_context_write_schema_properties(),
+            "properties": _runtime_context_host_issuance_schema_properties(),
             "required": ["project_id", "runtime_context_id", "task_id", "reason"],
         },
     },
@@ -6673,7 +6678,7 @@ TOOLS: list[dict] = [
         "description": "Runtime Context session-token rotation facade for expired or lost pre-startup mf_sub auth. Accepts either the server-projected copy-safe session_token_ref recovery proof or matching raw session/fence proof, and never persists raw tokens.",
         "inputSchema": {
             "type": "object",
-            "properties": _runtime_context_write_schema_properties(),
+            "properties": _runtime_context_host_issuance_schema_properties(),
             "required": ["project_id", "runtime_context_id", "task_id"],
             "anyOf": _runtime_context_session_token_reissue_auth_branches(),
         },
@@ -6683,7 +6688,7 @@ TOOLS: list[dict] = [
         "description": "Observer recovery facade that issues an audited worker host envelope when a resumed mf_sub session lost raw worker auth material. Does not authorize ref-only worker writes.",
         "inputSchema": {
             "type": "object",
-            "properties": _runtime_context_write_schema_properties(),
+            "properties": _runtime_context_host_issuance_schema_properties(),
             "required": ["project_id", "runtime_context_id", "task_id", "reason"],
         },
     },
@@ -9259,6 +9264,7 @@ class ToolDispatcher:
             )
             body = _runtime_context_write_body(request_args)
             if name in WORKER_MCP_HOST_ONLY_TOOLS:
+                body.pop("timeout_seconds", None)
                 result = self._governance_api_with_timeout(
                     "POST",
                     path,

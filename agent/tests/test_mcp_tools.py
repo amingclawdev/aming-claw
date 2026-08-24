@@ -4982,6 +4982,23 @@ def test_runtime_host_issuance_timeout_schema_matches_existing_policy():
         assert "transport timeout only" in runtime_timeout_schema["description"]
         assert "RuntimeContext write body" in runtime_timeout_schema["description"]
 
+    for tool_name in (
+        "runtime_context_current",
+        "runtime_context_worker_guide",
+        "runtime_context_read_receipt",
+        "runtime_context_implementation_evidence",
+        "runtime_context_scope_insufficiency_request",
+        "runtime_context_worker_commit",
+        "runtime_context_finish_time_worker_attestation",
+        "runtime_context_finish_gate",
+        "parallel_branch_startup",
+    ):
+        assert "timeout_seconds" not in _tool_properties(tool_name)
+    assert (
+        "timeout_seconds"
+        not in _tool_properties("graph_query")["managed_rejoin"]["properties"]
+    )
+
 
 def test_managed_mcp_contract_runtime_timeout_is_transport_only_and_exact_once(
 ):

@@ -6469,6 +6469,22 @@ def test_governance_mcp_contract_runtime_timeout_policy_is_bounded_and_configura
         assert "transport timeout only" in runtime_timeout_schema["description"]
         assert "RuntimeContext write body" in runtime_timeout_schema["description"]
 
+    for tool_name in (
+        "runtime_context_current",
+        "runtime_context_worker_guide",
+        "runtime_context_read_receipt",
+        "runtime_context_implementation_evidence",
+        "runtime_context_scope_insufficiency_request",
+        "runtime_context_worker_commit",
+        "runtime_context_finish_time_worker_attestation",
+        "runtime_context_finish_gate",
+        "parallel_branch_startup",
+    ):
+        assert (
+            "timeout_seconds"
+            not in tool_by_name[tool_name]["inputSchema"]["properties"]
+        )
+
 
 def test_governance_mcp_runtime_host_issuance_timeout_is_transport_only(
     monkeypatch,
