@@ -2854,7 +2854,7 @@ def test_mcp_runtime_context_write_tools_dispatch_to_canonical_facades(monkeypat
         )["inputSchema"]
         assert "lane_id" in implementation_schema["properties"]
 
-    def fake_http(method, path, body=None):
+    def fake_http(method, path, body=None, *, timeout_seconds=None):
         calls.append((method, path, body))
         return {"ok": True, "path": path}
 
@@ -6453,6 +6453,111 @@ def test_governance_mcp_contract_runtime_timeout_policy_is_bounded_and_configura
         ["timeout_seconds"]
         == timeout_schema
     )
+
+    for tool_name in (
+        "runtime_context_session_token_initial_join",
+        "runtime_context_session_token_reissue",
+        "runtime_context_session_token_rejoin",
+    ):
+        runtime_timeout_schema = tool_by_name[tool_name]["inputSchema"][
+            "properties"
+        ]["timeout_seconds"]
+        policy_fields = ("type", "minimum", "maximum", "default")
+        assert {
+            field: runtime_timeout_schema[field] for field in policy_fields
+        } == {field: timeout_schema[field] for field in policy_fields}
+        assert "transport timeout only" in runtime_timeout_schema["description"]
+        assert "RuntimeContext write body" in runtime_timeout_schema["description"]
+
+
+def test_governance_mcp_runtime_host_issuance_timeout_is_transport_only(
+    monkeypatch,
+):
+    continuity = runtime_mcp_tool_module.ManagedHostEnvelopeContinuity()
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_HOST_ENVELOPE_CONTINUITY",
+        continuity,
+    )
+    route = {
+        "route_id": "route-mirror-host-timeout",
+        "route_context_hash": "sha256:" + ("4" * 64),
+        "prompt_contract_id": "rprompt-mirror-host-timeout",
+        "prompt_contract_hash": "sha256:" + ("5" * 64),
+        "route_token_ref": "rtok-mirror-host-timeout",
+        "visible_injection_manifest_hash": "sha256:" + ("6" * 64),
+    }
+    calls = []
+
+    def fake_http(method, path, data=None, *, gov_token=None, timeout_seconds=None):
+        calls.append((method, path, data, gov_token, timeout_seconds))
+        index = len(calls)
+        raw_session = f"mirror-timeout-session-{index}"
+        raw_fence = f"mirror-timeout-fence-{index}"
+        identity = {
+            "project_id": "aming-claw",
+            "runtime_context_id": data["runtime_context_id"],
+            "task_id": data["task_id"],
+            "parent_task_id": data["parent_task_id"],
+            "contract_execution_id": data["contract_execution_id"],
+            "target_project_root": data["target_project_root"],
+            "worker_id": data["worker_id"],
+            "worker_slot_id": data["worker_slot_id"],
+            "actual_host_worker_id": data["actual_host_worker_id"],
+            "worker_session_id": data["worker_session_id"],
+            "host_session_id": data["host_session_id"],
+            "session_token_ref": data["session_token_ref"],
+            **route,
+        }
+        return {
+            "ok": True,
+            "status": "session_token_issued",
+            "delivery": "worker_host_envelope",
+            **identity,
+            "session_token": raw_session,
+            "fence_token": raw_fence,
+            "host_envelope": {
+                **identity,
+                "env": {
+                    "AMING_WORKER_SESSION_TOKEN": raw_session,
+                    "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                },
+            },
+        }
+
+    monkeypatch.setattr(governance_mcp_server, "_http", fake_http)
+    cases = (
+        ("runtime_context_session_token_initial_join", 45, 45),
+        ("runtime_context_session_token_reissue", 1, 10),
+        ("runtime_context_session_token_rejoin", None, 120),
+    )
+    for index, (tool_name, requested_timeout, expected_timeout) in enumerate(cases):
+        identity = {
+            "project_id": "aming-claw",
+            "runtime_context_id": f"mfrctx-mirror-timeout-{index}",
+            "task_id": f"worker-mirror-timeout-{index}",
+            "parent_task_id": "cex-mirror-timeout",
+            "contract_execution_id": "cex-mirror-timeout",
+            "target_project_root": f"/tmp/mirror-timeout-{index}",
+            "worker_id": f"worker-mirror-timeout-{index}",
+            "worker_slot_id": f"slot-mirror-timeout-{index}",
+            "actual_host_worker_id": f"worker-mirror-timeout-{index}",
+            "worker_session_id": f"session-mirror-timeout-{index}",
+            "host_session_id": f"session-mirror-timeout-{index}",
+            "session_token_ref": f"wstok-mirror-timeout-{index}",
+            **route,
+        }
+        arguments = {**identity, "reason": "exercise mirror transport policy"}
+        if requested_timeout is not None:
+            arguments["timeout_seconds"] = requested_timeout
+        result = governance_mcp_server._dispatch_tool(tool_name, arguments)
+
+        assert calls[-1][4] == expected_timeout
+        assert "timeout_seconds" not in calls[-1][2]
+        assert result["auth_loaded"] is True
+        assert result["managed_host_envelope"]["status"] == "staged"
+        assert "session_token" not in result
+        assert "fence_token" not in result
 
 
 def test_governance_mcp_contract_runtime_timeout_is_transport_only_with_disposition(

@@ -713,6 +713,16 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
             "join_reason": {"type": "string"},
             "rejoin_reason": {"type": "string"},
             "ttl_seconds": {"type": "integer"},
+            "timeout_seconds": {
+                "type": "integer",
+                "minimum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS,
+                "maximum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MAX_SECONDS,
+                "default": _CONTRACT_RUNTIME_MCP_TIMEOUT_DEFAULT_SECONDS,
+                "description": (
+                    "MCP-to-governance transport timeout only; never forwarded "
+                    "in the RuntimeContext write body."
+                ),
+            },
             "now_iso": {"type": "string"},
         }
     )
@@ -1526,7 +1536,7 @@ def _runtime_context_write_body(args: dict) -> dict:
     return {
         key: value
         for key, value in args.items()
-        if key != "project_id" and value is not None
+        if key not in {"project_id", "timeout_seconds"} and value is not None
     }
 
 
@@ -4261,12 +4271,19 @@ def _dispatch_tool(name: str, args: dict) -> Any:
             }
             else args
         )
-        return _http(
-            "POST",
+        path = (
             f"/api/graph-governance/{pid}/runtime-contexts/"
-            f"{runtime_context_id}/{suffix_by_name[name]}",
-            _runtime_context_write_body(request_args),
+            f"{runtime_context_id}/{suffix_by_name[name]}"
         )
+        body = _runtime_context_write_body(request_args)
+        if name in _WORKER_MCP_HOST_ONLY_TOOLS:
+            return _http(
+                "POST",
+                path,
+                body,
+                timeout_seconds=_contract_runtime_mcp_timeout_seconds(args),
+            )
+        return _http("POST", path, body)
 
     if name == "parallel_branch_allocate_precheck":
         pid = args["project_id"]

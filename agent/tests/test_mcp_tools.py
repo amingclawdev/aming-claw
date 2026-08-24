@@ -4876,6 +4876,113 @@ def test_managed_mcp_contract_runtime_timeout_policy_is_bounded_and_configurable
     ) == 45
 
 
+def test_managed_runtime_host_issuance_timeout_is_transport_only_and_stages():
+    route = {
+        "route_id": "route-host-issuance-timeout",
+        "route_context_hash": "sha256:" + ("1" * 64),
+        "prompt_contract_id": "rprompt-host-issuance-timeout",
+        "prompt_contract_hash": "sha256:" + ("2" * 64),
+        "route_token_ref": "rtok-host-issuance-timeout",
+        "visible_injection_manifest_hash": "sha256:" + ("3" * 64),
+    }
+    cases = (
+        ("runtime_context_session_token_initial_join", 45, 45),
+        ("runtime_context_session_token_reissue", 1, 10),
+        ("runtime_context_session_token_rejoin", None, 120),
+    )
+
+    for index, (tool_name, requested_timeout, expected_timeout) in enumerate(cases):
+        raw_session = f"managed-timeout-session-{index}"
+        raw_fence = f"managed-timeout-fence-{index}"
+        identity = {
+            "project_id": "aming-claw",
+            "runtime_context_id": f"mfrctx-host-timeout-{index}",
+            "task_id": f"worker-host-timeout-{index}",
+            "parent_task_id": "cex-host-timeout",
+            "contract_execution_id": "cex-host-timeout",
+            "target_project_root": f"/tmp/host-timeout-{index}",
+            "worker_id": f"worker-host-timeout-{index}",
+            "worker_slot_id": f"slot-host-timeout-{index}",
+            "agent_id": f"worker-host-timeout-{index}",
+            "allocation_owner": f"worker-host-timeout-{index}",
+            "actual_host_worker_id": f"worker-host-timeout-{index}",
+            "worker_session_id": f"session-host-timeout-{index}",
+            "host_session_id": f"session-host-timeout-{index}",
+            "session_token_ref": f"wstok-host-timeout-{index}",
+            **route,
+        }
+        calls = []
+
+        def generic_api(*_args, **_kwargs):
+            raise AssertionError("host issuance must use the timeout-aware transport")
+
+        dispatcher = ToolDispatcher(generic_api, worker_pool=None)
+
+        def timeout_api(method, path, data=None, *, timeout_seconds):
+            calls.append((method, path, data, timeout_seconds))
+            return {
+                "ok": True,
+                "status": "session_token_issued",
+                "delivery": "worker_host_envelope",
+                **identity,
+                "session_token": raw_session,
+                "fence_token": raw_fence,
+                "host_envelope": {
+                    **identity,
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": raw_session,
+                        "AMING_WORKER_FENCE_TOKEN": raw_fence,
+                    },
+                },
+            }
+
+        dispatcher._governance_api_with_timeout = timeout_api
+        arguments = {**identity, "reason": "exercise existing transport policy"}
+        if requested_timeout is not None:
+            arguments["timeout_seconds"] = requested_timeout
+        result = dispatcher.dispatch(tool_name, arguments)
+
+        assert calls[0][3] == expected_timeout
+        assert "timeout_seconds" not in calls[0][2]
+        assert result["auth_loaded"] is True
+        assert result["managed_host_envelope"]["status"] == "staged"
+        assert raw_session not in json.dumps(result, sort_keys=True)
+        assert raw_fence not in json.dumps(result, sort_keys=True)
+        assert dispatcher._host_envelope_continuity.pending_count() == 1
+
+    dispatcher = ToolDispatcher(lambda *_args, **_kwargs: {}, worker_pool=None)
+    dispatcher._governance_api_with_timeout = lambda *_args, **_kwargs: {
+        "ok": False,
+        "error": "request_timeout",
+        "message": "timed out",
+    }
+    timeout_result = dispatcher.dispatch(
+        "runtime_context_session_token_rejoin",
+        {**identity, "reason": "preserve ambiguous transport truth"},
+    )
+    assert timeout_result["error"] == "request_timeout"
+    assert "writes_performed" not in timeout_result
+    assert timeout_result.get("zero_write_rejection") is not True
+
+
+def test_runtime_host_issuance_timeout_schema_matches_existing_policy():
+    timeout_schema = _tool_properties("contract_runtime_submit_line")[
+        "timeout_seconds"
+    ]
+    policy_fields = ("type", "minimum", "maximum", "default")
+    for tool_name in (
+        "runtime_context_session_token_initial_join",
+        "runtime_context_session_token_reissue",
+        "runtime_context_session_token_rejoin",
+    ):
+        runtime_timeout_schema = _tool_properties(tool_name)["timeout_seconds"]
+        assert {
+            field: runtime_timeout_schema[field] for field in policy_fields
+        } == {field: timeout_schema[field] for field in policy_fields}
+        assert "transport timeout only" in runtime_timeout_schema["description"]
+        assert "RuntimeContext write body" in runtime_timeout_schema["description"]
+
+
 def test_managed_mcp_contract_runtime_timeout_is_transport_only_and_exact_once(
 ):
     calls = []
