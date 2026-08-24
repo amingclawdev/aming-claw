@@ -145105,14 +145105,41 @@ def test_compact_worker_and_onboard_finish_facades_share_bounded_authority(
         assert compact_attestation["full_worker_guide_builder_called"] is False
         assert compact_attestation["full_runtime_projection_called"] is False
 
+        mismatched_attestation_selector = copy.deepcopy(
+            compact_attestation["contract_runtime_next_legal_action"]
+        )
+        mismatched_attestation_selector["writer_role_safe_copy_payload"][
+            "copy_payload"
+        ]["runtime_guide_hash"] = "sha256:mismatched-writer"
+        mismatched_projection = (
+            candidate_server._onboard_worker_read_runtime_facade_projection(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                next_action=mismatched_attestation_selector,
+                current_projection={"contract_execution_id": execution_id},
+                runtime_resume={},
+                requested_task_id=worker_task_id,
+                requested_route_token_ref=attestation_action[
+                    "copy_safe_body"
+                ]["route_token_ref"],
+            )
+        )
+        assert mismatched_projection.get("actionable") is False
+        assert mismatched_projection[
+            "worker_finish_runtime_facade_projection"
+        ]["reason"] == "source_backed_runtime_context_facade_unavailable"
+
+        paged_attestation_selector = copy.deepcopy(
+            compact_attestation["contract_runtime_next_legal_action"]
+        )
+        paged_attestation_selector.pop("writer_role_safe_copy_payload", None)
         projected_attestation = (
             candidate_server._onboard_worker_read_runtime_facade_projection(
                 conn,
                 project_id=PID,
                 backlog_id=backlog_id,
-                next_action=compact_attestation[
-                    "contract_runtime_next_legal_action"
-                ],
+                next_action=paged_attestation_selector,
                 current_projection={"contract_execution_id": execution_id},
                 runtime_resume={},
                 requested_task_id=worker_task_id,
@@ -145131,7 +145158,7 @@ def test_compact_worker_and_onboard_finish_facades_share_bounded_authority(
                 project_id=PID,
                 backlog_id=backlog_id,
                 role="mf_sub",
-                work_type="mf_parallel",
+                work_type="parallel_worker",
                 record={"contract_execution_id": execution_id},
                 next_action=projected_attestation,
                 current_projection={"contract_execution_id": execution_id},
@@ -145322,14 +145349,16 @@ def test_compact_worker_and_onboard_finish_facades_share_bounded_authority(
                 "runtime_context_finish_gate"
             )
             assert runtime.store.get(execution_id) == generic_before_finish
+        paged_finish_selector = copy.deepcopy(
+            compact_finish["contract_runtime_next_legal_action"]
+        )
+        paged_finish_selector.pop("writer_role_safe_copy_payload", None)
         projected_finish = (
             candidate_server._onboard_worker_read_runtime_facade_projection(
                 conn,
                 project_id=PID,
                 backlog_id=backlog_id,
-                next_action=compact_finish[
-                    "contract_runtime_next_legal_action"
-                ],
+                next_action=paged_finish_selector,
                 current_projection={"contract_execution_id": execution_id},
                 runtime_resume={},
                 requested_task_id=worker_task_id,
@@ -145343,7 +145372,7 @@ def test_compact_worker_and_onboard_finish_facades_share_bounded_authority(
                 project_id=PID,
                 backlog_id=backlog_id,
                 role="mf_sub",
-                work_type="mf_parallel",
+                work_type="parallel_worker",
                 record={"contract_execution_id": execution_id},
                 next_action=projected_finish,
                 current_projection={"contract_execution_id": execution_id},

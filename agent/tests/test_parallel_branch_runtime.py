@@ -4368,6 +4368,19 @@ def test_runtime_context_current_values_accept_legacy_implementation_evidence_ki
     assert action_plan["next_legal_action"] == (
         "record_finish_time_worker_attestation"
     )
+    finish_direction = action_plan["next_required_evidence"][0]
+    assert finish_direction["id"] == "finish_time_worker_attestation"
+    assert finish_direction["is_next"] is True
+    assert finish_direction["next_action"] == (
+        "record_finish_time_worker_attestation"
+    )
+    assert finish_direction["expected_source"] == (
+        "worker_transcript_verify.finish_time_worker_self_attestation"
+    )
+    assert finish_direction["consumer"] == (
+        "mf_subagent_contract.validate_mf_subagent_finish_gate"
+    )
+    assert "contract_runtime_submit_line" not in json.dumps(action_plan)
 
 
 def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_independent() -> None:

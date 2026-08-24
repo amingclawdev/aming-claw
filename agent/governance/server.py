@@ -42908,10 +42908,10 @@ def _runtime_context_bounded_finish_facade_payload(
         task_id=task_id,
     ):
         return {}
-    # Managed compact reads intentionally page owner/role metadata while
-    # retaining the current writer-role copy payload.  Treat that input as an
-    # exact selector only: the re-read ContractRuntime projection above stays
-    # authoritative for ordering, role, revision, and writer hash.
+    # Managed compact reads may page owner/role metadata and the generic
+    # writer-role copy payload. Treat supplied fields as an exact selector:
+    # the re-read ContractRuntime projection above stays authoritative for
+    # ordering, role, revision, and writer hash.
     required_selector_fields = (
         "action",
         "stage_id",
@@ -42943,13 +42943,17 @@ def _runtime_context_bounded_finish_facade_payload(
     persisted_writer = persisted_next_action.get(
         "writer_role_safe_copy_payload"
     )
-    if not isinstance(requested_writer, Mapping) or not isinstance(
-        persisted_writer,
-        Mapping,
-    ):
+    if not isinstance(persisted_writer, Mapping):
         return {}
-    if _stable_public_hash(requested_writer) != _stable_public_hash(
-        persisted_writer
+    # The chain-current/onboard projection may intentionally page the generic
+    # writer body. Its absence is not a second authority decision: the exact
+    # persisted ContractRuntime line above remains authoritative and supplies
+    # the specialized RuntimeContext facade. If a caller does carry a writer
+    # body, however, it must still match the persisted writer exactly.
+    if requested_writer is not None and (
+        not isinstance(requested_writer, Mapping)
+        or _stable_public_hash(requested_writer)
+        != _stable_public_hash(persisted_writer)
     ):
         return {}
     contract_next_action = persisted_next_action
