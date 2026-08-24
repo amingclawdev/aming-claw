@@ -3633,6 +3633,46 @@ def test_failed_qa_fresh_dispatch_revision_is_append_only_single_cas_and_replay_
     assert len(store.record["completed_lines"]) == 3
     assert store.record["execution_state_revision"] == 12
 
+    different_identity = deepcopy(write)
+    different_identity.update(
+        {
+            "runtime_context_id": "mfrctx-replacement-b",
+            "task_id": "worker-replacement-b",
+            "worker_id": "worker-replacement-b",
+            "worker_slot_id": "worker-replacement-b",
+        }
+    )
+    different_identity["payload"].update(
+        {
+            "runtime_context_id": "mfrctx-replacement-b",
+            "task_id": "worker-replacement-b",
+            "worker_id": "worker-replacement-b",
+            "worker_slot_id": "worker-replacement-b",
+        }
+    )
+    different_authority = different_identity["payload"][
+        "failed_qa_rework_dispatch_revision_authority"
+    ]
+    different_authority.update(
+        {
+            "runtime_context_id": "mfrctx-replacement-b",
+            "task_id": "worker-replacement-b",
+        }
+    )
+    second_identity = runtime.revise_failed_qa_observer_dispatch(
+        record["contract_execution_id"],
+        different_identity,
+        actor_role="observer",
+    )
+    assert second_identity["ok"] is False
+    assert any(
+        "already has a different canonical replacement" in error
+        for error in second_identity["decision"]["errors"]
+    )
+    assert store.update_calls == 1
+    assert len(store.record["completed_lines"]) == 3
+    assert store.record["execution_state_revision"] == 12
+
     preserved_first_cycle = deepcopy(store.record["completed_lines"])
     later_failed_qa = deepcopy(failed_qa)
     later_failed_qa["payload"]["acceptance_failed"] = [

@@ -9955,7 +9955,7 @@ class ContractRuntime:
                 "failed-QA dispatch revision authority task_id must match"
             )
 
-        matching_dispatches: list[tuple[int, Mapping[str, Any]]] = []
+        current_cycle_dispatches: list[tuple[int, Mapping[str, Any]]] = []
         for index, candidate in enumerate(lines):
             if not isinstance(candidate, Mapping):
                 continue
@@ -9967,93 +9967,94 @@ class ContractRuntime:
                 != "dispatch_bounded_worker"
             ):
                 continue
-            if (
-                _worker_commit_text(candidate, "runtime_context_id")
-                == runtime_context_id
-                and _worker_commit_text(candidate, "task_id") == task_id
-            ):
-                matching_dispatches.append((index, candidate))
-
-        current_cycle_matching_dispatches: list[
-            tuple[int, Mapping[str, Any]]
-        ] = []
-        for matching_index, matched in matching_dispatches:
-            matched_payload = (
-                matched.get("payload")
-                if isinstance(matched.get("payload"), Mapping)
+            candidate_payload = (
+                candidate.get("payload")
+                if isinstance(candidate.get("payload"), Mapping)
                 else {}
             )
-            matched_revision = (
-                matched_payload.get("failed_qa_rework_dispatch_revision")
+            candidate_revision = (
+                candidate_payload.get("failed_qa_rework_dispatch_revision")
                 if isinstance(
-                    matched_payload.get(
+                    candidate_payload.get(
                         "failed_qa_rework_dispatch_revision"
                     ),
                     Mapping,
                 )
                 else {}
             )
-            matched_authority = (
-                matched_payload.get(
+            candidate_authority = (
+                candidate_payload.get(
                     "failed_qa_rework_dispatch_revision_authority"
                 )
                 if isinstance(
-                    matched_payload.get(
+                    candidate_payload.get(
                         "failed_qa_rework_dispatch_revision_authority"
                     ),
                     Mapping,
                 )
                 else {}
             )
+            candidate_runtime_context_id = _worker_commit_text(
+                candidate,
+                "runtime_context_id",
+            )
+            candidate_task_id = _worker_commit_text(candidate, "task_id")
             if (
-                matching_index > failed_qa_index
-                and matched_revision.get("append_only_history_preserved") is True
-                and matched_revision.get("timeline_projection_authoritative") is False
+                index > failed_qa_index
+                and candidate_runtime_context_id
+                and candidate_task_id
+                and candidate_revision.get("append_only_history_preserved") is True
+                and candidate_revision.get("timeline_projection_authoritative")
+                is False
                 and int(
-                    matched_revision.get("failed_qa_completed_line_index")
-                    if matched_revision.get("failed_qa_completed_line_index")
+                    candidate_revision.get("failed_qa_completed_line_index")
+                    if candidate_revision.get("failed_qa_completed_line_index")
                     is not None
                     else -1
                 )
                 == failed_qa_index
-                and str(matched_revision.get("runtime_context_id") or "").strip()
-                == runtime_context_id
-                and str(matched_revision.get("task_id") or "").strip() == task_id
-                and matched_authority.get("server_derived") is True
-                and str(matched_authority.get("source") or "").strip()
+                and str(
+                    candidate_revision.get("runtime_context_id") or ""
+                ).strip()
+                == candidate_runtime_context_id
+                and str(candidate_revision.get("task_id") or "").strip()
+                == candidate_task_id
+                and candidate_authority.get("server_derived") is True
+                and str(candidate_authority.get("source") or "").strip()
                 == "parallel_branch_allocate_failed_qa_rework"
                 and str(
-                    matched_authority.get("contract_execution_id") or ""
+                    candidate_authority.get("contract_execution_id") or ""
                 ).strip()
                 == str(contract_execution_id).strip()
                 and int(
-                    matched_authority.get("failed_qa_completed_line_index")
-                    if matched_authority.get("failed_qa_completed_line_index")
+                    candidate_authority.get("failed_qa_completed_line_index")
+                    if candidate_authority.get("failed_qa_completed_line_index")
                     is not None
                     else -1
                 )
                 == failed_qa_index
                 and str(
-                    matched_authority.get("runtime_context_id") or ""
+                    candidate_authority.get("runtime_context_id") or ""
                 ).strip()
-                == runtime_context_id
-                and str(matched_authority.get("task_id") or "").strip()
-                == task_id
+                == candidate_runtime_context_id
+                and str(candidate_authority.get("task_id") or "").strip()
+                == candidate_task_id
             ):
-                current_cycle_matching_dispatches.append(
-                    (matching_index, matched)
-                )
+                current_cycle_dispatches.append((index, candidate))
 
         exact_replay = False
-        if len(current_cycle_matching_dispatches) > 1:
+        if len(current_cycle_dispatches) > 1:
             errors.append(
                 "failed-QA dispatch revision has multiple current-cycle "
                 "replacement RuntimeContext authorities"
             )
-        elif current_cycle_matching_dispatches:
-            _matching_index, matched = current_cycle_matching_dispatches[0]
+        elif current_cycle_dispatches:
+            _matching_index, matched = current_cycle_dispatches[0]
             exact_replay = (
-                _worker_commit_text(matched, "parent_task_id")
+                _worker_commit_text(matched, "runtime_context_id")
+                == runtime_context_id
+                and _worker_commit_text(matched, "task_id") == task_id
+                and _worker_commit_text(matched, "parent_task_id")
                 == parent_task_id
                 and _worker_commit_text(matched, "worker_id")
                 == _worker_commit_text(effective_write, "worker_id")
@@ -10087,8 +10088,8 @@ class ContractRuntime:
             )
             if not exact_replay:
                 errors.append(
-                    "failed-QA dispatch revision conflicts with the current-cycle "
-                    "replacement RuntimeContext dispatch"
+                    "failed-QA source generation already has a different "
+                    "canonical replacement RuntimeContext authority"
                 )
 
         if errors:
