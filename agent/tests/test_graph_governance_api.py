@@ -162060,6 +162060,99 @@ def test_mf_parallel_revise_rev10_rejects_prefill_topology_change_zero_write(
     ).fetchone()[0] == timeline_count_before
 
 
+def test_mf_batch_parent_derives_row_successors_and_durable_queue(
+    conn,
+):
+    prepared = _prepare_guide_bound_mf_batch_entry(
+        conn,
+        suffix="SERVER-DERIVED-FANOUT",
+        required_worker_count=2,
+    )
+    caller_body = prepared["action_input"]
+
+    assert not set(server._MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS).intersection(
+        caller_body
+    )
+    assert {
+        "merge_queue_id",
+        "merge_queue_plan",
+        "per_row_successors",
+    }.isdisjoint(caller_body)
+
+    entered = server.handle_project_mf_batch_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=caller_body,
+        )
+    )
+
+    payload = entered["event"]["payload"]
+    assert payload["source_backed_contract_authority"] == (
+        server._mf_batch_parallel_source_contract_authority()
+    )
+    queue_plan = entered["merge_queue_plan"]
+    assert queue_plan["source_of_authority"] == (
+        "server.handle_project_mf_batch_parallel_enter"
+    )
+    assert queue_plan["durable_queue_write"] is True
+    assert queue_plan["durable_queue_item_count"] == 2
+
+    planned_items = sorted(
+        queue_plan["planned_items"],
+        key=lambda item: (item["queue_index"], item["queue_item_id"]),
+    )
+    durable_items = list_merge_queue_items(
+        conn,
+        PID,
+        queue_plan["merge_queue_id"],
+    )
+    assert [
+        (
+            item.queue_index,
+            item.queue_item_id,
+            item.backlog_id,
+            item.task_id,
+        )
+        for item in durable_items
+    ] == [
+        (
+            item["queue_index"],
+            item["queue_item_id"],
+            item["backlog_id"],
+            item["task_id"],
+        )
+        for item in planned_items
+    ]
+
+    planned_by_backlog = {
+        item["backlog_id"]: item for item in planned_items
+    }
+    successors = {
+        item["backlog_id"]: item for item in entered["per_row_successors"]
+    }
+    assert set(successors) == set(prepared["child_ids"])
+    for backlog_id, successor in successors.items():
+        planned = planned_by_backlog[backlog_id]
+        assert successor["requires_distinct_route_token_ref"] is True
+        assert successor["route_token_task_id_policy"] == (
+            "mf_parallel_successor_execution_id"
+        )
+        assert successor["body"]["task_id"] == planned["task_id"]
+        assert successor["body"]["parent_batch_id"] == entered["batch_id"]
+        assert successor["body"]["onboard_service_waiver"] is True
+        assert successor["body"]["merge_queue_id"] == queue_plan["merge_queue_id"]
+        assert successor["body"]["merge_queue_item"] == planned
+        assert successor["body"]["metadata"]["required_worker_count"] == 1
+        assert successor["body"]["metadata"]["lane_intents"][0][
+            "owned_files"
+        ] == planned["owned_files"]
+
+    assert payload["fanout_policy"]["per_row_successors"] == entered[
+        "per_row_successors"
+    ]
+
+
 def test_mf_batch_parallel_enter_returns_row_scoped_fanout_plan(
     conn,
     monkeypatch,
