@@ -583,10 +583,13 @@ def test_direct_main_rev3_demo_bypass_to_end_stays_no_pass_audit_only():
     assert '"PASS"' not in json.dumps(record["runtime_guide"], sort_keys=True)
 
 
-def test_direct_main_rev2_strict_runtime_binding_is_authoritative_at_write_gate():
+@pytest.mark.parametrize("revision", ["rev2", "rev3"])
+def test_direct_main_strict_runtime_binding_is_authoritative_at_write_gate(
+    revision,
+):
     runtime = ContractRuntime(ContractDefinitionRegistry())
-    execution_id = "cex-direct-main-rev2-strict-binding"
-    backlog_id = "AC-DIRECT-MAIN-REV2-STRICT-BINDING"
+    execution_id = f"cex-direct-main-{revision}-strict-binding"
+    backlog_id = f"AC-DIRECT-MAIN-{revision.upper()}-STRICT-BINDING"
     route_identity = {
         "route_id": "route-direct-main-rev2-strict-binding",
         "route_context_hash": "sha256:" + "1" * 64,
@@ -606,8 +609,8 @@ def test_direct_main_rev2_strict_runtime_binding_is_authoritative_at_write_gate(
         "route_identity": route_identity,
         "owned_files": ["agent/governance/server.py"],
         "target_files": ["agent/governance/server.py"],
-        "target_project_root": "/tmp/direct-main-rev2",
-        "worktree_path": "/tmp/direct-main-rev2",
+        "target_project_root": f"/tmp/direct-main-{revision}",
+        "worktree_path": f"/tmp/direct-main-{revision}",
         "base_commit": "a" * 40,
         "target_head_commit": "a" * 40,
         "same_execution_retry_allowed": False,
@@ -618,7 +621,7 @@ def test_direct_main_rev2_strict_runtime_binding_is_authoritative_at_write_gate(
     created = runtime.start_execution(
         "operator_supervised_direct_main",
         version="v1",
-        revision="rev2",
+        revision=revision,
         project_id="aming-claw",
         backlog_id=backlog_id,
         actor_role="observer",

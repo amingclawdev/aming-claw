@@ -10798,24 +10798,26 @@ def _qa_exact_candidate_direct_main_events(
     backlog_id: str,
     task_id: str,
 ) -> list[dict[str, Any]]:
-    """Return accepted Direct boundaries for one exact legacy or rev2 task."""
+    """Return accepted Direct boundaries for one legacy or pinned strict task."""
 
     if not backlog_id:
         return []
     legacy_task_id = _onboard_service_execution_id(project_id, backlog_id)
-    strict_task_id = _operator_supervised_direct_main_execution_id(
-        project_id,
-        backlog_id,
+    strict_records = _operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
     )
-    if task_id == strict_task_id:
-        strict_records = _operator_supervised_direct_main_strict_records(
-            conn,
-            project_id=project_id,
-            backlog_id=backlog_id,
-        )
-        if len(strict_records) != 1:
+    matching_strict_records = [
+        record
+        for record in strict_records
+        if str(record.get("contract_execution_id") or "").strip()
+        == task_id
+    ]
+    if matching_strict_records:
+        if len(strict_records) != 1 or len(matching_strict_records) != 1:
             return []
-        strict_record = strict_records[0]
+        strict_record = matching_strict_records[0]
         if not (
             str(strict_record.get("project_id") or "").strip() == project_id
             and str(strict_record.get("backlog_id") or "").strip()
@@ -10823,11 +10825,12 @@ def _qa_exact_candidate_direct_main_events(
             and str(
                 strict_record.get("contract_execution_id") or ""
             ).strip()
-            == strict_task_id
+            == task_id
             and str(strict_record.get("contract_id") or "").strip()
             == "operator_supervised_direct_main"
             and str(strict_record.get("version") or "").strip() == "v1"
-            and str(strict_record.get("revision") or "").strip() == "rev2"
+            and str(strict_record.get("revision") or "").strip()
+            in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         ):
             return []
     elif task_id != legacy_task_id:
@@ -11279,19 +11282,29 @@ def _qa_exact_candidate_comparison_authority_required(
 
     task_id = str(proof.get("task_id") or "").strip()
     backlog_id = str(proof.get("backlog_id") or "").strip()
-    strict_task_id = (
-        _operator_supervised_direct_main_execution_id(
-            project_id,
-            backlog_id,
+    selected_direct = (
+        _operator_supervised_direct_main_selected_execution_identity(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
         )
         if backlog_id
-        else ""
+        else {}
     )
+    strict_task_id = str(
+        selected_direct.get("contract_execution_id") or ""
+    ).strip()
     # The deterministic strict Direct task identity is only a requirement
     # selector, never comparison authority.  Missing, mismatched, or ambiguous
     # rev2 records must therefore fail closed instead of silently degrading to
     # an unmanaged self-comparison snapshot.
     if strict_task_id and task_id == strict_task_id:
+        return True
+    if (
+        selected_direct.get("ambiguous") is True
+        and task_id
+        in set(selected_direct.get("candidate_execution_ids") or [])
+    ):
         return True
     context = get_branch_context(conn, project_id, task_id) if task_id else None
     if context is not None:
@@ -13061,7 +13074,8 @@ def _qa_exact_candidate_direct_main_post_merge_provenance(
     strict_contract_direct = bool(
         str(direct_record.get("contract_id") or "").strip()
         == "operator_supervised_direct_main"
-        and str(direct_record.get("revision") or "").strip() == "rev2"
+        and str(direct_record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         and strict_direct_binding.get("strict_runtime_binding_required")
         is True
     )
@@ -14792,23 +14806,30 @@ def _observer_parentless_direct_main_graph_world_authority(
     route_proof: Mapping[str, Any],
     action: str,
 ) -> dict[str, Any]:
-    """Bind strict Direct rev2 observer traces to the current server world."""
+    """Bind a selected strict Direct observer trace to the current world."""
 
     query_source = str(body.get("query_source") or "").strip().lower()
     query_purpose = str(body.get("query_purpose") or "").strip().lower()
     backlog_id = str(route_proof.get("backlog_id") or "").strip()
     task_id = str(route_proof.get("task_id") or "").strip()
+    selected_direct = (
+        _operator_supervised_direct_main_selected_execution_identity(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+        if backlog_id
+        else {}
+    )
     if not (
         str(action or "").strip() == "graph-governance.query"
         and not str(body.get("trace_id") or "").strip()
         and query_source == "observer"
         and query_purpose == "gate_validation"
         and backlog_id
+        and selected_direct.get("resolved") is True
         and task_id
-        == _operator_supervised_direct_main_execution_id(
-            project_id,
-            backlog_id,
-        )
+        == str(selected_direct.get("contract_execution_id") or "").strip()
     ):
         return {}
 
@@ -85841,7 +85862,7 @@ def _current_full_reconcile_runtime_context_scope(
             and str(contract_record.get("contract_id") or "").strip()
             == "operator_supervised_direct_main"
             and str(contract_record.get("revision") or "").strip()
-            == "rev2"
+            in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
             and strict_direct_binding.get(
                 "strict_runtime_binding_required"
             )
@@ -115294,7 +115315,15 @@ def _contract_state_pinned_source_definition_resolution(
     }
 
     def strict_policy_possible(record: Mapping[str, Any]) -> bool:
-        if str(record.get("revision") or "").strip() == "rev2":
+        revision = str(record.get("revision") or "").strip()
+        if revision == "rev2":
+            return True
+        if (
+            str(record.get("contract_id") or "").strip()
+            == "operator_supervised_direct_main"
+            and revision
+            in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+        ):
             return True
         try:
             definition = _contract_runtime_definition_for_record(record)
@@ -134893,13 +134922,47 @@ _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE_ALIASES = frozenset(
         "mf.implementation_complete",
     }
 )
+_OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS = frozenset(
+    {"rev2", "rev3"}
+)
+
+
+def _operator_supervised_direct_main_fresh_definition() -> dict[str, Any]:
+    """Resolve authority for a new Direct execution without caller pinning."""
+
+    return _CONTRACT_DEFINITION_REGISTRY.resolve_for_new_execution(
+        "operator_supervised_direct_main",
+        version="v1",
+    )
+
+
+def _operator_supervised_direct_main_authority_source(revision: str) -> str:
+    revision = str(revision or "").strip()
+    return f"source_backed_operator_supervised_direct_main_{revision}"
+
+
+_OPERATOR_SUPERVISED_DIRECT_MAIN_AUTHORITY_SOURCES = frozenset(
+    _operator_supervised_direct_main_authority_source(revision)
+    for revision in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+)
 
 
 def _operator_supervised_direct_main_execution_id(
     project_id: str,
     backlog_id: str,
+    *,
+    revision: str = "",
 ) -> str:
-    """Return the only fresh Direct rev2 execution id for one bounded row."""
+    """Return the deterministic id for one selected Direct revision."""
+
+    selected_revision = str(revision or "").strip()
+    if not selected_revision:
+        selected_revision = str(
+            _operator_supervised_direct_main_fresh_definition().get(
+                "revision"
+            )
+            or ""
+        ).strip()
 
     return _contract_runtime_stable_id(
         "cex-direct-main",
@@ -134907,7 +134970,7 @@ def _operator_supervised_direct_main_execution_id(
         backlog_id,
         "operator_supervised_direct_main",
         "v1",
-        "rev2",
+        selected_revision,
     )
 
 
@@ -134926,7 +134989,8 @@ def _operator_supervised_direct_main_strict_records(
     return [
         dict(record)
         for record in records
-        if str(record.get("revision") or "").strip() == "rev2"
+        if str(record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         and isinstance(record.get("metadata"), Mapping)
         and record["metadata"].get(
             "operator_supervised_direct_main_runtime_binding"
@@ -134934,10 +134998,67 @@ def _operator_supervised_direct_main_strict_records(
     ]
 
 
+def _operator_supervised_direct_main_selected_execution_identity(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Select one pinned record, otherwise the registry-owned fresh revision."""
+
+    records = _operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    if len(records) > 1:
+        return {
+            "resolved": False,
+            "ambiguous": True,
+            "records": records,
+            "candidate_execution_ids": [
+                str(record.get("contract_execution_id") or "").strip()
+                for record in records
+            ],
+        }
+    if records:
+        record = records[0]
+        return {
+            "resolved": True,
+            "ambiguous": False,
+            "source": "pinned_record",
+            "contract_execution_id": str(
+                record.get("contract_execution_id") or ""
+            ).strip(),
+            "revision": str(record.get("revision") or "").strip(),
+            "record": record,
+            "records": records,
+        }
+    definition = _operator_supervised_direct_main_fresh_definition()
+    revision = str(definition.get("revision") or "").strip()
+    return {
+        "resolved": bool(revision),
+        "ambiguous": False,
+        "source": "fresh_registry_authority",
+        "contract_execution_id": (
+            _operator_supervised_direct_main_execution_id(
+                project_id,
+                backlog_id,
+                revision=revision,
+            )
+            if revision
+            else ""
+        ),
+        "revision": revision,
+        "definition": definition,
+        "records": [],
+    }
+
+
 def _operator_supervised_direct_main_generic_crud_rejection(
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Project the pinned Direct rev2 facade-only write policy."""
+    """Project the pinned strict Direct facade-only write policy."""
 
     metadata = (
         record.get("metadata")
@@ -134955,15 +135076,17 @@ def _operator_supervised_direct_main_generic_crud_rejection(
     if not (
         str(record.get("contract_id") or "").strip()
         == "operator_supervised_direct_main"
-        and str(record.get("revision") or "").strip() == "rev2"
+        and str(record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         and metadata.get("generic_crud_exposed") is False
         and binding.get("strict_runtime_binding_required") is True
     ):
         return {}
+    revision = str(record.get("revision") or "").strip()
     result = _contract_runtime_unchanged_line_rejection(
         record,
         [
-            "operator_supervised_direct_main rev2 rejects agent-facing "
+            f"operator_supervised_direct_main {revision} rejects agent-facing "
             "generic ContractRuntime line writes; use the exact timeline facade"
         ],
     )
@@ -135147,16 +135270,54 @@ def _operator_supervised_direct_main_start_runtime(
     route_token_ref: str,
     world_ref: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Start/read the fresh rev2 CEX after exact route closure is admitted."""
+    """Start fresh authority or read one immutable pinned Direct execution."""
 
-    execution_id = _operator_supervised_direct_main_execution_id(
-        project_id,
-        backlog_id,
+    runtime = _contract_runtime(conn)
+    strict_records = _operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
     )
+    if len(strict_records) > 1:
+        raise GovernanceError(
+            "operator_supervised_direct_main_execution_not_unique",
+            "Direct Main bounded row must resolve exactly one strict execution",
+            409,
+            {
+                "candidate_execution_ids": [
+                    str(record.get("contract_execution_id") or "")
+                    for record in strict_records
+                ],
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    if strict_records:
+        selected_record = strict_records[0]
+        selected_revision = str(
+            selected_record.get("revision") or ""
+        ).strip()
+        execution_id = str(
+            selected_record.get("contract_execution_id") or ""
+        ).strip()
+    else:
+        fresh_definition = (
+            _operator_supervised_direct_main_fresh_definition()
+        )
+        selected_revision = str(
+            fresh_definition.get("revision") or ""
+        ).strip()
+        execution_id = _operator_supervised_direct_main_execution_id(
+            project_id,
+            backlog_id,
+            revision=selected_revision,
+        )
     if str(task_id or "").strip() != execution_id:
         raise GovernanceError(
             "operator_supervised_direct_main_execution_identity_mismatch",
-            "Direct Main requires the exact deterministic rev2 execution id",
+            (
+                "Direct Main requires the exact selected pinned execution id"
+            ),
             409,
             {
                 "field": "task_id",
@@ -135185,26 +135346,6 @@ def _operator_supervised_direct_main_start_runtime(
             },
         )
 
-    runtime = _contract_runtime(conn)
-    strict_records = _operator_supervised_direct_main_strict_records(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-    )
-    if len(strict_records) > 1:
-        raise GovernanceError(
-            "operator_supervised_direct_main_execution_not_unique",
-            "Direct Main fresh row must resolve exactly one rev2 execution",
-            409,
-            {
-                "candidate_execution_ids": [
-                    str(record.get("contract_execution_id") or "")
-                    for record in strict_records
-                ],
-                "zero_write_rejection": True,
-                "writes_performed": False,
-            },
-        )
     if strict_records:
         record = strict_records[0]
         metadata = record.get("metadata") or {}
@@ -135277,14 +135418,17 @@ def _operator_supervised_direct_main_start_runtime(
     record = runtime.start_execution(
         "operator_supervised_direct_main",
         version="v1",
-        revision="rev2",
+        revision=selected_revision,
         project_id=project_id,
         backlog_id=backlog_id,
         actor_role="observer",
         contract_execution_id=execution_id,
         root_contract_execution_id=execution_id,
         contract_chain_id=_contract_runtime_stable_id(
-            "cchain-direct-main", project_id, backlog_id, "rev2"
+            "cchain-direct-main",
+            project_id,
+            backlog_id,
+            selected_revision,
         ),
         route_token_ref=route_token_ref,
         role_binding={
@@ -135782,7 +135926,7 @@ def _onboard_operator_supervised_direct_main_runtime_response(
     work_type: str,
     response_view: str,
 ) -> dict[str, Any]:
-    """Project the fresh Direct rev2 entrance without an onboard proxy.
+    """Project fresh Direct authority or one immutable pinned execution.
 
     Historical rows that already admitted the legacy parentless event retain
     their old projection.  A fresh row instead receives the deterministic
@@ -135831,10 +135975,25 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             "writes_performed": False,
         }
 
-    execution_id = _operator_supervised_direct_main_execution_id(
-        project_id,
-        backlog_id,
-    )
+    if strict_records:
+        selected_revision = str(
+            strict_records[0].get("revision") or ""
+        ).strip()
+        execution_id = str(
+            strict_records[0].get("contract_execution_id") or ""
+        ).strip()
+    else:
+        fresh_definition = (
+            _operator_supervised_direct_main_fresh_definition()
+        )
+        selected_revision = str(
+            fresh_definition.get("revision") or ""
+        ).strip()
+        execution_id = _operator_supervised_direct_main_execution_id(
+            project_id,
+            backlog_id,
+            revision=selected_revision,
+        )
     target_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
     persisted_ref = (
         str(strict_records[0].get("route_token_ref") or "").strip()
@@ -135900,7 +136059,10 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "evidence_refs": [
             f"backlog:{backlog_id}",
             f"contract_runtime:{execution_id}",
-            "contract_definition:operator_supervised_direct_main.v1.rev2",
+            (
+                "contract_definition:operator_supervised_direct_main.v1."
+                f"{selected_revision}"
+            ),
         ],
     }
     if route_ready:
@@ -135941,7 +136103,8 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             "graph_query_close_authority": graph_guidance,
             "copy_safe_pre_mutation_event": pre_mutation,
             "source_of_authority": (
-                "operator_supervised_direct_main.v1.rev2+route_registry"
+                "operator_supervised_direct_main.v1."
+                f"{selected_revision}+route_registry"
             ),
         }
     else:
@@ -135958,7 +136121,8 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             "action_input_ready": bool(target_files),
             "action_input_missing_fields": [] if target_files else ["target_files"],
             "source_of_authority": (
-                "operator_supervised_direct_main.v1.rev2+backlog_file_fence"
+                "operator_supervised_direct_main.v1."
+                f"{selected_revision}+backlog_file_fence"
             ),
         }
 
@@ -136047,6 +136211,13 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                 "generic_contract_runtime_submit_line_allowed": False,
                 "generic_contract_runtime_payload_executable": False,
             }
+            graph_query_close_authority = facade_projection.get(
+                "graph_query_close_authority"
+            )
+            if isinstance(graph_query_close_authority, Mapping):
+                next_action["graph_query_close_authority"] = deepcopy(
+                    dict(graph_query_close_authority)
+                )
         else:
             next_action = None
 
@@ -136070,7 +136241,7 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "contract_execution_id": execution_id,
         "contract_id": "operator_supervised_direct_main",
         "contract_version": "v1",
-        "contract_revision": "rev2",
+        "contract_revision": selected_revision,
         "source_backed_contract_selected": True,
         "onboard_service_proxy_selected": False,
         "target_files": target_files,
@@ -136541,7 +136712,7 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
     target_commit: str,
     current_full_auth: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Require the exact Direct rev2 QA Fact before current-full mutates."""
+    """Require the exact pinned Direct QA Fact before current-full mutates."""
 
     from . import task_timeline
 
@@ -136572,7 +136743,8 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
     applicable = bool(
         str(record.get("contract_id") or "").strip()
         == "operator_supervised_direct_main"
-        and str(record.get("revision") or "").strip() == "rev2"
+        and str(record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         and binding.get("strict_runtime_binding_required") is True
     )
     if not applicable:
@@ -137261,7 +137433,7 @@ def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
     record: Mapping[str, Any],
     close_commit: str,
 ) -> dict[str, Any]:
-    """Recheck the completed Direct rev2 Rule at the backlog-close boundary."""
+    """Recheck the completed pinned Direct Rule at backlog close."""
 
     metadata = (
         record.get("metadata")
@@ -137279,7 +137451,8 @@ def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
     if not (
         str(record.get("contract_id") or "").strip()
         == "operator_supervised_direct_main"
-        and str(record.get("revision") or "").strip() == "rev2"
+        and str(record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         and binding.get("strict_runtime_binding_required") is True
     ):
         return {}
@@ -137312,12 +137485,15 @@ def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
         for line in completed_lines
     ]
     missing: list[str] = []
+    pinned_revision = str(record.get("revision") or "").strip()
     if actual_lines != expected_lines:
-        missing.append("exact_completed_direct_rev2_lines")
+        missing.append(
+            f"exact_completed_direct_{pinned_revision}_lines"
+        )
 
     definition_identity = {
         "contract_id": "operator_supervised_direct_main",
-        "revision": "rev2",
+        "revision": pinned_revision,
     }
     line_binding_errors = {
         str(line.get("line_id") or "").strip(): errors
@@ -137499,13 +137675,16 @@ def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
         "accepted": passed,
         "passed": passed,
         "status": "passed" if passed else "failed",
-        "source": "source_backed_operator_supervised_direct_main_rev2",
+        "source": _operator_supervised_direct_main_authority_source(
+            pinned_revision
+        ),
         "source_of_authority": "ContractRuntime",
         "server_derived": True,
         "caller_claims_trusted": False,
         "project_id": project_id,
         "backlog_id": backlog_id,
         "contract_execution_id": contract_execution_id,
+        "contract_revision": pinned_revision,
         "close_commit": close_commit,
         "missing_requirement_ids": missing,
         "source_refs": list(dict.fromkeys(source_refs)),
@@ -137564,7 +137743,8 @@ def _operator_supervised_direct_main_apply_timeline_runtime(
     if not (
         str(record.get("contract_id") or "")
         == "operator_supervised_direct_main"
-        and str(record.get("revision") or "") == "rev2"
+        and str(record.get("revision") or "")
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         and isinstance(record.get("metadata"), Mapping)
         and record["metadata"].get(
             "operator_supervised_direct_main_runtime_binding"
@@ -167537,7 +167717,7 @@ def _contract_runtime_authoritative_close_verification(
         and str(operator_direct_gate.get("schema_version") or "")
         == "operator_supervised_direct_main.close_authority_gate.v1"
         and str(operator_direct_gate.get("source") or "")
-        == "source_backed_operator_supervised_direct_main_rev2"
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_AUTHORITY_SOURCES
     )
     completed_onboard_direct_gate = (
         runtime_projection.get("completed_onboard_direct_main_close_authority_gate")
@@ -167696,7 +167876,7 @@ def _contract_runtime_authoritative_close_verification(
                 )
             elif failed_authority_kind == "operator_supervised_direct_main":
                 next_action = (
-                    "complete the source-backed Direct rev2 route, graph-first, "
+                    "complete the source-backed pinned Direct route, graph-first, "
                     "single pre-mutation, implementation, independent QA, "
                     "current-full reconcile, and close-ready lines"
                 )
@@ -167726,7 +167906,7 @@ def _contract_runtime_authoritative_close_verification(
                 "label": (
                     "ContractRuntime mf_batch parent close authority"
                     if failed_authority_kind == "mf_batch_parent"
-                    else "ContractRuntime operator-supervised Direct rev2 close authority"
+                    else "ContractRuntime operator-supervised pinned Direct close authority"
                     if failed_authority_kind == "operator_supervised_direct_main"
                     else "ContractRuntime completed onboard direct-main close authority"
                     if failed_authority_kind == "completed_onboard_direct_main"
@@ -167764,7 +167944,8 @@ def _contract_runtime_authoritative_close_verification(
         else "mf_parallel"
     )
     source = (
-        "contract_runtime_source_backed_operator_supervised_direct_main_rev2"
+        "contract_runtime_"
+        + str(operator_direct_gate.get("source") or "")
         if authority_kind == "operator_supervised_direct_main"
         else "contract_runtime_completed_onboard_direct_main_immutable_preattempt"
         if authority_kind == "completed_onboard_direct_main"
@@ -167778,7 +167959,7 @@ def _contract_runtime_authoritative_close_verification(
     )
     message = (
         "backlog_close accepted the complete source-backed operator-supervised "
-        "Direct rev2 chain with current-full reconcile authority."
+        "pinned Direct chain with current-full reconcile authority."
         if authority_kind == "operator_supervised_direct_main"
         else "backlog_close accepted server-derived completed onboard direct-main "
         "close authority with immutable pre-attempt evidence."
@@ -168761,6 +168942,11 @@ def _contract_runtime_parentless_direct_main_selected_scope(
             ]
         )
         selected_execution_id = execution_ids[0] if len(execution_ids) == 1 else ""
+        selected_revision = (
+            str(strict_records[0].get("revision") or "").strip()
+            if len(strict_records) == 1
+            else ""
+        )
         return {
             "schema_version": "parentless_direct_main_selected_scope.v2",
             "resolved": bool(selected_execution_id),
@@ -168768,16 +168954,26 @@ def _contract_runtime_parentless_direct_main_selected_scope(
             "backlog_id": backlog_id,
             "contract_execution_id": selected_execution_id,
             "selection_source": (
-                "source_backed_operator_supervised_direct_main_rev2"
+                _operator_supervised_direct_main_authority_source(
+                    selected_revision
+                )
+                if selected_revision
+                else "ambiguous_source_backed_operator_supervised_direct_main"
             ),
+            "contract_revision": selected_revision,
             "candidate_execution_ids": execution_ids,
             "source_backed_contract_required": True,
             "onboard_service_proxy_authority": False,
         }
+    fresh_definition = _operator_supervised_direct_main_fresh_definition()
+    prospective_revision = str(
+        fresh_definition.get("revision") or ""
+    ).strip()
     prospective_execution_id = (
         _operator_supervised_direct_main_execution_id(
             project_id,
             backlog_id,
+            revision=prospective_revision,
         )
     )
     prospective_route_authority = (
@@ -168799,8 +168995,11 @@ def _contract_runtime_parentless_direct_main_selected_scope(
             "backlog_id": backlog_id,
             "contract_execution_id": prospective_execution_id,
             "selection_source": (
-                "source_backed_operator_supervised_direct_main_rev2"
+                _operator_supervised_direct_main_authority_source(
+                    prospective_revision
+                )
             ),
+            "contract_revision": prospective_revision,
             "candidate_execution_ids": [prospective_execution_id],
             "source_backed_contract_required": True,
             "onboard_service_proxy_authority": False,
@@ -168922,7 +169121,8 @@ def _contract_runtime_parentless_direct_main_close_ready_prewrite_gate(
         )
         and str(selected_record.get("contract_id") or "").strip()
         == "operator_supervised_direct_main"
-        and str(selected_record.get("revision") or "").strip() == "rev2"
+        and str(selected_record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         else {}
     )
 
@@ -169186,7 +169386,8 @@ def _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
         )
         and str(selected_record.get("contract_id") or "").strip()
         == "operator_supervised_direct_main"
-        and str(selected_record.get("revision") or "").strip() == "rev2"
+        and str(selected_record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         else {}
     )
     events = task_timeline.list_events(
@@ -175510,7 +175711,7 @@ def handle_observer_direct_mutation_exception(ctx: RequestContext):
 
 @route("POST", "/api/task/{project_id}/timeline")
 def handle_task_timeline_append(ctx: RequestContext):
-    """Serialize the one mutable Direct rev2 admission scope."""
+    """Serialize the one mutable pinned Direct admission scope."""
 
     project_id = ctx.get_project_id()
     backlog_id = str(ctx.body.get("backlog_id") or "").strip()
@@ -175523,13 +175724,40 @@ def handle_task_timeline_append(ctx: RequestContext):
         .replace("-", "_")
         for key in ("event_type", "event_kind")
     }
+    selected_direct: dict[str, Any] = {}
+    if backlog_id:
+        selection_conn = get_connection(project_id)
+        try:
+            selected_direct = (
+                _operator_supervised_direct_main_selected_execution_identity(
+                    selection_conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                )
+            )
+        finally:
+            selection_conn.close()
+    if (
+        selected_direct.get("ambiguous") is True
+        and task_id
+        in set(selected_direct.get("candidate_execution_ids") or [])
+    ):
+        raise GovernanceError(
+            "operator_supervised_direct_main_execution_not_unique",
+            "Direct Main bounded row resolves multiple strict executions",
+            409,
+            {
+                "candidate_execution_ids": list(
+                    selected_direct.get("candidate_execution_ids") or []
+                ),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
     strict_direct_admission = bool(
         backlog_id
         and task_id
-        == _operator_supervised_direct_main_execution_id(
-            project_id,
-            backlog_id,
-        )
+        == str(selected_direct.get("contract_execution_id") or "").strip()
         and event_tokens.intersection(
             {
                 "mf_observer_direct_implementation_exception",
@@ -176143,17 +176371,48 @@ def _handle_task_timeline_append(ctx: RequestContext):
                         "historical_backfill_allowed": False,
                     },
                 )
-            strict_direct_execution_id = (
-                _operator_supervised_direct_main_execution_id(
-                    project_id,
-                    str(ctx.body.get("backlog_id") or "").strip(),
+            strict_direct_selection = (
+                _operator_supervised_direct_main_selected_execution_identity(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=str(
+                        ctx.body.get("backlog_id") or ""
+                    ).strip(),
                 )
             )
+            strict_direct_execution_id = str(
+                strict_direct_selection.get("contract_execution_id") or ""
+            ).strip()
             strict_direct_record: dict[str, Any] = {}
             strict_direct_requested = bool(
                 str(ctx.body.get("task_id") or "").strip()
                 == strict_direct_execution_id
             )
+            if (
+                strict_direct_selection.get("ambiguous") is True
+                and str(ctx.body.get("task_id") or "").strip()
+                in set(
+                    strict_direct_selection.get(
+                        "candidate_execution_ids"
+                    )
+                    or []
+                )
+            ):
+                raise GovernanceError(
+                    "operator_supervised_direct_main_execution_not_unique",
+                    "Direct Main bounded row resolves multiple strict executions",
+                    409,
+                    {
+                        "candidate_execution_ids": list(
+                            strict_direct_selection.get(
+                                "candidate_execution_ids"
+                            )
+                            or []
+                        ),
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                    },
+                )
             if strict_direct_requested:
                 direct_main_pre_mutation_world_ref = (
                     _operator_supervised_direct_main_world_ref(
@@ -176938,12 +177197,35 @@ def _handle_task_timeline_append(ctx: RequestContext):
                     runtime_deployment_authority
                 )
         direct_task_id = str(ctx.body.get("task_id") or "").strip()
-        expected_direct_task_id = (
-            _operator_supervised_direct_main_execution_id(
-                project_id,
-                str(ctx.body.get("backlog_id") or "").strip(),
+        selected_direct = (
+            _operator_supervised_direct_main_selected_execution_identity(
+                conn,
+                project_id=project_id,
+                backlog_id=str(
+                    ctx.body.get("backlog_id") or ""
+                ).strip(),
             )
         )
+        expected_direct_task_id = str(
+            selected_direct.get("contract_execution_id") or ""
+        ).strip()
+        if (
+            selected_direct.get("ambiguous") is True
+            and direct_task_id
+            in set(selected_direct.get("candidate_execution_ids") or [])
+        ):
+            raise GovernanceError(
+                "operator_supervised_direct_main_execution_not_unique",
+                "Direct Main bounded row resolves multiple strict executions",
+                409,
+                {
+                    "candidate_execution_ids": list(
+                        selected_direct.get("candidate_execution_ids") or []
+                    ),
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                },
+            )
         if direct_task_id == expected_direct_task_id:
             try:
                 direct_record = _contract_runtime_store(conn).get(

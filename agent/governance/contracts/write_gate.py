@@ -11,6 +11,11 @@ from .hash import stable_sha256
 from .schema import ContractDefinitionError, find_line
 
 
+_OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS = frozenset(
+    {"rev2", "rev3"}
+)
+
+
 _GRAPH_CONTEXT_POLICIES = {
     "direct_fix_observer_graph_scope": {
         "actor_role": "observer",
@@ -363,7 +368,8 @@ def validate_contract_write(
     strict_direct_runtime = bool(
         str(definition.get("contract_id") or "").strip()
         == "operator_supervised_direct_main"
-        and str(definition.get("revision") or "").strip() == "rev2"
+        and str(definition.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         and isinstance(execution_state.get("metadata"), Mapping)
         and isinstance(
             execution_state["metadata"].get(
@@ -397,7 +403,7 @@ def operator_supervised_direct_main_runtime_binding_errors(
     execution_state: Mapping[str, Any],
     write: Mapping[str, Any],
 ) -> list[str]:
-    """Keep every fresh Direct rev2 line bound to its admitted route Fact.
+    """Keep every strict Direct line bound to its admitted route Fact.
 
     The HTTP/timeline adapters may enrich a request with DB-derived evidence,
     but the authoritative ContractRuntime Gate still rechecks the immutable
@@ -408,9 +414,11 @@ def operator_supervised_direct_main_runtime_binding_errors(
     if not (
         str(definition.get("contract_id") or "").strip()
         == "operator_supervised_direct_main"
-        and str(definition.get("revision") or "").strip() == "rev2"
+        and str(definition.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
     ):
         return []
+    revision = str(definition.get("revision") or "").strip()
     metadata = (
         execution_state.get("metadata")
         if isinstance(execution_state.get("metadata"), Mapping)
@@ -426,7 +434,8 @@ def operator_supervised_direct_main_runtime_binding_errors(
     )
     if binding.get("strict_runtime_binding_required") is not True:
         return [
-            "operator_supervised_direct_main rev2 requires the server-admitted immutable runtime binding"
+            "operator_supervised_direct_main "
+            f"{revision} requires the server-admitted immutable runtime binding"
         ]
 
     binding_hash = str(binding.get("binding_hash") or "").strip()
@@ -479,7 +488,8 @@ def operator_supervised_direct_main_runtime_binding_errors(
         and binding_hash == stable_sha256(unsigned_binding)
     ):
         errors.append(
-            "operator_supervised_direct_main rev2 requires one complete immutable runtime binding"
+            "operator_supervised_direct_main "
+            f"{revision} requires one complete immutable runtime binding"
         )
 
     payload = write.get("payload") if isinstance(write.get("payload"), Mapping) else {}

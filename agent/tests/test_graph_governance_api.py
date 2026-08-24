@@ -90605,10 +90605,17 @@ def _canonical_parentless_direct_main_implementation_body(
     }
 
 
-def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_premutation(
+@pytest.mark.parametrize(
+    ("execution_revision", "pinned_existing"),
+    [("rev3", False), ("rev2", True)],
+    ids=["fresh-rev3", "pinned-rev2"],
+)
+def test_direct_main_selected_guide_binds_runtime_and_admits_one_idempotent_premutation(
     conn,
     monkeypatch,
     tmp_path,
+    execution_revision,
+    pinned_existing,
 ):
     backlog_id = "AC-DIRECT-MAIN-REV2-SINGLE-ADMISSION-WARRANTY"
     demo_root, _ = _patch_demo_environment_paths(monkeypatch, tmp_path)
@@ -90648,38 +90655,11 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     )
     conn.commit()
 
-    initial = server.handle_project_onboard_route_guide(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "operator_supervised_direct_main",
-                "view": "compact",
-            },
-        )
-    )
     task_id = server._operator_supervised_direct_main_execution_id(
         PID,
         backlog_id,
+        revision=execution_revision,
     )
-    assert initial["contract_execution_id"] == task_id
-    assert initial["contract_id"] == "operator_supervised_direct_main"
-    assert initial["contract_revision"] == "rev2"
-    assert initial["onboard_service_proxy_selected"] is False
-    assert initial["next_legal_action"]["mcp_tool"] == (
-        "observer_route_context_issue"
-    )
-    issue_body = initial["next_legal_action"]["copy_safe_body"]
-    assert issue_body["task_id"] == task_id
-    assert sorted(issue_body["target_files"]) == sorted(row_files)
-    assert sorted(issue_body["owned_files"]) == sorted(row_files)
-    assert issue_body["allowed_actions"] == list(
-        server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
-    )
-
     route_token_ref = "rtok-direct-main-rev2-single-admission"
     route_identity = {
         "route_id": "route-direct-main-rev2-single-admission",
@@ -90719,6 +90699,114 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
             ],
         },
     )
+    if pinned_existing:
+        world_ref = server._operator_supervised_direct_main_world_ref(
+            project_id=PID,
+        )
+        route_authority = (
+            server._operator_supervised_direct_main_route_authority(
+                conn,
+                project_id=PID,
+                backlog_id=backlog_id,
+                contract_execution_id=task_id,
+                route_token_ref=route_token_ref,
+            )
+        )
+        assert route_authority["accepted"] is True
+        binding = {
+            "schema_version": (
+                "operator_supervised_direct_main.runtime_binding.v1"
+            ),
+            "strict_runtime_binding_required": True,
+            "server_derived": True,
+            "caller_claims_trusted": False,
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "contract_execution_id": task_id,
+            "route_identity": dict(route_authority["route_identity"]),
+            "owned_files": list(route_authority["row_declared_files"]),
+            "target_files": list(route_authority["row_declared_files"]),
+            "target_project_root": world_ref["target_project_root"],
+            "worktree_path": world_ref["target_project_root"],
+            "base_commit": world_ref["base_commit"],
+            "target_head_commit": world_ref["base_commit"],
+            "pre_mutation_world_ref": dict(world_ref),
+            "same_execution_retry_allowed": False,
+            "same_generation_retry_allowed": False,
+            "post_hoc_pass_backfill_allowed": False,
+        }
+        binding["binding_hash"] = server.stable_sha256(binding)
+        pinned_record = server._contract_runtime(conn).start_execution(
+            "operator_supervised_direct_main",
+            version="v1",
+            revision="rev2",
+            project_id=PID,
+            backlog_id=backlog_id,
+            actor_role="observer",
+            contract_execution_id=task_id,
+            root_contract_execution_id=task_id,
+            contract_chain_id=server._contract_runtime_stable_id(
+                "cchain-direct-main",
+                PID,
+                backlog_id,
+                "rev2",
+            ),
+            route_token_ref=route_token_ref,
+            role_binding={
+                "observer": "observer",
+                "qa": "qa",
+                "binding_source": (
+                    "operator_supervised_direct_main_route_authority"
+                ),
+            },
+            backlog_lineage={
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            metadata={
+                "facade": "observer_direct_mutation_exception",
+                "generic_crud_exposed": False,
+                "operator_supervised_direct_main_runtime_binding": binding,
+                "operator_supervised_direct_main_route_authority": (
+                    route_authority
+                ),
+            },
+        )
+        server.upsert_contract_chain_root_current_binding(conn, pinned_record)
+
+    initial = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "view": "compact",
+            },
+        )
+    )
+    assert initial["contract_execution_id"] == task_id
+    assert initial["contract_id"] == "operator_supervised_direct_main"
+    assert initial["contract_revision"] == execution_revision
+    assert initial["onboard_service_proxy_selected"] is False
+    if pinned_existing:
+        assert initial["next_legal_action"]["mcp_tool"] == (
+            "observer_direct_mutation_exception"
+        )
+    else:
+        assert initial["next_legal_action"]["mcp_tool"] == (
+            "observer_route_context_issue"
+        )
+        issue_body = initial["next_legal_action"]["copy_safe_body"]
+        assert issue_body["task_id"] == task_id
+        assert sorted(issue_body["target_files"]) == sorted(row_files)
+        assert sorted(issue_body["owned_files"]) == sorted(row_files)
+        assert issue_body["allowed_actions"] == list(
+            server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+        )
     routed = server.handle_project_onboard_route_guide(
         _ctx_with_role(
             {"project_id": PID},
@@ -90856,11 +90944,18 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         "parentless_direct_main_pre_mutation_authority_incomplete"
     )
     assert conn.total_changes == zero_event_changes
-    assert server._operator_supervised_direct_main_strict_records(
-        conn,
-        project_id=PID,
-        backlog_id=backlog_id,
-    ) == []
+    pre_admission_records = (
+        server._operator_supervised_direct_main_strict_records(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+        )
+    )
+    assert len(pre_admission_records) == (1 if pinned_existing else 0)
+    assert all(
+        not record["execution_state"]["completed_lines"]
+        for record in pre_admission_records
+    )
 
     graph_only_route = observer_route_context.issue_observer_write_route_context(
         project_id=PID,
@@ -90964,7 +91059,9 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
             )
         )
     assert no_cex_implementation.value.code == (
-        "operator_supervised_direct_main_runtime_required"
+        "operator_supervised_direct_main_runtime_line_mismatch"
+        if pinned_existing
+        else "operator_supervised_direct_main_runtime_required"
     )
     assert no_cex_implementation.value.details["zero_write_rejection"] is True
     assert conn.total_changes == no_cex_changes
@@ -91000,7 +91097,7 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         conn,
         project_id=PID,
         backlog_id=backlog_id,
-    ) == []
+    ) == pre_admission_records
 
     wrong_world_trace_id = "gqt-20260822-deadbeef01"
     _insert_observer_graph_query_trace(
@@ -91046,7 +91143,7 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
         conn,
         project_id=PID,
         backlog_id=backlog_id,
-    ) == []
+    ) == pre_admission_records
 
     append_body = _canonical_parentless_direct_main_pre_mutation_body(
         append_base={
@@ -91076,7 +91173,7 @@ def test_direct_main_rev2_fresh_guide_binds_runtime_and_admits_one_idempotent_pr
     ]
     record = server._contract_runtime(conn).store.get(task_id)
     assert record["contract_id"] == "operator_supervised_direct_main"
-    assert record["revision"] == "rev2"
+    assert record["revision"] == execution_revision
     assert record["authoritative_common_rule_join"]["join_state"] == "resolved"
     assert len(record["execution_state"]["completed_lines"]) == 3
 
@@ -93094,7 +93191,7 @@ def _parentless_direct_main_pre_mutation_graph_scope(
     else:
         parent_execution_id = guide["contract_execution_id"]
         assert guide["contract_id"] == "operator_supervised_direct_main"
-        assert guide["contract_revision"] == "rev2"
+        assert guide["contract_revision"] == "rev3"
     route_token_ref = f"rtok-append-{backlog_id.lower()}"
     route_identity = {
         "route_id": f"route-{backlog_id.lower()}",
@@ -106520,6 +106617,7 @@ def test_direct_main_rev2_public_failed_close_is_one_terminal_no_pass_fact(
     task_id = server._operator_supervised_direct_main_execution_id(
         PID,
         backlog_id,
+        revision="rev2",
     )
     route_token_ref = "rtok-direct-main-rev2-public-failed-close"
     route_identity = {
@@ -106805,7 +106903,7 @@ def test_direct_main_rev2_public_failed_close_is_one_terminal_no_pass_fact(
     assert runtime.store.get(task_id) == terminal_before_retry
 
 
-def test_direct_main_rev2_fresh_world_warranty_requires_db_verified_qa(
+def test_direct_main_rev3_fresh_world_warranty_requires_db_verified_qa(
     conn,
     monkeypatch,
     tmp_path,
@@ -106910,7 +107008,7 @@ def test_direct_main_rev2_fresh_world_warranty_requires_db_verified_qa(
                 "actor": "observer",
                 "payload": {
                     **route_identity,
-                    "reason": "fresh Direct rev2 post-repair warranty",
+                    "reason": "fresh Direct rev3 post-repair warranty",
                     "observer_direct_mutation": True,
                     "tiny_deterministic_scope": True,
                     "operator_approval": {
@@ -113057,7 +113155,7 @@ def test_contract_bound_direct_main_guide_does_not_use_generic_capsule(
         "onboard_route_guide.operator_supervised_direct_main.v2"
     )
     assert guide["contract_id"] == "operator_supervised_direct_main"
-    assert guide["contract_revision"] == "rev2"
+    assert guide["contract_revision"] == "rev3"
     assert guide["source_backed_contract_selected"] is True
     assert guide["onboard_service_proxy_selected"] is False
     assert "projection_hash" not in guide
@@ -113073,6 +113171,134 @@ def test_contract_bound_direct_main_guide_does_not_use_generic_capsule(
     assert sorted(issue_body["target_files"]) == sorted(
         issue_body["owned_files"]
     )
+
+
+def test_direct_main_guide_keeps_pinned_rev2_and_rejects_mixed_revision_ambiguity(
+    conn,
+):
+    backlog_id = "AC-DIRECT-MAIN-PINNED-REV2-SELECTOR"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    runtime = server._contract_runtime(conn)
+    strict_metadata = {
+        "generic_crud_exposed": False,
+        "operator_supervised_direct_main_runtime_binding": {
+            "strict_runtime_binding_required": True,
+        },
+    }
+    rev2_task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev2",
+    )
+    rev2_record = runtime.start_execution(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev2",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=rev2_task_id,
+        metadata=copy.deepcopy(strict_metadata),
+    )
+
+    pinned = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+            },
+        )
+    )
+    assert pinned["ok"] is True
+    assert pinned["contract_execution_id"] == rev2_task_id
+    assert pinned["contract_revision"] == "rev2"
+    assert pinned["contract_runtime_current"]["definition_hash"] == (
+        rev2_record["definition_hash"]
+    )
+
+    rev3_task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+    )
+    runtime.start_execution(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision="rev3",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=rev3_task_id,
+        metadata=copy.deepcopy(strict_metadata),
+    )
+    changes_before = conn.total_changes
+
+    ambiguous = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+            },
+        )
+    )
+    assert ambiguous["ok"] is False
+    assert ambiguous["error"] == (
+        "operator_supervised_direct_main_execution_not_unique"
+    )
+    assert sorted(ambiguous["candidate_execution_ids"]) == sorted(
+        [rev2_task_id, rev3_task_id]
+    )
+    assert ambiguous["writes_performed"] is False
+    assert conn.total_changes == changes_before
+
+    records_before = {
+        task_id: copy.deepcopy(runtime.store.get(task_id))
+        for task_id in (rev2_task_id, rev3_task_id)
+    }
+    timeline_count_before = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    for candidate_task_id in (rev2_task_id, rev3_task_id):
+        candidate_changes_before = conn.total_changes
+        with pytest.raises(GovernanceError) as timeline_blocked:
+            server.handle_task_timeline_append(
+                _ctx_with_role(
+                    {"project_id": PID},
+                    "observer",
+                    method="POST",
+                    body={
+                        "backlog_id": backlog_id,
+                        "task_id": candidate_task_id,
+                        "event_type": (
+                            "observer_direct_implementation_exception"
+                        ),
+                        "event_kind": (
+                            "observer_direct_implementation_exception"
+                        ),
+                    },
+                )
+            )
+        assert timeline_blocked.value.code == (
+            "operator_supervised_direct_main_execution_not_unique"
+        )
+        assert timeline_blocked.value.details["zero_write_rejection"] is True
+        assert timeline_blocked.value.details["writes_performed"] is False
+        assert conn.total_changes == candidate_changes_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_timeline_events"
+        ).fetchone()[0] == timeline_count_before
+        assert {
+            task_id: runtime.store.get(task_id)
+            for task_id in (rev2_task_id, rev3_task_id)
+        } == records_before
 
 
 @pytest.mark.parametrize(
@@ -168445,6 +168671,7 @@ def test_exact_candidate_direct_main_events_require_unique_strict_rev2_record(
     strict_task_id = server._operator_supervised_direct_main_execution_id(
         PID,
         backlog_id,
+        revision="rev2",
     )
     legacy_task_id = server._onboard_service_execution_id(PID, backlog_id)
     event = {
@@ -168515,7 +168742,7 @@ def test_exact_candidate_direct_main_events_require_unique_strict_rev2_record(
             "task_id": strict_task_id,
             "commit_sha": "c" * 40,
         },
-    ) is True
+    ) is False
 
     assert server._qa_exact_candidate_direct_main_events(
         object(),
@@ -168539,9 +168766,17 @@ def test_exact_candidate_strict_direct_record_gap_rejects_graph_query_zero_write
     strict_record_state,
 ):
     backlog_id = f"AC-DIRECT-MAIN-STRICT-RECORD-{strict_record_state.upper()}"
-    strict_task_id = server._operator_supervised_direct_main_execution_id(
+    fresh_task_id = server._operator_supervised_direct_main_execution_id(
         PID,
         backlog_id,
+    )
+    rev2_task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev2",
+    )
+    strict_task_id = (
+        fresh_task_id if strict_record_state == "missing" else rev2_task_id
     )
     project_root = tmp_path / f"strict-record-{strict_record_state}"
     candidate_commit = _init_test_git_repo(project_root)
@@ -168567,10 +168802,11 @@ def test_exact_candidate_strict_direct_record_gap_rejects_graph_query_zero_write
         []
         if strict_record_state == "missing"
         else [
-            strict_record,
+            {**strict_record, "contract_execution_id": rev2_task_id},
             {
                 **strict_record,
-                "contract_execution_id": "cex-second-strict-rev2-record",
+                "contract_execution_id": fresh_task_id,
+                "revision": "rev3",
             },
         ]
     )
