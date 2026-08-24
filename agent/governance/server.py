@@ -19792,6 +19792,49 @@ def _parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
     if not all((source_task_id, fresh_task_id, fresh_worker_id, fresh_worker_slot_id)):
         return {}
 
+    selected_dispatch = _contract_runtime_current_dispatch_authority_line(
+        record
+    )
+    if selected_dispatch.get("status") != "selected":
+        return {}
+    selected_payload = (
+        selected_dispatch.get("payload")
+        if isinstance(selected_dispatch.get("payload"), Mapping)
+        else {}
+    )
+    selected_line = (
+        selected_dispatch.get("line")
+        if isinstance(selected_dispatch.get("line"), Mapping)
+        else {}
+    )
+    selected_task_id = _runtime_context_public_text(
+        selected_line.get("task_id"),
+        selected_payload.get("task_id"),
+    )
+    selected_worker_id = _runtime_context_public_text(
+        selected_line.get("worker_id"),
+        selected_payload.get("worker_id"),
+    )
+    selected_worker_slot_id = _runtime_context_public_text(
+        selected_line.get("worker_slot_id"),
+        selected_payload.get("worker_slot_id"),
+    )
+    # The existing selector admits a post-failure dispatch only when its
+    # revision and server authority bind the active failed-QA line exactly.
+    # A timeline-only failure has no ContractRuntime line yet, so its original
+    # dispatch must remain eligible for the first boundary materialization.
+    if (
+        failed_qa_index >= 0
+        and int(selected_dispatch.get("completed_line_index") or -1)
+        > failed_qa_index
+        and (
+            selected_task_id != fresh_task_id
+            or selected_worker_id != fresh_worker_id
+            or selected_worker_slot_id != fresh_worker_slot_id
+        )
+    ):
+        return {}
+
     existing_fresh_context = get_branch_context(
         conn,
         project_id,

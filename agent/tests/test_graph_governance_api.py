@@ -27471,6 +27471,177 @@ def test_merged_batch_child_failed_qa_allocates_one_fresh_rework_runtime(
         ).fetchone()
     ) == before_queue_row
 
+    second_task_id = f"{source_task_id}-failed-qa-attempt-2-b"
+    second_worker_id = f"{second_task_id}-worker"
+    second_rework_body = {
+        **rework_body,
+        "task_id": second_task_id,
+        "worker_id": second_worker_id,
+        "worker_slot_id": second_worker_id,
+    }
+    canonical_record = runtime.store.get(contract_execution_id)
+    assert (
+        server._parallel_branch_allocate_verified_batch_target_authority(
+            conn,
+            project_id=PID,
+            record=canonical_record,
+            body=second_rework_body,
+        )
+        == {}
+    )
+    before_second_dump = "\n".join(conn.iterdump())
+    before_second_changes = conn.total_changes
+    with pytest.raises(GovernanceError) as second_rework_rejected:
+        server.handle_graph_governance_parallel_branch_allocate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=second_rework_body,
+            )
+        )
+    assert second_rework_rejected.value.code == (
+        "parallel_branch_allocate_batch_target_authority_missing"
+    )
+    assert second_rework_rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_second_changes
+    assert "\n".join(conn.iterdump()) == before_second_dump
+    assert get_branch_context(conn, PID, second_task_id) is None
+    assert dict(
+        conn.execute(
+            """
+            SELECT * FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+            """,
+            (
+                PID,
+                planned_authority["merge_queue_id"],
+                planned_authority["queue_item_id"],
+            ),
+        ).fetchone()
+    ) == before_queue_row
+
+
+def test_timeline_backed_first_rework_does_not_treat_original_dispatch_as_replacement(
+    monkeypatch,
+):
+    contract_execution_id = "cex-timeline-first-rework"
+    backlog_id = "AC-TIMELINE-FIRST-REWORK"
+    source_task_id = "timeline-source-worker"
+    source_context = SimpleNamespace(
+        runtime_context_id="mfrctx-timeline-source",
+        task_id=source_task_id,
+        parent_task_id=contract_execution_id,
+        backlog_id=backlog_id,
+        batch_id="batch-timeline-first-rework",
+        merge_queue_id="mq-timeline-first-rework",
+        status="merged",
+        worker_id="timeline-source-slot",
+        worker_slot_id="timeline-source-slot",
+        agent_id="timeline-source-slot",
+        allocation_owner="timeline-source-slot",
+    )
+    original_dispatch = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "actor_role": "observer",
+        "task_id": source_task_id,
+        "worker_id": "timeline-source-slot",
+        "worker_slot_id": "timeline-source-slot",
+        "payload": {
+            "task_id": source_task_id,
+            "worker_id": "timeline-source-slot",
+            "worker_slot_id": "timeline-source-slot",
+        },
+    }
+    record = {
+        "contract_execution_id": contract_execution_id,
+        "backlog_id": backlog_id,
+        "completed_lines": [original_dispatch],
+    }
+    verified_batch_child = {
+        "child_task_id": source_task_id,
+        "child_backlog_id": backlog_id,
+        "batch_id": source_context.batch_id,
+        "merge_queue_id": source_context.merge_queue_id,
+    }
+    failed_qa_source_ref = "timeline:42"
+
+    class _Rows:
+        @staticmethod
+        def fetchall():
+            return []
+
+    class _ReadOnlyConn:
+        def __init__(self):
+            self.execute_calls = 0
+
+        def execute(self, *_args, **_kwargs):
+            self.execute_calls += 1
+            return _Rows()
+
+    read_only_conn = _ReadOnlyConn()
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_branch_context",
+        lambda _conn, _project_id, task_id: (
+            source_context if task_id == source_task_id else None
+        ),
+    )
+    monkeypatch.setattr(task_timeline, "list_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_authenticated_failed_qa_timeline_boundary",
+        lambda **_kwargs: {
+            "source_ref": failed_qa_source_ref,
+            "event_id": 42,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_dispatch_authority_line",
+        lambda _record: {
+            "status": "selected",
+            "completed_line_index": 0,
+            "line": original_dispatch,
+            "payload": original_dispatch["payload"],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_dispatch_line_match",
+        lambda _record, _context: {"source_ref": "contract_runtime:dispatch:0"},
+    )
+
+    authority = (
+        server._parallel_branch_allocate_merged_batch_failed_qa_rework_authority(
+            read_only_conn,
+            project_id=PID,
+            record=record,
+            verified_batch_child=verified_batch_child,
+            body={
+                "stage_type": "failed_qa_rework",
+                "attempt": 2,
+                "task_id": "timeline-rework-worker",
+                "worker_id": "timeline-rework-slot",
+                "worker_slot_id": "timeline-rework-slot",
+                "failed_qa_source_ref": failed_qa_source_ref,
+            },
+        )
+    )
+
+    assert authority["failed_qa_rework_authority"][
+        "failed_qa_boundary_source"
+    ] == "authenticated_postmerge_timeline"
+    assert authority["failed_qa_rework_authority"][
+        "failed_qa_source_ref"
+    ] == failed_qa_source_ref
+    assert authority["failed_qa_rework_authority"][
+        "fresh_task_id"
+    ] == "timeline-rework-worker"
+    assert read_only_conn.execute_calls == 1
+
+
 def test_legacy_revised_batch_child_two_worker_allocation_fails_closed(
     conn,
     tmp_path,
