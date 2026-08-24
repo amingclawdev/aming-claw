@@ -73129,6 +73129,144 @@ def test_runtime_context_worker_guide_route_projection_fails_closed_on_ambiguous
     assert "\n".join(conn.iterdump()) == before_dump
 
 
+def _fully_validated_route_ref_renewal_fork(
+    conn,
+    *,
+    backlog_id: str,
+    task_id: str,
+) -> tuple[dict, dict, dict]:
+    original = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 2, 2, 0, tzinfo=timezone.utc),
+        evidence_refs=["test:route-reachability-original"],
+    )
+    original_token = copy.deepcopy(original["route_token"])
+    original_token["owned_files"] = ["agent/governance/server.py"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=original["route_token_ref"],
+        token=original_token,
+    )
+    first = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=original["route_token_ref"],
+        backlog_id=backlog_id,
+        task_id=task_id,
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 2, 2, 1, tzinfo=timezone.utc),
+        evidence_refs=["test:route-reachability-first-branch"],
+    )
+    resolved_first = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=first["route_token_ref"],
+        now=datetime(2099, 8, 2, 2, 1, 30, tzinfo=timezone.utc),
+    )
+    assert resolved_first is not None
+
+    sibling = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 2, 2, 2, tzinfo=timezone.utc),
+        evidence_refs=["test:route-reachability-second-branch"],
+    )
+    sibling_token = copy.deepcopy(sibling["route_token"])
+    sibling_token["owned_files"] = ["agent/governance/server.py"]
+    sibling_identity = _route_identity_from_issued_route(sibling)
+    sibling_proof = copy.deepcopy(
+        resolved_first["route_lineage"]["renewal_proof"]
+    )
+    sibling_proof["route_token_ref"] = sibling["route_token_ref"]
+    sibling_proof["route_identity"] = sibling_identity
+    sibling_lineage = copy.deepcopy(sibling_token.get("route_lineage") or {})
+    sibling_lineage["route_token_ref_renewed"] = True
+    sibling_lineage["renewal_proof"] = sibling_proof
+    sibling_token["route_lineage"] = sibling_lineage
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=sibling["route_token_ref"],
+        token=sibling_token,
+    )
+    return original, first, sibling
+
+
+def test_route_ref_reachability_guard_rejects_two_valid_active_branches_zero_write(
+    conn,
+):
+    backlog_id = "AC-ROUTE-REACHABILITY-TRUE-FORK"
+    task_id = "route-reachability-true-fork"
+    original, first, sibling = _fully_validated_route_ref_renewal_fork(
+        conn,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    first_leaf = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=first["route_token_ref"],
+        backlog_id=backlog_id,
+        task_id=task_id,
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 2, 2, 3, tzinfo=timezone.utc),
+        evidence_refs=["test:route-reachability-first-leaf"],
+    )
+    sibling_leaf = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=sibling["route_token_ref"],
+        backlog_id=backlog_id,
+        task_id=task_id,
+        allowed_actions=["task_timeline_append"],
+        ttl_hours=24.0,
+        now=datetime(2099, 8, 2, 2, 4, tzinfo=timezone.utc),
+        evidence_refs=["test:route-reachability-second-leaf"],
+    )
+    assert first_leaf["route_token_ref"] != sibling_leaf["route_token_ref"]
+    for branch, leaf in ((first, first_leaf), (sibling, sibling_leaf)):
+        resolved_branch = (
+            observer_route_context.resolve_route_token_ref_renewal_descendant(
+                conn,
+                project_id=PID,
+                route_token_ref=branch["route_token_ref"],
+                now=datetime(2099, 8, 2, 2, 5, tzinfo=timezone.utc),
+            )
+        )
+        assert resolved_branch is not None
+        assert resolved_branch["route_token_ref"] == leaf["route_token_ref"]
+    before_dump = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+
+    with pytest.raises(observer_route_context.RouteTokenRefError) as rejected:
+        observer_route_context.resolve_route_token_ref_renewal_descendant(
+            conn,
+            project_id=PID,
+            route_token_ref=original["route_token_ref"],
+            now=datetime(2099, 8, 2, 2, 5, tzinfo=timezone.utc),
+        )
+
+    assert rejected.value.code == (
+        "route_token_ref_renewal_descendant_ambiguous"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["fail_closed"] is True
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_dump
+
+
 def test_runtime_context_worker_guide_registry_backed_missing_ref_is_not_legacy(
     conn,
     monkeypatch,
