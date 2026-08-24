@@ -65031,7 +65031,7 @@ def _startup_identity_preflight_valid_body() -> dict[str, str]:
         "host_startup_id": "codex-thread:startup-identity-preflight",
         "host_session_id": "codex-session:startup-identity-preflight",
         "worker_session_id": "codex-session:startup-identity-preflight",
-        "worker_transcript_ref": "codex:startup-identity-preflight",
+        "worker_transcript_ref": "multi_agent:/root/startup-identity-preflight",
     }
 
 
