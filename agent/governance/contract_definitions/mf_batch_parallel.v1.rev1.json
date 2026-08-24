@@ -1,0 +1,489 @@
+{
+  "schema_version": "contract_definition.v1",
+  "contract_id": "mf_batch_parallel.v1",
+  "version": "v1",
+  "revision": "rev1",
+  "role": "observer",
+  "contract_type": "mf_batch_parallel",
+  "status": "active",
+  "compat_aliases": [
+    "mf_batch_parallel"
+  ],
+  "successors": [
+    {
+      "contract_id": "mf_parallel.v2",
+      "version": "v2",
+      "mode": "one_row_scoped_successor_per_batch_row",
+      "required": true,
+      "authority_source": "mf_batch_parallel_enter durable row fan-out binding"
+    },
+    {
+      "contract_id": "mf_parallel.v2",
+      "version": "v2",
+      "mode": "same_child_contract_append_only_failed_qa_rework_generation",
+      "required_when": "authenticated post-merge child QA is NO-PASS",
+      "maximum_fresh_rework_workers": 1,
+      "source_queue_item_remains_terminal": true,
+      "fresh_runtime_context_required": true,
+      "same_task_or_worker_identity_reuse_allowed": false,
+      "requires_new_shared_reconcile": true,
+      "requires_fresh_independent_qa": true,
+      "otherwise": "terminal_refusal"
+    }
+  ],
+  "metadata": {
+    "backlog_id": "AC-MF-BATCH-PARENT-SOURCE-BACKED-CONTRACT-P0-20260815",
+    "legacy_template_id": "mf_batch_parallel.v1",
+    "previous_revision": "template_only_mf_batch_parallel.v1",
+    "revision_reason": "Materialize the existing Batch parent topology as source-backed Rule authority, pin the common safety package, and expose the already-implemented append-only failed-QA rework generation without adding a Gate predicate.",
+    "runtime_dogfood": {
+      "enabled": true,
+      "selection": "fresh executions resolve rev1; historical template and timeline facts remain behavior witnesses only",
+      "historical_behavior_witness_commit": "170425064c5e8cdb27e7c86c06b9f2ccaf1b72ee",
+      "historical_behavior_witness_is_certificate": false
+    },
+    "activation": {
+      "schema_version": "contract_activation_dependency.v1",
+      "state": "ready",
+      "activation_ready": true,
+      "new_execution_allowed": true,
+      "template_selection_allowed": true,
+      "unresolved_dependencies": [],
+      "resolved_dependencies": [
+        {
+          "dependency_id": "AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815",
+          "status": "FIXED",
+          "commit_sha": "c994b511aae3e2a99d6100ca1f61c8cae95a0e48",
+          "package_id": "aming-claw.common-safety",
+          "package_version": "v1",
+          "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603"
+        }
+      ],
+      "result": {
+        "schema_version": "contract_activation_ready.v1",
+        "code": "contract_activation_ready",
+        "status": "accepted",
+        "classification": "source_backed_dependency_resolved",
+        "message": "mf_batch_parallel v1 rev1 explicitly joins the common Rule package and selects only the existing durable Batch Gate handlers",
+        "authorizes_write": false,
+        "activation_ready": true,
+        "new_execution_allowed": true
+      }
+    },
+    "common_rule_applicability": {
+      "schema_version": "contract_common_rule_applicability.v1",
+      "join_state": "resolved",
+      "package_id": "aming-claw.common-safety",
+      "package_version": "v1",
+      "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603",
+      "rule_ids": [
+        "AC-COMMON-IDENTITY-PROJECT-BACKLOG-TASK",
+        "AC-COMMON-IDENTITY-ROUTE",
+        "AC-COMMON-SCOPE-OWNED-FILES",
+        "AC-COMMON-WORKTREE-EXACT-IDENTITY",
+        "AC-COMMON-CREDENTIAL-NO-RAW-PERSISTENCE",
+        "AC-COMMON-COMMIT-IMMUTABLE-WORKER",
+        "AC-COMMON-QA-ROLE-SEPARATION",
+        "AC-COMMON-MERGE-ORDERED",
+        "AC-COMMON-GRAPH-EXACT-ACTIVE-PREFLIGHT",
+        "AC-COMMON-CLOSE-INTEGRITY"
+      ],
+      "scopes": [
+        "mf_batch_parallel"
+      ],
+      "omitted_rules_apply": false,
+      "server_inference_allowed": false,
+      "activation_allowed": true
+    },
+    "gate_bindings": {
+      "schema_version": "mf_batch_parallel.existing_gate_bindings.v1",
+      "new_predicates_added": false,
+      "hidden_server_inference_allowed": false,
+      "bindings": [
+        {
+          "line_id": "observer_batch_preflight",
+          "validator_symbol": "plan_mf_batch_parallel_preflight",
+          "implementation_file": "agent/governance/parallel_branch_runtime.py"
+        },
+        {
+          "line_id": "observer_bind_row_successors",
+          "validator_symbol": "handle_project_mf_batch_parallel_enter",
+          "implementation_file": "agent/governance/server.py"
+        },
+        {
+          "line_id": "observer_open_integration_epoch",
+          "validator_symbol": "open_or_validate_integration_epoch",
+          "implementation_file": "agent/governance/parallel_branch_runtime.py"
+        },
+        {
+          "line_id": "observer_ordered_batch_merge",
+          "validator_symbol": "select_merge_queue_item",
+          "implementation_file": "agent/governance/parallel_branch_runtime.py"
+        },
+        {
+          "line_id": "observer_final_reconcile",
+          "validator_symbol": "_contract_runtime_shared_batch_reconcile_authority",
+          "implementation_file": "agent/governance/server.py"
+        },
+        {
+          "line_id": "qa_batch_postmerge_verification",
+          "validator_symbol": "_contract_runtime_shared_batch_postmerge_qa_activation_verified",
+          "implementation_file": "agent/governance/server.py"
+        },
+        {
+          "line_id": "observer_atomic_coordination_epoch_close",
+          "validator_symbol": "_contract_runtime_mf_batch_parent_close_authority_gate",
+          "implementation_file": "agent/governance/server.py"
+        },
+        {
+          "policy_id": "failed_qa_rework_generation",
+          "validator_symbol": "_parallel_branch_allocate_merged_batch_failed_qa_rework_authority",
+          "implementation_file": "agent/governance/server.py"
+        }
+      ]
+    }
+  },
+  "system_layer": {
+    "entrypoint_policy": {
+      "allow_root_start": false,
+      "root_start_default": "deny",
+      "requires_parent_execution": true,
+      "required_parent": "completed onboard_route_guide service execution with exact Batch action_input",
+      "denied_reason": "mf_batch_parallel starts only from the durable guide-issued parent route"
+    },
+    "successor_policy": {
+      "allow_successor_start": true,
+      "initial_successor_contract_id": "mf_parallel.v2",
+      "one_successor_per_backlog_row": true,
+      "same_generation_retry_allowed": false,
+      "terminal_queue_row_rewrite_allowed": false,
+      "failed_qa_rework_mode": "same_child_contract_append_only_fresh_runtime_context",
+      "maximum_failed_qa_rework_workers": 1,
+      "fresh_task_identity_required": true,
+      "fresh_worker_identity_required": true,
+      "fresh_runtime_context_required": true,
+      "new_integration_generation_required": true,
+      "fresh_reconcile_and_qa_required": true,
+      "implicit_reopen_allowed": false,
+      "otherwise": "terminal_refusal"
+    },
+    "write_authority_policy": {
+      "agent_facing_generic_crud_allowed": false,
+      "allowed_writer_roles_source": "rule_layer.allowed_writer_roles",
+      "body_supplied_role_claims_trusted": false,
+      "unlisted_role_default": "deny"
+    },
+    "next_action_policy": {
+      "source": "first incomplete required Rule line plus server-derived Batch runtime projection",
+      "linear_nominal_path": true,
+      "failure_backedge_allowed": false,
+      "failed_qa_next_action": "one append-only fresh failed_qa_rework RuntimeContext or terminal refusal"
+    },
+    "projection_policy": {
+      "read_model_source": "source_json_normalized_definition",
+      "runtime_projection_source": "existing Batch timeline, merge queue, integration epoch, child ContractRuntime and backlog rows",
+      "mutable_completed_lines_trust_root": false,
+      "historical_template_or_timeline_is_authority": false
+    },
+    "route_policy": {
+      "route_identity_required": true,
+      "route_token_ref_required": true,
+      "visible_injection_manifest_required": true,
+      "raw_route_token_allowed": false,
+      "batch_route_must_match_guide_action_input": true
+    },
+    "authority_policy": {
+      "semantic_change_requires_new_revision": true,
+      "same_revision_semantic_change_allowed": false,
+      "independent_review_required": true,
+      "formatting_only_drift_must_remain_visible": true
+    },
+    "graph_binding_policy": {
+      "graph_query_required_before_parent_mutation": true,
+      "current_full_reconcile_required_per_integration_generation": true,
+      "active_snapshot_exact_head_required": true,
+      "candidate_or_historical_snapshot_is_close_authority": false
+    },
+    "integration_epoch_policy": {
+      "schema_version": "mf_batch_parallel.integration_epoch_rule.v1",
+      "open_trigger": "first_live_merge",
+      "target_ref_frozen_until_atomic_close": true,
+      "ordered_merge_required": true,
+      "one_current_full_reconcile_per_generation": true,
+      "first_generation_history_immutable": true,
+      "failed_qa_rework_generation": {
+        "source_queue_item_remains_terminal": true,
+        "fresh_runtime_context_required": true,
+        "fresh_task_and_worker_identity_required": true,
+        "exact_target_ref_and_base_binding_required": true,
+        "one_repair_merge": true,
+        "one_new_current_full_reconcile": true,
+        "fresh_independent_qa": true,
+        "same_generation_reopen_allowed": false,
+        "otherwise": "terminal_refusal"
+      }
+    },
+    "retry_policy": {
+      "same_execution_line_rewrite_allowed": false,
+      "same_generation_retry_allowed": false,
+      "terminal_queue_row_rewrite_allowed": false,
+      "append_only_failed_qa_rework_generation_allowed": true,
+      "maximum_failed_qa_rework_workers": 1,
+      "bypass_is_retry_authority": false,
+      "waive_is_pass_authority": false
+    },
+    "terminal_outcome_policy": {
+      "success": "atomic coordination close after all protected child FIXED rows, ordered merges, current generation reconcile and fresh postmerge QA",
+      "qa_failure": "source generation NO-PASS; one bounded append-only rework generation or terminal refusal",
+      "rework_exhausted": "terminal_no_pass_preserve_source_generation_as_audit",
+      "history_rewrite_allowed": false,
+      "bypass_can_produce_pass": false
+    }
+  },
+  "rule_layer": {
+    "stages": [
+      {
+        "stage_id": "batch_contract_draft",
+        "description": "Bind the coordination row, exact child row set and guide-issued Batch route.",
+        "lines": [
+          {
+            "line_id": "observer_bind_batch_parent",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "contract_binding",
+            "required": true,
+            "requires": [],
+            "description": "Persist the exact parent/child identity without treating the template or a historical run as authority."
+          }
+        ]
+      },
+      {
+        "stage_id": "batch_scope_review",
+        "description": "Run the side-effect-free Batch preflight and close every acceptance/file fence.",
+        "lines": [
+          {
+            "line_id": "observer_batch_preflight",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "batch_preflight",
+            "required": true,
+            "requires": ["observer_bind_batch_parent"],
+            "description": "Use plan_mf_batch_parallel_preflight; blockers are typed refusals and perform no durable queue write."
+          }
+        ]
+      },
+      {
+        "stage_id": "row_fanout_planning",
+        "description": "Bind one row-scoped mf_parallel successor plan per child backlog row.",
+        "lines": [
+          {
+            "line_id": "observer_plan_row_successors",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "row_successor_plan",
+            "required": true,
+            "requires": ["observer_batch_preflight"],
+            "description": "Each child retains its own Contract, RuntimeContext, file fence, QA and close authority."
+          }
+        ]
+      },
+      {
+        "stage_id": "row_successor_dispatch",
+        "description": "Enter the exact durable Batch generation and create the row-scoped successor bindings.",
+        "lines": [
+          {
+            "line_id": "observer_bind_row_successors",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "row_successor_binding",
+            "required": true,
+            "requires": ["observer_plan_row_successors"],
+            "description": "Use handle_project_mf_batch_parallel_enter; caller-supplied Batch authority is rejected."
+          }
+        ]
+      },
+      {
+        "stage_id": "row_successor_tracking",
+        "description": "Require every child candidate to finish its implementation and premerge QA boundary.",
+        "lines": [
+          {
+            "line_id": "observer_bind_row_candidates",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "row_candidate_custody",
+            "required": true,
+            "requires": ["observer_bind_row_successors"],
+            "description": "Candidate custody remains child-scoped and does not itself authorize canonical landing or parent close."
+          }
+        ]
+      },
+      {
+        "stage_id": "batch_integration_epoch",
+        "description": "Open or resume the one durable integration generation at the exact target ref and base.",
+        "lines": [
+          {
+            "line_id": "observer_open_integration_epoch",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "integration_epoch",
+            "required": true,
+            "requires": ["observer_bind_row_candidates"],
+            "description": "Use open_or_validate_integration_epoch; position skips, partial-head rebases and blind replay are refused."
+          }
+        ]
+      },
+      {
+        "stage_id": "ordered_batch_merge",
+        "description": "Land the immutable child candidates in the durable queue order.",
+        "lines": [
+          {
+            "line_id": "observer_ordered_batch_merge",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "ordered_merge",
+            "required": true,
+            "requires": ["observer_open_integration_epoch"],
+            "description": "Use the server-selected next merge queue item; a terminal source row is never mutated into retry authority."
+          }
+        ]
+      },
+      {
+        "stage_id": "final_batch_reconcile",
+        "description": "Run exactly one current-HEAD full reconcile for the completed integration generation.",
+        "lines": [
+          {
+            "line_id": "observer_final_reconcile",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "current_full_reconcile",
+            "required": true,
+            "requires": ["observer_ordered_batch_merge"],
+            "description": "The shared reconcile must bind the exact durable merged prefix and current canonical HEAD."
+          }
+        ]
+      },
+      {
+        "stage_id": "batch_final_qa",
+        "description": "Obtain fresh authenticated postmerge QA for every child against the shared reconciled HEAD.",
+        "lines": [
+          {
+            "line_id": "qa_batch_postmerge_verification",
+            "owner_role": "qa",
+            "allowed_writer_roles": ["qa"],
+            "evidence_kind": "batch_postmerge_independent_verification",
+            "required": true,
+            "requires": ["observer_final_reconcile"],
+            "description": "QA NO-PASS cannot backedge this generation; it may authorize one fresh failed_qa_rework RuntimeContext followed by a new reconcile and fresh QA."
+          }
+        ]
+      },
+      {
+        "stage_id": "protected_child_closures",
+        "description": "Close child rows only through their own Contract and Gate authority.",
+        "lines": [
+          {
+            "line_id": "observer_verify_protected_child_closures",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "protected_child_closures",
+            "required": true,
+            "requires": ["qa_batch_postmerge_verification"],
+            "description": "Every child must be formally FIXED; child close never releases the parent integration freeze."
+          }
+        ]
+      },
+      {
+        "stage_id": "atomic_coordination_epoch_close",
+        "description": "Atomically close the coordination row and release the exact integration generation.",
+        "lines": [
+          {
+            "line_id": "observer_atomic_coordination_epoch_close",
+            "owner_role": "observer",
+            "allowed_writer_roles": ["observer"],
+            "evidence_kind": "close_ready",
+            "required": true,
+            "requires": ["observer_verify_protected_child_closures"],
+            "description": "The existing parent close Gate derives authority from the durable Batch entry, terminal merge queue, child FIXED rows and exact close commit."
+          }
+        ]
+      }
+    ],
+    "transitions": [
+      {
+        "from": "batch_contract_draft",
+        "to": "batch_scope_review",
+        "decision": "guide_route_and_parent_identity_exact"
+      },
+      {
+        "from": "batch_scope_review",
+        "to": "row_fanout_planning",
+        "decision": "preflight_fanout_ready"
+      },
+      {
+        "from": "row_fanout_planning",
+        "to": "row_successor_dispatch",
+        "decision": "one_row_scoped_successor_plan_per_child"
+      },
+      {
+        "from": "row_successor_dispatch",
+        "to": "row_successor_tracking",
+        "decision": "durable_batch_entry_and_child_bindings_written"
+      },
+      {
+        "from": "row_successor_tracking",
+        "to": "batch_integration_epoch",
+        "decision": "all_child_candidates_custodied"
+      },
+      {
+        "from": "batch_integration_epoch",
+        "to": "ordered_batch_merge",
+        "decision": "exact_epoch_open_or_resumed"
+      },
+      {
+        "from": "ordered_batch_merge",
+        "to": "final_batch_reconcile",
+        "decision": "all_queue_items_terminal_merged"
+      },
+      {
+        "from": "final_batch_reconcile",
+        "to": "batch_final_qa",
+        "decision": "current_generation_full_reconcile_exact"
+      },
+      {
+        "from": "batch_final_qa",
+        "to": "protected_child_closures",
+        "decision": "all_child_postmerge_qa_passed"
+      },
+      {
+        "from": "protected_child_closures",
+        "to": "atomic_coordination_epoch_close",
+        "decision": "all_child_rows_fixed"
+      }
+    ]
+  },
+  "instruction_layer": {
+    "inline": [
+      "Use this parent only after a complete guide-issued mf_batch_parallel action_input binds the coordination row and at least two exact child backlog rows.",
+      "Run side-effect-free Batch preflight before fan-out; do not write a durable queue when preflight returns blockers.",
+      "Create one row-scoped mf_parallel successor per child; workers never implement against the Batch parent.",
+      "Open or resume the durable integration epoch only at the exact target ref and base; merge only the server-selected queue prefix.",
+      "After every integration generation run one current-HEAD full reconcile, then fresh authenticated postmerge QA for each child.",
+      "If postmerge QA is NO-PASS, preserve the terminal source queue row and immutable first-generation history; allocate at most one fresh failed_qa_rework RuntimeContext in the same child Contract, perform one repair merge, then a new reconcile and fresh QA. Otherwise stop with terminal refusal.",
+      "Never treat bypass or waive as candidate custody, landing, deployment, QA PASS or close authority.",
+      "Close children through their own protected Gates; close the coordination row and release the epoch only when every child is FIXED and the parent close Gate accepts the exact Batch result."
+    ],
+    "refs": []
+  },
+  "governance_hints": {
+    "schema_version": "governance_hints.v1",
+    "asset_binding_events": [
+      {
+        "schema_version": "asset_binding_event.v1",
+        "operation": "bind",
+        "path": ".",
+        "role": "config",
+        "target_module": "agent.governance.contracts.registry"
+      }
+    ]
+  }
+}

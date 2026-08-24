@@ -351,6 +351,118 @@ def test_mf_parallel_rev10_keeps_nominal_chain_and_forbids_commit_backedge() -> 
     assert successor_modes == {"same_contract_append_only_failed_qa_rework"}
 
 
+def test_mf_batch_parallel_rev1_maps_existing_gates_without_nominal_backedge() -> None:
+    registry = ContractDefinitionRegistry()
+    definition = registry.get(
+        "mf_batch_parallel",
+        version="v1",
+        revision="rev1",
+    )
+    package = registry.common_rule_package()
+    join = registry.resolve_common_rule_applicability(definition)
+    expected_chain = [
+        ("batch_contract_draft", "observer_bind_batch_parent", "observer"),
+        ("batch_scope_review", "observer_batch_preflight", "observer"),
+        ("row_fanout_planning", "observer_plan_row_successors", "observer"),
+        ("row_successor_dispatch", "observer_bind_row_successors", "observer"),
+        ("row_successor_tracking", "observer_bind_row_candidates", "observer"),
+        ("batch_integration_epoch", "observer_open_integration_epoch", "observer"),
+        ("ordered_batch_merge", "observer_ordered_batch_merge", "observer"),
+        ("final_batch_reconcile", "observer_final_reconcile", "observer"),
+        ("batch_final_qa", "qa_batch_postmerge_verification", "qa"),
+        (
+            "protected_child_closures",
+            "observer_verify_protected_child_closures",
+            "observer",
+        ),
+        (
+            "atomic_coordination_epoch_close",
+            "observer_atomic_coordination_epoch_close",
+            "observer",
+        ),
+    ]
+    flattened = [
+        (stage["stage_id"], line["line_id"], line["owner_role"])
+        for stage in definition["rule_layer"]["stages"]
+        for line in stage["lines"]
+    ]
+
+    assert flattened == expected_chain
+    assert join["authoritative"] is True
+    assert join["rule_ids"] == package["rule_ids"]
+    assert join["scopes"] == ["mf_batch_parallel"]
+    assert join["server_inference_allowed"] is False
+
+    line_ids = [line_id for _, line_id, _ in flattened]
+    previous_line = ""
+    for stage in definition["rule_layer"]["stages"]:
+        assert len(stage["lines"]) == 1
+        line = stage["lines"][0]
+        assert line["allowed_writer_roles"] == [line["owner_role"]]
+        assert line.get("requires", []) == (
+            [] if not previous_line else [previous_line]
+        )
+        previous_line = line["line_id"]
+
+    stage_order = {stage_id: index for index, (stage_id, *_rest) in enumerate(expected_chain)}
+    for transition in definition["rule_layer"]["transitions"]:
+        assert stage_order[transition["from"]] < stage_order[transition["to"]]
+    assert not any(
+        transition["from"] == "batch_final_qa"
+        and transition["to"] in {
+            "row_successor_dispatch",
+            "batch_integration_epoch",
+            "ordered_batch_merge",
+        }
+        for transition in definition["rule_layer"]["transitions"]
+    )
+
+    bindings = definition["metadata"]["gate_bindings"]
+    assert bindings["new_predicates_added"] is False
+    assert bindings["hidden_server_inference_allowed"] is False
+    expected_symbols = {
+        "plan_mf_batch_parallel_preflight": "agent/governance/parallel_branch_runtime.py",
+        "handle_project_mf_batch_parallel_enter": "agent/governance/server.py",
+        "open_or_validate_integration_epoch": "agent/governance/parallel_branch_runtime.py",
+        "select_merge_queue_item": "agent/governance/parallel_branch_runtime.py",
+        "_contract_runtime_shared_batch_reconcile_authority": "agent/governance/server.py",
+        "_contract_runtime_shared_batch_postmerge_qa_activation_verified": "agent/governance/server.py",
+        "_contract_runtime_mf_batch_parent_close_authority_gate": "agent/governance/server.py",
+        "_parallel_branch_allocate_merged_batch_failed_qa_rework_authority": "agent/governance/server.py",
+    }
+    assert {
+        item["validator_symbol"]: item["implementation_file"]
+        for item in bindings["bindings"]
+    } == expected_symbols
+    assert {
+        item["line_id"]
+        for item in bindings["bindings"]
+        if item.get("line_id")
+    }.issubset(set(line_ids))
+    for symbol, path in expected_symbols.items():
+        implementation = (REPO_ROOT / path).read_text(encoding="utf-8")
+        assert f"def {symbol}(" in implementation
+
+
+def test_mf_batch_parallel_rev1_keeps_170425_as_non_authoritative_witness() -> None:
+    definition = ContractDefinitionRegistry().get(
+        "mf_batch_parallel",
+        version="v1",
+        revision="rev1",
+    )
+    witness = definition["metadata"]["runtime_dogfood"]
+    historical = next(
+        world
+        for world in _happy_path_gate_map()["historical_reference_worlds"]
+        if world["lane"] == "mf_batch_parallel"
+    )
+
+    assert witness["historical_behavior_witness_commit"] == historical["commit_sha"]
+    assert witness["historical_behavior_witness_is_certificate"] is False
+    assert historical["current_contract_certificate"] is False
+    assert historical["simultaneous_environment"] is False
+
+
 def test_happy_path_gate_map_pins_three_independent_historical_worlds() -> None:
     gate_map = _happy_path_gate_map()
 

@@ -3,6 +3,70 @@
   "template_id": "mf_batch_parallel.v1",
   "version": "v1",
   "description": "Parent route template for observer-led parallel work across multiple backlog rows. Each row owns worker, independent QA, and protected close evidence; the parent owns one durable, restart-safe integration epoch that serializes merge and final reconcile, then atomically closes the coordination row with the epoch after every child has formally closed.",
+  "source": {
+    "type": "source_controlled",
+    "path": "contract_definitions/mf_batch_parallel.v1.rev1.json",
+    "authority": "contract_definition",
+    "template_is_authoritative": false,
+    "contract_id": "mf_batch_parallel.v1",
+    "version": "v1",
+    "revision": "rev1",
+    "definition_hash": "sha256:b124705eb06751d4ea4e37ddb2a42e9985c79759da40097193d9281295df86be",
+    "definition_source_sha256": "sha256:8854641bdc7a0ee98a681cf9f6c86cc6adb9021260d5b09e66b0d9a0d981ecaa"
+  },
+  "activation_policy": {
+    "schema_version": "contract_activation_dependency.v1",
+    "state": "ready",
+    "activation_ready": true,
+    "new_execution_allowed": true,
+    "template_selection_allowed": true,
+    "unresolved_dependencies": [],
+    "resolved_dependencies": [
+      {
+        "dependency_id": "AC-CONTRACT-COMMON-SAFETY-RULE-PACKAGE-P0-20260815",
+        "status": "FIXED",
+        "commit_sha": "c994b511aae3e2a99d6100ca1f61c8cae95a0e48",
+        "package_id": "aming-claw.common-safety",
+        "package_version": "v1",
+        "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603"
+      }
+    ],
+    "result": {
+      "schema_version": "contract_activation_ready.v1",
+      "code": "contract_activation_ready",
+      "status": "accepted",
+      "classification": "source_backed_dependency_resolved",
+      "message": "mf_batch_parallel v1 rev1 explicitly joins the common Rule package and selects only the existing durable Batch Gate handlers",
+      "authorizes_write": false,
+      "activation_ready": true,
+      "new_execution_allowed": true
+    }
+  },
+  "common_rule_applicability": {
+    "schema_version": "contract_common_rule_applicability.v1",
+    "join_state": "resolved",
+    "package_id": "aming-claw.common-safety",
+    "package_version": "v1",
+    "package_digest": "sha256:b811cb54c5517073de8d7bc02e9f315c612e91fc4bfb0f9dece99cfe08962603",
+    "rule_ids": [
+      "AC-COMMON-IDENTITY-PROJECT-BACKLOG-TASK",
+      "AC-COMMON-IDENTITY-ROUTE",
+      "AC-COMMON-SCOPE-OWNED-FILES",
+      "AC-COMMON-WORKTREE-EXACT-IDENTITY",
+      "AC-COMMON-CREDENTIAL-NO-RAW-PERSISTENCE",
+      "AC-COMMON-COMMIT-IMMUTABLE-WORKER",
+      "AC-COMMON-QA-ROLE-SEPARATION",
+      "AC-COMMON-MERGE-ORDERED",
+      "AC-COMMON-GRAPH-EXACT-ACTIVE-PREFLIGHT",
+      "AC-COMMON-CLOSE-INTEGRITY"
+    ],
+    "scopes": [
+      "mf_batch_parallel"
+    ],
+    "omitted_rules_apply": false,
+    "server_inference_allowed": false,
+    "activation_allowed": true
+  },
   "task_types": [
     "mf_batch_parallel",
     "manual_fix",
@@ -17,6 +81,7 @@
     "batch_integration_epoch",
     "ordered_batch_merge",
     "final_batch_reconcile",
+    "batch_final_qa",
     "protected_child_closures",
     "atomic_coordination_epoch_close"
   ],
@@ -38,6 +103,7 @@
     "integration_epoch_open",
     "merge_in_doubt",
     "final_reconcile_pending",
+    "final_qa_pending",
     "atomic_close_ready",
     "needs_revision",
     "batch_summary_ready",
@@ -155,6 +221,22 @@
       "child_protected_close_requires_reconciled_epoch": true,
       "all_child_rows_formally_closed_before_coordination_close": true,
       "release_only_in_atomic_coordination_epoch_close": true
+    },
+    "failed_qa_rework_generation": {
+      "schema_version": "mf_batch_parallel.failed_qa_rework_generation.v1",
+      "authority_source": "_parallel_branch_allocate_merged_batch_failed_qa_rework_authority",
+      "source_queue_item_remains_terminal": true,
+      "first_generation_history_immutable": true,
+      "same_generation_reopen_allowed": false,
+      "fresh_runtime_context_required": true,
+      "fresh_task_and_worker_identity_required": true,
+      "same_child_contract_execution": true,
+      "maximum_fresh_rework_workers": 1,
+      "exact_target_ref_and_base_binding_required": true,
+      "one_repair_merge": true,
+      "one_new_current_full_reconcile": true,
+      "fresh_postmerge_independent_qa": true,
+      "otherwise": "terminal_refusal"
     }
   },
   "observer_contract": {
@@ -185,8 +267,11 @@
   },
   "qa_contract": {
     "role": "qa",
-    "scope": "single row successor plus optional batch summary review",
-    "independent_verification_required": true
+    "scope": "each row successor against the shared postmerge reconciled HEAD",
+    "independent_verification_required": true,
+    "postmerge_child_verification_required": true,
+    "fresh_after_each_integration_generation": true,
+    "parent_self_attestation_allowed": false
   },
   "evidence_requirements": [
     "preflight_id",
@@ -196,14 +281,29 @@
     "row_successor_plan",
     "per_row_route_token_refs",
     "per_row_mf_parallel_contract_refs",
+    "integration_generation_id",
+    "current_full_reconcile_snapshot_id",
+    "postmerge_child_qa_refs",
+    "protected_child_close_refs",
     "conflict_policy",
     "batch_summary"
   ],
   "successors": [
     {
-      "contract_id": "mf_parallel",
-      "version": "v1",
+      "contract_id": "mf_parallel.v2",
+      "version": "v2",
       "reason": "Each backlog row in the batch must continue through a row-scoped mf_parallel successor."
+    },
+    {
+      "contract_id": "mf_parallel.v2",
+      "version": "v2",
+      "mode": "same_child_contract_append_only_failed_qa_rework_generation",
+      "maximum_fresh_rework_workers": 1,
+      "source_queue_item_remains_terminal": true,
+      "fresh_runtime_context_required": true,
+      "requires_new_shared_reconcile": true,
+      "requires_fresh_independent_qa": true,
+      "reason": "A postmerge child QA NO-PASS may create one append-only fresh RuntimeContext generation; it never mutates or reopens the terminal source queue row."
     }
   ]
 }

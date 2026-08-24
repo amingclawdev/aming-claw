@@ -24,6 +24,7 @@ CONTRACT_TEMPLATE_ALIASES = {
     "operator_supervised_direct_main": "operator_supervised_direct_main.v1",
     "mf_parallel": "mf_parallel.v2",
     "parallel_worker": "mf_parallel.v2",
+    "mf_batch_parallel": "mf_batch_parallel.v1",
     "hotfix.v1": "observer_hotfix_direct_mutation.v1",
     "observer_hotfix.v1": "observer_hotfix_direct_mutation.v1",
 }

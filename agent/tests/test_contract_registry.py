@@ -1754,3 +1754,68 @@ def test_direct_main_rev3_template_and_task_selection_are_source_backed() -> Non
         assert resolved["source"]["revision"] == "rev3"
         assert resolved["activation_policy"]["activation_ready"] is True
         assert resolved["activation_policy"]["new_execution_allowed"] is True
+
+
+def test_mf_batch_parallel_rev1_template_and_task_selection_are_source_backed() -> None:
+    registry = ContractDefinitionRegistry()
+    definition = registry.resolve_for_new_execution(
+        "mf_batch_parallel",
+        version="v1",
+    )
+    template = get_contract_template("mf_batch_parallel")
+    package = registry.common_rule_package()
+    join = registry.resolve_common_rule_applicability(definition)
+
+    assert definition["contract_id"] == "mf_batch_parallel.v1"
+    assert definition["revision"] == "rev1"
+    assert definition["status"] == "active"
+    assert definition["definition_hash"] == (
+        "sha256:b124705eb06751d4ea4e37ddb2a42e9985c79759da40097193d9281295df86be"
+    )
+    assert definition["source_sha256"] == (
+        "sha256:8854641bdc7a0ee98a681cf9f6c86cc6adb9021260d5b09e66b0d9a0d981ecaa"
+    )
+    assert registry.get("mf_batch_parallel", version="v1")["revision"] == "rev1"
+    assert registry.get("mf_batch_parallel.v1", version="v1")["revision"] == (
+        "rev1"
+    )
+    assert join["authoritative"] is True
+    assert join["join_state"] == "resolved"
+    assert join["package_id"] == package["package_id"]
+    assert join["package_version"] == package["package_version"]
+    assert join["package_digest"] == package["package_digest"]
+    assert join["rule_ids"] == package["rule_ids"]
+    assert join["scopes"] == ["mf_batch_parallel"]
+    assert join["omitted_rules_apply"] is False
+    assert join["server_inference_allowed"] is False
+
+    assert template["template_id"] == "mf_batch_parallel.v1"
+    assert template["source"] == {
+        "type": "source_controlled",
+        "path": "contract_definitions/mf_batch_parallel.v1.rev1.json",
+        "authority": "contract_definition",
+        "template_is_authoritative": False,
+        "contract_id": "mf_batch_parallel.v1",
+        "version": "v1",
+        "revision": "rev1",
+        "definition_hash": definition["definition_hash"],
+        "definition_source_sha256": definition["source_sha256"],
+    }
+    assert template["common_rule_applicability"] == definition["metadata"][
+        "common_rule_applicability"
+    ]
+    assert template["activation_policy"] == definition["metadata"]["activation"]
+    assert template["source"]["template_is_authoritative"] is False
+    assert template["integration_epoch_contract"][
+        "failed_qa_rework_generation"
+    ]["source_queue_item_remains_terminal"] is True
+
+    for query in (
+        {"template_id": "mf_batch_parallel"},
+        {"template_id": "mf_batch_parallel.v1"},
+        {"task_type": "mf_batch_parallel"},
+    ):
+        resolved = resolve_contract_template(**query)
+        assert resolved["source"]["revision"] == "rev1"
+        assert resolved["activation_policy"]["activation_ready"] is True
+        assert resolved["activation_policy"]["new_execution_allowed"] is True

@@ -23,6 +23,7 @@ from agent.governance.contracts.runtime import (
     ContractRetirementError,
     ContractRuntime,
     SQLiteContractExecutionStore,
+    StalePinnedContractExecutionError,
     WriteGateDecision,
     _active_failed_qa_line,
     _contract_completion_satisfying_lines,
@@ -474,6 +475,110 @@ def test_direct_main_rev3_fresh_selection_does_not_rebind_pinned_rev2():
     assert "AC-COMMON-MERGE-ORDERED" not in fresh_rev3[
         "authoritative_common_rule_join"
     ]["rule_ids"]
+
+
+def test_mf_batch_parallel_rev1_fresh_execution_is_source_pinned_and_immutable(
+    tmp_path,
+):
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "governance"
+        / "contract_definitions"
+        / "mf_batch_parallel.v1.rev1.json"
+    )
+    temp_definition = tmp_path / source_path.name
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    temp_definition.write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    registry = ContractDefinitionRegistry(tmp_path)
+    runtime = ContractRuntime(registry)
+    created = runtime.start_execution(
+        "mf_batch_parallel",
+        version="v1",
+        project_id="aming-claw",
+        backlog_id="AC-MF-BATCH-REV1-FRESH-PIN",
+        actor_role="observer",
+        contract_execution_id="cex-mf-batch-rev1-fresh-pin",
+    )
+    pinned_hash = created["definition_hash"]
+    pinned_source_hash = created["definition_source_sha256"]
+    package = registry.common_rule_package()
+
+    assert created["contract_id"] == "mf_batch_parallel.v1"
+    assert created["revision"] == "rev1"
+    assert created["authoritative_common_rule_join"]["rule_ids"] == package[
+        "rule_ids"
+    ]
+    assert created["authoritative_common_rule_join"]["scopes"] == [
+        "mf_batch_parallel"
+    ]
+    assert created["execution_state"]["next_action"]["line_id"] == (
+        "observer_bind_batch_parent"
+    )
+
+    payload["instruction_layer"]["inline"].append(
+        "fixture-only source drift after the execution is pinned"
+    )
+    temp_definition.write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    reloaded = registry.get("mf_batch_parallel", version="v1")
+    with pytest.raises(StalePinnedContractExecutionError):
+        runtime.current_record("cex-mf-batch-rev1-fresh-pin")
+    persisted = runtime.store.get("cex-mf-batch-rev1-fresh-pin")
+
+    assert reloaded["definition_hash"] != pinned_hash
+    assert reloaded["source_sha256"] != pinned_source_hash
+    assert persisted["definition_hash"] == pinned_hash
+    assert persisted["definition_source_sha256"] == pinned_source_hash
+    assert persisted["revision"] == "rev1"
+    assert persisted["completed_lines"] == []
+
+
+def test_mf_batch_parallel_rev1_failed_qa_rework_is_append_only_generation() -> None:
+    definition = ContractDefinitionRegistry().get(
+        "mf_batch_parallel",
+        version="v1",
+        revision="rev1",
+    )
+    successor = definition["system_layer"]["successor_policy"]
+    epoch = definition["system_layer"]["integration_epoch_policy"][
+        "failed_qa_rework_generation"
+    ]
+    retry = definition["system_layer"]["retry_policy"]
+
+    assert successor["terminal_queue_row_rewrite_allowed"] is False
+    assert successor["same_generation_retry_allowed"] is False
+    assert successor["failed_qa_rework_mode"] == (
+        "same_child_contract_append_only_fresh_runtime_context"
+    )
+    assert successor["maximum_failed_qa_rework_workers"] == 1
+    assert successor["fresh_task_identity_required"] is True
+    assert successor["fresh_worker_identity_required"] is True
+    assert successor["fresh_runtime_context_required"] is True
+    assert successor["new_integration_generation_required"] is True
+    assert successor["fresh_reconcile_and_qa_required"] is True
+    assert successor["implicit_reopen_allowed"] is False
+    assert epoch == {
+        "source_queue_item_remains_terminal": True,
+        "fresh_runtime_context_required": True,
+        "fresh_task_and_worker_identity_required": True,
+        "exact_target_ref_and_base_binding_required": True,
+        "one_repair_merge": True,
+        "one_new_current_full_reconcile": True,
+        "fresh_independent_qa": True,
+        "same_generation_reopen_allowed": False,
+        "otherwise": "terminal_refusal",
+    }
+    assert retry["same_execution_line_rewrite_allowed"] is False
+    assert retry["same_generation_retry_allowed"] is False
+    assert retry["terminal_queue_row_rewrite_allowed"] is False
+    assert retry["append_only_failed_qa_rework_generation_allowed"] is True
+    assert retry["bypass_is_retry_authority"] is False
+    assert retry["waive_is_pass_authority"] is False
 
 
 def test_direct_main_rev3_demo_bypass_to_end_stays_no_pass_audit_only():
