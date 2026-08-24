@@ -2343,108 +2343,31 @@ def resolve_route_token_ref_renewal_descendant(
     def exact_list(value: Sequence[str]) -> list[str]:
         return sorted(set(_string_list(value)))
 
-    current_row = requested_row
-    current_ref = requested_ref
-    visited: set[str] = set()
-    chain_refs = [requested_ref]
-    chain_edges: list[str] = []
-
-    for _hop in range(64):
-        if current_ref in visited:
-            fail(
-                "route_token_ref_renewal_lineage_cycle",
-                "route-token renewal lineage contains a cycle",
-                field="route_lineage",
-                expected="acyclic_exact_same_scope_chain",
-                actual=chain_refs,
-            )
-        visited.add(current_ref)
-        status = _string(current_row.get("status"))
-        if status == REF_STATUS_ACTIVE:
-            resolved = resolve_route_token_ref(
-                conn,
-                project_id=project_id,
-                route_token_ref=current_ref,
-                now=now,
-            )
-            if not resolved:
-                return None
-            if current_ref != requested_ref:
-                resolved = dict(resolved)
-                resolved["renewal_resolution"] = {
-                    "schema_version": (
-                        "route_token_ref_exact_renewal_descendant_resolution.v1"
-                    ),
-                    "status": "resolved_active_descendant",
-                    "requested_route_token_ref": requested_ref,
-                    "resolved_route_token_ref": current_ref,
-                    "requested_route_identity": row_identity(requested_row),
-                    "resolved_route_identity": row_identity(current_row),
-                    "route_token_ref_chain": list(chain_refs),
-                    "edge_types": list(chain_edges),
-                    "scope": exact_scope(current_row),
-                    "exact_scope_verified": True,
-                    "registry_verified": True,
-                    "writes_performed": False,
-                    "raw_route_token_exposed": False,
-                }
-            return resolved
-        if status != REF_STATUS_SUPERSEDED:
-            fail(
-                "route_token_ref_renewal_lineage_status_invalid",
-                "route-token renewal lineage contains a non-consumable row",
-                field="status",
-                expected=[REF_STATUS_ACTIVE, REF_STATUS_SUPERSEDED],
-                actual=status or "missing",
-            )
-
-        direct_claims: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
-        for candidate in rows_by_ref.values():
-            candidate_ref = _string(candidate.get("route_token_ref"))
-            if not candidate_ref or candidate_ref == current_ref:
-                continue
-            lineage = _json_loads_public_mapping(
-                candidate.get(_REF_LINEAGE_COLUMNS["route_lineage"])
-            )
-            for proof_key, edge_type in (
-                ("renewal_proof", "renewal"),
-                ("same_scope_reissue_proof", "same_scope_reissue"),
-            ):
-                proof = (
-                    dict(lineage.get(proof_key) or {})
-                    if isinstance(lineage.get(proof_key), Mapping)
-                    else {}
+    def validate_claim(
+        current_row: Mapping[str, Any],
+        current_ref: str,
+        candidate_row: Mapping[str, Any],
+        edge_type: str,
+        proof: Mapping[str, Any],
+    ) -> None:
+        candidate_ref = _string(candidate_row.get("route_token_ref"))
+        for field, expected, actual in (
+            (
+                "previous_route_token_ref",
+                current_ref,
+                proof.get("previous_route_token_ref"),
+            ),
+            ("route_token_ref", candidate_ref, proof.get("route_token_ref")),
+        ):
+            if not expected or _string(actual) != expected:
+                fail(
+                    "route_token_ref_renewal_proof_link_invalid",
+                    "route-token renewal proof does not identify its registry edge",
+                    field=f"route_lineage.{field}",
+                    expected=expected or "non_empty_registry_ref",
+                    actual=_string(actual) or "missing",
                 )
-                if (
-                    _string(proof.get("previous_route_token_ref")) == current_ref
-                    and _string(proof.get("route_token_ref")) == candidate_ref
-                ):
-                    direct_claims.append((candidate, edge_type, proof))
 
-        claimed_refs = sorted(
-            {
-                _string(candidate.get("route_token_ref"))
-                for candidate, _, _ in direct_claims
-            }
-        )
-        if not direct_claims:
-            fail(
-                "route_token_ref_renewal_descendant_missing",
-                "superseded route-token ref has no registered direct successor",
-                field="route_lineage.previous_route_token_ref",
-                expected=current_ref,
-                actual="missing",
-            )
-        if len(claimed_refs) != 1 or len(direct_claims) != 1:
-            fail(
-                "route_token_ref_renewal_descendant_ambiguous",
-                "superseded route-token ref has ambiguous registered successors",
-                field="route_lineage.previous_route_token_ref",
-                expected="exactly_one_registered_successor",
-                actual=claimed_refs,
-            )
-
-        candidate_row, edge_type, proof = direct_claims[0]
         candidate_ref = _string(candidate_row.get("route_token_ref"))
         current_scope = exact_scope(current_row)
         candidate_scope = exact_scope(candidate_row)
@@ -2612,18 +2535,170 @@ def resolve_route_token_ref_renewal_descendant(
                     actual=proof.get(field),
                 )
 
-        chain_refs.append(candidate_ref)
-        chain_edges.append(edge_type)
-        current_ref = candidate_ref
-        current_row = candidate_row
+    ReachablePath = tuple[
+        dict[str, Any],
+        str,
+        list[str],
+        list[str],
+        dict[str, Any],
+    ]
 
-    fail(
-        "route_token_ref_renewal_lineage_too_deep",
-        "route-token renewal lineage exceeded the bounded depth",
-        field="route_lineage",
-        expected="at_most_64_hops",
-        actual=len(chain_edges),
+    def active_reachable_paths(
+        current_row: dict[str, Any],
+        current_ref: str,
+        *,
+        chain_refs: list[str],
+        chain_edges: list[str],
+        path_visited: set[str],
+    ) -> list[ReachablePath]:
+        if len(chain_edges) > 64:
+            fail(
+                "route_token_ref_renewal_lineage_too_deep",
+                "route-token renewal lineage exceeded the bounded depth",
+                field="route_lineage",
+                expected="at_most_64_hops",
+                actual=len(chain_edges),
+            )
+        if current_ref in path_visited:
+            fail(
+                "route_token_ref_renewal_lineage_cycle",
+                "route-token renewal lineage contains a cycle",
+                field="route_lineage",
+                expected="acyclic_exact_same_scope_chain",
+                actual=chain_refs,
+            )
+
+        next_visited = set(path_visited)
+        next_visited.add(current_ref)
+        status = _string(current_row.get("status"))
+        if status == REF_STATUS_ACTIVE:
+            resolved = resolve_route_token_ref(
+                conn,
+                project_id=project_id,
+                route_token_ref=current_ref,
+                now=now,
+            )
+            if not resolved:
+                return []
+            return [
+                (
+                    current_row,
+                    current_ref,
+                    list(chain_refs),
+                    list(chain_edges),
+                    dict(resolved),
+                )
+            ]
+        if status != REF_STATUS_SUPERSEDED:
+            fail(
+                "route_token_ref_renewal_lineage_status_invalid",
+                "route-token renewal lineage contains a non-consumable row",
+                field="status",
+                expected=[REF_STATUS_ACTIVE, REF_STATUS_SUPERSEDED],
+                actual=status or "missing",
+            )
+
+        direct_claims: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+        for candidate in rows_by_ref.values():
+            candidate_ref = _string(candidate.get("route_token_ref"))
+            if not candidate_ref or candidate_ref == current_ref:
+                continue
+            lineage = _json_loads_public_mapping(
+                candidate.get(_REF_LINEAGE_COLUMNS["route_lineage"])
+            )
+            for proof_key, edge_type in (
+                ("renewal_proof", "renewal"),
+                ("same_scope_reissue_proof", "same_scope_reissue"),
+            ):
+                proof = (
+                    dict(lineage.get(proof_key) or {})
+                    if isinstance(lineage.get(proof_key), Mapping)
+                    else {}
+                )
+                if _string(proof.get("previous_route_token_ref")) == current_ref:
+                    direct_claims.append((candidate, edge_type, proof))
+
+        # A superseded leaf is a valid dead end.  It contributes no active
+        # authority, but all edges leading to it have already been verified by
+        # its caller.  The root-level cardinality check below still refuses a
+        # lineage with no active-reachable descendant at all.
+        if not direct_claims:
+            return []
+
+        for candidate, edge_type, proof in direct_claims:
+            validate_claim(current_row, current_ref, candidate, edge_type, proof)
+
+        claimed_refs = [
+            _string(candidate.get("route_token_ref"))
+            for candidate, _, _ in direct_claims
+        ]
+        if len(set(claimed_refs)) != len(claimed_refs):
+            fail(
+                "route_token_ref_renewal_descendant_ambiguous",
+                "superseded route-token ref has ambiguous registered successor proofs",
+                field="route_lineage.previous_route_token_ref",
+                expected="at_most_one_canonical_edge_per_successor",
+                actual=sorted(claimed_refs),
+            )
+
+        paths: list[ReachablePath] = []
+        for candidate, edge_type, _proof in direct_claims:
+            candidate_ref = _string(candidate.get("route_token_ref"))
+            paths.extend(
+                active_reachable_paths(
+                    candidate,
+                    candidate_ref,
+                    chain_refs=[*chain_refs, candidate_ref],
+                    chain_edges=[*chain_edges, edge_type],
+                    path_visited=next_visited,
+                )
+            )
+        return paths
+
+    reachable = active_reachable_paths(
+        requested_row,
+        requested_ref,
+        chain_refs=[requested_ref],
+        chain_edges=[],
+        path_visited=set(),
     )
+    if not reachable:
+        fail(
+            "route_token_ref_renewal_descendant_missing",
+            "superseded route-token ref has no active registered descendant",
+            field="route_lineage.active_reachability",
+            expected="exactly_one_active_reachable_descendant",
+            actual="none",
+        )
+    if len(reachable) != 1:
+        fail(
+            "route_token_ref_renewal_descendant_ambiguous",
+            "superseded route-token ref has ambiguous active-reachable descendants",
+            field="route_lineage.active_reachability",
+            expected="exactly_one_active_reachable_descendant",
+            actual=[path[2] for path in reachable],
+        )
+
+    resolved_row, resolved_ref, chain_refs, chain_edges, resolved = reachable[0]
+    if resolved_ref != requested_ref:
+        resolved["renewal_resolution"] = {
+            "schema_version": (
+                "route_token_ref_exact_renewal_descendant_resolution.v1"
+            ),
+            "status": "resolved_active_descendant",
+            "requested_route_token_ref": requested_ref,
+            "resolved_route_token_ref": resolved_ref,
+            "requested_route_identity": row_identity(requested_row),
+            "resolved_route_identity": row_identity(resolved_row),
+            "route_token_ref_chain": list(chain_refs),
+            "edge_types": list(chain_edges),
+            "scope": exact_scope(resolved_row),
+            "exact_scope_verified": True,
+            "registry_verified": True,
+            "writes_performed": False,
+            "raw_route_token_exposed": False,
+        }
+    return resolved
 
 
 def verify_route_token_binding(

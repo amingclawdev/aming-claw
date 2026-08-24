@@ -30,7 +30,7 @@ import sys
 import threading
 import unittest
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -45,6 +45,7 @@ from agent.governance.observer_route_context import (
     _ensure_ref_registry_schema,
     persist_route_token_ref,
     resolve_route_token_ref,
+    resolve_route_token_ref_renewal_descendant,
     supersede_route_token_ref,
     verify_route_token_binding,
 )
@@ -1098,6 +1099,392 @@ class TestF2BindingStoredEmptyBypass(unittest.TestCase):
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result["route_id"], token["route_id"])
+
+
+class TestRenewalDescendantActiveReachability(unittest.TestCase):
+    """Renewal descendants compete only when they reach active authority."""
+
+    _IDENTITY_FIELDS = (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "route_token_ref",
+    )
+
+    def _setup_root(self) -> tuple[sqlite3.Connection, str]:
+        conn = _make_conn()
+        token = _make_token(now=_NOW, ttl_hours=24.0)
+        ref = _orc.derive_route_token_ref(token)
+        persist_route_token_ref(
+            conn,
+            project_id=_PROJECT,
+            route_token_ref=ref,
+            token=token,
+        )
+        return conn, ref
+
+    @staticmethod
+    def _row(conn: sqlite3.Connection, ref: str) -> dict[str, Any]:
+        row = conn.execute(
+            "SELECT * FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=?",
+            (_PROJECT, ref),
+        ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def _identity(self, row: Mapping[str, Any]) -> dict[str, str]:
+        return {
+            field: str(row.get(field) or "")
+            for field in self._IDENTITY_FIELDS
+        }
+
+    def _canonical_renewal_proof(
+        self,
+        parent: Mapping[str, Any],
+        child: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": _orc.REF_RENEWAL_PROOF_SCHEMA_VERSION,
+            "status": "renewed",
+            "source": "renew_route_token_ref",
+            "previous_route_token_ref": parent["route_token_ref"],
+            "route_token_ref": child["route_token_ref"],
+            "scope": {
+                "project_id": _PROJECT,
+                "backlog_id": parent["backlog_id"],
+                "task_id": parent["task_id"],
+            },
+            "previous_route_identity": self._identity(parent),
+            "route_identity": self._identity(child),
+            "raw_route_token_persisted": False,
+            "raw_session_token_persisted": False,
+        }
+
+    def _set_renewal_proof(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        parent_ref: str,
+        child_ref: str,
+    ) -> None:
+        parent = self._row(conn, parent_ref)
+        child = self._row(conn, child_ref)
+        lineage = json.loads(child.get("route_lineage_json") or "{}")
+        lineage["renewal_proof"] = self._canonical_renewal_proof(parent, child)
+        conn.execute(
+            "UPDATE observer_route_token_refs SET route_lineage_json=? "
+            "WHERE project_id=? AND route_token_ref=?",
+            (json.dumps(lineage, sort_keys=True), _PROJECT, child_ref),
+        )
+        conn.commit()
+
+    def _add_successor(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        parent_ref: str,
+        minute: int,
+        status: str = _orc.REF_STATUS_ACTIVE,
+    ) -> str:
+        token = _make_token(
+            now=_NOW + timedelta(minutes=minute),
+            ttl_hours=24.0,
+        )
+        child_ref = _orc.derive_route_token_ref(token)
+        persist_route_token_ref(
+            conn,
+            project_id=_PROJECT,
+            route_token_ref=child_ref,
+            token=token,
+        )
+        self._set_renewal_proof(
+            conn,
+            parent_ref=parent_ref,
+            child_ref=child_ref,
+        )
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status=? "
+            "WHERE project_id=? AND route_token_ref=?",
+            (_orc.REF_STATUS_SUPERSEDED, _PROJECT, parent_ref),
+        )
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status=? "
+            "WHERE project_id=? AND route_token_ref=?",
+            (status, _PROJECT, child_ref),
+        )
+        conn.commit()
+        return child_ref
+
+    @staticmethod
+    def _dump(conn: sqlite3.Connection) -> str:
+        return "\n".join(conn.iterdump())
+
+    def _resolve_read_only(
+        self,
+        conn: sqlite3.Connection,
+        root_ref: str,
+    ) -> dict[str, Any]:
+        before = self._dump(conn)
+        resolved = resolve_route_token_ref_renewal_descendant(
+            conn,
+            project_id=_PROJECT,
+            route_token_ref=root_ref,
+            now=_NOW + timedelta(minutes=30),
+        )
+        self.assertEqual(self._dump(conn), before)
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        return resolved
+
+    def _assert_refused_read_only(
+        self,
+        conn: sqlite3.Connection,
+        root_ref: str,
+        *,
+        code: str,
+    ) -> RouteTokenRefError:
+        before = self._dump(conn)
+        with self.assertRaises(RouteTokenRefError) as raised:
+            resolve_route_token_ref_renewal_descendant(
+                conn,
+                project_id=_PROJECT,
+                route_token_ref=root_ref,
+                now=_NOW + timedelta(minutes=30),
+            )
+        self.assertEqual(self._dump(conn), before)
+        self.assertEqual(raised.exception.code, code)
+        self.assertFalse(raised.exception.details.get("writes_performed", False))
+        return raised.exception
+
+    def test_real_cleanup_hook_dead_end_does_not_compete(self) -> None:
+        conn, root_ref = self._setup_root()
+        dead_ref = self._add_successor(
+            conn,
+            parent_ref=root_ref,
+            minute=1,
+        )
+
+        # Exercise the real cleanup marker hook instead of directly changing
+        # the dead branch status in this regression.
+        from agent.governance.server import _apply_supersession_hook_if_needed
+
+        _apply_supersession_hook_if_needed(
+            conn,
+            project_id=_PROJECT,
+            event_kind="route_identity_cleanup",
+            event_type="",
+            payload=_make_supersession_payload(dead_ref),
+        )
+        active_ref = self._add_successor(
+            conn,
+            parent_ref=root_ref,
+            minute=2,
+        )
+
+        resolved = self._resolve_read_only(conn, root_ref)
+        self.assertEqual(resolved["route_token_ref"], active_ref)
+        resolution = resolved["renewal_resolution"]
+        self.assertEqual(
+            resolution["route_token_ref_chain"],
+            [root_ref, active_ref],
+        )
+        self.assertNotIn(dead_ref, resolution["route_token_ref_chain"])
+
+    def test_exactly_one_multihop_active_branch_resolves(self) -> None:
+        conn, root_ref = self._setup_root()
+        self._add_successor(
+            conn,
+            parent_ref=root_ref,
+            minute=1,
+            status=_orc.REF_STATUS_SUPERSEDED,
+        )
+        middle_ref = self._add_successor(
+            conn,
+            parent_ref=root_ref,
+            minute=2,
+            status=_orc.REF_STATUS_SUPERSEDED,
+        )
+        active_ref = self._add_successor(
+            conn,
+            parent_ref=middle_ref,
+            minute=3,
+        )
+
+        resolved = self._resolve_read_only(conn, root_ref)
+        self.assertEqual(resolved["route_token_ref"], active_ref)
+        self.assertEqual(
+            resolved["renewal_resolution"]["route_token_ref_chain"],
+            [root_ref, middle_ref, active_ref],
+        )
+        self.assertEqual(
+            resolved["renewal_resolution"]["edge_types"],
+            ["renewal", "renewal"],
+        )
+
+    def test_two_active_reachable_branches_fail_closed(self) -> None:
+        conn, root_ref = self._setup_root()
+        first_ref = self._add_successor(
+            conn,
+            parent_ref=root_ref,
+            minute=1,
+        )
+        second_ref = self._add_successor(
+            conn,
+            parent_ref=root_ref,
+            minute=2,
+        )
+
+        error = self._assert_refused_read_only(
+            conn,
+            root_ref,
+            code="route_token_ref_renewal_descendant_ambiguous",
+        )
+        self.assertEqual(
+            error.details["actual"],
+            [[root_ref, first_ref], [root_ref, second_ref]],
+        )
+
+    def test_only_superseded_dead_ends_fail_closed(self) -> None:
+        conn, root_ref = self._setup_root()
+        self._add_successor(
+            conn,
+            parent_ref=root_ref,
+            minute=1,
+            status=_orc.REF_STATUS_SUPERSEDED,
+        )
+        self._add_successor(
+            conn,
+            parent_ref=root_ref,
+            minute=2,
+            status=_orc.REF_STATUS_SUPERSEDED,
+        )
+
+        self._assert_refused_read_only(
+            conn,
+            root_ref,
+            code="route_token_ref_renewal_descendant_missing",
+        )
+
+    def _tamper_invalid_branch(
+        self,
+        conn: sqlite3.Connection,
+        branch_ref: str,
+        case: str,
+    ) -> None:
+        if case in {"proof", "proof_scope", "proof_identity"}:
+            row = self._row(conn, branch_ref)
+            lineage = json.loads(row["route_lineage_json"])
+            proof = lineage["renewal_proof"]
+            if case == "proof":
+                proof["schema_version"] = "tampered.v1"
+            elif case == "proof_scope":
+                proof["scope"]["task_id"] = "tampered-task"
+            else:
+                proof["route_identity"]["route_context_hash"] = "sha256:tampered"
+            conn.execute(
+                "UPDATE observer_route_token_refs SET route_lineage_json=? "
+                "WHERE project_id=? AND route_token_ref=?",
+                (json.dumps(lineage, sort_keys=True), _PROJECT, branch_ref),
+            )
+        elif case == "scope":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET backlog_id=? "
+                "WHERE project_id=? AND route_token_ref=?",
+                ("AC-TAMPERED-SCOPE", _PROJECT, branch_ref),
+            )
+        elif case == "actions":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET allowed_actions_json=? "
+                "WHERE project_id=? AND route_token_ref=?",
+                (json.dumps(["tampered_action"]), _PROJECT, branch_ref),
+            )
+        elif case == "target_files":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET target_files_json=? "
+                "WHERE project_id=? AND route_token_ref=?",
+                (json.dumps(["tampered.py"]), _PROJECT, branch_ref),
+            )
+        elif case == "owned_files":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET owned_files_json=? "
+                "WHERE project_id=? AND route_token_ref=?",
+                (json.dumps(["tampered.py"]), _PROJECT, branch_ref),
+            )
+        elif case == "expired":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET expires_at=? "
+                "WHERE project_id=? AND route_token_ref=?",
+                ("2000-01-01T00:00:00Z", _PROJECT, branch_ref),
+            )
+        elif case == "revoked":
+            conn.execute(
+                "UPDATE observer_route_token_refs SET status=? "
+                "WHERE project_id=? AND route_token_ref=?",
+                ("revoked", _PROJECT, branch_ref),
+            )
+        else:  # pragma: no cover - test helper misuse
+            raise AssertionError(f"unknown tamper case: {case}")
+        conn.commit()
+
+    def test_any_invalid_lineage_branch_fails_closed(self) -> None:
+        expected_codes = {
+            "proof": "route_token_ref_renewal_proof_invalid",
+            "proof_scope": "route_token_ref_renewal_scope_mismatch",
+            "proof_identity": "route_token_ref_renewal_identity_mismatch",
+            "scope": "route_token_ref_renewal_scope_mismatch",
+            "actions": "route_token_ref_renewal_allowed_actions_mismatch",
+            "target_files": "route_token_ref_renewal_target_files_mismatch",
+            "owned_files": "route_token_ref_renewal_owned_files_mismatch",
+            "expired": "route_token_ref_expired",
+            "revoked": "route_token_ref_renewal_lineage_status_invalid",
+        }
+        for index, (case, expected_code) in enumerate(expected_codes.items(), start=1):
+            with self.subTest(case=case):
+                conn, root_ref = self._setup_root()
+                invalid_ref = self._add_successor(
+                    conn,
+                    parent_ref=root_ref,
+                    minute=index,
+                )
+                self._add_successor(
+                    conn,
+                    parent_ref=root_ref,
+                    minute=index + 20,
+                )
+                self._tamper_invalid_branch(conn, invalid_ref, case)
+                self._assert_refused_read_only(
+                    conn,
+                    root_ref,
+                    code=expected_code,
+                )
+
+    def test_cycle_fails_closed_even_with_active_sibling(self) -> None:
+        conn, root_ref = self._setup_root()
+        cycle_ref = self._add_successor(
+            conn,
+            parent_ref=root_ref,
+            minute=1,
+            status=_orc.REF_STATUS_SUPERSEDED,
+        )
+        self._add_successor(
+            conn,
+            parent_ref=root_ref,
+            minute=2,
+        )
+        self._set_renewal_proof(
+            conn,
+            parent_ref=cycle_ref,
+            child_ref=root_ref,
+        )
+
+        self._assert_refused_read_only(
+            conn,
+            root_ref,
+            code="route_token_ref_renewal_lineage_cycle",
+        )
 
 
 if __name__ == "__main__":
