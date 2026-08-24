@@ -135790,6 +135790,23 @@ def test_runtime_context_worker_guide_projects_canonical_worker_commit_after_imp
         "target_project_root": str(worker_root),
         "view": "all",
     }
+    compact_commit = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                query={**query, "view": "compact"},
+            )
+        )
+    )
+    assert compact_commit["position_bounded"] is True
+    assert compact_commit["position_stage"] == "commit"
+    assert compact_commit["recovery_forest_called"] is False
+    assert compact_commit["canonical_executable_action"]["mcp_tool"] == (
+        "runtime_context_worker_commit"
+    )
     current = server.handle_graph_governance_parallel_branch_runtime_context_current_state(
         _ctx(
             {"project_id": PID, "runtime_context_id": runtime_context.runtime_context_id},
@@ -173726,6 +173743,11 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
     assert post_implementation_guide["contract_runtime_next_legal_action"][
         "line_id"
     ] == "worker_commit"
+    generated_worker_commit_body = copy.deepcopy(
+        post_implementation_guide["worker_guide"][
+            "worker_commit_facade_payload_skeleton"
+        ]["copy_safe_body"]
+    )
     implementation_lineage = _worker_implementation_lineage(
         implementation_record,
         implementation_line,
@@ -173750,6 +173772,52 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
         replace(inactive_context, head_commit=worker_commit_sha),
     )
     conn.commit()
+    generated_worker_commit_body.update(
+        {
+            "contract_execution_id": execution_id,
+            "runtime_context_id": inactive_context.runtime_context_id,
+            "task_id": inactive_context.task_id,
+            "parent_task_id": execution_id,
+            "session_token": inactive_token,
+            "session_token_ref": session_ref,
+            "fence_token": inactive_fence,
+            "target_project_root": inactive_context.target_project_root,
+            "worker_session_id": worker_session_id,
+            "filer_principal": worker_session_id,
+            "actor": worker_session_id,
+            "implementation_lineage_ref": implementation_lineage[
+                "implementation_lineage_ref"
+            ],
+            "worker_commit_sha": worker_commit_sha,
+            "commit_sha": worker_commit_sha,
+            "head_commit": worker_commit_sha,
+            "owned_files": list(inactive_context.owned_files),
+            "changed_files": list(inactive_context.owned_files),
+            "graph_trace_ids": [graph_trace_id],
+        }
+    )
+    baseline_commit_record = copy.deepcopy(runtime.store.get(execution_id))
+    baseline_commit_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    tampered_worker_commit_body = copy.deepcopy(generated_worker_commit_body)
+    tampered_worker_commit_body["fence_token"] = "wrong-implementation-r2-fence"
+    with pytest.raises((GovernanceError, ValidationError)):
+        server.handle_graph_governance_runtime_context_worker_commit(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": inactive_context.runtime_context_id,
+                },
+                "mf_sub",
+                method="POST",
+                body=tampered_worker_commit_body,
+            )
+        )
+    assert runtime.store.get(execution_id) == baseline_commit_record
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == baseline_commit_timeline_count
     worker_commit = server.handle_graph_governance_runtime_context_worker_commit(
         _ctx_with_role(
             {
@@ -173758,28 +173826,7 @@ def test_runtime_context_implementation_facade_rejects_publicly_then_finishes_in
             },
             "mf_sub",
             method="POST",
-            body={
-                "contract_execution_id": execution_id,
-                "runtime_context_id": inactive_context.runtime_context_id,
-                "task_id": inactive_context.task_id,
-                "parent_task_id": execution_id,
-                "session_token": inactive_token,
-                "session_token_ref": session_ref,
-                "fence_token": inactive_fence,
-                "target_project_root": inactive_context.target_project_root,
-                "worker_session_id": worker_session_id,
-                "filer_principal": worker_session_id,
-                "actor": worker_session_id,
-                "implementation_lineage_ref": implementation_lineage[
-                    "implementation_lineage_ref"
-                ],
-                "worker_commit_sha": worker_commit_sha,
-                "commit_sha": worker_commit_sha,
-                "head_commit": worker_commit_sha,
-                "owned_files": list(inactive_context.owned_files),
-                "changed_files": list(inactive_context.owned_files),
-                "graph_trace_ids": [graph_trace_id],
-            },
+            body=generated_worker_commit_body,
         )
     )
     assert worker_commit["ok"] is True
@@ -182752,6 +182799,661 @@ def test_worker_guide_compact_builds_directly_from_bounded_authority(
     stdio_guide = json.loads(stdio_responses[-1]["result"]["content"][0]["text"])
     assert stdio_guide["runtime_context_id"] == context.runtime_context_id
     assert stdio_guide["serialized_bytes"] <= compact["max_serialized_bytes"]
+
+
+def test_graph_position_bounds_current_and_guide_before_recovery_forest(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-GRAPH-POSITION-BOUNDED-FACADES"
+    worker_task_id = "graph-position-bounded-worker"
+    worker_fence = "fence-graph-position-bounded"
+    worker_token = "token-graph-position-bounded"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="graph-position-bounded-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+        target_project_root=str(worker_root),
+        parent_task_is_contract_execution=True,
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    common, _worker_commit = _mf_parallel_worker_proof_payloads(
+        context,
+        parent_task_id=contract_execution_id,
+        graph_trace_id="gqt-graph-position-bounded",
+        head_commit="a" * 40,
+        implementation_event_ref="timeline:graph-position-bounded",
+    )
+    runtime = server._contract_runtime(conn)
+    for stage_id, line_id, evidence_kind in (
+        ("worker_read", "worker_read_runtime_guide", "read_receipt"),
+        ("worker_startup", "worker_startup", "mf_subagent_startup"),
+    ):
+        runtime.current_guide(contract_execution_id, actor_role="mf_sub")
+        record = runtime.store.get(contract_execution_id)
+        write = server._contract_runtime_write_from_record(
+            record,
+            actor_role="mf_sub",
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        write.update(common)
+        write["payload"] = dict(common)
+        assert runtime.submit_line_write(
+            contract_execution_id,
+            write,
+            actor_role="mf_sub",
+        )["ok"] is True
+    conn.commit()
+    monkeypatch.setattr(server, "get_connection", lambda _pid: _NoCloseConn(conn))
+
+    def must_not_call(*_args, **_kwargs):
+        raise AssertionError(
+            "graph Position must project before full/recovery lifecycle builders"
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_projection_response",
+        must_not_call,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_details",
+        must_not_call,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_payloads",
+        must_not_call,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_finish_submission_bundle",
+        must_not_call,
+    )
+    query = {
+        "parent_task_id": contract_execution_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "target_project_root": str(worker_root),
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+
+    started = time.monotonic()
+    guide = server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            query={**query, "view": "compact"},
+        )
+    )
+    assert time.monotonic() - started < 5.0
+    assert guide["position_bounded"] is True
+    assert guide["position_stage"] == "graph"
+    assert guide["recovery_forest_called"] is False
+    assert guide["contract_runtime_next_legal_action"]["line_id"] == (
+        "worker_graph_context"
+    )
+    assert guide["canonical_executable_action"]["mcp_tool"] == "graph_query"
+    expected_hash = guide["canonical_executable_action_hash"]
+
+    for view in ("compact", "current", "worker_view", "gate_inputs"):
+        current = (
+            server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "runtime_context_id": context.runtime_context_id,
+                    },
+                    "mf_sub",
+                    query={**query, "view": view},
+                )
+            )
+        )
+        assert current["response_view"] == view
+        assert current["position_bounded"] is True
+        assert current["position_stage"] == "graph"
+        assert current["recovery_forest_called"] is False
+        assert current["contract_runtime_next_legal_action"]["line_id"] == (
+            "worker_graph_context"
+        )
+        assert current["canonical_executable_action_hash"] == expected_hash
+        assert current["canonical_executable_action"]["mcp_tool"] == (
+            "graph_query"
+        )
+        assert current["access_audit_persisted"] is True
+        assert current["serialized_bytes"] < 48 * 1024
+        projected = current["runtime_context_service"]["views"][view]
+        assert projected["canonical_executable_action_hash"] == expected_hash
+        assert projected["position_stage"] == "graph"
+
+    default_current = (
+        server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query=query,
+            )
+        )
+    )
+    assert default_current["response_view"] == "compact"
+    assert default_current["position_bounded"] is True
+    assert default_current["recovery_forest_called"] is False
+    assert default_current["canonical_executable_action_hash"] == expected_hash
+
+    runtime.current_guide(contract_execution_id, actor_role="mf_sub")
+    record = runtime.store.get(contract_execution_id)
+    graph_write = server._contract_runtime_write_from_record(
+        record,
+        actor_role="mf_sub",
+        stage_id="worker_context",
+        line_id="worker_graph_context",
+        evidence_kind="graph_trace",
+    )
+    graph_write.update(common)
+    graph_write.update(
+        {
+            "graph_query_trace_ids": ["gqt-graph-position-bounded"],
+            "db_verified": True,
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+            "graph_trace_evidence": {
+                **common,
+                "db_verified": True,
+                "graph_trace_ids": ["gqt-graph-position-bounded"],
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+            },
+        }
+    )
+    graph_write["payload"] = {
+        **common,
+        "graph_trace_ids": ["gqt-graph-position-bounded"],
+    }
+    assert runtime.submit_line_write(
+        contract_execution_id,
+        graph_write,
+        actor_role="mf_sub",
+    )["ok"] is True
+    conn.commit()
+    graph_line, graph_payload = (
+        server._runtime_context_position_bounded_completed_line(
+            runtime.store.get(contract_execution_id),
+            line_id="worker_graph_context",
+            runtime_context_id=context.runtime_context_id,
+            task_id=context.task_id,
+            parent_task_id=contract_execution_id,
+        )
+    )
+    assert graph_line
+    assert server._runtime_context_service_query_values(
+        {**graph_line, **graph_payload},
+        "graph_trace_ids",
+        "graph_query_trace_ids",
+        "verified_trace_ids",
+    ) == ["gqt-graph-position-bounded"]
+    implementation_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={**query, "view": "compact"},
+            )
+        )
+    )
+    assert implementation_guide["position_bounded"] is True
+    assert implementation_guide["position_stage"] == "implementation"
+    assert implementation_guide["recovery_forest_called"] is False
+    assert implementation_guide["canonical_executable_action"][
+        "mcp_tool"
+    ] == "runtime_context_implementation_evidence"
+
+
+def test_prestartup_position_bounds_receipt_and_startup_before_recovery_forest(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    backlog_id = "AC-PRESTARTUP-POSITION-BOUNDED-FACADES"
+    worker_task_id = "prestartup-position-bounded-worker"
+    worker_fence = "fence-prestartup-position-bounded"
+    worker_token = "token-prestartup-position-bounded"
+    worker_root = tmp_path / worker_task_id
+    worker_root.mkdir()
+    successor, context = _setup_mf_parallel_contract_runtime_worker_dispatch(
+        conn,
+        backlog_id=backlog_id,
+        task_id="prestartup-position-bounded-parent",
+        worker_task_id=worker_task_id,
+        fence_token=worker_fence,
+        token=worker_token,
+        worktree_path=str(worker_root),
+        target_project_root=str(worker_root),
+        parent_task_is_contract_execution=True,
+        required_worker_count=1,
+    )
+    contract_execution_id = successor["contract_execution_id"]
+    # Normalize the legacy standalone-dispatch fixture to the exact one-lane
+    # list shape consumed by the atomic-lane gate. The production two-lane
+    # dispatcher already persists this shape; this test stays focused on the
+    # downstream Position-bounded facade sequence.
+    fixture_store = server._contract_runtime_store(conn)
+    fixture_record = fixture_store.get(contract_execution_id)
+    fixture_dispatch = next(
+        item
+        for item in fixture_record["completed_lines"]
+        if item.get("line_id") == "observer_dispatch_bounded_workers"
+    )
+    fixture_worker = copy.deepcopy(fixture_dispatch["payload"])
+    fixture_worker.update(
+        {
+            "lane_id": context.worker_slot_id,
+            "line_instance_id": (
+                f"runtime_context:{context.runtime_context_id}"
+            ),
+        }
+    )
+    fixture_dispatch["payload"].update(
+        {
+            "bounded_workers": [fixture_worker],
+            "required_worker_count": 1,
+            "worker_count": 1,
+            "atomic_dispatch": False,
+            "all_or_nothing": False,
+        }
+    )
+    fixture_store.update(contract_execution_id, fixture_record)
+    latest = server._runtime_context_latest_contract_revision_payload(
+        conn,
+        context,
+    )
+    launch_hash = _fake_sha("prestartup-position-bounded-launch")
+    append_branch_contract_revision(
+        conn,
+        context,
+        revision_id="crev-prestartup-position-bounded-launch",
+        contract_version=str(latest.get("contract_version") or "mf_parallel.v2"),
+        payload={
+            **dict(latest.get("payload") or {}),
+            "launch_text_hash": launch_hash,
+        },
+        route_identity=server._parallel_branch_runtime_contract_route_identity(
+            latest
+        ),
+        route_gate=dict(latest.get("route_gate") or {}),
+        route_evidence_type=str(latest.get("route_evidence_type") or ""),
+        now_iso="2099-08-24T00:00:00Z",
+    )
+    conn.commit()
+    monkeypatch.setattr(server, "get_connection", lambda _pid: _NoCloseConn(conn))
+    query = {
+        "parent_task_id": contract_execution_id,
+        "fence_token": worker_fence,
+        "session_token": worker_token,
+        "session_token_ref": runtime_context_session_token_ref(context),
+        "target_project_root": str(worker_root),
+        "route_id": f"route-{worker_task_id}",
+        "route_context_hash": f"sha256:route-{worker_task_id}",
+        "prompt_contract_id": f"rprompt-{worker_task_id}",
+        "prompt_contract_hash": f"sha256:prompt-{worker_task_id}",
+        "route_token_ref": f"rtok-{worker_task_id}",
+        "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
+    }
+    path = {
+        "project_id": PID,
+        "runtime_context_id": context.runtime_context_id,
+    }
+    original_projection = server._runtime_context_projection_response
+    original_recovery = server._runtime_context_worker_recovery_details
+    original_payloads = server._runtime_context_worker_recovery_payloads
+    original_finish = server._runtime_context_finish_submission_bundle
+    current_revision = server._runtime_context_latest_contract_revision_payload(
+        conn,
+        context,
+    )
+    assert server._runtime_context_source_backed_launch_text_hash(
+        current_revision
+    ) == launch_hash
+
+    def must_not_call(*_args, **_kwargs):
+        raise AssertionError(
+            "healthy pre-startup Position must not build lifecycle forests"
+        )
+
+    def install_sentinels():
+        monkeypatch.setattr(
+            server,
+            "_runtime_context_projection_response",
+            must_not_call,
+        )
+        monkeypatch.setattr(
+            server,
+            "_runtime_context_worker_recovery_details",
+            must_not_call,
+        )
+        monkeypatch.setattr(
+            server,
+            "_runtime_context_worker_recovery_payloads",
+            must_not_call,
+        )
+        monkeypatch.setattr(
+            server,
+            "_runtime_context_finish_submission_bundle",
+            must_not_call,
+        )
+
+    install_sentinels()
+    receipt_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(path, "mf_sub", query={**query, "view": "compact"})
+        )
+    )
+    assert receipt_guide["position_bounded"] is True
+    assert receipt_guide["position_stage"] == "receipt"
+    assert receipt_guide["recovery_forest_called"] is False
+    assert receipt_guide["canonical_executable_action"]["mcp_tool"] == (
+        "runtime_context_read_receipt"
+    )
+    receipt_hash = receipt_guide["canonical_executable_action_hash"]
+    default_current = (
+        server.handle_graph_governance_parallel_branch_runtime_context_current_state(
+            _ctx_with_role(path, "mf_sub", query=query)
+        )
+    )
+    assert default_current["response_view"] == "compact"
+    assert default_current["position_stage"] == "receipt"
+    assert default_current["canonical_executable_action_hash"] == receipt_hash
+
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_projection_response",
+        original_projection,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_details",
+        original_recovery,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_payloads",
+        original_payloads,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_finish_submission_bundle",
+        original_finish,
+    )
+    receipt_body = copy.deepcopy(
+        receipt_guide["canonical_executable_action"]["copy_safe_body"]
+    )
+    receipt_body.update(
+        {
+            "session_token": worker_token,
+            "fence_token": worker_fence,
+        }
+    )
+    receipt = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(path, "mf_sub", method="POST", body=receipt_body)
+    )
+    assert receipt["ok"] is True
+    assert receipt["read_receipt_hash"] == launch_hash
+
+    install_sentinels()
+    startup_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(path, "mf_sub", query={**query, "view": "compact"})
+        )
+    )
+    assert startup_guide["position_bounded"] is True
+    assert startup_guide["position_stage"] == "startup"
+    assert startup_guide["recovery_forest_called"] is False
+    assert startup_guide["canonical_executable_action"]["mcp_tool"] == (
+        "parallel_branch_startup"
+    )
+    startup_body = startup_guide["canonical_executable_action"][
+        "copy_safe_body"
+    ]
+    assert startup_body["read_receipt_event_id"] == str(
+        receipt["read_receipt_event_id"]
+    )
+    assert startup_body["read_receipt_hash"] == launch_hash
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_projection_response",
+        original_projection,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_details",
+        original_recovery,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_payloads",
+        original_payloads,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_finish_submission_bundle",
+        original_finish,
+    )
+    startup_submission = copy.deepcopy(startup_body)
+    startup_submission.update(
+        {
+            "session_token": worker_token,
+            "fence_token": worker_fence,
+            "worker_session_id": f"codex-{worker_task_id}",
+            "filer_principal": f"codex-{worker_task_id}",
+            "worker_transcript_ref": f"codex:{worker_task_id}",
+            "host_startup_id": f"codex-thread:{worker_task_id}",
+            "host_session_id": f"codex-{worker_task_id}",
+            "head_commit": context.base_commit,
+            "actor": worker_task_id,
+        }
+    )
+    before_record = copy.deepcopy(
+        server._contract_runtime_store(conn).get(contract_execution_id)
+    )
+    before_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    tampered_startup = copy.deepcopy(startup_submission)
+    tampered_startup["fence_token"] = "wrong-worker-fence"
+    with pytest.raises((GovernanceError, ValidationError)):
+        server.handle_graph_governance_runtime_context_startup(
+            _ctx_with_role(
+                path,
+                "mf_sub",
+                method="POST",
+                body=tampered_startup,
+            )
+        )
+    assert server._contract_runtime_store(conn).get(
+        contract_execution_id
+    ) == before_record
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_timeline_count
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            path,
+            "mf_sub",
+            method="POST",
+            body=startup_submission,
+        )
+    )
+    assert startup["ok"] is True
+    assert startup["contract_runtime_canonical_line"]["accepted"] is True
+    graph_trace_id = "gqt-prestartup-position-bounded"
+    snapshot_id = "scope-prestartup-position-bounded"
+    _activate_basic_graph(
+        conn,
+        snapshot_id,
+        commit_sha=context.target_head_commit,
+    )
+    route_identity = {
+        field: query[field]
+        for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        parent_task_id=contract_execution_id,
+        snapshot_id=snapshot_id,
+        runtime_context_id=context.runtime_context_id,
+        task_id=context.task_id,
+        worker_role="mf_sub",
+        fence_token=worker_fence,
+        run_id=_mf_sub_run_id(context.task_id, worker_fence),
+        route_identity=route_identity,
+    )
+    graph_line = server._runtime_context_submit_canonical_contract_line(
+        conn,
+        project_id=PID,
+        context=context,
+        contract_execution_id=contract_execution_id,
+        stage_id="worker_context",
+        line_id="worker_graph_context",
+        evidence_kind="graph_trace",
+        payload={
+            "runtime_context_id": context.runtime_context_id,
+            "task_id": context.task_id,
+            "parent_task_id": contract_execution_id,
+            "worker_role": "mf_sub",
+            "worker_id": context.worker_id,
+            "worker_slot_id": context.worker_slot_id,
+            "target_project_root": context.target_project_root,
+            "graph_trace_ids": [graph_trace_id],
+            "graph_query_trace_ids": [graph_trace_id],
+            "graph_trace_evidence": {
+                "db_verified": True,
+                "graph_trace_ids": [graph_trace_id],
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+            },
+            "db_verified": True,
+            "query_source": "mf_subagent",
+            "query_purpose": "subagent_context_build",
+        },
+    )
+    assert graph_line["accepted"] is True
+    conn.commit()
+    install_sentinels()
+    implementation_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(path, "mf_sub", query={**query, "view": "compact"})
+        )
+    )
+    assert implementation_guide["position_bounded"] is True
+    assert implementation_guide["position_stage"] == "implementation"
+    assert implementation_guide["recovery_forest_called"] is False
+    assert implementation_guide["canonical_executable_action"][
+        "mcp_tool"
+    ] == "runtime_context_implementation_evidence"
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_projection_response",
+        original_projection,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_details",
+        original_recovery,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_worker_recovery_payloads",
+        original_payloads,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_finish_submission_bundle",
+        original_finish,
+    )
+    implementation_submission = copy.deepcopy(
+        implementation_guide["canonical_executable_action"]["copy_safe_body"]
+    )
+    test_command = "pytest -q prestartup-position-bounded"
+    implementation_submission.update(
+        {
+            "session_token": worker_token,
+            "fence_token": worker_fence,
+            "changed_files": list(context.owned_files),
+            "graph_trace_ids": [graph_trace_id],
+            "tests": [{"command": test_command, "status": "passed"}],
+            "test_results": {
+                "status": "passed",
+                "passed": True,
+                "commands": [{"command": test_command, "status": "passed"}],
+            },
+        }
+    )
+    implementation_submission["payload"] = {
+        **dict(implementation_submission.get("payload") or {}),
+        "graph_trace_ids": [graph_trace_id],
+    }
+    before_record = copy.deepcopy(
+        server._contract_runtime_store(conn).get(contract_execution_id)
+    )
+    before_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    tampered_implementation = copy.deepcopy(implementation_submission)
+    tampered_implementation["runtime_guide_hash"] = _fake_sha(
+        "wrong-prestartup-position-guide"
+    )
+    with pytest.raises(GovernanceError):
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                path,
+                "mf_sub",
+                method="POST",
+                body=tampered_implementation,
+            )
+        )
+    assert server._contract_runtime_store(conn).get(
+        contract_execution_id
+    ) == before_record
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == before_timeline_count
+    implementation = (
+        server.handle_graph_governance_runtime_context_implementation_evidence(
+            _ctx_with_role(
+                path,
+                "mf_sub",
+                method="POST",
+                body=implementation_submission,
+            )
+        )
+    )
+    assert implementation["ok"] is True
+    assert implementation["contract_runtime_canonical_line"]["accepted"] is True
 
 
 @pytest.mark.parametrize(

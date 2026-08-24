@@ -32233,6 +32233,8 @@ def _runtime_context_guide_executable_actions(
                         "write_authorization_policy",
                     )
                     if stage == "implementation"
+                    else ("worker_transcript_path",)
+                    if stage == "startup"
                     else ()
                 ),
             )
@@ -34235,6 +34237,504 @@ def _runtime_context_worker_guide_detail_page(
     return response
 
 
+def _runtime_context_position_bounded_completed_line(
+    record: Mapping[str, Any],
+    *,
+    line_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return one exact accepted worker line without scanning timeline state."""
+
+    matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for _index, raw_line in _contract_runtime_completed_lines(record):
+        if not isinstance(raw_line, Mapping):
+            continue
+        line = dict(raw_line)
+        payload = (
+            dict(line.get("payload"))
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        if (
+            str(line.get("line_id") or "").strip() != line_id
+            or str(line.get("actor_role") or "").strip() != "mf_sub"
+            or not _contract_runtime_line_status_passes(line)
+        ):
+            continue
+        if not (
+            _contract_runtime_mapping_matches_context(
+                line,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+            )
+            or _contract_runtime_mapping_matches_context(
+                payload,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+            )
+        ):
+            continue
+        matches.append((line, payload))
+    return matches[0] if len(matches) == 1 else ({}, {})
+
+
+def _runtime_context_position_bounded_receipt_authority(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    contract_record: Mapping[str, Any],
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    route_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve one timeline receipt already accepted by the current Contract."""
+
+    _line, contract_payload = _runtime_context_position_bounded_completed_line(
+        contract_record,
+        line_id="worker_read_runtime_guide",
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+    )
+    contract_hash = str(
+        contract_payload.get("read_receipt_hash") or ""
+    ).strip()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", contract_hash):
+        return {}
+
+    from . import task_timeline
+
+    candidates: list[dict[str, Any]] = []
+    for raw_event in task_timeline.list_events(
+        conn,
+        project_id,
+        task_id=task_id,
+        limit=64,
+    ):
+        if not isinstance(raw_event, Mapping):
+            continue
+        event = dict(raw_event)
+        payload = (
+            dict(event.get("payload"))
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        if (
+            str(event.get("event_type") or "").strip()
+            != "mf_subagent_read_receipt"
+            or str(event.get("event_kind") or "").strip()
+            not in {"mf_subagent_read_receipt", "contract_context_read_receipt"}
+            or str(event.get("status") or "").strip().lower()
+            not in {"accepted", "ok", "passed", "succeeded", "success"}
+            or str(payload.get("runtime_context_id") or "").strip()
+            != runtime_context_id
+            or str(payload.get("task_id") or "").strip() != task_id
+            or str(payload.get("parent_task_id") or "").strip()
+            != parent_task_id
+            or str(payload.get("read_receipt_hash") or "").strip()
+            != contract_hash
+        ):
+            continue
+        candidates.append(event)
+    if len(candidates) != 1:
+        return {}
+    event = candidates[0]
+    payload = (
+        event.get("payload")
+        if isinstance(event.get("payload"), Mapping)
+        else {}
+    )
+    try:
+        authority = _runtime_context_read_receipt_response_authority(
+            event,
+            context=context,
+            parent_task_id=parent_task_id,
+            expected_payload=payload,
+            route_identity=route_identity,
+        )
+    except GovernanceError:
+        return {}
+    return authority if authority.get("read_receipt_hash") == contract_hash else {}
+
+
+def _runtime_context_position_bounded_current_action(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    backlog_id: str,
+    worker_id: str,
+    worker_slot_id: str,
+    target_project_root: str,
+    worktree_path: str,
+    session_token_ref: str,
+    route_identity: Mapping[str, Any],
+    contract_execution_id: str,
+    parent_contract_execution_id: str,
+    contract_stage: str,
+    contract_next_action: Mapping[str, Any],
+    latest_revision_payload: Mapping[str, Any],
+    worker_scope_files: Sequence[str],
+) -> dict[str, Any]:
+    """Build only the current existing worker facade from Contract Position."""
+
+    try:
+        record = _contract_runtime_store(conn).get(contract_execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+    if (
+        str(record.get("contract_execution_id") or "").strip()
+        != contract_execution_id
+        or str(record.get("project_id") or "").strip() != project_id
+        or str(record.get("backlog_id") or "").strip() != backlog_id
+    ):
+        return {}
+
+    route = {
+        field: str(route_identity.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    if not all(route.values()):
+        return {}
+    action = ""
+    facade = ""
+    tool = ""
+    path = ""
+    body: dict[str, Any] = {}
+    optional_omission_fields: Sequence[str] = ()
+
+    if contract_stage == "receipt":
+        launch_hash = _runtime_context_source_backed_launch_text_hash(
+            latest_revision_payload
+        )
+        if not launch_hash:
+            return {}
+        revision_body = (
+            latest_revision_payload.get("payload")
+            if isinstance(latest_revision_payload.get("payload"), Mapping)
+            else {}
+        )
+        _receipt, _payload, body = (
+            _runtime_context_read_receipt_facade_bodies(
+                project_id=project_id,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+                worker_id=worker_id,
+                worker_slot_id=worker_slot_id,
+                target_project_root=target_project_root,
+                contract_execution_id=contract_execution_id,
+                contract_chain_id=str(
+                    record.get("contract_chain_id") or ""
+                ),
+                parent_contract_execution_id=str(
+                    record.get("parent_contract_execution_id") or ""
+                ),
+                successor_contract_execution_id=contract_execution_id,
+                contract_revision_id=str(
+                    latest_revision_payload.get("revision_id") or ""
+                ),
+                contract_hash=str(
+                    revision_body.get("contract_hash")
+                    or latest_revision_payload.get("contract_hash")
+                    or ""
+                ),
+                context_hash=str(
+                    revision_body.get("context_hash")
+                    or latest_revision_payload.get("context_hash")
+                    or ""
+                ),
+                route_identity=route,
+                session_token_ref=session_token_ref,
+                launch_text_hash=launch_hash,
+            )
+        )
+        action = "record_runtime_context_read_receipt"
+        facade = "runtime_context.read_receipts"
+        tool = "runtime_context_read_receipt"
+        path = (
+            f"/api/graph-governance/{project_id}/runtime-contexts/"
+            f"{runtime_context_id}/read-receipts"
+        )
+    elif contract_stage == "startup":
+        receipt_authority = _runtime_context_position_bounded_receipt_authority(
+            conn,
+            project_id=project_id,
+            context=context,
+            contract_record=record,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            route_identity=route,
+        )
+        dispatch = _contract_runtime_dispatch_identity_for_execution(
+            conn,
+            contract_execution_id=contract_execution_id,
+            context=context,
+        )
+        dispatch_fields = _contract_runtime_dispatch_identity_projection_fields(
+            dispatch
+        )
+        if not receipt_authority or not dispatch_fields:
+            return {}
+        worker_session_id = str(
+            getattr(context, "host_session_id", "") or ""
+        ).strip()
+        body = _runtime_context_startup_facade_body(
+            project_id=project_id,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_slot_id,
+            agent_id=worker_id,
+            allocation_owner=str(
+                getattr(context, "allocation_owner", "") or worker_id
+            ),
+            branch_ref=str(getattr(context, "branch_ref", "") or ""),
+            base_commit=str(getattr(context, "base_commit", "") or ""),
+            target_head_commit=str(
+                getattr(context, "target_head_commit", "") or ""
+            ),
+            merge_queue_id=str(
+                getattr(context, "merge_queue_id", "") or ""
+            ),
+            owned_files=worker_scope_files,
+            observer_command_id=str(
+                dispatch.get("observer_command_id") or ""
+            ),
+            dispatch_fields=dispatch_fields,
+            target_project_root=target_project_root,
+            worktree_path=worktree_path,
+            session_token_ref=session_token_ref,
+            worker_session_id=worker_session_id,
+            worker_transcript_ref=str(
+                getattr(context, "worker_transcript_ref", "") or ""
+            ),
+            worker_transcript_path=str(
+                getattr(context, "worker_transcript_path", "") or ""
+            ),
+            host_startup_id=str(
+                getattr(context, "host_startup_id", "") or ""
+            ),
+            host_session_id=worker_session_id,
+            read_receipt_event_id=str(receipt_authority["event_id"]),
+            read_receipt_hash=str(receipt_authority["read_receipt_hash"]),
+            route_identity=route,
+        )
+        action = "record_mf_subagent_startup"
+        facade = "runtime_context.startup"
+        tool = "parallel_branch_startup"
+        path = (
+            f"/api/graph-governance/{project_id}/runtime-contexts/"
+            f"{runtime_context_id}/startup"
+        )
+        optional_omission_fields = ("worker_transcript_path",)
+    elif contract_stage == "graph":
+        body = _runtime_context_graph_copy_safe_body(
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            target_project_root=target_project_root,
+            session_token_ref=session_token_ref,
+            route_identity=route,
+        )
+        action = "run_graph_query"
+        facade = "graph_query"
+        tool = "graph_query"
+        path = "/api/graph-governance/{project_id}/query"
+    elif contract_stage == "implementation":
+        graph_line, graph_payload = (
+            _runtime_context_position_bounded_completed_line(
+                record,
+                line_id="worker_graph_context",
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+            )
+        )
+        graph_trace_ids = _runtime_context_service_query_values(
+            {**graph_line, **graph_payload},
+            "graph_trace_ids",
+            "graph_query_trace_ids",
+            "verified_trace_ids",
+        )
+        writer = contract_next_action.get("writer_role_safe_copy_payload")
+        writer = writer if isinstance(writer, Mapping) else {}
+        writer_body = writer.get("copy_payload")
+        writer_body = writer_body if isinstance(writer_body, Mapping) else {}
+        writer_binding = {
+            field: (
+                writer_body.get(field)
+                if writer_body.get(field) not in (None, "")
+                else contract_next_action.get(field)
+            )
+            for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
+            if (
+                writer_body.get(field) not in (None, "")
+                or contract_next_action.get(field) not in (None, "")
+            )
+        }
+        writer_binding.setdefault(
+            "line_instance_id",
+            f"runtime_context:{runtime_context_id}",
+        )
+        if (
+            not graph_trace_ids
+            or set(writer_binding)
+            != set(_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS)
+            or writer_binding.get("line_instance_id")
+            != f"runtime_context:{runtime_context_id}"
+        ):
+            return {}
+        tests = [{"command": "<worker test command>", "status": "passed"}]
+        test_results = {
+            "status": "passed",
+            "passed": True,
+            "commands": [dict(item) for item in tests],
+        }
+        _payload, body = _runtime_context_implementation_facade_bodies(
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            contract_execution_id=contract_execution_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_slot_id,
+            target_project_root=target_project_root,
+            session_token_ref=session_token_ref,
+            graph_trace_ids=graph_trace_ids,
+            changed_files=[
+                "<cumulative runtime diff file from base_commit..HEAD>"
+            ],
+            tests=tests,
+            test_results=test_results,
+            implementation_writer_binding=writer_binding,
+            route_identity=route,
+        )
+        action = "record_implementation_evidence"
+        facade = "runtime_context.implementation_evidence"
+        tool = "runtime_context_implementation_evidence"
+        path = (
+            f"/api/graph-governance/{project_id}/runtime-contexts/"
+            f"{runtime_context_id}/implementation-evidence"
+        )
+        optional_omission_fields = (
+            "implementation_diff_submission_guidance",
+            "worker_session_lifecycle_policy",
+            "write_authorization_policy",
+        )
+    elif contract_stage == "commit":
+        _implementation_line, implementation_payload = (
+            _runtime_context_position_bounded_completed_line(
+                record,
+                line_id="worker_implementation",
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+            )
+        )
+        _startup_line, startup_payload = (
+            _runtime_context_position_bounded_completed_line(
+                record,
+                line_id="worker_startup",
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+            )
+        )
+        changed_files = _runtime_context_service_query_values(
+            implementation_payload,
+            "changed_files",
+            "worker_changed_files",
+            "owned_changed_files",
+        )
+        graph_trace_ids = _runtime_context_service_query_values(
+            implementation_payload,
+            "graph_trace_ids",
+            "graph_query_trace_ids",
+            "verified_trace_ids",
+        )
+        worker_session_id = str(
+            startup_payload.get("worker_session_id")
+            or startup_payload.get("filer_principal")
+            or ""
+        ).strip()
+        if not changed_files or not graph_trace_ids or not worker_session_id:
+            return {}
+        body = _runtime_context_worker_commit_facade_body(
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            contract_execution_id=contract_execution_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_slot_id,
+            worker_session_id=worker_session_id,
+            target_project_root=target_project_root,
+            session_token_ref=session_token_ref,
+            worker_commit_sha=(
+                "<exact full clean git HEAD after implementation commit>"
+            ),
+            owned_files=worker_scope_files,
+            changed_files=changed_files,
+            inherited_target_head_files=(),
+            authority_revision={},
+            graph_trace_ids=graph_trace_ids,
+            route_identity=route,
+        )
+        action = "record_worker_commit"
+        facade = "runtime_context.worker_commit"
+        tool = "runtime_context_worker_commit"
+        path = (
+            f"/api/graph-governance/{project_id}/runtime-contexts/"
+            f"{runtime_context_id}/worker-commit"
+        )
+    elif contract_stage in {"attestation", "finish"}:
+        return _runtime_context_current_finish_facade_action(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            contract_next_action=contract_next_action,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            target_project_root=target_project_root,
+            session_token_ref=session_token_ref,
+            route_identity=route,
+        )
+    if not body or not action or not tool:
+        return {}
+    return _guide_canonical_executable_action(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        parent_contract_execution_id=parent_contract_execution_id,
+        action=action,
+        facade=facade,
+        mcp_tool=tool,
+        method="POST",
+        path=path,
+        stage_id=contract_stage,
+        line_id="",
+        body=body,
+        optional_omission_fields=optional_omission_fields,
+    )
+
+
 def _runtime_context_worker_guide_early_compact_response(
     ctx: RequestContext,
     conn,
@@ -34293,26 +34793,6 @@ def _runtime_context_worker_guide_early_compact_response(
     )
     session_token_ref = runtime_context_session_token_ref(context)
     session_token_lease = runtime_context_session_token_lease_view(context)
-    recovery = _runtime_context_worker_recovery_details(
-        ctx,
-        conn,
-        project_id=project_id,
-        runtime_context_id=runtime_context_id,
-        task_id=task_id,
-        parent_task_id=parent_task_id,
-        fence_token=_runtime_context_request_value(ctx, "fence_token"),
-        session_token=_runtime_context_request_value(ctx, "session_token"),
-        session_token_ref=(
-            _runtime_context_request_value(ctx, "session_token_ref")
-            or _runtime_context_request_value(ctx, "worker_session_token_ref")
-        ),
-        target_project_root=_runtime_context_requested_target_project_root(ctx),
-        route_identity=route_identity,
-        reason="runtime_context_sequence_check",
-        context=context,
-        include_full_finish_projection=False,
-    )
-    actionable_payloads = dict(recovery.get("actionable_payloads") or {})
     contract_identity = _runtime_context_contract_execution_identity(
         latest_revision_payload,
         contract_revision_id=contract_revision_id,
@@ -34343,6 +34823,94 @@ def _runtime_context_worker_guide_early_compact_response(
     contract_next_action = dict(
         contract_projection.get("contract_runtime_next_legal_action") or {}
     )
+    contract_stage = _runtime_context_worker_guide_current_stage(
+        {
+            "next_legal_action": str(
+                contract_next_action.get("action") or ""
+            ),
+            "contract_runtime_next_legal_action": contract_next_action,
+        }
+    )
+    worker_scope_files = _runtime_context_collect_worker_scope_files(
+        task_id=task_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        latest_revision_payload=latest_revision_payload,
+        sources=[
+            {
+                "owned_files": getattr(context, "owned_files", []),
+                "target_files": getattr(context, "target_files", []),
+            },
+            latest_revision_payload,
+        ],
+    )
+    # The request gate has already authenticated the worker and exact
+    # RuntimeContext identity. ContractRuntime can therefore fix Position
+    # before a bounded facade is constructed. If the current stage cannot be
+    # projected from exact source-backed inputs, fall back to the existing
+    # recovery authority instead of inventing or guessing a body.
+    position_action = (
+        _runtime_context_position_bounded_current_action(
+            conn,
+            project_id=project_id,
+            context=context,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            backlog_id=backlog_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_slot_id,
+            target_project_root=target_project_root,
+            worktree_path=worktree_path,
+            session_token_ref=session_token_ref,
+            route_identity=route_identity,
+            contract_execution_id=contract_execution_id,
+            parent_contract_execution_id=str(
+                contract_identity.get("parent_contract_execution_id") or ""
+            ),
+            contract_stage=contract_stage,
+            contract_next_action=contract_next_action,
+            latest_revision_payload=latest_revision_payload,
+            worker_scope_files=worker_scope_files,
+        )
+        if role == "mf_sub"
+        and _runtime_context_contract_next_action_override_eligible(
+            contract_next_action,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+        else {}
+    )
+    position_bounded = bool(position_action)
+    if position_bounded:
+        recovery = {
+            "next_legal_action": str(
+                contract_next_action.get("action") or ""
+            ),
+            "actionable_payloads": {},
+            "diagnostics": {},
+        }
+    else:
+        recovery = _runtime_context_worker_recovery_details(
+            ctx,
+            conn,
+            project_id=project_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            fence_token=_runtime_context_request_value(ctx, "fence_token"),
+            session_token=_runtime_context_request_value(ctx, "session_token"),
+            session_token_ref=(
+                _runtime_context_request_value(ctx, "session_token_ref")
+                or _runtime_context_request_value(ctx, "worker_session_token_ref")
+            ),
+            target_project_root=_runtime_context_requested_target_project_root(ctx),
+            route_identity=route_identity,
+            reason="runtime_context_sequence_check",
+            context=context,
+            include_full_finish_projection=False,
+        )
+    actionable_payloads = dict(recovery.get("actionable_payloads") or {})
     recovery_next_action = str(
         recovery.get("next_legal_action") or ""
     ).strip()
@@ -34382,20 +34950,21 @@ def _runtime_context_worker_guide_early_compact_response(
         )
         contract_took_precedence = False
 
-    worker_scope_files = _runtime_context_collect_worker_scope_files(
-        task_id=task_id,
-        worker_id=worker_id,
-        worker_slot_id=worker_slot_id,
-        latest_revision_payload=latest_revision_payload,
-        sources=[
-            {
-                "owned_files": getattr(context, "owned_files", []),
-                "target_files": getattr(context, "target_files", []),
-            },
-            latest_revision_payload,
-            actionable_payloads,
-        ],
-    )
+    if actionable_payloads:
+        worker_scope_files = _runtime_context_collect_worker_scope_files(
+            task_id=task_id,
+            worker_id=worker_id,
+            worker_slot_id=worker_slot_id,
+            latest_revision_payload=latest_revision_payload,
+            sources=[
+                {
+                    "owned_files": getattr(context, "owned_files", []),
+                    "target_files": getattr(context, "target_files", []),
+                },
+                latest_revision_payload,
+                actionable_payloads,
+            ],
+        )
     target_root_projection = _runtime_context_target_root_projection(
         project_id=project_id,
         requested_target_project_root=_runtime_context_requested_target_project_root(
@@ -34452,28 +35021,13 @@ def _runtime_context_worker_guide_early_compact_response(
         contract_runtime_next_action=contract_next_action,
     )
     canonical_actions = dict(coverage.get("actions") or {})
-    current_finish_action = _runtime_context_current_finish_facade_action(
-        conn,
-        project_id=project_id,
-        backlog_id=backlog_id,
-        contract_execution_id=contract_execution_id,
-        contract_next_action=contract_next_action,
-        context=context,
-        runtime_context_id=runtime_context_id,
-        task_id=task_id,
-        parent_task_id=parent_task_id,
-        target_project_root=target_project_root,
-        session_token_ref=session_token_ref,
-        route_identity=route_identity,
-    )
-    if current_finish_action:
-        current_finish_stage = (
-            "attestation"
-            if str(contract_next_action.get("line_id") or "").strip()
-            == "worker_finish_time_attestation"
-            else "finish"
-        )
-        canonical_actions[current_finish_stage] = current_finish_action
+    if position_bounded:
+        canonical_actions[contract_stage] = dict(position_action)
+    elif contract_stage in {"attestation", "finish"}:
+        # A finish facade is current only when the bounded source-backed
+        # authority adapter produced it. Recovery templates are diagnostics,
+        # not an executable substitute for a missing durable finish body.
+        canonical_actions.pop(contract_stage, None)
     if "reissue" in next_legal_action:
         reissue = actionable_payloads.get("session_token_reissue_submission")
         if isinstance(reissue, Mapping) and isinstance(
@@ -34636,6 +35190,9 @@ def _runtime_context_worker_guide_early_compact_response(
     compact["builder"] = "bounded_current_authority"
     compact["full_worker_guide_builder_called"] = False
     compact["full_runtime_projection_called"] = False
+    compact["position_bounded"] = position_bounded
+    compact["position_stage"] = contract_stage
+    compact["recovery_forest_called"] = not position_bounded
     compact["role_scope"] = role
     compact["serialized_bytes"] = (
         _runtime_context_worker_guide_serialized_bytes(compact)
@@ -34649,6 +35206,159 @@ def _runtime_context_worker_guide_early_compact_response(
             requested_view="compact",
         )
     return compact
+
+
+def _runtime_context_position_bounded_current_state_response(
+    ctx: RequestContext,
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    role: str,
+    session: Mapping[str, Any],
+    requested_view: str,
+) -> dict[str, Any]:
+    """Project one explicit bounded current view from the current Position."""
+
+    from .parallel_branch_runtime import (
+        record_runtime_context_access_audit,
+        runtime_context_single_view_audit_node,
+    )
+
+    compact = _runtime_context_worker_guide_early_compact_response(
+        ctx,
+        conn,
+        project_id=project_id,
+        context=context,
+        role=role,
+    )
+    runtime_context_id = str(compact.get("runtime_context_id") or "").strip()
+    task_id = str(compact.get("task_id") or "").strip()
+    normalized_view = str(requested_view or "compact").strip().lower()
+    projected_view = {
+        key: deepcopy(compact.get(key))
+        for key in (
+            "project_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "target_project_root",
+            "worktree_path",
+            "branch_ref",
+            "worker_scope",
+            "route_identity",
+            "graph_query_identity",
+            "session_token_lease",
+            "contract_runtime_current_state",
+            "contract_runtime_next_legal_action",
+            "next_legal_action",
+            "canonical_executable_action",
+            "canonical_executable_action_hash",
+            "position_stage",
+        )
+    }
+    position_bounded = bool(compact.get("position_bounded"))
+    projected_view.update(
+        {
+            "schema_version": (
+                "runtime_context.position_bounded_worker_view.v1"
+                if position_bounded
+                else "runtime_context.bounded_recovery_worker_view.v1"
+            ),
+            "source_of_authority": (
+                "ContractRuntime.current_line"
+                if position_bounded
+                else str(
+                    compact.get("next_legal_action_decision_source")
+                    or "runtime_context_sequence_projection"
+                )
+            ),
+        }
+    )
+    projection_hash = _stable_public_hash(
+        {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "view": normalized_view,
+            "projection": projected_view,
+        }
+    )
+    audit_node = runtime_context_single_view_audit_node(
+        runtime_context_id=runtime_context_id,
+        view_name=normalized_view,
+        payload=projected_view,
+    )
+    audit = record_runtime_context_access_audit(
+        conn,
+        project_id=str(getattr(context, "project_id", "") or project_id),
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        session=session,
+        role=role,
+        view_name=normalized_view,
+        projection_hash=projection_hash,
+        nodes_read=[audit_node],
+        metadata={
+            "endpoint": "parallel-branches.runtime-context.current-state",
+            "projection": (
+                "position_bounded" if position_bounded else "bounded_recovery"
+            ),
+            "position_stage": compact.get("position_stage"),
+        },
+    )
+    conn.commit()
+    response = deepcopy(compact)
+    response.update(
+        {
+            "schema_version": (
+                "runtime_context.current_state_position_bounded.v1"
+                if position_bounded
+                else "runtime_context.current_state_bounded_recovery.v1"
+            ),
+            "response_view": normalized_view,
+            "governance_project_id": str(
+                getattr(context, "project_id", "") or project_id
+            ),
+            "target_project_id": str(
+                getattr(context, "target_project_id", "") or project_id
+            ),
+            "access_audit_persisted": bool(audit.get("audit_id")),
+            "governance_writes_performed": bool(audit.get("audit_id")),
+            "writes_performed": bool(audit.get("audit_id")),
+            "mutation_performed": bool(audit.get("audit_id")),
+            "product_mutation_performed": False,
+        }
+    )
+    response.update(
+        {
+            "runtime_context_service": {
+                "schema_version": (
+                    "runtime_context.position_bounded_service.v1"
+                    if position_bounded
+                    else "runtime_context.bounded_recovery_service.v1"
+                ),
+                "project_id": project_id,
+                "runtime_context_id": runtime_context_id,
+                "views": {normalized_view: projected_view},
+                "content_address": {
+                    "projection_hash": projection_hash,
+                    "source_of_authority": projected_view[
+                        "source_of_authority"
+                    ],
+                },
+            },
+            "access_audit": {
+                "schema_version": audit.get("schema_version"),
+                "audit_id": audit.get("audit_id"),
+                "projection_hash": audit.get("projection_hash"),
+                "nodes_read": audit.get("nodes_read"),
+            },
+        }
+    )
+    response["serialized_bytes"] = _runtime_context_server_read_serialized_bytes(
+        response
+    )
+    return response
 
 
 def _runtime_context_finish_submission_bundle(
@@ -38173,6 +38883,432 @@ def _runtime_context_post_read_startup_receipt_authority_is_exact(
     )
 
 
+def _runtime_context_read_receipt_facade_bodies(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    worker_id: str,
+    worker_slot_id: str,
+    target_project_root: str,
+    contract_execution_id: str,
+    contract_chain_id: str = "",
+    parent_contract_execution_id: str = "",
+    successor_contract_execution_id: str = "",
+    contract_revision_id: str = "",
+    contract_hash: str = "",
+    context_hash: str = "",
+    graph_trace_id: str = "",
+    route_identity: Mapping[str, Any] | None = None,
+    fence_token_hash: str = "",
+    session_token_ref: str = "",
+    launch_text_hash: str = "",
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Build the existing read-receipt facade body from one source shape."""
+
+    safe_route_identity = {
+        field: str((route_identity or {}).get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    }
+    normalized_launch_text_hash = str(launch_text_hash or "").strip()
+    launch_text_hash_ready = bool(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", normalized_launch_text_hash)
+    )
+    receipt_hash_value = (
+        normalized_launch_text_hash
+        if launch_text_hash_ready
+        else "<worker-computed-read-receipt-hash>"
+    )
+    launch_hash_value = (
+        normalized_launch_text_hash
+        if launch_text_hash_ready
+        else "<launch-text-sha256-if-known>"
+    )
+    session_token_env = "AMING_WORKER_SESSION_TOKEN"
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    context_session_token_ref = str(session_token_ref or "").strip()
+    session_token_ref_placeholder = (
+        context_session_token_ref
+        or "<copy session_token_ref from worker_guide.session_token_ref>"
+    )
+    session_token_placeholder = (
+        f"<read from env:{session_token_env} at submission time>"
+    )
+    fence_token_placeholder = (
+        f"<read from env:{fence_token_env} at submission time>"
+    )
+    canonical_context_receipt_template = {
+        "schema_version": "contract_context_read_receipt.v1",
+        "event_kind": "contract_context_read_receipt",
+        "legacy_event_kind": "mf_subagent_read_receipt",
+        "project_id": project_id,
+        "actor_role": "mf_sub",
+        "actor_session_principal": "<server-verified worker session principal>",
+        "contract_execution_id": (
+            contract_execution_id or "<active contract_execution_id>"
+        ),
+        "contract_chain_id": contract_chain_id,
+        "parent_contract_execution_id": parent_contract_execution_id,
+        "successor_contract_execution_id": successor_contract_execution_id,
+        "contract_revision_id": contract_revision_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "lane_id": worker_slot_id or worker_id,
+        "target_project_root": target_project_root,
+        "route_token_ref": safe_route_identity.get("route_token_ref", ""),
+        "fence_token_hash": fence_token_hash,
+        "context_hash": (
+            context_hash
+            or "<runtime_context_service.content_address.projection_hash>"
+        ),
+        "context_hash_source": (
+            "runtime_context_service.content_address.projection_hash"
+        ),
+        "contract_hash": contract_hash or "<contract revision hash>",
+        "acknowledged_at": "<worker-generated ISO-8601 timestamp>",
+        "receipt_hash": receipt_hash_value,
+        "read_receipt_hash": receipt_hash_value,
+        "graph_trace_id": graph_trace_id,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        **safe_route_identity,
+    }
+    canonical_body_fields = {
+        "canonical_event_kind": "contract_context_read_receipt",
+        "legacy_event_kind": "mf_subagent_read_receipt",
+        "actor_role": "mf_sub",
+    }
+    for key, value in {
+        "contract_execution_id": contract_execution_id,
+        "contract_chain_id": contract_chain_id,
+        "parent_contract_execution_id": parent_contract_execution_id,
+        "successor_contract_execution_id": successor_contract_execution_id,
+        "contract_revision_id": contract_revision_id,
+        "contract_hash": contract_hash,
+        "context_hash": context_hash,
+        "graph_trace_id": graph_trace_id,
+    }.items():
+        if value:
+            canonical_body_fields[key] = value
+    payload = {
+        "schema_version": "contract_context_read_receipt.v1",
+        "project_id": project_id,
+        **canonical_body_fields,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "event_type": "mf_subagent_read_receipt",
+        "event_kind": "contract_context_read_receipt",
+        "status": "accepted",
+        "read_receipt_hash": receipt_hash_value,
+        "launch_text_hash": launch_hash_value,
+        "session_token_env": session_token_env,
+        "session_token_ref": session_token_ref_placeholder,
+        "session_token_ref_present": bool(context_session_token_ref),
+        "fence_token_env": fence_token_env,
+        "fence_token_hash": fence_token_hash,
+        "fence_token_redacted": bool(fence_token_hash),
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        "contract_context_read_receipt": canonical_context_receipt_template,
+        **safe_route_identity,
+    }
+    body = {
+        "project_id": project_id,
+        **canonical_body_fields,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "session_token": session_token_placeholder,
+        "session_token_ref": session_token_ref_placeholder,
+        "fence_token": fence_token_placeholder,
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "event_type": "mf_subagent_read_receipt",
+        "event_kind": "contract_context_read_receipt",
+        "status": "accepted",
+        "read_receipt_hash": receipt_hash_value,
+        "launch_text_hash": launch_hash_value,
+        "contract_context_read_receipt": dict(
+            canonical_context_receipt_template
+        ),
+        **safe_route_identity,
+        "payload": dict(payload),
+    }
+    return canonical_context_receipt_template, payload, body
+
+
+def _runtime_context_startup_facade_body(
+    *,
+    project_id: str,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    worker_id: str,
+    worker_slot_id: str,
+    agent_id: str,
+    allocation_owner: str,
+    branch_ref: str,
+    base_commit: str,
+    target_head_commit: str,
+    merge_queue_id: str,
+    owned_files: Sequence[str],
+    observer_command_id: str,
+    dispatch_fields: Mapping[str, Any],
+    target_project_root: str,
+    worktree_path: str,
+    session_token_ref: str,
+    worker_session_id: str,
+    worker_transcript_ref: str,
+    worker_transcript_path: str,
+    host_startup_id: str,
+    host_session_id: str,
+    read_receipt_hash: str,
+    read_receipt_event_id: str,
+    route_identity: Mapping[str, Any],
+    worker_session_lifecycle_policy: Mapping[str, Any] | None = None,
+    write_authorization_policy: Mapping[str, Any] | None = None,
+    worker_identity_pointers: Mapping[str, Any] | None = None,
+    semantic_role_binding: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the one startup facade body shared by all Guide projections."""
+
+    session_token_env = "AMING_WORKER_SESSION_TOKEN"
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    return {
+        "project_id": project_id,
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "agent_id": agent_id or "<allocated governed worker id>",
+        "allocation_owner": allocation_owner or "<allocation owner>",
+        "observer_allocation_owner": allocation_owner or "<allocation owner>",
+        "branch": branch_ref or "<assigned worker branch>",
+        "branch_ref": branch_ref or "<assigned worker branch>",
+        "base_commit": base_commit or "<assigned base commit>",
+        "target_head_commit": (
+            target_head_commit or "<assigned target HEAD commit>"
+        ),
+        "merge_queue_id": merge_queue_id or "<assigned merge_queue_id>",
+        "owned_files": list(owned_files),
+        "observer_command_id": (
+            observer_command_id or "<claimed execute_backlog_row command id>"
+        ),
+        **dict(dispatch_fields),
+        "target_project_root": target_project_root,
+        "worktree_path": worktree_path,
+        "session_token": (
+            f"<read from env:{session_token_env} at submission time>"
+        ),
+        "session_token_ref": (
+            session_token_ref
+            or "<copy session_token_ref from worker_guide.session_token_ref>"
+        ),
+        "fence_token": (
+            f"<read from env:{fence_token_env} at submission time>"
+        ),
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "worker_session_id": (
+            worker_session_id or "<actual worker-owned session id>"
+        ),
+        "worker_transcript_ref": (
+            worker_transcript_ref
+            or "<host transcript ref, e.g. codex:<session-id>>"
+        ),
+        "worker_transcript_path": (
+            worker_transcript_path or "<local transcript path if available>"
+        ),
+        "harness_type": "codex",
+        "filer_principal": "<actual worker principal filing startup>",
+        "actual_host_worker_id": agent_id or "<allocated governed worker id>",
+        "host_startup_id": host_startup_id or "<host startup event/thread id>",
+        "host_session_id": host_session_id or "<host session id>",
+        "actual_cwd": worktree_path,
+        "actual_git_root": worktree_path,
+        "head_commit": "<worker worktree HEAD after launch>",
+        "read_receipt_hash": (
+            read_receipt_hash or "<accepted-read-receipt-hash>"
+        ),
+        "read_receipt_event_id": (
+            read_receipt_event_id or "<accepted-read-receipt-event-id>"
+        ),
+        "worker_session_lifecycle_policy": dict(
+            worker_session_lifecycle_policy or {}
+        ),
+        "write_authorization_policy": dict(
+            write_authorization_policy or {}
+        ),
+        "worker_identity_pointers": dict(worker_identity_pointers or {}),
+        "semantic_role_binding": dict(semantic_role_binding or {}),
+        **dict(route_identity),
+    }
+
+
+def _runtime_context_implementation_facade_bodies(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    contract_execution_id: str,
+    worker_id: str,
+    worker_slot_id: str,
+    target_project_root: str,
+    session_token_ref: str,
+    graph_trace_ids: Sequence[str],
+    changed_files: Sequence[str],
+    tests: Sequence[Mapping[str, Any]],
+    test_results: Mapping[str, Any],
+    implementation_writer_binding: Mapping[str, Any],
+    route_identity: Mapping[str, Any],
+    implementation_diff_submission_guidance: Mapping[str, Any] | None = None,
+    worker_session_lifecycle_policy: Mapping[str, Any] | None = None,
+    write_authorization_policy: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the one implementation facade payload/body source shape."""
+
+    session_token_env = "AMING_WORKER_SESSION_TOKEN"
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    common = {
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "contract_execution_id": contract_execution_id,
+        "lane_id": worker_slot_id or worker_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "target_project_root": target_project_root,
+        "graph_trace_ids": list(graph_trace_ids),
+        "implementation_diff_submission_guidance": dict(
+            implementation_diff_submission_guidance or {}
+        ),
+        "worker_session_lifecycle_policy": dict(
+            worker_session_lifecycle_policy or {}
+        ),
+        "write_authorization_policy": dict(
+            write_authorization_policy or {}
+        ),
+        **dict(implementation_writer_binding),
+    }
+    payload = {
+        "schema_version": "runtime_context.implementation_evidence.payload.v1",
+        **common,
+        "raw_session_token_persisted": False,
+        "raw_fence_token_persisted": False,
+        **dict(route_identity),
+    }
+    body = {
+        "project_id": project_id,
+        **common,
+        "session_token": (
+            f"<read from env:{session_token_env} at submission time>"
+        ),
+        "session_token_ref": (
+            session_token_ref
+            or "<copy session_token_ref from worker_guide.session_token_ref>"
+        ),
+        "fence_token": (
+            f"<read from env:{fence_token_env} at submission time>"
+        ),
+        "session_token_env": session_token_env,
+        "fence_token_env": fence_token_env,
+        "changed_files": list(changed_files),
+        "tests": [dict(item) for item in tests],
+        "test_results": dict(test_results),
+        "payload": payload,
+        **dict(route_identity),
+    }
+    return payload, body
+
+
+def _runtime_context_worker_commit_facade_body(
+    *,
+    project_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    parent_task_id: str,
+    contract_execution_id: str,
+    worker_id: str,
+    worker_slot_id: str,
+    worker_session_id: str,
+    target_project_root: str,
+    session_token_ref: str,
+    worker_commit_sha: str,
+    owned_files: Sequence[str],
+    changed_files: Sequence[str],
+    inherited_target_head_files: Sequence[str],
+    authority_revision: Mapping[str, Any],
+    graph_trace_ids: Sequence[str],
+    route_identity: Mapping[str, Any],
+    worker_implementation_lineage: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the one worker-commit facade body shared by Guide projections."""
+
+    session_token_env = "AMING_WORKER_SESSION_TOKEN"
+    fence_token_env = "AMING_WORKER_FENCE_TOKEN"
+    body = {
+        "project_id": project_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "contract_execution_id": contract_execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "worker_session_id": (
+            worker_session_id or "<same worker_session_id as startup>"
+        ),
+        "filer_principal": (
+            worker_session_id or "<same worker_session_id as startup>"
+        ),
+        "target_project_root": target_project_root,
+        "session_token": (
+            f"<read from env:{session_token_env} at submission time>"
+        ),
+        "session_token_ref": (
+            session_token_ref
+            or "<copy session_token_ref from worker_guide.session_token_ref>"
+        ),
+        "fence_token": (
+            f"<read from env:{fence_token_env} at submission time>"
+        ),
+        "worker_commit_sha": worker_commit_sha,
+        "owned_files": list(owned_files),
+        "changed_files": list(changed_files),
+        "inherited_target_head_files": list(inherited_target_head_files),
+        "authority_revision": dict(authority_revision),
+        "graph_trace_ids": list(graph_trace_ids),
+        **dict(route_identity),
+    }
+    lineage = dict(worker_implementation_lineage or {})
+    implementation_lineage_ref = str(
+        lineage.get("implementation_lineage_ref") or ""
+    ).strip()
+    if implementation_lineage_ref:
+        body["implementation_lineage_ref"] = implementation_lineage_ref
+        body["worker_implementation_lineage"] = lineage
+    return body
+
+
 def _runtime_context_worker_recovery_payloads(
     *,
     project_id: str,
@@ -38376,25 +39512,12 @@ def _runtime_context_worker_recovery_payloads(
     launch_text_hash_ready = bool(
         re.fullmatch(r"sha256:[0-9a-f]{64}", normalized_launch_text_hash)
     )
-    receipt_hash_value = (
-        normalized_launch_text_hash
-        if launch_text_hash_ready
-        else "<worker-computed-read-receipt-hash>"
-    )
-    launch_hash_value = (
-        normalized_launch_text_hash
-        if launch_text_hash_ready
-        else "<launch-text-sha256-if-known>"
-    )
     canonical_dispatch_fields = (
         _contract_runtime_dispatch_identity_projection_fields(
             canonical_dispatch_identity
         )
     )
     canonical_dispatch_fields.pop("observer_command_id", None)
-    implementation_lineage_ref = str(
-        canonical_implementation_lineage.get("implementation_lineage_ref") or ""
-    ).strip()
     required_route_identity_fields = list(_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS)
     session_token_env = "AMING_WORKER_SESSION_TOKEN"
     fence_token_env = "AMING_WORKER_FENCE_TOKEN"
@@ -38945,113 +40068,31 @@ def _runtime_context_worker_recovery_payloads(
         allowed_actions=["close_or_merge_after_evidence"],
         issue_payload=merge_queue_route_issue_payload,
     )
-    canonical_context_receipt_template = {
-        "schema_version": "contract_context_read_receipt.v1",
-        "event_kind": "contract_context_read_receipt",
-        "legacy_event_kind": "mf_subagent_read_receipt",
-        "project_id": project_id,
-        "actor_role": "mf_sub",
-        "actor_session_principal": "<server-verified worker session principal>",
-        "contract_execution_id": (
-            contract_execution_id or "<active contract_execution_id>"
-        ),
-        "contract_chain_id": contract_chain_id,
-        "parent_contract_execution_id": parent_contract_execution_id,
-        "successor_contract_execution_id": successor_contract_execution_id,
-        "contract_revision_id": contract_revision_id,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "worker_id": worker_id,
-        "worker_slot_id": worker_slot_id,
-        "lane_id": worker_slot_id or worker_id,
-        "target_project_root": target_project_root,
-        "route_token_ref": safe_route_identity.get("route_token_ref", ""),
-        "fence_token_hash": fence_token_hash,
-        "context_hash": (
-            context_hash
-            or "<runtime_context_service.content_address.projection_hash>"
-        ),
-        "context_hash_source": (
-            "runtime_context_service.content_address.projection_hash"
-        ),
-        "contract_hash": contract_hash or "<contract revision hash>",
-        "acknowledged_at": "<worker-generated ISO-8601 timestamp>",
-        "receipt_hash": receipt_hash_value,
-        "read_receipt_hash": receipt_hash_value,
-        "graph_trace_id": graph_trace_id,
-        "raw_session_token_persisted": False,
-        "raw_fence_token_persisted": False,
-        **safe_route_identity,
-    }
-    canonical_body_fields = {
-        "canonical_event_kind": "contract_context_read_receipt",
-        "legacy_event_kind": "mf_subagent_read_receipt",
-        "actor_role": "mf_sub",
-    }
-    for key, value in {
-        "contract_execution_id": contract_execution_id,
-        "contract_chain_id": contract_chain_id,
-        "parent_contract_execution_id": parent_contract_execution_id,
-        "successor_contract_execution_id": successor_contract_execution_id,
-        "contract_revision_id": contract_revision_id,
-        "contract_hash": contract_hash,
-        "context_hash": context_hash,
-        "graph_trace_id": graph_trace_id,
-    }.items():
-        if value:
-            canonical_body_fields[key] = value
-    read_receipt_payload = {
-        "schema_version": "contract_context_read_receipt.v1",
-        "project_id": project_id,
-        **canonical_body_fields,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "worker_role": "mf_sub",
-        "worker_id": worker_id,
-        "worker_slot_id": worker_slot_id,
-        "target_project_root": target_project_root,
-        "event_type": "mf_subagent_read_receipt",
-        "event_kind": "contract_context_read_receipt",
-        "status": "accepted",
-        "read_receipt_hash": receipt_hash_value,
-        "launch_text_hash": launch_hash_value,
-        "session_token_env": session_token_env,
-        "session_token_ref": session_token_ref_placeholder,
-        "session_token_ref_present": bool(context_session_token_ref),
-        "fence_token_env": fence_token_env,
-        "fence_token_hash": fence_token_hash,
-        "fence_token_redacted": bool(fence_token_hash),
-        "raw_session_token_persisted": False,
-        "raw_fence_token_persisted": False,
-        "contract_context_read_receipt": canonical_context_receipt_template,
-        **safe_route_identity,
-    }
-    read_receipt_body = {
-        "project_id": project_id,
-        **canonical_body_fields,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "worker_role": "mf_sub",
-        "worker_id": worker_id,
-        "worker_slot_id": worker_slot_id,
-        "target_project_root": target_project_root,
-        "session_token": session_token_placeholder,
-        "session_token_ref": session_token_ref_placeholder,
-        "fence_token": fence_token_placeholder,
-        "session_token_env": session_token_env,
-        "fence_token_env": fence_token_env,
-        "event_type": "mf_subagent_read_receipt",
-        "event_kind": "contract_context_read_receipt",
-        "status": "accepted",
-        "read_receipt_hash": receipt_hash_value,
-        "launch_text_hash": launch_hash_value,
-        "contract_context_read_receipt": dict(canonical_context_receipt_template),
-        **safe_route_identity,
-        "payload": dict(read_receipt_payload),
-    }
+    (
+        canonical_context_receipt_template,
+        read_receipt_payload,
+        read_receipt_body,
+    ) = _runtime_context_read_receipt_facade_bodies(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        target_project_root=target_project_root,
+        contract_execution_id=contract_execution_id,
+        contract_chain_id=contract_chain_id,
+        parent_contract_execution_id=parent_contract_execution_id,
+        successor_contract_execution_id=successor_contract_execution_id,
+        contract_revision_id=contract_revision_id,
+        contract_hash=contract_hash,
+        context_hash=context_hash,
+        graph_trace_id=graph_trace_id,
+        route_identity=safe_route_identity,
+        fence_token_hash=fence_token_hash,
+        session_token_ref=context_session_token_ref,
+        launch_text_hash=normalized_launch_text_hash,
+    )
     read_receipt_field_pointers = {
         "top_level_post_json": "read_receipt_facade_payload_skeleton.copy_safe_body",
         "do_not_post_alone": [
@@ -39220,74 +40261,39 @@ def _runtime_context_worker_recovery_payloads(
         "read_receipt_hash",
         "read_receipt_event_id",
     ]
-    startup_body = {
-        "project_id": project_id,
-        "contract_execution_id": contract_execution_id,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "worker_role": "mf_sub",
-        "worker_id": worker_id,
-        "worker_slot_id": worker_slot_id,
-        "agent_id": allocated_governed_worker_id or "<allocated governed worker id>",
-        "allocation_owner": normalized_allocation_owner or "<allocation owner>",
-        "observer_allocation_owner": (
-            normalized_allocation_owner or "<allocation owner>"
-        ),
-        "branch": normalized_branch_ref or "<assigned worker branch>",
-        "branch_ref": normalized_branch_ref or "<assigned worker branch>",
-        "base_commit": normalized_base_commit or "<assigned base commit>",
-        "target_head_commit": (
-            normalized_target_head_commit or "<assigned target HEAD commit>"
-        ),
-        "merge_queue_id": normalized_merge_queue_id or "<assigned merge_queue_id>",
-        "owned_files": list(active_owned_files),
-        "observer_command_id": (
-            canonical_observer_command_id
-            or "<claimed execute_backlog_row command id>"
-        ),
-        **canonical_dispatch_fields,
-        "target_project_root": target_project_root,
-        "worktree_path": normalized_worktree_path,
-        "session_token": session_token_placeholder,
-        "session_token_ref": session_token_ref_placeholder,
-        "fence_token": fence_token_placeholder,
-        "session_token_env": session_token_env,
-        "fence_token_env": fence_token_env,
-        "worker_session_id": (
-            normalized_worker_session_id or "<actual worker-owned session id>"
-        ),
-        "worker_transcript_ref": (
-            normalized_worker_transcript_ref
-            or "<host transcript ref, e.g. codex:<session-id>>"
-        ),
-        "worker_transcript_path": (
-            normalized_worker_transcript_path
-            or "<local transcript path if available>"
-        ),
-        "harness_type": "codex",
-        "filer_principal": "<actual worker principal filing startup>",
-        "actual_host_worker_id": (
-            allocated_governed_worker_id or "<allocated governed worker id>"
-        ),
-        "host_startup_id": normalized_host_startup_id or "<host startup event/thread id>",
-        "host_session_id": normalized_host_session_id or "<host session id>",
-        "actual_cwd": normalized_worktree_path,
-        "actual_git_root": normalized_worktree_path,
-        "head_commit": "<worker worktree HEAD after launch>",
-        "read_receipt_hash": (
-            trusted_read_receipt_hash or "<accepted-read-receipt-hash>"
-        ),
-        "read_receipt_event_id": (
-            trusted_read_receipt_event_id
-            or "<accepted-read-receipt-event-id>"
-        ),
-        "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
-        "write_authorization_policy": dict(write_authorization_policy),
-        "worker_identity_pointers": dict(worker_identity_pointers),
-        "semantic_role_binding": dict(startup_semantic_role_binding),
-        **safe_route_identity,
-    }
+    startup_body = _runtime_context_startup_facade_body(
+        project_id=project_id,
+        contract_execution_id=contract_execution_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        agent_id=allocated_governed_worker_id,
+        allocation_owner=normalized_allocation_owner,
+        branch_ref=normalized_branch_ref,
+        base_commit=normalized_base_commit,
+        target_head_commit=normalized_target_head_commit,
+        merge_queue_id=normalized_merge_queue_id,
+        owned_files=active_owned_files,
+        observer_command_id=canonical_observer_command_id,
+        dispatch_fields=canonical_dispatch_fields,
+        target_project_root=target_project_root,
+        worktree_path=normalized_worktree_path,
+        session_token_ref=context_session_token_ref,
+        worker_session_id=normalized_worker_session_id,
+        worker_transcript_ref=normalized_worker_transcript_ref,
+        worker_transcript_path=normalized_worker_transcript_path,
+        host_startup_id=normalized_host_startup_id,
+        host_session_id=normalized_host_session_id,
+        read_receipt_hash=trusted_read_receipt_hash,
+        read_receipt_event_id=trusted_read_receipt_event_id,
+        route_identity=safe_route_identity,
+        worker_session_lifecycle_policy=worker_session_lifecycle_policy,
+        write_authorization_policy=write_authorization_policy,
+        worker_identity_pointers=worker_identity_pointers,
+        semantic_role_binding=startup_semantic_role_binding,
+    )
     startup_payload = {
         "mf_subagent_startup_gate": {
             "contract_execution_id": contract_execution_id,
@@ -39334,28 +40340,6 @@ def _runtime_context_worker_recovery_payloads(
             **safe_route_identity,
         }
     }
-    implementation_evidence_payload = {
-        "schema_version": "runtime_context.implementation_evidence.payload.v1",
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "contract_execution_id": active_contract_execution_id,
-        "lane_id": worker_slot_id or worker_id,
-        "worker_role": "mf_sub",
-        "worker_id": worker_id,
-        "worker_slot_id": worker_slot_id,
-        "target_project_root": target_project_root,
-        "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
-        "implementation_diff_submission_guidance": dict(
-            implementation_diff_submission_guidance
-        ),
-        "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
-        "write_authorization_policy": dict(write_authorization_policy),
-        "raw_session_token_persisted": False,
-        "raw_fence_token_persisted": False,
-        **implementation_writer_binding,
-        **present_route_identity,
-    }
     implementation_evidence_tests = [
         {"command": "<worker test command>", "status": "passed"}
     ]
@@ -39364,35 +40348,33 @@ def _runtime_context_worker_recovery_payloads(
         "passed": True,
         "commands": [dict(item) for item in implementation_evidence_tests],
     }
-    implementation_evidence_body = {
-        "project_id": project_id,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "contract_execution_id": active_contract_execution_id,
-        "lane_id": worker_slot_id or worker_id,
-        "worker_role": "mf_sub",
-        "worker_id": worker_id,
-        "worker_slot_id": worker_slot_id,
-        "target_project_root": target_project_root,
-        "session_token": session_token_placeholder,
-        "session_token_ref": session_token_ref_placeholder,
-        "fence_token": fence_token_placeholder,
-        "session_token_env": session_token_env,
-        "fence_token_env": fence_token_env,
-        "changed_files": ["<cumulative runtime diff file from base_commit..HEAD>"],
-        "implementation_diff_submission_guidance": dict(
+    (
+        implementation_evidence_payload,
+        implementation_evidence_body,
+    ) = _runtime_context_implementation_facade_bodies(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        contract_execution_id=active_contract_execution_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        target_project_root=target_project_root,
+        session_token_ref=context_session_token_ref,
+        graph_trace_ids=["<worker-owned-graph-query-trace-id>"],
+        changed_files=[
+            "<cumulative runtime diff file from base_commit..HEAD>"
+        ],
+        tests=implementation_evidence_tests,
+        test_results=implementation_evidence_test_results,
+        implementation_writer_binding=implementation_writer_binding,
+        route_identity=present_route_identity,
+        implementation_diff_submission_guidance=(
             implementation_diff_submission_guidance
         ),
-        "tests": [dict(item) for item in implementation_evidence_tests],
-        "test_results": dict(implementation_evidence_test_results),
-        "graph_trace_ids": ["<worker-owned-graph-query-trace-id>"],
-        "worker_session_lifecycle_policy": dict(worker_session_lifecycle_policy),
-        "write_authorization_policy": dict(write_authorization_policy),
-        **implementation_writer_binding,
-        "payload": implementation_evidence_payload,
-        **present_route_identity,
-    }
+        worker_session_lifecycle_policy=worker_session_lifecycle_policy,
+        write_authorization_policy=write_authorization_policy,
+    )
     scope_insufficiency_path = (
         f"/api/graph-governance/{project_id}/runtime-contexts/"
         f"{runtime_context_id}/scope-insufficiency-requests"
@@ -39450,48 +40432,38 @@ def _runtime_context_worker_recovery_payloads(
             for field in _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS
         },
     }
-    worker_commit_body = {
-        "project_id": project_id,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "parent_task_id": parent_task_id,
-        "contract_execution_id": active_contract_execution_id,
-        "worker_role": "mf_sub",
-        "worker_id": worker_id,
-        "worker_slot_id": worker_slot_id,
-        "worker_session_id": (
-            normalized_worker_session_id or "<same worker_session_id as startup>"
+    worker_commit_body = _runtime_context_worker_commit_facade_body(
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        contract_execution_id=active_contract_execution_id,
+        worker_id=worker_id,
+        worker_slot_id=worker_slot_id,
+        worker_session_id=normalized_worker_session_id,
+        target_project_root=target_project_root,
+        session_token_ref=context_session_token_ref,
+        worker_commit_sha=(
+            "<exact full clean git HEAD after implementation commit>"
         ),
-        "filer_principal": (
-            normalized_worker_session_id or "<same worker_session_id as startup>"
-        ),
-        "target_project_root": target_project_root,
-        "session_token": session_token_placeholder,
-        "session_token_ref": session_token_ref_placeholder,
-        "fence_token": fence_token_placeholder,
-        "worker_commit_sha": "<exact full clean git HEAD after implementation commit>",
-        "owned_files": (
+        owned_files=(
             list((authority_revision or {}).get("active_owned_files") or [])
             or ["<all runtime-context owned files>"]
         ),
-        "changed_files": (
+        changed_files=(
             list((authority_revision or {}).get("worker_authored_files") or [])
             or ["<exact refreshed-base..worker_commit_sha authored file>"]
         ),
-        "inherited_target_head_files": list(
+        inherited_target_head_files=list(
             (authority_revision or {}).get("inherited_target_head_files") or []
         ),
-        "authority_revision": dict(authority_revision or {}),
-        "graph_trace_ids": ["<same DB-verified implementation graph trace id>"],
-        **safe_route_identity,
-    }
-    if implementation_lineage_ref:
-        worker_commit_body["implementation_lineage_ref"] = (
-            implementation_lineage_ref
-        )
-        worker_commit_body["worker_implementation_lineage"] = dict(
-            canonical_implementation_lineage
-        )
+        authority_revision=dict(authority_revision or {}),
+        graph_trace_ids=[
+            "<same DB-verified implementation graph trace id>"
+        ],
+        route_identity=safe_route_identity,
+        worker_implementation_lineage=canonical_implementation_lineage,
+    )
     merge_materialize_body = {
         "project_id": project_id,
         "merge_queue_id": (
@@ -47360,6 +48332,23 @@ def handle_graph_governance_parallel_branch_runtime_context_current_state(ctx: R
             action="graph-governance.parallel-branches.runtime-context.current-state",
             runtime_context_id=runtime_context_id,
         )
+
+        explicit_view = str(ctx.query.get("view") or "compact").strip().lower()
+        if role == "mf_sub" and explicit_view in {
+            "compact",
+            "current",
+            "worker_view",
+            "gate_inputs",
+        }:
+            return _runtime_context_position_bounded_current_state_response(
+                ctx,
+                conn,
+                project_id=project_id,
+                context=context,
+                role=role,
+                session=session,
+                requested_view=explicit_view,
+            )
 
         response = _runtime_context_projection_response(
             ctx,
