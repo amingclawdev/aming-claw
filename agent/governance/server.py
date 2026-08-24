@@ -177631,6 +177631,77 @@ def _handle_task_timeline_append(ctx: RequestContext):
                 actor=str(ctx.body.get("actor") or ""),
                 authority_source="contract_runtime",
             )
+        direct_main_implementation_prewrite_gate = (
+            _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
+                conn,
+                project_id=project_id,
+                body=ctx.body or {},
+                event_kind=norm_event_kind,
+                normalized_status=norm_status,
+                normalized_payload=validation_payload,
+            )
+        )
+        if (
+            direct_main_implementation_prewrite_gate.get("applicable") is True
+            and direct_main_implementation_prewrite_gate.get("passed") is not True
+        ):
+            raise GovernanceError(
+                "parentless_direct_main_implementation_test_evidence_incomplete",
+                (
+                    "parentless direct-main implementation test evidence is "
+                    "incomplete and was not persisted"
+                ),
+                422,
+                {
+                    **direct_main_implementation_prewrite_gate,
+                    "source": (
+                        "server.handle_task_timeline_append."
+                        "parentless_direct_main_implementation_prewrite_gate"
+                    ),
+                    "guide": {
+                        "correction": (
+                            "refresh onboard_route_guide and submit the exact "
+                            "payload.test_results object after replacing its "
+                            "commit and command placeholders"
+                        ),
+                        "accepted_aliases": [],
+                    },
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "persisted_as_accepted": False,
+                    "historical_backfill_allowed": False,
+                },
+            )
+        direct_main_implementation_event_type = ""
+        if direct_main_implementation_prewrite_gate.get("passed") is True:
+            direct_main_implementation_event_type = str(
+                ctx.body.get("event_type") or ""
+            ).strip()
+            if direct_main_implementation_event_type not in (
+                _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE_ALIASES
+            ):
+                raise GovernanceError(
+                    "parentless_direct_main_implementation_event_type_invalid",
+                    (
+                        "parentless direct-main implementation event type is "
+                        "not a recognized canonical alias"
+                    ),
+                    422,
+                    {
+                        "field": "event_type",
+                        "expected": sorted(
+                            _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE_ALIASES
+                        ),
+                        "actual": direct_main_implementation_event_type,
+                        "canonical_event_type": (
+                            _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE
+                        ),
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                        "persisted_as_accepted": False,
+                        "historical_backfill_allowed": False,
+                    },
+                )
         contract_runtime_close_evidence_gate = {}
         if contract_runtime_close_evidence_requested:
             if contract_runtime_completed_projection_gate:
@@ -178449,76 +178520,8 @@ def _handle_task_timeline_append(ctx: RequestContext):
                     "persisted_as_accepted": False,
                 },
             )
-        direct_main_implementation_prewrite_gate = (
-            _contract_runtime_parentless_direct_main_implementation_prewrite_gate(
-                conn,
-                project_id=project_id,
-                body=ctx.body or {},
-                event_kind=norm_event_kind,
-                normalized_status=norm_status,
-                normalized_payload=norm_payload,
-            )
-        )
-        if (
-            direct_main_implementation_prewrite_gate.get("applicable") is True
-            and direct_main_implementation_prewrite_gate.get("passed") is not True
-        ):
-            raise GovernanceError(
-                "parentless_direct_main_implementation_test_evidence_incomplete",
-                (
-                    "parentless direct-main implementation test evidence is "
-                    "incomplete and was not persisted"
-                ),
-                422,
-                {
-                    **direct_main_implementation_prewrite_gate,
-                    "source": (
-                        "server.handle_task_timeline_append."
-                        "parentless_direct_main_implementation_prewrite_gate"
-                    ),
-                    "guide": {
-                        "correction": (
-                            "refresh onboard_route_guide and submit the exact "
-                            "payload.test_results object after replacing its "
-                            "commit and command placeholders"
-                        ),
-                        "accepted_aliases": [],
-                    },
-                    "zero_write_rejection": True,
-                    "writes_performed": False,
-                    "persisted_as_accepted": False,
-                    "historical_backfill_allowed": False,
-                },
-            )
         if direct_main_implementation_prewrite_gate.get("passed") is True:
-            supplied_event_type = str(
-                ctx.body.get("event_type") or ""
-            ).strip()
-            if supplied_event_type not in (
-                _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE_ALIASES
-            ):
-                raise GovernanceError(
-                    "parentless_direct_main_implementation_event_type_invalid",
-                    (
-                        "parentless direct-main implementation event type is "
-                        "not a recognized canonical alias"
-                    ),
-                    422,
-                    {
-                        "field": "event_type",
-                        "expected": sorted(
-                            _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE_ALIASES
-                        ),
-                        "actual": supplied_event_type,
-                        "canonical_event_type": (
-                            _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE
-                        ),
-                        "zero_write_rejection": True,
-                        "writes_performed": False,
-                        "persisted_as_accepted": False,
-                        "historical_backfill_allowed": False,
-                    },
-                )
+            supplied_event_type = direct_main_implementation_event_type
             persisted_event_type = (
                 _PARENTLESS_DIRECT_MAIN_IMPLEMENTATION_EVENT_TYPE
             )

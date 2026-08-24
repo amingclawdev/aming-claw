@@ -93597,6 +93597,25 @@ def test_parentless_direct_main_implementation_prewrite_rejects_noncanonical_cha
         ["agent/governance/server.py"],
         message=commit_message,
     )
+    contract_before = copy.deepcopy(
+        server._contract_runtime(conn).store.get(task_id)
+    )
+    runtime_binding = contract_before["metadata"][
+        "operator_supervised_direct_main_runtime_binding"
+    ]
+    implementation_body = (
+        _canonical_parentless_direct_main_implementation_body(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            route_token_ref=route_token_ref,
+            route_identity=route_identity,
+            commit_sha=candidate_commit,
+        )
+    )
+    implementation_body["contract_execution_id"] = task_id
+    implementation_body["payload"]["direct_runtime_binding_hash"] = (
+        runtime_binding["binding_hash"]
+    )
     events_before = len(
         task_timeline.list_events(
             conn,
@@ -93614,19 +93633,13 @@ def test_parentless_direct_main_implementation_prewrite_rejects_noncanonical_cha
                 {"project_id": PID},
                 "observer",
                 method="POST",
-                body=_canonical_parentless_direct_main_implementation_body(
-                    backlog_id=backlog_id,
-                    task_id=task_id,
-                    route_token_ref=route_token_ref,
-                    route_identity=route_identity,
-                    commit_sha=candidate_commit,
-                ),
+                body=implementation_body,
             )
         )
 
     assert rejected.value.code == (
         "parentless_direct_main_implementation_test_evidence_incomplete"
-    )
+    ), rejected.value.details
     authority = rejected.value.details["commit_prewrite_authority"]
     assert "implementation_commit_chain_trailers_exact" in authority[
         "missing_requirement_ids"
@@ -93635,6 +93648,7 @@ def test_parentless_direct_main_implementation_prewrite_rejects_noncanonical_cha
     assert authority["commit_trailers_exact"] is False
     assert rejected.value.details["zero_write_rejection"] is True
     assert rejected.value.details["writes_performed"] is False
+    assert server._contract_runtime(conn).store.get(task_id) == contract_before
     assert conn.total_changes == changes_before
     assert len(
         task_timeline.list_events(
