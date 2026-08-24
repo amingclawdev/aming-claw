@@ -136160,6 +136160,7 @@ def _operator_supervised_direct_main_facade_action_projection(
     target_files: Sequence[str],
     record: Mapping[str, Any],
     runtime_next: Mapping[str, Any],
+    active_route_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Project the existing public facade for one strict Direct rev2 line.
 
@@ -136183,10 +136184,28 @@ def _operator_supervised_direct_main_facade_action_projection(
         )
         else {}
     )
-    route_identity = (
+    bound_route_identity = (
         dict(binding.get("route_identity") or {})
         if isinstance(binding.get("route_identity"), Mapping)
         else {}
+    )
+    presented_route_identity = (
+        dict(active_route_identity)
+        if isinstance(active_route_identity, Mapping)
+        else {}
+    )
+    route_identity = (
+        presented_route_identity
+        if (
+            _observer_root_route_identity_complete(
+                presented_route_identity
+            )
+            and str(
+                presented_route_identity.get("route_token_ref") or ""
+            ).strip()
+            == str(route_token_ref or "").strip()
+        )
+        else bound_route_identity
     )
     completed_lines = [
         line
@@ -136643,7 +136662,43 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         else ""
     )
     requested_ref = str(route_token_ref or "").strip()
-    if strict_records and requested_ref and requested_ref != persisted_ref:
+    strict_binding = (
+        (
+            strict_records[0].get("metadata") or {}
+        ).get("operator_supervised_direct_main_runtime_binding")
+        if strict_records
+        and isinstance(strict_records[0].get("metadata"), Mapping)
+        and isinstance(
+            (strict_records[0].get("metadata") or {}).get(
+                "operator_supervised_direct_main_runtime_binding"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    immutable_route_identity = (
+        strict_binding.get("route_identity")
+        if isinstance(strict_binding.get("route_identity"), Mapping)
+        else {}
+    )
+    active_route_authority = (
+        _operator_supervised_direct_main_active_route_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=execution_id,
+            immutable_route_identity=immutable_route_identity,
+            active_route_token_ref=requested_ref,
+            expected_files=target_files,
+        )
+        if strict_records and requested_ref
+        else {}
+    )
+    if (
+        strict_records
+        and requested_ref
+        and active_route_authority.get("passed") is not True
+    ):
         return {
             "schema_version": (
                 "onboard_route_guide.operator_supervised_direct_main.v2"
@@ -136656,10 +136711,17 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             "contract_execution_id": execution_id,
             "expected_route_token_ref": persisted_ref,
             "requested_route_token_ref": requested_ref,
+            "active_route_authority": active_route_authority,
             "writes_performed": False,
             "zero_write_rejection": True,
         }
-    effective_ref = persisted_ref if strict_records else requested_ref
+    effective_ref = (
+        requested_ref
+        if strict_records and active_route_authority.get("passed") is True
+        else persisted_ref
+        if strict_records
+        else requested_ref
+    )
     route_authority = (
         _operator_supervised_direct_main_route_authority(
             conn,
@@ -136671,6 +136733,12 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         if effective_ref
         else {}
     )
+    if active_route_authority.get("passed") is True:
+        route_authority = {
+            **route_authority,
+            "active_route_authority": active_route_authority,
+            "immutable_route_identity_preserved": True,
+        }
     route_ready = bool(route_authority.get("accepted") is True)
     if requested_ref and not route_ready and not strict_records:
         return {
@@ -136791,6 +136859,13 @@ def _onboard_operator_supervised_direct_main_runtime_response(
                     target_files=target_files,
                     record=current_record,
                     runtime_next=runtime_next,
+                    active_route_identity=(
+                        route_authority.get("route_identity")
+                        if isinstance(
+                            route_authority.get("route_identity"), Mapping
+                        )
+                        else {}
+                    ),
                 )
             )
             facade_tool = str(
@@ -137347,6 +137422,172 @@ def _operator_supervised_direct_main_active_route_authority(
     return authority
 
 
+def _operator_supervised_direct_main_persisted_active_route_authority_valid(
+    authority: Mapping[str, Any],
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    immutable_route_identity: Mapping[str, Any],
+    active_route_token_ref: str,
+    expected_files: Sequence[str] = (),
+) -> bool:
+    """Check only the hash-bound route Fact at the reconcile position.
+
+    This is deliberately not a second lineage resolver.  Each new protected
+    action resolves the live ref; a historical reconcile only consumes the
+    already-frozen, server-derived result and its exact binding links.
+    """
+
+    persisted = dict(authority) if isinstance(authority, Mapping) else {}
+
+    def identity(value: Any) -> dict[str, str]:
+        if not isinstance(value, Mapping):
+            return {}
+        return {
+            field: str(value.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        }
+
+    immutable = identity(immutable_route_identity)
+    frozen_immutable = identity(persisted.get("immutable_route_identity"))
+    frozen_active = identity(persisted.get("active_route_identity"))
+    immutable_ref = immutable.get("route_token_ref", "")
+    active_ref = str(active_route_token_ref or "").strip()
+    chain = [
+        str(item or "").strip()
+        for item in (persisted.get("route_token_ref_chain") or [])
+    ]
+    edges = [
+        str(item or "").strip()
+        for item in (persisted.get("edge_types") or [])
+    ]
+    renewal_used = persisted.get("renewal_used") is True
+    resolution = (
+        persisted.get("resolution_error_details")
+        if isinstance(persisted.get("resolution_error_details"), Mapping)
+        else {}
+    )
+    renewal = (
+        resolution.get("renewal_resolution")
+        if isinstance(resolution.get("renewal_resolution"), Mapping)
+        else {}
+    )
+    exact_scope = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+    frozen_resolution_common_exact = bool(
+        resolution.get("schema_version")
+        == "contract_runtime.append_scoped_child_route_resolution.v1"
+        and resolution.get("status") == "resolved_append_scoped_ref"
+        and str(resolution.get("caller_role") or "").strip() == "observer"
+        and str(resolution.get("field") or "").strip()
+        == "allowed_actions"
+        and list(resolution.get("expected") or [])
+        == ["task_timeline_append"]
+        and "task_timeline_append" in list(resolution.get("actual") or [])
+        and resolution.get("public_safe") is True
+        and identity(resolution.get("child_route_identity"))
+        == frozen_active
+        and str(resolution.get("route_token_ref") or "").strip()
+        == immutable_ref
+        and str(
+            resolution.get("requested_route_token_ref") or ""
+        ).strip()
+        == immutable_ref
+        and str(
+            resolution.get("resolved_route_token_ref") or ""
+        ).strip()
+        == active_ref
+        and resolution.get("scope") == exact_scope
+        and resolution.get("writes_performed") is False
+        and resolution.get("raw_route_token_exposed") is False
+    )
+    frozen_resolution_links_exact = bool(
+        (
+            renewal.get("schema_version")
+            == "route_token_ref_exact_renewal_descendant_resolution.v1"
+            and renewal.get("status") == "resolved_active_descendant"
+            and renewal.get("registry_verified") is True
+            and renewal.get("exact_scope_verified") is True
+            and renewal.get("writes_performed") is False
+            and renewal.get("raw_route_token_exposed") is False
+            and identity(renewal.get("requested_route_identity"))
+            == immutable
+            and identity(renewal.get("resolved_route_identity"))
+            == frozen_active
+            and str(renewal.get("requested_route_token_ref") or "").strip()
+            == immutable_ref
+            and str(renewal.get("resolved_route_token_ref") or "").strip()
+            == active_ref
+            and renewal.get("scope") == exact_scope
+            and list(renewal.get("route_token_ref_chain") or []) == chain
+            and list(renewal.get("edge_types") or []) == edges
+        )
+        if renewal_used
+        else not renewal and frozen_active == immutable
+    )
+    lineage_links_exact = bool(
+        chain
+        and chain[0] == immutable_ref
+        and chain[-1] == active_ref
+        and len(edges) == len(chain) - 1
+        and all(edge in {"renewal", "same_scope_reissue"} for edge in edges)
+        and (len(chain) >= 2 if renewal_used else chain == [immutable_ref])
+        and (renewal_used or not edges)
+    )
+    canonical_files = sorted(
+        _runtime_context_service_dedupe(
+            [str(path or "").strip() for path in expected_files]
+        )
+    )
+    return bool(
+        persisted.get("schema_version")
+        == "operator_supervised_direct_main.active_route_authority.v1"
+        and persisted.get("passed") is True
+        and str(persisted.get("status") or "").strip() == "passed"
+        and persisted.get("server_derived") is True
+        and persisted.get("caller_claims_trusted") is False
+        and str(persisted.get("source") or "").strip()
+        == "contract_runtime.append_scoped_child_route_resolution"
+        and persisted.get("identity_resolution_exact") is True
+        and persisted.get("scope_exact") is True
+        and persisted.get("registry_verified") is True
+        and persisted.get("historical_pre_mutation_event_rewritten") is False
+        and not str(persisted.get("resolution_error_code") or "").strip()
+        and persisted.get("writes_performed") is False
+        and persisted.get("zero_write_on_failure") is True
+        and persisted.get("raw_route_token_exposed") is False
+        and not list(persisted.get("missing_requirement_ids") or [])
+        and not list(persisted.get("identity_mismatches") or [])
+        and str(persisted.get("project_id") or "").strip() == project_id
+        and str(persisted.get("backlog_id") or "").strip() == backlog_id
+        and str(persisted.get("task_id") or "").strip() == task_id
+        and str(persisted.get("required_action") or "").strip()
+        == "task_timeline_append"
+        and list(persisted.get("expected_files") or []) == canonical_files
+        and frozen_immutable == immutable
+        and _observer_root_route_identity_complete(frozen_immutable)
+        and _observer_root_route_identity_complete(frozen_active)
+        and frozen_active.get("route_token_ref") == active_ref
+        and str(persisted.get("presented_route_token_ref") or "").strip()
+        == active_ref
+        and lineage_links_exact
+        and frozen_resolution_common_exact
+        and frozen_resolution_links_exact
+        and str(persisted.get("authority_hash") or "").strip()
+        == stable_sha256(
+            {
+                key: value
+                for key, value in persisted.items()
+                if key != "authority_hash"
+            }
+        )
+    )
+
+
 def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
     conn,
     *,
@@ -137623,7 +137864,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
 ) -> dict[str, Any]:
     """Project one exact Direct current-full provenance from existing Facts."""
 
-    from . import task_timeline
+    from . import graph_snapshot_store, task_timeline
 
     metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
     binding = (
@@ -137772,6 +138013,10 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             {},
         )
         marker = _json_loads(provenance.get("marker_json"), {})
+        marker_core = dict(marker)
+        marker_hash = str(
+            marker_core.pop("provenance_hash", "") or ""
+        ).strip()
         qa_preflight = (
             route_evidence.get("direct_main_qa_preflight_authority")
             if isinstance(route_evidence, Mapping)
@@ -137782,6 +138027,34 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 Mapping,
             )
             else {}
+        )
+        reconcile_active_route_authority = (
+            qa_preflight.get("active_route_authority")
+            if isinstance(
+                qa_preflight.get("active_route_authority"), Mapping
+            )
+            else {}
+        )
+        binding_route_identity = (
+            binding.get("route_identity")
+            if isinstance(binding.get("route_identity"), Mapping)
+            else {}
+        )
+        provenance_route_token_ref = str(
+            route_evidence.get("route_token_ref")
+            if isinstance(route_evidence, Mapping)
+            else ""
+        ).strip()
+        persisted_active_route_authority_valid = (
+            _operator_supervised_direct_main_persisted_active_route_authority_valid(
+                reconcile_active_route_authority,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=contract_execution_id,
+                immutable_route_identity=binding_route_identity,
+                active_route_token_ref=provenance_route_token_ref,
+                expected_files=list(binding.get("owned_files") or []),
+            )
         )
         reconcile_event_id = int(
             provenance.get("reconcile_event_id") or 0
@@ -137802,19 +138075,15 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 "reconcile/current-full"
             )
             and str(provenance.get("provenance_hash") or "").strip()
-            == str(marker.get("provenance_hash") or "").strip()
+            == marker_hash
+            and marker_hash == stable_sha256(marker_core)
+            and marker.get("route_evidence") == route_evidence
             and route_evidence.get("schema_version")
             == "graph_current_full_reconcile.route_evidence.v1"
             and route_evidence.get("protected_action")
             == "graph_current_full_reconcile"
             and route_evidence.get("raw_route_token_persisted") is False
-            and str(route_evidence.get("route_token_ref") or "").strip()
-            == str(
-                (binding.get("route_identity") or {}).get(
-                    "route_token_ref"
-                )
-                or ""
-            ).strip()
+            and persisted_active_route_authority_valid
             and qa_preflight.get("schema_version")
             == (
                 "operator_supervised_direct_main."
@@ -137908,7 +138177,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
         snapshot_id = str(provenance.get("snapshot_id") or "").strip()
         snapshot_rows = conn.execute(
             """
-            SELECT snapshot_id, commit_sha, status
+            SELECT *
               FROM graph_snapshots
              WHERE project_id = ? AND snapshot_id = ?
             """,
@@ -137922,6 +138191,23 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             == "active"
             and str(marker.get("snapshot_id") or "").strip()
             == snapshot_id
+        ):
+            continue
+        provenance_binding = (
+            graph_snapshot_store._current_full_snapshot_provenance_binding(
+                conn,
+                project_id,
+                dict(snapshot_rows[0]),
+            )
+        )
+        if not (
+            provenance_binding.get("verified") is True
+            and str(provenance_binding.get("provenance_id") or "").strip()
+            == str(provenance.get("provenance_id") or "").strip()
+            and str(provenance_binding.get("provenance_hash") or "").strip()
+            == str(provenance.get("provenance_hash") or "").strip()
+            and int(provenance_binding.get("reconcile_event_id") or 0)
+            == reconcile_event_id
         ):
             continue
         candidate = {
@@ -137960,6 +138246,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 qa_authority.get("authority_hash") or ""
             ),
             "qa_before_reconcile_verified": True,
+            "immutable_route_identity_preserved": True,
             "provenance_id": str(
                 provenance.get("provenance_id") or ""
             ).strip(),
