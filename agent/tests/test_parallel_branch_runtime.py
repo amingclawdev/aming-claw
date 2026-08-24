@@ -1446,6 +1446,7 @@ def test_mf_sub_startup_accepts_initial_join_bound_actual_host_worker(
     assert gate["agent_id"] == governed_worker_id
     assert gate["actual_host_worker_id"] == governed_worker_id
     assert gate["worker_session_id"] == desktop_session_id
+    assert gate["worker_transcript_ref"] == f"codex:{desktop_session_id}"
     assert gate["agent_id_match_mode"] == "initial_join_actual_host_worker"
     assert gate["session_token_evidence_type"] == "server_verified_ref"
     assert gate["server_issued_session_token_verified"] is True
