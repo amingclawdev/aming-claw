@@ -107265,6 +107265,10 @@ def _contract_runtime_compact_cli_next_action(
         "id",
         "action",
         "semantic_next_action",
+        "interface",
+        "facade",
+        "mcp_tool",
+        "body_source",
         "stage_id",
         "line_id",
         "line_instance_id",
@@ -107304,6 +107308,7 @@ def _contract_runtime_compact_cli_next_action(
         "worker_read_runtime_facade_projection",
         "worker_startup_runtime_facade_projection",
         "worker_graph_runtime_facade_projection",
+        "worker_finish_runtime_facade_projection",
         "failed_qa_blocker",
         "canonical_executable_action",
         "accepted_dispatch_authority",
@@ -107384,6 +107389,10 @@ def _contract_runtime_compact_cli_submit_line_guidance(
         key: guidance[key]
         for key in (
             "schema_version",
+            "generic_contract_runtime_submit_line_allowed",
+            "runtime_context_facade_required",
+            "runtime_context_facade",
+            "contract_runtime_completed_lines_mutated",
             "required_runtime_guide_hash_source",
             "target_writer_line_runtime_guide_hash_source",
             "every_line_must_copy_current_writer_hash",
@@ -107621,6 +107630,17 @@ def _contract_runtime_response(
         next_legal_action
     )
     response["next_legal_action"] = next_legal_action
+    projected_submit_guidance = (
+        compact_next_action_projection.get("submit_line_guidance")
+        if isinstance(compact_next_action_projection, Mapping)
+        and isinstance(
+            compact_next_action_projection.get("submit_line_guidance"),
+            Mapping,
+        )
+        else {}
+    )
+    if projected_submit_guidance:
+        response["submit_line_guidance"] = dict(projected_submit_guidance)
     response["submit_line_guidance"] = (
         _contract_runtime_compact_cli_submit_line_guidance(
             response.get("submit_line_guidance")
@@ -107834,6 +107854,16 @@ def _contract_runtime_bounded_line_write_response(
     elif explicit_zero_write:
         compact["writes_performed"] = False
         compact["mutation_performed"] = False
+
+    for field in (
+        "error",
+        "required_facade",
+        "generic_contract_runtime_submit_line_allowed",
+        "zero_write_rejection",
+    ):
+        value = source.get(field)
+        if isinstance(value, (str, int, float, bool, type(None))):
+            compact[field] = value
 
     decision = source.get("decision")
     if isinstance(decision, Mapping):
@@ -131518,26 +131548,38 @@ def _contract_runtime_finish_attestation_facade_only_rejection(
         str(actor_role or "").strip() == "mf_sub"
         and str(record.get("contract_id") or "").strip()
         in {"mf_parallel", "mf_parallel.v2"}
-        and str(write.get("stage_id") or "").strip() == "worker_attestation"
-        and str(write.get("line_id") or "").strip()
-        == "worker_finish_time_attestation"
-        and str(write.get("evidence_kind") or "").strip()
-        == "record_finish_time_worker_attestation"
     ):
         return {}
+    requested_line = (
+        str(write.get("stage_id") or "").strip(),
+        str(write.get("line_id") or "").strip(),
+        str(write.get("evidence_kind") or "").strip(),
+    )
+    required_facade = {
+        (
+            "worker_attestation",
+            "worker_finish_time_attestation",
+            "record_finish_time_worker_attestation",
+        ): "runtime_context_finish_time_worker_attestation",
+        (
+            "worker_finish",
+            "worker_finish_gate",
+            "mf_subagent_finish_gate",
+        ): "runtime_context_finish_gate",
+    }.get(requested_line, "")
+    if not required_facade:
+        return {}
+    line_id = requested_line[1]
     rejected = _contract_runtime_unchanged_line_rejection(
         record,
         [
-            "worker_finish_time_attestation requires "
-            "runtime_context_finish_time_worker_attestation"
+            f"{line_id} requires {required_facade}"
         ],
     )
     rejected.update(
         {
             "generic_contract_runtime_submit_line_allowed": False,
-            "required_facade": (
-                "runtime_context_finish_time_worker_attestation"
-            ),
+            "required_facade": required_facade,
             "strict_worker_session_fence_binding_required": True,
             "completed_line_mutated": False,
         }
@@ -147296,6 +147338,21 @@ def _onboard_worker_finish_runtime_facade_projection(
         "raw_fence_token_exposed": False,
         "raw_route_token_exposed": False,
     }
+    projected.pop("writer_role_safe_copy_payload", None)
+    projected.pop("mf_sub_host_bridge_guidance", None)
+    specialized_submit_guidance = {
+        "schema_version": (
+            "contract_runtime.specialized_worker_finish_facade_guidance.v1"
+        ),
+        "generic_contract_runtime_submit_line_allowed": False,
+        "runtime_context_facade_required": True,
+        "runtime_context_facade": expected_tool,
+        "contract_runtime_completed_lines_mutated": False,
+        "message": (
+            f"Use {expected_tool}; the canonical RuntimeContext facade owns "
+            "the source checkpoint and projects the Contract line."
+        ),
+    }
     return {
         **projected,
         "action": str(action.get("action") or projected.get("action") or ""),
@@ -147310,6 +147367,7 @@ def _onboard_worker_finish_runtime_facade_projection(
         "actionable": True,
         "host_realization": dict(action.get("host_realization") or {}),
         "canonical_executable_action": deepcopy(dict(action)),
+        "submit_line_guidance": specialized_submit_guidance,
         projection_key: facade_projection,
     }
 
@@ -196291,29 +196349,44 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
                 if isinstance(record.get("runtime_guide"), Mapping)
                 else {}
             )
+            facade_next_action = _runtime_next_action_from_guide(
+                runtime_guide
+            )
+            for identity_field in ("runtime_context_id", "task_id"):
+                requested_identity = _contract_runtime_ref_value(
+                    ctx,
+                    identity_field,
+                )
+                if requested_identity and not facade_next_action.get(
+                    identity_field
+                ):
+                    facade_next_action[identity_field] = requested_identity
             facade_projection = _onboard_worker_read_runtime_facade_projection(
                 conn,
                 project_id=project_id,
                 backlog_id=str(record.get("backlog_id") or ""),
-                next_action=(
-                    runtime_guide.get("next_legal_action")
-                    if isinstance(
-                        runtime_guide.get("next_legal_action"),
-                        Mapping,
-                    )
-                    else {}
-                ),
+                next_action=facade_next_action,
                 current_projection={
                     "contract_execution_id": contract_execution_id,
                 },
                 runtime_resume={},
+                requested_task_id=_contract_runtime_ref_value(
+                    ctx,
+                    "task_id",
+                ),
                 requested_route_token_ref=_contract_runtime_ref_value(
                     ctx,
                     "route_token_ref",
                     "observer_route_token_ref",
                 ),
             )
-            if (
+            selected_line_id = str(
+                facade_next_action.get("line_id") or ""
+            ).strip()
+            if selected_line_id in {
+                "worker_finish_time_attestation",
+                "worker_finish_gate",
+            } or (
                 facade_projection.get("actionable") is False
                 and facade_projection.get("blocked_by_failed_qa") is True
             ):

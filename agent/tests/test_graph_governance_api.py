@@ -144983,6 +144983,94 @@ def test_compact_worker_and_onboard_finish_facades_share_bounded_authority(
         )
         finish_action = compact_finish["canonical_executable_action"]
         assert finish_action["mcp_tool"] == "runtime_context_finish_gate"
+        cli_finish = (
+            candidate_server.handle_project_contract_runtime_current_state(
+                _ctx_with_role(
+                    {
+                        "project_id": PID,
+                        "contract_execution_id": execution_id,
+                    },
+                    "mf_sub",
+                    query={
+                        **query,
+                        "runtime_context_id": (
+                            runtime_context.runtime_context_id
+                        ),
+                        "task_id": worker_task_id,
+                        "worker_role": "mf_sub",
+                        "response_view": "cli_current",
+                    },
+                )
+            )
+        )
+        assert cli_finish["next_legal_action"].get("mcp_tool") == (
+            "runtime_context_finish_gate"
+        ), json.dumps(cli_finish, sort_keys=True, default=str)
+        assert cli_finish["next_legal_action"][
+            "canonical_executable_action"
+        ]["copy_safe_body"] == finish_action["copy_safe_body"]
+        assert (
+            "writer_role_safe_copy_payload"
+            not in cli_finish["next_legal_action"]
+        )
+        assert cli_finish["submit_line_guidance"] == {
+            "schema_version": (
+                "contract_runtime."
+                "specialized_worker_finish_facade_guidance.v1"
+            ),
+            "generic_contract_runtime_submit_line_allowed": False,
+            "runtime_context_facade_required": True,
+            "runtime_context_facade": "runtime_context_finish_gate",
+            "contract_runtime_completed_lines_mutated": False,
+        }
+        generic_finish_body = {
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "task_id": worker_task_id,
+            "parent_task_id": execution_id,
+            "worker_role": "mf_sub",
+            "fence_token": worker_fence,
+            "session_token_ref": runtime_context_session_token_ref(
+                runtime_context
+            ),
+            "target_project_root": str(worker_root),
+            "stage_id": "worker_finish",
+            "line_id": "worker_finish_gate",
+            "evidence_kind": "mf_subagent_finish_gate",
+            "payload": {
+                "runtime_context_id": runtime_context.runtime_context_id,
+                "task_id": worker_task_id,
+                "parent_task_id": execution_id,
+                "status": "passed",
+            },
+        }
+        for generic_handler in (
+            candidate_server.handle_project_contract_runtime_line_write_precheck,
+            candidate_server.handle_project_contract_runtime_line_write,
+        ):
+            generic_before_finish = copy.deepcopy(
+                runtime.store.get(execution_id)
+            )
+            rejected_finish = generic_handler(
+                _ctx(
+                    {
+                        "project_id": PID,
+                        "contract_execution_id": execution_id,
+                    },
+                    method="POST",
+                    body=generic_finish_body,
+                )
+            )
+            assert rejected_finish["ok"] is False
+            assert rejected_finish["decision"]["errors"] == [
+                "worker_finish_gate requires runtime_context_finish_gate"
+            ]
+            assert rejected_finish[
+                "generic_contract_runtime_submit_line_allowed"
+            ] is False
+            assert rejected_finish["required_facade"] == (
+                "runtime_context_finish_gate"
+            )
+            assert runtime.store.get(execution_id) == generic_before_finish
         projected_finish = (
             candidate_server._onboard_worker_read_runtime_facade_projection(
                 conn,
