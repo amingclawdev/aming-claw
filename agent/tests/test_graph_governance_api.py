@@ -96229,6 +96229,235 @@ def _mf_parallel_close_authority_v2_record(
     return record
 
 
+def test_rev10_close_ready_pairs_worker_finish_commit_within_each_lane(
+    monkeypatch,
+):
+    execution_id = "cex-rev10-lane-local-finish-commit"
+    backlog_id = "AC-REV10-LANE-LOCAL-FINISH-COMMIT"
+    graph_context = "mfrctx-rev10-graph"
+    runtime_context = "mfrctx-rev10-runtime"
+    graph_commit = "1" * 40
+    runtime_commit = "2" * 40
+    close_commit = "3" * 40
+    workers = [
+        {"runtime_context_id": graph_context},
+        {"runtime_context_id": runtime_context},
+    ]
+
+    def lane_line(
+        line_id: str,
+        evidence_kind: str,
+        actor_role: str,
+        runtime_context_id: str,
+        commit_sha: str,
+        index: int,
+    ) -> dict:
+        return {
+            "stage_id": line_id.rsplit("_", 1)[0],
+            "line_id": line_id,
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
+            "runtime_context_id": runtime_context_id,
+            "evidence_kind": evidence_kind,
+            "actor_role": actor_role,
+            "status": "passed",
+            "commit_sha": commit_sha,
+            "payload": {"runtime_context_id": runtime_context_id},
+            "_completed_line_index": index,
+            "_source_ref": (
+                f"contract_runtime:{execution_id}:completed_lines:{index}"
+            ),
+        }
+
+    lines = [
+        lane_line(
+            "worker_implementation",
+            "implementation",
+            "mf_sub",
+            runtime_context,
+            runtime_commit,
+            1,
+        ),
+        lane_line(
+            "worker_commit",
+            "worker_commit",
+            "mf_sub",
+            runtime_context,
+            runtime_commit,
+            2,
+        ),
+        lane_line(
+            "worker_implementation",
+            "implementation",
+            "mf_sub",
+            graph_context,
+            graph_commit,
+            3,
+        ),
+        lane_line(
+            "worker_commit",
+            "worker_commit",
+            "mf_sub",
+            graph_context,
+            graph_commit,
+            4,
+        ),
+        lane_line(
+            "worker_finish_gate",
+            "mf_subagent_finish_gate",
+            "mf_sub",
+            graph_context,
+            graph_commit,
+            5,
+        ),
+        lane_line(
+            "worker_finish_gate",
+            "mf_subagent_finish_gate",
+            "mf_sub",
+            runtime_context,
+            runtime_commit,
+            6,
+        ),
+        lane_line(
+            "observer_merge",
+            "merge",
+            "observer",
+            graph_context,
+            close_commit,
+            7,
+        ),
+        lane_line(
+            "observer_merge",
+            "merge",
+            "observer",
+            runtime_context,
+            close_commit,
+            8,
+        ),
+        {
+            "stage_id": "observer_reconcile",
+            "line_id": "observer_reconcile",
+            "evidence_kind": "reconcile",
+            "actor_role": "observer",
+            "status": "passed",
+            "commit_sha": close_commit,
+            "payload": {},
+            "_completed_line_index": 9,
+        },
+        {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "evidence_kind": "independent_verification",
+            "actor_role": "qa",
+            "status": "passed",
+            "commit_sha": close_commit,
+            "payload": {},
+            "_completed_line_index": 10,
+        },
+    ]
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev10",
+        "completed_lines": lines,
+        "runtime_guide": {"completed_lines": lines},
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_current_generation_worker_count",
+        lambda *_args, **_kwargs: 2,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_dispatch_authority_line",
+        lambda *_args, **_kwargs: {
+            "status": "selected",
+            "payload": {"bounded_workers": workers},
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_reconcile_close_diagnostic",
+        lambda *_args, **_kwargs: {
+            "passed": True,
+            "missing_requirement_ids": [],
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_descendant_close_head_bridge",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_server_line_identity",
+        lambda *_args, **_kwargs: {
+            "identity_status": "resolved",
+            "identity_source_line_id": "observer_close_ready",
+        },
+    )
+    close_ready = {
+        "stage_id": "observer_close",
+        "line_id": "observer_close_ready",
+        "evidence_kind": "close_ready",
+        "actor_role": "observer",
+        "status": "passed",
+        "commit_sha": close_commit,
+        "payload": {},
+        "_completed_line_index": 11,
+    }
+
+    precheck = server._contract_runtime_mf_parallel_close_ready_precheck(
+        record,
+        close_ready,
+        project_id=PID,
+    )
+
+    assert precheck["passed"] is True, precheck
+    assert precheck["commit_mismatches"] == []
+    assert (
+        "contract_runtime.worker_finish_exact_worker_commit"
+        not in precheck["missing_requirement_ids"]
+    )
+    assert precheck["formal_no_pass_bypass_exceptions"] == []
+
+    mismatched = json.loads(json.dumps(record))
+    bad_finish = next(
+        line
+        for line in mismatched["completed_lines"]
+        if line["line_id"] == "worker_finish_gate"
+        and line["runtime_context_id"] == runtime_context
+    )
+    bad_finish["commit_sha"] = "4" * 40
+    mismatch_precheck = (
+        server._contract_runtime_mf_parallel_close_ready_precheck(
+            mismatched,
+            close_ready,
+            project_id=PID,
+        )
+    )
+    assert mismatch_precheck["passed"] is False
+    assert (
+        "contract_runtime.worker_finish_exact_worker_commit"
+        in mismatch_precheck["missing_requirement_ids"]
+    )
+    assert mismatch_precheck["commit_mismatches"] == [
+        {
+            "requirement_id": "worker_finish_gate",
+            "line_id": "worker_finish_gate",
+            "expected_worker_commit": runtime_commit,
+            "actual_commit": "4" * 40,
+            "reason": "worker_finish_commit_mismatch",
+            "source_ref": (
+                f"contract_runtime:{execution_id}:completed_lines:6"
+            ),
+            "runtime_context_id": runtime_context,
+        }
+    ]
+
+
 def test_statusless_close_ready_commit_bridge_requires_closed_server_authority(
     monkeypatch,
 ):

@@ -169019,27 +169019,50 @@ def _contract_runtime_mf_parallel_close_authority_gate(
 
     commit_mismatches: list[dict[str, Any]] = []
     commit_bridge_diagnostics: list[dict[str, Any]] = []
-    worker_commit_line = found.get("worker_commit")
-    worker_finish_line = found.get("worker_finish_gate")
-    if worker_commit_line and worker_finish_line:
-        recorded_worker_commit = _contract_runtime_close_authority_explicit_commit(
-            worker_commit_line
+    if rev8_two_worker_fanout:
+        worker_commit_pairs = (
+            (
+                runtime_context_id,
+                lane_lines["worker_commit"].get(runtime_context_id),
+                lane_lines["worker_finish_gate"].get(runtime_context_id),
+            )
+            for runtime_context_id in expected_lane_ids
+        )
+    else:
+        worker_commit_pairs = (
+            (
+                "",
+                found.get("worker_commit"),
+                found.get("worker_finish_gate"),
+            ),
+        )
+    for runtime_context_id, worker_commit_line, worker_finish_line in (
+        worker_commit_pairs
+    ):
+        if not worker_commit_line or not worker_finish_line:
+            continue
+        recorded_worker_commit = (
+            _contract_runtime_close_authority_explicit_commit(
+                worker_commit_line
+            )
         )
         finish_commit = _contract_runtime_close_authority_explicit_commit(
             worker_finish_line
         )
-        if not recorded_worker_commit or finish_commit != recorded_worker_commit:
-            missing.append("contract_runtime.worker_finish_exact_worker_commit")
-            commit_mismatches.append(
-                {
-                    "requirement_id": "worker_finish_gate",
-                    "line_id": "worker_finish_gate",
-                    "expected_worker_commit": recorded_worker_commit,
-                    "actual_commit": finish_commit,
-                    "reason": "worker_finish_commit_mismatch",
-                    "source_ref": str(worker_finish_line.get("_source_ref") or ""),
-                }
-            )
+        if recorded_worker_commit and finish_commit == recorded_worker_commit:
+            continue
+        missing.append("contract_runtime.worker_finish_exact_worker_commit")
+        mismatch = {
+            "requirement_id": "worker_finish_gate",
+            "line_id": "worker_finish_gate",
+            "expected_worker_commit": recorded_worker_commit,
+            "actual_commit": finish_commit,
+            "reason": "worker_finish_commit_mismatch",
+            "source_ref": str(worker_finish_line.get("_source_ref") or ""),
+        }
+        if runtime_context_id:
+            mismatch["runtime_context_id"] = runtime_context_id
+        commit_mismatches.append(mismatch)
     if close_commit:
         for requirement_id in (
             "observer_merge",
