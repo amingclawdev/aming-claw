@@ -98032,6 +98032,137 @@ def _accept_close_ready_worker_set_line(
 
 
 @pytest.mark.parametrize(
+    "line_order",
+    ["grouped", "interleaved", "reversed_lanes"],
+)
+def test_close_ready_worker_set_pairs_distinct_commits_with_same_lane_finish(
+    monkeypatch,
+    line_order,
+):
+    record, _write = _standalone_close_ready_worker_set_fixture()
+    dispatch = record["completed_lines"][0]
+    workers = dispatch["payload"]["bounded_workers"]
+    lane_commits = {
+        workers[0]["runtime_context_id"]: "a" * 40,
+        workers[1]["runtime_context_id"]: "b" * 40,
+    }
+    lane_lines: dict[str, dict[str, dict[str, Any]]] = {
+        worker["runtime_context_id"]: {} for worker in workers
+    }
+    for line in record["completed_lines"][1:]:
+        runtime_context_id = line["runtime_context_id"]
+        line_id = line["line_id"]
+        lane_lines[runtime_context_id][line_id] = line
+        lane_commit = lane_commits[runtime_context_id]
+        if line_id == "worker_commit":
+            line["commit_sha"] = lane_commit
+            line["head_commit"] = lane_commit
+            line["payload"].update(
+                {
+                    "worker_commit_sha": lane_commit,
+                    "head_commit": lane_commit,
+                }
+            )
+        elif line_id == "worker_finish_gate":
+            line["head_commit"] = lane_commit
+            line["validated_head_commit"] = lane_commit
+            line["payload"]["head_commit"] = lane_commit
+            line["payload"]["validated_head_commit"] = lane_commit
+            line["payload"]["close_gate_projection"][
+                "head_commit"
+            ] = lane_commit
+            nested = line["payload"]["mf_subagent_finish_gate"]
+            nested["head_commit"] = lane_commit
+            nested["validated_head_commit"] = lane_commit
+            nested["close_gate_projection"]["head_commit"] = lane_commit
+
+    stage_order = (
+        "worker_implementation",
+        "worker_commit",
+        "worker_finish_gate",
+        "observer_merge",
+    )
+    if line_order == "grouped":
+        ordered_workers = workers
+        ordered = [
+            lane_lines[worker["runtime_context_id"]][line_id]
+            for worker in ordered_workers
+            for line_id in stage_order
+        ]
+    elif line_order == "reversed_lanes":
+        ordered_workers = list(reversed(workers))
+        ordered = [
+            lane_lines[worker["runtime_context_id"]][line_id]
+            for worker in ordered_workers
+            for line_id in stage_order
+        ]
+    else:
+        ordered = [
+            lane_lines[worker["runtime_context_id"]][line_id]
+            for line_id in stage_order
+            for worker in workers
+        ]
+    record["completed_lines"] = [dispatch, *ordered]
+    record["runtime_guide"]["completed_lines"] = copy.deepcopy(
+        record["completed_lines"]
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_line_acceptance",
+        _accept_close_ready_worker_set_line,
+    )
+
+    authority = server._contract_runtime_close_ready_worker_set_authority(
+        object(),
+        project_id=PID,
+        record=record,
+    )
+
+    assert authority["db_verified"] is True
+    assert authority["required_worker_count"] == 2
+    assert [
+        worker["runtime_context_id"] for worker in authority["workers"]
+    ] == sorted(lane_commits)
+    for worker_authority in authority["workers"]:
+        runtime_context_id = worker_authority["runtime_context_id"]
+        commit_line = lane_lines[runtime_context_id]["worker_commit"]
+        finish_line = lane_lines[runtime_context_id]["worker_finish_gate"]
+        line_authorities = {
+            item["line_id"]: item
+            for item in worker_authority["completed_line_authorities"]
+        }
+        assert commit_line["commit_sha"] == lane_commits[runtime_context_id]
+        assert finish_line["head_commit"] == lane_commits[runtime_context_id]
+        assert line_authorities["worker_commit"]["line_hash"] == (
+            server.stable_sha256(commit_line)
+        )
+        assert line_authorities["worker_finish_gate"]["line_hash"] == (
+            server.stable_sha256(finish_line)
+        )
+        assert line_authorities["worker_commit"]["completed_line_index"] == (
+            record["completed_lines"].index(commit_line)
+        )
+        assert line_authorities["worker_finish_gate"][
+            "completed_line_index"
+        ] == record["completed_lines"].index(finish_line)
+        sibling_context_id = next(
+            candidate
+            for candidate in lane_commits
+            if candidate != runtime_context_id
+        )
+        assert line_authorities["worker_commit"]["line_hash"] != (
+            server.stable_sha256(
+                lane_lines[sibling_context_id]["worker_commit"]
+            )
+        )
+        assert line_authorities["worker_finish_gate"]["line_hash"] != (
+            server.stable_sha256(
+                lane_lines[sibling_context_id]["worker_finish_gate"]
+            )
+        )
+
+
+@pytest.mark.parametrize(
     ("case", "mutator"),
     [
         (
