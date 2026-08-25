@@ -137856,7 +137856,6 @@ def _operator_supervised_direct_main_facade_action_projection(
             "project_id": project_id,
             "backlog_id": backlog_id,
             "task_id": contract_execution_id,
-            "contract_execution_id": contract_execution_id,
             "event_type": "qa.independent_verification",
             "event_kind": "independent_verification",
             "phase": "qa",
@@ -197985,8 +197984,18 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
                 conn, active_epoch
             )
         conn.commit()
+    public_record = (
+        _operator_supervised_direct_main_public_runtime_record(record)
+        if (
+            str(record.get("contract_id") or "").strip()
+            == "operator_supervised_direct_main"
+            and str(record.get("revision") or "").strip()
+            in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+        )
+        else record
+    )
     response = _contract_runtime_response(
-        record,
+        public_record,
         actor_role=actor_role,
         response_view=response_view,
         request_id=ctx.request_id,

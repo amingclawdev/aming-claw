@@ -108679,6 +108679,52 @@ def test_direct_main_rev3_fresh_world_warranty_requires_db_verified_qa(
             },
         )
     )
+    qa_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "route_token_ref": route_token_ref,
+                "view": "compact",
+            },
+        )
+    )
+    qa_action = qa_guide["next_legal_action"]
+    assert qa_action["line_id"] == "qa_graph_context"
+    assert qa_action["mcp_tool"] == "task_timeline_append"
+    assert qa_action["copy_safe_body"]["task_id"] == task_id
+    assert "contract_execution_id" not in qa_action["copy_safe_body"]
+    assert qa_action["generic_contract_runtime_submit_line_allowed"] is False
+
+    for current_reader_role in ("observer", "qa"):
+        direct_current = server.handle_project_contract_runtime_current_state(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "contract_execution_id": task_id,
+                },
+                current_reader_role,
+                method="GET",
+            )
+        )
+        direct_runtime_guide = direct_current["runtime_guide"]
+        assert "writer_role_safe_copy_payload" not in direct_runtime_guide
+        assert (
+            direct_runtime_guide[
+                "generic_contract_runtime_submit_line_allowed"
+            ]
+            is False
+        )
+        assert (
+            direct_runtime_guide["next_legal_action"][
+                "generic_contract_runtime_submit_line_allowed"
+            ]
+            is False
+        )
     strict_proof = {
         "backlog_id": backlog_id,
         "task_id": task_id,
