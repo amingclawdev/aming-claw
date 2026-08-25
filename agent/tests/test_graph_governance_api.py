@@ -72905,6 +72905,9 @@ def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebi
         tmp_path,
         suffix=f"renewal-{route_ref_presentation}-{renewal_hops}-hop",
         source_backed_contract_runtime=True,
+        initial_join_host_session_id=(
+            f"host-session-renewal-{route_ref_presentation}-{renewal_hops}"
+        ),
     )
     before_revision = get_latest_branch_contract_revision(
         conn,
@@ -73005,6 +73008,42 @@ def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebi
     assert read_canonical["task_id"] == case["task_id"]
     assert read_canonical["line_id"] == "worker_read_runtime_guide"
     assert read_canonical["next_legal_action"]["line_id"] == "worker_startup"
+    monkeypatch.setattr(
+        server,
+        "_RUNTIME_CONTEXT_SERVER_READ_INLINE_BYTES",
+        1024 * 1024,
+    )
+    monkeypatch.setattr(
+        server,
+        "_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_MAX_SERIALIZED_BYTES",
+        1024 * 1024,
+    )
+    worker_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": case["context"].runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "task_id": case["task_id"],
+                    "parent_task_id": case["parent_task_id"],
+                    "session_token": rejoin["session_token"],
+                    "session_token_ref": rejoin["session_token_ref"],
+                    "fence_token": rejoin["fence_token"],
+                    "target_project_root": str(case["target_root"]),
+                    **rejoin["route_identity"],
+                },
+            )
+        )
+    )
+    startup_copy_body = worker_guide["canonical_executable_action"][
+        "copy_safe_body"
+    ]
+    assert case["worker_session_id"] != case["host_session_id"]
+    assert startup_copy_body["worker_session_id"] == case["worker_session_id"]
+    assert startup_copy_body["host_session_id"] == case["host_session_id"]
     startup = server.handle_graph_governance_runtime_context_startup(
         _ctx_with_role(
             {
@@ -73025,7 +73064,7 @@ def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebi
                 "actual_host_worker_id": case["worker_id"],
                 "agent_id": case["worker_id"],
                 "host_startup_id": case["host_startup_id"],
-                "host_session_id": case["worker_session_id"],
+                "host_session_id": case["host_session_id"],
                 "worker_transcript_ref": (
                     f"codex:{case['worker_session_id']}"
                 ),

@@ -27421,6 +27421,15 @@ def _runtime_context_projection_response(
     current_authority_revision["active_owned_files"] = list(
         worker_scope_files
     )
+    projected_worker_session_id = (
+        _runtime_context_initial_join_worker_session_id(
+            timeline_events,
+            runtime_context_id=runtime_context_id,
+            task_id=str(getattr(context, "task_id", "") or ""),
+            backlog_id=str(getattr(context, "backlog_id", "") or ""),
+        )
+        or str(getattr(context, "host_session_id", "") or "").strip()
+    )
     current_actionable_payloads = _runtime_context_worker_recovery_payloads(
         project_id=project_id,
         main_worktree=_runtime_context_registered_main_worktree(project_id),
@@ -27440,9 +27449,7 @@ def _runtime_context_projection_response(
         actual_host_worker_id=str(
             getattr(context, "actual_host_worker_id", "") or ""
         ),
-        worker_session_id=str(
-            getattr(context, "host_session_id", "") or ""
-        ),
+        worker_session_id=projected_worker_session_id,
         host_startup_id=str(
             getattr(context, "host_startup_id", "") or ""
         ),
@@ -34593,9 +34600,20 @@ def _runtime_context_position_bounded_current_action(
         )
         if not receipt_authority or not dispatch_fields:
             return {}
-        worker_session_id = str(
-            getattr(context, "host_session_id", "") or ""
-        ).strip()
+        worker_session_id = (
+            _runtime_context_initial_join_worker_session_id(
+                _runtime_context_service_timeline_events(
+                    conn,
+                    project_id=project_id,
+                    task_id=task_id,
+                    backlog_id=backlog_id,
+                ),
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+            )
+            or str(getattr(context, "host_session_id", "") or "").strip()
+        )
         body = _runtime_context_startup_facade_body(
             project_id=project_id,
             contract_execution_id=contract_execution_id,
@@ -34634,7 +34652,9 @@ def _runtime_context_position_bounded_current_action(
             host_startup_id=str(
                 getattr(context, "host_startup_id", "") or ""
             ),
-            host_session_id=worker_session_id,
+            host_session_id=str(
+                getattr(context, "host_session_id", "") or ""
+            ).strip(),
             read_receipt_event_id=str(receipt_authority["event_id"]),
             read_receipt_hash=str(receipt_authority["read_receipt_hash"]),
             route_identity=route,
