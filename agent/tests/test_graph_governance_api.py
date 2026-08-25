@@ -98605,6 +98605,61 @@ def test_single_worker_close_ready_binds_durable_merge_identity_and_commit(
     ]
 
 
+def test_single_worker_batch_close_ready_binds_verified_shared_final_commit(
+    monkeypatch,
+):
+    fixture = _retained_close_ready_authority_fixture()
+    record = fixture["record"]
+    record["revision"] = "rev10"
+    row_merge_commit = fixture["merge"]["merged_commit_sha"]
+    final_batch_commit = "f" * 40
+    write = {
+        key: copy.deepcopy(value)
+        for key, value in fixture["write"].items()
+        if key not in {"commit_sha", "runtime_context_id", "task_id"}
+    }
+    write["payload"] = {
+        "close_readiness": copy.deepcopy(
+            fixture["write"]["payload"]["close_readiness"]
+        )
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_mf_parallel_current_generation_worker_count",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_postmerge_qa_worker_identity_authority",
+        lambda *_args, **_kwargs: {
+            "verified": True,
+            "db_verified": True,
+            "identity_status": "resolved",
+            "project_id": PID,
+            "backlog_id": record["backlog_id"],
+            "contract_execution_id": record["contract_execution_id"],
+            "runtime_context_id": fixture["merge"]["runtime_context_id"],
+            "task_id": fixture["merge"]["task_id"],
+            "parent_task_id": fixture["merge"]["parent_task_id"],
+            "candidate_commit_sha": final_batch_commit,
+        },
+    )
+
+    effective, errors = server._contract_runtime_bind_close_ready_worker_set(
+        object(), project_id=PID, record=record, write=write
+    )
+
+    assert errors == []
+    assert effective["commit_sha"] == final_batch_commit
+    assert effective["payload"]["close_commit"] == final_batch_commit
+    assert effective["payload"]["row_live_merge_commit"] == row_merge_commit
+    assert server._contract_runtime_mf_parallel_merge_commit_bridge(
+        close_commit=final_batch_commit,
+        merge_line=record["completed_lines"][0],
+        close_ready_line=effective,
+    )["bridge"] == "observer_close_ready_batch_final_commit"
+
+
 @pytest.mark.parametrize(
     ("container", "field"),
     [

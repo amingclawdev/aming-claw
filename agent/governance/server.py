@@ -169759,7 +169759,7 @@ def _contract_runtime_bind_close_ready_worker_set(
             )
             else {}
         )
-        server_close_commit = str(
+        row_merge_commit = str(
             durable_merge.get("merge_commit")
             or durable_merge.get("target_head_after_merge")
             or ""
@@ -169767,18 +169767,67 @@ def _contract_runtime_bind_close_ready_worker_set(
         merge_line_commit = _contract_runtime_close_authority_explicit_commit(
             latest_merge
         )
+        execution_id = str(record.get("contract_execution_id") or "").strip()
+        postmerge_close_authority = (
+            _contract_runtime_postmerge_qa_worker_identity_authority(
+                conn,
+                project_id=project_id,
+                record=record,
+            )
+        )
+        postmerge_close_commit = str(
+            postmerge_close_authority.get("candidate_commit_sha") or ""
+        ).strip()
+        postmerge_identity = tuple(
+            str(postmerge_close_authority.get(field) or "").strip()
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+            )
+        )
+        row_identity = tuple(
+            str(identity.get(field) or "").strip()
+            for field in (
+                "runtime_context_id",
+                "task_id",
+                "parent_task_id",
+            )
+        )
+        postmerge_close_verified = bool(
+            postmerge_close_authority.get("verified") is True
+            and postmerge_close_authority.get("db_verified") is True
+            and postmerge_close_authority.get("identity_status") == "resolved"
+            and str(
+                postmerge_close_authority.get("contract_execution_id") or ""
+            ).strip()
+            == execution_id
+            and postmerge_identity == row_identity
+            and re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                postmerge_close_commit,
+            )
+        )
+        server_close_commit = (
+            postmerge_close_commit
+            if postmerge_close_verified
+            else row_merge_commit
+        )
         if not (
-            re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", server_close_commit)
+            re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", row_merge_commit)
             and merge_line_commit
             and _contract_runtime_authority_commit_matches(
-                server_close_commit,
+                row_merge_commit,
                 merge_line_commit,
+            )
+            and re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                server_close_commit,
             )
         ):
             return effective, [
                 "contract_runtime.observer_close_ready_close_commit"
             ]
-        execution_id = str(record.get("contract_execution_id") or "").strip()
         identity_values = {
             "runtime_context_id": str(
                 identity.get("runtime_context_id") or ""
@@ -169835,6 +169884,11 @@ def _contract_runtime_bind_close_ready_worker_set(
         effective.setdefault("contract_execution_id", execution_id)
         payload.setdefault("contract_execution_id", execution_id)
         payload["close_commit"] = server_close_commit
+        if not _contract_runtime_authority_commit_matches(
+            server_close_commit,
+            row_merge_commit,
+        ):
+            payload["row_live_merge_commit"] = row_merge_commit
         for field, value in identity_values.items():
             effective.setdefault(field, value)
             payload.setdefault(field, value)
