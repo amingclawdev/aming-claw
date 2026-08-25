@@ -58152,6 +58152,12 @@ def _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
     host_session_id = str(
         getattr(context, "host_session_id", "") or ""
     ).strip()
+    worker_session_id = _runtime_context_initial_join_worker_session_id(
+        timeline_events,
+        runtime_context_id=runtime_id,
+        task_id=task_id,
+        backlog_id=backlog_id,
+    )
     host_startup_id = str(
         getattr(context, "host_startup_id", "") or ""
     ).strip()
@@ -58232,7 +58238,7 @@ def _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
         "worker_id": worker_id,
         "worker_slot_id": worker_slot_id,
         "actual_host_worker_id": actual_host_worker_id,
-        "worker_session_id": host_session_id,
+        "worker_session_id": worker_session_id,
         "host_startup_id": host_startup_id,
         "host_session_id": host_session_id,
         "target_project_root": target_project_root,
@@ -58287,7 +58293,7 @@ def _runtime_context_verifier_backed_pre_lineage_rejoin_authority(
         "worker_slot_id": worker_slot_id,
         "agent_id": actual_host_worker_id,
         "actual_host_worker_id": actual_host_worker_id,
-        "worker_session_id": host_session_id,
+        "worker_session_id": worker_session_id,
         "host_startup_id": host_startup_id,
         "host_session_id": host_session_id,
         "session_token_ref": active_session_token_ref,
@@ -60312,6 +60318,17 @@ def _runtime_context_session_rejoin_guidance_eligibility(
         host_session_id = str(
             getattr(context, "host_session_id", "") or ""
         ).strip()
+        worker_session_id = (
+            _runtime_context_initial_join_worker_session_id(
+                timeline_events,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                backlog_id=str(
+                    getattr(context, "backlog_id", "") or ""
+                ).strip(),
+            )
+            or host_session_id
+        )
         sequence_execution_id = str(
             prestartup_sequence.get("contract_execution_id") or ""
         ).strip()
@@ -60360,7 +60377,7 @@ def _runtime_context_session_rejoin_guidance_eligibility(
                 getattr(context, "allocation_owner", "") or ""
             ).strip(),
             actual_host_worker_id=actual_host_worker_id,
-            worker_session_id=host_session_id,
+            worker_session_id=worker_session_id,
             host_startup_id=str(
                 getattr(context, "host_startup_id", "") or ""
             ).strip(),
@@ -149420,6 +149437,15 @@ def _onboard_worker_read_runtime_facade_projection(
             or timeline_refs.get("read_receipt_event_ref")
             or ""
         ).strip()
+        startup_worker_session_id = (
+            _runtime_context_initial_join_worker_session_id(
+                timeline_events,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+            )
+            or str(getattr(context, "host_session_id", "") or "").strip()
+        )
         startup_payloads = _runtime_context_worker_recovery_payloads(
             project_id=project_id,
             main_worktree=_runtime_context_registered_main_worktree(project_id),
@@ -149440,9 +149466,7 @@ def _onboard_worker_read_runtime_facade_projection(
             actual_host_worker_id=str(
                 getattr(context, "actual_host_worker_id", "") or ""
             ),
-            worker_session_id=str(
-                getattr(context, "host_session_id", "") or ""
-            ),
+            worker_session_id=startup_worker_session_id,
             host_startup_id=str(
                 getattr(context, "host_startup_id", "") or ""
             ),
@@ -149739,6 +149763,20 @@ def _onboard_worker_read_runtime_facade_projection(
             latest_revision_payload
         )
     )
+    worker_session_id = (
+        _runtime_context_initial_join_worker_session_id(
+            _runtime_context_service_timeline_events(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+            ),
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+        or str(getattr(context, "host_session_id", "") or "").strip()
+    )
     actionable = _runtime_context_worker_recovery_payloads(
         project_id=project_id,
         main_worktree=_runtime_context_registered_main_worktree(project_id),
@@ -149755,7 +149793,7 @@ def _onboard_worker_read_runtime_facade_projection(
         actual_host_worker_id=str(
             getattr(context, "actual_host_worker_id", "") or ""
         ),
-        worker_session_id=str(getattr(context, "host_session_id", "") or ""),
+        worker_session_id=worker_session_id,
         host_startup_id=str(getattr(context, "host_startup_id", "") or ""),
         host_session_id=str(getattr(context, "host_session_id", "") or ""),
         branch_ref=str(getattr(context, "branch_ref", "") or ""),
