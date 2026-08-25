@@ -4292,6 +4292,8 @@ def test_runtime_context_current_values_accept_canonical_contract_qa_ref() -> No
 
 
 def test_runtime_context_current_values_accept_legacy_implementation_evidence_kind() -> None:
+    from agent.governance import server as server_module
+
     context = _runtime_projection_context()
     runtime_context_id = branch_runtime_context_id(PROJECT_ID, context.task_id)
     route_identity = {
@@ -4381,6 +4383,15 @@ def test_runtime_context_current_values_accept_legacy_implementation_evidence_ki
         "mf_subagent_contract.validate_mf_subagent_finish_gate"
     )
     assert "contract_runtime_submit_line" not in json.dumps(action_plan)
+    finish_facades = server_module._RUNTIME_CONTEXT_GUIDE_STAGE_FACADES
+    assert finish_facades["attestation"] == (
+        "runtime_context_finish_time_worker_attestation"
+    )
+    assert finish_facades["finish"] == "runtime_context_finish_gate"
+    assert "contract_runtime_submit_line" not in {
+        finish_facades["attestation"],
+        finish_facades["finish"],
+    }
 
 
 def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_independent() -> None:
