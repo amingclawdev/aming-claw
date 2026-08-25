@@ -10410,7 +10410,6 @@ class ContractRuntime:
             "worker_id",
             "worker_slot_id",
             "target_project_root",
-            "fence_token_hash",
         )
         if prior_implementation is not None:
             for field in identity_fields:
@@ -10431,6 +10430,15 @@ class ContractRuntime:
             effective_write,
             "session_token_ref",
         )
+        prior_fence_token_hash = (
+            _worker_commit_text(prior_implementation, "fence_token_hash")
+            if prior_implementation is not None
+            else ""
+        )
+        revised_fence_token_hash = _worker_commit_text(
+            effective_write,
+            "fence_token_hash",
+        )
         session_token_ref_rotation = (
             dict(rejoin_marker.get("session_token_ref_rotation"))
             if isinstance(
@@ -10443,7 +10451,11 @@ class ContractRuntime:
             prior_session_token_ref
             and revised_session_token_ref != prior_session_token_ref
         )
-        if session_token_ref_rotated:
+        fence_token_hash_rotated = bool(
+            prior_fence_token_hash
+            and revised_fence_token_hash != prior_fence_token_hash
+        )
+        if session_token_ref_rotated or fence_token_hash_rotated:
             rotation_errors: list[str] = []
             if not revised_session_token_ref:
                 rotation_errors.append("active session_token_ref is required")
@@ -10482,6 +10494,18 @@ class ContractRuntime:
                 session_token_ref_rotation.get("active_session_token_ref") or ""
             ).strip() != revised_session_token_ref:
                 rotation_errors.append("active session_token_ref must match")
+            if str(
+                session_token_ref_rotation.get("prior_fence_token_hash") or ""
+            ).strip() != prior_fence_token_hash:
+                rotation_errors.append("prior fence_token_hash must match")
+            if str(
+                session_token_ref_rotation.get("active_fence_token_hash") or ""
+            ).strip() != revised_fence_token_hash:
+                rotation_errors.append("active fence_token_hash must match")
+            if str(
+                session_token_ref_rotation.get("fence_token_hash") or ""
+            ).strip() != revised_fence_token_hash:
+                rotation_errors.append("rejoin fence_token_hash must match")
             for field in (
                 "runtime_context_id",
                 "task_id",
@@ -10503,9 +10527,9 @@ class ContractRuntime:
                 rotation_errors.append("rejoin contract_execution_id must match")
             if rotation_errors:
                 errors.append(
-                    "precommit implementation correction session_token_ref "
-                    "must match prior implementation or an audited same-worker "
-                    "rejoin: "
+                    "precommit implementation correction session_token_ref and "
+                    "fence_token_hash must match prior implementation or an "
+                    "audited same-worker rejoin: "
                     + "; ".join(rotation_errors)
                 )
 

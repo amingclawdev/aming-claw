@@ -53565,7 +53565,7 @@ def _runtime_context_precommit_correction_rejoin_marker(
     """Project an audited same-worker token rotation for precommit correction."""
 
     from .parallel_branch_runtime import (
-        runtime_context_secret_hash,
+        runtime_context_fence_token_verifier,
         runtime_context_session_token_ref,
     )
 
@@ -53575,6 +53575,10 @@ def _runtime_context_precommit_correction_rejoin_marker(
     prior_session_token_ref = _worker_commit_text(
         prior_implementation,
         "session_token_ref",
+    )
+    prior_fence_token_hash = _worker_commit_text(
+        prior_implementation,
+        "fence_token_hash",
     )
     active_session_token_ref = runtime_context_session_token_ref(context)
     expected_worker_id = str(getattr(context, "worker_id", "") or "").strip()
@@ -53586,15 +53590,15 @@ def _runtime_context_precommit_correction_rejoin_marker(
     expected_target_project_root = _runtime_context_effective_target_project_root(
         context
     )
-    expected_fence_token_hash = runtime_context_secret_hash(
-        str(getattr(context, "fence_token", "") or "")
-    )
+    expected_fence_token_hash = runtime_context_fence_token_verifier(context)
     if (
         not runtime_context_id
         or not task_id
         or not contract_execution_id
         or not prior_session_token_ref
+        or not prior_fence_token_hash
         or not active_session_token_ref
+        or not expected_fence_token_hash
         or prior_session_token_ref == active_session_token_ref
     ):
         return {}
@@ -53653,6 +53657,10 @@ def _runtime_context_precommit_correction_rejoin_marker(
             continue
         if str(payload.get("fence_token_hash") or "").strip() != (
             expected_fence_token_hash
+        ):
+            continue
+        if str(payload.get("target_project_root") or "").strip() != (
+            expected_target_project_root
         ):
             continue
         if str(payload.get("current_status") or "").strip() not in {
@@ -53716,6 +53724,8 @@ def _runtime_context_precommit_correction_rejoin_marker(
             "worker_slot_id": expected_worker_slot_id,
             "target_project_root": expected_target_project_root,
             "fence_token_hash": expected_fence_token_hash,
+            "prior_fence_token_hash": prior_fence_token_hash,
+            "active_fence_token_hash": expected_fence_token_hash,
             "prior_session_token_ref": prior_session_token_ref,
             "active_session_token_ref": active_session_token_ref,
             "route_token_ref": str(
@@ -53737,6 +53747,8 @@ def _runtime_context_precommit_correction_rejoin_marker(
                 "worker_slot_id": expected_worker_slot_id,
                 "target_project_root": expected_target_project_root,
                 "fence_token_hash": expected_fence_token_hash,
+                "prior_fence_token_hash": prior_fence_token_hash,
+                "active_fence_token_hash": expected_fence_token_hash,
                 "prior_session_token_ref": prior_session_token_ref,
                 "active_session_token_ref": active_session_token_ref,
                 "raw_session_tokens_persisted": False,
@@ -66934,7 +66946,7 @@ def _runtime_context_revise_precommit_implementation_lineage(
         )
 
     from .parallel_branch_runtime import (
-        runtime_context_secret_hash,
+        runtime_context_fence_token_verifier,
         runtime_context_session_token_ref,
     )
 
@@ -66951,9 +66963,7 @@ def _runtime_context_revise_precommit_implementation_lineage(
         "target_project_root": _runtime_context_effective_target_project_root(
             context
         ),
-        "fence_token_hash": runtime_context_secret_hash(
-            str(getattr(context, "fence_token", "") or "")
-        ),
+        "fence_token_hash": runtime_context_fence_token_verifier(context),
         "session_token_ref": runtime_context_session_token_ref(context),
     }
     identity_errors = [

@@ -4091,6 +4091,18 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         frozen_record,
         frozen_implementation,
     )
+    assert frozen_implementation["fence_token_hash"] == (
+        runtime_context_secret_hash(fence_token)
+    )
+    runtime_context = upsert_branch_context(
+        conn,
+        replace(
+            runtime_context,
+            fence_token="",
+            fence_token_verifier=runtime_context_secret_hash(fence_token),
+        ),
+        now_iso="2026-08-04T05:59:59Z",
+    )
     correction_intent = {
         "schema_version": (
             "runtime_context.precommit_implementation_correction_intent.v1"
@@ -4148,6 +4160,7 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         )
     )
     assert rejoin["session_token_ref"] != prior_session_token_ref
+    assert rejoin["fence_token"] != fence_token
     assert rejoin["bounded_rejoin_kind"] == "ordinary_initial_rejoin"
     rejoin_context = get_branch_context(conn, PID, runtime_context.task_id)
     assert rejoin_context is not None
@@ -4237,6 +4250,7 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
     assert replacement["bounded_replacement_rejoin"] is True
 
     assert replacement["bounded_replacement_generation"] == 1
+    assert replacement["fence_token"] != rejoin["fence_token"]
     replacement_rejoin_audit = task_timeline.list_events(
         conn,
         PID,
@@ -4255,6 +4269,46 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
     assert replacement_context.last_recovery_action == (
         "mf_subagent_session_token_rejoin_replacement_issued"
     )
+    replacement_marker = (
+        server._runtime_context_precommit_correction_rejoin_marker(
+            context=replacement_context,
+            runtime_context_id=runtime_context.runtime_context_id,
+            contract_execution_id=successor["contract_execution_id"],
+            prior_implementation=frozen_implementation,
+            timeline_events=task_timeline.list_events(
+                conn,
+                PID,
+                task_id=runtime_context.task_id,
+                backlog_id=backlog_id,
+                limit=1000,
+            ),
+        )
+    )
+    assert replacement_marker["prior_fence_token_hash"] == (
+        runtime_context_secret_hash(fence_token)
+    )
+    assert replacement_marker["active_fence_token_hash"] == (
+        replacement["fence_token_hash"]
+    )
+    forged_rejoin_events = copy.deepcopy(
+        task_timeline.list_events(
+            conn,
+            PID,
+            task_id=runtime_context.task_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        )
+    )
+    forged_rejoin_events[-1]["payload"]["target_project_root"] = str(
+        tmp_path / "foreign-root"
+    )
+    assert server._runtime_context_precommit_correction_rejoin_marker(
+        context=replacement_context,
+        runtime_context_id=runtime_context.runtime_context_id,
+        contract_execution_id=successor["contract_execution_id"],
+        prior_implementation=frozen_implementation,
+        timeline_events=forged_rejoin_events,
+    ) == {}
     before_third_context = replacement_context
     before_third_events = task_timeline.list_events(
         conn,
