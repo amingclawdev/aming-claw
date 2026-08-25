@@ -64420,7 +64420,8 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         "route_token_ref": f"rtok-{worker_task_id}",
         "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
     }
-    desktop_session_id = "/root/safe_ref_prestartup_worker"
+    desktop_worker_session_id = "/root/safe_ref_prestartup_worker"
+    desktop_host_session_id = "codex-session:safe-ref-prestartup-host"
     joined = server.handle_graph_governance_runtime_context_session_token_initial_join(
         _ctx_with_role(
             {
@@ -64439,8 +64440,8 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
                 "target_project_root": str(target_root),
                 "agent_id": allocated.worker_id,
                 "actual_host_worker_id": allocated.worker_id,
-                "worker_session_id": desktop_session_id,
-                "host_session_id": desktop_session_id,
+                "worker_session_id": desktop_worker_session_id,
+                "host_session_id": desktop_host_session_id,
                 "reason": "issue the exact fresh worker host envelope",
                 "ttl_seconds": 3600,
                 "now_iso": "2099-08-05T04:00:00Z",
@@ -64450,6 +64451,14 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     )
     joined_context = get_branch_context(conn, PID, allocated.task_id)
     assert joined_context is not None
+    assert joined["worker_session_id"] == desktop_worker_session_id
+    assert joined["host_session_id"] == desktop_host_session_id
+    assert joined["host_envelope"]["worker_session_id"] == (
+        desktop_worker_session_id
+    )
+    assert joined["host_envelope"]["host_session_id"] == (
+        desktop_host_session_id
+    )
     assert joined_context.fence_token == ""
     assert joined_context.fence_token_verifier == joined["fence_token_hash"]
     assert joined_context.fence_token_verifier == runtime_context_secret_hash(
@@ -64586,6 +64595,10 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     assert guide_reissue_body["session_token_ref"] == (
         joined["session_token_ref"]
     )
+    assert guide_reissue_body["worker_session_id"] == (
+        desktop_worker_session_id
+    )
+    assert guide_reissue_body["host_session_id"] == desktop_host_session_id
     assert {
         field: guide_reissue_body[field]
         for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
@@ -64640,6 +64653,12 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     assert reissued["contract_execution_id"] == contract_execution_id
     assert reissued["session_token_ref"] != joined["session_token_ref"]
     assert reissued["safe_ref_reissue_authority"]["server_derived"] is True
+    assert reissued["safe_ref_reissue_authority"]["worker_session_id"] == (
+        desktop_worker_session_id
+    )
+    assert reissued["safe_ref_reissue_authority"]["host_session_id"] == (
+        desktop_host_session_id
+    )
     assert reissued["safe_ref_reissue_authority"][
         "lease_status_at_authorization"
     ] == "expired"
@@ -64657,6 +64676,12 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
     )
     assert reissued["host_envelope"]["env"]["AMING_WORKER_FENCE_TOKEN"] == (
         reissued["fence_token"]
+    )
+    assert reissued["host_envelope"]["worker_session_id"] == (
+        desktop_worker_session_id
+    )
+    assert reissued["host_envelope"]["host_session_id"] == (
+        desktop_host_session_id
     )
     assert reissued["fence_token"] != joined["fence_token"]
     assert reissued["fence_token_hash"] == runtime_context_secret_hash(
@@ -65011,11 +65036,11 @@ def test_runtime_context_safe_ref_reissue_recovers_exact_joined_read_worker_befo
         "agent_id": allocated.worker_id,
         "actual_host_worker_id": allocated.worker_id,
         "host_startup_id": "codex-thread:safe-ref-prestartup-worker",
-        "host_session_id": desktop_session_id,
-        "worker_session_id": desktop_session_id,
+        "host_session_id": desktop_host_session_id,
+        "worker_session_id": desktop_worker_session_id,
         "worker_transcript_ref": "codex:safe-ref-prestartup-worker",
         "harness_type": "codex",
-        "filer_principal": desktop_session_id,
+        "filer_principal": desktop_worker_session_id,
         "actual_cwd": str(assigned_worktree),
         "actual_git_root": str(assigned_worktree),
         "branch": allocated.branch_ref,
@@ -65392,7 +65417,8 @@ def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
         "route_token_ref": f"rtok-{worker_task_id}",
         "visible_injection_manifest_hash": f"sha256:visible-{worker_task_id}",
     }
-    desktop_session_id = "/root/safe_ref_zero_write_worker"
+    desktop_worker_session_id = "/root/safe_ref_zero_write_worker"
+    desktop_host_session_id = "codex-session:safe-ref-zero-write-host"
     joined = server.handle_graph_governance_runtime_context_session_token_initial_join(
         _ctx_with_role(
             {"project_id": PID, "runtime_context_id": allocated.runtime_context_id},
@@ -65408,8 +65434,8 @@ def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
                 "worker_slot_id": allocated.worker_slot_id,
                 "agent_id": allocated.worker_id,
                 "actual_host_worker_id": allocated.worker_id,
-                "worker_session_id": desktop_session_id,
-                "host_session_id": desktop_session_id,
+                "worker_session_id": desktop_worker_session_id,
+                "host_session_id": desktop_host_session_id,
                 "reason": "issue exact zero-write test envelope",
                 "now_iso": "2099-08-05T05:00:00Z",
                 **route_identity,
@@ -65446,8 +65472,8 @@ def test_runtime_context_safe_ref_reissue_wrong_scope_and_replay_are_zero_write(
         "agent_id": allocated.worker_id,
         "allocation_owner": allocated.worker_id,
         "actual_host_worker_id": allocated.worker_id,
-        "worker_session_id": desktop_session_id,
-        "host_session_id": desktop_session_id,
+        "worker_session_id": desktop_worker_session_id,
+        "host_session_id": desktop_host_session_id,
         "session_token_ref": joined["session_token_ref"],
         "now_iso": "2099-08-05T05:01:00Z",
         **route_identity,

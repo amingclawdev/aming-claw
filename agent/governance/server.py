@@ -48689,6 +48689,58 @@ def _runtime_context_modern_special_rejoin_authority_valid(
         else {}
     )
     checkpoint = _runtime_context_rejoin_stage_checkpoint(baseline)
+    bounded_replacement_authority = (
+        payload.get("bounded_replacement_rejoin_authority")
+        if isinstance(
+            payload.get("bounded_replacement_rejoin_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    bounded_replacement_not_applicable = bool(
+        checkpoint
+        and str(
+            bounded_replacement_authority.get("schema_version") or ""
+        ).strip()
+        == "runtime_context.bounded_replacement_rejoin_authority.v2"
+        and bounded_replacement_authority.get("server_derived") is True
+        and bounded_replacement_authority.get("caller_claims_trusted") is False
+        and bounded_replacement_authority.get("applicable") is False
+        and bounded_replacement_authority.get("eligible") is False
+        and str(bounded_replacement_authority.get("mode") or "").strip()
+        == "not_applicable"
+        and int(
+            bounded_replacement_authority.get("replacement_generation") or 0
+        )
+        == 0
+        and str(
+            bounded_replacement_authority.get("last_recovery_action") or ""
+        ).strip()
+        == "mf_subagent_initial_join_issued"
+        and dict(
+            bounded_replacement_authority.get("current_worker_write_baseline")
+            or {}
+        )
+        == dict(baseline)
+        and dict(
+            bounded_replacement_authority.get("current_stage_checkpoint")
+            or {}
+        )
+        == dict(checkpoint)
+        and str(
+            bounded_replacement_authority.get("current_stage_checkpoint_id")
+            or ""
+        ).strip()
+        == str(checkpoint.get("stage_checkpoint_id") or "").strip()
+        and not bounded_replacement_authority.get("errors")
+        and not bounded_replacement_authority.get("identity_mismatches")
+        and not bounded_replacement_authority.get(
+            "current_checkpoint_issuance_event_refs"
+        )
+        and not bounded_replacement_authority.get(
+            "current_checkpoint_replacement_event_refs"
+        )
+    )
     runtime_context_id = str(
         getattr(context, "runtime_context_id", "") or ""
     ).strip()
@@ -48778,7 +48830,7 @@ def _runtime_context_modern_special_rejoin_authority_valid(
         and payload.get("pre_lineage_auth_only_rejoin") is True
         and payload.get("bounded_replacement_rejoin") is False
         and payload.get("bounded_replacement_generation") == 0
-        and payload.get("bounded_replacement_rejoin_authority") == {}
+        and bounded_replacement_not_applicable
         and str(payload.get("rejoin_stage_checkpoint_id") or "").strip()
         == str(checkpoint.get("stage_checkpoint_id") or "").strip()
         and payload.get("host_envelope_returned") is True
@@ -49119,7 +49171,6 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
     # durable context values into the proof passed to the runtime primitive.
     # A non-empty caller claim must still match exactly.
     for field, expected in (
-        ("worker_session_id", expected_host_session_id),
         ("host_session_id", expected_host_session_id),
         ("host_startup_id", expected_host_startup_id),
     ):
@@ -49357,8 +49408,13 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             action == "runtime_context_session_token_initial_join"
             and str(payload.get("actual_host_worker_id") or "").strip()
             == expected_actual_host_worker_id
-            and str(payload.get("worker_session_id") or "").strip()
+            and str(
+                payload.get("host_session_id")
+                or payload.get("worker_session_id")
+                or ""
+            ).strip()
             == expected_host_session_id
+            and bool(str(payload.get("worker_session_id") or "").strip())
         ):
             matching_initial_joins.append(event)
             validated_session_authorities.setdefault(
@@ -49398,7 +49454,8 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             ).strip()
             == expected_actual_host_worker_id
             and str(
-                payload.get("worker_session_id")
+                payload.get("host_session_id")
+                or payload.get("worker_session_id")
                 or expected_host_session_id
             ).strip()
             == expected_host_session_id
@@ -49555,6 +49612,25 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         if len(matching_initial_joins) != 1:
             raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
         selected_initial_join = matching_initial_joins[0]
+    selected_initial_join_payload = (
+        selected_initial_join.get("payload")
+        if isinstance(selected_initial_join.get("payload"), Mapping)
+        else {}
+    )
+    expected_worker_session_id = str(
+        selected_initial_join_payload.get("worker_session_id") or ""
+    ).strip()
+    supplied_worker_session_id = str(
+        body.get("worker_session_id") or ""
+    ).strip()
+    if (
+        not expected_worker_session_id
+        or (
+            supplied_worker_session_id
+            and supplied_worker_session_id != expected_worker_session_id
+        )
+    ):
+        raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     if len(matching_session_authorities) != 1:
         raise BranchRuntimeFenceError("fence_invalidated_or_unknown")
     (
@@ -49903,6 +49979,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
         contract_execution_id=presented_contract_execution_id,
         read_receipt_ref=authority_read_receipt_ref,
         initial_join_event_ref=f"timeline:{selected_initial_join.get('id', '')}",
+        worker_session_id=expected_worker_session_id,
         session_authority_event_ref=(
             f"timeline:{session_authority_event.get('id', '')}"
         ),
@@ -50105,6 +50182,10 @@ def handle_graph_governance_runtime_context_session_token_reissue(ctx: RequestCo
                     "session_authority_kind": (
                         safe_ref_authority.session_authority_kind
                     ),
+                    "worker_session_id": (
+                        safe_ref_authority.worker_session_id
+                    ),
+                    "host_session_id": safe_ref_authority.host_session_id,
                     "route_identity_hash": safe_ref_authority.route_identity_hash,
                     "stage_checkpoint_id": (
                         safe_ref_authority.stage_checkpoint_id

@@ -11583,6 +11583,7 @@ def build_safe_ref_prestartup_reissue_authority(
     read_receipt_ref: str,
     initial_join_event_ref: str,
     route_identity_hash: str,
+    worker_session_id: str = "",
     session_authority_event_ref: str = "",
     session_authority_kind: str = "initial_join",
     stage_checkpoint_id: str = "",
@@ -11618,6 +11619,9 @@ def build_safe_ref_prestartup_reissue_authority(
     worker_slot_id = str(context.worker_slot_id or worker_id).strip()
     actual_host_worker_id = str(context.actual_host_worker_id or "").strip()
     host_session_id = str(context.host_session_id or "").strip()
+    governed_worker_session_id = str(
+        worker_session_id or host_session_id
+    ).strip()
     authorized_at = str(lease.get("now") or "").strip()
     lease_status = str(lease.get("status") or "").strip()
     latest_ref_identifier_only = lease_status == "expired"
@@ -11634,6 +11638,7 @@ def build_safe_ref_prestartup_reissue_authority(
                 worker_id,
                 worker_slot_id,
                 actual_host_worker_id,
+                governed_worker_session_id,
                 host_session_id,
                 session_ref,
                 context.lease_id,
@@ -11728,7 +11733,7 @@ def build_safe_ref_prestartup_reissue_authority(
             or ""
         ).strip(),
         actual_host_worker_id=actual_host_worker_id,
-        worker_session_id=host_session_id,
+        worker_session_id=governed_worker_session_id,
         host_startup_id=str(context.host_startup_id or "").strip(),
         host_session_id=host_session_id,
         session_token_ref=session_ref,
@@ -11901,7 +11906,7 @@ def reissue_mf_subagent_runtime_session_token(
                 or context.agent_id
             ),
             "actual_host_worker_id": context.actual_host_worker_id,
-            "worker_session_id": context.host_session_id,
+            "worker_session_id": str(worker_session_id or "").strip(),
             "host_startup_id": context.host_startup_id,
             "host_session_id": context.host_session_id,
             "session_token_ref": runtime_context_session_token_ref(context),
@@ -12114,7 +12119,7 @@ def reissue_mf_subagent_runtime_session_token(
             "worker_slot_id": saved.worker_slot_id or saved.worker_id,
             "agent_id": str(agent_id or "").strip(),
             "actual_host_worker_id": saved.actual_host_worker_id,
-            "worker_session_id": saved.host_session_id,
+            "worker_session_id": str(worker_session_id or "").strip(),
             "host_startup_id": saved.host_startup_id,
             "host_session_id": saved.host_session_id,
             "principal_id": principal_id,
