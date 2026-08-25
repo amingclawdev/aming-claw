@@ -82428,6 +82428,10 @@ def test_rev8_postmerge_qa_graph_binding_uses_final_combined_root_and_commit(
     authority = _rev8_postmerge_qa_binding_authority()
     captured: dict[str, Any] = {}
     worker_commit = "b" * 40
+    reconcile_lane_runtime_context_id = record["completed_lines"][0][
+        "payload"
+    ]["bounded_workers"][0]["runtime_context_id"]
+    assert reconcile_lane_runtime_context_id != authority["runtime_context_id"]
 
     monkeypatch.setattr(
         server,
@@ -82469,7 +82473,10 @@ def test_rev8_postmerge_qa_graph_binding_uses_final_combined_root_and_commit(
             "requested_trace_ids": ["gqt-rev8-final-combined"],
             "missing_trace_ids": [],
             "identity_mismatches": [],
-            "runtime_context_id": authority["runtime_context_id"],
+            # A combined-CEX graph query can be recorded through a different
+            # verified reconcile lane.  It must not replace the final merge
+            # lane frozen in postmerge QA authority.
+            "runtime_context_id": reconcile_lane_runtime_context_id,
             "task_id": authority["qa_graph_trace_task_id"],
             "parent_task_id": authority["parent_task_id"],
             "backlog_id": record["backlog_id"],
@@ -82527,11 +82534,58 @@ def test_rev8_postmerge_qa_graph_binding_uses_final_combined_root_and_commit(
         authority["contract_execution_id"]
     )
     assert bound["payload"]["graph_trace_evidence"][
+        "runtime_context_id"
+    ] == authority["runtime_context_id"]
+    assert bound["payload"]["graph_trace_evidence"][
         "postmerge_qa_authority"
     ]["task_id"] == authority["task_id"]
     assert bound["qa_evidence_provenance"]["authenticated_qa_binding"][
         "qa_session_id"
     ] == "ses-rev8-final-combined"
+
+    record["completed_lines"].append(bound)
+    record["runtime_guide"] = {
+        "next_legal_action": {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "owner_role": "qa",
+            "evidence_kind": "independent_verification",
+        }
+    }
+    contexts = _rev8_postmerge_dispatch_contexts(record)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: list(contexts),
+    )
+
+    class IndependentQAContext:
+        @staticmethod
+        def require_auth(_conn):
+            return {
+                "role": "qa",
+                "principal_id": "qa:rev8-final-independent",
+                "session_id": "ses-rev8-final-independent",
+            }
+
+    independent = (
+        server._contract_runtime_bind_qa_independent_verification_authority(
+            IndependentQAContext(),
+            object(),
+            project_id=PID,
+            record=record,
+            write={
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "status": "accepted",
+            },
+        )
+    )
+    assert independent["runtime_context_id"] == authority["runtime_context_id"]
+    assert independent["task_id"] == authority["task_id"]
+    assert independent["parent_task_id"] == authority["parent_task_id"]
 
 
 @pytest.mark.parametrize(

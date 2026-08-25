@@ -123016,13 +123016,23 @@ def _contract_runtime_bind_qa_graph_authority(
             "contract_execution_id": str(
                 record.get("contract_execution_id") or ""
             ),
+            # Postmerge graph traces deliberately use the combined CEX task
+            # and may therefore be recorded through a reconcile lane that is
+            # not the final merge lane.  Keep graph task scope from the trace,
+            # but freeze worker runtime/parent identity from the verified
+            # postmerge ticket.  This is the two-scope contract consumed by
+            # independent QA; a trace-local runtime must not override it.
             "runtime_context_id": str(
-                evidence.get("runtime_context_id")
+                postmerge_authority.get("runtime_context_id")
+                if postmerge_authority.get("verified") is True
+                else evidence.get("runtime_context_id")
                 or identity["runtime_context_id"]
                 or ""
             ),
             "parent_task_id": str(
-                evidence.get("parent_task_id")
+                postmerge_authority.get("parent_task_id")
+                if postmerge_authority.get("verified") is True
+                else evidence.get("parent_task_id")
                 or identity["parent_task_id"]
                 or ""
             ),
