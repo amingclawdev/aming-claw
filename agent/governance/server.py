@@ -132767,6 +132767,7 @@ _CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS = (
     "nested_passing_verdict_field",
     "nested_passing_verdict_value",
     "silent_failing_normalization_prevented",
+    "qa_pass_write_compiler_parity_prevented",
     "completed_line_mutated",
     "zero_contract_runtime_write",
     "remediation",
@@ -133198,9 +133199,11 @@ def _contract_runtime_qa_rejection_response_fields(
     not replace the rejection's exact field/remediation/action contract.
     """
 
+    if not result.get("zero_contract_runtime_write") is True:
+        return {}
     if not (
-        result.get("zero_contract_runtime_write") is True
-        and result.get("silent_failing_normalization_prevented") is True
+        result.get("silent_failing_normalization_prevented") is True
+        or result.get("qa_pass_write_compiler_parity_prevented") is True
     ):
         return {}
     return {
@@ -163170,6 +163173,7 @@ def _contract_runtime_close_gate(
             "line_id": line.get("line_id", ""),
             "evidence_kind": line.get("evidence_kind", ""),
             "decision": result.get("decision") or {},
+            **_contract_runtime_qa_rejection_response_fields(result),
         }
         identity_mismatch = _contract_runtime_projection_dispatch_identity_mismatch(
             projection

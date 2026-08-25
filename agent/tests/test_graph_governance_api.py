@@ -127308,6 +127308,90 @@ def test_contract_runtime_qa_bridge_preserves_precheck_submit_and_failure_fields
     }
     assert accepted_qa["next_legal_action"]["line_id"] == "observer_close_ready"
 
+    parity_hotfix = runtime.start_execution(
+        "observer_hotfix",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id="cex-generic-hotfix-qa-compiler-parity",
+    )
+    conn.commit()
+    advance_hotfix(parity_hotfix["contract_execution_id"])
+    invalid_authored_pass = copy.deepcopy(qa_evidence_body)
+    invalid_authored_pass["tests"].append(
+        {
+            "name": "prior frozen baseline",
+            "status": "baseline_known_failure_only",
+            "passed": 6,
+            "failed": 1,
+            "candidate_new_failures": 0,
+        }
+    )
+    parity_before = runtime.store.get(parity_hotfix["contract_execution_id"])
+    parity_precheck = server.handle_project_contract_runtime_line_write_precheck(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": parity_hotfix[
+                    "contract_execution_id"
+                ],
+            },
+            "qa",
+            method="POST",
+            body=invalid_authored_pass,
+        )
+    )
+    parity_submit = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": parity_hotfix[
+                    "contract_execution_id"
+                ],
+            },
+            "qa",
+            method="POST",
+            body=invalid_authored_pass,
+        )
+    )
+    parity_after = runtime.store.get(parity_hotfix["contract_execution_id"])
+    for rejection in (parity_precheck, parity_submit):
+        assert rejection["ok"] is False
+        assert rejection["decision"]["errors"] == [
+            "qa_authored_pass_not_completion_satisfying"
+        ]
+        assert rejection[
+            "qa_pass_write_compiler_parity_prevented"
+        ] is True
+        assert rejection["zero_contract_runtime_write"] is True
+        assert rejection["completed_line_mutated"] is False
+        assert "baseline_observation" in rejection["remediation"]
+    assert parity_precheck["decision"] == parity_submit["decision"]
+    assert parity_after["execution_state_revision"] == parity_before[
+        "execution_state_revision"
+    ]
+    assert parity_after["completed_lines"] == parity_before["completed_lines"]
+
+    canonical_authored_pass = copy.deepcopy(invalid_authored_pass)
+    canonical_authored_pass["tests"][-1]["status"] = "baseline_observation"
+    canonical_submit = server.handle_project_contract_runtime_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": parity_hotfix[
+                    "contract_execution_id"
+                ],
+            },
+            "qa",
+            method="POST",
+            body=canonical_authored_pass,
+        )
+    )
+    assert canonical_submit["ok"] is True
+    assert canonical_submit["next_legal_action"]["line_id"] == (
+        "observer_close_ready"
+    )
+
     failed_hotfix = runtime.start_execution(
         "observer_hotfix",
         project_id=PID,

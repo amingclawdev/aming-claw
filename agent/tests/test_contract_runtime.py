@@ -31,6 +31,7 @@ from agent.governance.contracts.runtime import (
     _line_status_allows_contract_completion,
     _mf_parallel_worker_commit_errors,
     _project_record_state,
+    _qa_authored_pass_atomic_completion_errors,
     _worker_implementation_atomic_advance_errors,
     _worker_commit_completed_implementation,
     terminal_supersession_receipt_for_record,
@@ -198,6 +199,166 @@ def test_worker_implementation_atomic_advance_requires_compiler_consumption():
         _worker_implementation_atomic_advance_errors(advanced_to_sibling, line)
         == []
     )
+
+
+def _authenticated_authored_qa_line(
+    *,
+    baseline_status: str,
+) -> dict:
+    return {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "passed",
+        "authorization_source": "qa_session_token_ref",
+        "observer_impersonation": False,
+        "parent_materialization_authorized": False,
+        "qa_evidence_provenance": {
+            "schema_version": "qa_evidence_provenance.v1",
+            "server_derived": True,
+            "authorization_source": "qa_session_token_ref",
+            "evidence_owner_role": "qa",
+            "observer_impersonation": False,
+            "parent_materialization_authorized": False,
+            "authenticated_qa_binding": {
+                "schema_version": (
+                    "contract_runtime.authenticated_qa_binding.v1"
+                ),
+                "server_derived": True,
+                "independent_verification_session_matched": True,
+                "qa_principal": "qa:writer-compiler-parity",
+                "qa_session_id": "ses-writer-compiler-parity",
+            },
+            "completion_status_gate": {
+                "schema_version": (
+                    "contract_runtime.qa_completion_status_gate.v1"
+                ),
+                "source": "contract_runtime_line_write_normalization",
+                "server_derived": True,
+                "top_level_status_present": True,
+                "top_level_status_passing": True,
+                "normalized_status": "passed",
+                "nested_payload_decision_satisfies": False,
+            },
+        },
+        "tests": [
+            {
+                "name": "candidate exact suite",
+                "status": "passed",
+                "passed": 2,
+                "failed": 0,
+            },
+            {
+                "name": "frozen baseline observation",
+                "status": baseline_status,
+                "passed": 6,
+                "failed": 1,
+                "candidate_new_failures": 0,
+            },
+        ],
+        "verification": {
+            "status": "passed",
+            "verdict": "passed",
+            "candidate_new_failures": 0,
+            "overall_release_pass_claimed": True,
+        },
+    }
+
+
+def test_qa_authored_pass_atomic_completion_requires_canonical_evidence():
+    invalid = _authenticated_authored_qa_line(
+        baseline_status="baseline_known_failure_only",
+    )
+    stalled = {
+        "execution_state": {"completed_lines": []},
+    }
+    assert _qa_authored_pass_atomic_completion_errors(stalled, invalid) == [
+        "qa_authored_pass_not_completion_satisfying"
+    ]
+
+    canonical = _authenticated_authored_qa_line(
+        baseline_status="baseline_observation",
+    )
+    consumed = {
+        "execution_state": {"completed_lines": [deepcopy(canonical)]},
+    }
+    assert _qa_authored_pass_atomic_completion_errors(consumed, canonical) == []
+
+
+def test_qa_pass_precheck_and_submit_share_zero_write_compiler_parity(
+    tmp_path,
+):
+    package_registry = ContractDefinitionRegistry()
+    definition = _common_rule_bound_definition(package_registry)
+    definition.update(
+        {
+            "contract_id": "qa_writer_compiler_parity_runtime_test",
+            "role": "qa",
+        }
+    )
+    definition["rule_layer"]["stages"] = [
+        {
+            "stage_id": "qa",
+            "lines": [
+                {
+                    "line_id": "qa_independent_verification",
+                    "owner_role": "qa",
+                    "allowed_writer_roles": ["qa"],
+                    "evidence_kind": "independent_verification",
+                }
+            ],
+        }
+    ]
+    (tmp_path / "qa_writer_compiler_parity_runtime_test.v1.rev1.json").write_text(
+        json.dumps(definition),
+        encoding="utf-8",
+    )
+    runtime = ContractRuntime(ContractDefinitionRegistry(tmp_path))
+    created = runtime.start_execution(
+        "qa_writer_compiler_parity_runtime_test",
+        project_id="aming-claw",
+        backlog_id="AC-QA-WRITER-COMPILER-PARITY-TEST",
+        actor_role="qa",
+        contract_execution_id="cex-qa-writer-compiler-parity-test",
+    )
+    write = {
+        **_authenticated_authored_qa_line(
+            baseline_status="baseline_known_failure_only",
+        ),
+        "project_id": created["project_id"],
+        "backlog_id": created["backlog_id"],
+        "contract_execution_id": created["contract_execution_id"],
+        "definition_hash": created["definition_hash"],
+        "instruction_bundle_hash": created["instruction_bundle_hash"],
+        "execution_state_revision": created["execution_state_revision"],
+        "runtime_guide_hash": created["runtime_guide"]["runtime_guide_hash"],
+        "qa_session_token_ref": "qa-session-ref-writer-compiler-parity",
+    }
+    before = runtime.store.get(created["contract_execution_id"])
+
+    precheck = runtime.precheck_line_write(
+        created["contract_execution_id"],
+        write,
+        actor_role="qa",
+    )
+    submitted = runtime.submit_line_write(
+        created["contract_execution_id"],
+        write,
+        actor_role="qa",
+    )
+    after = runtime.store.get(created["contract_execution_id"])
+
+    assert precheck["ok"] is False
+    assert submitted["ok"] is False
+    assert precheck["decision"] == submitted["decision"]
+    assert precheck["qa_pass_write_compiler_parity_prevented"] is True
+    assert submitted["qa_pass_write_compiler_parity_prevented"] is True
+    assert precheck["zero_contract_runtime_write"] is True
+    assert submitted["zero_contract_runtime_write"] is True
+    assert "baseline_observation" in precheck["remediation"]
+    assert after["execution_state_revision"] == before["execution_state_revision"]
+    assert after["completed_lines"] == before["completed_lines"] == []
 
 
 def test_contract_runtime_rejects_digest_mismatch_before_execution_mutation(
@@ -3127,7 +3288,7 @@ def _synthetic_later_qa_pass(*, summary: str) -> dict:
     }
 
 
-def test_synthetic_later_pass_clears_repair_without_satisfying_close():
+def test_unauthenticated_synthetic_pass_cannot_clear_repair_boundary():
     failed = {
         "line_id": "qa_independent_verification",
         "actor_role": "qa",
@@ -3147,10 +3308,73 @@ def test_synthetic_later_pass_clears_repair_without_satisfying_close():
         source_record=record,
         source_line_index=1,
     )
+    failed_index, failed_line = _active_failed_qa_line(
+        record["completed_lines"],
+        source_record=record,
+    )
+    assert failed_index == 1
+    assert failed_line is passed
+
+
+def test_authenticated_invalid_pass_is_ignored_without_clearing_prior_failure():
+    prior_progress = {
+        "stage_id": "observer_integration",
+        "line_id": "observer_reconcile",
+        "actor_role": "observer",
+        "evidence_kind": "reconcile",
+        "status": "passed",
+    }
+    invalid_pass = _authenticated_authored_qa_line(
+        baseline_status="baseline_known_failure_only",
+    )
+    record = {
+        "contract_execution_id": "cex-historical-invalid-authored-pass",
+        "completed_lines": [prior_progress, invalid_pass],
+    }
+
+    satisfying = _contract_completion_satisfying_lines(
+        record["completed_lines"],
+        source_record=record,
+    )
+    assert satisfying == [prior_progress]
     assert _active_failed_qa_line(
         record["completed_lines"],
         source_record=record,
     ) == (-1, {})
+
+    genuine_failure = {
+        "stage_id": "qa",
+        "line_id": "qa_independent_verification",
+        "actor_role": "qa",
+        "evidence_kind": "independent_verification",
+        "status": "failed",
+    }
+    with_prior_failure = {
+        "contract_execution_id": "cex-invalid-pass-after-genuine-failure",
+        "completed_lines": [
+            prior_progress,
+            genuine_failure,
+            invalid_pass,
+        ],
+    }
+    failed_index, failed_line = _active_failed_qa_line(
+        with_prior_failure["completed_lines"],
+        source_record=with_prior_failure,
+    )
+    assert failed_index == 1
+    assert failed_line is genuine_failure
+
+    canonical_pass = _authenticated_authored_qa_line(
+        baseline_status="baseline_observation",
+    )
+    canonical_record = {
+        "contract_execution_id": "cex-canonical-baseline-observation-pass",
+        "completed_lines": [prior_progress, canonical_pass],
+    }
+    assert _contract_completion_satisfying_lines(
+        canonical_record["completed_lines"],
+        source_record=canonical_record,
+    ) == canonical_record["completed_lines"]
 
 
 def test_synthetic_later_pass_with_failure_summary_keeps_repair_active():

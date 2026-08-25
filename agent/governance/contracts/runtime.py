@@ -4422,7 +4422,7 @@ def _last_failed_qa_line_index(
             continue
         if str(line.get("line_id") or "").strip() != "qa_independent_verification":
             continue
-        if not _qa_line_supersedes_active_failed_qa(
+        if _qa_line_supersedes_active_failed_qa(
             line,
             source_record=source_record,
             source_line_index=_source_record_completed_line_index(
@@ -4430,7 +4430,16 @@ def _last_failed_qa_line_index(
                 source_record,
             ),
         ):
-            failed_index = index
+            continue
+        # A server-authenticated, top-level PASS claim that the completion
+        # compiler rejects is an invalid write attempt, not evidence that QA
+        # failed.  Historical records created before write/compiler parity was
+        # enforced therefore retain all earlier progress and redirect to QA.
+        # Crucially, ignoring the invalid attempt does not clear an earlier
+        # genuine failed/no-PASS boundary.
+        if _authenticated_authored_qa_pass_attempt(line):
+            continue
+        failed_index = index
     return failed_index
 
 
@@ -4440,66 +4449,19 @@ def _qa_line_supersedes_active_failed_qa(
     source_record: Mapping[str, Any] | None = None,
     source_line_index: int = -1,
 ) -> bool:
-    """Return whether a later QA line clears the active repair boundary.
+    """Return whether a later QA line is valid completion evidence.
 
-    Completion remains strictly server-normalized.  Failed-QA recovery also
-    has to understand one historical/synthetic projection: callers copied a
-    failed QA line, replaced its top-level and payload statuses with ``passed``,
-    but retained the earlier normalization gate that says no top-level status
-    was present.  That explicit later pass supersedes the older repair
-    authority without making the copied line close-satisfying.
+    Only the authoritative completion compiler may clear a failed-QA
+    boundary.  An authenticated authored PASS that the compiler rejects is a
+    third state: it is neither completion nor a genuine failure and therefore
+    cannot clear an earlier failed boundary.
     """
 
-    if _line_status_allows_contract_completion(
+    return _line_status_allows_contract_completion(
         line,
         source_record=source_record,
         source_line_index=source_line_index,
-    ):
-        return True
-    if str(line.get("line_id") or "").strip() != "qa_independent_verification":
-        return False
-    if str(line.get("actor_role") or "").strip().lower() != "qa":
-        return False
-    if bool(line.get("observer_impersonation")):
-        return False
-    payload = (
-        line.get("payload")
-        if isinstance(line.get("payload"), Mapping)
-        else {}
     )
-    if (
-        str(line.get("status") or "").strip().lower()
-        not in _QA_COMPLETION_PASSING_STATUSES
-        or str(payload.get("status") or "").strip().lower()
-        not in _QA_COMPLETION_PASSING_STATUSES
-    ):
-        return False
-    provenance = (
-        line.get("qa_evidence_provenance")
-        if isinstance(line.get("qa_evidence_provenance"), Mapping)
-        else {}
-    )
-    status_gate = (
-        provenance.get("completion_status_gate")
-        if isinstance(provenance.get("completion_status_gate"), Mapping)
-        else {}
-    )
-    if not (
-        str(status_gate.get("schema_version") or "")
-        == _QA_COMPLETION_STATUS_GATE_SCHEMA_VERSION
-        and status_gate.get("server_derived") is True
-        and status_gate.get("top_level_status_present") is False
-        and status_gate.get("top_level_status_passing") is False
-        and not str(status_gate.get("normalized_status") or "").strip()
-    ):
-        return False
-    if (
-        _mapping_own_fields_contain_contract_completion_blocker(payload)
-        or _contains_contract_completion_blocker(payload)
-        or _qa_independent_verification_summary_reports_failure(payload)
-    ):
-        return False
-    return True
 
 
 _FAILED_QA_RETRY_RESET_LINE_IDS = frozenset(
@@ -6093,6 +6055,44 @@ def _worker_implementation_atomic_advance_errors(
     return errors
 
 
+def _qa_authored_pass_atomic_completion_errors(
+    record: Mapping[str, Any],
+    written_line: Mapping[str, Any],
+) -> list[str]:
+    """Reject an authored QA PASS the completion compiler cannot consume.
+
+    Gate acceptance and completion projection are one write transaction.  A
+    server-authenticated top-level PASS must therefore occur in the exact
+    compiled completion set before the append is persisted.  Explicit
+    no-PASS evidence and genuinely failing QA retain their existing paths.
+    """
+
+    if not _authenticated_authored_qa_pass_attempt(written_line):
+        return []
+    state = (
+        record.get("execution_state")
+        if isinstance(record.get("execution_state"), Mapping)
+        else {}
+    )
+    completed = state.get("completed_lines")
+    completed = completed if isinstance(completed, list) else []
+    expected_stage = str(written_line.get("stage_id") or "").strip()
+    expected_instance = str(
+        written_line.get("line_instance_id") or ""
+    ).strip()
+    if any(
+        isinstance(item, Mapping)
+        and str(item.get("stage_id") or "").strip() == expected_stage
+        and str(item.get("line_id") or "").strip()
+        == "qa_independent_verification"
+        and str(item.get("line_instance_id") or "").strip()
+        == expected_instance
+        for item in completed
+    ):
+        return []
+    return ["qa_authored_pass_not_completion_satisfying"]
+
+
 def _worker_commit_has_finish_compatible_implementation_results(
     implementation: Mapping[str, Any],
     *,
@@ -6823,10 +6823,38 @@ def _contains_completion_blocker_outside_baseline_observation(
     return False
 
 
-def _authenticated_qa_pass_with_baseline_observations(
+def _qa_line_explicitly_disclaims_overall_pass(
     line: Mapping[str, Any],
 ) -> bool:
-    """Recognize only server-bound QA PASS with observation-local failures."""
+    """Return whether QA explicitly recorded a no-PASS disposition."""
+
+    containers = [line]
+    for key in ("payload", "test_results", "verification"):
+        value = line.get(key)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    artifact_refs = line.get("artifact_refs")
+    if isinstance(artifact_refs, Mapping):
+        ledger = artifact_refs.get("external_no_pass_baseline_ledger")
+        if isinstance(ledger, Mapping):
+            containers.append(ledger)
+    return any(
+        container.get("no_pass_claim") is True
+        or container.get("no_pass") is True
+        or container.get("overall_release_pass_claimed") is False
+        for container in containers
+    )
+
+
+def _authenticated_authored_qa_pass_attempt(
+    line: Mapping[str, Any],
+) -> bool:
+    """Recognize a server-authenticated top-level authored QA PASS claim.
+
+    This proves authorship and PASS intent only.  It deliberately does not
+    decide whether the complete evidence satisfies the Contract compiler.
+    Explicit canonical no-PASS evidence is excluded from this disposition.
+    """
 
     provenance = (
         line.get("qa_evidence_provenance")
@@ -6876,6 +6904,17 @@ def _authenticated_qa_pass_with_baseline_observations(
         and status_gate.get("top_level_status_passing") is True
         and str(status_gate.get("normalized_status") or "") == qa_status
         and status_gate.get("nested_payload_decision_satisfies") is False
+        and not _qa_line_explicitly_disclaims_overall_pass(line)
+    )
+
+
+def _authenticated_qa_pass_with_baseline_observations(
+    line: Mapping[str, Any],
+) -> bool:
+    """Recognize only server-bound QA PASS with observation-local failures."""
+
+    return bool(
+        _authenticated_authored_qa_pass_attempt(line)
         and not _contains_completion_blocker_outside_baseline_observation(
             line
         )
@@ -9228,6 +9267,45 @@ class ContractRuntime:
             view["projected_completed_lines_count"] = len(line_items)
         return view
 
+    def _project_line_write_candidate(
+        self,
+        record: Mapping[str, Any],
+        effective_write: Mapping[str, Any],
+        *,
+        effective_actor_role: str,
+        projected_completed_lines: Sequence[Mapping[str, Any]] | None = None,
+        projection: Mapping[str, Any] | None = None,
+        use_completed_line_projection: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], int]:
+        """Compile the exact post-write candidate without persisting it."""
+
+        expected_revision = int(record.get("execution_state_revision") or 1)
+        written_line = _line_evidence_from_write(
+            effective_write,
+            effective_actor_role,
+        )
+        completed_lines = list(record.get("completed_lines") or [])
+        completed_lines.append(written_line)
+        updated = deepcopy(dict(record))
+        updated["completed_lines"] = completed_lines
+        updated["execution_state_revision"] = expected_revision + 1
+        updated = self._record_view(
+            updated,
+            actor_role=effective_actor_role,
+            completed_lines=completed_lines,
+        )
+        result_record = updated
+        if use_completed_line_projection:
+            projected_after_write = list(projected_completed_lines or [])
+            projected_after_write.append(written_line)
+            result_record = self._record_view(
+                updated,
+                actor_role=effective_actor_role,
+                completed_lines=projected_after_write,
+                projection=projection,
+            )
+        return updated, result_record, written_line, expected_revision
+
     def submit_line_write(
         self,
         contract_execution_id: str,
@@ -9339,45 +9417,64 @@ class ContractRuntime:
                 "record": gate_record,
             }
 
-        completed_lines = list(refreshed.get("completed_lines") or [])
-        written_line = _line_evidence_from_write(effective_write, effective_actor_role)
-        completed_lines.append(written_line)
-        expected_revision = int(refreshed.get("execution_state_revision") or 1)
-        refreshed["completed_lines"] = completed_lines
-        refreshed["execution_state_revision"] = expected_revision + 1
-        refreshed = self._record_view(
-            refreshed,
-            actor_role=effective_actor_role,
-            completed_lines=completed_lines,
-        )
-        result_record = deepcopy(refreshed)
-        if use_completed_line_projection:
-            projected_after_write = list(projected_completed_lines)
-            projected_after_write.append(written_line)
-            result_record = self._record_view(
+        refreshed, result_record, written_line, expected_revision = (
+            self._project_line_write_candidate(
                 refreshed,
-                actor_role=effective_actor_role,
-                completed_lines=projected_after_write,
+                effective_write,
+                effective_actor_role=effective_actor_role,
+                projected_completed_lines=projected_completed_lines,
                 projection=projection,
+                use_completed_line_projection=use_completed_line_projection,
             )
-        implementation_postcondition_errors = (
-            _worker_implementation_atomic_advance_errors(
+        )
+        postcondition_errors = [
+            *_worker_implementation_atomic_advance_errors(
                 result_record,
                 written_line,
+            ),
+            *_qa_authored_pass_atomic_completion_errors(
+                result_record,
+                written_line,
+            ),
+        ]
+        if postcondition_errors:
+            qa_parity_rejected = bool(
+                "qa_authored_pass_not_completion_satisfying"
+                in postcondition_errors
             )
-        )
-        if implementation_postcondition_errors:
-            return {
+            worker_atomic_rejected = any(
+                error.startswith("worker_implementation_")
+                for error in postcondition_errors
+            )
+            postcondition_decision = _gate_decision_with_additional_errors(
+                gate_decision,
+                postcondition_errors,
+            )
+            result = {
                 "schema_version": "contract_runtime_write_result.v1",
                 "ok": False,
-                "decision": WriteGateDecision(
-                    ok=False,
-                    errors=tuple(implementation_postcondition_errors),
-                ).to_dict(),
+                "decision": _gate_decision_payload(postcondition_decision),
                 "record": gate_record,
                 "zero_contract_runtime_write": True,
-                "worker_implementation_atomic_advance": False,
+                "completed_line_mutated": False,
             }
+            if worker_atomic_rejected:
+                result["worker_implementation_atomic_advance"] = False
+            if qa_parity_rejected:
+                result.update(
+                    {
+                        "qa_pass_write_compiler_parity_prevented": True,
+                        "remediation": (
+                            "replace non-canonical baseline statuses with "
+                            "baseline_observation, or submit explicit canonical "
+                            "no-PASS evidence; then resubmit QA verification"
+                        ),
+                        "next_legal_action": (
+                            "resubmit_qa_independent_verification_with_compiler_satisfying_evidence"
+                        ),
+                    }
+                )
+            return result
         try:
             self.store.update(
                 contract_execution_id,
@@ -11059,7 +11156,31 @@ class ContractRuntime:
                 actor_role=effective_actor_role,
             ),
         )
-        return {
+        postcondition_errors: list[str] = []
+        if gate_decision.ok:
+            _, candidate_record, written_line, _ = (
+                self._project_line_write_candidate(
+                    refreshed,
+                    effective_write,
+                    effective_actor_role=effective_actor_role,
+                    projected_completed_lines=projected_completed_lines,
+                    projection=projection,
+                    use_completed_line_projection=use_completed_line_projection,
+                )
+            )
+            postcondition_errors = _qa_authored_pass_atomic_completion_errors(
+                candidate_record,
+                written_line,
+            )
+            gate_decision = _gate_decision_with_additional_errors(
+                gate_decision,
+                postcondition_errors,
+            )
+        qa_parity_rejected = bool(
+            "qa_authored_pass_not_completion_satisfying"
+            in postcondition_errors
+        )
+        result = {
             "schema_version": "contract_runtime_line_write_precheck_result.v1",
             "ok": gate_decision.ok,
             "decision": _gate_decision_payload(gate_decision),
@@ -11073,6 +11194,30 @@ class ContractRuntime:
             ),
             "runtime_guide_hash": str(guide.get("runtime_guide_hash") or ""),
         }
+        if postcondition_errors:
+            result.update(
+                {
+                    "zero_contract_runtime_write": True,
+                    "qa_pass_write_compiler_parity_prevented": (
+                        qa_parity_rejected
+                    ),
+                    "completed_line_mutated": False,
+                }
+            )
+        if qa_parity_rejected:
+            result.update(
+                {
+                    "remediation": (
+                        "replace non-canonical baseline statuses with "
+                        "baseline_observation, or submit explicit canonical "
+                        "no-PASS evidence; then resubmit QA verification"
+                    ),
+                    "next_legal_action": (
+                        "resubmit_qa_independent_verification_with_compiler_satisfying_evidence"
+                    ),
+                }
+            )
+        return result
 
     def _load_pinned_definition(self, record: Mapping[str, Any]) -> dict[str, Any]:
         definition = self.registry.get(
