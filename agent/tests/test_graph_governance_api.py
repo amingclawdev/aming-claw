@@ -163990,6 +163990,30 @@ def test_entered_batch_without_epoch_projects_current_successor_read_only(
         assert successor["graph_snapshot_id"] == current_snapshot["snapshot_id"]
         assert successor["merge_queue_item"]["base_commit"] == historical_head
         assert successor["merge_queue_item"]["validated_target_head"] == historical_head
+        successor_backlog_id = successor["backlog_id"]
+        successor_task_id = successor["task_id"]
+        child_parent_id = server._onboard_service_execution_id(
+            PID,
+            successor_backlog_id,
+        )
+        expected_successor_id = server._mf_parallel_execution_id(
+            PID,
+            successor_backlog_id,
+            child_parent_id,
+            successor_task_id,
+        )
+        if "action_input" in action:
+            assert action["action_input"]["task_id"] == expected_successor_id
+        if "server_derived_authority" in action:
+            assert action["server_derived_authority"][
+                "batch_parent_contract_execution_id"
+            ] == entered["parent_contract_execution_id"]
+            assert action["server_derived_authority"][
+                "child_parent_contract_execution_id"
+            ] == child_parent_id
+            assert action["server_derived_authority"]["child_parent_source"] == (
+                "generated_onboard_service_waiver"
+            )
     assert full["runtime_resume"]["source"] == "durable_entered_batch"
     assert compact_replay["next_legal_action"] == compact["next_legal_action"]
     assert compact_replay["guide_capsule_ref"] == compact["guide_capsule_ref"]
@@ -164002,6 +164026,58 @@ def test_entered_batch_without_epoch_projects_current_successor_read_only(
     assert conn.execute(
         "SELECT COUNT(*) FROM parallel_branch_runtime_contexts"
     ).fetchone()[0] == before["runtime"]
+
+    # The read-only guide and the mutating entrypoint must name the same
+    # child-row ContractRuntime world.  This is the join the demo exercises:
+    # Batch owns row custody, while the child onboard waiver owns the row-local
+    # parent required by the generic successor mapping contract.
+    resume_action = full["next_legal_action"]
+    resume_body = copy.deepcopy(
+        resume_action["successor_action_input"]["static_body"]
+    )
+    resumed_backlog_id = resume_action["backlog_id"]
+    resumed_parent_id = server._onboard_service_execution_id(
+        PID,
+        resumed_backlog_id,
+    )
+    resumed_execution_id = server._mf_parallel_execution_id(
+        PID,
+        resumed_backlog_id,
+        resumed_parent_id,
+        resume_action["task_id"],
+    )
+    resumed_route_ref = "rtok-entered-batch-resume-child"
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=resumed_backlog_id,
+        contract_execution_id=resumed_execution_id,
+        route_token_ref=resumed_route_ref,
+        allowed_actions=[
+            "mf_parallel_enter",
+            "mf_parallel_revise",
+            "contract_runtime_current",
+            "contract_runtime_submit_line",
+            "task_timeline_append",
+        ],
+    )
+    resume_body.update(
+        {
+            "observer_session_id": prepared["observer_session_id"],
+            "observer_route_token_ref": resumed_route_ref,
+        }
+    )
+    resumed = server.handle_project_mf_parallel_enter(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=resume_body,
+        )
+    )
+    assert resumed["contract_execution_id"] == resumed_execution_id
+    assert resumed["parent_contract_execution_id"] == resumed_parent_id
+    assert resumed["worker_cardinality_policy"]["source"] == (
+        "verified_batch_child_lineage"
+    )
 
     file_db = tmp_path / "entered-batch-resume.db"
     disk = sqlite3.connect(file_db)

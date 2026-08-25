@@ -123709,13 +123709,21 @@ def _entered_batch_successor_resume_projection(
     successor_body["graph_snapshot_id"] = current_snapshot_id
     child_backlog_id = str(selected.get("backlog_id") or "").strip()
     child_task_id = str(selected.get("task_id") or "").strip()
-    parent_execution_id = str(
+    batch_parent_execution_id = str(
         payload.get("parent_contract_execution_id") or ""
     ).strip()
+    # Each Batch row remains a backlog-scoped ContractRuntime chain.  The
+    # accepted Batch event owns scheduling/custody, while the generated
+    # onboard-service waiver deterministically creates that child row's
+    # service parent when mf_parallel_enter executes.
+    child_parent_execution_id = _onboard_service_execution_id(
+        project_id,
+        child_backlog_id,
+    )
     successor_execution_id = _mf_parallel_execution_id(
         project_id,
         child_backlog_id,
-        parent_execution_id,
+        child_parent_execution_id,
         child_task_id,
     )
     target_files = _runtime_context_public_file_values(
@@ -123788,6 +123796,9 @@ def _entered_batch_successor_resume_projection(
         "stale_count": stale_queue_item_count,
         "server_derived_authority": {
             "event_ref": f"timeline:{int(event['id'])}",
+            "batch_parent_contract_execution_id": batch_parent_execution_id,
+            "child_parent_contract_execution_id": child_parent_execution_id,
+            "child_parent_source": "generated_onboard_service_waiver",
             "entered_batch_verified": True,
             "durable_queue_verified": True,
             "current_target_head_verified": True,
