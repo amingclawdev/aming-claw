@@ -67009,6 +67009,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
     context_owned_files: tuple[str, ...] = ("agent/governance/server.py",),
     dispatch_owned_files: tuple[str, ...] | None = None,
     pre_initial_join_snapshot: dict[str, Any] | None = None,
+    initial_join_host_session_id: str = "",
 ):
     """Create one accepted initial join with no read/startup lineage."""
 
@@ -67019,6 +67020,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
     parent_task_id = f"cex-pre-lineage-rejoin-{suffix}"
     worker_id = f"desktop-pre-lineage-rejoin-{suffix}"
     worker_session_id = f"desktop-session-pre-lineage-rejoin-{suffix}"
+    host_session_id = initial_join_host_session_id or worker_session_id
     host_startup_id = f"desktop-startup-pre-lineage-rejoin-{suffix}"
     target_root = tmp_path / f"pre-lineage-rejoin-{suffix}"
     target_root.mkdir()
@@ -67265,7 +67267,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
         "actual_host_worker_id": worker_id,
         "worker_session_id": worker_session_id,
         "host_startup_id": host_startup_id,
-        "host_session_id": worker_session_id,
+        "host_session_id": host_session_id,
         **route_identity,
         "reason": "issue the only initial host envelope for this Desktop worker",
         "ttl_seconds": 3600,
@@ -67360,6 +67362,7 @@ def _setup_pre_lineage_rejoin_recovery_case(
         "parent_task_id": parent_task_id,
         "worker_id": worker_id,
         "worker_session_id": worker_session_id,
+        "host_session_id": host_session_id,
         "host_startup_id": host_startup_id,
         "target_root": target_root,
         "route_identity": route_identity,
@@ -67817,7 +67820,7 @@ def _pre_lineage_rejoin_body(case: Mapping[str, Any]) -> dict[str, Any]:
         "actual_host_worker_id": case["worker_id"],
         "worker_session_id": case["worker_session_id"],
         "host_startup_id": case["host_startup_id"],
-        "host_session_id": case["worker_session_id"],
+        "host_session_id": case["host_session_id"],
         "session_token_ref": runtime_context_session_token_ref(case["context"]),
         **case["route_identity"],
         "reason": "same Desktop worker lost the accepted envelope before lineage",
@@ -69793,7 +69796,11 @@ def test_pre_lineage_rejoin_guide_advertises_one_bounded_replacement(
         suffix="bounded-replacement-before-lineage",
         source_backed_contract_runtime=True,
         dispatch_status="passed",
+        initial_join_host_session_id=(
+            "desktop-host-session-bounded-replacement-before-lineage"
+        ),
     )
+    assert case["worker_session_id"] != case["host_session_id"]
 
     first = _pre_lineage_rejoin(case)
     assert first["bounded_rejoin_kind"] == "special_authority_rejoin"
@@ -69818,6 +69825,27 @@ def test_pre_lineage_rejoin_guide_advertises_one_bounded_replacement(
     assert eligibility["authority"]["current_session_token_ref"] == (
         runtime_context_session_token_ref(context)
     )
+
+    with pytest.raises(GovernanceError) as missing_auth:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": context.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "parent_task_id": case["parent_task_id"],
+                    "session_token_ref": runtime_context_session_token_ref(context),
+                    "target_project_root": str(case["target_root"]),
+                },
+            )
+        )
+    projected_rejoin = missing_auth.value.details["actionable_payloads"][
+        "session_token_rejoin_submission"
+    ]["copy_safe_body"]
+    assert projected_rejoin["worker_session_id"] == case["worker_session_id"]
+    assert projected_rejoin["host_session_id"] == case["host_session_id"]
 
     replacement = _pre_lineage_rejoin(
         case,
@@ -73894,7 +73922,9 @@ def test_runtime_context_pre_lineage_rejoin_guide_projects_same_call_parse_and_b
         monkeypatch,
         tmp_path,
         suffix="guide",
+        initial_join_host_session_id="desktop-host-session-pre-lineage-guide",
     )
+    assert case["worker_session_id"] != case["host_session_id"]
 
     with pytest.raises(GovernanceError) as missing_auth:
         server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
@@ -73962,6 +73992,30 @@ def test_runtime_context_pre_lineage_rejoin_guide_projects_same_call_parse_and_b
     assert "do not persist" in instructions
     assert "do not retry" in instructions
     assert "stop_and_report_bounded_pre_lineage_recovery_exhausted" in instructions
+
+    before_context = get_branch_context(conn, PID, case["task_id"])
+    assert before_context is not None
+    before_events = _pre_lineage_case_events(conn, case)
+    with pytest.raises(GovernanceError) as wrong_worker_session:
+        _pre_lineage_rejoin(
+            case,
+            body_updates={"worker_session_id": case["host_session_id"]},
+        )
+    assert wrong_worker_session.value.code == (
+        "runtime_context_pre_lineage_rejoin_identity_mismatch"
+    )
+    assert wrong_worker_session.value.details["field"] == "worker_session_id"
+    _assert_pre_lineage_rejoin_zero_write(
+        conn,
+        case,
+        wrong_worker_session.value,
+        before_context=before_context,
+        before_events=before_events,
+    )
+
+    accepted = _pre_lineage_rejoin(case)
+    assert accepted["ok"] is True
+    assert accepted["pre_lineage_auth_only_rejoin"] is True
 
 
 def test_runtime_context_session_token_initial_join_accepts_renewed_route_token_ref(

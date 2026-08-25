@@ -42296,6 +42296,29 @@ def _runtime_context_worker_recovery_details(
             )
             is True
         )
+        rejoin_authority = (
+            session_token_rejoin_eligibility.get("authority")
+            if isinstance(
+                session_token_rejoin_eligibility.get("authority"),
+                Mapping,
+            )
+            else {}
+        )
+        expected_rejoin_worker_session_id = str(
+            rejoin_authority.get("worker_session_id")
+            or (
+                _runtime_context_initial_join_worker_session_id(
+                    timeline_events,
+                    runtime_context_id=expected_runtime_context_id,
+                    task_id=str(getattr(context, "task_id", "") or ""),
+                    backlog_id=str(getattr(context, "backlog_id", "") or ""),
+                )
+                if missing_worker_lineage
+                else ""
+            )
+            or getattr(context, "host_session_id", "")
+            or ""
+        ).strip()
         if auth_authorization_invalid:
             diagnostics["reason"] = (
                 "worker_auth_material_missing"
@@ -42469,7 +42492,7 @@ def _runtime_context_worker_recovery_details(
                         "worker_slot_id": expected_worker_slot_id,
                         "agent_id": expected_actual_host_worker_id,
                         "actual_host_worker_id": expected_actual_host_worker_id,
-                        "worker_session_id": expected_host_session_id,
+                        "worker_session_id": expected_rejoin_worker_session_id,
                         "host_startup_id": str(
                             getattr(context, "host_startup_id", "") or ""
                         ),
@@ -42630,9 +42653,7 @@ def _runtime_context_worker_recovery_details(
             actual_host_worker_id=str(
                 getattr(context, "actual_host_worker_id", "") or ""
             ),
-            worker_session_id=str(
-                getattr(context, "host_session_id", "") or ""
-            ),
+            worker_session_id=expected_rejoin_worker_session_id,
             host_startup_id=str(getattr(context, "host_startup_id", "") or ""),
             host_session_id=str(getattr(context, "host_session_id", "") or ""),
             branch_ref=str(getattr(context, "branch_ref", "") or ""),
@@ -44650,11 +44671,67 @@ def _runtime_context_rejoin_public_identity_mismatches(
     ]
 
 
+def _runtime_context_initial_join_worker_session_id(
+    timeline_events: Sequence[Mapping[str, Any]],
+    *,
+    runtime_context_id: str,
+    task_id: str,
+    backlog_id: str,
+) -> str:
+    """Return the sole accepted initial-join worker-session identity.
+
+    A Desktop/Codex worker session is intentionally independent from the
+    persisted host session.  Pre-lineage recovery must therefore reuse the
+    canonical initial-join audit value instead of projecting host_session_id
+    into both identity fields.
+    """
+
+    accepted_worker_session_ids: list[str] = []
+    for event in timeline_events:
+        if not isinstance(event, Mapping):
+            continue
+        payload = (
+            event.get("payload")
+            if isinstance(event.get("payload"), Mapping)
+            else {}
+        )
+        if not (
+            str(event.get("event_type") or "").strip()
+            == "observer.runtime_context_session_token_initial_join"
+            and str(event.get("event_kind") or "").strip()
+            == "observer_command"
+            and str(event.get("phase") or "").strip()
+            == "runtime_context_initial_join"
+            and str(event.get("status") or "").strip().lower()
+            == "accepted"
+            and str(payload.get("action") or "").strip()
+            == "runtime_context_session_token_initial_join"
+            and str(payload.get("runtime_context_id") or "").strip()
+            == str(runtime_context_id or "").strip()
+            and str(event.get("task_id") or payload.get("task_id") or "").strip()
+            == str(task_id or "").strip()
+            and str(
+                event.get("backlog_id") or payload.get("backlog_id") or ""
+            ).strip()
+            == str(backlog_id or "").strip()
+        ):
+            continue
+        worker_session_id = str(
+            payload.get("worker_session_id") or ""
+        ).strip()
+        if worker_session_id:
+            accepted_worker_session_ids.append(worker_session_id)
+    if len(accepted_worker_session_ids) != 1:
+        return ""
+    return accepted_worker_session_ids[0]
+
+
 def _runtime_context_rejoin_request_identity_mismatches(
     body: Mapping[str, Any],
     *,
     runtime_context_id: str,
     context: Any,
+    worker_session_id: str = "",
 ) -> list[dict[str, str]]:
     """Compare caller-supplied rejoin identity with durable copy-body state.
 
@@ -44689,7 +44766,9 @@ def _runtime_context_rejoin_request_identity_mismatches(
         ).strip(),
         "actual_host_worker_id": agent_id,
         "worker_session_id": str(
-            getattr(context, "host_session_id", "") or ""
+            worker_session_id
+            or getattr(context, "host_session_id", "")
+            or ""
         ).strip(),
         "host_startup_id": str(
             getattr(context, "host_startup_id", "") or ""
@@ -58481,6 +58560,15 @@ def _runtime_context_pre_lineage_guidance_authority(
         getattr(context, "actual_host_worker_id", "") or ""
     ).strip()
     host_session_id = str(getattr(context, "host_session_id", "") or "").strip()
+    worker_session_id = (
+        _runtime_context_initial_join_worker_session_id(
+            timeline_events,
+            runtime_context_id=runtime_context_id,
+            task_id=str(getattr(context, "task_id", "") or "").strip(),
+            backlog_id=str(getattr(context, "backlog_id", "") or "").strip(),
+        )
+        or host_session_id
+    )
     body = {
         "runtime_context_id": runtime_context_id,
         "task_id": str(getattr(context, "task_id", "") or "").strip(),
@@ -58492,7 +58580,7 @@ def _runtime_context_pre_lineage_guidance_authority(
         ).strip(),
         "agent_id": actual_host_worker_id,
         "actual_host_worker_id": actual_host_worker_id,
-        "worker_session_id": host_session_id,
+        "worker_session_id": worker_session_id,
         "host_startup_id": str(
             getattr(context, "host_startup_id", "") or ""
         ).strip(),
@@ -60917,11 +61005,22 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
             )
             if not present
         ]
+        expected_rejoin_worker_session_id = (
+            _runtime_context_initial_join_worker_session_id(
+                timeline_events,
+                runtime_context_id=runtime_context_id,
+                task_id=context.task_id,
+                backlog_id=context.backlog_id,
+            )
+            if missing_lineage
+            else ""
+        )
         request_identity_mismatches = (
             _runtime_context_rejoin_request_identity_mismatches(
                 body,
                 runtime_context_id=runtime_context_id,
                 context=context,
+                worker_session_id=expected_rejoin_worker_session_id,
             )
         )
         if legacy_startup_template_repair_authority:
