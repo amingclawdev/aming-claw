@@ -42326,15 +42326,11 @@ def _runtime_context_worker_recovery_details(
         )
         expected_rejoin_worker_session_id = str(
             rejoin_authority.get("worker_session_id")
-            or (
-                _runtime_context_initial_join_worker_session_id(
-                    timeline_events,
-                    runtime_context_id=expected_runtime_context_id,
-                    task_id=str(getattr(context, "task_id", "") or ""),
-                    backlog_id=str(getattr(context, "backlog_id", "") or ""),
-                )
-                if missing_worker_lineage
-                else ""
+            or _runtime_context_initial_join_worker_session_id(
+                timeline_events,
+                runtime_context_id=expected_runtime_context_id,
+                task_id=str(getattr(context, "task_id", "") or ""),
+                backlog_id=str(getattr(context, "backlog_id", "") or ""),
             )
             or getattr(context, "host_session_id", "")
             or ""
@@ -61153,8 +61149,6 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                 task_id=context.task_id,
                 backlog_id=context.backlog_id,
             )
-            if missing_lineage
-            else ""
         )
         request_identity_mismatches = (
             _runtime_context_rejoin_request_identity_mismatches(

@@ -612,6 +612,159 @@ def test_exact_candidate_post_merge_qa_accepts_parentless_direct_main_without_ru
     }
 
 
+def test_post_startup_rejoin_preserves_canonical_worker_and_host_identity(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="post-startup-worker-host-identity",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+        initial_join_host_session_id="desktop-host-post-startup-identity",
+    )
+    special = _pre_lineage_rejoin(case)
+    receipt_hash = _fake_sha("post-startup-worker-host-identity-read")
+    read = server.handle_graph_governance_runtime_context_read_receipt(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": case["context"].runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": case["context"].runtime_context_id,
+                "contract_execution_id": case["parent_task_id"],
+                "task_id": case["task_id"],
+                "parent_task_id": case["parent_task_id"],
+                "worker_id": case["worker_id"],
+                "worker_slot_id": case["worker_id"],
+                "fence_token": special["fence_token"],
+                "session_token": special["session_token"],
+                "session_token_ref": special["session_token_ref"],
+                "target_project_root": str(case["target_root"]),
+                "actor": case["worker_id"],
+                "read_receipt_hash": receipt_hash,
+                "launch_text_hash": _fake_sha(
+                    "post-startup-worker-host-identity-launch"
+                ),
+                **case["route_identity"],
+            },
+        )
+    )
+    context = get_branch_context(conn, PID, case["task_id"])
+    assert context is not None
+    startup = server.handle_graph_governance_runtime_context_startup(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": context.runtime_context_id,
+            },
+            "mf_sub",
+            method="POST",
+            body={
+                "runtime_context_id": context.runtime_context_id,
+                "contract_execution_id": case["parent_task_id"],
+                "task_id": case["task_id"],
+                "parent_task_id": case["parent_task_id"],
+                "session_token": special["session_token"],
+                "session_token_ref": special["session_token_ref"],
+                "fence_token": special["fence_token"],
+                "target_project_root": str(case["target_root"]),
+                "agent_id": case["worker_id"],
+                "actual_host_worker_id": case["worker_id"],
+                "worker_session_id": case["worker_session_id"],
+                "host_startup_id": case["host_startup_id"],
+                "host_session_id": case["host_session_id"],
+                "worker_transcript_ref": f"codex:{case['worker_session_id']}",
+                "harness_type": "codex",
+                "filer_principal": case["worker_session_id"],
+                "actual_cwd": str(case["target_root"]),
+                "actual_git_root": str(case["target_root"]),
+                "branch": context.branch_ref,
+                "head_commit": context.head_commit,
+                "base_commit": context.base_commit,
+                "target_head_commit": context.target_head_commit,
+                "merge_queue_id": context.merge_queue_id,
+                "owned_files": list(context.owned_files),
+                "read_receipt_hash": receipt_hash,
+                "read_receipt_event_id": str(read["timeline_event"]["id"]),
+                "startup_source": "codex_desktop_governed_dispatch",
+                **case["route_identity"],
+            },
+        )
+    )
+    assert startup["ok"] is True
+
+    current = get_branch_context(conn, PID, case["task_id"])
+    assert current is not None
+    assert case["worker_session_id"] != case["host_session_id"]
+    assert current.host_session_id == case["host_session_id"]
+    with pytest.raises(GovernanceError) as missing_auth:
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": current.runtime_context_id,
+                },
+                "mf_sub",
+                query={
+                    "task_id": case["task_id"],
+                    "parent_task_id": case["parent_task_id"],
+                    "session_token_ref": runtime_context_session_token_ref(current),
+                    "target_project_root": str(case["target_root"]),
+                    **case["route_identity"],
+                },
+            )
+        )
+    rejoin_body = copy.deepcopy(
+        missing_auth.value.details["actionable_payloads"][
+            "session_token_rejoin_submission"
+        ]["copy_safe_body"]
+    )
+    assert rejoin_body["worker_session_id"] == case["worker_session_id"]
+    assert rejoin_body["host_session_id"] == case["host_session_id"]
+
+    stale_host_body = {**rejoin_body, "worker_session_id": case["host_session_id"]}
+    before_rejection = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as stale_host:
+        server.handle_graph_governance_runtime_context_session_token_rejoin(
+            _ctx_with_role(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": current.runtime_context_id,
+                },
+                "coordinator",
+                method="POST",
+                body=stale_host_body,
+            )
+        )
+    assert stale_host.value.code == "runtime_context_rejoin_identity_mismatch"
+    assert stale_host.value.details["field"] == "worker_session_id"
+    assert "\n".join(conn.iterdump()) == before_rejection
+
+    rejoin_body["reason"] = "recover the exact worker after accepted startup"
+    ordinary = server.handle_graph_governance_runtime_context_session_token_rejoin(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "runtime_context_id": current.runtime_context_id,
+            },
+            "coordinator",
+            method="POST",
+            body=rejoin_body,
+        )
+    )
+    assert ordinary["bounded_rejoin_kind"] == "ordinary_initial_rejoin"
+    assert ordinary["host_envelope"]["runtime_context_id"] == (
+        current.runtime_context_id
+    )
+
+
 @pytest.mark.parametrize(
     "field",
     [
