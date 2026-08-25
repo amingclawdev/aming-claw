@@ -44698,12 +44698,16 @@ def _runtime_context_initial_join_worker_session_id(
     task_id: str,
     backlog_id: str,
 ) -> str:
-    """Return the sole accepted initial-join worker-session identity.
+    """Return the unique accepted initial-join worker-session identity.
 
     A Desktop/Codex worker session is intentionally independent from the
     persisted host session.  Pre-lineage recovery must therefore reuse the
     canonical initial-join audit value instead of projecting host_session_id
-    into both identity fields.
+    into both identity fields.  Repeated accepted audit records may preserve
+    different lease or route history while naming the same worker session, so
+    projection resolves identity cardinality rather than event cardinality.
+    The separate pre-lineage authorization gate still requires exactly one
+    accepted audit record before it permits a rejoin.
     """
 
     accepted_worker_session_ids: list[str] = []
@@ -44741,9 +44745,28 @@ def _runtime_context_initial_join_worker_session_id(
         ).strip()
         if worker_session_id:
             accepted_worker_session_ids.append(worker_session_id)
-    if len(accepted_worker_session_ids) != 1:
+    unique_worker_session_ids = list(dict.fromkeys(accepted_worker_session_ids))
+    if len(unique_worker_session_ids) > 1:
+        raise GovernanceError(
+            "runtime_context_initial_join_worker_session_identity_conflict",
+            (
+                "accepted initial-join audits disagree on canonical "
+                "worker_session_id"
+            ),
+            details={
+                "runtime_context_id": str(runtime_context_id or "").strip(),
+                "task_id": str(task_id or "").strip(),
+                "backlog_id": str(backlog_id or "").strip(),
+                "audit_cardinality": len(accepted_worker_session_ids),
+                "identity_cardinality": len(unique_worker_session_ids),
+                "worker_session_ids": unique_worker_session_ids,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    if not unique_worker_session_ids:
         return ""
-    return accepted_worker_session_ids[0]
+    return unique_worker_session_ids[0]
 
 
 def _runtime_context_rejoin_request_identity_mismatches(

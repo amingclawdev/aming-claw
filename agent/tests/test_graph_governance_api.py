@@ -72971,6 +72971,35 @@ def test_runtime_context_pre_lineage_rejoin_resolves_renewal_descendant_and_rebi
     assert revision_renewal["route_token_ref"] == renewed["route_token_ref"]
     assert revision_renewal["registry_verified"] is True
 
+    repeated_initial_join_payload = copy.deepcopy(
+        case["initial_join_event"]["payload"]
+    )
+    repeated_initial_join_payload["reason"] = (
+        "preserve a later accepted route and lease audit for the same worker"
+    )
+    repeated_initial_join_payload["session_token_ref"] = rejoin[
+        "session_token_ref"
+    ]
+    task_timeline.record_event(
+        conn,
+        project_id=PID,
+        task_id=case["task_id"],
+        backlog_id=case["backlog_id"],
+        event_type="observer.runtime_context_session_token_initial_join",
+        event_kind="observer_command",
+        phase="runtime_context_initial_join",
+        status="accepted",
+        actor="observer-repeated-initial-join-audit",
+        payload=repeated_initial_join_payload,
+    )
+    conn.commit()
+    assert server._runtime_context_initial_join_worker_session_id(
+        _pre_lineage_case_events(conn, case),
+        runtime_context_id=case["context"].runtime_context_id,
+        task_id=case["task_id"],
+        backlog_id=case["backlog_id"],
+    ) == case["worker_session_id"]
+
     read_receipt = server.handle_graph_governance_runtime_context_read_receipt(
         _ctx_with_role(
             {
@@ -73975,6 +74004,49 @@ def test_runtime_context_pre_lineage_rejoin_requires_exactly_one_canonical_initi
         before_context=before_context,
         before_events=before_events,
     )
+
+
+def test_runtime_context_initial_join_worker_identity_conflict_fails_closed():
+    runtime_context_id = "mfrctx-initial-join-worker-identity-conflict"
+    task_id = "worker-initial-join-worker-identity-conflict"
+    backlog_id = "AC-INITIAL-JOIN-WORKER-IDENTITY-CONFLICT"
+
+    def accepted_event(worker_session_id):
+        return {
+            "event_type": "observer.runtime_context_session_token_initial_join",
+            "event_kind": "observer_command",
+            "phase": "runtime_context_initial_join",
+            "status": "accepted",
+            "task_id": task_id,
+            "backlog_id": backlog_id,
+            "payload": {
+                "action": "runtime_context_session_token_initial_join",
+                "runtime_context_id": runtime_context_id,
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "worker_session_id": worker_session_id,
+            },
+        }
+
+    with pytest.raises(GovernanceError) as conflict:
+        server._runtime_context_initial_join_worker_session_id(
+            [accepted_event("desktop-worker-a"), accepted_event("desktop-worker-b")],
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+
+    assert conflict.value.code == (
+        "runtime_context_initial_join_worker_session_identity_conflict"
+    )
+    assert conflict.value.details["audit_cardinality"] == 2
+    assert conflict.value.details["identity_cardinality"] == 2
+    assert conflict.value.details["worker_session_ids"] == [
+        "desktop-worker-a",
+        "desktop-worker-b",
+    ]
+    assert conflict.value.details["zero_write_rejection"] is True
+    assert conflict.value.details["writes_performed"] is False
 
 
 def test_runtime_context_pre_lineage_rejoin_guide_projects_same_call_parse_and_bounded_stop_contract(
