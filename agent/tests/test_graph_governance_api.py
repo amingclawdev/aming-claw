@@ -180333,6 +180333,50 @@ def test_mf_parallel_postworker_projection_orders_lane_merges_after_workers():
     assert merged[4]["task_id"] == "postworker-reminder"
 
 
+def test_mf_parallel_postmerge_projection_orders_integration_before_durable_qa():
+    parent_task_id = "cex-postmerge-durable-qa-order"
+    runtime_context_id = "mfrctx-postmerge-durable-qa-order"
+    task_id = "postmerge-durable-qa-order"
+
+    def line(stage_id, line_id, *, line_task_id=task_id):
+        return {
+            "stage_id": stage_id,
+            "line_id": line_id,
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
+            "runtime_context_id": runtime_context_id,
+            "task_id": line_task_id,
+            "parent_task_id": parent_task_id,
+        }
+
+    completed = [
+        line("worker_finish", "worker_finish_gate"),
+        line(
+            "qa_graph_context",
+            "qa_graph_context",
+            line_task_id=parent_task_id,
+        ),
+        line("qa", "qa_independent_verification"),
+    ]
+    projected = [
+        line("observer_lane_merge", "observer_merge"),
+        line("observer_reconcile", "observer_reconcile"),
+    ]
+
+    merged = server._contract_runtime_merge_projected_completed_lines(
+        completed,
+        projected,
+        postmerge_revision=True,
+    )
+
+    assert [item["line_id"] for item in merged] == [
+        "worker_finish_gate",
+        "observer_merge",
+        "observer_reconcile",
+        "qa_graph_context",
+        "qa_independent_verification",
+    ]
+
+
 def test_exact_candidate_postmerge_provenance_uses_direct_lane_merge_binding(
     conn,
     monkeypatch,
@@ -180981,6 +181025,7 @@ def test_rev9_postmerge_projection_requires_fresh_qa_after_reconcile(
     task_id = "rev9-fresh-postmerge-final-lane"
     runtime_context_id = "mfrctx-rev9-fresh-postmerge-final-lane"
     candidate_commit = "8" * 40
+    lane_merge_commit = "a" * 40
     merged_commit = "9" * 40
     target_root = "/tmp/rev9-fresh-postmerge-canonical"
     premerge_trace_id = "gqt-rev9-premerge-candidate"
@@ -181063,7 +181108,7 @@ def test_rev9_postmerge_projection_requires_fresh_qa_after_reconcile(
         phase="live_merge",
         actor="observer",
         created_at="2026-08-16T01:01:00Z",
-        commit_sha=merged_commit,
+        commit_sha=lane_merge_commit,
     )
     reconcile = event(
         102,
@@ -181158,7 +181203,8 @@ def test_rev9_postmerge_projection_requires_fresh_qa_after_reconcile(
             "runtime_context_id": runtime_context_id,
             "task_id": task_id,
             "parent_task_id": parent_task_id,
-            "merge_commit": merged_commit,
+            "merge_commit": lane_merge_commit,
+            "merged_commit_sha": lane_merge_commit,
             "merge_event_ref": "timeline:101",
             "merge_event_id": 101,
         },
@@ -181198,12 +181244,14 @@ def test_rev9_postmerge_projection_requires_fresh_qa_after_reconcile(
         context=context,
         timeline_events=[premerge, merge, reconcile, final_qa],
     )
-    assert {line["line_id"] for line in after_final} == {
+    assert [line["line_id"] for line in after_final] == [
         "observer_merge",
         "observer_reconcile",
         "qa_graph_context",
         "qa_independent_verification",
-    }
+    ]
+    assert after_final[0]["commit_sha"] == lane_merge_commit
+    assert after_final[1]["commit_sha"] == merged_commit
 
     wrong_commit = copy.deepcopy(final_qa)
     wrong_commit["commit_sha"] = "7" * 40
@@ -181284,13 +181332,13 @@ def test_rev9_postmerge_projection_requires_fresh_qa_after_reconcile(
         context=context,
         timeline_events=[premerge, merge, reconcile, final_qa, close_ready],
     )
-    assert {line["line_id"] for line in after_close} == {
+    assert [line["line_id"] for line in after_close] == [
         "observer_merge",
         "observer_reconcile",
         "qa_graph_context",
         "qa_independent_verification",
         "observer_close_ready",
-    }
+    ]
 
 
 def test_rev9_reconcile_authority_uses_selected_lane_with_aggregate_final_merge(

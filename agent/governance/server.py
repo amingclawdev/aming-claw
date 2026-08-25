@@ -110360,6 +110360,9 @@ def _contract_runtime_mf_parallel_context_projection(
         _contract_runtime_merge_projected_completed_lines(
             projection_base_lines,
             projected_lines,
+            postmerge_revision=_is_mf_parallel_postmerge_revision(
+                record
+            ),
         )
         if projected_lines
         else projection_base_lines
@@ -110434,6 +110437,8 @@ def _contract_runtime_mf_parallel_context_projection(
 def _contract_runtime_merge_projected_completed_lines(
     completed_lines: Sequence[Mapping[str, Any]],
     projected_lines: Sequence[Mapping[str, Any]],
+    *,
+    postmerge_revision: bool = False,
 ) -> list[Mapping[str, Any]]:
     completed = [line for line in completed_lines if isinstance(line, Mapping)]
     projected = [line for line in projected_lines if isinstance(line, Mapping)]
@@ -110466,15 +110471,56 @@ def _contract_runtime_merge_projected_completed_lines(
         if lane_key is not None:
             last_completed_lane_index[lane_key] = index
 
+    first_completed_qa_index_by_context: dict[str, int] = {}
+    if postmerge_revision:
+        for index, line in enumerate(completed):
+            if str(line.get("line_id") or "").strip() not in {
+                "qa_graph_context",
+                "qa_independent_verification",
+            }:
+                continue
+            runtime_context_id = str(
+                line.get("runtime_context_id") or ""
+            ).strip()
+            line_instance_id = str(
+                line.get("line_instance_id") or ""
+            ).strip()
+            if (
+                runtime_context_id
+                and line_instance_id
+                == f"runtime_context:{runtime_context_id}"
+            ):
+                first_completed_qa_index_by_context.setdefault(
+                    runtime_context_id,
+                    index,
+                )
+
+    deferred_before_qa: dict[int, list[int]] = {}
     deferred_by_lane_anchor: dict[int, list[int]] = {}
     for projected_index, line in enumerate(projected):
-        if str(line.get("line_id") or "").strip() not in {
+        line_id = str(line.get("line_id") or "").strip()
+        if line_id not in {
             "qa_graph_context",
             "qa_independent_verification",
             "observer_merge",
             "observer_reconcile",
             "observer_close_ready",
         }:
+            continue
+        runtime_context_id = str(
+            line.get("runtime_context_id") or ""
+        ).strip()
+        if (
+            postmerge_revision
+            and line_id in {"observer_merge", "observer_reconcile"}
+            and runtime_context_id in first_completed_qa_index_by_context
+        ):
+            qa_index = first_completed_qa_index_by_context[
+                runtime_context_id
+            ]
+            deferred_before_qa.setdefault(qa_index, []).append(
+                projected_index
+            )
             continue
         lane_key = direct_lane_key(line)
         if lane_key is None:
@@ -110521,6 +110567,7 @@ def _contract_runtime_merge_projected_completed_lines(
     deferred = {
         projected_index
         for projected_indexes in (
+            *deferred_before_qa.values(),
             *deferred_by_lane_anchor.values(),
             *deferred_by_merge.values(),
         )
@@ -110530,6 +110577,14 @@ def _contract_runtime_merge_projected_completed_lines(
     merged: list[Mapping[str, Any]] = []
     inserted: set[int] = set()
     for completed_index, line in enumerate(completed):
+        for projected_index in deferred_before_qa.get(
+            completed_index,
+            [],
+        ):
+            if projected_index in inserted:
+                continue
+            merged.append(projected[projected_index])
+            inserted.add(projected_index)
         merged.append(line)
         if str(line.get("line_id") or "").strip() == (
             "observer_dispatch_bounded_workers"
@@ -113589,6 +113644,8 @@ def _contract_runtime_projection_post_worker_lines(
         close_ready_event = {}
 
     lines: list[dict[str, Any]] = []
+    qa_lines: list[dict[str, Any]] = []
+    integration_lines: list[dict[str, Any]] = []
     qa_graph_line_instance_id = f"runtime_context:{runtime_context_id}"
     qa_graph_line_present = bool(qa_graph_refs.get("db_verified"))
     if not bounded_qa_policy:
@@ -113605,7 +113662,7 @@ def _contract_runtime_projection_post_worker_lines(
         and qa_graph_line_present
         and not authoritative_qa_premerge_only
     ):
-        lines.append(
+        qa_lines.append(
             _contract_runtime_projected_qa_graph_line(
                 record=record,
                 context=context,
@@ -113618,7 +113675,7 @@ def _contract_runtime_projection_post_worker_lines(
         and qa_graph_line_present
         and not authoritative_qa_premerge_only
     ):
-        lines.append(
+        qa_lines.append(
             _contract_runtime_projected_post_worker_line(
                 record=record,
                 context=context,
@@ -113631,7 +113688,7 @@ def _contract_runtime_projection_post_worker_lines(
             )
         )
     if merge_event:
-        lines.append(
+        integration_lines.append(
             _contract_runtime_projected_post_worker_line(
                 record=record,
                 context=context,
@@ -113645,7 +113702,7 @@ def _contract_runtime_projection_post_worker_lines(
             )
         )
     if reconcile_event:
-        lines.append(
+        integration_lines.append(
             _contract_runtime_projected_post_worker_line(
                 record=record,
                 context=context,
@@ -113658,6 +113715,12 @@ def _contract_runtime_projection_post_worker_lines(
                 server_authority=reconcile_authority,
             )
         )
+    if postmerge_revision:
+        lines.extend(integration_lines)
+        lines.extend(qa_lines)
+    else:
+        lines.extend(qa_lines)
+        lines.extend(integration_lines)
     if close_ready_event and not authoritative_qa_premerge_only:
         derived_from = []
         if merge_event:
@@ -114304,8 +114367,19 @@ def _contract_runtime_projected_post_worker_line(
                     ),
                 }
             )
+    server_authority = server_authority or {}
+    authority_commit = (
+        (
+            server_authority.get("reconciled_commit_sha")
+            or server_authority.get("canonical_head_commit")
+            or server_authority.get("active_snapshot_commit")
+            or server_authority.get("merged_commit_sha")
+        )
+        if line_id == "observer_reconcile"
+        else server_authority.get("merged_commit_sha")
+    )
     commit_sha = str(
-        (server_authority or {}).get("merged_commit_sha")
+        authority_commit
         or event.get("commit_sha")
         or payload.get("commit_sha")
         or payload.get("merge_commit")
@@ -124009,6 +124083,9 @@ def _contract_runtime_shared_batch_child_lane_merge_authority(
             _contract_runtime_merge_projected_completed_lines(
                 record.get("completed_lines") or [],
                 projected_lines,
+                postmerge_revision=_is_mf_parallel_postmerge_revision(
+                    record
+                ),
             )
         )
         projection = _contract_runtime_rev8_two_worker_merge_projection(
