@@ -4394,7 +4394,7 @@ def test_runtime_context_current_values_accept_legacy_implementation_evidence_ki
     }
 
 
-def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_independent() -> None:
+def test_runtime_context_timeline_derived_evidence_binds_current_finish_without_cross_lane_overwrite() -> None:
     from agent.governance import parallel_branch_runtime as runtime
 
     context = _runtime_projection_context()
@@ -4570,6 +4570,73 @@ def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_in
             },
         ]
     )
+    other_runtime_context_id = "mfrctx-other-runtime-lane"
+    other_commit_sha = "9" * 40
+    other_lane_common = {
+        "runtime_context_id": other_runtime_context_id,
+        "task_id": context.task_id,
+        "parent_task_id": context.root_task_id,
+        "backlog_id": context.backlog_id,
+        "worker_role": "mf_sub",
+        "fence_token": "other-runtime-fence",
+        "head_commit": other_commit_sha,
+        **route_identity,
+    }
+    events.extend(
+        [
+            {
+                "id": 19090,
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "event_type": "mf_subagent.worker_commit",
+                "event_kind": "worker_commit",
+                "phase": "worker_commit",
+                "status": "passed",
+                "actor": "other-runtime-worker",
+                "commit_sha": other_commit_sha,
+                "payload": {
+                    **other_lane_common,
+                    "worker_commit_sha": other_commit_sha,
+                    "validated_head_commit": other_commit_sha,
+                },
+            },
+            {
+                "id": 19091,
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "event_type": "mf_subagent.finish_time_worker_attestation",
+                "event_kind": "worker_progress",
+                "phase": "finish_time_worker_attestation",
+                "status": "passed",
+                "actor": "other-runtime-worker",
+                "commit_sha": other_commit_sha,
+                "payload": {
+                    **other_lane_common,
+                    "action": "record_finish_time_worker_attestation",
+                    "finish_time_worker_self_attestation": {
+                        "status": "passed",
+                        "finish_time_self_attesting": True,
+                    },
+                },
+            },
+            {
+                "id": 19092,
+                "task_id": context.task_id,
+                "backlog_id": context.backlog_id,
+                "event_type": "mf_subagent.finish_gate",
+                "event_kind": "mf_subagent_finish_gate",
+                "phase": "finish_gate",
+                "status": "passed",
+                "actor": "other-runtime-worker",
+                "commit_sha": other_commit_sha,
+                "payload": {
+                    **other_lane_common,
+                    "validated_head_commit": other_commit_sha,
+                    "checkpoint_id": "other-runtime-checkpoint",
+                },
+            },
+        ]
+    )
     orders = (
         events,
         list(reversed(events)),
@@ -4602,6 +4669,13 @@ def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_in
             "timeline:19072",
             "timeline:19079",
         ]
+        assert refs["finish_time_attestation_event_refs"] == [
+            "timeline:19043",
+            "timeline:19052",
+            "timeline:19063",
+            "timeline:19071",
+            "timeline:19078",
+        ]
         assert refs["verification_event_refs"] == ["timeline:19080"]
         assert refs["route_action_precheck_event_ref"] == "timeline:19082"
         assert projection["finish_gate"]["event_id"] == "timeline:19079"
@@ -4609,6 +4683,9 @@ def test_runtime_context_timeline_derived_evidence_binds_current_finish_order_in
             commits[-1]
         )
         assert projection["route_identity"] == route_identity
+        assert "timeline:19090" not in refs.values()
+        assert "timeline:19091" not in refs["finish_time_attestation_event_refs"]
+        assert "timeline:19092" not in refs["finish_event_refs"]
     assert projections[0] == projections[1] == projections[2]
 
 
