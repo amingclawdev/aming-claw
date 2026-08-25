@@ -9679,6 +9679,107 @@ def _qa_git_object_source(
     }
 
 
+def _qa_git_object_byte_size(
+    project_root: Path,
+    *,
+    commit_sha: str,
+    path: str,
+) -> int:
+    result = _qa_git_bytes(
+        project_root,
+        ["cat-file", "-s", f"{commit_sha}:{path}"],
+    )
+    try:
+        byte_size = int(result.stdout.decode("ascii").strip())
+    except (UnicodeDecodeError, ValueError):
+        byte_size = -1
+    if result.returncode != 0 or byte_size < 0:
+        _qa_overlay_fail(
+            "git_blob_missing_requires_exact_candidate_snapshot",
+            "candidate overlay could not read a required git blob",
+            commit_sha=commit_sha,
+            path=path,
+        )
+    return byte_size
+
+
+def _qa_overlay_preflight_total_source_bytes(
+    project_root: Path,
+    *,
+    base_commit_sha: str,
+    candidate_commit_sha: str,
+    file_changes: Sequence[Mapping[str, Any]],
+) -> None:
+    """Apply the existing overlay byte budget before source parsing."""
+
+    total_bytes = 0
+    oversized_fallback_files: set[str] = set()
+    for change in file_changes:
+        status = str(change["status"])
+        path = str(change["path"])
+        old_path = str(change.get("old_path") or "")
+        base_path = old_path if status == "R" else path
+        blob_refs: list[tuple[str, str]] = []
+        if status != "A":
+            blob_refs.append((base_commit_sha, base_path))
+        if status != "D":
+            blob_refs.append((candidate_commit_sha, path))
+        for commit_sha, blob_path in blob_refs:
+            byte_size = _qa_git_object_byte_size(
+                project_root,
+                commit_sha=commit_sha,
+                path=blob_path,
+            )
+            if byte_size > _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES:
+                _qa_overlay_fail(
+                    "total_source_limit_requires_exact_candidate_snapshot",
+                    "candidate overlay source exceeds the elevated bounded inspection limit",
+                    path=blob_path,
+                    byte_size=byte_size,
+                    max_total_bytes=(
+                        _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES
+                    ),
+                )
+            if byte_size > _QA_OVERLAY_MAX_FILE_BYTES:
+                if _qa_overlay_deterministic_adapter(blob_path) is None:
+                    _qa_overlay_fail(
+                        "oversized_source_requires_exact_candidate_snapshot",
+                        "candidate overlay file exceeds the ordinary per-file limit and has no supported deterministic source adapter",
+                        path=blob_path,
+                        byte_size=byte_size,
+                        max_byte_size=_QA_OVERLAY_MAX_FILE_BYTES,
+                        fallback_policy=(
+                            _QA_OVERLAY_OVERSIZED_SOURCE_POLICY
+                        ),
+                    )
+                oversized_fallback_files.add(blob_path)
+            total_bytes += byte_size
+
+    elevated_fallback_activated = bool(oversized_fallback_files)
+    effective_max_total_bytes = (
+        _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES
+        if elevated_fallback_activated
+        else _QA_OVERLAY_MAX_TOTAL_BYTES
+    )
+    if total_bytes > effective_max_total_bytes:
+        _qa_overlay_fail(
+            "total_source_limit_requires_exact_candidate_snapshot",
+            "candidate overlay total source limit was exceeded",
+            ordinary_max_total_bytes=_QA_OVERLAY_MAX_TOTAL_BYTES,
+            effective_max_total_bytes=effective_max_total_bytes,
+            elevated_fallback_max_total_bytes=(
+                _QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES
+            ),
+            elevated_fallback_activated=elevated_fallback_activated,
+            fallback_reason=(
+                _QA_OVERLAY_OVERSIZED_SOURCE_POLICY
+                if elevated_fallback_activated
+                else ""
+            ),
+            inspected_source_bytes=total_bytes,
+        )
+
+
 def _qa_overlay_file_kind(path: str) -> str:
     from .language_policy import DEFAULT_LANGUAGE_POLICY
 
@@ -11569,6 +11670,12 @@ def _qa_candidate_diff_context(
             changed_file_count=len(file_changes),
             max_changed_files=_QA_OVERLAY_MAX_FILES,
         )
+    _qa_overlay_preflight_total_source_bytes(
+        canonical_root,
+        base_commit_sha=base_commit_sha,
+        candidate_commit_sha=candidate_commit_sha,
+        file_changes=file_changes,
+    )
 
     overlay_files: list[dict[str, Any]] = []
     candidate_sources: dict[str, dict[str, Any]] = {}

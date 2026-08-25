@@ -60831,6 +60831,17 @@ def test_qa_candidate_overlay_oversized_source_still_obeys_total_byte_limit(
         "_QA_OVERLAY_OVERSIZED_SOURCE_MAX_TOTAL_BYTES",
         server._QA_OVERLAY_MAX_FILE_BYTES + 128,
     )
+    source_reads = []
+
+    def unexpected_source_read(*args, **kwargs):
+        source_reads.append((args, kwargs))
+        raise AssertionError("source parsing must not precede byte-budget rejection")
+
+    monkeypatch.setattr(
+        server,
+        "_qa_git_object_source",
+        unexpected_source_read,
+    )
 
     with pytest.raises(server._QACandidateOverlayError) as exc:
         server._qa_candidate_diff_context(
@@ -60841,6 +60852,7 @@ def test_qa_candidate_overlay_oversized_source_still_obeys_total_byte_limit(
             candidate_commit_sha=candidate_commit,
         )
     assert exc.value.reason == "total_source_limit_requires_exact_candidate_snapshot"
+    assert source_reads == []
 
 
 @pytest.mark.parametrize(
