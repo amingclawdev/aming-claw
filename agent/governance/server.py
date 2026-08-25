@@ -62420,6 +62420,9 @@ def handle_graph_governance_runtime_context_session_token_rejoin(ctx: RequestCon
                     "AMING_WORKER_SESSION_TOKEN",
                     "AMING_WORKER_FENCE_TOKEN",
                 ],
+                "target_project_root": (
+                    _runtime_context_effective_target_project_root(context)
+                ),
                 "reason": reason,
                 "operator_session_role": session_role(session),
                 "read_receipt_event_ref": timeline_refs.get("read_receipt_event_ref", ""),

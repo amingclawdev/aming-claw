@@ -4237,6 +4237,19 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
     assert replacement["bounded_replacement_rejoin"] is True
 
     assert replacement["bounded_replacement_generation"] == 1
+    replacement_rejoin_audit = task_timeline.list_events(
+        conn,
+        PID,
+        task_id=runtime_context.task_id,
+        backlog_id=backlog_id,
+        limit=1000,
+    )[-1]
+    assert replacement_rejoin_audit["event_type"] == (
+        "observer.runtime_context_session_token_rejoin"
+    )
+    assert replacement_rejoin_audit["payload"]["target_project_root"] == (
+        str(target_root)
+    )
     replacement_context = get_branch_context(conn, PID, runtime_context.task_id)
     assert replacement_context is not None
     assert replacement_context.last_recovery_action == (
@@ -4306,7 +4319,7 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         """
         INSERT INTO graph_snapshots
           (project_id, snapshot_id, commit_sha, snapshot_kind, status, created_at)
-        VALUES (?, ?, ?, 'scope', 'active', ?)
+        VALUES (?, ?, ?, 'full', 'active', ?)
         """,
         (
             PID,
@@ -4336,8 +4349,11 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         runtime_context_id=runtime_context.runtime_context_id,
         task_id=runtime_context.task_id,
         worker_role="mf_sub",
-        fence_token=fence_token,
-        run_id=_mf_sub_run_id(runtime_context.task_id, fence_token),
+        fence_token=replacement["fence_token"],
+        run_id=_mf_sub_run_id(
+            runtime_context.task_id,
+            replacement["fence_token"],
+        ),
         created_at="2026-08-04T06:00:01Z",
     )
     conn.commit()
