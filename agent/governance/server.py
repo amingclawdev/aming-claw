@@ -125229,11 +125229,8 @@ def _contract_runtime_completed_merge_reconcile_authority(
         merge=trusted_merge,
         reconcile=reconcile_projection,
     )
-    if not (
-        reconcile_authority.get("db_verified") is True
-        and reconcile_authority.get("live_verified") is True
-        and reconcile_authority.get("active_snapshot_verified") is True
-        and reconcile_authority.get("graph_reconciled") is True
+    if not _contract_runtime_current_full_reconcile_activation_verified(
+        reconcile_authority
     ):
         if allow_postmerge_qa_admission:
             shared = _contract_runtime_shared_batch_reconcile_authority(

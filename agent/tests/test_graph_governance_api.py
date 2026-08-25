@@ -20571,6 +20571,92 @@ def test_mf_batch_task_only_shared_authority_is_resealed_after_enrichment(
     ] == fixture["batch_id"]
 
 
+def test_mf_batch_superseded_child_reconcile_falls_back_to_shared_final(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _shared_batch_reconcile_authority_fixture(
+        conn,
+        tmp_path,
+        monkeypatch,
+        coordination_runtime_scope=False,
+        nested_enter_queue_plan=True,
+        service_enter_task=True,
+        task_only_reconcile_task="batch",
+    )
+    stale_child_authority = {
+        "schema_version": (
+            "graph_snapshot_store.current_full_reconcile_state.v1"
+        ),
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "server_derived": True,
+        "db_verified": True,
+        "live_verified": True,
+        "active_snapshot_verified": True,
+        "graph_reconciled": True,
+        "canonical_head_commit": fixture["final_head"],
+        "active_snapshot_commit": fixture["final_head"],
+        "reconciled_commit_sha": fixture["child_commits"][0],
+    }
+    shared_calls = []
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_line_evidence_policy",
+        lambda *_args, **_kwargs: {
+            "allow_taskless_reconcile_only_for_explicit_shared_batch": True,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        lambda *_args, **_kwargs: stale_child_authority,
+    )
+    shared_batch_reconcile = (
+        server._contract_runtime_shared_batch_reconcile_authority
+    )
+
+    def record_shared_call(*args, **kwargs):
+        shared_calls.append(True)
+        return shared_batch_reconcile(*args, **kwargs)
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_shared_batch_reconcile_authority",
+        record_shared_call,
+    )
+    assert all(
+        stale_child_authority[field] is True
+        for field in (
+            "db_verified",
+            "live_verified",
+            "active_snapshot_verified",
+            "graph_reconciled",
+        )
+    )
+    assert not server._contract_runtime_current_full_reconcile_activation_verified(
+        stale_child_authority
+    )
+
+    joined = server._contract_runtime_completed_merge_reconcile_authority(
+        conn,
+        project_id=PID,
+        record=fixture["record"],
+        context=fixture["context"],
+        timeline_events=[],
+        merge=fixture["merge"],
+    )
+
+    assert shared_calls == [True]
+    assert server._contract_runtime_current_full_reconcile_activation_verified(
+        joined
+    )
+    assert joined["reconciled_commit_sha"] == fixture["final_head"]
+    assert joined["shared_batch_reconcile_authority"][
+        "final_head_commit"
+    ] == fixture["final_head"]
+
+
 def test_mf_batch_deferred_reconcile_receipt_binds_shared_close_authority(
     conn,
     tmp_path,
