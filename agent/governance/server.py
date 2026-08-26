@@ -162548,7 +162548,19 @@ def _contract_runtime_completed_line_projection_gate(
     request_route_token_ref = _route_request_identity_value(body, "route_token_ref")
     record_route_token_ref = str(record.get("route_token_ref") or "").strip()
     completed_route_token_ref = str(matched_line.get("route_token_ref") or "").strip()
-    source_route_token_ref = completed_route_token_ref or record_route_token_ref
+    completed_payload = (
+        matched_line.get("payload")
+        if isinstance(matched_line.get("payload"), Mapping)
+        else {}
+    )
+    completed_payload_route_token_ref = str(
+        completed_payload.get("route_token_ref") or ""
+    ).strip()
+    source_route_token_ref = (
+        completed_route_token_ref
+        or completed_payload_route_token_ref
+        or record_route_token_ref
+    )
     correction = (
         dict(historical_route_correction)
         if isinstance(historical_route_correction, Mapping)

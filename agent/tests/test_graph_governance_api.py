@@ -9413,6 +9413,69 @@ def test_failed_qa_route_rotation_uses_one_server_correction_identity(monkeypatc
     assert rejected.value.details["error"] == "completed_line_route_token_ref_mismatch"
 
 
+def test_completed_line_projection_preserves_payload_route_authority():
+    requested = {
+        "stage_id": "worker_implementation",
+        "line_id": "worker_implementation",
+        "evidence_kind": "implementation",
+    }
+    source_line = {
+        **requested,
+        "actor_role": "mf_sub",
+        "payload": {"route_token_ref": "rtok-worker"},
+    }
+    record = {
+        "contract_execution_id": "cex-payload-route-authority",
+        "route_token_ref": "rtok-observer",
+        "completed_lines": [source_line],
+        "execution_state": {"next_legal_action": {}},
+        "runtime_guide": {},
+    }
+
+    gate = server._contract_runtime_completed_line_projection_gate(
+        record,
+        body={"route_token_ref": "rtok-worker"},
+        event_kind="implementation",
+        actor_role="mf_sub",
+        line=requested,
+        allow_in_progress_completed_line=True,
+    )
+    assert gate["accepted"] is True
+
+    with pytest.raises(GovernanceError) as foreign_route:
+        server._contract_runtime_completed_line_projection_gate(
+            record,
+            body={"route_token_ref": "rtok-observer"},
+            event_kind="implementation",
+            actor_role="mf_sub",
+            line=requested,
+            allow_in_progress_completed_line=True,
+        )
+    assert foreign_route.value.details["source_route_token_ref"] == "rtok-worker"
+
+    top_level_record = json.loads(json.dumps(record))
+    top_level_record["completed_lines"][0]["route_token_ref"] = "rtok-top-level"
+    assert server._contract_runtime_completed_line_projection_gate(
+        top_level_record,
+        body={"route_token_ref": "rtok-top-level"},
+        event_kind="implementation",
+        actor_role="mf_sub",
+        line=requested,
+        allow_in_progress_completed_line=True,
+    )["accepted"] is True
+
+    record_fallback = json.loads(json.dumps(record))
+    record_fallback["completed_lines"][0]["payload"] = {}
+    assert server._contract_runtime_completed_line_projection_gate(
+        record_fallback,
+        body={"route_token_ref": "rtok-observer"},
+        event_kind="implementation",
+        actor_role="mf_sub",
+        line=requested,
+        allow_in_progress_completed_line=True,
+    )["accepted"] is True
+
+
 def test_line_bypass_does_not_preflight_the_same_guide_twice(conn, monkeypatch):
     class FakeRuntime:
         store = SimpleNamespace(
