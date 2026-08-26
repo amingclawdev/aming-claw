@@ -61,6 +61,20 @@ assertBacklogAuthority(
   "Backlog detail and Timeline DAG must consume the canonical three-axis authority view",
 );
 assertBacklogAuthority(
+  backlogViewSource.includes("projectContractRuntimeGateMatrix(timeline?.authorityView)")
+    && backlogViewSource.includes('data-contract-gate-authority="contract-runtime"')
+    && backlogViewSource.includes("ContractRuntime authority matrix")
+    && backlogViewSource.includes('data-contract-gate-authority="legacy-advisory"')
+    && backlogViewSource.includes("Historical MF close gate (advisory)"),
+  "Contract & Gate must render ContractRuntime current authority as primary and legacy MF close-gate data as advisory",
+);
+assertBacklogAuthority(
+  backlogViewSource.includes("Canonical ContractRuntime authority is not loaded")
+    && backlogViewSource.includes("cannot establish PASS or BLOCKED")
+    && backlogViewSource.includes("legacy MF close gate raw (advisory)"),
+  "missing canonical authority must fail closed without promoting legacy timeline-gate state",
+);
+assertBacklogAuthority(
   backlogViewSource.includes("normalizeTaskPlaybackDag")
     && backlogViewSource.includes("visualization: compactTimeline?.contract_runtime_visualization")
     && backlogViewSource.includes("timeline-event:${timelineEventKey(event, index)}"),

@@ -14,6 +14,7 @@ import {
   isPrivateTimelineText,
   projectTaskTimelineEvent,
   timelineStatusFromEvent,
+  type GateMatrixRow,
   type GateMatrixProjection,
   type TaskTimelineEvidenceInspector,
   type TaskTimelineSemanticChip,
@@ -675,6 +676,162 @@ export function projectContractRuntimeAuthorityViewModel(
       truncated: response.timeline.truncated,
       next_cursor: response.timeline.next_cursor,
     },
+  };
+}
+
+function contractRuntimeMatrixStatus(
+  status: ContractRuntimeAuthorityDisplayStatus,
+): GateMatrixRow["status"] {
+  if (status === "PASS" || status === "COMPLETED" || status === "RECORDED") return "passed";
+  if (status === "BLOCKED" || status === "FAILED") return "failed";
+  if (status === "BYPASSED" || status === "WAIVED") return "unknown";
+  return "unknown";
+}
+
+function contractRuntimeMatrixFamily(
+  ownerRole: string,
+  evidenceKind: string,
+): Pick<GateMatrixRow, "family" | "familyLabel"> {
+  const normalizedOwner = ownerRole.toLowerCase();
+  const normalizedEvidence = evidenceKind.toLowerCase();
+  if (normalizedOwner.includes("qa")) {
+    return { family: "audit_close", familyLabel: "ContractRuntime QA / close" };
+  }
+  if (normalizedOwner.includes("mf_sub") || normalizedOwner.includes("worker")) {
+    return { family: "route_context", familyLabel: "ContractRuntime worker execution" };
+  }
+  if (normalizedEvidence.includes("qa") || normalizedEvidence.includes("verification")) {
+    return { family: "audit_close", familyLabel: "ContractRuntime QA / close" };
+  }
+  return { family: "contract", familyLabel: "ContractRuntime execution" };
+}
+
+function contractRuntimeMatrixLabel(...values: unknown[]): string {
+  const value = values.map((item) => safeText(String(item ?? ""))).find(Boolean) ?? "contract line";
+  return value
+    .replace(/^contract_runtime[.:_-]*/i, "")
+    .replace(/[._-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function contractRuntimeEvidenceEventId(sourceRef: string): string[] {
+  const match = sourceRef.match(/(?:timeline(?::|_event:)|event[:/])(\d+)/i);
+  return match?.[1] ? [match[1]] : [];
+}
+
+/**
+ * Projects the primary Contract & Gate matrix from canonical ContractRuntime
+ * current state. Legacy MF close-gate JSON is intentionally excluded: callers
+ * may render it separately as historical/advisory evidence, but it must never
+ * override this projection or manufacture a PASS.
+ */
+export function projectContractRuntimeGateMatrix(
+  authority?: ContractRuntimeAuthorityViewModel | null,
+): GateMatrixProjection {
+  if (!authority) {
+    return {
+      schema_version: "gate_matrix_projection.v1",
+      rows: [],
+      overallPassed: false,
+      gatePresent: false,
+      applicable: true,
+    };
+  }
+
+  const currentAction = authority.contract_execution_progress.current_action;
+  const currentActionId = safeText(String(currentAction.id ?? currentAction.line_id ?? currentAction.action ?? ""));
+  const currentActionIds = new Set(
+    [currentAction.id, currentAction.line_id, currentAction.stage_id, currentAction.action]
+      .map((value) => safeText(String(value ?? "")))
+      .filter(Boolean),
+  );
+  const currentActionLabel = contractRuntimeMatrixLabel(
+    currentAction.action,
+    currentAction.id,
+    currentAction.line_id,
+  );
+  const rows: GateMatrixRow[] = authority.contract_execution_progress.line_states.map((line, index) => {
+    const family = contractRuntimeMatrixFamily(line.owner_role, line.evidence_kind);
+    const status = contractRuntimeMatrixStatus(line.display_status);
+    const sourceRef = safeText(line.source_ref);
+    const lineMatchesCurrent = [line.id, line.line_id, line.stage_id]
+      .map((value) => safeText(value))
+      .filter(Boolean)
+      .some((value) => currentActionIds.has(value));
+    const exceptionState = line.display_status === "BYPASSED" || line.display_status === "WAIVED";
+    const evidenceEventIds = contractRuntimeEvidenceEventId(sourceRef);
+    return {
+      id: `contract_runtime.${safeText(line.stage_id) || "stage"}.${safeText(line.line_id) || index}`,
+      label: contractRuntimeMatrixLabel(line.line_id, line.evidence_kind, line.stage_id),
+      ...family,
+      required: true,
+      status,
+      nextAction: exceptionState
+        ? `${line.display_status} is recorded as an exception and does not imply PASS.`
+        : lineMatchesCurrent && currentActionId
+          ? `Current legal action: ${currentActionLabel}`
+          : status === "failed"
+            ? `ContractRuntime line ${safeText(line.line_id) || safeText(line.stage_id) || "unknown"} is ${line.display_status.toLowerCase()}.`
+            : "",
+      evidenceEventIds,
+      evidenceLabels: evidenceEventIds.map(() => `ContractRuntime · ${line.display_status}`),
+    };
+  });
+
+  if (rows.length === 0 && currentActionId) {
+    const family = contractRuntimeMatrixFamily(
+      safeText(String(currentAction.owner_role ?? currentAction.worker_role ?? "")),
+      safeText(String(currentAction.evidence_kind ?? "")),
+    );
+    const blocked = Boolean(currentAction.block_reason)
+      || safeText(String(currentAction.status ?? "")).toLowerCase().includes("block");
+    rows.push({
+      id: `contract_runtime.current_action.${currentActionId}`,
+      label: currentActionLabel,
+      ...family,
+      required: currentAction.required !== false,
+      status: blocked ? "failed" : "unknown",
+      nextAction: `Current legal action: ${currentActionLabel}`,
+      evidenceEventIds: [],
+      evidenceLabels: [],
+    });
+  }
+
+  const close = authority.backlog_close_readiness;
+  const backlogStatus = safeText(close.backlog_status).toUpperCase();
+  const superseded = backlogStatus === "SUPERSEDED";
+  const closeStatus = superseded
+    ? "not_applicable"
+    : close.display_status === "PASS"
+      ? "passed"
+      : close.display_status === "BLOCKED" || close.display_status === "FAILED"
+        ? "failed"
+        : "unknown";
+  rows.push({
+    id: "contract_runtime.backlog_close_readiness",
+    label: "Backlog Close Readiness",
+    family: "audit_close",
+    familyLabel: "ContractRuntime QA / close",
+    required: !superseded,
+    status: closeStatus,
+    nextAction: superseded
+      ? "SUPERSEDED is a terminal coordination state; it is not PASS and legacy MF close checks are advisory."
+      : closeStatus === "passed"
+        ? ""
+        : currentActionId
+          ? `Current legal action: ${currentActionLabel}`
+          : `${close.display_status} does not establish close-ready PASS.`,
+    evidenceEventIds: [],
+    evidenceLabels: [],
+  });
+
+  return {
+    schema_version: "gate_matrix_projection.v1",
+    rows,
+    overallPassed: closeStatus === "passed"
+      && rows.filter((row) => row.required).every((row) => row.status === "passed"),
+    gatePresent: true,
+    applicable: true,
   };
 }
 

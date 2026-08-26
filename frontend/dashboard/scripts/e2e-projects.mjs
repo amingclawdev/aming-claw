@@ -784,15 +784,15 @@ function verifyRuntimeGuideDocsContract({ announce = true } = {}) {
   if (announce) phase("runtime guide docs contract");
   const onboardingSource = readFileSync(path.join(REPO_ROOT, "docs/onboarding.md"), "utf8");
   const contractDocSource = readFileSync(path.join(REPO_ROOT, "docs/dev/contract-driven-governance.md"), "utf8");
-  const skillSource = readFileSync(path.join(REPO_ROOT, "skills/aming-claw/SKILL.md"), "utf8");
-  const mfSopSource = readFileSync(path.join(REPO_ROOT, "skills/aming-claw/references/mf-sop.md"), "utf8");
+  const skillSource = readFileSync(path.join(REPO_ROOT, "skills/aming-claw-onboard/SKILL.md"), "utf8");
+  const mfSopSource = readFileSync(path.join(REPO_ROOT, "skills/aming-claw-onboard/references/mf-sop.md"), "utf8");
 
-  assert(onboardingSource.includes("Read `aming-claw://current-context`.") && onboardingSource.includes("Read `aming-claw://skill`.") && onboardingSource.includes("Read `aming-claw://graph-first`."), "Onboarding should require fresh sessions to load current Aming Claw MCP context before observer work");
+  assert(onboardingSource.includes("Read `aming-claw://current-context`.") && onboardingSource.includes("MCP `onboard_route_guide`") && onboardingSource.includes("agent_onboard_guidance.onboard_route_guide.graph_first_policy"), "Onboarding should require fresh sessions to load current context, the live route guide, and graph-first policy before observer work");
   assert(onboardingSource.includes("`runtime_context_worker_guide`") && onboardingSource.includes("`submit_mf_subagent_read_receipt`"), "Onboarding should point mf_sub workers at the Runtime Context worker guide and read-receipt next action");
   assert(onboardingSource.includes("daily-planner-lite") && onboardingSource.includes("normal close gate") && onboardingSource.includes("route/startup/identity repair"), "Onboarding should preserve the one-prompt demo happy-path contract");
   assert(contractDocSource.includes("read receipt first, real startup second, worker-scoped") && contractDocSource.includes("Observer-authored implementation, observer-filled worker evidence"), "Contract-driven governance doc should forbid observer-filled worker evidence as a normal close path");
-  assert(skillSource.includes("Runtime Context worker guide is the") && skillSource.includes("reconstruct historical evidence as the normal close"), "Aming Claw skill should make the worker guide the fresh mf_sub entrypoint");
-  assert(mfSopSource.includes("`runtime_context_worker_guide` before implementation") && mfSopSource.includes("QA/audit archive paths are recovery evidence only"), "MF SOP should guide fresh workers through runtime guide, startup, evidence, and finish gates");
+  assert(skillSource.includes("use the live MCP `onboard_route_guide` tool as the source of") && skillSource.includes("truth. The HTTP endpoint is a fallback") && skillSource.includes("For worker or QA work, use the runtime context or QA session entry"), "Aming Claw skill should route fresh mf_sub work through live onboard and runtime-context authority");
+  assert(mfSopSource.includes("MF no-PASS QA authority") && mfSopSource.includes("never synthesizes PASS") && mfSopSource.includes("Managed MCP worker host-envelope continuity"), "MF SOP should preserve no-PASS QA semantics and managed worker host-envelope continuity");
   ok("runtime guide docs cover fresh-session context, startup/read-receipt surfaces, and normal-close boundaries");
 }
 
@@ -817,7 +817,7 @@ function verifyBacklogEvidenceContract() {
   assert(apiSource.includes("backlogTimelineGateFor"), "Backlog API client should fetch per-row timeline gate evidence");
   assert(apiSource.includes("/timeline-gate?"), "Backlog API client should call the timeline-gate endpoint");
   assert(apiSource.includes("contractRuntimeVisualizationFor") && apiSource.includes("/visualization/backlogs/"), "Dashboard API should use the canonical ContractRuntime visualization endpoint");
-  assert(apiSource.includes("Promise.all([taskTimelineRequest, authorityRequest])") && apiSource.includes("contract_runtime_visualization: contractRuntimeVisualization"), "The existing task timeline fetch path should carry the canonical visualization response to Activity/Playback consumers");
+  assert(apiSource.includes("taskPlaybackBootstrapFor(projectId, backlogId") && apiSource.includes("taskTimeline.contract_runtime_visualization") && apiSource.includes("contract_runtime_visualization: contractRuntimeVisualization"), "The existing task timeline bootstrap/fallback path should carry the canonical visualization response to Activity/Playback consumers");
   assert(apiSource.includes("requirePublicSafeTypedDag") && apiSource.includes("response.dag?.typed_edges !== true") && apiSource.includes("typedDagRawSecretPath(response.dag)"), "The dashboard API boundary should reject visualization payloads that are not public-safe, read-only typed DAGs or contain raw secrets");
   assert(typeSource.includes("ContractRuntimeVisualizationResponse") && typeSource.includes("contract_runtime.visualization.v1"), "Dashboard types should expose the public-safe ContractRuntime visualization schema");
   assert(playbackSource.includes("projectContractRuntimeAuthorityViewModel") && playbackSource.includes("contract_runtime.authority_view_model.v1"), "Playback library should expose the canonical three-axis authority adapter");
@@ -827,10 +827,14 @@ function verifyBacklogEvidenceContract() {
   assert(playbackTestSource.includes('"direct_main.v1"') && playbackTestSource.includes('"mf_parallel.v2"') && playbackTestSource.includes('"mf_batch_parallel.v1"') && playbackTestSource.includes("worker_qa_rework") && playbackTestSource.includes("ordered_merge_queue") && playbackTestSource.includes("parent_event"), "Typed DAG fixtures should cover distinct direct, parallel QA/rework, and ordered batch/causality topologies");
   assert(playbackSource.includes("RAW_TYPED_DAG_SECRET_TEXT") && playbackSource.includes("typedDagRawSecretPath") && playbackTestSource.includes("raw-session-token-should-not-render") && playbackTestSource.includes("raw-route-token-should-not-render"), "Typed DAG security fixtures should reject and redact raw route/session secrets across node and edge display fields");
   assert(viewSource.includes("projectContractRuntimeAuthorityViewModel") && viewSource.includes("ContractRuntimeAuthorityPanel"), "Backlog detail and Timeline DAG should consume the canonical authority adapter");
+  assert(playbackSource.includes("projectContractRuntimeGateMatrix") && playbackSource.includes("Legacy MF close-gate JSON is intentionally excluded"), "The primary Contract & Gate matrix should be a canonical ContractRuntime projection, not a legacy MF timeline-gate projection");
+  assert(viewSource.includes("projectContractRuntimeGateMatrix(timeline?.authorityView)") && viewSource.includes('data-contract-gate-authority="contract-runtime"') && viewSource.includes("ContractRuntime authority matrix"), "Backlog Contract & Gate should render canonical ContractRuntime authority as its primary matrix");
+  assert(viewSource.includes('data-contract-gate-authority="legacy-advisory"') && viewSource.includes("Historical MF close gate (advisory)") && viewSource.includes("does not override ContractRuntime"), "Legacy MF close-gate data should remain visibly historical/advisory");
+  assert(playbackTestSource.includes("direct-main, mf_parallel, and mf_batch_parallel Contract & Gate matrices") && playbackTestSource.includes("contract_complete with an OPEN backlog must remain no-PASS") && playbackTestSource.includes("SUPERSEDED coordination rows"), "Contract & Gate fixtures should cover all three dogfood modes plus no-PASS and SUPERSEDED authority semantics");
   assert(viewSource.includes("normalizeTaskPlaybackDag") && viewSource.includes("Typed edges") && viewSource.includes("edge.authority_source") && viewSource.includes("edge.evidence_ref") && viewSource.includes("edge.inferred"), "Backlog detail should consume the same normalized typed DAG identities and label explicit versus inferred authority");
   assert(playbackPanelSource.includes("ContractRuntime authority") && playbackPanelSource.includes("Backlog row close authority") && playbackPanelSource.includes("partial / continuation required"), "Playback History should render independent contract, close, and paginated-history axes");
   assert(playbackViewSource.includes("taskPlaybackNextLegalActionPresentations") && playbackViewSource.includes("Backlog row close authority"), "Activity Current should use the shared canonical next-action projection and separate close authority");
-  assert(playbackViewSource.includes("authorityTraceCacheRef.current[authorityCacheKey]") && playbackViewSource.includes("trace.authority_view?.cache_identity.key"), "Activity and Playback caches should retain distinct execution/revision/event authority identities");
+  assert(playbackViewSource.includes("const authorityCacheKey = trace.authority_view?.cache_identity.key") && playbackViewSource.includes("authorityCacheKey,") && playbackViewSource.includes("trace.authority_view?.cache_identity.key"), "Activity and Playback caches should retain distinct execution/revision/event authority identities");
   assert(viewSource.includes("Historical compact ledger (advisory)") && viewSource.includes("Historical ledger action (advisory)"), "Legacy compact-ledger instructions should remain history/advisory when canonical authority is present");
   assert(playbackSource.includes("backlog_id: response.backlog_id") && playbackSource.includes("execution_state_revision: executionStateRevision") && playbackSource.includes("event_id: eventId"), "Authority adapter cache identity should include backlog, execution revision, and event identity");
   assert(playbackSource.includes("current_snapshot_in_playback: false") && semanticSource.includes('text.includes("bypass") || text.includes("waiv")'), "Current authority snapshots must stay out of playback and bypass/waiver evidence must not render as PASS");
@@ -933,10 +937,10 @@ function verifyBacklogEvidenceContract() {
   assert(playbackSource.includes("current_stream_events") && playbackSource.includes("isCurrentStreamProjectionEvent") && playbackSource.includes("synthetic_current"), "Activity Current should unify stable synthetic current projections with recent raw events");
   assert(taskTimelineSource.includes('f"contract-runtime:{execution_id}:rev:{revision}"') && taskTimelineSource.includes('f"contract-chain:{chain_identity}:gen:{generation}"'), "Recent current projections should use stable ContractRuntime and contract-chain revision identities");
   assert(apiSource.includes("current_stream_events?:"), "Dashboard API should type the unified current-stream projection response");
-  assert(playbackViewSource.includes("CURRENT_TASK_REFRESH_MS"), "Activity view should define a bounded live refresh interval");
-  assert(playbackViewSource.includes("window.setInterval(() => refresh(false), CURRENT_TASK_REFRESH_MS)"), "Activity view should poll the primary task without page reloads");
-  assert(playbackViewSource.includes("refreshActivityTimeline"), "Activity view should refresh task detail, timeline, and gate together");
-  assert(playbackViewSource.includes("api.backlogBugFor(projectId, bugId, signal)"), "Activity view should refresh backlog row detail during live polling");
+  assert(playbackViewSource.includes("useEventStreamWithFreshness(projectId") && playbackViewSource.includes('enabled: Boolean(projectId) && mode === "activity"'), "Activity view should subscribe to bounded project SSE only while Current is active");
+  assert(playbackViewSource.includes("onEvent: ({ name })") && playbackViewSource.includes("if (isActivityLiveEvent(name)) setActivityRefreshSeq"), "Activity view should invalidate bounded Current resources on authoritative live events");
+  assert(playbackViewSource.includes("refreshCurrentTaskHint(controller.signal)") && playbackViewSource.includes("refreshRecentEvents(controller.signal)"), "Activity view should refresh the current-task hint and bounded recent-event window without loading full playback history");
+  assert(playbackViewSource.includes("api.backlogBugFor(projectId, bugId, controller.signal)"), "Activity view should fetch a URL-selected backlog detail through an abortable request");
   assert(playbackViewSource.includes("activityMountedRef"), "Activity view should guard async refreshes after unmount");
   assert(playbackViewSource.includes("const activityBug = selectedBug ?? localOverrideBug ?? hintedCurrentBug"), "Current activity should prefer URL-selected backlog, then local-override, then fall back to the current-task hint");
   assert(!playbackViewSource.includes("activeTaskCandidates") && !playbackViewSource.includes("secondaryActivityBugs"), "Current activity must not render a backlog/history candidate list");
@@ -1044,7 +1048,7 @@ function verifyBacklogEvidenceContract() {
   assert(playbackPanelSource.includes("task-playback-event-column"), "Task playback filters should align above the event list instead of the detail column");
   assert(playbackPanelSource.includes("Evidence links"), "Task playback panel should expose typed primary evidence links");
   assert(playbackPanelSource.includes("EvidenceInspectorModal"), "Task playback evidence links should open a structured inspector modal");
-  assert(playbackPanelSource.includes('aria-haspopup="dialog"'), "Task playback evidence chips should advertise dialog inspection");
+  assert(playbackPanelSource.includes('aria-haspopup={action === "inspect" ? "dialog" : undefined}'), "Task playback evidence chips should advertise dialog inspection only for refs handled by the inspector modal");
   assert(playbackPanelSource.includes('role="dialog"') && playbackPanelSource.includes('aria-modal="true"'), "Task playback evidence inspector should render as an accessible modal dialog");
   assert(playbackPanelSource.includes("Public-safe evidence context"), "Task playback evidence inspector should label its public-safe context boundary");
   assert(playbackPanelSource.includes("Structured context"), "Task playback evidence inspector should show structured context before raw data");
@@ -1121,12 +1125,12 @@ function verifyBacklogEvidenceContract() {
   assert(playbackSource.includes("isPrivatePlaybackText"), "Task playback privacy classifier should be exported for selector filtering");
   assert(playbackViewSource.includes("api.taskTimelineFor"), "Playback selection should fetch governed task timeline data");
   assert(playbackViewSource.includes("api.backlogTimelineGateFor"), "Playback selection should fetch governed close-gate data");
-  assert(playbackViewSource.includes("isPrivatePlaybackBacklog") && playbackViewSource.includes("!isPrivatePlaybackBacklog(bug)"), "Playback selector should filter private backlog rows");
+  assert(playbackViewSource.includes("if (!bug?.bug_id || isPrivatePlaybackBacklog(bug)) continue;"), "Playback selector should exclude private backlog rows before adding them to the public row map");
   assert(playbackViewSource.includes("publicBugs.find"), "URL-selected playback rows should resolve only through public backlog rows");
   assert(playbackViewSource.includes("inFlightPlaybackKeysRef"), "Playback loading should track in-flight governed requests outside render state");
   assert(!playbackViewSource.includes("[playbackByBug, projectId, selectedBug]"), "Playback loading effect must not depend on full playback state");
   assert(playbackViewSource.includes("selectedLoadBugId = selectedBug?.bug_id"), "Playback loading should wait for URL-selected backlog data to become available");
-  assert(playbackViewSource.includes("[projectId, selectedLoadBugId]"), "Playback loading effect should be keyed by project and selected backlog availability");
+  assert(playbackViewSource.includes("[mode, projectId, selectedLoadBugId]"), "Playback loading effect should be keyed by mode, project, and selected backlog availability");
   assert(playbackViewSource.includes("mountedRef.current = true"), "Playback mount guard should reset during React StrictMode effect replay");
   assert(playbackViewSource.includes("Gate candidates"), "Playback selector should expose a gate-oriented filter");
   assert(playbackViewSource.includes("PLAYBACK_BACKLOG_PARAM"), "Playback row selection should be URL-addressable");
@@ -1158,10 +1162,10 @@ function verifyBacklogEvidenceContract() {
   assert(playbackSource.includes("readPlaybackEventParam"), "Task playback lib should export readPlaybackEventParam URL param reader");
   assert(playbackSource.includes("PLAYBACK_URL_PARAMS"), "Task playback lib should export PLAYBACK_URL_PARAMS canonical param map");
   assert(playbackSource.includes('"view"') && playbackSource.includes('"activity_tab"') && playbackSource.includes('"playback_backlog"') && playbackSource.includes('"playback_event"'), "PLAYBACK_URL_PARAMS should cover view, activity_tab, playback_backlog, and playback_event");
-  assert(playbackViewSource.includes("buildPlaybackUrl") && playbackViewSource.includes("findFrameIdByEventParam") && playbackViewSource.includes("readPlaybackEventParam"), "Activity view should use canonical URL helpers for deep-link navigation");
+  assert(playbackViewSource.includes("buildPlaybackUrl") && playbackViewSource.includes("resolveInitialPlaybackFrameId") && playbackViewSource.includes("resolveSelectedFrameIdForEventParam") && playbackViewSource.includes("readPlaybackEventParam"), "Activity view should use canonical URL and state-preserving frame-resolution helpers for deep-link navigation");
   assert(playbackViewSource.includes("selectedEventParam") && playbackViewSource.includes("setSelectedEventParam"), "Activity view should track playback_event URL param state for async deep-link resolution");
   assert(playbackViewSource.includes("navigateToPlayback(card.backlog_id, eventId)"), "Activity card click should pass event id to navigateToPlayback for deep-link URL");
-  assert(playbackViewSource.includes("findFrameIdByEventParam(state.trace.frames, selectedEventParam)"), "Activity view should resolve deep-link frame id only after trace is loaded (async race guard)");
+  assert(playbackViewSource.includes("resolveSelectedFrameIdForEventParam(frames, selectedEventParam, selectedFrameId)"), "Activity view should resolve deep-link frame id only after trace is loaded while preserving the current selection (async race guard)");
   assert(playbackTestSource.includes("buildPlaybackUrl") && playbackTestSource.includes("findFrameIdByEventParam"), "Task playback fixture should cover canonical URL builder and deep-link frame resolution");
   assert(playbackTestSource.includes("view=activity") && playbackTestSource.includes("activity_tab=history") && playbackTestSource.includes("playback_backlog="), "Task playback URL tests should assert canonical view=activity&activity_tab=history&playback_backlog= form");
   // B3/B4 UE blockers: bounded scroll containers and mobile layout (AC-ACTIVITY-PLAYBACK-IA-UE-BLOCKERS-20260611)
