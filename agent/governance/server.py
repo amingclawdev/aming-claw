@@ -33,6 +33,11 @@ if _agent_dir not in sys.path:
 
 from .errors import GovernanceError, PermissionDeniedError, ValidationError
 from .dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
+from .parallel_branch_runtime import (
+    PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_FIELDS,
+    PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS,
+    parallel_branch_authority_field_is_nontransferable,
+)
 import logging
 import sqlite3
 import time
@@ -99337,7 +99342,30 @@ def _caller_timeline_key_is_credential(key: Any) -> bool:
     return compact in _CALLER_TIMELINE_CREDENTIAL_KEY_COMPACT_DENYLIST
 
 
+_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCES = (
+    frozenset(_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS),
+    frozenset(_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS),
+    frozenset(_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS),
+    frozenset(_QA_REVIEW_AUTHORITY_NAMES),
+    frozenset(_QA_REVIEW_AUTHORITY_CONTAINERS),
+)
+_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset(
+    PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
+    | {
+        field_name
+        for field_source in (
+            _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCES
+        )
+        for field_name in field_source
+        if parallel_branch_authority_field_is_nontransferable(field_name)
+    }
+)
+
+
 _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX = {
+    "canonical_schema": (
+        _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
+    ),
     "credential": frozenset(
         {
             "access_token",
@@ -99718,9 +99746,12 @@ def _contract_runtime_key_is_execution_authority_or_credential(
 ) -> bool:
     """Classify keys that cannot cross a retired execution generation."""
 
+    key_name = str(key or "").strip()
+    if key_name in PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_FIELDS:
+        return False
     if _caller_timeline_key_is_credential(key):
         return True
-    compact = re.sub(r"[^a-z0-9]+", "", str(key or "").casefold())
+    compact = re.sub(r"[^a-z0-9]+", "", key_name.casefold())
     if not compact:
         return False
     return bool(

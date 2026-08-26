@@ -14,7 +14,13 @@ import secrets
 import sqlite3
 import subprocess
 import uuid
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import (
+    asdict,
+    dataclass,
+    field,
+    fields as dataclass_fields,
+    replace,
+)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -2461,6 +2467,110 @@ class StandaloneHistoricalCheckpointAuthority:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+PARALLEL_BRANCH_TYPED_AUTHORITY_TYPES = (
+    AuditedPostmergeRecoveryAuthority,
+    DependencyRevalidationQaCandidateAuthority,
+    FailedQaRunningRevisionRejoinAuthority,
+    SafeRefPrestartupReissueAuthority,
+    PostQaMergeConflictRejoinAuthority,
+    PostQaRejoinRetargetAuthority,
+    StandaloneHistoricalCheckpointAuthority,
+)
+
+# These fields describe schema shape, audit labels, file scope, or bounded
+# diagnostics. They are safe to preserve when the surrounding acceptance
+# criterion is copied into a fresh generation. Every other field declared by
+# a typed Authority schema is execution authority and cannot cross generations.
+PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_FIELD_NAMES = frozenset(
+    {
+        "actor",
+        "actor_role",
+        "applicable",
+        "attempt",
+        "authoritative_pass_synthesized",
+        "authorized_at",
+        "backlog_id",
+        "business_qa_bypassed",
+        "diagnostic_backlog_id",
+        "eligible",
+        "historical_bypass_context",
+        "latest_ref_identifier_only",
+        "lease_status_at_authorization",
+        "mode",
+        "no_pass_claim",
+        "owned_files",
+        "project_id",
+        "query_root_clean",
+        "query_root_untracked_files_checked",
+        "rejected_preflights_created_snapshot",
+        "retry",
+        "retry_round",
+        "role",
+        "schema_version",
+        "server_derived",
+        "source",
+        "source_details",
+        "status",
+        "target_files",
+        "test_files",
+        "worker_role",
+        "worktree_clean",
+    }
+)
+PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_FIELD_SUFFIXES = (
+    "_actor",
+    "_authorized_at",
+    "_created_at",
+    "_expires_at",
+    "_passed",
+    "_role",
+    "_status",
+    "_trusted",
+    "_verified",
+)
+PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_NUMERIC_SUFFIXES = (
+    "_attempt",
+    "_retry",
+    "_retry_round",
+)
+
+
+def parallel_branch_authority_field_is_nontransferable(field_name: Any) -> bool:
+    """Return whether one canonical Authority leaf binds an execution.
+
+    The safe policy is intentionally narrow and semantic. It does not infer
+    safety from generic ``*_id``/``*_ref`` patterns: typed commit, head,
+    snapshot, preview, checkpoint, event, runtime, session, worktree, branch,
+    and queue fields therefore fail closed without a second hand-maintained
+    alias list.
+    """
+
+    name = str(field_name or "").strip()
+    if not name or name in PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_FIELD_NAMES:
+        return False
+    if name.endswith(PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_FIELD_SUFFIXES):
+        return False
+    if name.endswith(PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_NUMERIC_SUFFIXES):
+        return False
+    return True
+
+
+PARALLEL_BRANCH_TYPED_AUTHORITY_FIELDS = frozenset(
+    field_info.name
+    for authority_type in PARALLEL_BRANCH_TYPED_AUTHORITY_TYPES
+    for field_info in dataclass_fields(authority_type)
+)
+PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset(
+    field_name
+    for field_name in PARALLEL_BRANCH_TYPED_AUTHORITY_FIELDS
+    if parallel_branch_authority_field_is_nontransferable(field_name)
+)
+PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_FIELDS = frozenset(
+    PARALLEL_BRANCH_TYPED_AUTHORITY_FIELDS
+    - PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
+)
 
 
 @dataclass(frozen=True)

@@ -2826,6 +2826,23 @@ def _rev10_failed_qa_fresh_repair_record(
     }
 
 
+_TYPED_AUTHORITY_PROVEN_GAPS = (
+    "candidate_diff_sha256",
+    "manual_merge_event_ref",
+    "overwritten_candidate_commit",
+    "merge_preview_id",
+    "actual_worktree_head",
+    "initial_join_event_ref",
+    "actual_worker_head",
+    "previous_target_head",
+    "prior_rejoin_event_ref",
+    "current_target_commit",
+    "checkpoint_commit",
+    "target_head_before_merge",
+    "provenance_id",
+)
+
+
 _RETIRED_EXECUTION_AUTHORITY_KEY_CASES = (
     (
         "credential_session_fence_lease",
@@ -3096,7 +3113,69 @@ _RETIRED_EXECUTION_AUTHORITY_KEY_CASES = (
             "provenance_paths",
         ),
     ),
+    ("typed_authority_schema", _TYPED_AUTHORITY_PROVEN_GAPS),
 )
+
+
+def test_failed_qa_repair_typed_authority_schema_has_no_classifier_drift():
+    assert {
+        authority_type.__name__
+        for authority_type in (
+            parallel_branch_runtime.PARALLEL_BRANCH_TYPED_AUTHORITY_TYPES
+        )
+    } == {
+        "AuditedPostmergeRecoveryAuthority",
+        "DependencyRevalidationQaCandidateAuthority",
+        "FailedQaRunningRevisionRejoinAuthority",
+        "PostQaMergeConflictRejoinAuthority",
+        "PostQaRejoinRetargetAuthority",
+        "SafeRefPrestartupReissueAuthority",
+        "StandaloneHistoricalCheckpointAuthority",
+    }
+    typed_fields = (
+        parallel_branch_runtime.PARALLEL_BRANCH_TYPED_AUTHORITY_FIELDS
+    )
+    safe_fields = (
+        parallel_branch_runtime.PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_FIELDS
+    )
+    nontransferable_fields = (
+        parallel_branch_runtime
+        .PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
+    )
+    assert typed_fields == safe_fields | nontransferable_fields
+    assert safe_fields.isdisjoint(nontransferable_fields)
+    assert not (
+        nontransferable_fields
+        - server._CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
+    )
+    assert all(
+        server._contract_runtime_key_is_execution_authority_or_credential(
+            field_name
+        )
+        for field_name in nontransferable_fields
+    )
+    assert not any(
+        server._contract_runtime_key_is_execution_authority_or_credential(
+            field_name
+        )
+        for field_name in safe_fields
+    )
+
+
+@pytest.mark.parametrize("authority_key", _TYPED_AUTHORITY_PROVEN_GAPS)
+def test_failed_qa_repair_classifier_rejects_typed_authority_gaps(
+    authority_key,
+):
+    assert authority_key in (
+        parallel_branch_runtime
+        .PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
+    )
+    assert (
+        server._contract_runtime_key_is_execution_authority_or_credential(
+            authority_key
+        )
+        is True
+    )
 
 
 @pytest.mark.parametrize(
