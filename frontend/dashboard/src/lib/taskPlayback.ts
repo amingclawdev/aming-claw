@@ -289,6 +289,12 @@ export interface TaskPlaybackDagNode extends ContractRuntimeDagNode {
   kind: string;
   label: string;
   authority_source: string;
+  owner_role?: string;
+  actor_role?: string;
+  evidence_kind?: string;
+  line_id?: string;
+  stage_id?: string;
+  lane_id?: string;
   inferred: boolean;
 }
 
@@ -1156,6 +1162,12 @@ export function normalizeTaskPlaybackDag(input: NormalizeTaskPlaybackDagInput): 
       event_id: sanitizeTaskPlaybackDagText(String(raw.event_id ?? ""), "node.event_id"),
       task_id: sanitizeTaskPlaybackDagText(String(raw.task_id ?? ""), "node.task_id"),
       worker_id: sanitizeTaskPlaybackDagText(String(raw.worker_id ?? ""), "node.worker_id"),
+      owner_role: sanitizeTaskPlaybackDagText(String(raw.owner_role ?? ""), "node.owner_role"),
+      actor_role: sanitizeTaskPlaybackDagText(String(raw.actor_role ?? ""), "node.actor_role"),
+      evidence_kind: sanitizeTaskPlaybackDagText(String(raw.evidence_kind ?? ""), "node.evidence_kind"),
+      line_id: sanitizeTaskPlaybackDagText(String(raw.line_id ?? ""), "node.line_id"),
+      stage_id: sanitizeTaskPlaybackDagText(String(raw.stage_id ?? ""), "node.stage_id"),
+      lane_id: sanitizeTaskPlaybackDagText(String(raw.lane_id ?? ""), "node.lane_id"),
       merge_queue_id: sanitizeTaskPlaybackDagText(String(raw.merge_queue_id ?? ""), "node.merge_queue_id"),
       merge_queue_index: numberFrom(raw.merge_queue_index) ?? undefined,
       inferred: Boolean(raw.inferred),
@@ -1177,15 +1189,37 @@ export function normalizeTaskPlaybackDag(input: NormalizeTaskPlaybackDagInput): 
   const eventNodeIds = new Map<string, string>();
   orderedEvents.forEach((event, index) => {
     const eventId = eventIdentity(event, index);
+    const semantic = projectTaskTimelineEvent(event, index);
     const nodeId = addNode({
       id: `timeline-event:${safeText(eventId)}`,
       kind: "timeline_event",
-      label: safeText(projectTaskTimelineEvent(event, index).headline || event.event_kind || event.event_type),
+      label: safeText(semantic.headline || event.event_kind || event.event_type),
       status: safeText(event.status || event.decision || ""),
       authority_source: "task_timeline_events",
       evidence_ref: `timeline:${safeText(eventId)}`,
       event_id: safeText(eventId),
       task_id: safeText(event.task_id || ""),
+      worker_id: sanitizeTaskPlaybackDagText(
+        firstDagDeepText(event, ["worker_slot_id", "worker_id", "agent_id"]),
+        "node.worker_id",
+      ),
+      owner_role: sanitizeTaskPlaybackDagText(
+        firstDagDeepText(event, ["owner_role", "worker_role", "actor_role"]),
+        "node.owner_role",
+      ),
+      evidence_kind: sanitizeTaskPlaybackDagText(
+        firstDagDeepText(event, ["evidence_kind"]),
+        "node.evidence_kind",
+      ),
+      line_id: sanitizeTaskPlaybackDagText(
+        firstDagDeepText(event, ["line_id"]),
+        "node.line_id",
+      ),
+      stage_id: sanitizeTaskPlaybackDagText(
+        firstDagDeepText(event, ["stage_id"]),
+        "node.stage_id",
+      ),
+      lane_id: sanitizeTaskPlaybackDagText(semantic.lane_id, "node.lane_id"),
       inferred: !(rawDag?.nodes ?? []).some((node) => safeText(String(node.id ?? "")) === `timeline-event:${safeText(eventId)}`),
     });
     eventNodeIds.set(eventId, nodeId);

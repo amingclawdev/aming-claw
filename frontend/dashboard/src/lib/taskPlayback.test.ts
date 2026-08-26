@@ -1409,7 +1409,23 @@ function taskPlaybackTypedDagAssertions(): string[] {
   );
   const parallel = typedDagVisualizationFixture(
     "mf_parallel.v2",
-    [node("worker:one", "worker"), node("qa:failed", "qa"), node("worker:rework", "worker"), node("qa:passed", "qa"), node("contract-execution:parent", "contract_execution"), node("contract-execution:child", "contract_execution")],
+    [
+      node("worker:one", "worker"),
+      node("qa:failed", "qa"),
+      node("worker:rework", "worker"),
+      node("qa:passed", "qa"),
+      {
+        ...node("contract-line:independent-verification", "contract_line"),
+        owner_role: "qa",
+        actor_role: "qa",
+        evidence_kind: "verification",
+        line_id: "independent_verification",
+        stage_id: "qa",
+        lane_id: "verification",
+      },
+      node("contract-execution:parent", "contract_execution"),
+      node("contract-execution:child", "contract_execution"),
+    ],
     [
       edge("contract_successor", "contract-execution:parent", "contract-execution:child"),
       edge("worker_qa_failed", "worker:one", "qa:failed"),
@@ -1436,6 +1452,16 @@ function taskPlaybackTypedDagAssertions(): string[] {
   }));
   assertFixture(fixtures.map((fixture) => fixture.topology).join(",") === "direct_main,mf_parallel,mf_batch_parallel", "typed DAG fixtures should preserve three distinct reusable topologies");
   assertFixture(fixtures.every((fixture) => fixture.public_safe && fixture.typed_edges), "typed DAG consumer must preserve the public-safe typed-edge boundary");
+  const roleBoundVerification = fixtures[1].nodes.find((item) => item.id === "contract-line:independent-verification");
+  assertFixture(
+    roleBoundVerification?.owner_role === "qa"
+      && roleBoundVerification.actor_role === "qa"
+      && roleBoundVerification.evidence_kind === "verification"
+      && roleBoundVerification.line_id === "independent_verification"
+      && roleBoundVerification.stage_id === "qa"
+      && roleBoundVerification.lane_id === "verification",
+    "typed DAG normalization must retain public role-bound verification identity for downstream lane projection",
+  );
   assertFixture(fixtures.flatMap((fixture) => fixture.edges).every((item) => item.source && item.target && item.relationship && item.authority_source && item.evidence_ref), "every typed edge must retain stable endpoints, relationship, authority, and evidence ref");
   assertFixture(direct.dag.edges.some((item) => item.inferred) && fixtures[0].edges.some((item) => item.inferred), "inferred bypass/waiver edges must remain visibly marked");
 
