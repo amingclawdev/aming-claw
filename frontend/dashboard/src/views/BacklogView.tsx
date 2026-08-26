@@ -6,6 +6,7 @@ import {
   normalizeTaskPlaybackCompactLedger,
   normalizeTaskPlaybackDag,
   projectContractRuntimeAuthorityViewModel,
+  projectContractRuntimeGateMatrix,
   taskPlaybackCompactLedgerDisplayState,
   taskPlaybackCompactLedgerNextActionLabel,
   taskPlaybackCompactLedgerRowForBacklog,
@@ -916,7 +917,11 @@ function BacklogDetailModal({
   }), [bug, events, fallbackBugId, projectId, timeline?.visualization]);
   const dag = useMemo(() => buildTimelineDag(bug, events, gate, typedDag), [bug, events, gate, typedDag]);
   const contractAudit = useMemo(() => buildContractAudit(bug, events, gate, timeline?.gate), [bug, events, gate, timeline?.gate]);
-  const gateMatrix = useMemo(
+  const authorityGateMatrix = useMemo(
+    () => projectContractRuntimeGateMatrix(timeline?.authorityView),
+    [timeline?.authorityView],
+  );
+  const legacyGateMatrix = useMemo(
     () => projectGateMatrix(timelineGateWithAuditClose(gate, timeline?.gate), timeline?.gate?.applicable !== false),
     [gate, timeline?.gate],
   );
@@ -1093,7 +1098,18 @@ function BacklogDetailModal({
             <EvidenceInspector node={selectedNode} projectId={projectId} currentBacklogId={fallbackBugId} onJumpToBacklog={onSelectRelated} />
           </div>
         ) : (
-          <ContractGatePanel audit={contractAudit} response={timeline?.gate} gate={gate} matrix={gateMatrix} backlogId={fallbackBugId} projectId={projectId} acceptanceCriteria={listFrom(bug?.acceptance_criteria)} />
+          <ContractGatePanel
+            audit={contractAudit}
+            response={timeline?.gate}
+            gate={gate}
+            authority={timeline?.authorityView}
+            visualization={timeline?.visualization}
+            matrix={authorityGateMatrix}
+            legacyMatrix={legacyGateMatrix}
+            backlogId={fallbackBugId}
+            projectId={projectId}
+            acceptanceCriteria={listFrom(bug?.acceptance_criteria)}
+          />
         )}
       </section>
     </div>
@@ -2064,7 +2080,10 @@ function ContractGatePanel({
   audit,
   response,
   gate,
+  authority,
+  visualization,
   matrix,
+  legacyMatrix,
   backlogId,
   projectId,
   acceptanceCriteria,
@@ -2072,38 +2091,70 @@ function ContractGatePanel({
   audit: ContractAudit;
   response?: BacklogTimelineGateResponse;
   gate?: MfCloseTimelineGate;
+  authority?: ContractRuntimeAuthorityViewModel;
+  visualization?: ContractRuntimeVisualizationResponse;
   matrix: GateMatrixProjection;
+  legacyMatrix: GateMatrixProjection;
   backlogId: string;
   projectId: string;
   acceptanceCriteria?: string[];
 }) {
   const gateState = gateEvidenceState(response, audit.events);
+  const closeDisplay = authority?.backlog_close_readiness.display_status ?? "UNKNOWN";
+  const backlogStatus = String(authority?.backlog_close_readiness.backlog_status ?? "").toUpperCase();
+  const authorityBadge = !matrix.gatePresent
+    ? "authority not loaded"
+    : backlogStatus === "SUPERSEDED"
+      ? "superseded"
+      : matrix.overallPassed
+        ? "passed"
+        : closeDisplay.toLowerCase().replaceAll("_", " ");
+  const authorityBadgeClass = matrix.overallPassed
+    ? "status-complete"
+    : closeDisplay === "BLOCKED" || closeDisplay === "FAILED"
+      ? "status-failed"
+      : "status-unknown";
   return (
     <div className="backlog-modal-tab-panel" role="tabpanel">
 
-      {/* ── PRIMARY: Contract × Gate verification matrix ───────────────── */}
-      <div className="backlog-modal-section">
+      {/* ── PRIMARY: canonical ContractRuntime authority ────────────────── */}
+      <div className="backlog-modal-section" data-contract-gate-authority="contract-runtime">
         <div className="backlog-modal-section-head">
-          <span>Contract & Gate verification matrix</span>
-          <span className={`status-badge ${!matrix.gatePresent ? "status-unknown" : !matrix.applicable ? "status-unknown" : matrix.overallPassed ? "status-complete" : "status-failed"}`}>
-            {!matrix.gatePresent ? "gate not loaded" : !matrix.applicable ? "not applicable" : matrix.overallPassed ? "passed" : "blocked"}
+          <span>ContractRuntime authority matrix</span>
+          <span className={`status-badge ${authorityBadgeClass}`}>
+            {authorityBadge}
           </span>
         </div>
-        {!matrix.applicable ? (
-          <div className="timeline-empty">This backlog row is not subject to the MF close gate.</div>
-        ) : !matrix.gatePresent ? (
-          <div className="timeline-empty">Gate data not yet loaded. Expand the timeline to fetch gate evidence.</div>
+        {!matrix.gatePresent ? (
+          <div className="timeline-empty">Canonical ContractRuntime authority is not loaded. Historical MF close-gate data below remains advisory and cannot establish PASS or BLOCKED.</div>
         ) : matrix.rows.length === 0 ? (
-          <div className="timeline-empty">No gate requirement rows were found in the loaded gate response.</div>
+          <div className="timeline-empty">No canonical ContractRuntime requirement rows are available.</div>
         ) : (
           <GateVerificationMatrix rows={matrix.rows} backlogId={backlogId} projectId={projectId} />
         )}
       </div>
 
-      {/* ── Original contract inputs ────────────────────────────────────── */}
+      {/* ── Historical/advisory legacy MF close-gate projection ─────────── */}
+      <div className="backlog-modal-section" data-contract-gate-authority="legacy-advisory">
+        <div className="backlog-modal-section-head">
+          <span>Historical MF close gate (advisory)</span>
+          <span className="status-badge status-unknown">does not override ContractRuntime</span>
+        </div>
+        {!legacyMatrix.gatePresent ? (
+          <div className="timeline-empty">No historical MF close-gate response was loaded.</div>
+        ) : !legacyMatrix.applicable ? (
+          <div className="timeline-empty">The historical MF close gate is not applicable to this row.</div>
+        ) : legacyMatrix.rows.length === 0 ? (
+          <div className="timeline-empty">No historical MF close-gate rows were found.</div>
+        ) : (
+          <GateVerificationMatrix rows={legacyMatrix.rows} backlogId={backlogId} projectId={projectId} />
+        )}
+      </div>
+
+      {/* ── Historical contract inputs ──────────────────────────────────── */}
       <div className="backlog-modal-section">
         <div className="backlog-modal-section-head">
-          <span>Contract inputs</span>
+          <span>Historical contract inputs (advisory)</span>
           <span className={`status-badge ${audit.contract.valid ? "status-complete" : audit.contract.empty ? "status-unknown" : "status-failed"}`}>
             {audit.contract.empty ? "missing" : audit.contract.valid ? "parsed" : "invalid json"}
           </span>
@@ -2119,11 +2170,11 @@ function ContractGatePanel({
         </div>
       </div>
 
-      {/* ── Requirement evidence map (from chain_trigger_json) ──────────── */}
+      {/* ── Historical requirement evidence map (chain_trigger_json) ───── */}
       {audit.requirements.length > 0 ? (
         <div className="backlog-modal-section">
           <div className="backlog-modal-section-head">
-            <span>Contract requirement evidence</span>
+            <span>Historical contract requirement evidence (advisory)</span>
             <span className="mono">{audit.requirements.length} requirement{audit.requirements.length === 1 ? "" : "s"}</span>
           </div>
           <div className="backlog-contract-requirements">
@@ -2134,13 +2185,11 @@ function ContractGatePanel({
         </div>
       ) : null}
 
-      {/* ── Gate summary cards ──────────────────────────────────────────── */}
+      {/* ── Historical gate summary cards ───────────────────────────────── */}
       <div className="backlog-modal-section">
         <div className="backlog-modal-section-head">
-          <span>Gate detail cards</span>
-          <span className={`status-badge ${gateState.noGate ? "status-unknown" : gate?.passed ? "status-complete" : "status-failed"}`}>
-            {gateState.noGate ? "no gate evidence" : gate?.status || "recorded"}
-          </span>
+          <span>Historical MF close-gate detail (advisory)</span>
+          <span className="status-badge status-unknown">{gateState.noGate ? "no gate evidence" : "historical/advisory"}</span>
         </div>
         {gateState.noGate ? <NoGateNotice reason={gateState.reason} /> : gate ? <GateSummary gate={gate} response={response} /> : null}
         {gate ? <RouteContextGuidancePanel gate={gate} /> : null}
@@ -2167,16 +2216,17 @@ function ContractGatePanel({
         </div>
       ) : null}
 
-      {/* ── Raw payloads ────────────────────────────────────────────────── */}
+      {/* ── Raw public-safe authority and compatibility payloads ────────── */}
       <div className="backlog-modal-section">
         <div className="backlog-modal-section-head">
-          <span>Raw contract / gate payloads</span>
+          <span>Raw authority / compatibility payloads</span>
           <span className="mono">inspectable</span>
         </div>
         <div className="backlog-raw-payload-grid">
-          <RawPayloadBlock label="chain_trigger_json raw" value={audit.contract.rawForDisplay} />
-          <RawPayloadBlock label="parsed contract root" value={audit.contract.valid ? audit.contract.root : { error: audit.contract.error || "missing" }} />
-          <RawPayloadBlock label="timeline gate raw" value={response ?? { state: "not recorded" }} />
+          <RawPayloadBlock label="ContractRuntime current authority" value={visualization ?? { state: "not loaded" }} />
+          <RawPayloadBlock label="chain_trigger_json raw (advisory)" value={audit.contract.rawForDisplay} />
+          <RawPayloadBlock label="parsed legacy contract root (advisory)" value={audit.contract.valid ? audit.contract.root : { error: audit.contract.error || "missing" }} />
+          <RawPayloadBlock label="legacy MF close gate raw (advisory)" value={response ?? { state: "not recorded" }} />
         </div>
       </div>
     </div>

@@ -9,6 +9,7 @@ import {
   normalizeTaskPlaybackCompactLedger,
   projectRecentTimelineEvents,
   projectContractRuntimeAuthorityViewModel,
+  projectContractRuntimeGateMatrix,
   taskPlaybackLedgerRowsToTimelineEvents,
   taskPlaybackCompactLedgerBlockingLabel,
   taskPlaybackCompactLedgerDisplayState,
@@ -2061,6 +2062,54 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
       && dogfoodViews.every((view) => view.backlog_close_readiness.display_status === "BLOCKED"),
     "dogfood executions/revisions/events should remain cache-distinct while OPEN row close stays blocked",
   );
+  const dogfoodAuthorityMatrices = dogfoodViews.map((view) => projectContractRuntimeGateMatrix(view));
+  assertFixture(
+    dogfoodAuthorityMatrices.every((matrix) => matrix.gatePresent && !matrix.overallPassed)
+      && dogfoodAuthorityMatrices.every((matrix) => matrix.rows.some((row) => row.id === "contract_runtime.backlog_close_readiness" && row.status === "failed")),
+    "direct-main, mf_parallel, and mf_batch_parallel Contract & Gate matrices must derive blocked close state from canonical authority",
+  );
+  assertFixture(
+    dogfoodAuthorityMatrices[1].rows.some((row) => row.familyLabel === "ContractRuntime worker execution")
+      && dogfoodAuthorityMatrices[1].rows.some((row) => row.familyLabel === "ContractRuntime QA / close"),
+    "mf_parallel canonical matrix must preserve distinct worker and independent QA requirements",
+  );
+
+  const completedContractMatrix = projectContractRuntimeGateMatrix(completedContractView);
+  assertFixture(
+    !completedContractMatrix.overallPassed
+      && completedContractMatrix.rows.find((row) => row.id === "contract_runtime.backlog_close_readiness")?.status === "unknown",
+    "contract_complete with an OPEN backlog must remain no-PASS in the canonical Contract & Gate matrix",
+  );
+  const exceptionMatrix = projectContractRuntimeGateMatrix(view);
+  assertFixture(
+    !exceptionMatrix.overallPassed
+      && exceptionMatrix.rows.some((row) => row.nextAction.includes("does not imply PASS")),
+    "BYPASSED or WAIVED ContractRuntime evidence must remain visible without becoming PASS",
+  );
+  const supersededMatrix = projectContractRuntimeGateMatrix(projectContractRuntimeAuthorityViewModel({
+    ...response,
+    backlog: { ...response.backlog, status: "SUPERSEDED" },
+    backlog_close_readiness: {
+      ...response.backlog_close_readiness,
+      state: "open",
+      backlog_status: "SUPERSEDED",
+      contract_execution_state: "contract_complete",
+    },
+    contract_execution_progress: {
+      ...response.contract_execution_progress,
+      readiness_state: "contract_complete",
+      next_legal_action: {},
+    },
+    contract_chain: { ...response.contract_chain, readiness_state: "contract_complete", next_legal_action: {} },
+  }));
+  const supersededCloseRow = supersededMatrix.rows.find((row) => row.id === "contract_runtime.backlog_close_readiness");
+  assertFixture(
+    !supersededMatrix.overallPassed
+      && supersededCloseRow?.required === false
+      && supersededCloseRow.status === "not_applicable"
+      && supersededCloseRow.nextAction.includes("not PASS"),
+    "SUPERSEDED coordination rows must remain terminal/no-PASS instead of inheriting a legacy gate block",
+  );
   dogfoodModes.forEach((mode, index) => {
     const backlogId = `AC-SNAPSHOT-REFRESH-${mode.contractId}`;
     const sourceEvent: TaskTimelineEvent = {
@@ -2145,6 +2194,7 @@ function taskPlaybackAuthorityAdapterAssertions(): string[] {
     "task timeline consumer carries canonical authority axes without adding playback frames",
     "current authority snapshot stays out of playback history",
     "direct-main, mf_parallel, and mf_batch_parallel dogfood modes retain canonical actions and cache identities",
+    "Contract & Gate authority matrix covers direct-main, parallel, batch, no-PASS, exception, and SUPERSEDED states",
     "direct-main, mf_parallel, and mf_batch_parallel refresh snapshots advance without rewriting history",
     "Current and Playback share a prominent semantic next-legal-action callout",
   ];
