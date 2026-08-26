@@ -2780,49 +2780,20 @@ def test_mf_parallel_rev10_failed_qa_files_copy_safe_fresh_repair_row():
     assert old_identity["parent_task_id"] in body["provenance_paths"][0]
 
 
-def test_mf_parallel_rev10_failed_qa_rejects_nested_acceptance_authority():
-    leaked_authority = {
-        "branch_ref": "refs/heads/old-worker",
-        "contract_execution_id": "cex-old-generation",
-        "fence": "raw-old-fence",
-        "fence_ref": "fence-ref-old-generation",
-        "fence_token": "fence-token-old-generation",
-        "fence_token_ref": "fence-token-ref-old-generation",
-        "lane_id": "lane-old-generation",
-        "merge_queue_id": "mq-old-generation",
-        "parent_task_id": "task-old-parent",
-        "route_token_ref": "rtok-old-generation",
-        "runtime_context_id": "mfrctx-old-generation",
-        "session": "raw-old-session",
-        "session_ref": "session-ref-old-generation",
-        "session_token": "session-token-old-generation",
-        "session_token_ref": "session-token-ref-old-generation",
-        "target_project_root": "/tmp/old-project-root",
-        "task_id": "task-old-generation",
-        "worker_id": "worker-old-generation",
-        "worker_slot_id": "worker-slot-old-generation",
-        "worktree_path": "/tmp/old-worker-worktree",
-    }
-    record = {
+def _rev10_failed_qa_fresh_repair_record(
+    acceptance_criteria,
+    *,
+    backlog_id="AC-REV10-FAILED-QA-UNSAFE-AC",
+    contract_execution_id="cex-rev10-unsafe-ac-source",
+):
+    return {
         "project_id": "aming-claw",
-        "backlog_id": "AC-REV10-FAILED-QA-UNSAFE-AC",
+        "backlog_id": backlog_id,
         "contract_id": "mf_parallel.v2",
         "revision": "rev10",
-        "contract_execution_id": "cex-rev10-unsafe-ac-source",
+        "contract_execution_id": contract_execution_id,
         "metadata": {
-            "acceptance_criteria": [
-                {
-                    "id": "AC-REV10-UNSAFE-NESTED-AUTHORITY",
-                    "text": "Historical criterion contains unsafe metadata.",
-                    "required_scope": [
-                        "agent/governance/server.py",
-                        "agent/tests/test_contract_runtime.py",
-                    ],
-                    "historical_context": {
-                        "nested": dict(leaked_authority),
-                    },
-                }
-            ],
+            "acceptance_criteria": deepcopy(acceptance_criteria),
             "acceptance_scope_closure": {
                 "row_declared_files": [
                     "agent/governance/server.py",
@@ -2850,6 +2821,54 @@ def test_mf_parallel_rev10_failed_qa_rejects_nested_acceptance_authority():
         ],
     }
 
+
+def test_mf_parallel_rev10_failed_qa_rejects_nested_acceptance_authority():
+    leaked_authority = {
+        "branch_ref": "refs/heads/old-worker",
+        "contract_execution_id": "cex-old-generation",
+        "fence": "raw-old-fence",
+        "fence_ref": "fence-ref-old-generation",
+        "fence_token": "fence-token-old-generation",
+        "fence_token_ref": "fence-token-ref-old-generation",
+        "git_branch": "old-git-branch",
+        "lane_id": "lane-old-generation",
+        "merge_queue_id": "mq-old-generation",
+        "merge_queue_item_id": "mq-item-old-generation",
+        "observer_command_id": "cmd-old-generation",
+        "parent_task_id": "task-old-parent",
+        "project_root": "/tmp/old-project-root-alias",
+        "queue_item_id": "queue-item-old-generation",
+        "route_token_ref": "rtok-old-generation",
+        "runtime_context_id": "mfrctx-old-generation",
+        "session": "raw-old-session",
+        "session_ref": "session-ref-old-generation",
+        "session_token": "session-token-old-generation",
+        "session_token_ref": "session-token-ref-old-generation",
+        "target_project_root": "/tmp/old-project-root",
+        "task_id": "task-old-generation",
+        "worker_id": "worker-old-generation",
+        "worker_slot_id": "worker-slot-old-generation",
+        "worker_worktree_path": "/tmp/old-worker-path-alias",
+        "assigned_worktree": "/tmp/old-assigned-worktree",
+        "worktree_branch": "old-worktree-branch",
+        "worktree_path": "/tmp/old-worker-worktree",
+    }
+    record = _rev10_failed_qa_fresh_repair_record(
+        [
+            {
+                "id": "AC-REV10-UNSAFE-NESTED-AUTHORITY",
+                "text": "Historical criterion contains unsafe metadata.",
+                "required_scope": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_contract_runtime.py",
+                ],
+                "historical_context": {
+                    "nested": dict(leaked_authority),
+                },
+            },
+        ]
+    )
+
     state = server._runtime_current_state_from_record(record)
     action = state["next_legal_action"]
 
@@ -2859,7 +2878,7 @@ def test_mf_parallel_rev10_failed_qa_rejects_nested_acceptance_authority():
     assert action["action_input"] == {}
     assert action["copy_safe_body"] == {}
     assert action["canonical_executable_action"] == {}
-    assert "acceptance_criteria" in action["missing_action_input_fields"]
+    assert "acceptance_criteria" in action["action_input_missing_fields"]
     assert action["unsafe_action_input_paths"] == sorted(
         f"acceptance_criteria[0].historical_context.nested.{key}"
         for key in leaked_authority
@@ -2873,6 +2892,52 @@ def test_mf_parallel_rev10_failed_qa_rejects_nested_acceptance_authority():
     assert action["failed_qa_source_ref"].startswith(
         "contract_runtime:cex-rev10-unsafe-ac-source:completed_lines:"
     )
+
+
+def test_mf_parallel_rev10_failed_qa_allows_safe_semantic_key_mutations():
+    safe_semantic_criteria = [
+        {
+            "id": "AC-REV10-SAFE-SEMANTIC-MUTATIONS",
+            "text": "Semantic descriptions remain source-backed acceptance.",
+            "required_scope": [
+                "agent/governance/server.py",
+                "agent/tests/test_contract_runtime.py",
+            ],
+            "methodology": {
+                "project_root_behavior": "derive a fresh registered root",
+                "worker_worktree_path_requirement": "allocate a fresh path",
+                "assigned_worktree_expectation": "must be isolated",
+                "worktree_branching_strategy": "use a fresh branch",
+                "git_branch_policy": "never reuse retired authority",
+                "merge_queue_item_idempotency": "preserve row semantics",
+                "queue_item_identifier_format": "server generated",
+                "observer_command_description": "file a fresh repair row",
+                "session_behavior": "fresh authorization is required",
+                "tokenization_strategy": "index the source text",
+            },
+        }
+    ]
+    record = _rev10_failed_qa_fresh_repair_record(
+        safe_semantic_criteria,
+        backlog_id="AC-REV10-FAILED-QA-SAFE-SEMANTIC-AC",
+        contract_execution_id="cex-rev10-safe-semantic-ac-source",
+    )
+
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+
+    assert action["actionable"] is True
+    assert action["action_input_ready"] is True
+    assert action["action_input_missing_fields"] == []
+    assert action["unsafe_action_input_paths"] == []
+    assert action["copy_safe_body"]["acceptance_criteria"] == (
+        safe_semantic_criteria
+    )
+    assert action["failed_qa_source_ref"].startswith(
+        "contract_runtime:cex-rev10-safe-semantic-ac-source:completed_lines:"
+    )
+    assert "contract_execution_id" not in action["copy_safe_body"]
 
 
 def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation(

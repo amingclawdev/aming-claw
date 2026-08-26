@@ -99337,6 +99337,210 @@ def _caller_timeline_key_is_credential(key: Any) -> bool:
     return compact in _CALLER_TIMELINE_CREDENTIAL_KEY_COMPACT_DENYLIST
 
 
+_CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX = {
+    "credential": frozenset(
+        {
+            "api_key",
+            "authorization",
+            "fence_token",
+            "fence_token_ref",
+            "password",
+            "qa_session_token",
+            "qa_session_token_ref",
+            "route_token",
+            "route_token_ref",
+            "secret",
+            "session_token",
+            "session_token_ref",
+            "token",
+            "worker_session_token",
+            "worker_session_token_ref",
+        }
+    ),
+    "runtime_identity": frozenset(
+        {
+            "actual_host_worker_id",
+            "agent_id",
+            "contract_execution_id",
+            "current_contract_execution_id",
+            "host_startup_id",
+            "host_worker_id",
+            "lane_id",
+            "parent_contract_execution_id",
+            "parent_task_id",
+            "root_contract_execution_id",
+            "runtime_context_id",
+            "successor_contract_execution_id",
+            "task_id",
+            "worker_id",
+            "worker_slot_id",
+        }
+    ),
+    "session_identity": frozenset(
+        {
+            "host_session_id",
+            "observer_session_id",
+            "observer_session_ref",
+            "session",
+            "session_id",
+            "session_ref",
+            "worker_session_id",
+            "worker_session_ref",
+        }
+    ),
+    "project_root": frozenset(
+        {
+            "project_root",
+            "repo_root",
+            "repo_root_path",
+            "target_graph_root",
+            "target_project_root",
+            "workspace_root",
+            "worktree_root",
+        }
+    ),
+    "worktree": frozenset(
+        {
+            "assigned_worktree",
+            "worker_worktree_path",
+            "worktree_path",
+        }
+    ),
+    "branch": frozenset(
+        {
+            "branch_ref",
+            "git_branch",
+            "ref_name",
+            "target_branch",
+            "target_ref",
+            "worktree_branch",
+        }
+    ),
+    "merge_queue": frozenset(
+        {
+            "batch_id",
+            "merge_queue_id",
+            "merge_queue_item_id",
+            "parent_batch_id",
+            "queue_index",
+            "queue_item_id",
+        }
+    ),
+    "command": frozenset({"observer_command_id"}),
+    "fence": frozenset({"fence", "fence_ref"}),
+    "commit": frozenset(
+        {
+            "base_commit",
+            "branch_head",
+            "candidate_commit",
+            "candidate_commit_sha",
+            "commit_sha",
+            "current_head",
+            "head_commit",
+            "target_head_commit",
+        }
+    ),
+    "route": frozenset(
+        {
+            *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
+            *_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS,
+            "accepted_dispatch_authority",
+            "canonical_route_identity",
+            "route_gate",
+            "route_identity",
+            "route_token_gate",
+            "server_derived_authority",
+        }
+    ),
+}
+_CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_DENYLIST = frozenset(
+    re.sub(r"[^a-z0-9]+", "", key.casefold())
+    for aliases in _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX.values()
+    for key in aliases
+)
+_CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_SUFFIXES = (
+    "apikey",
+    "authorization",
+    "branch",
+    "branchref",
+    "commandid",
+    "contractexecutionid",
+    "credential",
+    "credentials",
+    "fence",
+    "fenceref",
+    "identity",
+    "laneid",
+    "mergequeueid",
+    "password",
+    "passphrase",
+    "projectroot",
+    "queueitemid",
+    "reporoot",
+    "routecontexthash",
+    "routeid",
+    "secret",
+    "session",
+    "sessionid",
+    "sessionref",
+    "taskid",
+    "token",
+    "tokenref",
+    "workerid",
+    "workerslotid",
+    "worktree",
+    "worktreepath",
+    "worktreeroot",
+)
+
+
+def _contract_runtime_key_is_execution_authority_or_credential(
+    key: Any,
+) -> bool:
+    """Classify keys that cannot cross a retired execution generation."""
+
+    if _caller_timeline_key_is_credential(key):
+        return True
+    compact = re.sub(r"[^a-z0-9]+", "", str(key or "").casefold())
+    if not compact:
+        return False
+    return bool(
+        compact
+        in _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_DENYLIST
+        or compact.endswith(
+            _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_SUFFIXES
+        )
+    )
+
+
+def _contract_runtime_unsafe_execution_authority_paths(
+    value: Any,
+    *,
+    root_path: str,
+) -> list[str]:
+    """Return key paths carrying retired authority without copying values."""
+
+    unsafe_paths: list[str] = []
+
+    def collect(child: Any, path: str) -> None:
+        if isinstance(child, Mapping):
+            for raw_key, nested in child.items():
+                key = str(raw_key or "").strip()
+                nested_path = f"{path}.{key}" if key else path
+                if _contract_runtime_key_is_execution_authority_or_credential(
+                    key
+                ):
+                    unsafe_paths.append(nested_path)
+                    continue
+                collect(nested, nested_path)
+        elif isinstance(child, (list, tuple)):
+            for index, nested in enumerate(child):
+                collect(nested, f"{path}[{index}]")
+
+    collect(value, root_path)
+    return sorted(set(unsafe_paths))
+
+
 def _caller_timeline_key_is_server_projected(key: Any) -> bool:
     compact = re.sub(r"[^a-z0-9]+", "", str(key or "").casefold())
     return compact in _SERVER_PROJECTED_TIMELINE_KEY_COMPACT_DENYLIST
@@ -106627,86 +106831,12 @@ def _contract_runtime_failed_qa_fresh_repair_action(
         if isinstance(child_plan.get("acceptance_criteria"), list)
         else []
     )
-    forbidden_acceptance_keys = {
-        "actual_host_worker_id",
-        "api_key",
-        "authorization",
-        "branch_ref",
-        "contract_execution_id",
-        "fence",
-        "fence_ref",
-        "fence_token",
-        "fence_token_ref",
-        "host_session_id",
-        "host_startup_id",
-        "host_worker_id",
-        "lane_id",
-        "merge_queue_id",
-        "observer_session_id",
-        "observer_session_ref",
-        "parent_contract_execution_id",
-        "parent_task_id",
-        "password",
-        "route_token",
-        "route_token_ref",
-        "runtime_context_id",
-        "session",
-        "session_id",
-        "session_ref",
-        "session_token",
-        "session_token_ref",
-        "secret",
-        "target_project_root",
-        "task_id",
-        "token",
-        "worker_id",
-        "worker_session_ref",
-        "worker_session_id",
-        "worker_session_token",
-        "worker_session_token_ref",
-        "worker_slot_id",
-        "worktree_path",
-    }
-    unsafe_acceptance_paths: list[str] = []
-
-    def collect_unsafe_acceptance_paths(
-        value: Any,
-        path: str = "acceptance_criteria",
-    ) -> None:
-        if isinstance(value, Mapping):
-            for raw_key, child in value.items():
-                key = str(raw_key or "").strip()
-                normalized = key.lower()
-                child_path = f"{path}.{key}" if key else path
-                if (
-                    normalized in forbidden_acceptance_keys
-                    or normalized.endswith(
-                        (
-                            "_token",
-                            "_token_ref",
-                            "_fence",
-                            "_fence_ref",
-                            "_session",
-                            "_session_id",
-                            "_session_ref",
-                            "_credential",
-                            "_secret",
-                            "_password",
-                            "_api_key",
-                        )
-                    )
-                ):
-                    unsafe_acceptance_paths.append(child_path)
-                    continue
-                collect_unsafe_acceptance_paths(child, child_path)
-        elif isinstance(value, (list, tuple)):
-            for index, child in enumerate(value):
-                collect_unsafe_acceptance_paths(
-                    child,
-                    f"{path}[{index}]",
-                )
-
-    collect_unsafe_acceptance_paths(acceptance_criteria)
+    unsafe_acceptance_paths = (
+        _contract_runtime_unsafe_execution_authority_paths(
+            acceptance_criteria,
+            root_path="acceptance_criteria",
+        )
+    )
     safe_acceptance_criteria = (
         [] if unsafe_acceptance_paths else deepcopy(acceptance_criteria)
     )
@@ -106805,10 +106935,8 @@ def _contract_runtime_failed_qa_fresh_repair_action(
         "action_input": deepcopy(action_input),
         "copy_safe_body": deepcopy(action_input),
         "canonical_executable_action": canonical_action,
-        "missing_action_input_fields": missing_fields,
-        "unsafe_action_input_paths": sorted(
-            set(unsafe_acceptance_paths)
-        ),
+        "action_input_missing_fields": missing_fields,
+        "unsafe_action_input_paths": unsafe_acceptance_paths,
         "failed_qa_source_ref": failed_source_ref,
         "failed_qa_status": str(
             failure_payload.get("status")
@@ -106822,10 +106950,11 @@ def _contract_runtime_failed_qa_fresh_repair_action(
         "source_runtime_authority_reusable": False,
         "historical_contract_successor": historical_direct_fix,
         "forbidden_authority_reuse": sorted(
-            {
-                *forbidden_acceptance_keys,
-                "accepted_dispatch_authority",
-            }
+            key
+            for aliases in (
+                _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX.values()
+            )
+            for key in aliases
         ),
         "next_after_success": {
             "interface": "onboard_route_guide",
@@ -148104,6 +148233,8 @@ _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION = "onboard_route_guide.compact_response.v1
 _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES = 16 * 1024
 _ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES = 6 * 1024
 _ONBOARD_GUIDE_CAPSULE_MAX_FETCH_SECTIONS = 3
+_ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_ITEMS = 32
+_ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_CHARS = 512
 _ONBOARD_GUIDE_CAPSULE_TTL_SECONDS = 300.0
 _ONBOARD_GUIDE_CAPSULE_MAX_ENTRIES = 128
 _ONBOARD_GUIDE_CAPSULE_SINGLE_FLIGHT_WAIT_SECONDS = 5.0
@@ -152251,6 +152382,15 @@ def _onboard_route_guide_compact_service_response(
             "action_input_missing_fields": list(
                 next_action.get("action_input_missing_fields") or []
             ),
+            "unsafe_action_input_paths": [
+                str(item)[
+                    :_ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_CHARS
+                ]
+                for item in (
+                    next_action.get("unsafe_action_input_paths") or []
+                )
+                if str(item or "").strip()
+            ][:_ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_ITEMS],
             "server_derived_authority": (
                 dict(next_action.get("server_derived_authority"))
                 if isinstance(

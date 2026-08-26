@@ -136441,6 +136441,106 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
     ):
         assert stale_identity[identity_field] not in rendered_action
 
+    unsafe_onboard_aliases = {
+        "project_root": "/tmp/retired-project-root",
+        "worker_worktree_path": "/tmp/retired-worker-worktree",
+        "assigned_worktree": "/tmp/retired-assigned-worktree",
+        "worktree_branch": "retired-worktree-branch",
+        "git_branch": "retired-git-branch",
+        "merge_queue_item_id": "retired-merge-queue-item",
+        "queue_item_id": "retired-queue-item",
+        "observer_command_id": "retired-observer-command",
+    }
+    unsafe_criteria = [
+        {
+            "id": "AC-REV10-FAILED-QA-ONBOARD-UNSAFE-ALIASES",
+            "text": "Retired execution aliases must not enter the repair row.",
+            "required_scope": [
+                "agent/governance/server.py",
+                "agent/tests/test_graph_governance_api.py",
+            ],
+            "historical_context": {
+                "nested": dict(unsafe_onboard_aliases),
+            },
+        }
+    ]
+    unsafe_record = copy.deepcopy(child_record)
+    unsafe_record["metadata"] = {
+        **dict(unsafe_record.get("metadata") or {}),
+        "acceptance_criteria": unsafe_criteria,
+        "observer_prefill_child_plan": {
+            **dict(
+                (unsafe_record.get("metadata") or {}).get(
+                    "observer_prefill_child_plan"
+                )
+                or {}
+            ),
+            "acceptance_criteria": unsafe_criteria,
+        },
+    }
+    unsafe_revision = int(
+        child_record.get("execution_state_revision") or 0
+    ) + 1
+    unsafe_record["execution_state_revision"] = unsafe_revision
+    unsafe_record["execution_state"] = {
+        **dict(unsafe_record.get("execution_state") or {}),
+        "execution_state_revision": unsafe_revision,
+        "execution_state_hash": _fake_sha(
+            "rev10-failed-qa-onboard-unsafe-aliases"
+        ),
+    }
+    runtime.store.update(
+        execution_id,
+        unsafe_record,
+        expected_revision=int(
+            child_record.get("execution_state_revision") or 0
+        ),
+    )
+    conn.commit()
+
+    unsafe_guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "parallel_worker",
+                "response_view": "compact",
+            },
+        )
+    )
+
+    assert unsafe_guide["ok"] is True
+    assert unsafe_guide["actionable"] is False
+    unsafe_action = unsafe_guide["next_legal_action"]
+    assert unsafe_action["action_input_ready"] is False
+    assert unsafe_action["action_input_missing_fields"] == [
+        "acceptance_criteria"
+    ]
+    expected_unsafe_paths = sorted(
+        "acceptance_criteria[0].historical_context.nested." + key
+        for key in unsafe_onboard_aliases
+    )
+    assert unsafe_action["unsafe_action_input_paths"] == (
+        expected_unsafe_paths
+    )
+    assert len(unsafe_action["unsafe_action_input_paths"]) <= (
+        server._ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_ITEMS
+    )
+    assert all(
+        len(path)
+        <= server._ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_CHARS
+        for path in unsafe_action["unsafe_action_input_paths"]
+    )
+    rendered_unsafe_guide = json.dumps(unsafe_guide, sort_keys=True)
+    for value in unsafe_onboard_aliases.values():
+        assert value not in rendered_unsafe_guide
+    assert unsafe_action["failed_qa_source_ref"].startswith(
+        f"contract_runtime:{execution_id}:completed_lines:"
+    )
+
 
 def test_mf_parallel_dispatch_ticket_authority_rejects_conflicting_route_identity():
     authority = server._contract_runtime_dispatch_ticket_authority(
