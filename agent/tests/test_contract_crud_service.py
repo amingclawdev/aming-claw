@@ -29,6 +29,7 @@ from agent.governance.contracts.runtime import (
 )
 from agent.governance.contracts.hash import stable_sha256
 from agent.governance.server import (
+    _contract_runtime_precommit_correction_intent_requested,
     _contract_runtime_direct_fix_close_authority_gate,
     _contract_runtime_mf_parallel_concurrent_sibling_writer_rebase,
     _contract_runtime_writer_line_guide_hash,
@@ -1360,6 +1361,44 @@ def test_precommit_correction_rebinds_exact_current_atomic_lane_writer_copy():
         source,
         correction_intent=mismatched,
     ) == {}
+
+
+def test_precommit_correction_intent_bypasses_completed_line_projection():
+    intent = {
+        "schema_version": (
+            "runtime_context.precommit_implementation_correction_intent.v1"
+        ),
+        "action": "revise_precommit_worker_implementation",
+        "contract_execution_id": "cex-precommit-projection-bypass",
+        "runtime_context_id": "mfrctx-precommit-projection-bypass",
+        "task_id": "task-precommit-projection-bypass",
+        "prior_implementation_lineage_ref": (
+            "contract-runtime:implementation:prior"
+        ),
+    }
+
+    assert _contract_runtime_precommit_correction_intent_requested(
+        {
+            "event_kind": "implementation",
+            "payload": {
+                "precommit_implementation_correction_intent": intent,
+            },
+        }
+    ) is True
+    assert _contract_runtime_precommit_correction_intent_requested(
+        {
+            "event_kind": "implementation",
+            "payload": {"changed_files": ["agent/governance/server.py"]},
+        }
+    ) is False
+    assert _contract_runtime_precommit_correction_intent_requested(
+        {
+            "event_kind": "implementation",
+            "payload": {
+                "precommit_implementation_correction_intent": None,
+            },
+        }
+    ) is True
 
 
 def test_contract_runtime_writer_role_safe_copy_payload_for_mf_sub_to_qa():

@@ -164960,6 +164960,26 @@ def _contract_runtime_completed_line_projection_gate(
     return gate
 
 
+def _contract_runtime_precommit_correction_intent_requested(
+    body: Mapping[str, Any],
+) -> bool:
+    """Keep explicit precommit corrections on the canonical write path.
+
+    A correction intentionally targets a previously completed
+    ``worker_implementation`` line.  Treating that old line as an ordinary
+    duplicate would project success without calling the strict RuntimeContext
+    revision helper, leaving ContractRuntime unchanged.  Presence is enough
+    here: the canonical helper remains responsible for validating the intent
+    object and rejecting malformed requests without a write.
+    """
+
+    payload = body.get("payload") if isinstance(body, Mapping) else None
+    return bool(
+        isinstance(payload, Mapping)
+        and "precommit_implementation_correction_intent" in payload
+    )
+
+
 def _contract_runtime_completed_line_projection_preflight_gate(
     conn,
     *,
@@ -164998,6 +165018,63 @@ def _contract_runtime_completed_line_projection_preflight_gate(
             record=record,
             actor_role=actor_role,
         )
+    if _contract_runtime_precommit_correction_intent_requested(body):
+        payload = body.get("payload")
+        correction_intent = (
+            payload.get("precommit_implementation_correction_intent")
+            if isinstance(payload, Mapping)
+            else None
+        )
+        runtime_context_id = str(
+            payload.get("runtime_context_id")
+            if isinstance(payload, Mapping)
+            else ""
+        ).strip()
+        task_id = str(
+            payload.get("task_id") if isinstance(payload, Mapping) else ""
+        ).strip()
+        latest_implementation = (
+            _worker_commit_completed_implementation(
+                record,
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+            )
+            if runtime_context_id and task_id
+            else None
+        )
+        latest_payload = (
+            latest_implementation.get("payload")
+            if isinstance(latest_implementation, Mapping)
+            and isinstance(latest_implementation.get("payload"), Mapping)
+            else {}
+        )
+        prior_revision = (
+            latest_payload.get("canonical_precommit_lineage_revision")
+            if isinstance(
+                latest_payload.get("canonical_precommit_lineage_revision"),
+                Mapping,
+            )
+            else {}
+        )
+        exact_idempotent_projection = bool(
+            isinstance(correction_intent, Mapping)
+            and str(correction_intent.get("action") or "").strip()
+            == "revise_precommit_worker_implementation"
+            and str(correction_intent.get("contract_execution_id") or "").strip()
+            == str(record.get("contract_execution_id") or "").strip()
+            and str(correction_intent.get("runtime_context_id") or "").strip()
+            == runtime_context_id
+            and str(correction_intent.get("task_id") or "").strip() == task_id
+            and str(
+                correction_intent.get("prior_implementation_lineage_ref") or ""
+            ).strip()
+            == str(
+                prior_revision.get("supersedes_implementation_lineage_ref") or ""
+            ).strip()
+            and prior_revision
+        )
+        if not exact_idempotent_projection:
+            return {}
     completed_line = _contract_runtime_completed_line_request_for_event(
         record,
         event_kind=event_kind,
