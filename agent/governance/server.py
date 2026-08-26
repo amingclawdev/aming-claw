@@ -122663,23 +122663,12 @@ def _contract_runtime_rev8_postmerge_qa_authority(
             )
             else {}
         )
-        projected_reconcile_line_commit = str(
-            reconcile_line.get("commit_sha") or ""
-        ).strip().lower()
-        projected_reconcile_line_commit_verified = bool(
-            projected_reconcile_line_commit == merged_commit
-            or (
-                declared_batch_child
-                and _contract_runtime_shared_batch_postmerge_qa_activation_verified(
-                    projected_reconcile_authority
-                )
-                and projected_reconcile_line_commit
-                == str(
-                    projected_reconcile_authority.get(
-                        "reconciled_commit_sha"
-                    )
-                    or ""
-                ).strip().lower()
+        projected_reconcile_line_commit_verified = (
+            _contract_runtime_projected_reconcile_line_commit_verified(
+                declared_batch_child=declared_batch_child,
+                line_commit=reconcile_line.get("commit_sha"),
+                merged_commit=merged_commit,
+                reconcile_authority=projected_reconcile_authority,
             )
         )
         if not (
@@ -130755,6 +130744,46 @@ def _contract_runtime_shared_batch_postmerge_qa_activation_verified(
     return _contract_runtime_shared_batch_reconcile_activation_verified(
         authority,
         allow_postmerge_qa_admission=True,
+    )
+
+
+def _contract_runtime_projected_reconcile_line_commit_verified(
+    *,
+    declared_batch_child: bool,
+    line_commit: Any,
+    merged_commit: Any,
+    reconcile_authority: Mapping[str, Any],
+) -> bool:
+    """Keep child merge lineage distinct from a Batch fan-in checkpoint.
+
+    A standalone projected reconcile line remains pinned to its merge commit.
+    A declared Batch child may instead name the final fan-in head, but only
+    when the existing shared-Batch authority verifies and names that same
+    head as both its final commit and the current-full reconciled commit.
+    """
+
+    line_commit = str(line_commit or "").strip().lower()
+    merged_commit = str(merged_commit or "").strip().lower()
+    if line_commit == merged_commit:
+        return True
+    shared = (
+        reconcile_authority.get("shared_batch_reconcile_authority")
+        if isinstance(
+            reconcile_authority.get("shared_batch_reconcile_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    return bool(
+        declared_batch_child
+        and _contract_runtime_shared_batch_postmerge_qa_activation_verified(
+            reconcile_authority
+        )
+        and line_commit
+        == str(
+            reconcile_authority.get("reconciled_commit_sha") or ""
+        ).strip().lower()
+        == str(shared.get("final_head_commit") or "").strip().lower()
     )
 
 

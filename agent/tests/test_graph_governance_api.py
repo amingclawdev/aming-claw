@@ -22585,6 +22585,67 @@ def test_mf_batch_child_live_shape_projects_consumed_legacy_candidate_qa(
         )
 
 
+def test_mf_batch_child_projected_reconcile_commit_requires_verified_fanin(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    world = _mf_batch_child_postmerge_qa_world(
+        conn,
+        tmp_path,
+        monkeypatch,
+        persist_contract_post_worker_lines=False,
+        record_legacy_candidate_qa_receipts=True,
+    )
+    record = server._contract_runtime(conn).store.get(
+        _BATCH_QA_CHILD_EXECUTIONS[0]
+    )
+    projected, projection = (
+        server._contract_runtime_apply_mf_parallel_context_projection(
+            conn,
+            project_id=PID,
+            record=record,
+            actor_role="qa",
+        )
+    )
+    assert projection["status"] == "projected"
+    reconcile_line = next(
+        line
+        for line in projected["completed_lines"]
+        if line.get("line_id") == "observer_reconcile"
+    )
+    authority = reconcile_line["payload"]["reconcile_authority"]
+    assert world.child_commits[0] != world.final_head
+    assert server._contract_runtime_projected_reconcile_line_commit_verified(
+        declared_batch_child=True,
+        line_commit=world.final_head,
+        merged_commit=world.child_commits[0],
+        reconcile_authority=authority,
+    ) is True
+    assert server._contract_runtime_projected_reconcile_line_commit_verified(
+        declared_batch_child=False,
+        line_commit=world.final_head,
+        merged_commit=world.child_commits[0],
+        reconcile_authority=authority,
+    ) is False
+    assert server._contract_runtime_projected_reconcile_line_commit_verified(
+        declared_batch_child=True,
+        line_commit="f" * 40,
+        merged_commit=world.child_commits[0],
+        reconcile_authority=authority,
+    ) is False
+    forged = copy.deepcopy(authority)
+    forged["shared_batch_reconcile_authority"]["final_head_commit"] = (
+        "f" * 40
+    )
+    assert server._contract_runtime_projected_reconcile_line_commit_verified(
+        declared_batch_child=True,
+        line_commit=world.final_head,
+        merged_commit=world.child_commits[0],
+        reconcile_authority=forged,
+    ) is False
+
+
 def test_mf_batch_child_live_shape_legacy_receipt_fails_closed_on_drift(
     conn,
     tmp_path,
