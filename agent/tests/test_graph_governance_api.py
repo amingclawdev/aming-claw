@@ -171621,6 +171621,136 @@ def _seed_open_epoch_planned_successor(
     )
 
 
+def _worldref_seal_server_fixture(conn):
+    backlog_id = "AC-WORLDREF-SERVER-ROW3"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    epoch = _seed_open_epoch_planned_successor(
+        conn,
+        batch_id="batch-worldref-server",
+        queue_id="mq-worldref-server",
+        queue_item_id="item-worldref-server-row3",
+        task_id="task-worldref-server-row3",
+        backlog_id=backlog_id,
+        current_head="a" * 40,
+    )
+    conn.commit()
+    return epoch
+
+
+def _stub_worldref_seal_git(monkeypatch, tmp_path, *, head="b" * 40):
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: tmp_path,
+    )
+    monkeypatch.setattr(server, "_git_clean_worktree_verified", lambda _root: True)
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_resolve_canonical_commit",
+        lambda _root, _ref, *, field: head,
+    )
+    monkeypatch.setattr(server, "_git_commit_is_ancestor", lambda *_args: True)
+
+
+def test_worldref_seal_projects_copy_safe_http_action_in_onboard(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    epoch = _worldref_seal_server_fixture(conn)
+    _stub_worldref_seal_git(monkeypatch, tmp_path)
+
+    resume = server._server_integration_epoch_resume_payload(conn, epoch)
+
+    assert resume["id"] == "integration_epoch_worldref_seal_linear_unlock", resume
+    assert resume["method"] == "POST"
+    assert resume["path"].endswith("/worldref-seal-linear-unlock")
+    assert resume["action_input_ready"] is True
+    assert resume["action_input"]["epoch_world_head"] == "a" * 40
+    assert resume["action_input"]["target_world_head"] == "b" * 40
+    assert resume["action_input"]["merge_cursor"] == 1
+    assert resume["action_input"]["merged_prefix"] == ["item-row1"]
+    assert resume["resume_authorized"] is False
+    assert resume["release_authorized"] is False
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-UNRELATED-WORLDREF-REQUEST",
+                "role": "observer",
+                "work_type": "system_operation",
+                "response_view": "compact",
+            },
+        )
+    )
+    assert guide["backlog_id"] == epoch.coordination_backlog_id
+    assert guide["next_legal_action"]["id"] == (
+        "integration_epoch_worldref_seal_linear_unlock"
+    )
+    canonical = guide["canonical_executable_action"]
+    assert canonical["method"] == "POST"
+    assert canonical["path"].endswith("/worldref-seal-linear-unlock")
+    assert canonical["copy_safe_body"]["epoch_id"] == epoch.epoch_id
+
+
+def test_worldref_seal_http_handler_is_atomic_and_exact_replay_is_idempotent(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    epoch = _worldref_seal_server_fixture(conn)
+    _stub_worldref_seal_git(monkeypatch, tmp_path)
+    action = server._server_integration_epoch_resume_payload(conn, epoch)
+    monkeypatch.setattr(
+        server,
+        "_require_integration_epoch_release_authority",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "principal_id": "worldref-seal-observer",
+            "role_source": "observer_session_route_token_ref",
+        },
+    )
+    route_handlers = [
+        handler
+        for method, path, handler in server.ROUTES
+        if method == "POST"
+        and path
+        == (
+            "/api/projects/{project_id}/integration-epochs/{batch_id}/"
+            "worldref-seal-linear-unlock"
+        )
+    ]
+    assert route_handlers == [
+        server.handle_integration_epoch_worldref_seal_linear_unlock
+    ]
+    ctx = _ctx(
+        {"project_id": PID, "batch_id": epoch.batch_id},
+        method="POST",
+        body=action["action_input"],
+    )
+
+    result = route_handlers[0](ctx)
+
+    assert result["ok"] is True
+    assert result["replayed"] is False
+    assert result["current_head_preserved"] is True
+    sealed = get_integration_epoch(conn, PID, epoch.batch_id)
+    assert sealed.status == "aborted_with_exception"
+    assert sealed.current_head == epoch.current_head
+    assert sealed.merge_cursor == epoch.merge_cursor
+    assert sealed.merged_prefix == epoch.merged_prefix
+    before_replay = conn.total_changes
+
+    replay = route_handlers[0](ctx)
+
+    assert replay["ok"] is True
+    assert replay["replayed"] is True
+    assert replay["writes_performed"] is False
+    assert conn.total_changes == before_replay
+
+
 @pytest.mark.parametrize(
     "field,replacement",
     [

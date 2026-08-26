@@ -770,6 +770,321 @@ def _runtime_conn() -> sqlite3.Connection:
     return conn
 
 
+def _worldref_seal_fixture() -> tuple[
+    sqlite3.Connection,
+    parallel_branch_runtime.IntegrationEpoch,
+    MergeQueueItem,
+]:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    batch_id = "batch-worldref-seal"
+    queue_id = "mq-worldref-seal"
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=queue_id,
+        queue_item_id="mqitem-row-3",
+        backlog_id="AC-WORLDREF-SEAL-ROW-3",
+        task_id="task-worldref-seal-row-3",
+        branch_ref="",
+        queue_index=3,
+        status="planned",
+        target_ref="refs/heads/main",
+    )
+    upsert_merge_queue_item(conn, item, now_iso=NOW)
+    conn.execute(
+        """
+        INSERT INTO backlog_bugs (
+            bug_id, title, status, priority, target_files, test_files,
+            acceptance_criteria, created_at, updated_at
+        ) VALUES (?, ?, 'OPEN', 'P0', '[]', '[]', '[]', ?, ?)
+        """,
+        (item.backlog_id, "Never-started terminal row", NOW, NOW),
+    )
+    epoch = parallel_branch_runtime.upsert_integration_epoch(
+        conn,
+        parallel_branch_runtime.IntegrationEpoch(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            epoch_id="epoch-worldref-seal",
+            coordination_backlog_id="AC-WORLDREF-SEAL-BATCH",
+            target_ref="refs/heads/main",
+            base_head="0" * 40,
+            current_head="a" * 40,
+            merge_queue_id=queue_id,
+            merge_cursor=2,
+            merged_prefix=("mqitem-row-1", "mqitem-row-2"),
+            remaining_queue_item_ids=(item.queue_item_id,),
+            status="open",
+            active_queue_item_id=item.queue_item_id,
+            active_task_id=item.task_id,
+            active_backlog_id=item.backlog_id,
+            last_merge_commit="a" * 40,
+        ),
+        now_iso=NOW,
+    )
+    conn.commit()
+    return conn, epoch, item
+
+
+def _worldref_target_authority(
+    epoch: parallel_branch_runtime.IntegrationEpoch,
+    *,
+    target_world_head: str = "b" * 40,
+) -> dict[str, object]:
+    authority: dict[str, object] = {
+        "schema_version": "mf_batch_parallel.target_worldref_authority.v1",
+        "server_derived": True,
+        "db_verified": True,
+        "canonical_target_ref_verified": True,
+        "clean_worktree_verified": True,
+        "target_ref_stable": True,
+        "target_descends_from_epoch_world": True,
+        "project_id": epoch.project_id,
+        "batch_id": epoch.batch_id,
+        "epoch_id": epoch.epoch_id,
+        "target_ref": epoch.target_ref,
+        "target_world_head": target_world_head,
+    }
+    authority["authority_hash"] = (
+        parallel_branch_runtime._worldref_seal_identity_hash(authority)
+    )
+    return authority
+
+
+def test_worldref_seal_terminalizes_only_row3_and_preserves_epoch_world() -> None:
+    conn, epoch, item = _worldref_seal_fixture()
+    action = parallel_branch_runtime.integration_epoch_worldref_seal_action_payload(
+        conn,
+        epoch,
+        target_world_head="b" * 40,
+        target_world_head_validated=True,
+        target_descends_from_epoch_world=True,
+    )
+
+    assert action["action"] == "integration_epoch_worldref_seal_linear_unlock"
+    assert action["action_input_ready"] is True
+    assert action["resume_authorized"] is False
+    request = action["action_input"]
+    result = parallel_branch_runtime.seal_integration_epoch_worldref_linear_unlock(
+        conn,
+        request=request,
+        target_world_authority=_worldref_target_authority(epoch),
+        now_iso="2026-05-16T12:05:00Z",
+    )
+    conn.commit()
+
+    assert result["terminal_disposition"] == "aborted_with_exception"
+    assert result["current_head_preserved"] is True
+    assert result["merge_cursor_preserved"] is True
+    assert result["merged_prefix_preserved"] is True
+    assert result["merge_credit_granted"] is False
+    assert result["pass_synthesized"] is False
+    saved_epoch = parallel_branch_runtime.get_integration_epoch(
+        conn, PROJECT_ID, epoch.batch_id
+    )
+    assert saved_epoch is not None
+    assert saved_epoch.status == "aborted_with_exception"
+    assert saved_epoch.current_head == epoch.current_head
+    assert saved_epoch.merge_cursor == 2
+    assert saved_epoch.merged_prefix == epoch.merged_prefix
+    saved_item = parallel_branch_runtime.get_merge_queue_item(
+        conn, PROJECT_ID, epoch.merge_queue_id, item.queue_item_id
+    )
+    assert saved_item is not None
+    assert saved_item.status == "terminal_no_pass"
+    backlog = conn.execute(
+        "SELECT status, runtime_state FROM backlog_bugs WHERE bug_id = ?",
+        (item.backlog_id,),
+    ).fetchone()
+    assert tuple(backlog) == ("WAIVED", "completed_with_exception")
+    worldrefs = conn.execute(
+        """
+        SELECT world_kind, commit_sha
+        FROM parallel_branch_integration_epoch_world_refs
+        ORDER BY world_kind
+        """
+    ).fetchall()
+    assert {(row["world_kind"], row["commit_sha"]) for row in worldrefs} == {
+        ("epoch_world_head", "a" * 40),
+        ("foreign_direct_repair_descendant", "b" * 40),
+    }
+    diagnostic = conn.execute(
+        "SELECT status, mf_type FROM backlog_bugs WHERE bug_id = ?",
+        (result["diagnostic_backlog_id"],),
+    ).fetchone()
+    assert tuple(diagnostic) == ("OPEN", "chain_rescue")
+
+
+def test_worldref_seal_exact_replay_is_zero_write_and_payload_drift_refuses() -> None:
+    conn, epoch, _ = _worldref_seal_fixture()
+    action = parallel_branch_runtime.integration_epoch_worldref_seal_action_payload(
+        conn,
+        epoch,
+        target_world_head="b" * 40,
+        target_world_head_validated=True,
+        target_descends_from_epoch_world=True,
+    )
+    request = action["action_input"]
+    authority = _worldref_target_authority(epoch)
+    first = parallel_branch_runtime.seal_integration_epoch_worldref_linear_unlock(
+        conn,
+        request=request,
+        target_world_authority=authority,
+        now_iso="2026-05-16T12:05:00Z",
+    )
+    conn.commit()
+    before_replay = conn.total_changes
+
+    replay = parallel_branch_runtime.seal_integration_epoch_worldref_linear_unlock(
+        conn,
+        request=request,
+        target_world_authority=authority,
+        now_iso="2026-05-16T12:06:00Z",
+    )
+
+    assert replay["replayed"] is True
+    assert replay["writes_performed"] is False
+    assert replay["seal_id"] == first["seal_id"]
+    assert conn.total_changes == before_replay
+    drifted = dict(request)
+    drifted["merge_cursor"] = 3
+    with pytest.raises(
+        parallel_branch_runtime.IntegrationEpochWorldRefSealError,
+        match="exactly match",
+    ):
+        parallel_branch_runtime.seal_integration_epoch_worldref_linear_unlock(
+            conn,
+            request=drifted,
+            target_world_authority=authority,
+        )
+    assert conn.total_changes == before_replay
+
+
+def test_worldref_seal_reuses_unique_existing_no_pass_root() -> None:
+    conn, epoch, item = _worldref_seal_fixture()
+    diagnostic_id = "AC-EXISTING-NO-PASS-DIAGNOSTIC"
+    binding = {
+        "project_id": PROJECT_ID,
+        "batch_id": epoch.batch_id,
+        "epoch_id": epoch.epoch_id,
+        "merge_queue_id": epoch.merge_queue_id,
+        "source_backlog_id": item.backlog_id,
+        "contract_execution_id": item.task_id,
+        "no_pass_claim": True,
+    }
+    conn.execute(
+        """
+        INSERT INTO backlog_bugs (
+            bug_id, title, status, priority, chain_trigger_json,
+            bypass_policy_json, mf_type, created_at, updated_at
+        ) VALUES (?, ?, 'OPEN', 'P0', ?, ?, 'chain_rescue', ?, ?)
+        """,
+        (
+            diagnostic_id,
+            "Existing no-PASS diagnostic root",
+            json.dumps(binding, sort_keys=True),
+            json.dumps(binding, sort_keys=True),
+            NOW,
+            NOW,
+        ),
+    )
+    conn.commit()
+    action = parallel_branch_runtime.integration_epoch_worldref_seal_action_payload(
+        conn,
+        epoch,
+        target_world_head="b" * 40,
+        target_world_head_validated=True,
+        target_descends_from_epoch_world=True,
+    )
+
+    assert action["action_input"]["diagnostic_backlog_id"] == diagnostic_id
+    assert action["action_input"]["diagnostic_root_mode"] == "reuse"
+    result = parallel_branch_runtime.seal_integration_epoch_worldref_linear_unlock(
+        conn,
+        request=action["action_input"],
+        target_world_authority=_worldref_target_authority(epoch),
+        now_iso="2026-05-16T12:05:00Z",
+    )
+
+    assert result["diagnostic_backlog_id"] == diagnostic_id
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backlog_bugs WHERE mf_type = 'chain_rescue'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT status FROM backlog_bugs WHERE bug_id = ?", (diagnostic_id,)
+    ).fetchone()[0] == "OPEN"
+
+
+def test_worldref_seal_row3_evidence_and_nonunique_root_refuse_without_write() -> None:
+    conn, epoch, item = _worldref_seal_fixture()
+    upsert_merge_queue_item(
+        conn,
+        replace(item, branch_ref="refs/heads/codex/row3"),
+        now_iso=NOW,
+    )
+    conn.commit()
+    before = conn.total_changes
+
+    refusal = parallel_branch_runtime.integration_epoch_worldref_seal_action_payload(
+        conn,
+        epoch,
+        target_world_head="b" * 40,
+        target_world_head_validated=True,
+        target_descends_from_epoch_world=True,
+    )
+
+    assert refusal["action"] == "integration_epoch_worldref_seal_refused"
+    assert refusal["zero_write_refusal"] is True
+    assert any(
+        blocker["code"] == "queue_execution_evidence_present"
+        for blocker in refusal["blockers"]
+    )
+    assert conn.total_changes == before
+
+    conn, epoch, item = _worldref_seal_fixture()
+    binding = {
+        "project_id": PROJECT_ID,
+        "batch_id": epoch.batch_id,
+        "epoch_id": epoch.epoch_id,
+        "merge_queue_id": epoch.merge_queue_id,
+        "source_backlog_id": item.backlog_id,
+        "contract_execution_id": item.task_id,
+        "no_pass_claim": True,
+    }
+    for suffix in ("A", "B"):
+        conn.execute(
+            """
+            INSERT INTO backlog_bugs (
+                bug_id, title, status, priority, chain_trigger_json,
+                bypass_policy_json, mf_type, created_at, updated_at
+            ) VALUES (?, ?, 'OPEN', 'P0', ?, ?, 'chain_rescue', ?, ?)
+            """,
+            (
+                f"AC-WORLDREF-DIAGNOSTIC-{suffix}",
+                "Existing no-PASS diagnostic root",
+                json.dumps(binding, sort_keys=True),
+                json.dumps(binding, sort_keys=True),
+                NOW,
+                NOW,
+            ),
+        )
+    conn.commit()
+    before = conn.total_changes
+    refusal = parallel_branch_runtime.integration_epoch_worldref_seal_action_payload(
+        conn,
+        epoch,
+        target_world_head="b" * 40,
+        target_world_head_validated=True,
+        target_descends_from_epoch_world=True,
+    )
+    assert any(
+        blocker["code"] == "no_pass_diagnostic_root_non_unique"
+        for blocker in refusal["blockers"]
+    )
+    assert conn.total_changes == before
+
+
 def test_merge_queue_target_fallback_uses_requested_durable_selector() -> None:
     conn = _runtime_conn()
     queue_id = "mq-target-alias-selector"

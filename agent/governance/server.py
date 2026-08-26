@@ -82441,7 +82441,11 @@ def _git_commit_is_ancestor(
 def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
     """Project incomplete-fanin reconcile input from canonical Git HEAD."""
 
-    from .parallel_branch_runtime import integration_epoch_resume_payload
+    from .parallel_branch_runtime import (
+        INTEGRATION_EPOCH_OPEN,
+        integration_epoch_resume_payload,
+        integration_epoch_worldref_seal_action_payload,
+    )
 
     current_target_head = ""
     current_target_head_validated = False
@@ -82514,6 +82518,73 @@ def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
                             current_target_head_blocker = (
                                 "integration_epoch_current_head_not_canonical"
                             )
+    if (
+        epoch.status == INTEGRATION_EPOCH_OPEN
+        and len(epoch.remaining_queue_item_ids) == 1
+        and epoch.remaining_queue_item_ids == (epoch.active_queue_item_id,)
+    ):
+        target_world_head = ""
+        target_world_head_validated = False
+        target_world_blocker = ""
+        target_descends_from_epoch_world = False
+        try:
+            project_root = project_service.resolve_project_root(
+                epoch.project_id,
+                None,
+                fallback_self=False,
+            )
+        except Exception:
+            project_root = None
+            target_world_blocker = "target_world_project_resolution_failed"
+        if project_root is None and not target_world_blocker:
+            target_world_blocker = "target_world_project_not_registered"
+        if project_root is not None and not target_world_blocker:
+            root = Path(project_root)
+            if not _git_clean_worktree_verified(root):
+                target_world_blocker = "target_world_worktree_not_clean"
+            else:
+                try:
+                    target_world_head = (
+                        _parallel_branch_resolve_canonical_commit(
+                            root,
+                            epoch.target_ref,
+                            field="target_ref",
+                        ).lower()
+                    )
+                except Exception:
+                    target_world_blocker = "target_world_ref_not_git_object"
+                else:
+                    target_world_head_validated = bool(
+                        re.fullmatch(
+                            r"[0-9a-f]{40}|[0-9a-f]{64}",
+                            target_world_head,
+                        )
+                    )
+                    if not target_world_head_validated:
+                        target_world_blocker = "target_world_head_not_full"
+                    else:
+                        target_descends_from_epoch_world = (
+                            _git_commit_is_ancestor(
+                                root,
+                                epoch.current_head,
+                                target_world_head,
+                            )
+                        )
+        if (
+            target_world_head != str(epoch.current_head or "").lower()
+            and (target_world_head or target_world_blocker)
+        ):
+            return integration_epoch_worldref_seal_action_payload(
+                conn,
+                epoch,
+                target_world_head=target_world_head,
+                target_world_head_validated=target_world_head_validated,
+                target_descends_from_epoch_world=(
+                    target_descends_from_epoch_world
+                ),
+                target_world_blocker=target_world_blocker,
+            )
+
     return integration_epoch_resume_payload(
         conn,
         epoch,
@@ -200484,6 +200555,9 @@ def _integration_epoch_release_auth_error(
 _INTEGRATION_EPOCH_RELEASE_ROUTE_ACTION = (
     "integration_epoch_release_unlandable_child"
 )
+_INTEGRATION_EPOCH_WORLDREF_SEAL_ROUTE_ACTION = (
+    "integration_epoch_worldref_seal_linear_unlock"
+)
 _INTEGRATION_EPOCH_RELEASE_ROUTE_PROOF_FIELDS = (
     "observer_session_id",
     "observer_route_token_ref",
@@ -200507,6 +200581,10 @@ def _require_integration_epoch_release_authority(
     conn,
     *,
     project_id: str,
+    required_action: str = _INTEGRATION_EPOCH_RELEASE_ROUTE_ACTION,
+    operator_operation: str = (
+        "parallel-branches.integration-epoch.release-unlandable-child"
+    ),
 ) -> dict[str, Any]:
     """Select one release authority mode before any release-ledger write."""
 
@@ -200680,11 +200758,11 @@ def _require_integration_epoch_release_authority(
                 if str(value or "").strip()
             }
         )
-        if _INTEGRATION_EPOCH_RELEASE_ROUTE_ACTION not in allowed_actions:
+        if required_action not in allowed_actions:
             raise _integration_epoch_release_auth_error(
                 "route_token_ref_action_not_allowed",
                 field="allowed_actions",
-                expected=[_INTEGRATION_EPOCH_RELEASE_ROUTE_ACTION],
+                expected=[required_action],
                 actual=allowed_actions,
             )
         return {
@@ -200708,7 +200786,7 @@ def _require_integration_epoch_release_authority(
         operator = _require_graph_governance_operator(
             ctx,
             conn,
-            "parallel-branches.integration-epoch.release-unlandable-child",
+            operator_operation,
         )
     except GovernanceError as exc:
         raise _integration_epoch_release_auth_error(
@@ -200932,6 +201010,267 @@ def handle_integration_epoch_release_unlandable_child(ctx: RequestContext):
                 ),
             },
             "writes_performed": bool(result.get("writes_performed", True)),
+        }
+    finally:
+        conn.close()
+
+
+_integration_epoch_worldref_seal_request_fields = (
+    "schema_version",
+    "project_id",
+    "batch_id",
+    "epoch_id",
+    "merge_queue_id",
+    "queue_item_id",
+    "task_id",
+    "backlog_id",
+    "backlog_status_before",
+    "target_ref",
+    "merge_cursor",
+    "merged_prefix",
+    "epoch_world_head",
+    "target_world_head",
+    "diagnostic_backlog_id",
+    "diagnostic_root_mode",
+    "epoch_no_pass_generation_key",
+    "original_evidence_refs",
+    "original_evidence_hash",
+    "terminal_disposition",
+    "backlog_projection",
+)
+
+
+@route(
+    "POST",
+    "/api/projects/{project_id}/integration-epochs/{batch_id}/"
+    "worldref-seal-linear-unlock",
+)
+def handle_integration_epoch_worldref_seal_linear_unlock(ctx: RequestContext):
+    """Seal one exact no-PASS epoch generation without reanchoring it."""
+
+    from .parallel_branch_runtime import (
+        IntegrationEpochWorldRefSealError,
+        _worldref_seal_identity_hash,
+        get_integration_epoch,
+        list_active_integration_epochs,
+        seal_integration_epoch_worldref_linear_unlock,
+    )
+
+    project_id = ctx.get_project_id()
+    batch_id = str(ctx.path_params.get("batch_id") or "").strip()
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    request = {
+        field: deepcopy(body[field])
+        for field in _integration_epoch_worldref_seal_request_fields
+        if field in body
+    }
+    if (
+        str(request.get("project_id") or "") != project_id
+        or str(request.get("batch_id") or "") != batch_id
+    ):
+        return 422, {
+            "ok": False,
+            "error": "integration_epoch_worldref_seal_path_identity_mismatch",
+            "writes_performed": False,
+            "mutation_performed": False,
+            "zero_write_rejection": True,
+        }
+
+    conn = get_connection(project_id)
+    try:
+        try:
+            operator = _require_integration_epoch_release_authority(
+                ctx,
+                conn,
+                project_id=project_id,
+                required_action=_INTEGRATION_EPOCH_WORLDREF_SEAL_ROUTE_ACTION,
+                operator_operation=(
+                    "parallel-branches.integration-epoch."
+                    "worldref-seal-linear-unlock"
+                ),
+            )
+        except GovernanceError as exc:
+            return exc.status, {
+                "ok": False,
+                **_public_zero_write_error_response(exc),
+            }
+
+        epoch = get_integration_epoch(conn, project_id, batch_id)
+        existing_seal = conn.execute(
+            """
+            SELECT seal_id
+            FROM parallel_branch_integration_epoch_worldref_seals
+            WHERE project_id = ? AND batch_id = ? AND epoch_id = ?
+            """,
+            (project_id, batch_id, str(request.get("epoch_id") or "")),
+        ).fetchone()
+        if (
+            epoch is None
+            or epoch.epoch_id != str(request.get("epoch_id") or "")
+            or (
+                existing_seal is None
+                and list_active_integration_epochs(conn, project_id) != [epoch]
+            )
+        ):
+            return 409, {
+                "ok": False,
+                "error": "integration_epoch_worldref_seal_epoch_identity_mismatch",
+                "writes_performed": False,
+                "mutation_performed": False,
+                "zero_write_rejection": True,
+            }
+        if existing_seal is not None:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = seal_integration_epoch_worldref_linear_unlock(
+                    conn,
+                    request=request,
+                    target_world_authority={},
+                )
+            except IntegrationEpochWorldRefSealError as exc:
+                conn.rollback()
+                return 409, {"ok": False, **exc.details}
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
+            return {
+                **result,
+                "action": _INTEGRATION_EPOCH_WORLDREF_SEAL_ROUTE_ACTION,
+                "project_id": project_id,
+                "batch_id": batch_id,
+                "authorization": {
+                    "mode": operator.get("role_source"),
+                    "operator_principal": str(
+                        operator.get("principal_id")
+                        or operator.get("role")
+                        or "operator"
+                    ),
+                    "raw_credentials_exposed": False,
+                    "raw_route_token_persisted": False,
+                },
+                "runtime_entrypoint": {
+                    "method": "POST",
+                    "path": (
+                        "/api/projects/{project_id}/integration-epochs/"
+                        "{batch_id}/worldref-seal-linear-unlock"
+                    ),
+                },
+            }
+        try:
+            project_root = project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=False,
+            )
+        except Exception:
+            project_root = None
+        root = Path(project_root) if project_root is not None else None
+        if root is None or not _git_clean_worktree_verified(root):
+            return 409, {
+                "ok": False,
+                "error": "integration_epoch_worldref_seal_clean_world_required",
+                "writes_performed": False,
+                "mutation_performed": False,
+                "zero_write_rejection": True,
+            }
+        try:
+            first_target_head = _parallel_branch_resolve_canonical_commit(
+                root,
+                epoch.target_ref,
+                field="target_ref",
+            ).lower()
+        except Exception:
+            first_target_head = ""
+        if not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", first_target_head
+        ):
+            return 409, {
+                "ok": False,
+                "error": "integration_epoch_worldref_seal_target_ref_unverified",
+                "writes_performed": False,
+                "mutation_performed": False,
+                "zero_write_rejection": True,
+            }
+        target_descends = _git_commit_is_ancestor(
+            root, epoch.current_head, first_target_head
+        )
+        if not target_descends:
+            return 409, {
+                "ok": False,
+                "error": "integration_epoch_worldref_seal_target_not_descendant",
+                "writes_performed": False,
+                "mutation_performed": False,
+                "zero_write_rejection": True,
+            }
+
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            second_target_head = _parallel_branch_resolve_canonical_commit(
+                root,
+                epoch.target_ref,
+                field="target_ref",
+            ).lower()
+            if second_target_head != first_target_head:
+                raise IntegrationEpochWorldRefSealError(
+                    "integration_epoch_worldref_seal_target_ref_drift",
+                    "canonical target ref changed during seal precheck",
+                )
+            authority = {
+                "schema_version": (
+                    "mf_batch_parallel.target_worldref_authority.v1"
+                ),
+                "server_derived": True,
+                "db_verified": True,
+                "canonical_target_ref_verified": True,
+                "clean_worktree_verified": True,
+                "target_ref_stable": True,
+                "target_descends_from_epoch_world": True,
+                "project_id": project_id,
+                "batch_id": batch_id,
+                "epoch_id": epoch.epoch_id,
+                "target_ref": epoch.target_ref,
+                "target_world_head": first_target_head,
+            }
+            authority["authority_hash"] = _worldref_seal_identity_hash(
+                authority
+            )
+            result = seal_integration_epoch_worldref_linear_unlock(
+                conn,
+                request=request,
+                target_world_authority=authority,
+            )
+        except IntegrationEpochWorldRefSealError as exc:
+            conn.rollback()
+            return 409, {"ok": False, **exc.details}
+        except Exception:
+            conn.rollback()
+            raise
+        conn.commit()
+        return {
+            **result,
+            "action": _INTEGRATION_EPOCH_WORLDREF_SEAL_ROUTE_ACTION,
+            "project_id": project_id,
+            "batch_id": batch_id,
+            "authorization": {
+                "mode": operator.get("role_source"),
+                "operator_principal": str(
+                    operator.get("principal_id")
+                    or operator.get("role")
+                    or "operator"
+                ),
+                "raw_credentials_exposed": False,
+                "raw_route_token_persisted": False,
+            },
+            "runtime_entrypoint": {
+                "method": "POST",
+                "path": (
+                    "/api/projects/{project_id}/integration-epochs/"
+                    "{batch_id}/worldref-seal-linear-unlock"
+                ),
+            },
         }
     finally:
         conn.close()

@@ -253,7 +253,7 @@ CREATE TABLE IF NOT EXISTS parallel_branch_integration_epochs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_parallel_branch_integration_epoch_active_target
   ON parallel_branch_integration_epochs(project_id, target_ref)
-  WHERE status != 'closed';
+  WHERE status IN ('open', 'merge_in_doubt', 'reconcile_pending', 'reconciled');
 CREATE INDEX IF NOT EXISTS idx_parallel_branch_integration_epoch_queue
   ON parallel_branch_integration_epochs(project_id, merge_queue_id, status);
 
@@ -313,6 +313,56 @@ CREATE INDEX IF NOT EXISTS idx_parallel_branch_epoch_release_projection_repairs
   ON parallel_branch_integration_epoch_release_projection_repairs(
       project_id, batch_id, queue_item_id, release_event_id
   );
+
+CREATE TABLE IF NOT EXISTS parallel_branch_integration_epoch_world_refs (
+    project_id        TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    epoch_id          TEXT NOT NULL,
+    world_ref_id      TEXT NOT NULL,
+    world_kind        TEXT NOT NULL,
+    target_ref        TEXT NOT NULL,
+    commit_sha        TEXT NOT NULL,
+    evidence_json     TEXT NOT NULL DEFAULT '{}',
+    evidence_hash     TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    PRIMARY KEY (project_id, batch_id, epoch_id, world_ref_id),
+    UNIQUE (project_id, batch_id, epoch_id, world_kind, commit_sha)
+);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_epoch_world_refs_commit
+  ON parallel_branch_integration_epoch_world_refs(
+      project_id, target_ref, commit_sha
+  );
+
+CREATE TABLE IF NOT EXISTS parallel_branch_integration_epoch_worldref_seals (
+    project_id        TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    epoch_id          TEXT NOT NULL,
+    seal_id           TEXT NOT NULL,
+    merge_queue_id    TEXT NOT NULL,
+    queue_item_id     TEXT NOT NULL,
+    task_id           TEXT NOT NULL,
+    backlog_id        TEXT NOT NULL,
+    target_ref        TEXT NOT NULL,
+    merge_cursor      INTEGER NOT NULL,
+    merged_prefix_json TEXT NOT NULL,
+    epoch_world_ref_id TEXT NOT NULL,
+    target_world_ref_id TEXT NOT NULL,
+    epoch_world_head  TEXT NOT NULL,
+    target_world_head TEXT NOT NULL,
+    diagnostic_backlog_id TEXT NOT NULL,
+    original_evidence_refs_json TEXT NOT NULL,
+    original_evidence_hash TEXT NOT NULL,
+    request_hash      TEXT NOT NULL,
+    disposition       TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    PRIMARY KEY (project_id, batch_id, epoch_id),
+    UNIQUE (seal_id),
+    UNIQUE (project_id, merge_queue_id, queue_item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_epoch_worldref_seals_backlog
+  ON parallel_branch_integration_epoch_worldref_seals(
+      project_id, backlog_id, created_at
+  );
 """
 
 STATE_MERGED = "merged"
@@ -335,6 +385,10 @@ STATE_ABANDONED = "abandoned"
 # audit archive does not mutate integration epochs, and only the dedicated
 # release action may write this queue state.
 STATE_RELEASED_UNLANDABLE = "released_unlandable"
+# Epoch-owned terminal disposition for a row that provably never acquired any
+# execution or landing evidence.  It is intentionally not a released child:
+# release/reconcile/merge credit remain false and the old generation is sealed.
+STATE_TERMINAL_NO_PASS = "terminal_no_pass"
 STATE_ROLLBACK_REQUIRED = "rollback_required"
 STATE_ALLOCATED = "allocated"
 STATE_WORKTREE_READY = "worktree_ready"
@@ -355,6 +409,7 @@ MATERIALIZED_RUNTIME_CONTEXT_STATES = {
     STATE_MERGED,
     STATE_MERGE_FAILED,
     STATE_RELEASED_UNLANDABLE,
+    STATE_TERMINAL_NO_PASS,
     STATE_ROLLBACK_REQUIRED,
 }
 
@@ -373,6 +428,7 @@ INTEGRATION_EPOCH_MERGE_IN_DOUBT = "merge_in_doubt"
 INTEGRATION_EPOCH_RECONCILE_PENDING = "reconcile_pending"
 INTEGRATION_EPOCH_RECONCILED = "reconciled"
 INTEGRATION_EPOCH_CLOSED = "closed"
+INTEGRATION_EPOCH_ABORTED_WITH_EXCEPTION = "aborted_with_exception"
 INTEGRATION_EPOCH_ACTIVE_STATES = frozenset(
     {
         INTEGRATION_EPOCH_OPEN,
@@ -401,6 +457,7 @@ MERGE_EXECUTION_FLOWS = frozenset(
 
 ACTION_LEAVE_MERGED = "leave_merged"
 ACTION_LEAVE_RELEASED_UNLANDABLE = "leave_released_unlandable"
+ACTION_LEAVE_TERMINAL_NO_PASS = "leave_terminal_no_pass"
 ACTION_OBSERVER_DECISION_REQUIRED = "observer_decision_required"
 ACTION_RECLAIM_FROM_CHECKPOINT = "reclaim_from_checkpoint"
 ACTION_RECLAIM_AFTER_DEPENDENCY = "reclaim_after_dependency"
@@ -484,6 +541,7 @@ MERGE_BLOCKING_STATES = {
     STATE_MERGE_FAILED,
     STATE_ABANDONED,
     STATE_RELEASED_UNLANDABLE,
+    STATE_TERMINAL_NO_PASS,
     STATE_ROLLBACK_REQUIRED,
 }
 MERGE_REVALIDATION_BLOCKING_STATES = {
@@ -1207,6 +1265,30 @@ class IntegrationEpochUnlandableChildReleaseError(ValueError):
             "release_performed": False,
             "merge_credit_granted": False,
             "zero_write_rejection": True,
+            **details,
+        }
+
+
+class IntegrationEpochWorldRefSealError(ValueError):
+    """Fail-closed refusal for the typed epoch WorldRef seal action."""
+
+    def __init__(self, error: str, message: str, **details: Any):
+        super().__init__(message)
+        self.error = str(error or "integration_epoch_worldref_seal_refused")
+        self.message = message
+        self.details: dict[str, Any] = {
+            "error": self.error,
+            "message": message,
+            "seal_performed": False,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "zero_write_rejection": True,
+            "merge_credit_granted": False,
+            "target_head_mutated": False,
+            "pass_synthesized": False,
+            "resume_authorized": False,
+            "reconcile_authorized": False,
+            "release_authorized": False,
             **details,
         }
 
@@ -2788,6 +2870,7 @@ def ensure_branch_runtime_schema(conn: sqlite3.Connection) -> None:
     _ensure_branch_runtime_context_columns(conn)
     _ensure_branch_merge_queue_columns(conn)
     _ensure_integration_epoch_columns(conn)
+    _ensure_integration_epoch_active_target_index(conn)
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_parallel_branch_runtime_project_runtime_context
@@ -2817,6 +2900,34 @@ def _ensure_integration_epoch_columns(conn: sqlite3.Connection) -> None:
             "ALTER TABLE parallel_branch_integration_epochs "
             "ADD COLUMN reconciled_target_head TEXT NOT NULL DEFAULT ''"
         )
+
+
+def _ensure_integration_epoch_active_target_index(
+    conn: sqlite3.Connection,
+) -> None:
+    """Migrate the active-target index without treating sealed epochs as live."""
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        ("idx_parallel_branch_integration_epoch_active_target",),
+    ).fetchone()
+    sql = str(
+        (row["sql"] if hasattr(row, "keys") else row[0]) if row else ""
+    ).lower()
+    if "status in" in sql and "reconciled" in sql:
+        return
+    conn.execute(
+        "DROP INDEX IF EXISTS idx_parallel_branch_integration_epoch_active_target"
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX idx_parallel_branch_integration_epoch_active_target
+          ON parallel_branch_integration_epochs(project_id, target_ref)
+          WHERE status IN (
+              'open', 'merge_in_doubt', 'reconcile_pending', 'reconciled'
+          )
+        """
+    )
 
 
 def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
@@ -13429,8 +13540,8 @@ def upsert_merge_queue_item(
     if (
         previous_status_row is not None
         and str(previous_status_row["status"] or "")
-        == STATE_RELEASED_UNLANDABLE
-        and item.status != STATE_RELEASED_UNLANDABLE
+        in {STATE_RELEASED_UNLANDABLE, STATE_TERMINAL_NO_PASS}
+        and item.status != str(previous_status_row["status"] or "")
     ):
         raise IntegrationEpochUnlandableChildReleaseError(
             "released_unlandable_child_cannot_be_resurrected",
@@ -13439,7 +13550,7 @@ def upsert_merge_queue_item(
             merge_queue_id=item.merge_queue_id,
             queue_item_id=item.queue_item_id,
             child_backlog_id=item.backlog_id,
-            observed_status=STATE_RELEASED_UNLANDABLE,
+            observed_status=str(previous_status_row["status"] or ""),
             requested_status=item.status,
             recovery="file a new backlog row and allocate a new child lane",
         )
@@ -15268,8 +15379,14 @@ def get_active_integration_epoch(
     """Return the frozen epoch that owns a target ref or merge queue."""
 
     ensure_branch_runtime_schema(conn)
-    clauses = ["project_id = ?", "status != ?"]
-    params: list[Any] = [project_id, INTEGRATION_EPOCH_CLOSED]
+    clauses = ["project_id = ?", "status IN (?, ?, ?, ?)"]
+    params: list[Any] = [
+        project_id,
+        INTEGRATION_EPOCH_OPEN,
+        INTEGRATION_EPOCH_MERGE_IN_DOUBT,
+        INTEGRATION_EPOCH_RECONCILE_PENDING,
+        INTEGRATION_EPOCH_RECONCILED,
+    ]
     if str(target_ref or "").strip():
         clauses.append("target_ref = ?")
         params.append(str(target_ref).strip())
@@ -15298,10 +15415,16 @@ def list_active_integration_epochs(
     rows = conn.execute(
         """
         SELECT * FROM parallel_branch_integration_epochs
-        WHERE project_id = ? AND status != ?
+        WHERE project_id = ? AND status IN (?, ?, ?, ?)
         ORDER BY created_at, batch_id
         """,
-        (project_id, INTEGRATION_EPOCH_CLOSED),
+        (
+            project_id,
+            INTEGRATION_EPOCH_OPEN,
+            INTEGRATION_EPOCH_MERGE_IN_DOUBT,
+            INTEGRATION_EPOCH_RECONCILE_PENDING,
+            INTEGRATION_EPOCH_RECONCILED,
+        ),
     ).fetchall()
     return [_integration_epoch_from_row(row) for row in rows]
 
@@ -15320,11 +15443,19 @@ def resolve_active_integration_epoch_for_backlog(
     parent = conn.execute(
         """
         SELECT * FROM parallel_branch_integration_epochs
-        WHERE project_id = ? AND coordination_backlog_id = ? AND status != ?
+        WHERE project_id = ? AND coordination_backlog_id = ?
+          AND status IN (?, ?, ?, ?)
         ORDER BY created_at
         LIMIT 1
         """,
-        (project_id, backlog, INTEGRATION_EPOCH_CLOSED),
+        (
+            project_id,
+            backlog,
+            INTEGRATION_EPOCH_OPEN,
+            INTEGRATION_EPOCH_MERGE_IN_DOUBT,
+            INTEGRATION_EPOCH_RECONCILE_PENDING,
+            INTEGRATION_EPOCH_RECONCILED,
+        ),
     ).fetchone()
     if parent is not None:
         return _integration_epoch_from_row(parent), "coordination"
@@ -15337,11 +15468,18 @@ def resolve_active_integration_epoch_for_backlog(
          AND item.merge_queue_id = epoch.merge_queue_id
         WHERE epoch.project_id = ?
           AND item.backlog_id = ?
-          AND epoch.status != ?
+          AND epoch.status IN (?, ?, ?, ?)
         ORDER BY epoch.created_at, item.queue_index
         LIMIT 1
         """,
-        (project_id, backlog, INTEGRATION_EPOCH_CLOSED),
+        (
+            project_id,
+            backlog,
+            INTEGRATION_EPOCH_OPEN,
+            INTEGRATION_EPOCH_MERGE_IN_DOUBT,
+            INTEGRATION_EPOCH_RECONCILE_PENDING,
+            INTEGRATION_EPOCH_RECONCILED,
+        ),
     ).fetchone()
     if child is not None:
         return _integration_epoch_from_row(child), "child"
@@ -15980,6 +16118,711 @@ def advance_integration_epoch_after_merge(
         ),
         now_iso=now_iso,
     )
+
+
+_WORLDREF_SEAL_SCHEMA = "mf_batch_parallel.epoch_worldref_seal.v1"
+_WORLDREF_SEAL_ACTION = "integration_epoch_worldref_seal_linear_unlock"
+
+
+def _worldref_seal_identity_hash(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _integration_epoch_no_pass_generation_key(epoch: IntegrationEpoch) -> str:
+    return "epoch-no-pass-" + _worldref_seal_identity_hash(
+        {
+            "project_id": epoch.project_id,
+            "batch_id": epoch.batch_id,
+            "epoch_id": epoch.epoch_id,
+            "merge_queue_id": epoch.merge_queue_id,
+        }
+    )[7:27]
+
+
+def _integration_epoch_no_pass_root_candidates(
+    conn: sqlite3.Connection,
+    epoch: IntegrationEpoch,
+) -> list[str]:
+    """Resolve only OPEN roots bound to this exact historical generation."""
+
+    generation_key = _integration_epoch_no_pass_generation_key(epoch)
+    items = list_merge_queue_items(
+        conn, epoch.project_id, epoch.merge_queue_id, target_ref=epoch.target_ref
+    )
+    task_ids = {item.task_id for item in items if item.task_id}
+    backlog_ids = {item.backlog_id for item in items if item.backlog_id}
+    try:
+        rows = conn.execute(
+            """
+            SELECT bug_id, chain_trigger_json, bypass_policy_json
+            FROM backlog_bugs
+            WHERE status = 'OPEN' AND mf_type = 'chain_rescue'
+            ORDER BY bug_id
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    candidates: list[str] = []
+    for row in rows:
+        trigger = _parse_json_object(row["chain_trigger_json"])
+        policy = _parse_json_object(row["bypass_policy_json"])
+        values = (trigger, policy)
+        exact_generation = any(
+            str(value.get("epoch_no_pass_generation_key") or "")
+            == generation_key
+            and str(value.get("project_id") or epoch.project_id)
+            == epoch.project_id
+            and str(value.get("batch_id") or "") == epoch.batch_id
+            and str(value.get("epoch_id") or "") == epoch.epoch_id
+            and str(value.get("merge_queue_id") or "")
+            == epoch.merge_queue_id
+            and value.get("no_pass_claim") is True
+            for value in values
+        )
+        historical_contract_root = any(
+            value.get("no_pass_claim") is True
+            and str(value.get("source_backlog_id") or "") in backlog_ids
+            and str(value.get("contract_execution_id") or "") in task_ids
+            for value in values
+        )
+        if exact_generation or historical_contract_root:
+            candidates.append(str(row["bug_id"] or ""))
+    return [value for value in candidates if value]
+
+
+def _integration_epoch_row3_evidence_blockers(
+    conn: sqlite3.Connection,
+    *,
+    epoch: IntegrationEpoch,
+    item: MergeQueueItem,
+) -> list[dict[str, Any]]:
+    """Return durable evidence that forbids a no-PASS terminalization."""
+
+    blockers: list[dict[str, Any]] = []
+    possible_landed = _merge_queue_item_possible_landed_evidence(item)
+    if possible_landed["possible_landed"]:
+        blockers.append(
+            {"code": "possible_landed", "evidence": possible_landed}
+        )
+    queue_evidence = {
+        key: value
+        for key, value in {
+            "branch_ref": item.branch_ref,
+            "base_commit": item.base_commit,
+            "branch_head": item.branch_head,
+            "validated_target_head": item.validated_target_head,
+            "current_target_head": item.current_target_head,
+            "validation_attempt": item.validation_attempt,
+            "merge_preview_id": item.merge_preview_id,
+            "snapshot_id": item.snapshot_id,
+            "projection_id": item.projection_id,
+            "merge_commit": item.merge_commit,
+            "target_head_before_merge": item.target_head_before_merge,
+            "target_head_after_merge": item.target_head_after_merge,
+            "completed_at": item.completed_at,
+        }.items()
+        if value not in ("", 0, None)
+    }
+    if queue_evidence:
+        blockers.append(
+            {"code": "queue_execution_evidence_present", "evidence": queue_evidence}
+        )
+
+    queries = {
+        "branch_or_worker_context": (
+            """
+            SELECT COUNT(*) FROM parallel_branch_runtime_contexts
+            WHERE project_id = ? AND (task_id = ? OR backlog_id = ?
+                                      OR runtime_context_id = ?)
+            """,
+            (epoch.project_id, item.task_id, item.backlog_id, item.task_id),
+        ),
+        "worker_contract_revision": (
+            """
+            SELECT COUNT(*) FROM parallel_branch_runtime_contract_revisions
+            WHERE project_id = ? AND (task_id = ? OR backlog_id = ?)
+            """,
+            (epoch.project_id, item.task_id, item.backlog_id),
+        ),
+        "contract_runtime_execution": (
+            """
+            SELECT COUNT(*) FROM contract_runtime_executions
+            WHERE project_id = ? AND
+                  (contract_execution_id = ? OR backlog_id = ?)
+            """,
+            (epoch.project_id, item.task_id, item.backlog_id),
+        ),
+    }
+    for code, (sql, params) in queries.items():
+        try:
+            count = int(conn.execute(sql, params).fetchone()[0] or 0)
+        except sqlite3.Error:
+            count = 0
+        if count:
+            blockers.append({"code": code, "row_count": count})
+
+    try:
+        batch_row = conn.execute(
+            """
+            SELECT * FROM parallel_branch_batch_items
+            WHERE project_id = ? AND batch_id = ? AND task_id = ?
+            """,
+            (epoch.project_id, epoch.batch_id, item.task_id),
+        ).fetchone()
+    except sqlite3.Error:
+        batch_row = None
+    if batch_row is not None:
+        batch_evidence = {
+            key: batch_row[key]
+            for key in (
+                "branch_ref", "worktree_path", "branch_head", "base_commit",
+                "checkpoint_id", "merge_commit", "target_head_before_merge",
+                "target_head_after_merge", "snapshot_id", "projection_id",
+                "merge_preview_id",
+            )
+            if batch_row[key] not in ("", None)
+        }
+        if batch_evidence or str(batch_row["status"] or "") not in {"", "planned"}:
+            blockers.append(
+                {
+                    "code": "batch_item_execution_evidence_present",
+                    "status": str(batch_row["status"] or ""),
+                    "evidence": batch_evidence,
+                }
+            )
+
+    forbidden_tokens = (
+        "cex", "contract_runtime", "branch", "checkpoint", "worker",
+        "implementation", "finish", "qa", "merge", "landed", "worktree",
+    )
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, event_type, event_kind, phase
+            FROM task_timeline_events
+            WHERE project_id = ? AND (task_id = ? OR backlog_id = ?)
+            ORDER BY id
+            """,
+            (epoch.project_id, item.task_id, item.backlog_id),
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    forbidden_events = []
+    for row in rows:
+        text = " ".join(
+            str(row[key] or "").lower()
+            for key in ("event_type", "event_kind", "phase")
+        )
+        if any(token in text for token in forbidden_tokens):
+            forbidden_events.append(
+                {
+                    "event_ref": f"timeline:{int(row['id'] or 0)}",
+                    "event_type": str(row["event_type"] or ""),
+                    "event_kind": str(row["event_kind"] or ""),
+                    "phase": str(row["phase"] or ""),
+                }
+            )
+    if forbidden_events:
+        blockers.append(
+            {"code": "timeline_execution_evidence_present", "events": forbidden_events}
+        )
+    return blockers
+
+
+def integration_epoch_worldref_seal_action_payload(
+    conn: sqlite3.Connection,
+    epoch: IntegrationEpoch,
+    *,
+    target_world_head: str,
+    target_world_head_validated: bool,
+    target_descends_from_epoch_world: bool,
+    target_world_blocker: str = "",
+) -> dict[str, Any]:
+    """Build one copy-safe typed seal action, or one exact refusal."""
+
+    ensure_branch_runtime_schema(conn)
+    target_head = str(target_world_head or "").strip().lower()
+    blockers: list[dict[str, Any]] = []
+    active_epochs = list_active_integration_epochs(conn, epoch.project_id)
+    if len(active_epochs) != 1 or active_epochs[0] != epoch:
+        blockers.append(
+            {
+                "code": "integration_epoch_active_identity_non_unique",
+                "active_epoch_count": len(active_epochs),
+            }
+        )
+    if epoch.status != INTEGRATION_EPOCH_OPEN:
+        blockers.append(
+            {"code": "integration_epoch_not_open", "status": epoch.status}
+        )
+    if epoch.remaining_queue_item_ids != (epoch.active_queue_item_id,):
+        blockers.append(
+            {
+                "code": "integration_epoch_not_single_terminal_row",
+                "remaining_queue_item_ids": list(epoch.remaining_queue_item_ids),
+            }
+        )
+    item = get_merge_queue_item(
+        conn, epoch.project_id, epoch.merge_queue_id, epoch.active_queue_item_id
+    )
+    if item is None:
+        blockers.append({"code": "integration_epoch_queue_item_missing"})
+    elif item.status != "planned":
+        blockers.append(
+            {"code": "integration_epoch_row_not_planned", "status": item.status}
+        )
+    if not target_world_head_validated:
+        blockers.append(
+            {
+                "code": target_world_blocker or "target_world_head_unverified",
+                "target_world_head": target_head,
+            }
+        )
+    if not target_head or target_head == epoch.current_head.lower():
+        blockers.append(
+            {
+                "code": "worldref_conflation_refused",
+                "epoch_world_head": epoch.current_head,
+                "target_world_head": target_head,
+            }
+        )
+    if target_head and not target_descends_from_epoch_world:
+        blockers.append(
+            {
+                "code": "foreign_world_not_linear_descendant",
+                "epoch_world_head": epoch.current_head,
+                "target_world_head": target_head,
+            }
+        )
+    roots = _integration_epoch_no_pass_root_candidates(conn, epoch)
+    if len(roots) > 1:
+        blockers.append(
+            {"code": "no_pass_diagnostic_root_non_unique", "root_count": len(roots)}
+        )
+    if item is not None:
+        blockers.extend(
+            _integration_epoch_row3_evidence_blockers(conn, epoch=epoch, item=item)
+        )
+        try:
+            backlog_row = conn.execute(
+                "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+                (item.backlog_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            backlog_row = None
+        if backlog_row is None:
+            blockers.append({"code": "row3_backlog_missing"})
+        elif str(backlog_row["status"] or "").upper() not in {
+            "OPEN",
+            "MF_IN_PROGRESS",
+        }:
+            blockers.append(
+                {
+                    "code": "row3_backlog_not_open",
+                    "status": str(backlog_row["status"] or ""),
+                }
+            )
+    if blockers:
+        return {
+            "schema_version": "mf_batch_parallel.epoch_worldref_seal_refusal.v1",
+            "id": "integration_epoch_worldref_seal_refused",
+            "action": "integration_epoch_worldref_seal_refused",
+            "line_id": "integration_epoch_worldref_seal_refused",
+            "source": "durable_integration_epoch_worldref_precheck",
+            "actionable": False,
+            "action_input_ready": False,
+            "action_input": {},
+            "blocked": True,
+            "blockers": blockers,
+            "writes_performed": False,
+            "zero_write_refusal": True,
+            "position_skippable": False,
+        }
+
+    assert item is not None
+    generation_key = _integration_epoch_no_pass_generation_key(epoch)
+    diagnostic_id = (
+        roots[0]
+        if roots
+        else "AC-EPOCH-NO-PASS-" + generation_key.rsplit("-", 1)[-1].upper()
+    )
+    evidence_refs = [
+        f"integration-epoch:{epoch.batch_id}:{epoch.epoch_id}",
+        f"merge-queue:{epoch.merge_queue_id}:{item.queue_item_id}",
+        f"backlog:{item.backlog_id}",
+        f"worldref:epoch:{epoch.current_head.lower()}",
+        f"worldref:foreign-target:{target_head}",
+        *[f"merged-prefix:{value}" for value in epoch.merged_prefix],
+    ]
+    if roots:
+        evidence_refs.append(f"backlog:{diagnostic_id}")
+    evidence_hash = _worldref_seal_identity_hash(evidence_refs)
+    action_input = {
+        "schema_version": _WORLDREF_SEAL_SCHEMA,
+        "project_id": epoch.project_id,
+        "batch_id": epoch.batch_id,
+        "epoch_id": epoch.epoch_id,
+        "merge_queue_id": epoch.merge_queue_id,
+        "queue_item_id": item.queue_item_id,
+        "task_id": item.task_id,
+        "backlog_id": item.backlog_id,
+        "backlog_status_before": str(backlog_row["status"] or "").upper(),
+        "target_ref": epoch.target_ref,
+        "merge_cursor": epoch.merge_cursor,
+        "merged_prefix": list(epoch.merged_prefix),
+        "epoch_world_head": epoch.current_head.lower(),
+        "target_world_head": target_head,
+        "diagnostic_backlog_id": diagnostic_id,
+        "diagnostic_root_mode": "reuse" if roots else "create_if_missing",
+        "epoch_no_pass_generation_key": generation_key,
+        "original_evidence_refs": evidence_refs,
+        "original_evidence_hash": evidence_hash,
+        "terminal_disposition": "terminal_no_pass",
+        "backlog_projection": "WAIVED/completed_with_exception",
+    }
+    return {
+        "schema_version": "mf_batch_parallel.epoch_worldref_seal_action.v1",
+        "id": _WORLDREF_SEAL_ACTION,
+        "action": _WORLDREF_SEAL_ACTION,
+        "line_id": _WORLDREF_SEAL_ACTION,
+        "source": "durable_integration_epoch_worldref_precheck",
+        "source_of_authority": "durable_integration_epoch",
+        "interface": _WORLDREF_SEAL_ACTION,
+        "method": "POST",
+        "path": (
+            "/api/projects/{project_id}/integration-epochs/"
+            "{batch_id}/worldref-seal-linear-unlock"
+        ),
+        "owner_role": "observer",
+        "allowed_actions": [_WORLDREF_SEAL_ACTION],
+        "requires_route_token_ref": True,
+        "requires_active_observer_session": True,
+        "actionable": True,
+        "action_input_ready": True,
+        "action_input": action_input,
+        "action_input_copy_safe": True,
+        "blocked": False,
+        "position_skippable": False,
+        "pass_synthesized": False,
+        "resume_authorized": False,
+        "scheduler_authorized": False,
+        "merge_authorized": False,
+        "reconcile_authorized": False,
+        "close_ready_authorized": False,
+        "release_authorized": False,
+    }
+
+
+def seal_integration_epoch_worldref_linear_unlock(
+    conn: sqlite3.Connection,
+    *,
+    request: Mapping[str, Any],
+    target_world_authority: Mapping[str, Any],
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Atomically seal one never-started terminal row without merge credit."""
+
+    ensure_branch_runtime_schema(conn)
+    supplied = dict(request or {})
+    project = str(supplied.get("project_id") or "").strip()
+    batch = str(supplied.get("batch_id") or "").strip()
+    epoch_id = str(supplied.get("epoch_id") or "").strip()
+    request_hash = _worldref_seal_identity_hash(supplied)
+    existing = conn.execute(
+        """
+        SELECT * FROM parallel_branch_integration_epoch_worldref_seals
+        WHERE project_id = ? AND batch_id = ? AND epoch_id = ?
+        """,
+        (project, batch, epoch_id),
+    ).fetchone()
+    if existing is not None:
+        if str(existing["request_hash"] or "") != request_hash:
+            raise IntegrationEpochWorldRefSealError(
+                "integration_epoch_worldref_seal_replay_payload_drift",
+                "seal replay must exactly match the immutable request",
+                seal_id=str(existing["seal_id"] or ""),
+            )
+        return {
+            "schema_version": _WORLDREF_SEAL_SCHEMA,
+            "ok": True,
+            "replayed": True,
+            "seal_id": str(existing["seal_id"] or ""),
+            "writes_performed": False,
+            "mutation_performed": False,
+            "terminal_disposition": str(existing["disposition"] or ""),
+            "merge_credit_granted": False,
+            "target_head_mutated": False,
+            "pass_synthesized": False,
+        }
+    epoch = get_integration_epoch(conn, project, batch)
+    if epoch is None or epoch.epoch_id != epoch_id:
+        raise IntegrationEpochWorldRefSealError(
+            "integration_epoch_worldref_seal_epoch_identity_mismatch",
+            "seal requires the exact durable epoch identity",
+        )
+    authority = dict(target_world_authority or {})
+    authority_hash = str(authority.pop("authority_hash", "") or "")
+    if not (
+        authority.get("schema_version")
+        == "mf_batch_parallel.target_worldref_authority.v1"
+        and authority.get("server_derived") is True
+        and authority.get("db_verified") is True
+        and authority.get("canonical_target_ref_verified") is True
+        and authority.get("clean_worktree_verified") is True
+        and authority.get("target_ref_stable") is True
+        and authority.get("target_descends_from_epoch_world") is True
+        and authority_hash == _worldref_seal_identity_hash(authority)
+        and str(authority.get("project_id") or "") == project
+        and str(authority.get("batch_id") or "") == batch
+        and str(authority.get("epoch_id") or "") == epoch_id
+        and str(authority.get("target_ref") or "") == epoch.target_ref
+    ):
+        raise IntegrationEpochWorldRefSealError(
+            "integration_epoch_worldref_seal_target_authority_invalid",
+            "target WorldRef authority is incomplete or drifted",
+        )
+    expected_projection = integration_epoch_worldref_seal_action_payload(
+        conn,
+        epoch,
+        target_world_head=str(authority.get("target_world_head") or ""),
+        target_world_head_validated=True,
+        target_descends_from_epoch_world=True,
+    )
+    expected = dict(expected_projection.get("action_input") or {})
+    if not expected or supplied != expected:
+        mismatches = sorted(
+            key for key in set(expected) | set(supplied)
+            if expected.get(key) != supplied.get(key)
+        )
+        raise IntegrationEpochWorldRefSealError(
+            "integration_epoch_worldref_seal_payload_drift",
+            "seal input must exactly match the current copy-safe action",
+            mismatched_fields=mismatches,
+        )
+    item = get_merge_queue_item(
+        conn, project, epoch.merge_queue_id, epoch.active_queue_item_id
+    )
+    if item is None:
+        raise IntegrationEpochWorldRefSealError(
+            "integration_epoch_worldref_seal_queue_item_missing",
+            "seal queue item disappeared before the atomic write",
+        )
+    now = now_iso or utc_now()
+    source = conn.execute(
+        "SELECT * FROM backlog_bugs WHERE bug_id = ?", (item.backlog_id,)
+    ).fetchone()
+    if source is None:
+        raise IntegrationEpochWorldRefSealError(
+            "integration_epoch_worldref_seal_backlog_missing",
+            "source backlog disappeared before the atomic write",
+        )
+    diagnostic_id = str(expected["diagnostic_backlog_id"])
+    roots = _integration_epoch_no_pass_root_candidates(conn, epoch)
+    if expected["diagnostic_root_mode"] == "reuse":
+        if roots != [diagnostic_id]:
+            raise IntegrationEpochWorldRefSealError(
+                "integration_epoch_worldref_seal_diagnostic_root_drift",
+                "existing no-PASS root is missing or non-unique",
+            )
+    else:
+        if roots:
+            raise IntegrationEpochWorldRefSealError(
+                "integration_epoch_worldref_seal_diagnostic_root_drift",
+                "a no-PASS root appeared after precheck",
+            )
+        binding = {
+            "schema_version": "mf_batch_parallel.epoch_no_pass_diagnostic_root.v1",
+            "project_id": project,
+            "batch_id": batch,
+            "epoch_id": epoch_id,
+            "merge_queue_id": epoch.merge_queue_id,
+            "queue_item_id": item.queue_item_id,
+            "source_backlog_id": item.backlog_id,
+            "epoch_no_pass_generation_key": expected[
+                "epoch_no_pass_generation_key"
+            ],
+            "no_pass_claim": True,
+            "authoritative_pass_synthesized": False,
+            "keep_open": True,
+        }
+        conn.execute(
+            """
+            INSERT INTO backlog_bugs (
+                bug_id, title, status, priority, target_files, test_files,
+                acceptance_criteria, details_md, chain_trigger_json,
+                provenance_paths, bypass_policy_json, mf_type,
+                created_at, updated_at
+            ) VALUES (?, ?, 'OPEN', 'P0', ?, ?, ?, ?, ?, ?, ?, 'chain_rescue', ?, ?)
+            """,
+            (
+                diagnostic_id,
+                f"Epoch no-PASS diagnostic: {batch}/{item.queue_item_id}",
+                str(source["target_files"] or "[]"),
+                str(source["test_files"] or "[]"),
+                _json_array((
+                    "Preserve the sealed generation as audit-only no-PASS evidence.",
+                    "Any repair requires a separate backlog and fresh generation.",
+                )),
+                "Created atomically by the epoch-owned WorldRef seal.",
+                _json_object(binding),
+                _json_array(expected["original_evidence_refs"]),
+                _json_object(binding),
+                now,
+                now,
+            ),
+        )
+
+    evidence = {
+        "schema_version": "mf_batch_parallel.typed_worldref_evidence.v1",
+        "project_id": project,
+        "batch_id": batch,
+        "epoch_id": epoch_id,
+        "target_ref": epoch.target_ref,
+        "original_evidence_refs": list(expected["original_evidence_refs"]),
+        "original_evidence_hash": expected["original_evidence_hash"],
+    }
+    epoch_ref_id = "worldref-epoch-" + epoch.current_head.lower()[:20]
+    target_ref_id = "worldref-foreign-" + expected["target_world_head"][:20]
+    for ref_id, kind, commit in (
+        (epoch_ref_id, "epoch_world_head", epoch.current_head.lower()),
+        (target_ref_id, "foreign_direct_repair_descendant", expected["target_world_head"]),
+    ):
+        ref_evidence = {**evidence, "world_kind": kind, "commit_sha": commit}
+        conn.execute(
+            """
+            INSERT INTO parallel_branch_integration_epoch_world_refs (
+                project_id, batch_id, epoch_id, world_ref_id, world_kind,
+                target_ref, commit_sha, evidence_json, evidence_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project, batch, epoch_id, ref_id, kind, epoch.target_ref,
+                commit, _json_object(ref_evidence),
+                _worldref_seal_identity_hash(ref_evidence), now,
+            ),
+        )
+    saved_item = upsert_merge_queue_item(
+        conn,
+        replace(
+            item,
+            status=STATE_TERMINAL_NO_PASS,
+            completed_at=now,
+            failure_reason="epoch_worldref_sealed_terminal_no_pass",
+        ),
+        now_iso=now,
+    )
+    takeover = _parse_json_object(str(source["takeover_json"] or "{}"))
+    takeover["epoch_worldref_seal"] = {
+        "schema_version": _WORLDREF_SEAL_SCHEMA,
+        "status": "completed_with_exception",
+        "disposition": "terminal_no_pass",
+        "batch_id": batch,
+        "epoch_id": epoch_id,
+        "queue_item_id": item.queue_item_id,
+        "diagnostic_backlog_id": diagnostic_id,
+        "pass_synthesized": False,
+        "release_authorized": False,
+        "repair_requires_fresh_generation": True,
+    }
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+        SET status = 'WAIVED', fixed_at = ?, updated_at = ?,
+            runtime_state = 'completed_with_exception',
+            last_failure_reason = 'epoch_worldref_sealed_terminal_no_pass',
+            takeover_json = ?
+        WHERE bug_id = ? AND status = ?
+        """,
+        (
+            now,
+            now,
+            _json_object(takeover),
+            item.backlog_id,
+            expected["backlog_status_before"],
+        ),
+    )
+    if conn.execute("SELECT changes()").fetchone()[0] != 1:
+        raise IntegrationEpochWorldRefSealError(
+            "integration_epoch_worldref_seal_backlog_projection_drift",
+            "Row3 backlog was not exactly OPEN at projection time",
+        )
+    saved_epoch = upsert_integration_epoch(
+        conn,
+        replace(
+            epoch,
+            status=INTEGRATION_EPOCH_ABORTED_WITH_EXCEPTION,
+            reconcile_state="not_authorized",
+            failure_reason="terminal_no_pass_worldref_sealed",
+            closed_at=now,
+        ),
+        now_iso=now,
+    )
+    seal_core = {
+        "project_id": project,
+        "batch_id": batch,
+        "epoch_id": epoch_id,
+        "merge_queue_id": epoch.merge_queue_id,
+        "queue_item_id": item.queue_item_id,
+        "epoch_world_head": epoch.current_head.lower(),
+        "target_world_head": expected["target_world_head"],
+        "request_hash": request_hash,
+    }
+    seal_id = "epoch-worldref-seal-" + _worldref_seal_identity_hash(seal_core)[7:27]
+    conn.execute(
+        """
+        INSERT INTO parallel_branch_integration_epoch_worldref_seals (
+            project_id, batch_id, epoch_id, seal_id, merge_queue_id,
+            queue_item_id, task_id, backlog_id, target_ref, merge_cursor,
+            merged_prefix_json, epoch_world_ref_id, target_world_ref_id,
+            epoch_world_head, target_world_head, diagnostic_backlog_id,
+            original_evidence_refs_json, original_evidence_hash,
+            request_hash, disposition, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            project, batch, epoch_id, seal_id, epoch.merge_queue_id,
+            item.queue_item_id, item.task_id, item.backlog_id, epoch.target_ref,
+            epoch.merge_cursor, _json_array(epoch.merged_prefix), epoch_ref_id,
+            target_ref_id, epoch.current_head.lower(), expected["target_world_head"],
+            diagnostic_id, _json_array(expected["original_evidence_refs"]),
+            expected["original_evidence_hash"], request_hash,
+            "aborted_with_exception", now,
+        ),
+    )
+    return {
+        "schema_version": _WORLDREF_SEAL_SCHEMA,
+        "ok": True,
+        "replayed": False,
+        "seal_id": seal_id,
+        "writes_performed": True,
+        "mutation_performed": True,
+        "integration_epoch": integration_epoch_to_dict(saved_epoch),
+        "queue_item": merge_queue_item_to_dict(saved_item),
+        "diagnostic_backlog_id": diagnostic_id,
+        "terminal_disposition": "aborted_with_exception",
+        "backlog_projection": "WAIVED/completed_with_exception",
+        "current_head_preserved": saved_epoch.current_head == epoch.current_head,
+        "merge_cursor_preserved": saved_epoch.merge_cursor == epoch.merge_cursor,
+        "merged_prefix_preserved": saved_epoch.merged_prefix == epoch.merged_prefix,
+        "merge_credit_granted": False,
+        "target_head_mutated": False,
+        "pass_synthesized": False,
+        "resume_authorized": False,
+        "scheduler_authorized": False,
+        "merge_authorized": False,
+        "reconcile_authorized": False,
+        "close_ready_authorized": False,
+        "release_authorized": False,
+        "repair_requires_separate_backlog": True,
+        "repair_requires_fresh_generation": True,
+    }
 
 
 def reanchor_open_integration_epoch_after_direct_repair(
@@ -23305,6 +24148,13 @@ def decide_merge_queue(
         elif item.status == STATE_RELEASED_UNLANDABLE:
             queue_state = STATE_RELEASED_UNLANDABLE
             action = ACTION_LEAVE_RELEASED_UNLANDABLE
+            merge_allowed = False
+            target_mutation_allowed = False
+            graph_allowed = False
+            semantic_allowed = False
+        elif item.status == STATE_TERMINAL_NO_PASS:
+            queue_state = STATE_TERMINAL_NO_PASS
+            action = ACTION_LEAVE_TERMINAL_NO_PASS
             merge_allowed = False
             target_mutation_allowed = False
             graph_allowed = False
