@@ -4056,6 +4056,37 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         base_commit=base_commit,
         owned_files=tuple(owned_files),
     )
+    correction_route = observer_route_context.issue_observer_write_route_context(
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=runtime_context.task_id,
+        target_files=list(owned_files),
+        allowed_actions=["task_timeline_append"],
+        evidence_refs=["test:precommit-implementation-facade"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=correction_route["route_token_ref"],
+        token=correction_route["route_token"],
+    )
+    append_branch_contract_revision(
+        conn,
+        runtime_context,
+        revision_id="crev-precommit-implementation-facade-route",
+        payload={
+            "runtime_context_id": runtime_context.runtime_context_id,
+            "target_files": list(owned_files),
+        },
+        route_identity={
+            **{
+                field: correction_route["route_token"][field]
+                for field in server._RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+                if field in correction_route["route_token"]
+            },
+            "route_token_ref": correction_route["route_token_ref"],
+        },
+    )
     evidence_events = _record_mf_parallel_runtime_context_worker_evidence(
         conn,
         runtime_context,
@@ -4408,11 +4439,80 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
             runtime_context.task_id,
             replacement["fence_token"],
         ),
+        route_identity=server._runtime_context_latest_route_identity(
+            conn,
+            replacement_context,
+        ),
         created_at="2026-08-04T06:00:01Z",
     )
     conn.commit()
     active_fence_token = replacement["fence_token"]
     active_session_token = replacement["session_token"]
+
+    record_before_guide = runtime.store.get(
+        successor["contract_execution_id"]
+    )
+    correction_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                query={
+                    "parent_task_id": backlog_id,
+                    "fence_token": active_fence_token,
+                    "session_token": active_session_token,
+                    "session_token_ref": replacement["session_token_ref"],
+                    "target_project_root": str(target_root),
+                    "graph_trace_id": active_graph_trace_id,
+                    "view": "compact",
+                },
+            )
+        )
+    )
+    assert correction_guide["position_bounded"] is True, {
+        key: correction_guide.get(key)
+        for key in (
+            "position_stage",
+            "next_legal_action",
+            "contract_runtime_next_legal_action",
+            "blocking_reasons",
+            "route_identity",
+        )
+    }
+    assert correction_guide["position_stage"] == "implementation"
+    assert correction_guide["next_legal_action"] == (
+        "revise_precommit_worker_implementation"
+    )
+    correction_action = correction_guide[
+        "contract_runtime_next_legal_action"
+    ]
+    assert correction_action["action"] == (
+        "revise_precommit_worker_implementation"
+    )
+    assert correction_action["source_of_authority"] == (
+        "ContractRuntime.completed_lines.worker_implementation+"
+        "graph_query_traces+RuntimeContext.current_values"
+    )
+    correction_body = correction_guide["canonical_executable_action"][
+        "copy_safe_body"
+    ]
+    assert correction_body["graph_trace_ids"] == [active_graph_trace_id]
+    assert graph_trace_id not in correction_body["graph_trace_ids"]
+    assert correction_body[
+        "precommit_implementation_correction_intent"
+    ] == correction_intent
+    assert correction_guide["canonical_executable_action"]["mcp_tool"] == (
+        "runtime_context_implementation_evidence"
+    )
+    assert "bypass" not in json.dumps(
+        correction_guide["canonical_executable_action"],
+        sort_keys=True,
+    )
+    assert runtime.store.get(successor["contract_execution_id"]) == (
+        record_before_guide
+    )
 
     def submit_correction(*, intent=correction_intent):
         request_body = {
@@ -4424,7 +4524,9 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
             "parent_task_id": backlog_id,
             "fence_token": active_fence_token,
             "session_token": active_session_token,
+            "session_token_ref": replacement["session_token_ref"],
             "target_project_root": str(target_root),
+            "route_token_ref": correction_route["route_token_ref"],
             "commit_sha": corrected_head,
             "changed_files": frozen_asset_files,
             "graph_trace_ids": [active_graph_trace_id],

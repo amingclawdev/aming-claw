@@ -29392,6 +29392,315 @@ def _runtime_context_worker_implementation_test_results_repair_action(
     return next_action
 
 
+def _runtime_context_worker_implementation_graph_trace_repair_action(
+    conn,
+    *,
+    project_id: str,
+    context: Any,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    canonical_next_action: Mapping[str, Any],
+    current_fence_token: str,
+    requested_graph_trace_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Redirect a stale post-rejoin trace through the existing correction.
+
+    A graph query is read-only and must not silently rewrite Contract Position.
+    When a legal RuntimeContext rejoin makes the canonical implementation trace
+    ineligible for the current fence generation, this adapter selects one exact
+    current-generation DB trace and projects the already-supported append-only
+    precommit implementation correction.  The worker-commit equality gate stays
+    strict and becomes actionable again only after that correction lands.
+    """
+
+    next_action = (
+        dict(canonical_next_action)
+        if isinstance(canonical_next_action, Mapping)
+        else {}
+    )
+    if (
+        str(next_action.get("line_id") or "").strip() != "worker_commit"
+        or not current_fence_token
+    ):
+        return {}
+    try:
+        record = _contract_runtime_store(conn).get(contract_execution_id)
+    except (ContractRuntimeError, sqlite3.Error):
+        return {}
+    implementation = _worker_commit_completed_implementation(
+        record,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+    )
+    if not isinstance(implementation, Mapping):
+        return {}
+    if any(
+        isinstance(line, Mapping)
+        and str(line.get("line_id") or "").strip() == "worker_commit"
+        and _runtime_context_contract_line_matches_worker(
+            line,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+        )
+        for line in record.get("completed_lines") or []
+    ):
+        return {}
+
+    lineage = _worker_implementation_lineage(record, implementation)
+    prior_trace_ids = list(lineage.get("graph_trace_ids") or [])
+    prior_lineage_ref = str(
+        lineage.get("implementation_lineage_ref") or ""
+    ).strip()
+    if not prior_trace_ids or not prior_lineage_ref:
+        return {}
+    parent_task_id = _runtime_context_mf_sub_parent_task_id(context)
+    backlog_id = str(getattr(context, "backlog_id", "") or "").strip()
+    prior_refs = _runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        backlog_id=backlog_id,
+        fence_token=current_fence_token,
+        explicit_trace_ids=prior_trace_ids,
+        strict_explicit_trace_ids=True,
+    )
+    prior_bounded = set(
+        (prior_refs.get("bounded_replacement_trace_authority") or {}).keys()
+    )
+    prior_is_exact_current_generation = bool(
+        prior_refs.get("db_verified") is True
+        and set(prior_refs.get("verified_trace_ids") or [])
+        == set(prior_trace_ids)
+        and not prior_bounded.intersection(prior_trace_ids)
+    )
+    if prior_is_exact_current_generation:
+        return {}
+
+    from . import task_timeline
+
+    rejoin_marker = _runtime_context_precommit_correction_rejoin_marker(
+        context=context,
+        runtime_context_id=runtime_context_id,
+        contract_execution_id=contract_execution_id,
+        prior_implementation=implementation,
+        timeline_events=task_timeline.list_events(
+            conn,
+            project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            limit=1000,
+        ),
+    )
+    if not rejoin_marker:
+        return {}
+
+    requested = _runtime_context_service_dedupe(
+        requested_graph_trace_ids
+    )
+    if len(requested) > 1:
+        return {}
+    fresh_refs = _runtime_context_service_graph_trace_refs(
+        conn,
+        project_id=project_id,
+        runtime_context_id=runtime_context_id,
+        task_id=task_id,
+        parent_task_id=parent_task_id,
+        backlog_id=backlog_id,
+        fence_token=current_fence_token,
+        explicit_trace_ids=requested,
+        strict_explicit_trace_ids=bool(requested),
+    )
+    if fresh_refs.get("db_verified") is not True:
+        return {}
+    bounded_fresh_ids = set(
+        (fresh_refs.get("bounded_replacement_trace_authority") or {}).keys()
+    )
+    current_generation_ids = [
+        trace_id
+        for trace_id in fresh_refs.get("verified_trace_ids") or []
+        if trace_id not in bounded_fresh_ids
+    ]
+    if requested and current_generation_ids != requested:
+        return {}
+    if not current_generation_ids:
+        return {}
+    selected_trace_id = current_generation_ids[0]
+
+    from .parallel_branch_runtime import (
+        runtime_context_fence_token_verifier,
+        runtime_context_session_token_ref,
+    )
+
+    active_fence_hash = runtime_context_fence_token_verifier(context)
+    active_route = _runtime_context_latest_route_identity(conn, context)
+    selected_row = conn.execute(
+        """
+        SELECT route_id, route_context_hash, prompt_contract_id,
+               prompt_contract_hash, visible_injection_manifest_hash,
+               route_token_ref, fence_token, fence_token_hash
+        FROM graph_query_traces
+        WHERE project_id = ? AND trace_id = ?
+        LIMIT 1
+        """,
+        (project_id, selected_trace_id),
+    ).fetchone()
+    if selected_row is None or _graph_query_trace_fence_hash(
+        selected_row
+    ) != active_fence_hash:
+        return {}
+    if any(
+        str(active_route.get(field) or "").strip()
+        and str(selected_row[field] or "").strip()
+        != str(active_route.get(field) or "").strip()
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+    ):
+        return {}
+
+    writer_container = next_action.get("writer_role_safe_copy_payload")
+    writer_copy = dict(
+        writer_container.get("copy_payload")
+        if isinstance(writer_container, Mapping)
+        and isinstance(writer_container.get("copy_payload"), Mapping)
+        else {}
+    )
+    writer_copy.update(
+        {
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "evidence_kind": "implementation",
+            "line_instance_id": f"runtime_context:{runtime_context_id}",
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "target_project_root": (
+                _runtime_context_effective_target_project_root(context)
+            ),
+            "session_token_ref": runtime_context_session_token_ref(context),
+            "fence_token_hash": active_fence_hash,
+        }
+    )
+    writer_copy.update(
+        {
+            field: str(active_route.get(field) or "").strip()
+            for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+            if str(active_route.get(field) or "").strip()
+        }
+    )
+    implementation_payload = (
+        implementation.get("payload")
+        if isinstance(implementation.get("payload"), Mapping)
+        else {}
+    )
+    source_tests = implementation_payload.get("tests")
+    if not isinstance(source_tests, list):
+        source_tests = implementation.get("tests")
+    tests = [
+        dict(item)
+        for item in source_tests or []
+        if isinstance(item, Mapping)
+    ]
+    test_results = implementation_payload.get("test_results")
+    if not isinstance(test_results, Mapping):
+        test_results = implementation.get("test_results")
+    test_results = dict(test_results) if isinstance(test_results, Mapping) else {}
+    commit_sha = _worker_commit_text(
+        implementation,
+        "commit_sha",
+        "head_commit",
+        "immutable_head_commit",
+    )
+    correction_intent = {
+        "schema_version": (
+            "runtime_context.precommit_implementation_correction_intent.v1"
+        ),
+        "action": "revise_precommit_worker_implementation",
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "prior_implementation_lineage_ref": prior_lineage_ref,
+    }
+    action_input = {
+        **writer_copy,
+        "contract_execution_id": contract_execution_id,
+        "commit_sha": commit_sha,
+        "changed_files": list(lineage.get("changed_files") or []),
+        "graph_trace_ids": [selected_trace_id],
+        "tests": tests,
+        "test_results": test_results,
+        "precommit_implementation_correction_intent": correction_intent,
+        "correction_reason": (
+            "authenticated_runtime_context_rejoin_rotated_graph_authority"
+        ),
+        "evidence_refs": [f"graph-query-trace:{selected_trace_id}"],
+    }
+    if any(
+        not action_input.get(field)
+        for field in (
+            "contract_execution_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "target_project_root",
+            "session_token_ref",
+            "fence_token_hash",
+            "commit_sha",
+            "changed_files",
+            "graph_trace_ids",
+            "test_results",
+        )
+    ):
+        return {}
+    next_action.update(
+        {
+            "schema_version": "contract_runtime_next_legal_action.v1",
+            "id": "worker_implementation_graph_trace_rejoin_correction",
+            "action": "revise_precommit_worker_implementation",
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "owner_role": "mf_sub",
+            "allowed_writer_roles": ["mf_sub"],
+            "evidence_kind": "implementation",
+            "required": True,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "source": (
+                "ContractRuntime.completed_lines.worker_implementation+"
+                "graph_query_traces+RuntimeContext.current_values"
+            ),
+            "source_of_authority": (
+                "ContractRuntime.completed_lines.worker_implementation+"
+                "graph_query_traces+RuntimeContext.current_values"
+            ),
+            "authority_decision_source": (
+                "runtime_context_rejoin_graph_trace_authority"
+            ),
+            "submit_via": "runtime_context_implementation_evidence",
+            "historical_source_mutation_allowed": False,
+            "worker_commit_bypass_allowed": False,
+            "action_input": action_input,
+            "redirection": {
+                "schema_version": (
+                    "runtime_context.graph_trace_rejoin_redirection.v1"
+                ),
+                "reason": (
+                    "canonical implementation trace is not exact-current-fence "
+                    "after an authenticated rejoin"
+                ),
+                "prior_graph_trace_ids": prior_trace_ids,
+                "selected_current_graph_trace_ids": [selected_trace_id],
+                "precommit_rejoin_marker": dict(rejoin_marker),
+                "append_only_correction_required": True,
+                "graph_query_mutated_contract_runtime": False,
+                "strict_worker_commit_trace_equality_preserved": True,
+            },
+        }
+    )
+    return next_action
+
+
 def _runtime_context_finish_hint_from_source_backed_implementation(
     finish_attestation_hint: Mapping[str, Any],
     timeline_refs: Mapping[str, Any],
@@ -34517,6 +34826,21 @@ def _runtime_context_position_bounded_current_action(
         field: str(route_identity.get(field) or "").strip()
         for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
     }
+    projected_action_input = contract_next_action.get("action_input")
+    projected_action_input = (
+        projected_action_input
+        if isinstance(projected_action_input, Mapping)
+        else {}
+    )
+    if str(contract_next_action.get("action") or "").strip() in {
+        "revise_precommit_worker_implementation",
+        "repair_worker_implementation_test_results",
+    }:
+        for field in _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS:
+            if not route[field]:
+                route[field] = str(
+                    projected_action_input.get(field) or ""
+                ).strip()
     if not all(route.values()):
         return {}
     action = ""
@@ -34682,6 +35006,42 @@ def _runtime_context_position_bounded_current_action(
         tool = "graph_query"
         path = "/api/graph-governance/{project_id}/query"
     elif contract_stage == "implementation":
+        correction_input = contract_next_action.get("action_input")
+        correction_input = (
+            correction_input
+            if isinstance(correction_input, Mapping)
+            else {}
+        )
+        correction_action = str(
+            contract_next_action.get("action") or ""
+        ).strip()
+        if (
+            correction_action
+            in {
+                "revise_precommit_worker_implementation",
+                "repair_worker_implementation_test_results",
+            }
+            and str(contract_next_action.get("submit_via") or "").strip()
+            == "runtime_context_implementation_evidence"
+            and correction_input
+        ):
+            return _guide_canonical_executable_action(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=contract_execution_id,
+                parent_contract_execution_id=parent_contract_execution_id,
+                action=correction_action,
+                facade="runtime_context.implementation_evidence",
+                mcp_tool="runtime_context_implementation_evidence",
+                method="POST",
+                path=(
+                    f"/api/graph-governance/{project_id}/runtime-contexts/"
+                    f"{runtime_context_id}/implementation-evidence"
+                ),
+                stage_id="implementation",
+                line_id="worker_implementation",
+                body=dict(correction_input),
+            )
         graph_line, graph_payload = (
             _runtime_context_position_bounded_completed_line(
                 record,
@@ -34950,6 +35310,41 @@ def _runtime_context_worker_guide_early_compact_response(
     contract_next_action = dict(
         contract_projection.get("contract_runtime_next_legal_action") or {}
     )
+    graph_trace_repair_action = (
+        _runtime_context_worker_implementation_graph_trace_repair_action(
+            conn,
+            project_id=project_id,
+            context=context,
+            contract_execution_id=contract_execution_id,
+            runtime_context_id=runtime_context_id,
+            task_id=task_id,
+            canonical_next_action=contract_next_action,
+            current_fence_token=_runtime_context_request_value(
+                ctx,
+                "fence_token",
+            ),
+            requested_graph_trace_ids=(
+                _runtime_context_service_query_values(
+                    ctx.query,
+                    "graph_trace_id",
+                    "graph_trace_ids",
+                    "graph_query_trace_id",
+                    "graph_query_trace_ids",
+                )
+            ),
+        )
+        if role == "mf_sub" and contract_execution_id
+        else {}
+    )
+    if graph_trace_repair_action:
+        contract_state[
+            "canonical_next_legal_action_before_graph_trace_repair"
+        ] = dict(contract_next_action)
+        contract_next_action = dict(graph_trace_repair_action)
+        contract_state["next_legal_action"] = dict(contract_next_action)
+        contract_state["graph_trace_rejoin_redirection"] = dict(
+            contract_next_action.get("redirection") or {}
+        )
     contract_stage = _runtime_context_worker_guide_current_stage(
         {
             "next_legal_action": str(
