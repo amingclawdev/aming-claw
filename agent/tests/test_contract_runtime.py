@@ -2780,6 +2780,101 @@ def test_mf_parallel_rev10_failed_qa_files_copy_safe_fresh_repair_row():
     assert old_identity["parent_task_id"] in body["provenance_paths"][0]
 
 
+def test_mf_parallel_rev10_failed_qa_rejects_nested_acceptance_authority():
+    leaked_authority = {
+        "branch_ref": "refs/heads/old-worker",
+        "contract_execution_id": "cex-old-generation",
+        "fence": "raw-old-fence",
+        "fence_ref": "fence-ref-old-generation",
+        "fence_token": "fence-token-old-generation",
+        "fence_token_ref": "fence-token-ref-old-generation",
+        "lane_id": "lane-old-generation",
+        "merge_queue_id": "mq-old-generation",
+        "parent_task_id": "task-old-parent",
+        "route_token_ref": "rtok-old-generation",
+        "runtime_context_id": "mfrctx-old-generation",
+        "session": "raw-old-session",
+        "session_ref": "session-ref-old-generation",
+        "session_token": "session-token-old-generation",
+        "session_token_ref": "session-token-ref-old-generation",
+        "target_project_root": "/tmp/old-project-root",
+        "task_id": "task-old-generation",
+        "worker_id": "worker-old-generation",
+        "worker_slot_id": "worker-slot-old-generation",
+        "worktree_path": "/tmp/old-worker-worktree",
+    }
+    record = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-REV10-FAILED-QA-UNSAFE-AC",
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev10",
+        "contract_execution_id": "cex-rev10-unsafe-ac-source",
+        "metadata": {
+            "acceptance_criteria": [
+                {
+                    "id": "AC-REV10-UNSAFE-NESTED-AUTHORITY",
+                    "text": "Historical criterion contains unsafe metadata.",
+                    "required_scope": [
+                        "agent/governance/server.py",
+                        "agent/tests/test_contract_runtime.py",
+                    ],
+                    "historical_context": {
+                        "nested": dict(leaked_authority),
+                    },
+                }
+            ],
+            "acceptance_scope_closure": {
+                "row_declared_files": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_contract_runtime.py",
+                ]
+            },
+            "observer_prefill_child_plan": {
+                "row_test_files": ["agent/tests/test_contract_runtime.py"],
+            },
+        },
+        "runtime_guide": {
+            "next_legal_action": {
+                "line_id": "worker_read_runtime_guide",
+            }
+        },
+        "completed_lines": [
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "payload": {"status": "failed", "verdict": "FAIL"},
+            }
+        ],
+    }
+
+    state = server._runtime_current_state_from_record(record)
+    action = state["next_legal_action"]
+
+    assert action["id"] == "file_fresh_bounded_row"
+    assert action["actionable"] is False
+    assert action["action_input_ready"] is False
+    assert action["action_input"] == {}
+    assert action["copy_safe_body"] == {}
+    assert action["canonical_executable_action"] == {}
+    assert "acceptance_criteria" in action["missing_action_input_fields"]
+    assert action["unsafe_action_input_paths"] == sorted(
+        f"acceptance_criteria[0].historical_context.nested.{key}"
+        for key in leaked_authority
+    )
+    assert set(leaked_authority).issubset(
+        action["forbidden_authority_reuse"]
+    )
+    rendered_action = json.dumps(action, sort_keys=True)
+    for value in leaked_authority.values():
+        assert value not in rendered_action
+    assert action["failed_qa_source_ref"].startswith(
+        "contract_runtime:cex-rev10-unsafe-ac-source:completed_lines:"
+    )
+
+
 def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation(
     monkeypatch,
 ):

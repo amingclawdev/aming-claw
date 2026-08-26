@@ -118331,6 +118331,23 @@ def test_onboard_route_guide_no_backlog_system_operation_returns_policy(conn):
         "mcp_tools"
     ] == ["backlog_upsert", "backlog_list", "backlog_get"]
 
+    compact = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "role": "observer",
+                "work_type": "system_operation",
+                "response_view": "compact",
+            },
+        )
+    )
+    assert compact["ok"] is True
+    assert "mcp_tool" in compact
+    assert "actionable" in compact
+    assert "mcp_tool" not in compact["next_legal_action"]
+    assert "actionable" not in compact["next_legal_action"]
+
 
 @pytest.mark.parametrize(
     "work_type",
@@ -136159,13 +136176,23 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
     )
     acceptance_criteria = [
         {
-            "id": "AC-REV10-FAILED-QA-ONBOARD-FRESH-ROW",
-            "text": "Onboard advertises the exact fresh repair backlog body.",
+            "id": f"AC-REV10-FAILED-QA-ONBOARD-FRESH-ROW-{index}",
+            "text": (
+                f"CL-170 source-backed acceptance {index}: preserve the "
+                "complete independently reviewable criterion while routing "
+                "the failed generation to one fresh bounded repair row. "
+                + (
+                    "The compact guide must retain every canonical field "
+                    "without client-side reconstruction or stale authority. "
+                    * 5
+                )
+            ),
             "required_scope": [
                 "agent/governance/server.py",
                 "agent/tests/test_graph_governance_api.py",
             ],
         }
+        for index in range(1, 8)
     ]
     stale_identity = {
         "runtime_context_id": "mfrctx-rev10-onboard-stale",
@@ -136359,6 +136386,14 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
     assert current["next_legal_action"]["actionable"] is True
     assert "runtime_context_id" not in current["next_legal_action"]
     assert "accepted_dispatch_authority" not in current["next_legal_action"]
+    assert guide["ok"] is True
+    assert guide["status"] == "fresh_bounded_repair_action_ready"
+    assert guide["mcp_tool"] == "backlog_upsert"
+    assert guide["actionable"] is True
+    assert guide["serialized_bytes"] <= guide["max_serialized_bytes"]
+    assert len(json.dumps(guide, sort_keys=True).encode("utf-8")) <= (
+        server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+    )
     action = guide["next_legal_action"]
     assert action["id"] == "file_fresh_bounded_row"
     assert action["mcp_tool"] == "backlog_upsert"
@@ -136366,9 +136401,11 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
     assert action["action_input_ready"] is True
     assert action["fresh_authority_required"] is True
     assert action["same_row_resume_allowed"] is False
-    canonical = action["canonical_executable_action"]
+    assert "canonical_executable_action" not in action
+    canonical = guide["canonical_executable_action"]
     assert canonical["mcp_tool"] == "backlog_upsert"
     body = canonical["copy_safe_body"]
+    assert 5_500 <= server._onboard_guide_capsule_serialized_bytes(body) <= 7_500
     assert body["bug_id"].startswith(f"{backlog_id}-QA-REPAIR-")
     assert body["target_files"] == ["agent/governance/server.py"]
     assert body["test_files"] == [
@@ -136378,7 +136415,22 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
     assert action["next_after_success"]["body"]["backlog_id"] == body[
         "bug_id"
     ]
-    rendered_action = json.dumps(action, sort_keys=True)
+    body_occurrences = 0
+
+    def count_body_occurrences(value):
+        nonlocal body_occurrences
+        if isinstance(value, Mapping):
+            if dict(value) == body:
+                body_occurrences += 1
+            for child in value.values():
+                count_body_occurrences(child)
+        elif isinstance(value, list):
+            for child in value:
+                count_body_occurrences(child)
+
+    count_body_occurrences(guide)
+    assert body_occurrences == 1
+    rendered_action = json.dumps(guide, sort_keys=True)
     for identity_field in (
         "runtime_context_id",
         "task_id",

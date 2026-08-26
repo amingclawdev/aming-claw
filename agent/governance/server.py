@@ -106627,6 +106627,89 @@ def _contract_runtime_failed_qa_fresh_repair_action(
         if isinstance(child_plan.get("acceptance_criteria"), list)
         else []
     )
+    forbidden_acceptance_keys = {
+        "actual_host_worker_id",
+        "api_key",
+        "authorization",
+        "branch_ref",
+        "contract_execution_id",
+        "fence",
+        "fence_ref",
+        "fence_token",
+        "fence_token_ref",
+        "host_session_id",
+        "host_startup_id",
+        "host_worker_id",
+        "lane_id",
+        "merge_queue_id",
+        "observer_session_id",
+        "observer_session_ref",
+        "parent_contract_execution_id",
+        "parent_task_id",
+        "password",
+        "route_token",
+        "route_token_ref",
+        "runtime_context_id",
+        "session",
+        "session_id",
+        "session_ref",
+        "session_token",
+        "session_token_ref",
+        "secret",
+        "target_project_root",
+        "task_id",
+        "token",
+        "worker_id",
+        "worker_session_ref",
+        "worker_session_id",
+        "worker_session_token",
+        "worker_session_token_ref",
+        "worker_slot_id",
+        "worktree_path",
+    }
+    unsafe_acceptance_paths: list[str] = []
+
+    def collect_unsafe_acceptance_paths(
+        value: Any,
+        path: str = "acceptance_criteria",
+    ) -> None:
+        if isinstance(value, Mapping):
+            for raw_key, child in value.items():
+                key = str(raw_key or "").strip()
+                normalized = key.lower()
+                child_path = f"{path}.{key}" if key else path
+                if (
+                    normalized in forbidden_acceptance_keys
+                    or normalized.endswith(
+                        (
+                            "_token",
+                            "_token_ref",
+                            "_fence",
+                            "_fence_ref",
+                            "_session",
+                            "_session_id",
+                            "_session_ref",
+                            "_credential",
+                            "_secret",
+                            "_password",
+                            "_api_key",
+                        )
+                    )
+                ):
+                    unsafe_acceptance_paths.append(child_path)
+                    continue
+                collect_unsafe_acceptance_paths(child, child_path)
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                collect_unsafe_acceptance_paths(
+                    child,
+                    f"{path}[{index}]",
+                )
+
+    collect_unsafe_acceptance_paths(acceptance_criteria)
+    safe_acceptance_criteria = (
+        [] if unsafe_acceptance_paths else deepcopy(acceptance_criteria)
+    )
 
     project_id = str(record.get("project_id") or "").strip()
     source_backlog_id = str(record.get("backlog_id") or "").strip()
@@ -106663,7 +106746,7 @@ def _contract_runtime_failed_qa_fresh_repair_action(
         "status": "OPEN",
         "target_files": target_files,
         "test_files": test_files,
-        "acceptance_criteria": deepcopy(acceptance_criteria),
+        "acceptance_criteria": safe_acceptance_criteria,
     }
     missing_fields = [
         field
@@ -106723,6 +106806,9 @@ def _contract_runtime_failed_qa_fresh_repair_action(
         "copy_safe_body": deepcopy(action_input),
         "canonical_executable_action": canonical_action,
         "missing_action_input_fields": missing_fields,
+        "unsafe_action_input_paths": sorted(
+            set(unsafe_acceptance_paths)
+        ),
         "failed_qa_source_ref": failed_source_ref,
         "failed_qa_status": str(
             failure_payload.get("status")
@@ -106735,15 +106821,12 @@ def _contract_runtime_failed_qa_fresh_repair_action(
         "fresh_authority_required": True,
         "source_runtime_authority_reusable": False,
         "historical_contract_successor": historical_direct_fix,
-        "forbidden_authority_reuse": [
-            "runtime_context_id",
-            "task_id",
-            "route_token_ref",
-            "worktree_path",
-            "branch_ref",
-            "merge_queue_id",
-            "accepted_dispatch_authority",
-        ],
+        "forbidden_authority_reuse": sorted(
+            {
+                *forbidden_acceptance_keys,
+                "accepted_dispatch_authority",
+            }
+        ),
         "next_after_success": {
             "interface": "onboard_route_guide",
             "role": "observer",
@@ -152112,7 +152195,9 @@ def _onboard_route_guide_compact_service_response(
             "id": str(next_action.get("id") or ""),
             "action": action,
             "interface": str(next_action.get("interface") or ""),
-            "mcp_tool": canonical_mcp_tool,
+            "mcp_tool": (
+                canonical_mcp_tool if fresh_bounded_successor else ""
+            ),
             "line_id": str(next_action.get("line_id") or ""),
             "stage_id": str(next_action.get("stage_id") or ""),
             "description": str(
@@ -152159,7 +152244,8 @@ def _onboard_route_guide_compact_service_response(
             ),
             "actionable": (
                 bool(next_action.get("actionable"))
-                if "actionable" in next_action
+                if fresh_bounded_successor
+                and "actionable" in next_action
                 else None
             ),
             "action_input_missing_fields": list(
@@ -152675,6 +152761,68 @@ def _onboard_route_guide_compact_service_response(
         or ""
     )
     if (
+        fresh_bounded_successor
+        and not host_precursor_required
+        and canonical_executable_action
+    ):
+        # A fresh repair row can carry several complete acceptance criteria.
+        # Publish its copy-safe body exactly once: the top-level canonical
+        # action is executable, while next_legal_action remains a body-free
+        # routing summary. The same lossless body remains available in the
+        # revision-fenced capsule for oversized continuation.
+        fresh_next_action = dict(next_action_projection)
+        fresh_next_action.pop("canonical_executable_action", None)
+        fresh_response = {
+            "schema_version": _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION,
+            "ok": True,
+            "response_view": "compact",
+            "status": "fresh_bounded_repair_action_ready",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "selected_role": selected_role,
+            "selected_work_type": selected_work_type,
+            "selected_task_id": str(identity.get("selected_task_id") or ""),
+            "work_type_storage_projection": work_type_storage_projection,
+            "selected_guidance_json_path": selected_guidance_path,
+            "next_legal_action": fresh_next_action,
+            "graph_first_preflight": graph_first_preflight,
+            "source_of_authority": source_of_authority,
+            "contract_execution_id": identity["contract_execution_id"],
+            "execution_state_revision": identity["execution_state_revision"],
+            "projection_hash": identity["projection_hash"],
+            "canonical_executable_action": canonical_executable_action,
+            "canonical_executable_action_path": (
+                "canonical_executable_action"
+            ),
+            "action_input_path": (
+                "canonical_executable_action.copy_safe_body"
+            ),
+            "facade": public_facade,
+            "mcp_tool": public_mcp_tool,
+            "actionable": True,
+            "guide_capsule_ref": entry["guide_capsule_ref"],
+            "projection_degraded": projection_degraded,
+            "max_serialized_bytes": (
+                _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+            ),
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
+            "raw_route_token_exposed": False,
+            "advisory_only": True,
+            "authorizes_write": False,
+            "satisfies_gate": False,
+            "synthesizes_pass": False,
+            "serialized_bytes": 0,
+        }
+        fresh_response["serialized_bytes"] = (
+            _onboard_guide_capsule_serialized_bytes(fresh_response)
+        )
+        if (
+            _onboard_guide_capsule_serialized_bytes(fresh_response)
+            <= _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
+        ):
+            return fresh_response
+    if (
         finish_runtime_selected
         and worker_runtime_ready
         and not host_precursor_required
@@ -152931,10 +153079,17 @@ def _onboard_route_guide_compact_service_response(
             next_action.get("irreversible_runtime_audit_terminal_authority")
         )
     )
+    observer_fresh_bounded_continuation = bool(
+        selected_role_key == "observer"
+        and fresh_bounded_successor
+        and str(continuation_action.get("mcp_tool") or "")
+        == "backlog_upsert"
+    )
     continuation_ready = bool(
         (
             selected_role_key == "worker"
             or observer_irreversible_terminal_continuation
+            or observer_fresh_bounded_continuation
         )
         and not host_precursor_required
         and isinstance(action_input_section, Mapping)
@@ -152950,9 +153105,10 @@ def _onboard_route_guide_compact_service_response(
     if continuation_ready:
         # The public host orchestrator already knows how to fetch this exact
         # bounded section. Keep the compact read successful for worker
-        # continuation and for the one server-signed irreversible-runtime
-        # observer terminal action. The opaque capsule ref remains scope-,
-        # revision-, projection-, and auth-generation-fenced by fetch.
+        # continuation, one server-signed irreversible-runtime observer
+        # terminal action, or one fresh bounded observer repair successor.
+        # The opaque capsule ref remains scope-, revision-, projection-, and
+        # auth-generation-fenced by fetch.
         return {
             "schema_version": _ONBOARD_GUIDE_COMPACT_SCHEMA_VERSION,
             "ok": True,
@@ -152976,6 +153132,19 @@ def _onboard_route_guide_compact_service_response(
                 "sections": ["action_input"],
                 "source_binding": dict(continuation_source_binding),
             },
+            **(
+                {
+                    "facade": public_facade,
+                    "mcp_tool": public_mcp_tool,
+                    "actionable": True,
+                    "action_input_path": (
+                        "guide_capsule.sections.action_input."
+                        "canonical_executable_action"
+                    ),
+                }
+                if observer_fresh_bounded_continuation
+                else {}
+            ),
             "max_serialized_bytes": (
                 _ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
             ),
