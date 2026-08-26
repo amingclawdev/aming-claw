@@ -99341,31 +99341,90 @@ def _caller_timeline_key_is_credential(key: Any) -> bool:
     return compact in _CALLER_TIMELINE_CREDENTIAL_KEY_COMPACT_DENYLIST
 
 
-_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCE_MARKERS = (
-    "AUTHORITY",
-    "CHECKPOINT_BASELINE",
-    "EXECUTION_ID",
-    "IDENTITY",
-    "PROVENANCE_SECURITY",
-)
-_CONTRACT_RUNTIME_SERVER_CANONICAL_DISPATCH_RUNTIME_SOURCE_MARKERS = (
-    "DISPATCH_RUNTIME",
-)
-_CONTRACT_RUNTIME_SERVER_CANONICAL_CONTAINER_EXACT_SOURCE_NAMES = frozenset(
-    {"_CONTRACT_RUNTIME_CONTAINER_KEYS"}
-)
-_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES = frozenset(
-    {
-        "_CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS",
-        "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
-        "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES",
-        "_CONTRACT_RUNTIME_SERVER_CANONICAL_CONTAINER_EXACT_SOURCE_NAMES",
-        "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES",
-        "_CONTRACT_RUNTIME_SERVER_CANONICAL_DISPATCH_RUNTIME_SOURCE_MARKERS",
-        "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCE_MARKERS",
-        "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES",
-    }
-)
+# Every module-level string collection whose name ends in one of the canonical
+# schema suffixes has one explicit disposition.  Authority leaves feed the
+# nontransferable classifier.  Recursive containers are inventory only: their
+# names do not become authority merely because they hold mappings.  Audited
+# non-authority collections are response/projection schemas and never feed the
+# classifier.  The audit below fails closed in tests when a new collection is
+# added without making this choice.
+_CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION = {
+    "authority_leaf": frozenset(
+        {
+            "_CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS",
+            "_CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS",
+            "_CONTRACT_RUNTIME_EXECUTION_ID_FIELDS",
+            "_CONTRACT_RUNTIME_LINE_WRITE_PROTOCOL_FIELDS",
+            "_CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS",
+            "_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS",
+            "_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS",
+            "_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS",
+            "_DESKTOP_EXECUTION_TICKET_RESOLVE_FIELDS",
+            "_FINISH_GATE_PARENT_LINEAGE_REQUIRED_FIELDS",
+            "_GUIDE_RAW_AUTH_BODY_FIELDS",
+            "_INTEGRATION_EPOCH_RELEASE_RAW_CREDENTIAL_FIELDS",
+            "_INTEGRATION_EPOCH_RELEASE_ROUTE_PROOF_FIELDS",
+            "_MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS",
+            "_MF_PARALLEL_LANE_INTENT_FIELDS",
+            "_MF_SUB_HOST_BRIDGE_REQUIRED_FIELDS",
+            "_OBSERVER_HOTFIX_ATTEMPT_ALLOWED_FIELDS",
+            "_ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS",
+            "_PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS",
+            "_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS",
+            "_PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_KEYS",
+            "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS",
+            "_QA_REVIEW_AUTHORITY_NAMES",
+            "_ROUTE_ACTION_SCOPE_LINEAGE_KEYS",
+            "_ROUTE_GATE_PAYLOAD_KEYS",
+            "_ROUTE_REGISTRY_IDENTITY_FIELDS",
+            "_RUNTIME_CONTEXT_GRAPH_TRACE_ID_KEYS",
+            "_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS",
+            "_RUNTIME_CONTEXT_LEGACY_REJOIN_BASELINE_KEYS",
+            "_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS",
+            "_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS",
+            "_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS",
+            "_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS",
+            "_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS",
+            "_RUNTIME_CONTEXT_SERVER_IDENTITY_FIELDS",
+            "_TIMELINE_BOUNDED_DISPATCH_RUNTIME_LINEAGE_FIELDS",
+            "_TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS",
+            "_TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS",
+        }
+    ),
+    "recursive_container": frozenset(
+        {
+            "_CONTRACT_RUNTIME_CONTAINER_KEYS",
+            "_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS",
+            "_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_CONTAINERS",
+            "_QA_REVIEW_AUTHORITY_CONTAINERS",
+            "_SERVER_PROJECTED_TIMELINE_KEYS",
+        }
+    ),
+    "audited_non_authority": frozenset(
+        {
+            "_BACKLOG_TRIAGE_SUCCESSOR_JSON_FIELDS",
+            "_BACKLOG_TRIAGE_SUCCESSOR_SCALAR_FIELDS",
+            "_CONTRACT_CHAIN_RUNTIME_FRESHNESS_COMPARE_KEYS",
+            "_CONTRACT_CHAIN_RUNTIME_FRESHNESS_CONTEXT_KEYS",
+            "_CONTRACT_RUNTIME_QA_FAILURE_COUNT_FIELDS",
+            "_CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS",
+            "_CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS",
+            "_CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS",
+            "_CURRENT_FULL_BUILD_KEYS",
+            "_LEGACY_PRIMARY_ROUTE_CLAIM_KEYS",
+            "_QA_EXTERNAL_NO_PASS_BASE_REPRODUCTION_REQUIRED_KEYS",
+            "_QA_EXTERNAL_NO_PASS_CANDIDATE_COUNTS_REQUIRED_KEYS",
+            "_RESUMED_SUCCESSOR_STATUS_FIELDS",
+            "_RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_COUNT_FIELDS",
+            "_RUNTIME_CONTEXT_LEGACY_REJOIN_PAYLOAD_KEYS",
+            "_RUNTIME_CONTEXT_LEGACY_REJOIN_PRE_LINEAGE_PAYLOAD_KEYS",
+            "_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_ACTIONABLE_KEYS",
+            "_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_CONTRACT_STATE_KEYS",
+            "_SEMANTIC_REVISION_FORBIDDEN_KEYS",
+            "_TIMELINE_TOP_LEVEL_ROLE_FIELDS",
+        }
+    ),
+}
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES: tuple[str, ...] = ()
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES: tuple[
     str, ...
@@ -99376,22 +99435,93 @@ _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset(
 )
 
 
+def _contract_runtime_is_server_canonical_collection_source(
+    source_name: Any,
+    raw_fields: Any,
+) -> bool:
+    name = str(source_name or "")
+    if not name.startswith("_") or not name.endswith(
+        ("_FIELDS", "_NAMES", "_KEYS", "_CONTAINERS")
+    ):
+        return False
+    if name.startswith("_CONTRACT_RUNTIME_SERVER_CANONICAL_") or name in {
+        "_CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS",
+        "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
+    }:
+        return False
+    return bool(
+        isinstance(raw_fields, (frozenset, list, set, tuple))
+        and all(isinstance(field_name, str) for field_name in raw_fields)
+    )
+
+
+def _contract_runtime_server_canonical_collection_sources(
+) -> dict[str, frozenset[str]]:
+    return dict(
+        sorted(
+            (
+                source_name,
+                frozenset(raw_fields),
+            )
+            for source_name, raw_fields in globals().items()
+            if _contract_runtime_is_server_canonical_collection_source(
+                source_name,
+                raw_fields,
+            )
+        )
+    )
+
+
+def _contract_runtime_server_canonical_source_registry_audit(
+) -> dict[str, Any]:
+    inventory = set(_contract_runtime_server_canonical_collection_sources())
+    dispositions = {
+        disposition: set(source_names)
+        for disposition, source_names in (
+            _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION.items()
+        )
+    }
+    registered = set().union(*dispositions.values())
+    memberships: dict[str, list[str]] = {}
+    for disposition, source_names in dispositions.items():
+        for source_name in source_names:
+            memberships.setdefault(source_name, []).append(disposition)
+    overlapping = sorted(
+        source_name
+        for source_name, source_dispositions in memberships.items()
+        if len(source_dispositions) != 1
+    )
+    unclassified = sorted(inventory - registered)
+    missing = sorted(registered - inventory)
+    return {
+        "complete": not (overlapping or unclassified or missing),
+        "inventory_source_names": sorted(inventory),
+        "registered_source_names": sorted(registered),
+        "authority_leaf_source_names": sorted(
+            dispositions["authority_leaf"]
+        ),
+        "recursive_container_source_names": sorted(
+            dispositions["recursive_container"]
+        ),
+        "audited_non_authority_source_names": sorted(
+            dispositions["audited_non_authority"]
+        ),
+        "overlapping_source_names": overlapping,
+        "unclassified_source_names": unclassified,
+        "missing_registered_source_names": missing,
+    }
+
+
 def _contract_runtime_is_server_canonical_authority_container_source(
     source_name: Any,
 ) -> bool:
     """Return whether one source lists mapping containers, not leaf authority."""
 
     name = str(source_name or "")
-    if (
-        not name.startswith("_")
-        or name
-        in _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES
-    ):
-        return False
-    return bool(
-        name
-        in _CONTRACT_RUNTIME_SERVER_CANONICAL_CONTAINER_EXACT_SOURCE_NAMES
-        or (name.endswith("_CONTAINERS") and "AUTHORITY" in name)
+    return name in (
+        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
+            "recursive_container"
+        ]
     )
 
 
@@ -99399,63 +99529,39 @@ def _contract_runtime_is_server_canonical_authority_field_source(
     source_name: Any,
 ) -> bool:
     name = str(source_name or "")
-    if (
-        not name.startswith("_")
-        or name
-        in _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES
-    ):
-        return False
-    if _contract_runtime_is_server_canonical_authority_container_source(name):
-        return False
-    if name.endswith("_FIELDS"):
-        is_canonical_authority = any(
-            marker in name
-            for marker in (
-                _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCE_MARKERS
-            )
-        )
-        is_dispatch_runtime_contract = any(
-            marker in name
-            for marker in (
-                _CONTRACT_RUNTIME_SERVER_CANONICAL_DISPATCH_RUNTIME_SOURCE_MARKERS
-            )
-        )
-        return is_canonical_authority or is_dispatch_runtime_contract
-    if name.endswith(("_NAMES", "_KEYS")):
-        return "AUTHORITY" in name
-    return False
+    return name in (
+        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
+            "authority_leaf"
+        ]
+    )
 
 
 def _contract_runtime_server_canonical_authority_field_sources(
 ) -> dict[str, frozenset[str]]:
-    sources: dict[str, frozenset[str]] = {}
-    for source_name, raw_fields in globals().items():
-        if not _contract_runtime_is_server_canonical_authority_field_source(
-            source_name
-        ):
-            continue
-        if not isinstance(raw_fields, (frozenset, list, set, tuple)):
-            continue
-        if not all(isinstance(field_name, str) for field_name in raw_fields):
-            continue
-        sources[source_name] = frozenset(raw_fields)
-    return dict(sorted(sources.items()))
+    inventory = _contract_runtime_server_canonical_collection_sources()
+    return {
+        source_name: inventory[source_name]
+        for source_name in sorted(
+            _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
+                "authority_leaf"
+            ]
+        )
+        if source_name in inventory
+    }
 
 
 def _contract_runtime_server_canonical_authority_container_sources(
 ) -> dict[str, frozenset[str]]:
-    sources: dict[str, frozenset[str]] = {}
-    for source_name, raw_fields in globals().items():
-        if not _contract_runtime_is_server_canonical_authority_container_source(
-            source_name
-        ):
-            continue
-        if not isinstance(raw_fields, (frozenset, list, set, tuple)):
-            continue
-        if not all(isinstance(field_name, str) for field_name in raw_fields):
-            continue
-        sources[source_name] = frozenset(raw_fields)
-    return dict(sorted(sources.items()))
+    inventory = _contract_runtime_server_canonical_collection_sources()
+    return {
+        source_name: inventory[source_name]
+        for source_name in sorted(
+            _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
+                "recursive_container"
+            ]
+        )
+        if source_name in inventory
+    }
 
 
 def _contract_runtime_refresh_canonical_authority_field_inventory(

@@ -2873,6 +2873,25 @@ _FRESH_REPAIR_BENIGN_SEMANTIC_KEYS = (
 )
 
 
+_FRESH_REPAIR_EXTRA_SEMANTIC_KEYS = (
+    "expected",
+    "actual",
+    "result",
+    "tool",
+    "method",
+    "path",
+    "phase",
+    "event_type",
+    "dependencies",
+    "constraints",
+    "operation_id",
+    "malformed_input_outcome",
+    "given",
+    "when",
+    "then",
+)
+
+
 _RETIRED_EXECUTION_AUTHORITY_KEY_CASES = (
     (
         "credential_session_fence_lease",
@@ -3152,13 +3171,30 @@ _RETIRED_EXECUTION_AUTHORITY_KEY_CASES = (
 
 
 def test_failed_qa_repair_server_authority_schemas_have_no_classifier_drift():
+    registry_audit = (
+        server._contract_runtime_server_canonical_source_registry_audit()
+    )
+    assert registry_audit["complete"] is True
+    assert registry_audit["unclassified_source_names"] == []
+    assert registry_audit["missing_registered_source_names"] == []
+    assert registry_audit["overlapping_source_names"] == []
+    assert set(registry_audit["inventory_source_names"]) == set(
+        registry_audit["registered_source_names"]
+    )
+    assert set(registry_audit["registered_source_names"]) == (
+        set(registry_audit["authority_leaf_source_names"])
+        | set(registry_audit["recursive_container_source_names"])
+        | set(registry_audit["audited_non_authority_source_names"])
+    )
     sources = server._contract_runtime_server_canonical_authority_field_sources()
     assert {
+        "_CONTRACT_RUNTIME_LINE_WRITE_PROTOCOL_FIELDS",
         "_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS",
         "_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS",
         "_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS",
         "_MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS",
         "_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS",
+        "_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS",
         "_RUNTIME_CONTEXT_SERVER_IDENTITY_FIELDS",
         "_TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS",
     }.issubset(sources)
@@ -3207,11 +3243,84 @@ def test_failed_qa_repair_server_authority_schemas_have_no_classifier_drift():
     )
 
 
+def test_failed_qa_repair_registry_audit_flags_unclassified_schema(
+    monkeypatch,
+):
+    future_source = "_RUNTIME_CONTEXT_FUTURE_WRITER_BINDING_FIELDS"
+    monkeypatch.setattr(
+        server,
+        future_source,
+        ("future_writer_generation_binding",),
+        raising=False,
+    )
+
+    audit = server._contract_runtime_server_canonical_source_registry_audit()
+
+    assert audit["complete"] is False
+    assert audit["unclassified_source_names"] == [future_source]
+    assert future_source not in audit["registered_source_names"]
+
+
 def test_failed_qa_repair_dispatch_runtime_schema_refreshes_future_fields(
     monkeypatch,
 ):
     source_name = "_TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS"
     future_field = "future_dispatch_generation_binding"
+    original_fields = getattr(server, source_name)
+    assert source_name in (
+        server._contract_runtime_server_canonical_authority_field_sources()
+    )
+    assert (
+        server._contract_runtime_key_is_execution_authority_or_credential(
+            future_field
+        )
+        is False
+    )
+
+    try:
+        monkeypatch.setattr(
+            server,
+            source_name,
+            (*original_fields, future_field),
+        )
+        refreshed = (
+            server._contract_runtime_refresh_canonical_authority_field_inventory()
+        )
+        assert future_field in refreshed
+        assert future_field in (
+            server._contract_runtime_server_canonical_authority_field_sources()[
+                source_name
+            ]
+        )
+        assert (
+            server._contract_runtime_key_is_execution_authority_or_credential(
+                future_field
+            )
+            is True
+        )
+    finally:
+        monkeypatch.setattr(server, source_name, original_fields)
+        server._contract_runtime_refresh_canonical_authority_field_inventory()
+
+
+@pytest.mark.parametrize(
+    ("source_name", "future_field"),
+    (
+        (
+            "_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS",
+            "future_writer_generation_binding",
+        ),
+        (
+            "_CONTRACT_RUNTIME_LINE_WRITE_PROTOCOL_FIELDS",
+            "future_line_write_generation_binding",
+        ),
+    ),
+)
+def test_failed_qa_repair_registered_submit_schema_refreshes_future_fields(
+    monkeypatch,
+    source_name,
+    future_field,
+):
     original_fields = getattr(server, source_name)
     assert source_name in (
         server._contract_runtime_server_canonical_authority_field_sources()
@@ -3517,7 +3626,13 @@ def test_mf_parallel_rev10_failed_qa_allows_safe_semantic_key_mutations():
     assert "contract_execution_id" not in action["copy_safe_body"]
 
 
-@pytest.mark.parametrize("semantic_key", _FRESH_REPAIR_BENIGN_SEMANTIC_KEYS)
+@pytest.mark.parametrize(
+    "semantic_key",
+    (
+        *_FRESH_REPAIR_BENIGN_SEMANTIC_KEYS,
+        *_FRESH_REPAIR_EXTRA_SEMANTIC_KEYS,
+    ),
+)
 def test_failed_qa_repair_classifier_allows_benign_semantic_keys(
     semantic_key,
 ):
@@ -3527,12 +3642,37 @@ def test_failed_qa_repair_classifier_allows_benign_semantic_keys(
         )
         is False
     )
+    criterion = {
+        "id": f"AC-REV10-BENIGN-{semantic_key.upper()}",
+        "text": "One plain semantic key remains copy-safe.",
+        "required_scope": ["agent/governance/server.py"],
+        "extra_semantics": {
+            semantic_key: f"plain semantic {semantic_key}",
+        },
+    }
+    record = _rev10_failed_qa_fresh_repair_record(
+        [criterion],
+        backlog_id=f"AC-REV10-BENIGN-{semantic_key.upper()}",
+        contract_execution_id=f"cex-rev10-benign-{semantic_key}",
+    )
+
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+
+    assert action["actionable"] is True
+    assert action["action_input_ready"] is True
+    assert action["unsafe_action_input_paths"] == []
+    assert action["copy_safe_body"]["acceptance_criteria"] == [criterion]
 
 
 def test_mf_parallel_rev10_failed_qa_preserves_benign_semantic_keys():
     benign_context = {
         key: f"benign semantic value for {key}"
-        for key in _FRESH_REPAIR_BENIGN_SEMANTIC_KEYS
+        for key in (
+            *_FRESH_REPAIR_BENIGN_SEMANTIC_KEYS,
+            *_FRESH_REPAIR_EXTRA_SEMANTIC_KEYS,
+        )
     }
     acceptance_criteria = [
         {
@@ -3555,6 +3695,46 @@ def test_mf_parallel_rev10_failed_qa_preserves_benign_semantic_keys():
     assert action["actionable"] is True
     assert action["action_input_ready"] is True
     assert action["action_input_missing_fields"] == []
+    assert action["unsafe_action_input_paths"] == []
+    assert action["copy_safe_body"]["acceptance_criteria"] == (
+        acceptance_criteria
+    )
+
+
+def test_mf_parallel_rev10_failed_qa_preserves_benign_container_dicts():
+    benign_containers = {
+        container_key: {
+            "given": f"plain semantic given in {container_key}",
+            "when": f"plain semantic when in {container_key}",
+            "then": f"plain semantic then in {container_key}",
+        }
+        for container_key in (
+            "payload",
+            "verification",
+            "artifact_refs",
+            "current_state",
+        )
+    }
+    acceptance_criteria = [
+        {
+            "id": "AC-REV10-BENIGN-CONTAINER-DICTS",
+            "text": "Benign container mappings remain copy-safe.",
+            "required_scope": ["agent/governance/server.py"],
+            "historical_context": benign_containers,
+        }
+    ]
+    record = _rev10_failed_qa_fresh_repair_record(
+        acceptance_criteria,
+        backlog_id="AC-REV10-FAILED-QA-BENIGN-CONTAINER-DICTS",
+        contract_execution_id="cex-rev10-benign-container-dicts",
+    )
+
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+
+    assert action["actionable"] is True
+    assert action["action_input_ready"] is True
     assert action["unsafe_action_input_paths"] == []
     assert action["copy_safe_body"]["acceptance_criteria"] == (
         acceptance_criteria
