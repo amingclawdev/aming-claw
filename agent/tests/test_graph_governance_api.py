@@ -123133,15 +123133,18 @@ def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete
     ]:
         runtime.current_guide(hotfix_execution_id, actor_role=actor_role)
         hotfix_record = runtime.store.get(hotfix_execution_id)
+        write = server._contract_runtime_write_from_record(
+            hotfix_record,
+            actor_role=actor_role,
+            stage_id=stage_id,
+            line_id=line_id,
+            evidence_kind=evidence_kind,
+        )
+        if evidence_kind == "independent_verification":
+            write["status"] = "passed"
         result = runtime.submit_line_write(
             hotfix_execution_id,
-            server._contract_runtime_write_from_record(
-                hotfix_record,
-                actor_role=actor_role,
-                stage_id=stage_id,
-                line_id=line_id,
-                evidence_kind=evidence_kind,
-            ),
+            write,
             actor_role=actor_role,
         )
         assert result["ok"] is True
