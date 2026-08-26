@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { api, ApiError, BACKLOG_HOT_WINDOW_LIMIT, type BacklogHotWindowResponse } from "../lib/api";
 import {
   buildPlaybackUrl,
@@ -17,6 +17,7 @@ import {
   type TaskPlaybackCompactLedgerRow,
   type TaskPlaybackDag,
   type TaskPlaybackDagEdge,
+  type TaskPlaybackDagNode,
 } from "../lib/taskPlayback";
 import {
   projectTaskTimelineEvent,
@@ -929,6 +930,10 @@ function BacklogDetailModal({
   const [selectedNodeId, setSelectedNodeId] = useState<string>("");
   const selectedNode = dag.nodes.find((node) => node.id === selectedNodeId) ?? dag.nodes[0] ?? null;
   const title = bug?.title || fallbackBugId;
+  const dagGridStyle = {
+    "--backlog-dag-phase-count": Math.max(1, dag.phaseLabels.length),
+    "--backlog-dag-track-min-width": `${Math.max(1, dag.phaseLabels.length) * 130 + Math.max(0, dag.phaseLabels.length - 1) * 8 + 14}px`,
+  } as CSSProperties;
 
   useEffect(() => {
     if (!selectedNode || dag.nodes.some((node) => node.id === selectedNodeId)) return;
@@ -1040,12 +1045,16 @@ function BacklogDetailModal({
                 <div className="timeline-empty">No execution timeline events are available.</div>
               ) : null}
               {dag.nodes.length > 0 ? (
-                <div className="backlog-dag-shell">
-                  <div className="backlog-dag-phases" style={{ gridTemplateColumns: `120px repeat(${dag.phaseLabels.length}, minmax(130px, 1fr))` }}>
-                    <span />
-                    {dag.phaseLabels.map((phase) => (
-                      <span key={phase}>{phase}</span>
-                    ))}
+                <div className="backlog-dag-shell" style={dagGridStyle}>
+                  <div className="backlog-dag-phases" aria-label="Timeline phases">
+                    <span className="backlog-dag-phase-spacer" aria-hidden="true" />
+                    <div className="backlog-dag-phase-track">
+                      {dag.phaseLabels.map((phase) => (
+                        <span className="backlog-dag-phase-label" key={phase} title={phase} aria-label={phase}>
+                          {phase}
+                        </span>
+                      ))}
+                    </div>
                   </div>
                   <div className="backlog-dag-grid">
                     {dag.lanes.map((lane) => (
@@ -1053,8 +1062,12 @@ function BacklogDetailModal({
                         <div className="backlog-dag-lane-label" title={lane.label}>
                           {lane.label}
                         </div>
-                        <div className="backlog-dag-lane-track" style={{ gridTemplateColumns: `repeat(${dag.phaseLabels.length}, minmax(130px, 1fr))` }}>
-                          {lane.nodes.map((node) => (
+                        <div className="backlog-dag-lane-track">
+                          {lane.nodes.length === 0 && lane.family === "verification" ? (
+                            <div className="backlog-dag-lane-empty" role="status">
+                              No authoritative QA or independent-verification evidence is recorded.
+                            </div>
+                          ) : lane.nodes.map((node) => (
                             <button
                               type="button"
                               key={node.id}
@@ -3063,6 +3076,12 @@ interface TimelineDagNode {
   syntheticVerification?: Record<string, unknown>;
 }
 
+interface TimelineDagEventProjection {
+  event: TaskTimelineEvent;
+  index: number;
+  canonicalNode?: TaskPlaybackDagNode;
+}
+
 export function buildBacklogParallelTimelineFixtureDagForTest(): TimelineDag {
   const backlog: BacklogBug = {
     bug_id: "FIXTURE-BACKLOG-PARALLEL-TIMELINE",
@@ -3137,6 +3156,98 @@ export function buildBacklogSemanticLaneParityFixtureDagForTest(): TimelineDag {
   );
 }
 
+export function buildBacklogCanonicalVerificationFixtureDagForTest(): TimelineDag {
+  const backlog: BacklogBug = {
+    bug_id: "FIXTURE-BACKLOG-CANONICAL-VERIFICATION",
+    title: "Fixture canonical verification projection",
+    status: "OPEN",
+    priority: "P1",
+  };
+  const events: TaskTimelineEvent[] = [{
+    event_id: "fixture-canonical-worker",
+    event_type: "worker_implementation",
+    event_kind: "implementation",
+    actor: "mf_sub",
+    phase: "implementation",
+    status: "accepted",
+    payload: { worker_slot_id: "source" },
+    created_at: "2026-08-14T12:00:00Z",
+  }];
+  const visualization = {
+    public_safe: true,
+    contract_execution_progress: { contract_id: "mf_parallel.v2" },
+    contract_chain: { current_contract_id: "mf_parallel.v2" },
+    dag: {
+      schema_version: "contract_runtime.visualization.dag.v1",
+      nodes: [
+        {
+          id: "contract-line:qa-accepted",
+          kind: "contract_line",
+          label: "Independent QA verified the worker change",
+          status: "accepted",
+          authority_source: "contract_runtime.completed_lines",
+          evidence_ref: "timeline:fixture-qa-accepted",
+          owner_role: "qa",
+          evidence_kind: "verification",
+          line_id: "independent_qa",
+          stage_id: "qa",
+          inferred: false,
+        },
+        {
+          id: "verification:blocked",
+          kind: "independent_verification",
+          label: "Independent verification found missing viewport evidence",
+          status: "blocked",
+          authority_source: "contract_runtime.completed_lines",
+          evidence_ref: "timeline:fixture-verification-blocked",
+          owner_role: "qa",
+          evidence_kind: "verification",
+          line_id: "independent_verification",
+          stage_id: "verification",
+          inferred: false,
+        },
+        {
+          id: "verification:inferred-reference",
+          kind: "independent_verification",
+          label: "Inferred verification reference",
+          status: "passed",
+          authority_source: "contract_runtime.visualization.dag",
+          inferred: true,
+        },
+      ],
+      edges: [],
+      node_count: 3,
+      edge_count: 0,
+      typed_edges: true,
+    },
+  } as unknown as ContractRuntimeVisualizationResponse;
+  const typedDag = normalizeTaskPlaybackDag({ projectId: "aming-claw", backlog, events, visualization });
+  return buildTimelineDag(backlog, events, undefined, typedDag);
+}
+
+export function buildBacklogEmptyVerificationFixtureDagForTest(): TimelineDag {
+  const backlog: BacklogBug = {
+    bug_id: "FIXTURE-BACKLOG-EMPTY-VERIFICATION",
+    title: "Fixture empty verification projection",
+    status: "OPEN",
+    priority: "P1",
+  };
+  const events: TaskTimelineEvent[] = [{
+    event_id: "fixture-empty-verification-observer",
+    event_type: "observer_command",
+    event_kind: "observer_command",
+    actor: "observer",
+    phase: "dispatch",
+    status: "accepted",
+  }];
+  return buildTimelineDag(
+    backlog,
+    events,
+    undefined,
+    normalizeTaskPlaybackDag({ projectId: "aming-claw", backlog, events }),
+  );
+}
+
 function buildTimelineDag(
   bug: BacklogBug | null,
   events: TaskTimelineEvent[],
@@ -3146,35 +3257,84 @@ function buildTimelineDag(
   const phaseLabels: string[] = [];
   const nodes: TimelineDagNode[] = [];
   const orderedEvents = events.slice().sort(compareTimelineEvents);
-  const laneContext = buildTimelineLaneContext(orderedEvents);
-  orderedEvents.forEach((event, index) => {
+  const canonicalNodes = new Map(typedDag.nodes.map((node) => [node.id, node]));
+  const eventProjections: TimelineDagEventProjection[] = orderedEvents.map((event, index) => ({
+    event,
+    index,
+    canonicalNode: canonicalNodes.get(`timeline-event:${timelineEventKey(event, index)}`),
+  }));
+  const laneContext = buildTimelineLaneContext(eventProjections);
+  eventProjections.forEach(({ event, index, canonicalNode }) => {
     const semantic = projectTaskTimelineEvent(event, index);
     const phase = phaseLabelForEvent(event, index);
-    const lane = timelineLaneIdForEvent(event, laneContext, index);
+    const lane = timelineLaneIdForEvent(event, laneContext, index, canonicalNode);
     // AC-2: use registry headline as L1; truncate for card, keep full for hover.
     const fullHeadline = semantic.headline || timelineNodeLabel(event, index);
-    const truncatedLabel = fullHeadline.length > 52 ? `${fullHeadline.slice(0, 49)}…` : fullHeadline;
+    const truncatedLabel = truncateTimelineDagLabel(fullHeadline);
     const eventNode: TimelineDagNode = {
-      id: `timeline-event:${timelineEventKey(event, index)}`,
+      id: canonicalNode?.id || `timeline-event:${timelineEventKey(event, index)}`,
       label: truncatedLabel,
       headline: fullHeadline,
       lane,
-      rawLane: rawLaneKeyForEvent(event),
+      rawLane: rawLaneKeyForEvent(event, canonicalNode),
       phase,
       phaseIndex: phaseIndex(phaseLabels, phase),
       status: dagStatusForEvent(event),
       statusLabel: semantic.status_label || event.status || event.decision || event.event_kind || "event",
       event,
-      inferred: isInferredLane(event),
+      inferred: canonicalNode?.inferred ?? isInferredLane(event),
     };
     nodes.push(eventNode);
   });
+
+  const projectedNodeIds = new Set(nodes.map((node) => node.id));
+  for (const canonicalNode of typedDag.nodes) {
+    if (
+      projectedNodeIds.has(canonicalNode.id)
+      || canonicalNode.inferred
+      || canonicalTimelineLaneForNode(canonicalNode) !== "verification"
+    ) {
+      continue;
+    }
+    const headline = canonicalNode.label || canonicalNode.id;
+    const phase = titleizeLane(canonicalNode.stage_id || canonicalNode.line_id || "verification");
+    nodes.push({
+      id: canonicalNode.id,
+      label: truncateTimelineDagLabel(headline),
+      headline,
+      lane: "verification",
+      rawLane: canonicalNode.owner_role || canonicalNode.evidence_kind || canonicalNode.kind,
+      phase,
+      phaseIndex: phaseIndex(phaseLabels, phase),
+      status: dagStatusForCanonicalNode(canonicalNode),
+      statusLabel: canonicalNode.status || "status not recorded",
+      inferred: false,
+      syntheticPayload: {
+        schema_version: "task_playback.canonical_dag_node.v1",
+        kind: canonicalNode.kind,
+        authority_source: canonicalNode.authority_source,
+        evidence_ref: canonicalNode.evidence_ref || "",
+      },
+      syntheticVerification: {
+        owner_role: canonicalNode.owner_role || "",
+        actor_role: canonicalNode.actor_role || "",
+        evidence_kind: canonicalNode.evidence_kind || "",
+        line_id: canonicalNode.line_id || "",
+        stage_id: canonicalNode.stage_id || "",
+        status: canonicalNode.status || "",
+        authority_source: canonicalNode.authority_source,
+        evidence_ref: canonicalNode.evidence_ref || "",
+      },
+    });
+    projectedNodeIds.add(canonicalNode.id);
+  }
 
   const laneOrder = timelineLaneOrder(laneContext);
   const laneMap = new Map<string, TimelineDagNode[]>();
   for (const node of nodes) {
     laneMap.set(node.lane, [...(laneMap.get(node.lane) ?? []), node]);
   }
+  if (!laneMap.has("verification")) laneMap.set("verification", []);
   const lanes = Array.from(laneMap.entries())
     .map(([id, laneNodes]) => ({
       id,
@@ -3220,6 +3380,45 @@ function dagStatusForEvent(event: TaskTimelineEvent): TimelineDagNode["status"] 
   if (text.includes("running") || text.includes("claimed") || text.includes("pending")) return "running";
   if (text.includes("pass") || text.includes("accept") || text.includes("success") || text.includes("ok") || text.includes("succeed")) return "passed";
   return "unknown";
+}
+
+function dagStatusForCanonicalNode(node: TaskPlaybackDagNode): TimelineDagNode["status"] {
+  const status = String(node.status || "").trim().toLowerCase();
+  if (!status) return "unknown";
+  if (/bypass|waiv/.test(status)) return "bypassed";
+  if (/fail|block|reject|error/.test(status)) return "failed";
+  if (/missing|absent/.test(status)) return "missing";
+  if (/retry/.test(status)) return "retry";
+  if (/running|claimed|pending|waiting/.test(status)) return "running";
+  if (/pass|accept|approved|success|succeed|complete|recorded|ok/.test(status)) return "passed";
+  return "unknown";
+}
+
+function truncateTimelineDagLabel(value: string): string {
+  return value.length > 52 ? `${value.slice(0, 49)}…` : value;
+}
+
+function canonicalTimelineLaneForNode(node?: TaskPlaybackDagNode): string {
+  if (!node) return "";
+  const declaredLane = String(node.lane_id || "").trim().toLowerCase();
+  if (/^(qa|verification|independent[_-]?verification)$/.test(declaredLane)) return "verification";
+  if (/^(worker|mf_sub|subagent)$/.test(declaredLane)) return "worker";
+  if (["observer", "gate", "content_sys"].includes(declaredLane)) return declaredLane;
+  const roleText = [
+    node.owner_role,
+    node.actor_role,
+    node.evidence_kind,
+    node.line_id,
+    node.stage_id,
+    node.kind,
+    node.id,
+  ].join(" ").toLowerCase();
+  if (/independent[_\s-]?verification|qa|verification/.test(roleText)) return "verification";
+  if (/content[_\s-]?sys/.test(roleText)) return "content_sys";
+  if (/gate|close[_\s-]?ready/.test(roleText)) return "gate";
+  if (/worker|mf[_\s-]?sub|subagent/.test(roleText)) return "worker";
+  if (/observer|orchestrat|dispatch|route/.test(roleText)) return "observer";
+  return "";
 }
 
 function evidenceRequirementIds(event: TaskTimelineEvent): string[] {
@@ -3302,16 +3501,18 @@ function compareTimelineEvents(a: TaskTimelineEvent, b: TaskTimelineEvent): numb
   return Number(a.id ?? 0) - Number(b.id ?? 0);
 }
 
-function buildTimelineLaneContext(events: TaskTimelineEvent[]): TimelineLaneContext {
-  const workerKeys = stableUnique(events
-    .filter((event, index) => projectTaskTimelineEvent(event, index).lane_id === "worker")
-    .map(rawWorkerKeyForEvent)
+function buildTimelineLaneContext(projections: TimelineDagEventProjection[]): TimelineLaneContext {
+  const workerKeys = stableUnique(projections
+    .filter(({ event, index, canonicalNode }) => (
+      (canonicalTimelineLaneForNode(canonicalNode) || projectTaskTimelineEvent(event, index).lane_id) === "worker"
+    ))
+    .map(({ event, canonicalNode }) => rawWorkerKeyForEvent(event, canonicalNode))
     .filter(Boolean));
   const roleCounts = new Map<string, number>();
   const workerAliases = new Map<string, string>();
   workerKeys.forEach((key, index) => {
-    const event = events.find((item) => rawWorkerKeyForEvent(item) === key);
-    const role = event ? workerRoleForEvent(event) : "";
+    const projection = projections.find(({ event, canonicalNode }) => rawWorkerKeyForEvent(event, canonicalNode) === key);
+    const role = projection ? workerRoleForEvent(projection.event, projection.canonicalNode) : "";
     const count = role ? (roleCounts.get(role) ?? 0) + 1 : 0;
     if (role) roleCounts.set(role, count);
     const roleLabel = role ? `${titleizeLane(role)} worker${count > 1 ? ` ${count}` : ""}` : "";
@@ -3320,11 +3521,16 @@ function buildTimelineLaneContext(events: TaskTimelineEvent[]): TimelineLaneCont
   return { workerKeys, workerAliases };
 }
 
-function timelineLaneIdForEvent(event: TaskTimelineEvent, context: TimelineLaneContext, index = 0): string {
-  const semanticLane = projectTaskTimelineEvent(event, index).lane_id;
+function timelineLaneIdForEvent(
+  event: TaskTimelineEvent,
+  context: TimelineLaneContext,
+  index = 0,
+  canonicalNode?: TaskPlaybackDagNode,
+): string {
+  const semanticLane = canonicalTimelineLaneForNode(canonicalNode) || projectTaskTimelineEvent(event, index).lane_id;
   if (semanticLane !== "worker") return semanticLane;
   if (context.workerKeys.length <= 1) return "worker";
-  const key = rawWorkerKeyForEvent(event);
+  const key = rawWorkerKeyForEvent(event, canonicalNode);
   if (!key) return "worker";
   return `worker_${cssToken(context.workerAliases.get(key) || key)}`;
 }
@@ -3347,10 +3553,11 @@ function timelineLaneFamily(id: string): TimelineDagLane["family"] {
   return "observer";
 }
 
-function rawWorkerKeyForEvent(event: TaskTimelineEvent): string {
+function rawWorkerKeyForEvent(event: TaskTimelineEvent, canonicalNode?: TaskPlaybackDagNode): string {
   const payload = asRecord(event.payload);
   const verification = asRecord(event.verification);
   return (
+    canonicalNode?.worker_id ||
     // worker_slot_id is the stable per-worker identity — check it first so
     // receipt/startup/implementation events all collapse into the same lane.
     stringField(payload, "worker_slot_id") ||
@@ -3368,10 +3575,14 @@ function rawWorkerKeyForEvent(event: TaskTimelineEvent): string {
   );
 }
 
-function rawLaneKeyForEvent(event: TaskTimelineEvent): string {
+function rawLaneKeyForEvent(event: TaskTimelineEvent, canonicalNode?: TaskPlaybackDagNode): string {
   const payload = asRecord(event.payload);
   const verification = asRecord(event.verification);
   return (
+    canonicalNode?.lane_id ||
+    canonicalNode?.owner_role ||
+    canonicalNode?.actor_role ||
+    canonicalNode?.evidence_kind ||
     stringField(payload, "lane") ||
     stringField(payload, "agent_lane") ||
     stringField(payload, "worker_lane") ||
@@ -3389,8 +3600,8 @@ function rawLaneKeyForEvent(event: TaskTimelineEvent): string {
   );
 }
 
-function workerRoleForEvent(event: TaskTimelineEvent): string {
-  const text = rawLaneKeyForEvent(event).toLowerCase();
+function workerRoleForEvent(event: TaskTimelineEvent, canonicalNode?: TaskPlaybackDagNode): string {
+  const text = rawLaneKeyForEvent(event, canonicalNode).toLowerCase();
   if (text.includes("front")) return "frontend";
   if (text.includes("back")) return "backend";
   if (text.includes("test") || text.includes("qa") || text.includes("verify")) return "verification";

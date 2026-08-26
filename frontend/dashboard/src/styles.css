@@ -4427,13 +4427,18 @@ a:hover { text-decoration: underline; }
 }
 
 .backlog-dag-shell {
+  --backlog-dag-lane-label-width: 120px;
+  --backlog-dag-phase-min-width: 130px;
+  --backlog-dag-phase-gap: 8px;
+  --backlog-dag-track-min-width: 144px;
   overflow-x: auto;
   padding-bottom: 4px;
 }
 
 .backlog-dag-phases {
   display: grid;
-  gap: 8px;
+  grid-template-columns: var(--backlog-dag-lane-label-width) minmax(var(--backlog-dag-track-min-width), 1fr);
+  gap: var(--backlog-dag-phase-gap);
   min-width: 760px;
   margin-bottom: 6px;
   color: var(--ink-500);
@@ -4442,8 +4447,25 @@ a:hover { text-decoration: underline; }
   text-transform: uppercase;
 }
 
-.backlog-dag-phases span:not(:first-child) {
+.backlog-dag-phase-track,
+.backlog-dag-lane-track {
+  display: grid;
+  grid-template-columns: repeat(var(--backlog-dag-phase-count), minmax(var(--backlog-dag-phase-min-width), 1fr));
+  gap: var(--backlog-dag-phase-gap);
+}
+
+.backlog-dag-phase-track {
+  min-width: 0;
+  padding: 0 7px;
+}
+
+.backlog-dag-phase-label {
+  display: block;
+  min-width: 0;
   padding: 0 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .backlog-dag-grid {
@@ -4454,8 +4476,8 @@ a:hover { text-decoration: underline; }
 
 .backlog-dag-lane {
   display: grid;
-  grid-template-columns: 120px minmax(0, 1fr);
-  gap: 8px;
+  grid-template-columns: var(--backlog-dag-lane-label-width) minmax(var(--backlog-dag-track-min-width), 1fr);
+  gap: var(--backlog-dag-phase-gap);
   align-items: stretch;
 }
 
@@ -4473,13 +4495,22 @@ a:hover { text-decoration: underline; }
 }
 
 .backlog-dag-lane-track {
-  display: grid;
-  gap: 8px;
   min-height: 64px;
   padding: 6px;
   border: 1px solid var(--ink-100);
   border-radius: 6px;
   background: linear-gradient(to right, #ffffff, #f8fafc);
+}
+
+.backlog-dag-lane-empty {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  min-height: 50px;
+  padding: 8px;
+  color: var(--ink-500);
+  font-size: 11px;
+  font-style: italic;
 }
 
 .backlog-dag-node {

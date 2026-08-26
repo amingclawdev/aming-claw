@@ -5,6 +5,8 @@ import { ContractRuntimeAuthorityPanel } from "../components/TaskPlaybackPanel";
 import type { ContractRuntimeAuthorityViewModel } from "../lib/taskPlayback";
 import type { BacklogBug } from "../types";
 import {
+  buildBacklogCanonicalVerificationFixtureDagForTest,
+  buildBacklogEmptyVerificationFixtureDagForTest,
   buildBacklogParallelTimelineFixtureDagForTest,
   buildBacklogSemanticLaneParityFixtureDagForTest,
   filterBacklogHotWindowRows,
@@ -50,6 +52,7 @@ export const projectedCommandCardFixtureLabel = projectedCommandCardLabel();
 
 const backlogViewSource = readFileSync(new URL("./BacklogView.tsx", import.meta.url), "utf8");
 const playbackPanelSource = readFileSync(new URL("../components/TaskPlaybackPanel.tsx", import.meta.url), "utf8");
+const stylesSource = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
 
 function assertBacklogAuthority(condition: boolean, message: string): void {
   if (!condition) throw new Error(`Backlog authority fixture failed: ${message}`);
@@ -103,6 +106,42 @@ assertBacklogAuthority(
   parallelWorkerLanes.every((lane) => lane.label.startsWith("Subagents / Workers · "))
     && parallelWorkerLanes.every((lane) => !lane.label.includes("mf_sub_")),
   "worker lane labels must remain readable aliases rather than raw worker identities",
+);
+
+const canonicalVerificationDag = buildBacklogCanonicalVerificationFixtureDagForTest();
+const canonicalVerificationLane = canonicalVerificationDag.lanes.find((lane) => lane.id === "verification");
+assertBacklogAuthority(
+  canonicalVerificationLane?.nodes.length === 2
+    && canonicalVerificationLane.nodes.map((node) => node.id).join(",")
+      === "contract-line:qa-accepted,verification:blocked",
+  "Verification must render every explicit canonical QA/independent-verification node and omit inferred references",
+);
+assertBacklogAuthority(
+  canonicalVerificationLane?.nodes.map((node) => node.status).join(",") === "passed,failed"
+    && canonicalVerificationLane.nodes.every((node) => node.syntheticVerification?.authority_source === "contract_runtime.completed_lines"),
+  "canonical Verification nodes must retain their real authority and status without manufacturing PASS",
+);
+
+const emptyVerificationDag = buildBacklogEmptyVerificationFixtureDagForTest();
+const emptyVerificationLane = emptyVerificationDag.lanes.find((lane) => lane.id === "verification");
+assertBacklogAuthority(
+  emptyVerificationLane?.nodes.length === 0
+    && !emptyVerificationDag.nodes.some((node) => node.lane === "verification"),
+  "missing authoritative verification evidence must remain an empty lane rather than a synthetic node",
+);
+assertBacklogAuthority(
+  backlogViewSource.includes("No authoritative QA or independent-verification evidence is recorded.")
+    && backlogViewSource.includes('role="status"'),
+  "an empty Verification lane must state that no authoritative evidence exists",
+);
+assertBacklogAuthority(
+  backlogViewSource.includes('className="backlog-dag-phase-track"')
+    && backlogViewSource.includes("title={phase}")
+    && backlogViewSource.includes("aria-label={phase}")
+    && stylesSource.includes(".backlog-dag-phase-track,\n.backlog-dag-lane-track")
+    && stylesSource.includes("text-overflow: ellipsis")
+    && stylesSource.includes("--backlog-dag-track-min-width"),
+  "phase headers and lane tracks must share stable columns while preserving full accessible phase titles",
 );
 assertBacklogAuthority(
   backlogViewSource.includes("Typed edges")
