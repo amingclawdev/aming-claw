@@ -1213,3 +1213,117 @@ def test_current_full_authority_keeps_completed_reconcile_after_later_head(
     assert authority["canonical_head_equals_reconciled_commit"] is False
     assert authority["reconciled_commit_is_ancestor_of_canonical_head"] is True
     assert authority["graph_reconciled"] is True
+
+
+def test_batch_postmerge_generation_authority_is_server_derived(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    execution_id = "cex-batch-row-2"
+    runtime_context_id = "mfrctx-batch-row-2"
+    task_id = "batch-row-2"
+    backlog_id = "AC-BATCH-ROW-2"
+    generation_id = "bypassgen-root2"
+    diagnostic_id = "AC-CONTRACT-LINE-BYPASS-TEST"
+    candidate_commit = "a" * 40
+    owned_files = [
+        "agent/governance/dashboard_dist/",
+        "frontend/dashboard/src/views/BacklogView.tsx",
+    ]
+    changed_files = [
+        "agent/governance/dashboard_dist/index.html",
+        "agent/governance/dashboard_dist/assets/index.js",
+        "frontend/dashboard/src/views/BacklogView.tsx",
+    ]
+    root_line = {
+        "stage_id": "worker_finish",
+        "line_id": "worker_finish_gate",
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+        "evidence_kind": "contract_line_bypass",
+        "status": "waived",
+        "no_pass_claim": True,
+        "payload": {
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": execution_id,
+            "worker_role": "mf_sub",
+            "no_pass_generation": {"generation_id": generation_id},
+        },
+    }
+    record = {
+        "project_id": "contract-runtime-api-test",
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "completed_lines": [root_line],
+    }
+    runtime = SimpleNamespace(store=SimpleNamespace(get=lambda _execution: record))
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: runtime)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_no_pass_generation",
+        lambda _record: {
+            "root_generation_persisted": True,
+            "generation_id": generation_id,
+            "root_line_id": "worker_finish_gate",
+            "root_stage_id": "worker_finish",
+            "root_line_instance_id": f"runtime_context:{runtime_context_id}",
+            "source_backlog_id": backlog_id,
+            "contract_execution_id": execution_id,
+            "root_diagnostic_backlog_id": diagnostic_id,
+            "root_bypass_identity": "bypass:row-2",
+            "no_pass_claim": True,
+            "authoritative_pass_synthesized": False,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_strict_no_pass_bypass_audit",
+        lambda *_args, **_kwargs: {"db_verified": True},
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_actual_worker_commit_line",
+        lambda *_args, **_kwargs: (
+            {"commit_sha": candidate_commit},
+            {
+                "worker_commit_sha": candidate_commit,
+                "changed_files": changed_files,
+                "owned_files": owned_files,
+            },
+        ),
+    )
+    context = SimpleNamespace(
+        owned_files=tuple(owned_files),
+        target_files=(),
+        worktree_path=str(tmp_path),
+    )
+
+    authority = server._audited_postmerge_recovery_batch_generation_authority(
+        object(),
+        project_id="contract-runtime-api-test",
+        backlog_id=backlog_id,
+        task_id=task_id,
+        runtime_context_id=runtime_context_id,
+        execution_id=execution_id,
+        context=context,
+    )
+
+    assert authority["server_derived"] is True
+    assert authority["candidate_commit"] == candidate_commit
+    assert authority["no_pass_generation_id"] == generation_id
+    assert authority["diagnostic_backlog_id"] == diagnostic_id
+    assert authority["fence_containment"]["ok"] is True
+    assert authority["authoritative_pass_synthesized"] is False
+
+    root_line["payload"]["no_pass_generation"]["generation_id"] = (
+        "bypassgen-forged"
+    )
+    assert server._audited_postmerge_recovery_batch_generation_authority(
+        object(),
+        project_id="contract-runtime-api-test",
+        backlog_id=backlog_id,
+        task_id=task_id,
+        runtime_context_id=runtime_context_id,
+        execution_id=execution_id,
+        context=context,
+    ) == {}

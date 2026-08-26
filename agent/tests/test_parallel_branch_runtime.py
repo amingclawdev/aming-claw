@@ -62,6 +62,7 @@ from agent.governance.parallel_branch_runtime import (
     BranchTaskRuntimeContext,
     BatchMergeItem,
     BatchMergeRuntime,
+    AuditedPostmergeRecoveryAuthority,
     DependencyRevalidationQaCandidateAuthority,
     MergeQueueItem,
     PostQaMergeConflictRejoinAuthority,
@@ -9576,6 +9577,82 @@ def test_merge_queue_accepts_route_gated_finish_checkpoint_without_raw_fence() -
     assert queued["queue_item"]["status"] == "queued_for_merge"
     assert queued["context"]["checkpoint_id"] == "ckpt-route-checkpoint"
     assert queued["queue_item"]["branch_head"] == "head-route-checkpoint"
+
+
+def test_merge_queue_no_pass_generation_recovery_needs_no_worker_fence() -> None:
+    conn = _runtime_conn()
+    backlog_id = "AC-BATCH-NO-PASS-RECOVERY"
+    task_id = "batch-row-2"
+    execution_id = "cex-batch-row-2"
+    runtime_context_id = "mfrctx-batch-row-2"
+    merge_queue_id = "mq-batch-row-2"
+    candidate_commit = "a" * 40
+    merged_commit = "b" * 40
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_task_id=execution_id,
+            runtime_context_id=runtime_context_id,
+            merge_queue_id=merge_queue_id,
+            branch_ref="refs/heads/codex/batch-row-2",
+            status=STATE_RUNNING,
+            fence_token="worker-secret-that-must-not-be-reused",
+            base_commit="c" * 40,
+            head_commit=candidate_commit,
+            target_head_commit=merged_commit,
+        ),
+        now_iso=NOW,
+    )
+    authority = AuditedPostmergeRecoveryAuthority(
+        project_id=PROJECT_ID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        parent_task_id=execution_id,
+        runtime_context_id=runtime_context_id,
+        merge_queue_id=merge_queue_id,
+        candidate_commit=candidate_commit,
+        merged_commit=merged_commit,
+        candidate_diff_sha256="sha256:" + "d" * 64,
+        qa_receipt_ref="timeline:27508",
+        manual_merge_event_ref="timeline:27510",
+        diagnostic_backlog_id="AC-CONTRACT-LINE-BYPASS-TEST",
+        no_pass_generation_id="bypassgen-root2",
+        authority_hash="sha256:" + "e" * 64,
+    )
+
+    queued = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PROJECT_ID,
+        task_id=task_id,
+        merge_queue_id=merge_queue_id,
+        audited_postmerge_recovery_authority=authority,
+        now_iso=NOW,
+    )
+
+    assert queued["queue_item"]["status"] == "queued_for_merge"
+    assert queued["queue_item"]["recovery_mode"] == "audited_postmerge_no_pass"
+    assert queued["audited_postmerge_recovery_authority"][
+        "no_pass_generation_id"
+    ] == "bypassgen-root2"
+    assert queued["context"]["checkpoint_id"] == ""
+    assert "worker-secret-that-must-not-be-reused" not in json.dumps(
+        queued,
+        sort_keys=True,
+    )
+
+    invalid = replace(authority, no_pass_generation_id="not-a-generation")
+    with pytest.raises(ValueError, match="authority is invalid"):
+        queue_merge_item_for_branch_context(
+            conn,
+            project_id=PROJECT_ID,
+            task_id=task_id,
+            merge_queue_id=merge_queue_id,
+            audited_postmerge_recovery_authority=invalid,
+            now_iso=NOW,
+        )
 
 
 def test_merge_queue_finish_checkpoint_preserves_verifier_only_fence_custody() -> None:

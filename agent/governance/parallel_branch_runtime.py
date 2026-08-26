@@ -1451,6 +1451,7 @@ class AuditedPostmergeRecoveryAuthority:
     manual_merge_event_ref: str
     diagnostic_backlog_id: str
     authority_hash: str
+    no_pass_generation_id: str = ""
     schema_version: str = "parallel_branch.audited_postmerge_recovery_authority.v1"
     no_pass_claim: bool = True
     authoritative_pass_synthesized: bool = False
@@ -22649,6 +22650,14 @@ def queue_merge_item_for_branch_context(
                 str(postmerge_recovery.candidate_diff_sha256 or ""),
             )
             or not str(postmerge_recovery.authority_hash or "").startswith("sha256:")
+            or (
+                bool(str(postmerge_recovery.no_pass_generation_id or ""))
+                and re.fullmatch(
+                    r"bypassgen-[0-9a-z]+",
+                    str(postmerge_recovery.no_pass_generation_id or ""),
+                )
+                is None
+            )
         ):
             raise ValueError("audited post-merge recovery authority is invalid")
         if (

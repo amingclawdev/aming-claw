@@ -7782,3 +7782,42 @@ def test_route_prompt_identity_computes_manifest_hash_when_manifest_present() ->
     bundle = {"visible_injection_manifest": manifest}
     result = _route_prompt_identity({"route_prompt_bundle": bundle})
     assert result.get("visible_injection_manifest_hash") == expected_hash
+
+
+def test_worker_fence_directory_roots_cover_batch_dashboard_leaves(
+    tmp_path: Path,
+) -> None:
+    """Batch build leaves inherit a trailing-slash directory allocation."""
+
+    from agent.governance.contracts.runtime import _worker_fence_containment
+
+    owned_files = [
+        "agent/governance/dashboard_dist/",
+        "frontend/dashboard/src/views/BacklogView.tsx",
+        "frontend/dashboard/src/lib/taskPlayback.ts",
+    ]
+    changed_files = [
+        "agent/governance/dashboard_dist/index.html",
+        "agent/governance/dashboard_dist/assets/index-BGxFKhRa.css",
+        "agent/governance/dashboard_dist/assets/index-g53enVQG.js",
+        "frontend/dashboard/src/views/BacklogView.tsx",
+        "frontend/dashboard/src/lib/taskPlayback.ts",
+    ]
+
+    accepted = _worker_fence_containment(
+        changed_files,
+        owned_files,
+        repository_root=str(tmp_path),
+    )
+    escaped = _worker_fence_containment(
+        ["agent/governance/dashboard_dist-escape/index.html"],
+        owned_files,
+        repository_root=str(tmp_path),
+    )
+
+    assert accepted["ok"] is True
+    assert accepted["out_of_fence_files"] == []
+    assert escaped["ok"] is False
+    assert escaped["out_of_fence_files"] == [
+        "agent/governance/dashboard_dist-escape/index.html"
+    ]
