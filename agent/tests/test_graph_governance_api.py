@@ -171582,6 +171582,7 @@ def _seed_open_epoch_planned_successor(
     task_id="task-canonical-successor",
     backlog_id="AC-CANONICAL-SUCCESSOR",
     current_head="a" * 40,
+    target_ref="refs/heads/main",
 ):
     upsert_merge_queue_items(
         conn,
@@ -171595,7 +171596,7 @@ def _seed_open_epoch_planned_successor(
                 branch_ref="",
                 queue_index=2,
                 status="planned",
-                target_ref="refs/heads/main",
+                target_ref=target_ref,
             )
         ],
     )
@@ -171606,7 +171607,7 @@ def _seed_open_epoch_planned_successor(
             batch_id=batch_id,
             epoch_id="integration-epoch-canonical-successor",
             coordination_backlog_id="AC-BATCH-PARENT",
-            target_ref="refs/heads/main",
+            target_ref=target_ref,
             base_head="0" * 40,
             current_head=current_head,
             merge_queue_id=queue_id,
@@ -171621,7 +171622,12 @@ def _seed_open_epoch_planned_successor(
     )
 
 
-def _worldref_seal_server_fixture(conn):
+def _worldref_seal_server_fixture(
+    conn,
+    *,
+    current_head="a" * 40,
+    target_ref="refs/heads/main",
+):
     backlog_id = "AC-WORLDREF-SERVER-ROW3"
     _insert_simple_mf_close_backlog(conn, backlog_id)
     epoch = _seed_open_epoch_planned_successor(
@@ -171631,10 +171637,70 @@ def _worldref_seal_server_fixture(conn):
         queue_item_id="item-worldref-server-row3",
         task_id="task-worldref-server-row3",
         backlog_id=backlog_id,
-        current_head="a" * 40,
+        current_head=current_head,
+        target_ref=target_ref,
     )
     conn.commit()
     return epoch
+
+
+def _insert_active_epoch_worldref_repair_backlog(
+    conn,
+    *,
+    status="OPEN",
+    priority="P0",
+    target_files=None,
+    test_files=None,
+):
+    conn.execute(
+        """
+        INSERT INTO backlog_bugs (
+            bug_id, title, status, priority, target_files, test_files,
+            acceptance_criteria, mf_type, bypass_policy_json,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, '[]', 'chain_rescue', '{}', ?, ?)
+        """,
+        (
+            server._ACTIVE_EPOCH_WORLDREF_REPAIR_BACKLOG_ID,
+            "Active epoch WorldRef fresh repair",
+            status,
+            priority,
+            json.dumps(
+                target_files
+                if target_files is not None
+                else list(server._ACTIVE_EPOCH_WORLDREF_REPAIR_FILES)
+            ),
+            json.dumps(test_files if test_files is not None else []),
+            "2026-08-26T20:00:00Z",
+            "2026-08-26T20:00:00Z",
+        ),
+    )
+    conn.commit()
+
+
+def _worldref_production_git_repo(tmp_path):
+    root = tmp_path / "worldref-production-repo"
+    base_head = _init_test_git_repo(root, filename="base.txt")
+    subprocess.run(
+        ["git", "branch", "-M", "codex/worldref-production"],
+        cwd=root,
+        check=True,
+    )
+    (root / "repair.txt").write_text("repair\n", encoding="utf-8")
+    subprocess.run(["git", "add", "repair.txt"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "repair"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return (
+        root,
+        "refs/heads/codex/worldref-production",
+        base_head,
+        batch_jobs.git_commit(root),
+    )
 
 
 def _stub_worldref_seal_git(monkeypatch, tmp_path, *, head="b" * 40):
@@ -171650,6 +171716,419 @@ def _stub_worldref_seal_git(monkeypatch, tmp_path, *, head="b" * 40):
         lambda _root, _ref, *, field: head,
     )
     monkeypatch.setattr(server, "_git_commit_is_ancestor", lambda *_args: True)
+
+
+def test_parallel_branch_canonical_commit_resolver_accepts_exact_ids_and_managed_refs(
+    tmp_path,
+):
+    root, target_ref, _base_head, target_head = _worldref_production_git_repo(
+        tmp_path
+    )
+
+    assert server._parallel_branch_resolve_canonical_commit(
+        root,
+        target_head,
+        field="target_ref",
+    ) == target_head
+    assert server._parallel_branch_resolve_canonical_commit(
+        root,
+        target_head[:12],
+        field="target_ref",
+    ) == target_head
+    assert server._parallel_branch_resolve_canonical_commit(
+        root,
+        target_ref,
+        field="target_ref",
+    ) == target_head
+
+
+@pytest.mark.parametrize(
+    "unsafe_ref",
+    [
+        "-refs/heads/main",
+        "main",
+        "HEAD",
+        "refs/tags/release",
+        "refs/remotes/origin/main",
+        "refs/heads/main@{1}",
+        "refs/heads/main..other",
+        "refs/heads/main^",
+        "refs/heads/main~1",
+        "refs/heads//main",
+    ],
+)
+def test_parallel_branch_canonical_commit_resolver_rejects_foreign_or_ambiguous_refs(
+    tmp_path,
+    unsafe_ref,
+):
+    root, _target_ref, _base_head, _target_head = (
+        _worldref_production_git_repo(tmp_path)
+    )
+    with pytest.raises(GovernanceError) as exc_info:
+        server._parallel_branch_resolve_canonical_commit(
+            root,
+            unsafe_ref,
+            field="target_ref",
+        )
+    assert exc_info.value.code == "parallel_merge_commit_invalid"
+
+
+def test_parallel_branch_canonical_commit_resolver_rejects_missing_and_noncommit_refs(
+    tmp_path,
+):
+    root, _target_ref, _base_head, _target_head = (
+        _worldref_production_git_repo(tmp_path)
+    )
+    blob = subprocess.run(
+        ["git", "hash-object", "base.txt"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    corrupt_branch = root / ".git" / "refs" / "heads" / "codex" / "noncommit"
+    corrupt_branch.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_branch.write_text(f"{blob}\n", encoding="ascii")
+
+    for ref_name in (
+        "refs/heads/codex/missing",
+        "refs/heads/codex/noncommit",
+    ):
+        with pytest.raises(GovernanceError) as exc_info:
+            server._parallel_branch_resolve_canonical_commit(
+                root,
+                ref_name,
+                field="target_ref",
+            )
+        assert exc_info.value.code == "parallel_merge_commit_unresolved"
+
+
+def test_worldref_symbolic_target_projects_formal_seal_from_real_git_repo(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    root, target_ref, base_head, target_head = _worldref_production_git_repo(
+        tmp_path
+    )
+    epoch = _worldref_seal_server_fixture(
+        conn,
+        current_head=base_head,
+        target_ref=target_ref,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: root,
+    )
+
+    resume = server._server_integration_epoch_resume_payload(conn, epoch)
+
+    assert resume["id"] == "integration_epoch_worldref_seal_linear_unlock"
+    assert resume["action_input"]["target_ref"] == target_ref
+    assert resume["action_input"]["epoch_world_head"] == base_head
+    assert resume["action_input"]["target_world_head"] == target_head
+    monkeypatch.setattr(
+        server,
+        "_require_integration_epoch_release_authority",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "principal_id": "worldref-production-observer",
+            "role_source": "observer_session_route_token_ref",
+        },
+    )
+
+    sealed = server.handle_integration_epoch_worldref_seal_linear_unlock(
+        _ctx(
+            {"project_id": PID, "batch_id": epoch.batch_id},
+            method="POST",
+            body=resume["action_input"],
+        )
+    )
+
+    assert sealed["ok"] is True
+    assert sealed["replayed"] is False
+    assert get_integration_epoch(conn, PID, epoch.batch_id).status == (
+        "aborted_with_exception"
+    )
+
+
+def test_worldref_symbolic_target_move_between_reads_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    root, target_ref, base_head, target_head = _worldref_production_git_repo(
+        tmp_path
+    )
+    epoch = _worldref_seal_server_fixture(
+        conn,
+        current_head=base_head,
+        target_ref=target_ref,
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: root,
+    )
+    action = server._server_integration_epoch_resume_payload(conn, epoch)
+    tree = subprocess.run(
+        ["git", "show", "-s", "--format=%T", target_head],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    moved_head = subprocess.run(
+        ["git", "commit-tree", tree, "-p", target_head, "-m", "moved ref"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    production_git_output = server._git_output
+    target_read_count = 0
+
+    def move_after_first_target_read(project_root, args, *, timeout=5):
+        nonlocal target_read_count
+        value = production_git_output(project_root, args, timeout=timeout)
+        if args == [
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{target_ref}^{{commit}}",
+        ]:
+            target_read_count += 1
+            if target_read_count == 1:
+                subprocess.run(
+                    ["git", "update-ref", target_ref, moved_head, target_head],
+                    cwd=root,
+                    check=True,
+                )
+        return value
+
+    monkeypatch.setattr(server, "_git_output", move_after_first_target_read)
+    monkeypatch.setattr(
+        server,
+        "_require_integration_epoch_release_authority",
+        lambda *_args, **_kwargs: {
+            "role": "observer",
+            "principal_id": "worldref-drift-observer",
+            "role_source": "observer_session_route_token_ref",
+        },
+    )
+
+    status, refusal = (
+        server.handle_integration_epoch_worldref_seal_linear_unlock(
+            _ctx(
+                {"project_id": PID, "batch_id": epoch.batch_id},
+                method="POST",
+                body=action["action_input"],
+            )
+        )
+    )
+
+    assert status == 409
+    assert refusal["error"] == (
+        "integration_epoch_worldref_seal_target_ref_drift"
+    )
+    assert target_read_count == 2
+    assert get_integration_epoch(conn, PID, epoch.batch_id) == epoch
+    assert conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM parallel_branch_integration_epoch_worldref_seals
+        WHERE project_id = ? AND batch_id = ?
+        """,
+        (PID, epoch.batch_id),
+    ).fetchone()[0] == 0
+
+
+def test_worldref_refusal_projects_exact_fresh_repair_and_returns_to_parent(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    root, target_ref, base_head, target_head = _worldref_production_git_repo(
+        tmp_path
+    )
+    epoch = _worldref_seal_server_fixture(
+        conn,
+        current_head=base_head,
+        target_ref=target_ref,
+    )
+    _insert_active_epoch_worldref_repair_backlog(conn)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: root,
+    )
+    production_resolver = server._parallel_branch_resolve_canonical_commit
+
+    def refuse_symbolic_ref(repo_root, commit_ref, *, field):
+        if str(commit_ref).startswith("refs/heads/"):
+            raise GovernanceError(
+                "parallel_merge_commit_invalid",
+                "simulated deployed symbolic-ref regression",
+                409,
+            )
+        return production_resolver(repo_root, commit_ref, field=field)
+
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_resolve_canonical_commit",
+        refuse_symbolic_ref,
+    )
+    before = conn.total_changes
+
+    successor = server._server_integration_epoch_resume_payload(conn, epoch)
+
+    assert successor["id"] == (
+        "active_epoch_worldref_precheck_fresh_repair_successor"
+    )
+    assert successor["action"] == "onboard_route_guide"
+    assert successor["action_input"] == {
+        "project_id": PID,
+        "backlog_id": server._ACTIVE_EPOCH_WORLDREF_REPAIR_BACKLOG_ID,
+        "role": "observer",
+        "work_type": "operator_supervised_direct_main",
+        "response_view": "compact",
+    }
+    authority = successor["fresh_repair_successor_authority"]
+    assert authority["original_epoch"]["epoch_id"] == epoch.epoch_id
+    assert authority["original_epoch"]["current_head"] == base_head
+    assert authority["original_epoch"]["merged_prefix"] == ["item-row1"]
+    assert authority["repair_world_head"] == target_head
+    assert authority["old_epoch_mutated"] is False
+    assert authority["pass_synthesized"] is False
+    assert conn.total_changes == before
+
+    initial_guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": "AC-UNRELATED-WORLDREF-REQUEST",
+                "role": "observer",
+                "work_type": "system_operation",
+                "response_view": "compact",
+            },
+        )
+    )
+    assert initial_guide["next_legal_action"]["id"] == (
+        "active_epoch_worldref_precheck_fresh_repair_successor"
+    )
+    assert initial_guide["canonical_executable_action"]["mcp_tool"] == (
+        "onboard_route_guide"
+    )
+    assert initial_guide["canonical_executable_action"]["copy_safe_body"] == (
+        successor["action_input"]
+    )
+    assert conn.total_changes == before
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": server._ACTIVE_EPOCH_WORLDREF_REPAIR_BACKLOG_ID,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+            },
+        )
+    )
+    assert guide["selected_backlog_source"] == (
+        "active_epoch_worldref_precheck_fresh_repair"
+    )
+    assert guide["contract_execution_id"].startswith("cex-direct-main-")
+    assert guide["next_legal_action"]["id"] == (
+        "operator_supervised_direct_main_route_issue"
+    )
+    assert guide["active_epoch_parent_authority"]["authority_hash"] == (
+        authority["authority_hash"]
+    )
+    assert guide["old_epoch_mutated"] is False
+    assert conn.total_changes == before
+
+    replay = server._server_integration_epoch_resume_payload(conn, epoch)
+    assert replay["action_input"] == successor["action_input"]
+    assert replay["fresh_repair_successor_authority"]["authority_hash"] == (
+        authority["authority_hash"]
+    )
+    assert conn.total_changes == before
+
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_resolve_canonical_commit",
+        production_resolver,
+    )
+    returned = server._server_integration_epoch_resume_payload(conn, epoch)
+    assert returned["id"] == "integration_epoch_worldref_seal_linear_unlock"
+    assert returned["action_input"]["target_world_head"] == target_head
+    persisted = get_integration_epoch(conn, PID, epoch.batch_id)
+    assert persisted == epoch
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["row_status", "priority", "file_fence", "branch", "ancestry"],
+)
+def test_worldref_fresh_repair_drift_preserves_original_zero_write_refusal(
+    conn,
+    monkeypatch,
+    tmp_path,
+    drift,
+):
+    root, target_ref, base_head, _target_head = _worldref_production_git_repo(
+        tmp_path
+    )
+    epoch = _worldref_seal_server_fixture(
+        conn,
+        current_head=("f" * 40 if drift == "ancestry" else base_head),
+        target_ref=target_ref,
+    )
+    _insert_active_epoch_worldref_repair_backlog(
+        conn,
+        status="MF_IN_PROGRESS" if drift == "row_status" else "OPEN",
+        priority="P1" if drift == "priority" else "P0",
+        target_files=(
+            ["agent/governance/server.py"]
+            if drift == "file_fence"
+            else None
+        ),
+    )
+    if drift == "branch":
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "codex/other-world"],
+            cwd=root,
+            check=True,
+        )
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: root,
+    )
+
+    def refuse_symbolic_ref(_root, _commit_ref, *, field):
+        raise GovernanceError(
+            "parallel_merge_commit_invalid",
+            f"simulated {field} symbolic-ref regression",
+            409,
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_parallel_branch_resolve_canonical_commit",
+        refuse_symbolic_ref,
+    )
+    before = conn.total_changes
+
+    refusal = server._server_integration_epoch_resume_payload(conn, epoch)
+
+    assert refusal["id"] == "integration_epoch_worldref_seal_refused"
+    assert refusal["actionable"] is False
+    assert refusal["zero_write_refusal"] is True
+    assert conn.total_changes == before
 
 
 def test_worldref_seal_projects_copy_safe_http_action_in_onboard(

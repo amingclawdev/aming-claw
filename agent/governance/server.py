@@ -77081,26 +77081,57 @@ def _parallel_branch_resolve_canonical_commit(
     *,
     field: str,
 ) -> str:
-    normalized = str(commit_ref or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{7,64}", normalized):
+    supplied = str(commit_ref or "").strip()
+    abbreviated_commit = supplied.lower()
+    commit_id_input = bool(
+        re.fullmatch(r"[0-9a-f]{7,64}", abbreviated_commit)
+    )
+    managed_symbolic_ref = bool(
+        supplied.startswith("refs/heads/")
+        and len(supplied) <= 255
+    )
+    if managed_symbolic_ref:
+        try:
+            ref_check = subprocess.run(
+                ["git", "check-ref-format", supplied],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=Path(repo_root).resolve(),
+            )
+        except Exception:
+            managed_symbolic_ref = False
+        else:
+            managed_symbolic_ref = ref_check.returncode == 0
+    if not commit_id_input and not managed_symbolic_ref:
         raise GovernanceError(
             "parallel_merge_commit_invalid",
-            f"{field} must be an available hexadecimal Git commit",
+            (
+                f"{field} must be an available hexadecimal Git commit or "
+                "an exact managed local branch ref"
+            ),
             409,
             {
                 "field": field,
-                "commit_ref": normalized,
+                "commit_ref": supplied,
                 "canonical_full_commit_required": True,
+                "managed_symbolic_ref_namespace": "refs/heads/",
             },
         )
+    candidate = abbreviated_commit if commit_id_input else supplied
     resolved = _git_output(
         Path(repo_root).resolve(),
-        ["rev-parse", "--verify", f"{normalized}^{{commit}}"],
+        [
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{candidate}^{{commit}}",
+        ],
         timeout=10,
     ).strip().lower()
     if (
         not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", resolved)
-        or not resolved.startswith(normalized)
+        or (commit_id_input and not resolved.startswith(abbreviated_commit))
     ):
         raise GovernanceError(
             "parallel_merge_commit_unresolved",
@@ -77108,8 +77139,9 @@ def _parallel_branch_resolve_canonical_commit(
             409,
             {
                 "field": field,
-                "commit_ref": normalized,
+                "commit_ref": supplied,
                 "canonical_full_commit_required": True,
+                "managed_symbolic_ref": managed_symbolic_ref,
             },
         )
     return resolved
@@ -82438,6 +82470,239 @@ def _git_commit_is_ancestor(
     return result.returncode == 0
 
 
+_ACTIVE_EPOCH_WORLDREF_REPAIR_BACKLOG_ID = (
+    "AC-ACTIVE-EPOCH-PRECHECK-FRESH-REPAIR-SUCCESSOR-P0-20260826"
+)
+_ACTIVE_EPOCH_WORLDREF_REPAIR_FILES = (
+    "agent/governance/server.py",
+    "agent/tests/test_graph_governance_api.py",
+)
+_ACTIVE_EPOCH_WORLDREF_REPAIR_REFUSAL_CODES = frozenset(
+    {
+        "target_world_ref_not_git_object",
+        "worldref_conflation_refused",
+    }
+)
+
+
+def _active_epoch_worldref_precheck_fresh_repair_successor(
+    conn,
+    *,
+    epoch,
+    refusal: Mapping[str, Any],
+    project_root: Path | None,
+) -> dict[str, Any]:
+    """Project one exact current-world repair without mutating the old epoch."""
+
+    from .parallel_branch_runtime import (
+        INTEGRATION_EPOCH_OPEN,
+        get_merge_queue_item,
+    )
+
+    if not (
+        refusal.get("schema_version")
+        == "mf_batch_parallel.epoch_worldref_seal_refusal.v1"
+        and refusal.get("id") == "integration_epoch_worldref_seal_refused"
+        and refusal.get("source")
+        == "durable_integration_epoch_worldref_precheck"
+        and refusal.get("actionable") is False
+        and refusal.get("writes_performed") is False
+        and refusal.get("zero_write_refusal") is True
+        and epoch.status == INTEGRATION_EPOCH_OPEN
+        and epoch.remaining_queue_item_ids == (epoch.active_queue_item_id,)
+        and project_root is not None
+    ):
+        return {}
+    blocker_codes = {
+        str(blocker.get("code") or "").strip()
+        for blocker in refusal.get("blockers") or []
+        if isinstance(blocker, Mapping)
+    }
+    if blocker_codes != _ACTIVE_EPOCH_WORLDREF_REPAIR_REFUSAL_CODES:
+        return {}
+
+    item = get_merge_queue_item(
+        conn,
+        epoch.project_id,
+        epoch.merge_queue_id,
+        epoch.active_queue_item_id,
+    )
+    if not (
+        item is not None
+        and item.status == "planned"
+        and item.task_id == epoch.active_task_id
+        and item.backlog_id == epoch.active_backlog_id
+        and item.queue_item_id == epoch.active_queue_item_id
+    ):
+        return {}
+    repair_row = conn.execute(
+        """
+        SELECT bug_id, status, priority, target_files, test_files
+        FROM backlog_bugs
+        WHERE bug_id = ?
+        """,
+        (_ACTIVE_EPOCH_WORLDREF_REPAIR_BACKLOG_ID,),
+    ).fetchone()
+    repair_files = sorted(
+        _runtime_context_public_file_values(
+            [
+                *_string_list_field(
+                    _row_get(repair_row, "target_files", "")
+                ),
+                *_string_list_field(
+                    _row_get(repair_row, "test_files", "")
+                ),
+            ]
+        )
+    )
+    if not (
+        repair_row is not None
+        and str(_row_get(repair_row, "status", "")).strip().upper()
+        == "OPEN"
+        and str(_row_get(repair_row, "priority", "")).strip().upper()
+        == "P0"
+        and repair_files == sorted(_ACTIVE_EPOCH_WORLDREF_REPAIR_FILES)
+    ):
+        return {}
+
+    root = Path(project_root).resolve()
+    current_branch_ref = _git_output(
+        root,
+        ["symbolic-ref", "--quiet", "HEAD"],
+        timeout=10,
+    ).strip()
+    repair_world_head = _git_head_commit(root).strip().lower()
+    if not (
+        _git_clean_worktree_verified(root)
+        and current_branch_ref == epoch.target_ref
+        and re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", repair_world_head
+        )
+        and repair_world_head != str(epoch.current_head or "").lower()
+        and _git_commit_is_ancestor(
+            root,
+            str(epoch.current_head or "").lower(),
+            repair_world_head,
+        )
+    ):
+        return {}
+
+    repair_execution_id = _operator_supervised_direct_main_execution_id(
+        epoch.project_id,
+        _ACTIVE_EPOCH_WORLDREF_REPAIR_BACKLOG_ID,
+    )
+    refusal_evidence = {
+        "schema_version": "active_epoch.worldref_precheck_refusal_evidence.v1",
+        "refusal_schema_version": str(refusal.get("schema_version") or ""),
+        "refusal_id": str(refusal.get("id") or ""),
+        "blockers": deepcopy(list(refusal.get("blockers") or [])),
+        "writes_performed": False,
+        "zero_write_refusal": True,
+    }
+    refusal_evidence["evidence_hash"] = stable_sha256(refusal_evidence)
+    authority = {
+        "schema_version": (
+            "active_epoch.worldref_precheck_fresh_repair_authority.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": epoch.project_id,
+        "repair_backlog_id": _ACTIVE_EPOCH_WORLDREF_REPAIR_BACKLOG_ID,
+        "repair_contract_execution_id": repair_execution_id,
+        "repair_work_type": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+        "repair_world_head": repair_world_head,
+        "repair_files": repair_files,
+        "original_epoch": {
+            "batch_id": epoch.batch_id,
+            "epoch_id": epoch.epoch_id,
+            "status": epoch.status,
+            "target_ref": epoch.target_ref,
+            "base_head": epoch.base_head,
+            "current_head": epoch.current_head,
+            "merge_queue_id": epoch.merge_queue_id,
+            "merge_cursor": epoch.merge_cursor,
+            "merged_prefix": list(epoch.merged_prefix),
+            "remaining_queue_item_ids": list(
+                epoch.remaining_queue_item_ids
+            ),
+            "active_queue_item_id": epoch.active_queue_item_id,
+            "active_task_id": epoch.active_task_id,
+            "active_backlog_id": epoch.active_backlog_id,
+        },
+        "queue_position_pinned": True,
+        "old_epoch_mutated": False,
+        "row3_mutated": False,
+        "queue_mutated": False,
+        "skip_authorized": False,
+        "reanchor_authorized": False,
+        "direct_fix_authorized": False,
+        "pass_synthesized": False,
+        "refusal_evidence": refusal_evidence,
+        "return_condition": {
+            "requires_independent_qa": True,
+            "requires_canonical_landing": True,
+            "requires_deployed_runtime_identity": True,
+            "requires_current_full_activation": True,
+            "next_parent_action": (
+                "re_evaluate_original_integration_epoch_worldref_precheck"
+            ),
+        },
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    action_input = {
+        "project_id": epoch.project_id,
+        "backlog_id": _ACTIVE_EPOCH_WORLDREF_REPAIR_BACKLOG_ID,
+        "role": "observer",
+        "work_type": _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE,
+        "response_view": "compact",
+    }
+    return {
+        "schema_version": (
+            "mf_batch_parallel.active_epoch_worldref_fresh_repair.v1"
+        ),
+        "id": "active_epoch_worldref_precheck_fresh_repair_successor",
+        "action": "onboard_route_guide",
+        "line_id": "active_epoch_worldref_precheck_fresh_repair_successor",
+        "source": "durable_integration_epoch_worldref_precheck",
+        "source_of_authority": (
+            "server_derived_active_epoch_worldref_fresh_repair"
+        ),
+        "interface": "onboard_route_guide",
+        "mcp_tool": "onboard_route_guide",
+        "method": "POST",
+        "path": "/api/projects/{project_id}/onboard-route-guide",
+        "owner_role": "observer",
+        "requires_role": "observer",
+        "allowed_actions": ["onboard_route_guide"],
+        "actionable": True,
+        "action_input_ready": True,
+        "action_input": action_input,
+        "action_input_copy_safe": True,
+        "fresh_authority_required": True,
+        "same_row_resume_allowed": False,
+        "action_scope": {
+            "project_id": epoch.project_id,
+            "backlog_id": _ACTIVE_EPOCH_WORLDREF_REPAIR_BACKLOG_ID,
+            "contract_execution_id": repair_execution_id,
+            "target_files": repair_files,
+        },
+        "fresh_repair_successor_authority": authority,
+        "parent_refusal": deepcopy(dict(refusal)),
+        "parent_epoch_backlog_id": epoch.active_backlog_id,
+        "blocked": False,
+        "parent_blocked": True,
+        "position_skippable": False,
+        "pass_synthesized": False,
+        "resume_authorized": False,
+        "scheduler_authorized": False,
+        "merge_authorized": False,
+        "reconcile_authorized": False,
+        "close_ready_authorized": False,
+        "release_authorized": False,
+        "writes_performed": False,
+    }
+
+
 def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
     """Project incomplete-fanin reconcile input from canonical Git HEAD."""
 
@@ -82574,7 +82839,7 @@ def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
             target_world_head != str(epoch.current_head or "").lower()
             and (target_world_head or target_world_blocker)
         ):
-            return integration_epoch_worldref_seal_action_payload(
+            worldref_projection = integration_epoch_worldref_seal_action_payload(
                 conn,
                 epoch,
                 target_world_head=target_world_head,
@@ -82584,6 +82849,21 @@ def _server_integration_epoch_resume_payload(conn, epoch) -> dict[str, Any]:
                 ),
                 target_world_blocker=target_world_blocker,
             )
+            if (
+                worldref_projection.get("id")
+                == "integration_epoch_worldref_seal_refused"
+            ):
+                repair_successor = (
+                    _active_epoch_worldref_precheck_fresh_repair_successor(
+                        conn,
+                        epoch=epoch,
+                        refusal=worldref_projection,
+                        project_root=project_root,
+                    )
+                )
+                if repair_successor:
+                    return repair_successor
+            return worldref_projection
 
     return integration_epoch_resume_payload(
         conn,
@@ -156530,6 +156810,78 @@ def _onboard_route_guide_service_response(
     active_epoch = get_active_integration_epoch(conn, project_id)
     if active_epoch is not None:
         resume = _server_integration_epoch_resume_payload(conn, active_epoch)
+        repair_authority = (
+            resume.get("fresh_repair_successor_authority")
+            if isinstance(
+                resume.get("fresh_repair_successor_authority"), Mapping
+            )
+            else {}
+        )
+        exact_repair_request = bool(
+            resume.get("id")
+            == "active_epoch_worldref_precheck_fresh_repair_successor"
+            and str(backlog_id or "").strip()
+            == _ACTIVE_EPOCH_WORLDREF_REPAIR_BACKLOG_ID
+            and str(role or "").strip() == "observer"
+            and str(work_type or "").strip()
+            in {"direct_main", _OPERATOR_SUPERVISED_DIRECT_MAIN_WORK_TYPE}
+            and repair_authority.get("server_derived") is True
+            and str(repair_authority.get("authority_hash") or "").strip()
+            == stable_sha256(
+                {
+                    key: value
+                    for key, value in repair_authority.items()
+                    if key != "authority_hash"
+                }
+            )
+        )
+        if exact_repair_request:
+            direct_repair = (
+                _onboard_operator_supervised_direct_main_runtime_response(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    route_token_ref=route_token_ref,
+                    role=role,
+                    work_type=work_type,
+                    response_view=response_view,
+                )
+            )
+            if direct_repair:
+                repair_next_action = (
+                    dict(direct_repair.get("next_legal_action"))
+                    if isinstance(
+                        direct_repair.get("next_legal_action"), Mapping
+                    )
+                    else None
+                )
+                if repair_next_action is not None:
+                    repair_next_action[
+                        "active_epoch_parent_authority"
+                    ] = deepcopy(dict(repair_authority))
+                return {
+                    **dict(direct_repair),
+                    "schema_version": (
+                        "onboard_route_guide.active_epoch_worldref_"
+                        "fresh_repair.v1"
+                    ),
+                    "selected_backlog_source": (
+                        "active_epoch_worldref_precheck_fresh_repair"
+                    ),
+                    "next_legal_action": repair_next_action,
+                    "active_integration_epoch_parent": (
+                        integration_epoch_to_dict(active_epoch)
+                    ),
+                    "active_epoch_parent_authority": deepcopy(
+                        dict(repair_authority)
+                    ),
+                    "parent_refusal": deepcopy(
+                        dict(resume.get("parent_refusal") or {})
+                    ),
+                    "position_skippable": False,
+                    "old_epoch_mutated": False,
+                    "pass_synthesized": False,
+                }
         canonical_backlog_id = str(
             resume.get("backlog_id")
             or active_epoch.coordination_backlog_id
