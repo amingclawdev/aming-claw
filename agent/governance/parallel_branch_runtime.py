@@ -15272,6 +15272,22 @@ def upsert_integration_epoch(
     """Persist the single durable integration epoch for one batch."""
 
     ensure_branch_runtime_schema(conn)
+    persisted = conn.execute(
+        """
+        SELECT * FROM parallel_branch_integration_epochs
+        WHERE project_id = ? AND batch_id = ?
+        """,
+        (epoch.project_id, epoch.batch_id),
+    ).fetchone()
+    if persisted is not None and str(persisted["status"] or "") == (
+        INTEGRATION_EPOCH_ABORTED_WITH_EXCEPTION
+    ):
+        sealed = _integration_epoch_from_row(persisted)
+        if epoch != sealed:
+            raise IntegrationEpochFrozenError(
+                "sealed no-PASS integration epoch is immutable", sealed
+            )
+        return sealed
     now = now_iso or utc_now()
     created = epoch.created_at or now
     conn.execute(
@@ -15565,6 +15581,59 @@ def integration_epoch_resume_payload(
     current_target_head_blocker: str = "",
 ) -> dict[str, Any]:
     """Build the copy-safe canonical restart/onboard instruction."""
+
+    if epoch.status == INTEGRATION_EPOCH_ABORTED_WITH_EXCEPTION:
+        return {
+            "schema_version": (
+                "mf_batch_parallel.integration_epoch_terminal_audit.v1"
+            ),
+            "id": "integration_epoch_terminal_no_pass_audit",
+            "action": "integration_epoch_terminal_no_pass_audit",
+            "line_id": "integration_epoch_terminal_no_pass_audit",
+            "source": "durable_integration_epoch_worldref_seal",
+            "precedence": "sealed_integration_epoch_audit_only",
+            "project_id": epoch.project_id,
+            "batch_id": epoch.batch_id,
+            "epoch_id": epoch.epoch_id,
+            "target_ref": epoch.target_ref,
+            "merge_queue_id": epoch.merge_queue_id,
+            "queue_item_id": epoch.active_queue_item_id,
+            "task_id": epoch.active_task_id,
+            "backlog_id": epoch.active_backlog_id,
+            "merge_cursor": epoch.merge_cursor,
+            "merged_prefix": list(epoch.merged_prefix),
+            "epoch_world_head": epoch.current_head,
+            "status": epoch.status,
+            "terminal_disposition": "terminal_no_pass",
+            "actionable": False,
+            "blocked": True,
+            "blocker": {
+                "code": "integration_epoch_terminal_no_pass_sealed",
+                "message": (
+                    "the historical no-PASS generation is audit-only; "
+                    "repair requires a separate backlog and fresh generation"
+                ),
+                "same_generation_retry_allowed": False,
+            },
+            "action_input": {},
+            "action_input_ready": False,
+            "action_input_copy_safe": False,
+            "executable_action_available": False,
+            "position_skippable": False,
+            "pass_synthesized": False,
+            "current_authorized": False,
+            "resume_authorized": False,
+            "scheduler_authorized": False,
+            "merge_authorized": False,
+            "reconcile_authorized": False,
+            "close_ready_authorized": False,
+            "release_authorized": False,
+            "repair_requires_separate_backlog": True,
+            "repair_requires_fresh_generation": True,
+            "raw_session_token_included": False,
+            "raw_fence_token_included": False,
+            "raw_route_token_included": False,
+        }
 
     item = None
     if epoch.active_queue_item_id:
@@ -15862,6 +15931,10 @@ def open_or_validate_integration_epoch(
         )
     existing = get_integration_epoch(conn, item.project_id, batch)
     if existing is not None:
+        if existing.status == INTEGRATION_EPOCH_ABORTED_WITH_EXCEPTION:
+            raise IntegrationEpochFrozenError(
+                "sealed no-PASS integration epoch cannot be reopened", existing
+            )
         if existing.status == INTEGRATION_EPOCH_CLOSED:
             raise IntegrationEpochFrozenError(
                 "closed integration epoch cannot accept another merge", existing
@@ -16041,6 +16114,10 @@ def arm_integration_epoch_merge_in_doubt(
 ) -> IntegrationEpoch:
     """Durably arm crash recovery before the git writer mutates the target."""
 
+    if epoch.status != INTEGRATION_EPOCH_OPEN:
+        raise IntegrationEpochFrozenError(
+            "only an open integration epoch can arm merge-in-doubt", epoch
+        )
     if epoch.active_queue_item_id != item.queue_item_id:
         raise IntegrationEpochFrozenError(
             "cannot arm a non-canonical integration epoch item", epoch
@@ -16074,6 +16151,10 @@ def advance_integration_epoch_after_merge(
     epoch = get_integration_epoch(conn, project_id, batch_id)
     if epoch is None:
         raise KeyError(f"integration epoch not found: {project_id}/{batch_id}")
+    if epoch.status == INTEGRATION_EPOCH_ABORTED_WITH_EXCEPTION:
+        raise IntegrationEpochFrozenError(
+            "sealed no-PASS integration epoch cannot advance", epoch
+        )
     if epoch.active_queue_item_id != queue_item_id:
         if queue_item_id in epoch.merged_prefix:
             return epoch
@@ -16146,18 +16227,292 @@ def _integration_epoch_no_pass_generation_key(epoch: IntegrationEpoch) -> str:
     )[7:27]
 
 
+def _worldref_recursive_values(value: Any, keys: set[str]) -> list[Any]:
+    matches: list[Any] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if str(key or "") in keys:
+                matches.append(child)
+            matches.extend(_worldref_recursive_values(child, keys))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            matches.extend(_worldref_recursive_values(child, keys))
+    return matches
+
+
+def _worldref_no_pass_generation_ids(value: Any) -> set[str]:
+    generations: set[str] = set()
+    for candidate in _worldref_recursive_values(
+        value,
+        {
+            "generation_id",
+            "no_pass_generation",
+            "no_pass_generation_id",
+            "root_bypass_generation_id",
+        },
+    ):
+        if isinstance(candidate, Mapping):
+            candidate = candidate.get("generation_id")
+        text = str(candidate or "").strip()
+        if re.fullmatch(r"bypassgen-[0-9A-Za-z._-]+", text):
+            generations.add(text)
+    return generations
+
+
 def _integration_epoch_no_pass_root_candidates(
     conn: sqlite3.Connection,
     epoch: IntegrationEpoch,
-) -> list[str]:
-    """Resolve only OPEN roots bound to this exact historical generation."""
+) -> list[dict[str, str]]:
+    """Resolve only OPEN roots with exact child/CEX/event generation lineage."""
 
-    generation_key = _integration_epoch_no_pass_generation_key(epoch)
     items = list_merge_queue_items(
         conn, epoch.project_id, epoch.merge_queue_id, target_ref=epoch.target_ref
     )
-    task_ids = {item.task_id for item in items if item.task_id}
     backlog_ids = {item.backlog_id for item in items if item.backlog_id}
+    try:
+        rows = conn.execute(
+            """
+            SELECT bug_id, chain_trigger_json, bypass_policy_json,
+                   provenance_paths
+            FROM backlog_bugs
+            WHERE status = 'OPEN' AND mf_type = 'chain_rescue'
+            ORDER BY bug_id
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    candidates: list[dict[str, str]] = []
+    for row in rows:
+        trigger = _parse_json_object(row["chain_trigger_json"])
+        policy = _parse_json_object(row["bypass_policy_json"])
+        values = (trigger, policy)
+        if not any(value.get("no_pass_claim") is True for value in values):
+            continue
+        if any(value.get("no_pass_claim") is False for value in values):
+            continue
+        source_backlogs = {
+            str(value.get("source_backlog_id") or "").strip()
+            for value in values
+            if str(value.get("source_backlog_id") or "").strip()
+        }
+        execution_ids = {
+            str(value.get("contract_execution_id") or "").strip()
+            for value in values
+            if str(value.get("contract_execution_id") or "").strip()
+        }
+        generations = set().union(
+            *(_worldref_no_pass_generation_ids(value) for value in values)
+        )
+        if not (
+            len(source_backlogs) == 1
+            and source_backlogs.issubset(backlog_ids)
+            and len(execution_ids) == 1
+            and len(generations) == 1
+        ):
+            continue
+        source_backlog_id = next(iter(source_backlogs))
+        execution_id = next(iter(execution_ids))
+        generation_id = next(iter(generations))
+        diagnostic_id = str(row["bug_id"] or "").strip()
+        root_ids = {
+            str(value.get("root_diagnostic_backlog_id") or "").strip()
+            for value in values
+            if str(value.get("root_diagnostic_backlog_id") or "").strip()
+        }
+        if root_ids and root_ids != {diagnostic_id}:
+            continue
+
+        cex_table = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'contract_runtime_executions'
+            """
+        ).fetchone()
+        cex_bound = False
+        if cex_table is not None:
+            cex_rows = conn.execute(
+                """
+                SELECT backlog_id FROM contract_runtime_executions
+                WHERE project_id = ? AND contract_execution_id = ?
+                """,
+                (epoch.project_id, execution_id),
+            ).fetchall()
+            cex_bound = bool(
+                len(cex_rows) == 1
+                and str(cex_rows[0]["backlog_id"] or "")
+                == source_backlog_id
+            )
+            if not cex_bound:
+                continue
+            chain_table = conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'backlog_contract_chain_current'
+                """
+            ).fetchone()
+            if chain_table is not None:
+                chain = conn.execute(
+                    """
+                    SELECT * FROM backlog_contract_chain_current
+                    WHERE project_id = ? AND backlog_id = ?
+                    """,
+                    (epoch.project_id, source_backlog_id),
+                ).fetchone()
+                if chain is not None:
+                    chain_execution_ids = {
+                        str(chain[key] or "").strip()
+                        for key in (
+                            "root_contract_execution_id",
+                            "current_contract_execution_id",
+                            "parent_to_resume_contract_execution_id",
+                            "active_child_contract_execution_id",
+                        )
+                        if str(chain[key] or "").strip()
+                    }
+                    chain_execution_ids.update(
+                        str(value or "").strip()
+                        for value in _worldref_recursive_values(
+                            _parse_json_object(chain["active_chain_json"]),
+                            {
+                                "contract_execution_id",
+                                "execution_id",
+                                "execution_ids",
+                            },
+                        )
+                        if not isinstance(value, (list, tuple, Mapping))
+                        and str(value or "").strip()
+                    )
+                    if chain_execution_ids and execution_id not in chain_execution_ids:
+                        continue
+
+        provenance = _parse_json_array(row["provenance_paths"])
+        timeline_ids = sorted(
+            {
+                int(match.group(1))
+                for ref in provenance
+                if (match := re.fullmatch(r"timeline:(\d+)", str(ref or "")))
+            }
+        )
+        if not timeline_ids:
+            continue
+        placeholders = ",".join("?" for _ in timeline_ids)
+        event_rows = conn.execute(
+            f"""
+            SELECT * FROM task_timeline_events
+            WHERE project_id = ? AND id IN ({placeholders})
+            ORDER BY id
+            """,
+            (epoch.project_id, *timeline_ids),
+        ).fetchall()
+        bound_events: list[str] = []
+        for event in event_rows:
+            event_payload = {
+                "payload": _parse_json_object(event["payload_json"]),
+                "verification": _parse_json_object(event["verification_json"]),
+                "artifact_refs": _parse_json_object(event["artifact_refs_json"]),
+            }
+            event_text = " ".join(
+                str(event[key] or "").lower()
+                for key in ("event_type", "event_kind", "phase", "decision")
+            )
+            event_generation_ids = _worldref_no_pass_generation_ids(
+                event_payload
+            )
+            event_queue_ids = {
+                str(value or "").strip()
+                for value in _worldref_recursive_values(
+                    event_payload, {"merge_queue_id"}
+                )
+                if str(value or "").strip()
+            }
+            event_heads = {
+                str(value or "").strip().lower()
+                for value in _worldref_recursive_values(
+                    event_payload,
+                    {
+                        "current_head",
+                        "current_target_head",
+                        "epoch_world_head",
+                        "target_head_before",
+                        "target_head_before_merge",
+                        "target_head_after",
+                        "target_head_after_merge",
+                    },
+                )
+                if str(value or "").strip()
+            }
+            event_cex_ids = {
+                str(value or "").strip()
+                for value in _worldref_recursive_values(
+                    event_payload,
+                    {
+                        "contract_execution_id",
+                        "source_contract_execution_id",
+                        "parent_contract_execution_id",
+                    },
+                )
+                if str(value or "").strip()
+            }
+            no_pass_claims = _worldref_recursive_values(
+                event_payload, {"no_pass_claim"}
+            )
+            if (
+                generation_id in event_generation_ids
+                and epoch.merge_queue_id in event_queue_ids
+                and epoch.current_head.lower() in event_heads
+                and execution_id
+                in ({str(event["task_id"] or "")} | event_cex_ids)
+                and source_backlog_id
+                in {
+                    str(event["backlog_id"] or ""),
+                    *{
+                        str(value or "").strip()
+                        for value in _worldref_recursive_values(
+                            event_payload,
+                            {"backlog_id", "source_backlog_id"},
+                        )
+                    },
+                }
+                and any(value is True for value in no_pass_claims)
+                and "merge" in event_text
+            ):
+                bound_events.append(f"timeline:{int(event['id'])}")
+        if len(bound_events) != 1:
+            continue
+        if cex_table is None and not bound_events:
+            continue
+        candidates.append(
+            {
+                "bug_id": diagnostic_id,
+                "source_backlog_id": source_backlog_id,
+                "contract_execution_id": execution_id,
+                "generation_id": generation_id,
+                "timeline_event_ref": bound_events[0],
+            }
+        )
+    return candidates
+
+
+def _integration_epoch_no_pass_root_lineage_mismatches(
+    conn: sqlite3.Connection,
+    epoch: IntegrationEpoch,
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Find scoped OPEN no-PASS roots that failed exact lineage validation."""
+
+    child_backlogs = {
+        item.backlog_id
+        for item in list_merge_queue_items(
+            conn,
+            epoch.project_id,
+            epoch.merge_queue_id,
+            target_ref=epoch.target_ref,
+        )
+        if item.backlog_id
+    }
+    valid_ids = {
+        str(candidate.get("bug_id") or "") for candidate in candidates
+    }
     try:
         rows = conn.execute(
             """
@@ -16169,32 +16524,26 @@ def _integration_epoch_no_pass_root_candidates(
         ).fetchall()
     except sqlite3.Error:
         return []
-    candidates: list[str] = []
+    mismatches: list[str] = []
     for row in rows:
-        trigger = _parse_json_object(row["chain_trigger_json"])
-        policy = _parse_json_object(row["bypass_policy_json"])
-        values = (trigger, policy)
-        exact_generation = any(
-            str(value.get("epoch_no_pass_generation_key") or "")
-            == generation_key
-            and str(value.get("project_id") or epoch.project_id)
-            == epoch.project_id
-            and str(value.get("batch_id") or "") == epoch.batch_id
-            and str(value.get("epoch_id") or "") == epoch.epoch_id
-            and str(value.get("merge_queue_id") or "")
-            == epoch.merge_queue_id
-            and value.get("no_pass_claim") is True
-            for value in values
+        bug_id = str(row["bug_id"] or "")
+        if bug_id in valid_ids:
+            continue
+        values = (
+            _parse_json_object(row["chain_trigger_json"]),
+            _parse_json_object(row["bypass_policy_json"]),
         )
-        historical_contract_root = any(
-            value.get("no_pass_claim") is True
-            and str(value.get("source_backlog_id") or "") in backlog_ids
-            and str(value.get("contract_execution_id") or "") in task_ids
+        source_backlogs = {
+            str(value.get("source_backlog_id") or "").strip()
             for value in values
-        )
-        if exact_generation or historical_contract_root:
-            candidates.append(str(row["bug_id"] or ""))
-    return [value for value in candidates if value]
+            if str(value.get("source_backlog_id") or "").strip()
+        }
+        if (
+            source_backlogs.intersection(child_backlogs)
+            and any(value.get("no_pass_claim") is True for value in values)
+        ):
+            mismatches.append(bug_id)
+    return mismatches
 
 
 def _integration_epoch_row3_evidence_blockers(
@@ -16215,13 +16564,9 @@ def _integration_epoch_row3_evidence_blockers(
         key: value
         for key, value in {
             "branch_ref": item.branch_ref,
-            "base_commit": item.base_commit,
             "branch_head": item.branch_head,
-            "validated_target_head": item.validated_target_head,
-            "current_target_head": item.current_target_head,
             "validation_attempt": item.validation_attempt,
             "merge_preview_id": item.merge_preview_id,
-            "snapshot_id": item.snapshot_id,
             "projection_id": item.projection_id,
             "merge_commit": item.merge_commit,
             "target_head_before_merge": item.target_head_before_merge,
@@ -16401,10 +16746,23 @@ def integration_epoch_worldref_seal_action_payload(
                 "target_world_head": target_head,
             }
         )
-    roots = _integration_epoch_no_pass_root_candidates(conn, epoch)
-    if len(roots) > 1:
+    root_candidates = _integration_epoch_no_pass_root_candidates(conn, epoch)
+    root_mismatches = _integration_epoch_no_pass_root_lineage_mismatches(
+        conn, epoch, root_candidates
+    )
+    if len(root_candidates) > 1:
         blockers.append(
-            {"code": "no_pass_diagnostic_root_non_unique", "root_count": len(roots)}
+            {
+                "code": "no_pass_diagnostic_root_non_unique",
+                "root_count": len(root_candidates),
+            }
+        )
+    if root_mismatches:
+        blockers.append(
+            {
+                "code": "no_pass_diagnostic_root_lineage_mismatch",
+                "diagnostic_backlog_ids": root_mismatches,
+            }
         )
     if item is not None:
         blockers.extend(
@@ -16449,8 +16807,8 @@ def integration_epoch_worldref_seal_action_payload(
     assert item is not None
     generation_key = _integration_epoch_no_pass_generation_key(epoch)
     diagnostic_id = (
-        roots[0]
-        if roots
+        root_candidates[0]["bug_id"]
+        if root_candidates
         else "AC-EPOCH-NO-PASS-" + generation_key.rsplit("-", 1)[-1].upper()
     )
     evidence_refs = [
@@ -16461,8 +16819,17 @@ def integration_epoch_worldref_seal_action_payload(
         f"worldref:foreign-target:{target_head}",
         *[f"merged-prefix:{value}" for value in epoch.merged_prefix],
     ]
-    if roots:
-        evidence_refs.append(f"backlog:{diagnostic_id}")
+    if root_candidates:
+        root = root_candidates[0]
+        evidence_refs.extend(
+            [
+                f"backlog:{diagnostic_id}",
+                f"backlog:{root['source_backlog_id']}",
+                f"contract-runtime:{root['contract_execution_id']}",
+                f"no-pass-generation:{root['generation_id']}",
+                root["timeline_event_ref"],
+            ]
+        )
     evidence_hash = _worldref_seal_identity_hash(evidence_refs)
     action_input = {
         "schema_version": _WORLDREF_SEAL_SCHEMA,
@@ -16474,13 +16841,21 @@ def integration_epoch_worldref_seal_action_payload(
         "task_id": item.task_id,
         "backlog_id": item.backlog_id,
         "backlog_status_before": str(backlog_row["status"] or "").upper(),
+        "row3_original_custody": {
+            "base_commit": item.base_commit,
+            "validated_target_head": item.validated_target_head,
+            "current_target_head": item.current_target_head,
+            "snapshot_id": item.snapshot_id,
+        },
         "target_ref": epoch.target_ref,
         "merge_cursor": epoch.merge_cursor,
         "merged_prefix": list(epoch.merged_prefix),
         "epoch_world_head": epoch.current_head.lower(),
         "target_world_head": target_head,
         "diagnostic_backlog_id": diagnostic_id,
-        "diagnostic_root_mode": "reuse" if roots else "create_if_missing",
+        "diagnostic_root_mode": (
+            "reuse" if root_candidates else "create_if_missing"
+        ),
         "epoch_no_pass_generation_key": generation_key,
         "original_evidence_refs": evidence_refs,
         "original_evidence_hash": evidence_hash,
@@ -16624,15 +16999,15 @@ def seal_integration_epoch_worldref_linear_unlock(
             "source backlog disappeared before the atomic write",
         )
     diagnostic_id = str(expected["diagnostic_backlog_id"])
-    roots = _integration_epoch_no_pass_root_candidates(conn, epoch)
+    root_candidates = _integration_epoch_no_pass_root_candidates(conn, epoch)
     if expected["diagnostic_root_mode"] == "reuse":
-        if roots != [diagnostic_id]:
+        if [root["bug_id"] for root in root_candidates] != [diagnostic_id]:
             raise IntegrationEpochWorldRefSealError(
                 "integration_epoch_worldref_seal_diagnostic_root_drift",
                 "existing no-PASS root is missing or non-unique",
             )
     else:
-        if roots:
+        if root_candidates:
             raise IntegrationEpochWorldRefSealError(
                 "integration_epoch_worldref_seal_diagnostic_root_drift",
                 "a no-PASS root appeared after precheck",

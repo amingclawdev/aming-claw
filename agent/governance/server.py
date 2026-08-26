@@ -201025,6 +201025,7 @@ _integration_epoch_worldref_seal_request_fields = (
     "task_id",
     "backlog_id",
     "backlog_status_before",
+    "row3_original_custody",
     "target_ref",
     "merge_cursor",
     "merged_prefix",
