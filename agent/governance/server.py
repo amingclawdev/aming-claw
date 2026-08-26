@@ -21501,6 +21501,318 @@ def _active_epoch_canonical_successor_dispatch_allowed(
     )
 
 
+def _active_epoch_reconciled_direct_repair_reanchor_authority(
+    conn,
+    *,
+    active_epoch: Any,
+    project_id: str,
+    requested_head_commit: str,
+    repair_proof: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve Direct Main repair history at the batch-successor checkpoint.
+
+    The caller supplies only timeline references.  Git ancestry, commit
+    trailers, timeline rows, graph snapshots, and the current target ref are
+    all re-read here before the epoch store may project the repaired HEAD.
+    """
+
+    proof = dict(repair_proof) if isinstance(repair_proof, Mapping) else {}
+
+    def json_mapping(raw: Any) -> dict[str, Any]:
+        parsed = _json_loads(raw, {})
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+    def row_text(row: Any, key: str) -> str:
+        try:
+            value = row[key]
+        except (KeyError, IndexError, TypeError):
+            value = ""
+        return str(value or "").strip()
+
+    def reject(field: str, expected: Any, actual: Any) -> NoReturn:
+        raise GovernanceError(
+            "integration_epoch_direct_repair_reanchor_authority_invalid",
+            (
+                "the active Batch epoch may absorb only an ordered, "
+                "server-verified Direct Main merge and reconcile chain"
+            ),
+            409,
+            {
+                "field": field,
+                "expected": expected,
+                "actual": actual,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "fail_closed": True,
+            },
+        )
+
+    if proof.get("schema_version") != (
+        "mf_batch_parallel.reconciled_direct_main_repair_chain.v1"
+    ):
+        reject(
+            "schema_version",
+            "mf_batch_parallel.reconciled_direct_main_repair_chain.v1",
+            proof.get("schema_version"),
+        )
+    raw_hops = proof.get("repair_hops")
+    if not isinstance(raw_hops, list) or not 1 <= len(raw_hops) <= 8:
+        reject("repair_hops", "one to eight ordered repair hops", raw_hops)
+
+    requested = str(requested_head_commit or "").strip().lower()
+    before_head = str(active_epoch.current_head or "").strip().lower()
+    if not (
+        str(active_epoch.status or "") == "open"
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", requested)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", before_head)
+        and requested != before_head
+    ):
+        reject(
+            "epoch_head_transition",
+            "open epoch with distinct full before/after commits",
+            {
+                "status": str(active_epoch.status or ""),
+                "before_head": before_head,
+                "requested_head": requested,
+            },
+        )
+
+    try:
+        project_root = Path(
+            project_service.resolve_project_root(
+                project_id,
+                None,
+                fallback_self=False,
+            )
+        )
+    except Exception:
+        reject("project_root", "registered project root", "unresolved")
+    if not _git_clean_worktree_verified(project_root):
+        reject("worktree", "clean", "dirty")
+    target_ref = str(active_epoch.target_ref or "").strip()
+    target_ref_head = _git_output(project_root, ["rev-parse", target_ref]).lower()
+    if target_ref_head != requested:
+        reject("target_ref_head", requested, target_ref_head)
+
+    from . import graph_snapshot_store as graph_store
+
+    normalized_hops: list[dict[str, Any]] = []
+    cursor = before_head
+    for index, raw_hop in enumerate(raw_hops):
+        hop = dict(raw_hop) if isinstance(raw_hop, Mapping) else {}
+        merge_ref = str(hop.get("merge_event_ref") or "").strip()
+        reconcile_ref = str(hop.get("reconcile_event_ref") or "").strip()
+        merge_match = re.fullmatch(r"timeline:([1-9][0-9]*)", merge_ref)
+        reconcile_match = re.fullmatch(
+            r"timeline:([1-9][0-9]*)", reconcile_ref
+        )
+        if not merge_match or not reconcile_match:
+            reject(
+                f"repair_hops[{index}].timeline_refs",
+                "two full timeline:<positive-id> references",
+                {
+                    "merge_event_ref": merge_ref,
+                    "reconcile_event_ref": reconcile_ref,
+                },
+            )
+        merge_row = conn.execute(
+            """
+            SELECT * FROM task_timeline_events
+            WHERE project_id = ? AND id = ?
+            """,
+            (project_id, int(merge_match.group(1))),
+        ).fetchone()
+        reconcile_row = conn.execute(
+            """
+            SELECT * FROM task_timeline_events
+            WHERE project_id = ? AND id = ?
+            """,
+            (project_id, int(reconcile_match.group(1))),
+        ).fetchone()
+        if merge_row is None or reconcile_row is None:
+            reject(
+                f"repair_hops[{index}].timeline_rows",
+                "two existing project-scoped rows",
+                {
+                    "merge_found": merge_row is not None,
+                    "reconcile_found": reconcile_row is not None,
+                },
+            )
+
+        merge_payload = json_mapping(merge_row["payload_json"])
+        merge_artifacts = json_mapping(merge_row["artifact_refs_json"])
+        reconcile_payload = json_mapping(reconcile_row["payload_json"])
+        reconcile_artifacts = json_mapping(
+            reconcile_row["artifact_refs_json"]
+        )
+        repair_commit = row_text(merge_row, "commit_sha").lower()
+        merge_backlog = row_text(merge_row, "backlog_id")
+        merge_task = row_text(merge_row, "task_id")
+        reconciled_snapshot_id = str(
+            reconcile_payload.get("active_snapshot_id")
+            or reconcile_artifacts.get("active_snapshot")
+            or ""
+        ).strip()
+        observed_before = str(
+            merge_payload.get("before_commit")
+            or merge_artifacts.get("target_before")
+            or ""
+        ).strip().lower()
+        timeline_valid = all(
+            (
+                row_text(merge_row, "event_type")
+                == "observer.direct_main_repair_merged",
+                row_text(merge_row, "event_kind") == "merge",
+                row_text(merge_row, "actor") == "observer",
+                row_text(merge_row, "status") == "accepted",
+                bool(merge_backlog),
+                bool(merge_task),
+                observed_before == cursor,
+                str(merge_payload.get("merged_commit") or "").lower()
+                == repair_commit,
+                row_text(reconcile_row, "event_type")
+                == "observer.direct_main_repair_reconciled",
+                row_text(reconcile_row, "event_kind") == "reconcile",
+                row_text(reconcile_row, "actor") == "observer",
+                row_text(reconcile_row, "status") == "accepted",
+                row_text(reconcile_row, "backlog_id") == merge_backlog,
+                row_text(reconcile_row, "task_id") == merge_task,
+                row_text(reconcile_row, "commit_sha").lower()
+                == repair_commit,
+                str(reconcile_payload.get("graph_snapshot_commit") or "").lower()
+                == repair_commit,
+                reconcile_payload.get("graph_stale") is False,
+                str(reconcile_artifacts.get("repair_merge_event") or "")
+                == merge_ref,
+                bool(reconciled_snapshot_id),
+            )
+        )
+        if not timeline_valid:
+            reject(
+                f"repair_hops[{index}].timeline_authority",
+                "matching accepted observer Direct Main merge and reconcile",
+                {
+                    "merge_event_ref": merge_ref,
+                    "reconcile_event_ref": reconcile_ref,
+                    "repair_commit": repair_commit,
+                    "observed_before": observed_before,
+                    "expected_before": cursor,
+                },
+            )
+
+        parent_line = _git_output(
+            project_root,
+            ["rev-list", "--parents", "-n", "1", repair_commit],
+        ).split()
+        if parent_line != [repair_commit, cursor]:
+            reject(
+                f"repair_hops[{index}].first_parent",
+                [repair_commit, cursor],
+                parent_line,
+            )
+        commit_body = _git_output(
+            project_root,
+            ["show", "-s", "--format=%B", repair_commit],
+        )
+        bug_trailers = re.findall(
+            r"(?m)^Chain-Bug-Id:\s*(\S+)\s*$", commit_body
+        )
+        source_trailers = re.findall(
+            r"(?m)^Chain-Source-Task:\s*(\S+)\s*$", commit_body
+        )
+        if bug_trailers != [merge_backlog] or source_trailers != [merge_task]:
+            reject(
+                f"repair_hops[{index}].commit_trailers",
+                {
+                    "Chain-Bug-Id": [merge_backlog],
+                    "Chain-Source-Task": [merge_task],
+                },
+                {
+                    "Chain-Bug-Id": bug_trailers,
+                    "Chain-Source-Task": source_trailers,
+                },
+            )
+        snapshot = graph_store.get_graph_snapshot(
+            conn,
+            project_id,
+            reconciled_snapshot_id,
+        )
+        if not (
+            snapshot
+            and str(snapshot.get("commit_sha") or "").lower() == repair_commit
+            and str(snapshot.get("snapshot_kind") or "") == "full"
+            and str(snapshot.get("status") or "") in {"active", "superseded"}
+        ):
+            reject(
+                f"repair_hops[{index}].graph_snapshot",
+                "full active or superseded snapshot at the repair commit",
+                snapshot or {},
+            )
+        normalized_hops.append(
+            {
+                "merge_event_ref": merge_ref,
+                "reconcile_event_ref": reconcile_ref,
+                "backlog_id": merge_backlog,
+                "task_id": merge_task,
+                "before_head": cursor,
+                "repair_commit": repair_commit,
+                "snapshot_id": reconciled_snapshot_id,
+            }
+        )
+        cursor = repair_commit
+
+    if cursor != requested:
+        reject("repair_chain_final_head", requested, cursor)
+    graph_status = graph_store.graph_governance_status(conn, project_id)
+    if not (
+        str(graph_status.get("active_snapshot_id") or "")
+        == normalized_hops[-1]["snapshot_id"]
+        and str(graph_status.get("graph_snapshot_commit") or "").lower()
+        == requested
+        and int(graph_status.get("pending_scope_reconcile_count") or 0) == 0
+    ):
+        reject(
+            "active_graph",
+            {
+                "snapshot_id": normalized_hops[-1]["snapshot_id"],
+                "commit_sha": requested,
+                "pending_scope_reconcile_count": 0,
+            },
+            {
+                "snapshot_id": graph_status.get("active_snapshot_id"),
+                "commit_sha": graph_status.get("graph_snapshot_commit"),
+                "pending_scope_reconcile_count": graph_status.get(
+                    "pending_scope_reconcile_count"
+                ),
+            },
+        )
+
+    authority = {
+        "schema_version": (
+            "mf_batch_parallel.integration_epoch_direct_repair_"
+            "reanchor_authority.v1"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": project_id,
+        "batch_id": str(active_epoch.batch_id or ""),
+        "epoch_id": str(active_epoch.epoch_id or ""),
+        "target_ref": target_ref,
+        "before_head": before_head,
+        "after_head": requested,
+        "repair_hops": normalized_hops,
+        "active_snapshot_id": normalized_hops[-1]["snapshot_id"],
+        "queue_cursor_preserved": True,
+        "merge_credit_granted": False,
+        "authoritative_pass_synthesized": False,
+        "source_of_authority": (
+            "server_verified_git+timeline+graph_successor_checkpoint"
+        ),
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/allocate")
 def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     """Allocate and optionally materialize one parallel branch runtime context."""
@@ -197733,6 +198045,105 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
             project_id,
             target_ref=enter_target_ref,
         )
+        requested_epoch_head = str(
+            body.get("target_head_commit")
+            or body.get("head_commit")
+            or metadata.get("target_head_commit")
+            or epoch_successor_proof.get("current_head")
+            or merge_queue_item.get("current_target_head")
+            or merge_queue_item.get("target_head_commit")
+            or ""
+        ).strip()
+        requested_epoch_batch_id = str(
+            body.get("parent_batch_id")
+            or body.get("batch_id")
+            or metadata.get("parent_batch_id")
+            or metadata.get("batch_id")
+            or epoch_successor_proof.get("batch_id")
+            or ""
+        ).strip()
+        requested_epoch_merge_queue_id = str(
+            body.get("merge_queue_id")
+            or merge_queue_item.get("merge_queue_id")
+            or metadata.get("merge_queue_id")
+            or epoch_successor_proof.get("merge_queue_id")
+            or ""
+        ).strip()
+        requested_epoch_queue_item_id = str(
+            merge_queue_item.get("queue_item_id")
+            or epoch_successor_proof.get("queue_item_id")
+            or ""
+        ).strip()
+        epoch_reanchor_authority: dict[str, Any] = {}
+        repair_chain_proof = (
+            epoch_successor_proof.get("reconciled_direct_main_repair_chain")
+            if isinstance(
+                epoch_successor_proof.get(
+                    "reconciled_direct_main_repair_chain"
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        canonical_identity_at_frozen_head = bool(
+            active_epoch is not None
+            and _active_epoch_canonical_successor_dispatch_allowed(
+                conn,
+                active_epoch=active_epoch,
+                project_id=project_id,
+                task_id=task_id,
+                backlog_id=backlog_id,
+                batch_id=requested_epoch_batch_id,
+                merge_queue_id=requested_epoch_merge_queue_id,
+                target_ref=enter_target_ref,
+                requested_head_commit=str(active_epoch.current_head or ""),
+                queue_item_id=requested_epoch_queue_item_id,
+            )
+        )
+        if (
+            active_epoch is not None
+            and repair_chain_proof
+            and canonical_identity_at_frozen_head
+            and not _contract_runtime_authority_commit_matches(
+                str(active_epoch.current_head or ""),
+                requested_epoch_head,
+            )
+        ):
+            epoch_reanchor_authority = (
+                _active_epoch_reconciled_direct_repair_reanchor_authority(
+                    conn,
+                    active_epoch=active_epoch,
+                    project_id=project_id,
+                    requested_head_commit=requested_epoch_head,
+                    repair_proof=repair_chain_proof,
+                )
+            )
+            from .parallel_branch_runtime import (
+                reanchor_open_integration_epoch_after_direct_repair,
+            )
+
+            active_epoch = (
+                reanchor_open_integration_epoch_after_direct_repair(
+                    conn,
+                    project_id=project_id,
+                    batch_id=str(active_epoch.batch_id or ""),
+                    expected_current_head=str(active_epoch.current_head or ""),
+                    repaired_current_head=requested_epoch_head,
+                    authority=epoch_reanchor_authority,
+                )
+            )
+            metadata["active_integration_epoch_successor"] = {
+                **dict(epoch_successor_proof),
+                "current_head": requested_epoch_head,
+                "reconciled_direct_main_repair_chain": {
+                    "schema_version": (
+                        "mf_batch_parallel.reconciled_direct_main_"
+                        "repair_chain_projection.v1"
+                    ),
+                    "server_derived": True,
+                    "authority": dict(epoch_reanchor_authority),
+                },
+            }
         canonical_epoch_successor = (
             active_epoch is not None
             and _active_epoch_canonical_successor_dispatch_allowed(
@@ -197741,36 +198152,11 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                 project_id=project_id,
                 task_id=task_id,
                 backlog_id=backlog_id,
-                batch_id=str(
-                    body.get("parent_batch_id")
-                    or body.get("batch_id")
-                    or metadata.get("parent_batch_id")
-                    or metadata.get("batch_id")
-                    or epoch_successor_proof.get("batch_id")
-                    or ""
-                ).strip(),
-                merge_queue_id=str(
-                    body.get("merge_queue_id")
-                    or merge_queue_item.get("merge_queue_id")
-                    or metadata.get("merge_queue_id")
-                    or epoch_successor_proof.get("merge_queue_id")
-                    or ""
-                ).strip(),
+                batch_id=requested_epoch_batch_id,
+                merge_queue_id=requested_epoch_merge_queue_id,
                 target_ref=enter_target_ref,
-                requested_head_commit=str(
-                    body.get("target_head_commit")
-                    or body.get("head_commit")
-                    or metadata.get("target_head_commit")
-                    or epoch_successor_proof.get("current_head")
-                    or merge_queue_item.get("current_target_head")
-                    or merge_queue_item.get("target_head_commit")
-                    or ""
-                ).strip(),
-                queue_item_id=str(
-                    merge_queue_item.get("queue_item_id")
-                    or epoch_successor_proof.get("queue_item_id")
-                    or ""
-                ).strip(),
+                requested_head_commit=requested_epoch_head,
+                queue_item_id=requested_epoch_queue_item_id,
             )
         )
         if active_epoch is not None and not canonical_epoch_successor:
@@ -197782,6 +198168,7 @@ def handle_project_mf_parallel_enter(ctx: RequestContext):
                     "durable batch integration epoch"
                 ),
                 "integration_epoch": integration_epoch_to_dict(active_epoch),
+                "direct_repair_reanchor_requested": bool(repair_chain_proof),
                 "next_legal_action": _server_integration_epoch_resume_payload(
                     conn, active_epoch
                 ),

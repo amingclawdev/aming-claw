@@ -171756,6 +171756,343 @@ def test_mf_parallel_enter_allows_open_epoch_canonical_planned_successor(conn):
     assert entered["next_legal_action"]["id"] == "observer_prefill_child_contracts"
 
 
+def test_mf_parallel_enter_projects_verified_direct_repair_before_successor(
+    conn,
+    monkeypatch,
+):
+    backlog_id = "AC-CANONICAL-SUCCESSOR"
+    task_id = "task-canonical-successor"
+    before_head = "a" * 40
+    repaired_head = "b" * 40
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    started = server.handle_project_onboard_contract_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "route_token_ref": "rtok-reanchor-onboard",
+            },
+        )
+    )
+    _complete_source_backed_onboarding(conn, started["contract_execution_id"])
+    epoch = _seed_open_epoch_planned_successor(
+        conn,
+        task_id=task_id,
+        backlog_id=backlog_id,
+        current_head=before_head,
+    )
+    conn.commit()
+
+    authority = {
+        "schema_version": (
+            "mf_batch_parallel.integration_epoch_direct_repair_"
+            "reanchor_authority.v1"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": PID,
+        "batch_id": epoch.batch_id,
+        "epoch_id": epoch.epoch_id,
+        "target_ref": epoch.target_ref,
+        "before_head": before_head,
+        "after_head": repaired_head,
+        "repair_hops": [
+            {
+                "merge_event_ref": "timeline:10",
+                "reconcile_event_ref": "timeline:11",
+                "repair_commit": repaired_head,
+            }
+        ],
+        "active_snapshot_id": "full-repaired-head",
+        "queue_cursor_preserved": True,
+        "merge_credit_granted": False,
+        "authoritative_pass_synthesized": False,
+        "source_of_authority": "server_verified_test_fixture",
+    }
+    authority["authority_hash"] = (
+        parallel_branch_runtime._canonical_contract_hash(authority)
+    )
+    monkeypatch.setattr(
+        server,
+        "_active_epoch_reconciled_direct_repair_reanchor_authority",
+        lambda *_args, **_kwargs: dict(authority),
+    )
+
+    entered = server.handle_project_mf_parallel_enter(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "reason": "Resume at the exact reconciled Direct Main head.",
+                "contract_revision": "rev8",
+                "route_token_ref": "rtok-reanchor-successor",
+                "owned_files": ["agent/canonical.py"],
+                "target_head_commit": repaired_head,
+                "metadata": {
+                    "active_integration_epoch_successor": {
+                        "batch_id": "batch-canonical-successor",
+                        "merge_queue_id": "mq-canonical-successor",
+                        "queue_item_id": "item-canonical-successor",
+                        "target_ref": "refs/heads/main",
+                        "current_head": repaired_head,
+                        "reconciled_direct_main_repair_chain": {
+                            "schema_version": (
+                                "mf_batch_parallel.reconciled_direct_main_"
+                                "repair_chain.v1"
+                            ),
+                            "repair_hops": [
+                                {
+                                    "merge_event_ref": "timeline:10",
+                                    "reconcile_event_ref": "timeline:11",
+                                }
+                            ],
+                        },
+                    }
+                },
+            },
+        )
+    )
+
+    saved = get_integration_epoch(conn, PID, epoch.batch_id)
+    assert entered["ok"] is True
+    assert saved.current_head == repaired_head
+    assert saved.merge_cursor == 1
+    assert saved.remaining_queue_item_ids == ("item-canonical-successor",)
+    assert saved.last_merge_commit == ""
+    assert get_merge_queue_item(
+        conn,
+        PID,
+        "mq-canonical-successor",
+        "item-canonical-successor",
+    ).status == "planned"
+
+
+def test_active_epoch_reanchor_resolves_ordered_direct_repair_chain(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "epoch-direct-repair-chain"
+    base_head = _init_test_git_repo(root, filename="base.txt")
+    subprocess.run(["git", "branch", "-M", "main"], cwd=root, check=True)
+
+    repair_rows = []
+    previous = base_head
+    for index in (1, 2):
+        backlog_id = f"AC-DIRECT-REPAIR-{index}"
+        task_id = f"cex-direct-repair-{index}"
+        path = root / f"repair-{index}.txt"
+        path.write_text(f"repair {index}\n", encoding="utf-8")
+        subprocess.run(["git", "add", path.name], cwd=root, check=True)
+        subprocess.run(
+            [
+                "git",
+                "commit",
+                "-m",
+                f"direct repair {index}",
+                "-m",
+                (
+                    f"Chain-Bug-Id: {backlog_id}\n"
+                    f"Chain-Source-Task: {task_id}"
+                ),
+            ],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        repair_commit = batch_jobs.git_commit(root)
+        snapshot_id = f"full-direct-repair-{index}"
+        merge = task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_type="observer.direct_main_repair_merged",
+            phase="observer_merge",
+            event_kind="merge",
+            actor="observer",
+            status="accepted",
+            commit_sha=repair_commit,
+            payload={
+                "before_commit": previous,
+                "merged_commit": repair_commit,
+            },
+            artifact_refs={"target_before": previous},
+            post_commit_hooks=False,
+        )
+        reconcile = task_timeline.record_event(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            event_type="observer.direct_main_repair_reconciled",
+            phase="post_merge_reconcile",
+            event_kind="reconcile",
+            actor="observer",
+            status="accepted",
+            commit_sha=repair_commit,
+            payload={
+                "active_snapshot_id": snapshot_id,
+                "graph_snapshot_commit": repair_commit,
+                "graph_stale": False,
+            },
+            artifact_refs={
+                "active_snapshot": snapshot_id,
+                "repair_merge_event": f"timeline:{merge['id']}",
+            },
+            post_commit_hooks=False,
+        )
+        repair_rows.append(
+            {
+                "merge_event_ref": f"timeline:{merge['id']}",
+                "reconcile_event_ref": f"timeline:{reconcile['id']}",
+                "commit": repair_commit,
+                "snapshot_id": snapshot_id,
+            }
+        )
+        previous = repair_commit
+
+    store.ensure_schema(conn)
+    for index, row in enumerate(repair_rows):
+        conn.execute(
+            """
+            INSERT INTO graph_snapshots (
+                project_id, snapshot_id, commit_sha, parent_snapshot_id,
+                snapshot_kind, ref_name, branch_ref, graph_sha256,
+                inventory_sha256, drift_sha256, status, created_at,
+                created_by, notes
+            ) VALUES (?, ?, ?, '', 'full', '', '', '', '', '',
+                      'candidate', ?, 'observer', '')
+            """,
+            (
+                PID,
+                row["snapshot_id"],
+                row["commit"],
+                f"2026-08-26T15:5{index}:00Z",
+            ),
+        )
+    for row in repair_rows:
+        store.activate_graph_snapshot(
+            conn,
+            PID,
+            row["snapshot_id"],
+            ref_name="active",
+            auto_rebuild_projection=False,
+            schema_ready=True,
+            post_commit_hooks=False,
+        )
+
+    queue_id = "mq-direct-repair-chain"
+    item_id = "item-direct-repair-chain"
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PID,
+            merge_queue_id=queue_id,
+            queue_item_id=item_id,
+            task_id="task-canonical-successor",
+            backlog_id="AC-CANONICAL-SUCCESSOR",
+            branch_ref="",
+            queue_index=3,
+            status="planned",
+            target_ref="refs/heads/main",
+        ),
+    )
+    epoch = upsert_integration_epoch(
+        conn,
+        IntegrationEpoch(
+            project_id=PID,
+            batch_id="batch-direct-repair-chain",
+            epoch_id="epoch-direct-repair-chain",
+            coordination_backlog_id="AC-BATCH-PARENT",
+            target_ref="refs/heads/main",
+            base_head=base_head,
+            current_head=base_head,
+            merge_queue_id=queue_id,
+            merge_cursor=2,
+            merged_prefix=("item-1", "item-2"),
+            remaining_queue_item_ids=(item_id,),
+            status="open",
+            active_queue_item_id=item_id,
+            active_task_id="task-canonical-successor",
+            active_backlog_id="AC-CANONICAL-SUCCESSOR",
+            last_merge_commit=base_head,
+        ),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: root,
+    )
+    proof = {
+        "schema_version": (
+            "mf_batch_parallel.reconciled_direct_main_repair_chain.v1"
+        ),
+        "repair_hops": [
+            {
+                "merge_event_ref": row["merge_event_ref"],
+                "reconcile_event_ref": row["reconcile_event_ref"],
+            }
+            for row in repair_rows
+        ],
+    }
+
+    with pytest.raises(
+        GovernanceError,
+        match="ordered, server-verified Direct Main",
+    ):
+        server._active_epoch_reconciled_direct_repair_reanchor_authority(
+            conn,
+            active_epoch=epoch,
+            project_id=PID,
+            requested_head_commit=repair_rows[-1]["commit"],
+            repair_proof={
+                **proof,
+                "repair_hops": list(reversed(proof["repair_hops"])),
+            },
+        )
+    assert get_integration_epoch(
+        conn, PID, "batch-direct-repair-chain"
+    ).current_head == base_head
+
+    authority = (
+        server._active_epoch_reconciled_direct_repair_reanchor_authority(
+            conn,
+            active_epoch=epoch,
+            project_id=PID,
+            requested_head_commit=repair_rows[-1]["commit"],
+            repair_proof=proof,
+        )
+    )
+    saved = (
+        parallel_branch_runtime.reanchor_open_integration_epoch_after_direct_repair(
+            conn,
+            project_id=PID,
+            batch_id=epoch.batch_id,
+            expected_current_head=base_head,
+            repaired_current_head=repair_rows[-1]["commit"],
+            authority=authority,
+        )
+    )
+
+    assert authority["db_verified"] is True
+    assert authority["authoritative_pass_synthesized"] is False
+    assert len(authority["repair_hops"]) == 2
+    assert saved.current_head == repair_rows[-1]["commit"]
+    assert saved.merge_cursor == 2
+    assert saved.merged_prefix == ("item-1", "item-2")
+    assert saved.remaining_queue_item_ids == (item_id,)
+    assert saved.last_merge_commit == base_head
+    assert get_merge_queue_item(conn, PID, queue_id, item_id).status == "planned"
+
+
 @pytest.mark.parametrize(
     "invalid_child_commit,invalid_child_fixed_at,expected_detail_key",
     [

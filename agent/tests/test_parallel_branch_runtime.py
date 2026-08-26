@@ -339,6 +339,182 @@ def test_batch_read_model_preserves_server_order_identity_without_replacement_au
     assert read_model["integration_epoch"]["merged_prefix"] == [queue_item_id]
 
 
+def _direct_repair_reanchor_authority(epoch, before_head: str, after_head: str):
+    authority = {
+        "schema_version": (
+            "mf_batch_parallel.integration_epoch_direct_repair_"
+            "reanchor_authority.v1"
+        ),
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": epoch.project_id,
+        "batch_id": epoch.batch_id,
+        "epoch_id": epoch.epoch_id,
+        "target_ref": epoch.target_ref,
+        "before_head": before_head,
+        "after_head": after_head,
+        "repair_hops": [
+            {
+                "before_head": before_head,
+                "repair_commit": after_head,
+                "merge_event_ref": "timeline:10",
+                "reconcile_event_ref": "timeline:11",
+            }
+        ],
+        "queue_cursor_preserved": True,
+        "merge_credit_granted": False,
+        "authoritative_pass_synthesized": False,
+    }
+    authority["authority_hash"] = (
+        parallel_branch_runtime._canonical_contract_hash(authority)
+    )
+    return authority
+
+
+def test_direct_repair_reanchor_changes_only_open_epoch_current_head() -> None:
+    conn = _runtime_conn()
+    batch_id = "batch-direct-repair-reanchor"
+    queue_id = "mq-direct-repair-reanchor"
+    item_id = "item-direct-repair-reanchor"
+    before_head = "a" * 40
+    after_head = "b" * 40
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=queue_id,
+            queue_item_id=item_id,
+            backlog_id="AC-DIRECT-REPAIR-SUCCESSOR",
+            task_id="task-direct-repair-successor",
+            branch_ref="",
+            queue_index=3,
+            status="planned",
+            target_ref="refs/heads/main",
+        ),
+        now_iso=NOW,
+    )
+    epoch = parallel_branch_runtime.upsert_integration_epoch(
+        conn,
+        parallel_branch_runtime.IntegrationEpoch(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            epoch_id="epoch-direct-repair-reanchor",
+            coordination_backlog_id="AC-DIRECT-REPAIR-PARENT",
+            target_ref="refs/heads/main",
+            base_head="0" * 40,
+            current_head=before_head,
+            merge_queue_id=queue_id,
+            merge_cursor=2,
+            merged_prefix=("item-1", "item-2"),
+            remaining_queue_item_ids=(item_id,),
+            status="open",
+            active_queue_item_id=item_id,
+            active_task_id="task-direct-repair-successor",
+            active_backlog_id="AC-DIRECT-REPAIR-SUCCESSOR",
+            last_merge_commit=before_head,
+        ),
+        now_iso=NOW,
+    )
+
+    saved = (
+        parallel_branch_runtime.reanchor_open_integration_epoch_after_direct_repair(
+            conn,
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            expected_current_head=before_head,
+            repaired_current_head=after_head,
+            authority=_direct_repair_reanchor_authority(
+                epoch, before_head, after_head
+            ),
+            now_iso="2026-05-16T12:01:00Z",
+        )
+    )
+
+    assert saved.current_head == after_head
+    assert saved.merge_cursor == 2
+    assert saved.merged_prefix == ("item-1", "item-2")
+    assert saved.remaining_queue_item_ids == (item_id,)
+    assert saved.active_queue_item_id == item_id
+    assert saved.active_task_id == "task-direct-repair-successor"
+    assert saved.active_backlog_id == "AC-DIRECT-REPAIR-SUCCESSOR"
+    assert saved.last_merge_commit == before_head
+    assert saved.status == "open"
+    assert (
+        parallel_branch_runtime.get_merge_queue_item(
+            conn, PROJECT_ID, queue_id, item_id
+        ).status
+        == "planned"
+    )
+
+
+def test_direct_repair_reanchor_rejects_unsealed_authority_without_write() -> None:
+    conn = _runtime_conn()
+    batch_id = "batch-direct-repair-reanchor-invalid"
+    queue_id = "mq-direct-repair-reanchor-invalid"
+    item_id = "item-direct-repair-reanchor-invalid"
+    before_head = "c" * 40
+    after_head = "d" * 40
+    upsert_merge_queue_item(
+        conn,
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=queue_id,
+            queue_item_id=item_id,
+            backlog_id="AC-DIRECT-REPAIR-INVALID",
+            task_id="task-direct-repair-invalid",
+            branch_ref="",
+            queue_index=2,
+            status="planned",
+            target_ref="refs/heads/main",
+        ),
+        now_iso=NOW,
+    )
+    epoch = parallel_branch_runtime.upsert_integration_epoch(
+        conn,
+        parallel_branch_runtime.IntegrationEpoch(
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            epoch_id="epoch-direct-repair-reanchor-invalid",
+            coordination_backlog_id="AC-DIRECT-REPAIR-PARENT",
+            target_ref="refs/heads/main",
+            base_head="0" * 40,
+            current_head=before_head,
+            merge_queue_id=queue_id,
+            merge_cursor=1,
+            merged_prefix=("item-1",),
+            remaining_queue_item_ids=(item_id,),
+            status="open",
+            active_queue_item_id=item_id,
+            active_task_id="task-direct-repair-invalid",
+            active_backlog_id="AC-DIRECT-REPAIR-INVALID",
+            last_merge_commit=before_head,
+        ),
+        now_iso=NOW,
+    )
+    authority = _direct_repair_reanchor_authority(
+        epoch, before_head, after_head
+    )
+    authority["repair_hops"][0]["repair_commit"] = "e" * 40
+
+    with pytest.raises(ValueError, match="authority is invalid"):
+        parallel_branch_runtime.reanchor_open_integration_epoch_after_direct_repair(
+            conn,
+            project_id=PROJECT_ID,
+            batch_id=batch_id,
+            expected_current_head=before_head,
+            repaired_current_head=after_head,
+            authority=authority,
+            now_iso="2026-05-16T12:01:00Z",
+        )
+
+    unchanged = parallel_branch_runtime.get_integration_epoch(
+        conn, PROJECT_ID, batch_id
+    )
+    assert unchanged.current_head == before_head
+    assert unchanged.merge_cursor == 1
+    assert unchanged.remaining_queue_item_ids == (item_id,)
+
+
 def test_generation_restart_requires_signed_governance_failure_disposition() -> None:
     runtime = BatchMergeRuntime(
         project_id=PROJECT_ID,

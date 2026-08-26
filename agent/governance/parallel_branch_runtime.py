@@ -15982,6 +15982,99 @@ def advance_integration_epoch_after_merge(
     )
 
 
+def reanchor_open_integration_epoch_after_direct_repair(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    batch_id: str,
+    expected_current_head: str,
+    repaired_current_head: str,
+    authority: Mapping[str, Any],
+    now_iso: str = "",
+) -> IntegrationEpoch:
+    """Project a verified Direct Main repair into an open batch epoch.
+
+    This is deliberately not merge credit.  A repair performed between two
+    serialized batch rows changes the real target HEAD, so the next row must
+    start from that reconciled world.  The server verifies Git, timeline, and
+    graph authority before calling this projection; this store layer then
+    changes only ``current_head`` and preserves the queue cursor verbatim.
+    """
+
+    proof = dict(authority) if isinstance(authority, Mapping) else {}
+    proof_hash = str(proof.pop("authority_hash", "") or "").strip()
+    if not (
+        proof.get("schema_version")
+        == (
+            "mf_batch_parallel.integration_epoch_direct_repair_"
+            "reanchor_authority.v1"
+        )
+        and proof.get("server_derived") is True
+        and proof.get("db_verified") is True
+        and proof_hash
+        and proof_hash == _canonical_contract_hash(proof)
+    ):
+        raise ValueError("integration epoch re-anchor authority is invalid")
+
+    epoch = get_integration_epoch(conn, project_id, batch_id)
+    if epoch is None:
+        raise KeyError(f"integration epoch not found: {project_id}/{batch_id}")
+    before = str(expected_current_head or "").strip().lower()
+    after = str(repaired_current_head or "").strip().lower()
+    if not (
+        epoch.status == INTEGRATION_EPOCH_OPEN
+        and epoch.current_head.lower() == before
+        and before
+        and after
+        and before != after
+        and epoch.remaining_queue_item_ids
+        and epoch.active_queue_item_id == epoch.remaining_queue_item_ids[0]
+        and str(proof.get("project_id") or "") == project_id
+        and str(proof.get("batch_id") or "") == batch_id
+        and str(proof.get("epoch_id") or "") == epoch.epoch_id
+        and str(proof.get("target_ref") or "") == epoch.target_ref
+        and str(proof.get("before_head") or "").lower() == before
+        and str(proof.get("after_head") or "").lower() == after
+    ):
+        raise IntegrationEpochFrozenError(
+            "Direct Main repair does not match the open epoch head/cursor",
+            epoch,
+        )
+
+    active_item = get_merge_queue_item(
+        conn,
+        project_id,
+        epoch.merge_queue_id,
+        epoch.active_queue_item_id,
+    )
+    if active_item is None or active_item.status != "planned":
+        raise IntegrationEpochFrozenError(
+            "Direct Main repair re-anchor requires the planned canonical successor",
+            epoch,
+        )
+
+    preserved = {
+        "merge_cursor": epoch.merge_cursor,
+        "merged_prefix": epoch.merged_prefix,
+        "remaining_queue_item_ids": epoch.remaining_queue_item_ids,
+        "active_queue_item_id": epoch.active_queue_item_id,
+        "active_task_id": epoch.active_task_id,
+        "active_backlog_id": epoch.active_backlog_id,
+        "last_merge_commit": epoch.last_merge_commit,
+        "status": epoch.status,
+    }
+    saved = upsert_integration_epoch(
+        conn,
+        replace(epoch, current_head=after),
+        now_iso=now_iso,
+    )
+    if any(getattr(saved, field) != value for field, value in preserved.items()):
+        raise RuntimeError(
+            "integration epoch re-anchor mutated serialized queue authority"
+        )
+    return saved
+
+
 def _merge_queue_item_possible_landed_evidence(
     item: MergeQueueItem,
 ) -> dict[str, Any]:
