@@ -2892,6 +2892,21 @@ _FRESH_REPAIR_EXTRA_SEMANTIC_KEYS = (
 )
 
 
+_FRESH_REPAIR_MIXED_QA_LEDGER_BENIGN_FIELDS = (
+    "candidate_specific_issues",
+    "candidate_new_failures",
+    "base_reproduction",
+    "candidate_suite_counts",
+    "refs",
+)
+
+
+_FRESH_REPAIR_MIXED_QA_LEDGER_AUTHORITY_FIELDS = (
+    "base_commit_sha",
+    "candidate_commit_sha",
+)
+
+
 _RETIRED_EXECUTION_AUTHORITY_KEY_CASES = (
     (
         "credential_session_fence_lease",
@@ -3178,6 +3193,11 @@ def test_failed_qa_repair_server_authority_schemas_have_no_classifier_drift():
     assert registry_audit["unclassified_source_names"] == []
     assert registry_audit["missing_registered_source_names"] == []
     assert registry_audit["overlapping_source_names"] == []
+    assert registry_audit["unclassified_field_paths"] == []
+    assert registry_audit["overlapping_field_paths"] == []
+    assert registry_audit["stale_partition_field_paths"] == []
+    assert registry_audit["missing_partition_source_names"] == []
+    assert registry_audit["unknown_partition_disposition_paths"] == []
     assert set(registry_audit["inventory_source_names"]) == set(
         registry_audit["registered_source_names"]
     )
@@ -3185,6 +3205,23 @@ def test_failed_qa_repair_server_authority_schemas_have_no_classifier_drift():
         set(registry_audit["authority_leaf_source_names"])
         | set(registry_audit["recursive_container_source_names"])
         | set(registry_audit["audited_non_authority_source_names"])
+    )
+    assert set(registry_audit["field_inventory_paths"]) == (
+        set(registry_audit["authority_leaf_field_paths"])
+        | set(registry_audit["recursive_container_field_paths"])
+        | set(registry_audit["audited_non_authority_field_paths"])
+    )
+    assert not (
+        set(registry_audit["authority_leaf_field_paths"])
+        & set(registry_audit["recursive_container_field_paths"])
+    )
+    assert not (
+        set(registry_audit["authority_leaf_field_paths"])
+        & set(registry_audit["audited_non_authority_field_paths"])
+    )
+    assert not (
+        set(registry_audit["recursive_container_field_paths"])
+        & set(registry_audit["audited_non_authority_field_paths"])
     )
     sources = server._contract_runtime_server_canonical_authority_field_sources()
     assert {
@@ -3206,7 +3243,21 @@ def test_failed_qa_repair_server_authority_schemas_have_no_classifier_drift():
         "_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS",
         "_QA_REVIEW_AUTHORITY_CONTAINERS",
     }.issubset(container_sources)
-    assert set(sources).isdisjoint(container_sources)
+    assert set(sources).intersection(container_sources) == {
+        "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS"
+    }
+    mixed_partitions = (
+        server._CONTRACT_RUNTIME_SERVER_CANONICAL_MIXED_SOURCE_PARTITIONS[
+            "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS"
+        ]
+    )
+    assert mixed_partitions["authority_leaf"] == set(
+        _FRESH_REPAIR_MIXED_QA_LEDGER_AUTHORITY_FIELDS
+    )
+    assert set(_FRESH_REPAIR_MIXED_QA_LEDGER_BENIGN_FIELDS).issubset(
+        mixed_partitions["recursive_container"]
+        | mixed_partitions["audited_non_authority"]
+    )
     assert server._CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS == {
         field_name
         for source_fields in container_sources.values()
@@ -3259,6 +3310,47 @@ def test_failed_qa_repair_registry_audit_flags_unclassified_schema(
     assert audit["complete"] is False
     assert audit["unclassified_source_names"] == [future_source]
     assert future_source not in audit["registered_source_names"]
+
+
+def test_failed_qa_repair_mixed_source_audit_flags_unclassified_future_field(
+    monkeypatch,
+):
+    source_name = "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS"
+    future_field = "future_qa_diagnostic_generation_binding"
+    original_fields = getattr(server, source_name)
+
+    try:
+        monkeypatch.setattr(
+            server,
+            source_name,
+            {*original_fields, future_field},
+        )
+        audit = (
+            server._contract_runtime_server_canonical_source_registry_audit()
+        )
+        assert audit["complete"] is False
+        assert audit["unclassified_field_paths"] == [
+            f"{source_name}.{future_field}"
+        ]
+
+        refreshed = (
+            server._contract_runtime_refresh_canonical_authority_field_inventory()
+        )
+        assert future_field not in refreshed
+        assert future_field not in (
+            server._contract_runtime_server_canonical_authority_field_sources()[
+                source_name
+            ]
+        )
+        assert (
+            server._contract_runtime_key_is_execution_authority_or_credential(
+                future_field
+            )
+            is False
+        )
+    finally:
+        monkeypatch.setattr(server, source_name, original_fields)
+        server._contract_runtime_refresh_canonical_authority_field_inventory()
 
 
 def test_failed_qa_repair_dispatch_runtime_schema_refreshes_future_fields(
@@ -3739,6 +3831,101 @@ def test_mf_parallel_rev10_failed_qa_preserves_benign_container_dicts():
     assert action["copy_safe_body"]["acceptance_criteria"] == (
         acceptance_criteria
     )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("candidate_specific_issues", ["plain scoped diagnostic"]),
+        ("candidate_new_failures", ["plain candidate diagnostic"]),
+        (
+            "base_reproduction",
+            {
+                "reproduced": True,
+                "total": 1,
+                "failure_identities": ["plain baseline diagnostic"],
+            },
+        ),
+        (
+            "candidate_suite_counts",
+            {"passed": 3, "failed": 1, "baseline_known_non_green": 1},
+        ),
+        ("refs", ["plain audit label"]),
+        ("failure_summary", "plain failure summary"),
+    ),
+)
+def test_mf_parallel_rev10_failed_qa_preserves_mixed_qa_diagnostics(
+    field_name,
+    field_value,
+):
+    criterion = {
+        "id": f"AC-REV10-MIXED-QA-{field_name.upper()}",
+        "text": "Diagnostic QA metadata remains copy-safe.",
+        "required_scope": ["agent/governance/server.py"],
+        "extra_semantics": {field_name: field_value},
+    }
+    record = _rev10_failed_qa_fresh_repair_record(
+        [criterion],
+        backlog_id=f"AC-REV10-MIXED-QA-{field_name.upper()}",
+        contract_execution_id=f"cex-rev10-mixed-qa-{field_name}",
+    )
+
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+
+    assert (
+        server._contract_runtime_key_is_execution_authority_or_credential(
+            field_name
+        )
+        is False
+    )
+    assert action["actionable"] is True
+    assert action["action_input_ready"] is True
+    assert action["unsafe_action_input_paths"] == []
+    assert action["copy_safe_body"]["acceptance_criteria"] == [criterion]
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    _FRESH_REPAIR_MIXED_QA_LEDGER_AUTHORITY_FIELDS,
+)
+def test_mf_parallel_rev10_failed_qa_rejects_mixed_qa_commit_authority(
+    field_name,
+):
+    sentinel = f"retired-{field_name}-sentinel"
+    record = _rev10_failed_qa_fresh_repair_record(
+        [
+            {
+                "id": "AC-REV10-MIXED-QA-COMMIT-AUTHORITY",
+                "text": "Historical comparison commits are not reusable.",
+                "required_scope": ["agent/governance/server.py"],
+                "extra_semantics": {field_name: sentinel},
+            }
+        ],
+        backlog_id="AC-REV10-MIXED-QA-COMMIT-AUTHORITY",
+        contract_execution_id="cex-rev10-mixed-qa-commit-authority",
+    )
+
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+
+    assert (
+        server._contract_runtime_server_canonical_field_dispositions(
+            "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS",
+            field_name,
+        )
+        == ("authority_leaf",)
+    )
+    assert action["actionable"] is False
+    assert action["action_input_ready"] is False
+    assert action["action_input"] == {}
+    assert action["copy_safe_body"] == {}
+    assert action["unsafe_action_input_paths"] == [
+        f"acceptance_criteria[0].extra_semantics.{field_name}"
+    ]
+    assert sentinel not in json.dumps(action, sort_keys=True)
 
 
 @pytest.mark.parametrize(

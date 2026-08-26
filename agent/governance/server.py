@@ -99425,6 +99425,38 @@ _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION = {
         }
     ),
 }
+# Some canonical collections combine execution-binding leaves with diagnostic
+# fields or recursive evidence containers.  These sources must enumerate every
+# field explicitly: a future field is neither silently trusted nor blanket
+# denied until its disposition is reviewed.
+_CONTRACT_RUNTIME_SERVER_CANONICAL_MIXED_SOURCE_PARTITIONS = {
+    "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS": {
+        "authority_leaf": frozenset(
+            {
+                "base_commit_sha",
+                "candidate_commit_sha",
+            }
+        ),
+        "recursive_container": frozenset(
+            {
+                "base_reproduction",
+                "candidate_suite_counts",
+            }
+        ),
+        "audited_non_authority": frozenset(
+            {
+                "base_failure_identities",
+                "candidate_failure_identities",
+                "candidate_new_failures",
+                "candidate_specific_issues",
+                "no_pass_claim",
+                "overall_release_pass_claimed",
+                "refs",
+                "schema_version",
+            }
+        ),
+    },
+}
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES: tuple[str, ...] = ()
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES: tuple[
     str, ...
@@ -99472,9 +99504,52 @@ def _contract_runtime_server_canonical_collection_sources(
     )
 
 
+def _contract_runtime_server_canonical_field_dispositions(
+    source_name: Any,
+    field_name: Any,
+) -> tuple[str, ...]:
+    source = str(source_name or "")
+    field = str(field_name or "")
+    mixed_partitions = (
+        _CONTRACT_RUNTIME_SERVER_CANONICAL_MIXED_SOURCE_PARTITIONS.get(source)
+    )
+    if isinstance(mixed_partitions, Mapping):
+        return tuple(
+            disposition
+            for disposition, partition_fields in mixed_partitions.items()
+            if field in partition_fields
+        )
+    if source in (
+        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
+            "authority_leaf"
+        ]
+    ):
+        return (
+            ("authority_leaf",)
+            if parallel_branch_authority_field_is_nontransferable(field)
+            else ("audited_non_authority",)
+        )
+    if source in (
+        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
+            "recursive_container"
+        ]
+    ):
+        return ("recursive_container",)
+    if source in (
+        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
+            "audited_non_authority"
+        ]
+    ):
+        return ("audited_non_authority",)
+    return ()
+
+
 def _contract_runtime_server_canonical_source_registry_audit(
 ) -> dict[str, Any]:
-    inventory = set(_contract_runtime_server_canonical_collection_sources())
+    collection_sources = (
+        _contract_runtime_server_canonical_collection_sources()
+    )
+    inventory = set(collection_sources)
     dispositions = {
         disposition: set(source_names)
         for disposition, source_names in (
@@ -99493,8 +99568,72 @@ def _contract_runtime_server_canonical_source_registry_audit(
     )
     unclassified = sorted(inventory - registered)
     missing = sorted(registered - inventory)
+    field_memberships: dict[str, tuple[str, ...]] = {}
+    for source_name, source_fields in collection_sources.items():
+        if source_name not in registered:
+            continue
+        for field_name in source_fields:
+            field_path = f"{source_name}.{field_name}"
+            field_memberships[field_path] = (
+                _contract_runtime_server_canonical_field_dispositions(
+                    source_name,
+                    field_name,
+                )
+            )
+    unclassified_fields = sorted(
+        field_path
+        for field_path, field_dispositions in field_memberships.items()
+        if not field_dispositions
+    )
+    overlapping_fields = sorted(
+        field_path
+        for field_path, field_dispositions in field_memberships.items()
+        if len(field_dispositions) > 1
+    )
+    field_paths_by_disposition = {
+        disposition: sorted(
+            field_path
+            for field_path, field_dispositions in field_memberships.items()
+            if field_dispositions == (disposition,)
+        )
+        for disposition in (
+            "authority_leaf",
+            "recursive_container",
+            "audited_non_authority",
+        )
+    }
+    stale_partition_fields: list[str] = []
+    missing_partition_sources: list[str] = []
+    unknown_partition_dispositions: list[str] = []
+    for source_name, source_partitions in (
+        _CONTRACT_RUNTIME_SERVER_CANONICAL_MIXED_SOURCE_PARTITIONS.items()
+    ):
+        source_fields = collection_sources.get(source_name)
+        if source_fields is None:
+            missing_partition_sources.append(source_name)
+            continue
+        for disposition, partition_fields in source_partitions.items():
+            if disposition not in field_paths_by_disposition:
+                unknown_partition_dispositions.append(
+                    f"{source_name}.{disposition}"
+                )
+                continue
+            stale_partition_fields.extend(
+                f"{source_name}.{field_name}"
+                for field_name in partition_fields
+                if field_name not in source_fields
+            )
     return {
-        "complete": not (overlapping or unclassified or missing),
+        "complete": not (
+            overlapping
+            or unclassified
+            or missing
+            or unclassified_fields
+            or overlapping_fields
+            or stale_partition_fields
+            or missing_partition_sources
+            or unknown_partition_dispositions
+        ),
         "inventory_source_names": sorted(inventory),
         "registered_source_names": sorted(registered),
         "authority_leaf_source_names": sorted(
@@ -99509,6 +99648,25 @@ def _contract_runtime_server_canonical_source_registry_audit(
         "overlapping_source_names": overlapping,
         "unclassified_source_names": unclassified,
         "missing_registered_source_names": missing,
+        "field_inventory_paths": sorted(field_memberships),
+        "authority_leaf_field_paths": field_paths_by_disposition[
+            "authority_leaf"
+        ],
+        "recursive_container_field_paths": field_paths_by_disposition[
+            "recursive_container"
+        ],
+        "audited_non_authority_field_paths": field_paths_by_disposition[
+            "audited_non_authority"
+        ],
+        "unclassified_field_paths": unclassified_fields,
+        "overlapping_field_paths": overlapping_fields,
+        "stale_partition_field_paths": sorted(stale_partition_fields),
+        "missing_partition_source_names": sorted(
+            missing_partition_sources
+        ),
+        "unknown_partition_disposition_paths": sorted(
+            unknown_partition_dispositions
+        ),
     }
 
 
@@ -99540,13 +99698,19 @@ def _contract_runtime_server_canonical_authority_field_sources(
 ) -> dict[str, frozenset[str]]:
     inventory = _contract_runtime_server_canonical_collection_sources()
     return {
-        source_name: inventory[source_name]
-        for source_name in sorted(
-            _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
-                "authority_leaf"
-            ]
+        source_name: partition_fields
+        for source_name in sorted(inventory)
+        if (
+            partition_fields := frozenset(
+                field_name
+                for field_name in inventory[source_name]
+                if "authority_leaf"
+                in _contract_runtime_server_canonical_field_dispositions(
+                    source_name,
+                    field_name,
+                )
+            )
         )
-        if source_name in inventory
     }
 
 
@@ -99554,13 +99718,19 @@ def _contract_runtime_server_canonical_authority_container_sources(
 ) -> dict[str, frozenset[str]]:
     inventory = _contract_runtime_server_canonical_collection_sources()
     return {
-        source_name: inventory[source_name]
-        for source_name in sorted(
-            _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
-                "recursive_container"
-            ]
+        source_name: partition_fields
+        for source_name in sorted(inventory)
+        if (
+            partition_fields := frozenset(
+                field_name
+                for field_name in inventory[source_name]
+                if "recursive_container"
+                in _contract_runtime_server_canonical_field_dispositions(
+                    source_name,
+                    field_name,
+                )
+            )
         )
-        if source_name in inventory
     }
 
 
@@ -99582,7 +99752,6 @@ def _contract_runtime_refresh_canonical_authority_field_inventory(
             field_name
             for field_source in sources.values()
             for field_name in field_source
-            if parallel_branch_authority_field_is_nontransferable(field_name)
         }
     )
     _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = derived

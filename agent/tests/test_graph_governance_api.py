@@ -136174,6 +136174,21 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
         backlog_id=backlog_id,
         route_token_ref="",
     )
+    mixed_qa_diagnostics = {
+        "candidate_specific_issues": ["plain scoped diagnostic"],
+        "candidate_new_failures": ["plain candidate diagnostic"],
+        "base_reproduction": {
+            "reproduced": True,
+            "total": 1,
+            "failure_identities": ["plain baseline diagnostic"],
+        },
+        "candidate_suite_counts": {
+            "passed": 3,
+            "failed": 1,
+            "baseline_known_non_green": 1,
+        },
+        "refs": ["plain audit label"],
+    }
     acceptance_criteria = [
         {
             "id": f"AC-REV10-FAILED-QA-ONBOARD-FRESH-ROW-{index}",
@@ -136191,6 +136206,11 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
                 "agent/governance/server.py",
                 "agent/tests/test_graph_governance_api.py",
             ],
+            **(
+                {"extra_semantics": mixed_qa_diagnostics}
+                if index == 1
+                else {}
+            ),
         }
         for index in range(1, 8)
     ]
@@ -136406,7 +136426,7 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
     canonical = guide["canonical_executable_action"]
     assert canonical["mcp_tool"] == "backlog_upsert"
     body = canonical["copy_safe_body"]
-    assert 5_500 <= server._onboard_guide_capsule_serialized_bytes(body) <= 7_500
+    assert 5_500 <= server._onboard_guide_capsule_serialized_bytes(body) <= 8_000
     assert body["bug_id"].startswith(f"{backlog_id}-QA-REPAIR-")
     assert body["target_files"] == ["agent/governance/server.py"]
     assert body["test_files"] == [
