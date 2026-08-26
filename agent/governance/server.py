@@ -164980,6 +164980,37 @@ def _contract_runtime_precommit_correction_intent_requested(
     )
 
 
+def _contract_runtime_precommit_correction_intent_matches_canonical_revision(
+    correction_intent: Any,
+    *,
+    contract_execution_id: str,
+    runtime_context_id: str,
+    task_id: str,
+    prior_revision: Mapping[str, Any],
+) -> bool:
+    """Return whether a correction is an exact replay of a canonical revision."""
+
+    return bool(
+        isinstance(correction_intent, Mapping)
+        and str(correction_intent.get("schema_version") or "").strip()
+        == "runtime_context.precommit_implementation_correction_intent.v1"
+        and str(correction_intent.get("action") or "").strip()
+        == "revise_precommit_worker_implementation"
+        and str(correction_intent.get("contract_execution_id") or "").strip()
+        == contract_execution_id
+        and str(correction_intent.get("runtime_context_id") or "").strip()
+        == runtime_context_id
+        and str(correction_intent.get("task_id") or "").strip() == task_id
+        and str(
+            correction_intent.get("prior_implementation_lineage_ref") or ""
+        ).strip()
+        == str(
+            prior_revision.get("supersedes_implementation_lineage_ref") or ""
+        ).strip()
+        and prior_revision
+    )
+
+
 def _contract_runtime_completed_line_projection_preflight_gate(
     conn,
     *,
@@ -165056,22 +165087,16 @@ def _contract_runtime_completed_line_projection_preflight_gate(
             )
             else {}
         )
-        exact_idempotent_projection = bool(
-            isinstance(correction_intent, Mapping)
-            and str(correction_intent.get("action") or "").strip()
-            == "revise_precommit_worker_implementation"
-            and str(correction_intent.get("contract_execution_id") or "").strip()
-            == str(record.get("contract_execution_id") or "").strip()
-            and str(correction_intent.get("runtime_context_id") or "").strip()
-            == runtime_context_id
-            and str(correction_intent.get("task_id") or "").strip() == task_id
-            and str(
-                correction_intent.get("prior_implementation_lineage_ref") or ""
-            ).strip()
-            == str(
-                prior_revision.get("supersedes_implementation_lineage_ref") or ""
-            ).strip()
-            and prior_revision
+        exact_idempotent_projection = (
+            _contract_runtime_precommit_correction_intent_matches_canonical_revision(
+                correction_intent,
+                contract_execution_id=str(
+                    record.get("contract_execution_id") or ""
+                ).strip(),
+                runtime_context_id=runtime_context_id,
+                task_id=task_id,
+                prior_revision=prior_revision,
+            )
         )
         if not exact_idempotent_projection:
             return {}

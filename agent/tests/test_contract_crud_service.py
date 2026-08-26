@@ -29,6 +29,7 @@ from agent.governance.contracts.runtime import (
 )
 from agent.governance.contracts.hash import stable_sha256
 from agent.governance.server import (
+    _contract_runtime_precommit_correction_intent_matches_canonical_revision,
     _contract_runtime_precommit_correction_intent_requested,
     _contract_runtime_direct_fix_close_authority_gate,
     _contract_runtime_mf_parallel_concurrent_sibling_writer_rebase,
@@ -1385,6 +1386,37 @@ def test_precommit_correction_intent_bypasses_completed_line_projection():
             },
         }
     ) is True
+
+    match_kwargs = {
+        "contract_execution_id": "cex-precommit-projection-bypass",
+        "runtime_context_id": "mfrctx-precommit-projection-bypass",
+        "task_id": "task-precommit-projection-bypass",
+        "prior_revision": {
+            "supersedes_implementation_lineage_ref": (
+                "contract-runtime:implementation:prior"
+            ),
+        },
+    }
+    assert (
+        _contract_runtime_precommit_correction_intent_matches_canonical_revision(
+            intent,
+            **match_kwargs,
+        )
+        is True
+    )
+    for invalid_schema in (None, "runtime_context.precommit_correction.v0"):
+        malformed_intent = dict(intent)
+        if invalid_schema is None:
+            malformed_intent.pop("schema_version")
+        else:
+            malformed_intent["schema_version"] = invalid_schema
+        assert (
+            _contract_runtime_precommit_correction_intent_matches_canonical_revision(
+                malformed_intent,
+                **match_kwargs,
+            )
+            is False
+        )
     assert _contract_runtime_precommit_correction_intent_requested(
         {
             "event_kind": "implementation",
