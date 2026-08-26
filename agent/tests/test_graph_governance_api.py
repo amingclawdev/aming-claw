@@ -22555,6 +22555,23 @@ def test_mf_batch_child_live_shape_projects_consumed_legacy_candidate_qa(
         assert "observer_reconcile" in projected_line_ids, json.dumps(
             projection, sort_keys=True
         )
+        projected_reconcile = next(
+            line
+            for line in projected["completed_lines"]
+            if line.get("line_id") == "observer_reconcile"
+        )
+        # The line records what was reconciled: the final Batch fan-in head.
+        # The embedded authority separately retains this child's own durable
+        # merge commit, which is an intermediate prefix for the first row.
+        assert projected_reconcile["commit_sha"] == world.final_head
+        projected_reconcile_authority = projected_reconcile["payload"][
+            "reconcile_authority"
+        ]
+        assert projected_reconcile_authority["merged_commit_sha"] == (
+            world.child_commits[index]
+        )
+        if index == 0:
+            assert world.child_commits[index] != world.final_head
 
         authority = server._contract_runtime_rev8_postmerge_qa_authority(
             conn,

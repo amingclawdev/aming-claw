@@ -122663,6 +122663,25 @@ def _contract_runtime_rev8_postmerge_qa_authority(
             )
             else {}
         )
+        projected_reconcile_line_commit = str(
+            reconcile_line.get("commit_sha") or ""
+        ).strip().lower()
+        projected_reconcile_line_commit_verified = bool(
+            projected_reconcile_line_commit == merged_commit
+            or (
+                declared_batch_child
+                and _contract_runtime_shared_batch_postmerge_qa_activation_verified(
+                    projected_reconcile_authority
+                )
+                and projected_reconcile_line_commit
+                == str(
+                    projected_reconcile_authority.get(
+                        "reconciled_commit_sha"
+                    )
+                    or ""
+                ).strip().lower()
+            )
+        )
         if not (
             str(reconcile_payload.get("schema_version") or "")
             == "mf_parallel.runtime_context_post_worker_line_projection.v1"
@@ -122682,8 +122701,7 @@ def _contract_runtime_rev8_postmerge_qa_authority(
             and str(reconcile_line.get("task_id") or "") == task_id
             and str(reconcile_line.get("parent_task_id") or "")
             == parent_task_id
-            and str(reconcile_line.get("commit_sha") or "").lower()
-            == merged_commit
+            and projected_reconcile_line_commit_verified
             and _contract_runtime_current_full_reconcile_activation_verified(
                 projected_reconcile_authority
             )
