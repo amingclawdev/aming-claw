@@ -136184,7 +136184,7 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
                 + (
                     "The compact guide must retain every canonical field "
                     "without client-side reconstruction or stale authority. "
-                    * 5
+                    * 6
                 )
             ),
             "required_scope": [
@@ -136390,6 +136390,7 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
     assert guide["status"] == "fresh_bounded_repair_action_ready"
     assert guide["mcp_tool"] == "backlog_upsert"
     assert guide["actionable"] is True
+    assert 12_000 <= guide["serialized_bytes"]
     assert guide["serialized_bytes"] <= guide["max_serialized_bytes"]
     assert len(json.dumps(guide, sort_keys=True).encode("utf-8")) <= (
         server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES

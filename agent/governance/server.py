@@ -99340,18 +99340,25 @@ def _caller_timeline_key_is_credential(key: Any) -> bool:
 _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX = {
     "credential": frozenset(
         {
+            "access_token",
             "api_key",
             "authorization",
             "fence_token",
+            "fence_token_hash",
             "fence_token_ref",
+            "fence_token_verifier",
             "password",
             "qa_session_token",
             "qa_session_token_ref",
             "route_token",
+            "route_token_hash",
             "route_token_ref",
             "secret",
             "session_token",
+            "session_token_hash",
             "session_token_ref",
+            "source_fence_token_hash",
+            "source_session_token_ref",
             "token",
             "worker_session_token",
             "worker_session_token_ref",
@@ -99361,31 +99368,67 @@ _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX = {
         {
             "actual_host_worker_id",
             "agent_id",
+            "active_task_id",
+            "coordination_reconcile_task_id",
+            "contract_chain_id",
             "contract_execution_id",
+            "contract_hash",
+            "contract_revision_id",
+            "correction_id",
             "current_contract_execution_id",
+            "definition_hash",
+            "execution_state_hash",
+            "execution_state_revision",
             "host_startup_id",
             "host_worker_id",
+            "instance_id",
+            "instruction_bundle_hash",
             "lane_id",
+            "line_instance_id",
             "parent_contract_execution_id",
             "parent_task_id",
+            "reconcile_runtime_context_id",
+            "reconcile_task_id",
             "root_contract_execution_id",
+            "root_task_id",
+            "route_task_id",
+            "runtime_guide_hash",
             "runtime_context_id",
+            "source_authority_sha256",
+            "source_execution_state_revision",
+            "source_implementation_lineage_ref",
+            "source_line_instance_id",
+            "source_line_sha256",
+            "source_test_results_sha256",
+            "stage_task_id",
             "successor_contract_execution_id",
             "task_id",
             "worker_id",
             "worker_slot_id",
+            "worker_task_id",
+            "qa_graph_trace_task_id",
+            "qa_scope_task_id",
         }
     ),
     "session_identity": frozenset(
         {
             "host_session_id",
+            "lease_id",
             "observer_session_id",
             "observer_session_ref",
+            "qa_session_id",
             "session",
+            "session_authority_event_ref",
             "session_id",
+            "session_identity_hash",
+            "session_lease_id",
             "session_ref",
+            "transcript_path",
+            "transcript_ref",
             "worker_session_id",
             "worker_session_ref",
+            "worker_transcript_path",
+            "worker_transcript_ref",
         }
     ),
     "project_root": frozenset(
@@ -99403,12 +99446,14 @@ _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX = {
         {
             "assigned_worktree",
             "worker_worktree_path",
+            "worktree_id",
             "worktree_path",
         }
     ),
     "branch": frozenset(
         {
             "branch_ref",
+            "branch",
             "git_branch",
             "ref_name",
             "target_branch",
@@ -99444,12 +99489,198 @@ _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX = {
         {
             *_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS,
             *_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS,
+            "accepted_route_identity",
             "accepted_dispatch_authority",
+            "active_route_identity",
+            "canonical_identity_binding",
             "canonical_route_identity",
+            "child_route_identity",
+            "current_route_identity",
+            "expected_binding",
+            "identity_binding_hash",
+            "qa_scope_binding_ref",
             "route_gate",
             "route_identity",
+            "route_identity_hash",
             "route_token_gate",
             "server_derived_authority",
+        }
+    ),
+    "graph_and_commit": frozenset(
+        {
+            "active_checkpoint_id",
+            "active_epoch_id",
+            "active_graph_commit",
+            "active_snapshot_commit",
+            "active_snapshot_commit_sha",
+            "active_snapshot_id",
+            "authority_hash",
+            "base_commit",
+            "base_commit_sha",
+            "base_snapshot_id",
+            "candidate_commit",
+            "candidate_commit_sha",
+            "candidate_diff_hash",
+            "canonical_head_commit",
+            "canonical_head_commit_sha",
+            "canonical_project_identity_hash",
+            "canonical_snapshot_id",
+            "canonical_target_head_commit",
+            "checkpoint_id",
+            "comparison_base_commit_sha",
+            "current_active_snapshot_commit_sha",
+            "current_active_snapshot_id",
+            "current_canonical_commit_sha",
+            "current_canonical_head_commit_sha",
+            "current_graph_snapshot_id",
+            "current_head",
+            "current_stage_checkpoint_id",
+            "current_target_head",
+            "diff_base_commit",
+            "diff_hash",
+            "epoch_id",
+            "execution_state_hash",
+            "graph_basis_decision_hash",
+            "graph_commit",
+            "graph_commit_sha",
+            "graph_hash",
+            "graph_query_trace_id",
+            "graph_query_trace_ids",
+            "graph_snapshot_commit",
+            "graph_snapshot_commit_sha",
+            "graph_snapshot_id",
+            "graph_trace_id",
+            "graph_trace_ids",
+            "head_commit",
+            "identity_hash",
+            "immutable_head_commit",
+            "integration_epoch_id",
+            "merge_commit",
+            "merge_commit_sha",
+            "merge_head_commit",
+            "merge_head_sha",
+            "merged_commit",
+            "merged_commit_sha",
+            "projection_hash",
+            "projection_watermark",
+            "provenance_hash",
+            "qa_snapshot_commit",
+            "qa_snapshot_id",
+            "query_root_commit",
+            "query_root_commit_sha",
+            "query_root_head_commit",
+            "query_root_head_sha",
+            "query_root_identity_hash",
+            "reconcile_commit",
+            "reconcile_commit_sha",
+            "reconcile_head_commit",
+            "reconcile_head_sha",
+            "reconcile_snapshot_commit",
+            "reconcile_snapshot_id",
+            "reconciled_commit",
+            "reconciled_commit_sha",
+            "repository_identity_hash",
+            "root_identity_hash",
+            "snapshot_commit",
+            "snapshot_commit_sha",
+            "snapshot_hash",
+            "snapshot_id",
+            "stage_checkpoint_id",
+            "state_hash",
+            "target_commit",
+            "target_commit_sha",
+            "target_head_commit",
+            "target_head_sha",
+            "trace_id",
+            "trace_ids",
+            "trace_commit_sha",
+            "trace_snapshot_id",
+            "worker_commit",
+            "worker_commit_sha",
+        }
+    ),
+    "dispatch": frozenset(
+        {
+            "accepted_dispatch_authority",
+            "accepted_dispatch_identity",
+            "canonical_dispatch_identity",
+            "contract_runtime_dispatch_identity",
+            "contract_runtime_dispatch_revision",
+            "contract_runtime_dispatch_source_ref",
+            "dispatch_acceptance_ref",
+            "dispatch_authority",
+            "dispatch_authority_hash",
+            "dispatch_completed_line_ref",
+            "dispatch_context",
+            "dispatch_event_ref",
+            "dispatch_evidence",
+            "dispatch_identity",
+            "dispatch_identity_hash",
+            "dispatch_line_hash",
+            "dispatch_source_ref",
+            "dispatch_ticket",
+            "dispatch_ticket_authority",
+            "dispatch_worker_hash",
+            "runtime_dispatch_evidence",
+            "ticket_authority_source_ref",
+            "worker_commit_source_ref",
+        }
+    ),
+    "merge_reconcile_qa": frozenset(
+        {
+            "candidate_review_context",
+            "current_full_reconcile_marker",
+            "current_full_reconcile_provenance",
+            "durable_merge_authority",
+            "graph_review_context",
+            "graph_trace_evidence",
+            "implementation_event_ref",
+            "implementation_lineage_ref",
+            "implementation_source_ref",
+            "materialize_event_id",
+            "materialize_event_ref",
+            "materialize_source_ref",
+            "merge_event_id",
+            "merge_event_ref",
+            "merge_source_ref",
+            "post_merge_provenance",
+            "qa_event_id",
+            "qa_event_ref",
+            "qa_graph_trace_db_evidence",
+            "qa_receipt_ref",
+            "qa_report_ref",
+            "qa_source_ref",
+            "read_receipt_event_id",
+            "read_receipt_event_ref",
+            "read_receipt_hash",
+            "read_receipt_ref",
+            "read_receipt_source_ref",
+            "receipt_event_id",
+            "receipt_event_ref",
+            "receipt_hash",
+            "receipt_ref",
+            "receipt_source_ref",
+            "reconcile_authority",
+            "reconcile_event_id",
+            "reconcile_event_ref",
+            "reconcile_source_ref",
+            "rejoin_event_id",
+            "rejoin_event_ref",
+            "rejoin_source_ref",
+            "review_event_id",
+            "review_event_ref",
+            "review_source_ref",
+            "selected_atomic_lane_authority",
+            "source_merge_event_ref",
+            "source_qa_event_ref",
+            "source_reconcile_event_ref",
+            "worker_commit_event_ref",
+        }
+    ),
+    "server_only_provenance": frozenset(
+        {
+            "failed_qa_source_ref",
+            "provenance_paths",
         }
     ),
 }
@@ -99461,36 +99692,24 @@ _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_DENYLIST = frozenset(
 _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_SUFFIXES = (
     "apikey",
     "authorization",
-    "branch",
-    "branchref",
-    "commandid",
-    "contractexecutionid",
     "credential",
     "credentials",
-    "fence",
-    "fenceref",
-    "identity",
-    "laneid",
-    "mergequeueid",
+    "authorityhash",
+    "diffhash",
+    "executionstatehash",
+    "executionstaterevision",
+    "identityhash",
+    "lineinstanceid",
     "password",
     "passphrase",
-    "projectroot",
-    "queueitemid",
-    "reporoot",
-    "routecontexthash",
-    "routeid",
+    "provenancehash",
     "secret",
-    "session",
-    "sessionid",
-    "sessionref",
-    "taskid",
+    "snapshotid",
+    "statehash",
     "token",
     "tokenref",
-    "workerid",
-    "workerslotid",
-    "worktree",
-    "worktreepath",
-    "worktreeroot",
+    "traceid",
+    "traceids",
 )
 
 
@@ -106950,11 +107169,7 @@ def _contract_runtime_failed_qa_fresh_repair_action(
         "source_runtime_authority_reusable": False,
         "historical_contract_successor": historical_direct_fix,
         "forbidden_authority_reuse": sorted(
-            key
-            for aliases in (
-                _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX.values()
-            )
-            for key in aliases
+            _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX
         ),
         "next_after_success": {
             "interface": "onboard_route_guide",
@@ -148235,6 +148450,8 @@ _ONBOARD_GUIDE_CAPSULE_SECTION_MAX_SERIALIZED_BYTES = 6 * 1024
 _ONBOARD_GUIDE_CAPSULE_MAX_FETCH_SECTIONS = 3
 _ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_ITEMS = 32
 _ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_CHARS = 512
+_ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_TOTAL_MAX_CHARS = 4 * 1024
+_ONBOARD_GUIDE_FORBIDDEN_AUTHORITY_REUSE_MAX_ITEMS = 64
 _ONBOARD_GUIDE_CAPSULE_TTL_SECONDS = 300.0
 _ONBOARD_GUIDE_CAPSULE_MAX_ENTRIES = 128
 _ONBOARD_GUIDE_CAPSULE_SINGLE_FLIGHT_WAIT_SECONDS = 5.0
@@ -148255,6 +148472,28 @@ _ONBOARD_GUIDE_CAPSULE_METRICS = {
     "single_flight_joins": 0,
     "auth_generation_rejections": 0,
 }
+
+
+def _onboard_guide_bounded_unsafe_action_input_paths(
+    paths: Sequence[Any],
+) -> list[str]:
+    bounded: list[str] = []
+    total_chars = 0
+    for raw_path in paths:
+        path = str(raw_path or "").strip()
+        if not path:
+            continue
+        path = path[:_ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_CHARS]
+        if (
+            total_chars + len(path)
+            > _ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_TOTAL_MAX_CHARS
+        ):
+            break
+        bounded.append(path)
+        total_chars += len(path)
+        if len(bounded) >= _ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_ITEMS:
+            break
+    return bounded
 
 
 def _onboard_guide_capsule_auth_generation(
@@ -152382,15 +152621,11 @@ def _onboard_route_guide_compact_service_response(
             "action_input_missing_fields": list(
                 next_action.get("action_input_missing_fields") or []
             ),
-            "unsafe_action_input_paths": [
-                str(item)[
-                    :_ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_CHARS
-                ]
-                for item in (
+            "unsafe_action_input_paths": (
+                _onboard_guide_bounded_unsafe_action_input_paths(
                     next_action.get("unsafe_action_input_paths") or []
                 )
-                if str(item or "").strip()
-            ][:_ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_ITEMS],
+            ),
             "server_derived_authority": (
                 dict(next_action.get("server_derived_authority"))
                 if isinstance(
@@ -152497,7 +152732,7 @@ def _onboard_route_guide_compact_service_response(
             ),
             "forbidden_authority_reuse": list(
                 next_action.get("forbidden_authority_reuse") or []
-            ),
+            )[:_ONBOARD_GUIDE_FORBIDDEN_AUTHORITY_REUSE_MAX_ITEMS],
             "next_after_success": (
                 deepcopy(dict(next_action.get("next_after_success")))
                 if isinstance(next_action.get("next_after_success"), Mapping)

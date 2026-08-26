@@ -2755,6 +2755,10 @@ def test_mf_parallel_rev10_failed_qa_files_copy_safe_fresh_repair_row():
     assert body["target_files"] == ["agent/governance/server.py"]
     assert body["test_files"] == ["agent/tests/test_contract_runtime.py"]
     assert body["acceptance_criteria"] == acceptance_criteria
+    assert body["provenance_paths"] == [action["failed_qa_source_ref"]]
+    assert action["failed_qa_source_ref"].startswith(
+        "contract_runtime:cex-rev10-stale-source:completed_lines:"
+    )
     assert action["canonical_executable_action"]["copy_safe_body"] == body
     assert action["next_after_success"]["body"]["backlog_id"] == body[
         "bug_id"
@@ -2822,36 +2826,311 @@ def _rev10_failed_qa_fresh_repair_record(
     }
 
 
-def test_mf_parallel_rev10_failed_qa_rejects_nested_acceptance_authority():
+_RETIRED_EXECUTION_AUTHORITY_KEY_CASES = (
+    (
+        "credential_session_fence_lease",
+        (
+            "route_token_hash",
+            "session_token_hash",
+            "fence_token_hash",
+            "fence_token_verifier",
+            "source_session_token_ref",
+            "source_fence_token_hash",
+            "host_session_id",
+            "observer_session_id",
+            "observer_session_ref",
+            "worker_session_id",
+            "worker_session_ref",
+            "qa_session_id",
+            "lease_id",
+            "session_lease_id",
+            "host_startup_id",
+            "actual_host_worker_id",
+            "worker_transcript_ref",
+            "worker_transcript_path",
+            "transcript_ref",
+            "transcript_path",
+            "session_authority_event_ref",
+            "session_identity_hash",
+            "route_token_ref",
+            "session_token_ref",
+            "fence_token_ref",
+        ),
+    ),
+    (
+        "execution_submit_identity",
+        (
+            "contract_chain_id",
+            "worker_task_id",
+            "reconcile_runtime_context_id",
+            "reconcile_task_id",
+            "root_task_id",
+            "stage_task_id",
+            "active_task_id",
+            "line_instance_id",
+            "instance_id",
+            "source_line_instance_id",
+            "execution_state_revision",
+            "source_execution_state_revision",
+            "execution_state_hash",
+            "definition_hash",
+            "instruction_bundle_hash",
+            "runtime_guide_hash",
+            "contract_hash",
+            "contract_revision_id",
+            "observer_command_id",
+            "correction_id",
+            "source_authority_sha256",
+            "source_line_sha256",
+            "source_implementation_lineage_ref",
+            "source_test_results_sha256",
+            "contract_execution_id",
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "root_task_id",
+            "stage_task_id",
+            "active_task_id",
+            "route_task_id",
+            "qa_scope_task_id",
+            "qa_graph_trace_task_id",
+            "coordination_reconcile_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "lane_id",
+        ),
+    ),
+    (
+        "route_binding",
+        (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "route_token_ref",
+            "visible_injection_manifest_hash",
+            "route_identity_hash",
+            "identity_binding_hash",
+            "canonical_identity_binding",
+            "qa_scope_binding_ref",
+            "accepted_route_identity",
+            "active_route_identity",
+            "child_route_identity",
+            "current_route_identity",
+            "expected_binding",
+            "route_identity",
+            "route_gate",
+            "route_token_gate",
+            "canonical_route_identity",
+        ),
+    ),
+    (
+        "location",
+        (
+            "project_root",
+            "repo_root",
+            "repo_root_path",
+            "target_graph_root",
+            "target_project_root",
+            "workspace_root",
+            "worktree_root",
+            "worktree_path",
+            "worker_worktree_path",
+            "assigned_worktree",
+            "worktree_id",
+            "branch_ref",
+            "branch",
+            "worktree_branch",
+            "git_branch",
+            "target_branch",
+            "target_ref",
+            "ref_name",
+            "worker_transcript_ref",
+            "worker_transcript_path",
+            "transcript_ref",
+            "transcript_path",
+        ),
+    ),
+    (
+        "commit_graph",
+        (
+            "base_commit",
+            "base_commit_sha",
+            "head_commit",
+            "target_head_commit",
+            "current_target_head",
+            "canonical_head_commit",
+            "merged_commit_sha",
+            "merge_commit_sha",
+            "reconciled_commit_sha",
+            "reconcile_commit_sha",
+            "snapshot_commit_sha",
+            "query_root_head_commit",
+            "query_root_commit",
+            "query_root_commit_sha",
+            "query_root_head_sha",
+            "active_snapshot_id",
+            "active_snapshot_commit_sha",
+            "base_snapshot_id",
+            "canonical_snapshot_id",
+            "snapshot_id",
+            "graph_snapshot_id",
+            "graph_snapshot_commit",
+            "graph_snapshot_commit_sha",
+            "qa_snapshot_id",
+            "qa_snapshot_commit",
+            "reconcile_snapshot_id",
+            "reconcile_snapshot_commit",
+            "trace_snapshot_id",
+            "projection_hash",
+            "checkpoint_id",
+            "epoch_id",
+            "integration_epoch_id",
+            "active_epoch_id",
+            "trace_id",
+            "trace_ids",
+            "graph_trace_id",
+            "graph_trace_ids",
+            "graph_query_trace_id",
+            "graph_query_trace_ids",
+            "authority_hash",
+            "identity_hash",
+            "provenance_hash",
+            "candidate_diff_hash",
+            "state_hash",
+            "reconcile_provenance_hash",
+            "candidate_state_hash",
+            "target_commit",
+            "target_commit_sha",
+            "target_head_sha",
+            "merge_head_commit",
+            "merge_head_sha",
+            "reconcile_head_commit",
+            "reconcile_head_sha",
+            "worker_commit",
+            "worker_commit_sha",
+        ),
+    ),
+    (
+        "dispatch",
+        (
+            "accepted_dispatch_authority",
+            "dispatch_ticket_authority",
+            "canonical_dispatch_identity",
+            "accepted_dispatch_identity",
+            "contract_runtime_dispatch_identity",
+            "contract_runtime_dispatch_revision",
+            "dispatch_source_ref",
+            "contract_runtime_dispatch_source_ref",
+            "worker_commit_source_ref",
+            "dispatch_acceptance_ref",
+            "dispatch_authority",
+            "dispatch_authority_hash",
+            "dispatch_completed_line_ref",
+            "dispatch_context",
+            "dispatch_event_ref",
+            "dispatch_evidence",
+            "dispatch_identity",
+            "dispatch_identity_hash",
+            "dispatch_line_hash",
+            "dispatch_ticket",
+            "dispatch_worker_hash",
+            "runtime_dispatch_evidence",
+            "ticket_authority_source_ref",
+        ),
+    ),
+    (
+        "merge_reconcile_qa",
+        (
+            "merge_queue_id",
+            "merge_queue_item_id",
+            "queue_item_id",
+            "queue_index",
+            "batch_id",
+            "parent_batch_id",
+            "merge_event_id",
+            "merge_event_ref",
+            "merge_source_ref",
+            "reconcile_event_id",
+            "reconcile_event_ref",
+            "reconcile_source_ref",
+            "qa_event_id",
+            "qa_event_ref",
+            "qa_source_ref",
+            "materialize_event_id",
+            "materialize_event_ref",
+            "materialize_source_ref",
+            "review_event_id",
+            "review_event_ref",
+            "review_source_ref",
+            "read_receipt_event_id",
+            "read_receipt_event_ref",
+            "read_receipt_ref",
+            "read_receipt_source_ref",
+            "receipt_event_id",
+            "receipt_event_ref",
+            "receipt_source_ref",
+            "rejoin_event_id",
+            "rejoin_event_ref",
+            "rejoin_source_ref",
+            "durable_merge_authority",
+            "current_full_reconcile_marker",
+            "current_full_reconcile_provenance",
+            "reconcile_authority",
+            "post_merge_provenance",
+            "qa_graph_trace_db_evidence",
+            "graph_trace_evidence",
+            "graph_review_context",
+            "candidate_review_context",
+            "selected_atomic_lane_authority",
+            "implementation_event_ref",
+            "implementation_lineage_ref",
+            "implementation_source_ref",
+            "source_merge_event_ref",
+            "source_qa_event_ref",
+            "source_reconcile_event_ref",
+            "worker_commit_event_ref",
+            "qa_receipt_ref",
+            "qa_report_ref",
+            "failed_qa_source_ref",
+            "provenance_paths",
+        ),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "authority_key",
+    (
+        "line_instance_id",
+        "source_line_instance_id",
+        "dispatch_source_ref",
+        "contract_runtime_dispatch_source_ref",
+        "source_implementation_lineage_ref",
+    ),
+)
+def test_failed_qa_repair_classifier_rejects_proven_authority_gaps(
+    authority_key,
+):
+    assert (
+        server._contract_runtime_key_is_execution_authority_or_credential(
+            authority_key
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("authority_group", "authority_keys"),
+    _RETIRED_EXECUTION_AUTHORITY_KEY_CASES,
+)
+def test_mf_parallel_rev10_failed_qa_rejects_nested_acceptance_authority(
+    authority_group,
+    authority_keys,
+):
     leaked_authority = {
-        "branch_ref": "refs/heads/old-worker",
-        "contract_execution_id": "cex-old-generation",
-        "fence": "raw-old-fence",
-        "fence_ref": "fence-ref-old-generation",
-        "fence_token": "fence-token-old-generation",
-        "fence_token_ref": "fence-token-ref-old-generation",
-        "git_branch": "old-git-branch",
-        "lane_id": "lane-old-generation",
-        "merge_queue_id": "mq-old-generation",
-        "merge_queue_item_id": "mq-item-old-generation",
-        "observer_command_id": "cmd-old-generation",
-        "parent_task_id": "task-old-parent",
-        "project_root": "/tmp/old-project-root-alias",
-        "queue_item_id": "queue-item-old-generation",
-        "route_token_ref": "rtok-old-generation",
-        "runtime_context_id": "mfrctx-old-generation",
-        "session": "raw-old-session",
-        "session_ref": "session-ref-old-generation",
-        "session_token": "session-token-old-generation",
-        "session_token_ref": "session-token-ref-old-generation",
-        "target_project_root": "/tmp/old-project-root",
-        "task_id": "task-old-generation",
-        "worker_id": "worker-old-generation",
-        "worker_slot_id": "worker-slot-old-generation",
-        "worker_worktree_path": "/tmp/old-worker-path-alias",
-        "assigned_worktree": "/tmp/old-assigned-worktree",
-        "worktree_branch": "old-worktree-branch",
-        "worktree_path": "/tmp/old-worker-worktree",
+        key: f"must-not-leak-{authority_group}-{index}"
+        for index, key in enumerate(authority_keys, start=1)
     }
     record = _rev10_failed_qa_fresh_repair_record(
         [
@@ -2883,26 +3162,96 @@ def test_mf_parallel_rev10_failed_qa_rejects_nested_acceptance_authority():
         f"acceptance_criteria[0].historical_context.nested.{key}"
         for key in leaked_authority
     )
-    assert set(leaked_authority).issubset(
-        action["forbidden_authority_reuse"]
+    assert action["forbidden_authority_reuse"] == sorted(
+        server._CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX
     )
     rendered_action = json.dumps(action, sort_keys=True)
     for value in leaked_authority.values():
         assert value not in rendered_action
-    assert action["failed_qa_source_ref"].startswith(
+    typed_failed_qa_ref = action["failed_qa_source_ref"]
+    assert typed_failed_qa_ref.startswith(
         "contract_runtime:cex-rev10-unsafe-ac-source:completed_lines:"
     )
+    assert typed_failed_qa_ref not in leaked_authority.values()
+
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id="aming-claw",
+        backlog_id=record["backlog_id"],
+        role="observer",
+        work_type="parallel_worker",
+        record=record,
+        next_action=action,
+        current_projection={
+            "current_contract_execution_id": record[
+                "contract_execution_id"
+            ],
+            "execution_state_revision": 1,
+            "projection_hash": "sha256:" + "4" * 64,
+            "next_legal_action": action,
+        },
+        runtime_resume={"next_legal_action": action},
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+    assert compact["ok"] is True
+    assert compact["actionable"] is False
+    compact_action = compact["next_legal_action"]
+    assert compact_action["action_input_ready"] is False
+    assert compact_action["action_input_missing_fields"] == [
+        "acceptance_criteria"
+    ]
+    assert compact["action_input"] == {}
+    assert compact["copy_safe_body"] == {}
+    assert compact["canonical_executable_action"] == {}
+    assert compact_action["unsafe_action_input_paths"] == (
+        server._onboard_guide_bounded_unsafe_action_input_paths(
+            action["unsafe_action_input_paths"]
+        )
+    )
+    rendered_compact = json.dumps(compact, sort_keys=True)
+    for value in leaked_authority.values():
+        assert value not in rendered_compact
 
 
 def test_mf_parallel_rev10_failed_qa_allows_safe_semantic_key_mutations():
     safe_semantic_criteria = [
         {
             "id": "AC-REV10-SAFE-SEMANTIC-MUTATIONS",
-            "text": "Semantic descriptions remain source-backed acceptance.",
+            "text": (
+                "Semantic prose may name cex-historical-example, "
+                "runtime_context_id, line_instance_id, and "
+                "dispatch_source_ref without carrying structured authority."
+            ),
+            "schema_version": "acceptance_criterion.v1",
+            "status": "required",
+            "strategy": "fresh bounded successor",
+            "actor_role": "observer",
+            "worker_role": "mf_sub",
+            "source": "historical audit label",
+            "source_details": {
+                "source_ref": "audit-label-only-not-execution-authority",
+                "example": (
+                    "line_instance_id and dispatch_source_ref may appear in "
+                    "prose values without becoming executable authority"
+                ),
+            },
             "required_scope": [
                 "agent/governance/server.py",
                 "agent/tests/test_contract_runtime.py",
             ],
+            "kind": "behavioral",
+            "files": ["agent/governance/server.py"],
+            "node_ids": ["methodology-node"],
+            "target_files": ["agent/governance/server.py"],
+            "test_files": ["agent/tests/test_contract_runtime.py"],
+            "owned_files": ["agent/governance/server.py"],
+            "inputs": ["failed QA audit source"],
+            "outputs": ["fresh repair row"],
+            "behavior_contract": {
+                "given": "a terminal failed generation",
+                "when": "the observer files a new row",
+                "then": "old authority is not copied",
+            },
             "methodology": {
                 "project_root_behavior": "derive a fresh registered root",
                 "worker_worktree_path_requirement": "allocate a fresh path",
@@ -2938,6 +3287,71 @@ def test_mf_parallel_rev10_failed_qa_allows_safe_semantic_key_mutations():
         "contract_runtime:cex-rev10-safe-semantic-ac-source:completed_lines:"
     )
     assert "contract_execution_id" not in action["copy_safe_body"]
+
+
+def test_mf_parallel_rev10_failed_qa_compact_caps_unsafe_path_diagnostics():
+    record = _rev10_failed_qa_fresh_repair_record(
+        [
+            {
+                "id": "AC-REV10-UNSAFE-DIAGNOSTIC-CAP",
+                "text": "Bound unsafe key-path diagnostics.",
+                "required_scope": ["agent/governance/server.py"],
+                "historical_context": {"line_instance_id": "retired-lane"},
+            }
+        ],
+        backlog_id="AC-REV10-FAILED-QA-DIAGNOSTIC-CAP",
+        contract_execution_id="cex-rev10-diagnostic-cap",
+    )
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+    unsafe_paths = [
+        (
+            "acceptance_criteria[0].historical_context."
+            + (f"safe_segment_{index}_" * 40)
+            + ".trace_id"
+        )
+        for index in range(40)
+    ]
+    assert all(
+        len(path)
+        > server._ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_CHARS
+        for path in unsafe_paths
+    )
+    action["unsafe_action_input_paths"] = unsafe_paths
+
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id="aming-claw",
+        backlog_id=record["backlog_id"],
+        role="observer",
+        work_type="parallel_worker",
+        record=record,
+        next_action=action,
+        current_projection={
+            "current_contract_execution_id": record[
+                "contract_execution_id"
+            ],
+            "execution_state_revision": 1,
+            "projection_hash": "sha256:" + "5" * 64,
+            "next_legal_action": action,
+        },
+        runtime_resume={"next_legal_action": action},
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+
+    assert compact["ok"] is True
+    projected_paths = compact["next_legal_action"][
+        "unsafe_action_input_paths"
+    ]
+    assert projected_paths == (
+        server._onboard_guide_bounded_unsafe_action_input_paths(
+            unsafe_paths
+        )
+    )
+    assert len(projected_paths) <= 32
+    assert all(len(path) == 512 for path in projected_paths)
+    assert sum(map(len, projected_paths)) <= 4 * 1024
 
 
 def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation(
