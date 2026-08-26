@@ -4102,7 +4102,10 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         runtime_context=runtime_context,
         parent_task_id=backlog_id,
         graph_trace_id=graph_trace_id,
-        head_commit=frozen_head,
+        # The happy path records implementation before worker_commit, so the
+        # immutable commit is not yet part of this canonical source line.  The
+        # correction endpoint derives it later from the clean assigned HEAD.
+        head_commit="",
         implementation_event_ref=f"timeline:{evidence_events['implementation']}",
         include_worker_commit=False,
         changed_files=[frozen_first_file],
@@ -4121,6 +4124,12 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
     frozen_lineage = _worker_implementation_lineage(
         frozen_record,
         frozen_implementation,
+    )
+    assert not server._worker_commit_text(
+        frozen_implementation,
+        "commit_sha",
+        "head_commit",
+        "immutable_head_commit",
     )
     assert frozen_implementation["fence_token_hash"] == (
         runtime_context_secret_hash(fence_token)
@@ -4498,6 +4507,7 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
     correction_body = correction_guide["canonical_executable_action"][
         "copy_safe_body"
     ]
+    assert "commit_sha" not in correction_body
     assert correction_body["graph_trace_ids"] == [active_graph_trace_id]
     assert graph_trace_id not in correction_body["graph_trace_ids"]
     assert correction_body[
@@ -4675,7 +4685,7 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         if line.get("line_id") == "worker_implementation"
     ]
     assert len(implementations) == 2
-    assert implementations[0]["commit_sha"] == frozen_head
+    assert "commit_sha" not in implementations[0]
     assert implementations[0]["changed_files"] == [frozen_first_file]
     assert implementations[0]["session_token_ref"] == prior_session_token_ref
     assert implementations[-1]["commit_sha"] == corrected_head

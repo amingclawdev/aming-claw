@@ -29604,12 +29604,6 @@ def _runtime_context_worker_implementation_graph_trace_repair_action(
     if not isinstance(test_results, Mapping):
         test_results = implementation.get("test_results")
     test_results = dict(test_results) if isinstance(test_results, Mapping) else {}
-    commit_sha = _worker_commit_text(
-        implementation,
-        "commit_sha",
-        "head_commit",
-        "immutable_head_commit",
-    )
     correction_intent = {
         "schema_version": (
             "runtime_context.precommit_implementation_correction_intent.v1"
@@ -29623,7 +29617,6 @@ def _runtime_context_worker_implementation_graph_trace_repair_action(
     action_input = {
         **writer_copy,
         "contract_execution_id": contract_execution_id,
-        "commit_sha": commit_sha,
         "changed_files": list(lineage.get("changed_files") or []),
         "graph_trace_ids": [selected_trace_id],
         "tests": tests,
@@ -29644,7 +29637,6 @@ def _runtime_context_worker_implementation_graph_trace_repair_action(
             "target_project_root",
             "session_token_ref",
             "fence_token_hash",
-            "commit_sha",
             "changed_files",
             "graph_trace_ids",
             "test_results",
