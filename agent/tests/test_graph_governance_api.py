@@ -68147,6 +68147,235 @@ def _contract_update_initial_join_body(case: Mapping[str, Any]) -> dict[str, Any
     }
 
 
+def _setup_contract_update_dispatch_allocation_case(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    suffix: str,
+) -> dict[str, Any]:
+    backlog_id = f"AC-CONTRACT-UPDATE-ALLOCATION-{suffix.upper()}"
+    row_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    repository_root = tmp_path / f"contract-update-allocation-{suffix}"
+    commit_sha = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?, acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps([row_files[0]]),
+            json.dumps([row_files[1]]),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-CU-ALLOC-01",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": row_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    started = server.handle_project_contract_update_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={"backlog_id": backlog_id, "onboard_service_waiver": True},
+        )
+    )
+    execution_id = started["contract_execution_id"]
+    requested = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                "stage_id": "observer_request",
+                "line_id": "observer_request_contract_update",
+                "evidence_kind": "contract_update_request",
+                "payload": {
+                    "previous_revision": "rev1",
+                    "new_revision": "rev2",
+                    "owned_files": row_files,
+                    "target_files": row_files,
+                },
+            },
+        )
+    )
+    assert requested["ok"] is True
+    route_identity = {
+        "route_id": f"route-contract-update-allocation-{suffix}",
+        "route_context_hash": _fake_sha(f"cu-allocation-{suffix}:route"),
+        "prompt_contract_id": f"rprompt-cu-allocation-{suffix}",
+        "prompt_contract_hash": _fake_sha(f"cu-allocation-{suffix}:prompt"),
+        "route_token_ref": f"rtok-contract-update-allocation-{suffix}",
+        "visible_injection_manifest_hash": _fake_sha(
+            f"cu-allocation-{suffix}:manifest"
+        ),
+    }
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=execution_id,
+        target_files=row_files,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        **route_identity,
+    )
+    conn.commit()
+    return {
+        "backlog_id": backlog_id,
+        "execution_id": execution_id,
+        "row_files": row_files,
+        "repository_root": repository_root,
+        "commit_sha": commit_sha,
+        "route_identity": route_identity,
+        "requested": requested,
+    }
+
+
+def test_contract_update_rev2_dispatch_uses_one_lane_precheck_allocation(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _setup_contract_update_dispatch_allocation_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="accepted",
+    )
+    next_action = case["requested"]["next_legal_action"]
+    route_recipe = next_action["per_lane_observer_route_context_issue"]
+    assert route_recipe["required_issue_count"] == 1
+    assert route_recipe["mcp_tool"] == "observer_route_context_issue"
+    assert route_recipe["atomic_precheck"]["mcp_tool"] == (
+        "parallel_branch_allocate_precheck"
+    )
+    precheck_template = copy.deepcopy(
+        route_recipe["atomic_precheck"]["request_body_template"]
+    )
+    lane = precheck_template["lanes"][0]
+    lane["route_token_ref"] = case["route_identity"]["route_token_ref"]
+
+    zero_write_tables = (
+        "parallel_branch_runtime_contexts",
+        "parallel_branch_runtime_contract_revisions",
+        "parallel_branch_merge_queue_items",
+        "task_timeline_events",
+    )
+    before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    }
+    before_changes = conn.total_changes
+    prechecked = (
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=precheck_template,
+            )
+        )
+    )
+    assert prechecked["status"] == "ready"
+    assert prechecked["expected_lane_count"] == 1
+    assert prechecked["atomic"] is False
+    assert prechecked["allocation_scope"] == "contract_update_single_lane"
+    assert conn.total_changes == before_changes
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in zero_write_tables
+    } == before
+
+    wrong_cex = copy.deepcopy(precheck_template)
+    wrong_cex["lanes"][0]["contract_execution_id"] = "cex-unrelated"
+    with pytest.raises(GovernanceError):
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx({"project_id": PID}, method="POST", body=wrong_cex)
+        )
+    wrong_files = copy.deepcopy(precheck_template)
+    wrong_files["lanes"][0]["owned_files"] = [case["row_files"][0]]
+    wrong_files["lanes"][0]["target_files"] = [case["row_files"][0]]
+    with pytest.raises(GovernanceError):
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx({"project_id": PID}, method="POST", body=wrong_files)
+        )
+    assert conn.total_changes == before_changes
+
+    allocation_body = prechecked["copy_safe_allocation_bodies"][0]
+    status_code, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx({"project_id": PID}, method="POST", body=allocation_body)
+    )
+    assert status_code == 201
+    assert allocated["ok"] is True
+    runtime_context_id = allocated["context"]["runtime_context_id"]
+
+    current = server.handle_project_contract_update_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": case["execution_id"],
+            },
+            "observer",
+        )
+    )
+    dispatch_next = current["next_legal_action"]
+    accepted_authority = dispatch_next["accepted_dispatch_authority"]
+    assert accepted_authority["server_derived"] is True
+    assert accepted_authority["db_verified"] is True
+    assert accepted_authority["runtime_context_id"] == runtime_context_id
+    assert dispatch_next["copy_safe_dispatch_payload"][
+        "contract_runtime_submit_line"
+    ]["mcp_tool"] == "contract_update_submit_line"
+    dispatch_body = dispatch_next["writer_role_safe_copy_payload"][
+        "copy_payload"
+    ]
+    dispatched = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": case["execution_id"],
+            },
+            "observer",
+            method="POST",
+            body=dispatch_body,
+        )
+    )
+    assert dispatched["ok"] is True, dispatched["decision"]
+    assert dispatched["next_legal_action"]["id"] == (
+        "worker_read_runtime_guide"
+    )
+    after_dispatch_changes = conn.total_changes
+    with pytest.raises(GovernanceError):
+        server.handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=precheck_template,
+            )
+        )
+    assert conn.total_changes == after_dispatch_changes
+
+
 def test_contract_update_initial_join_uses_exact_allocation_and_dispatch_anchor(
     conn,
     monkeypatch,
@@ -120455,9 +120684,48 @@ def test_contract_update_accepted_line_publishes_current_stream_invalidations(co
     )
 
 
-def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(conn):
+def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
     backlog_id = "AC-CONTRACT-UPDATE-FACADE"
     _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    row_files = [
+        "agent/governance/server.py",
+        "agent/tests/test_graph_governance_api.py",
+    ]
+    repository_root = tmp_path / "contract-update-facade"
+    repository_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?, acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps([row_files[0]]),
+            json.dumps([row_files[1]]),
+            json.dumps(
+                [
+                    {
+                        "id": "AC-CONTRACT-UPDATE-FACADE",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": row_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
     onboard = server.handle_project_onboard_contract_start(
         _ctx_with_role(
             {"project_id": PID},
@@ -120522,17 +120790,6 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     assert forged["ok"] is False
     assert "cannot write line" in forged["decision"]["errors"][0]
 
-    runtime_context = _insert_mf_parallel_source_backed_runtime_context(
-        conn,
-        backlog_id=backlog_id,
-        task_id="contract-update-worker",
-        parent_task_id=execution_id,
-        fence_token="fence-contract-update-worker",
-        token="contract-update-worker-token",
-        target_project_root="/tmp/contract-update-worker",
-        base_commit="contract-update-worker-head",
-        target_head_commit="contract-update-worker-head",
-    )
     accepted = server.handle_project_contract_update_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": execution_id},
@@ -120549,13 +120806,8 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
                         "agent/governance/contract_definitions/"
                         "onboard_contract.v1.rev2.json"
                     ),
-                    "worker_runtime_context": {
-                        "runtime_context_id": runtime_context.runtime_context_id,
-                        "task_id": runtime_context.task_id,
-                        "parent_task_id": execution_id,
-                        "worker_role": "mf_sub",
-                        "target_project_root": "/tmp/contract-update-worker",
-                    },
+                    "owned_files": row_files,
+                    "target_files": row_files,
                 },
             },
         )
@@ -120567,28 +120819,65 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
         "observer_dispatch_bounded_workers"
     )
     assert accepted["next_legal_action"]["allowed_writer_roles"] == ["observer"]
-
-    dispatch_identity = {
-        "runtime_context_id": runtime_context.runtime_context_id,
-        "task_id": runtime_context.task_id,
-        "parent_task_id": execution_id,
-        "worker_role": "mf_sub",
-        "worker_id": runtime_context.worker_id,
-        "worker_slot_id": runtime_context.worker_slot_id,
-        "target_project_root": runtime_context.target_project_root,
+    route_identity = {
+        "route_id": "route-contract-update-facade",
+        "route_context_hash": _fake_sha("contract-update-facade:route"),
+        "prompt_contract_id": "rprompt-contract-update-facade",
+        "prompt_contract_hash": _fake_sha("contract-update-facade:prompt"),
+        "route_token_ref": "rtok-contract-update-facade-allocation",
+        "visible_injection_manifest_hash": _fake_sha(
+            "contract-update-facade:manifest"
+        ),
     }
+    _persist_append_route_token_ref(
+        conn,
+        backlog_id=backlog_id,
+        task_id=execution_id,
+        target_files=row_files,
+        allowed_actions=[
+            "parallel_branch_allocate",
+            "task_timeline_append",
+        ],
+        **route_identity,
+    )
+    precheck_body = copy.deepcopy(
+        accepted["next_legal_action"][
+            "per_lane_observer_route_context_issue"
+        ]["atomic_precheck"]["request_body_template"]
+    )
+    precheck_body["lanes"][0]["route_token_ref"] = route_identity[
+        "route_token_ref"
+    ]
+    prechecked = server.handle_graph_governance_parallel_branch_allocate_precheck(
+        _ctx({"project_id": PID}, method="POST", body=precheck_body)
+    )
+    status_code, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=prechecked["copy_safe_allocation_bodies"][0],
+        )
+    )
+    assert status_code == 201
+    runtime_context = get_branch_context(
+        conn,
+        PID,
+        allocated["context"]["task_id"],
+    )
+    current = server.handle_project_contract_update_current_state(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+        )
+    )
     accepted = server.handle_project_contract_update_line_write(
         _ctx_with_role(
             {"project_id": PID, "contract_execution_id": execution_id},
             "observer",
             method="POST",
-            body={
-                **dispatch_identity,
-                "stage_id": "dispatch",
-                "line_id": "observer_dispatch_bounded_workers",
-                "evidence_kind": "dispatch_bounded_worker",
-                "payload": dispatch_identity,
-            },
+            body=current["next_legal_action"][
+                "writer_role_safe_copy_payload"
+            ]["copy_payload"],
         )
     )
 
@@ -120684,9 +120973,21 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
         "mf_sub_host_bridge_guidance"
     ] == bridge_guidance
 
+    dispatch_identity = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": runtime_context.worker_id,
+        "worker_slot_id": runtime_context.worker_slot_id,
+        "target_project_root": runtime_context.target_project_root,
+        **route_identity,
+    }
+    fence_token = allocated["context"]["fence_token"]
+    session_token = allocated["same_owner_worker_session"]["session_token"]
     worker_identity = {
         **dispatch_identity,
-        "fence_token": "fence-contract-update-worker",
+        "fence_token": fence_token,
         "session_token_ref": runtime_context_session_token_ref(runtime_context),
         "read_receipt_hash": _fake_sha("contract-update-worker-read"),
         "launch_text_hash": _fake_sha("contract-update-worker-launch"),
@@ -120731,7 +121032,7 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     _activate_basic_graph(
         conn,
         graph_snapshot_id,
-        commit_sha="contract-update-worker-head",
+        commit_sha=repository_commit,
     )
     graph_context = server.handle_graph_governance_query(
         _ctx(
@@ -120740,7 +121041,7 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
             body={
                 **worker_identity,
                 "contract_execution_id": execution_id,
-                "session_token": "contract-update-worker-token",
+                "session_token": session_token,
                 "snapshot_id": graph_snapshot_id,
                 "tool": "query_schema",
                 "args": {},
@@ -120749,7 +121050,7 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
                 "query_purpose": "subagent_context_build",
                 "run_id": _mf_sub_run_id(
                     runtime_context.task_id,
-                    "fence-contract-update-worker",
+                    fence_token,
                 ),
             },
         )
@@ -120773,9 +121074,9 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
                 "task_id": runtime_context.task_id,
                 "parent_task_id": execution_id,
                 "worker_role": "mf_sub",
-                "fence_token": "fence-contract-update-worker",
+                "fence_token": fence_token,
                 "session_token_ref": runtime_context_session_token_ref(runtime_context),
-                "target_project_root": "/tmp/contract-update-worker",
+                "target_project_root": runtime_context.target_project_root,
             },
         )
     )
@@ -120793,9 +121094,9 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
                 "task_id": runtime_context.task_id,
                 "parent_task_id": execution_id,
                 "worker_role": "mf_sub",
-                "fence_token": "fence-contract-update-worker",
+                "fence_token": fence_token,
                 "session_token_ref": runtime_context_session_token_ref(runtime_context),
-                "target_project_root": "/tmp/contract-update-worker",
+                "target_project_root": runtime_context.target_project_root,
                 "stage_id": "worker_previous_source",
                 "line_id": "worker_previous_source_proof",
                 "evidence_kind": "contract_previous_source_proof",

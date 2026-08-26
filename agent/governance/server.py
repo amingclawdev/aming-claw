@@ -17868,6 +17868,166 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
     return copy_safe_body, lane_projection
 
 
+def _contract_update_rev2_dispatch_allocation_authority(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Admit only the active rev2 ContractUpdate bounded-dispatch window.
+
+    ContractUpdate intentionally reuses the existing RuntimeContext allocator,
+    but it is not an mf_parallel contract.  Keep that distinction explicit:
+    this authority is one lane, one active dispatch line, and one exact source
+    execution.  It never changes mf_parallel cardinality or prefill policy.
+    """
+
+    guide = (
+        record.get("runtime_guide")
+        if isinstance(record.get("runtime_guide"), Mapping)
+        else {}
+    )
+    next_line = (
+        guide.get("next_legal_action")
+        if isinstance(guide.get("next_legal_action"), Mapping)
+        else {}
+    )
+    project_id = str(record.get("project_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    if not (
+        str(record.get("contract_id") or "").strip()
+        == CONTRACT_UPDATE_CONTRACT_ID
+        and str(record.get("revision") or "").strip() == "rev2"
+        and project_id
+        and backlog_id
+        and execution_id
+        and str(next_line.get("stage_id") or "").strip() == "dispatch"
+        and str(next_line.get("line_id") or "").strip()
+        == "observer_dispatch_bounded_workers"
+        and str(next_line.get("evidence_kind") or "").strip()
+        == "dispatch_bounded_worker"
+        and str(next_line.get("owner_role") or "").strip() == "observer"
+        and "observer" in {
+            str(role or "").strip()
+            for role in next_line.get("allowed_writer_roles") or []
+        }
+    ):
+        return {}
+    return {
+        "schema_version": (
+            "contract_update.rev2_dispatch_allocation_authority.v1"
+        ),
+        "source": "ContractRuntime.first_missing_line",
+        "server_derived": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": CONTRACT_UPDATE_CONTRACT_ID,
+        "contract_revision": "rev2",
+        "execution_state_revision": int(
+            record.get("execution_state_revision") or 0
+        ),
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "evidence_kind": "dispatch_bounded_worker",
+        "required_worker_count": 1,
+        "expected_lane_count": 1,
+        "atomic": False,
+        "scope": "contract_update_single_lane",
+        "mf_parallel_policy_unchanged": True,
+    }
+
+
+def _contract_update_allocation_precheck_policy(
+    authority: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the typed one-lane policy without entering mf_parallel policy."""
+
+    cardinality = {
+        "schema_version": (
+            "contract_update.rev2_worker_cardinality_policy.v1"
+        ),
+        "source": "contract_update_rev2_dispatch_line",
+        "required_worker_count": 1,
+        "batch_row_scoped_successor": False,
+        "contract_update_dispatch_authority": dict(authority),
+        "caller_override_allowed": False,
+    }
+    precheck = {
+        "schema_version": (
+            "contract_update.rev2_allocation_precheck_policy.v1"
+        ),
+        "source": "contract_update_rev2_dispatch_line",
+        "cardinality_source": "contract_update_rev2_dispatch_line",
+        "tool": "parallel_branch_allocate_precheck",
+        "expected_lane_count": 1,
+        "allowed_lane_counts": [1],
+        "lane_count_policy": "exactly",
+        "atomic": False,
+        "scope": "contract_update_single_lane",
+        "verified_batch_child": False,
+        "declared_batch_child": False,
+        "verified_contract_update_single_lane": True,
+        "allocation_supported": True,
+        "unsupported_reason": "",
+        "submit_returned_bodies_unchanged": True,
+        "standalone_mf_parallel_policy_unchanged": True,
+        "caller_override_allowed": False,
+        "contract_update_dispatch_authority": dict(authority),
+        "target_ref_contract": {
+            "schema_version": (
+                "parallel_branch_allocate.target_ref_contract.v1"
+            ),
+            "worker_branch_field": "branch_ref",
+            "planned_target_field": "ref_name",
+            "accepted_target_alias_fields": ["ref_name", "target_branch"],
+            "durable_target_source": "",
+            "target_authority": "contract_update_allocation_contract",
+            "target_from_branch_ref_allowed": False,
+            "copy_safe_precheck_injects_ref_name": False,
+            "copy_safe_precheck_removes_target_branch": False,
+            "mismatch_policy": "not_applicable_no_durable_batch_authority",
+        },
+    }
+    return cardinality, precheck
+
+
+def _contract_update_dispatch_authority_policy(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reuse the dispatch binder under an exact rev2 one-lane authority."""
+
+    if not _contract_update_rev2_dispatch_allocation_authority(record):
+        return {}
+    return {
+        "schema_version": "contract_update.dispatch_authority_policy.v1",
+        "enabled": True,
+        "validate_before_precheck_and_submit": True,
+        "line_ids": ["observer_dispatch_bounded_workers"],
+        "required_worker_count": 1,
+        "required_dispatch_fields": [
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "worker_id",
+            "worker_slot_id",
+            "observer_command_id",
+            "worker_role",
+            "target_project_root",
+            "worktree_path",
+            "branch_ref",
+            "base_commit",
+            "target_head_commit",
+            "merge_queue_id",
+            "owned_files",
+            "profile_requirements",
+            "retry_policy",
+        ],
+        "required_child_route_fields": list(
+            _RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS
+        ),
+        "standalone_mf_parallel_policy_unchanged": True,
+    }
+
+
 @route(
     "POST",
     "/api/graph-governance/{project_id}/parallel-branches/allocation-precheck",
@@ -18054,21 +18214,29 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             "contract_id": str(contract_record.get("contract_id") or "").strip(),
             "revision": str(contract_record.get("revision") or "").strip(),
         }
+        contract_update_authority = (
+            _contract_update_rev2_dispatch_allocation_authority(
+                contract_record
+            )
+        )
+        mf_parallel_authority = bool(
+            _is_mf_parallel_record_contract_id(
+                contract_identity["contract_id"]
+            )
+            and _is_mf_parallel_postmerge_revision(contract_record)
+        )
         if (
             contract_identity["project_id"] != project_id
             or contract_identity["backlog_id"] != backlog_id
             or contract_identity["contract_execution_id"]
             != contract_execution_id
-            or not _is_mf_parallel_record_contract_id(
-                contract_identity["contract_id"]
-            )
-            or not _is_mf_parallel_postmerge_revision(contract_record)
+            or not (mf_parallel_authority or contract_update_authority)
         ):
             raise GovernanceError(
                 "parallel_branch_allocate_precheck_contract_authority_mismatch",
                 (
                     "allocation precheck lane scope does not match an exact "
-                    "mf_parallel ContractRuntime execution"
+                    "active mf_parallel or contract_update dispatch execution"
                 ),
                 422,
                 {
@@ -18087,6 +18255,8 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             else {}
         )
         if (
+            mf_parallel_authority
+            and
             str(contract_record.get("revision") or "").strip() == "rev10"
             and contract_metadata.get("observer_prefill_child_plan_required")
             is True
@@ -18134,18 +18304,25 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                         "mutation_performed": False,
                     },
                 )
-        cardinality_policy = (
-            _contract_runtime_mf_parallel_worker_cardinality_policy(
-                conn,
-                project_id=project_id,
-                record=contract_record,
+        if contract_update_authority:
+            cardinality_policy, allocation_precheck_policy = (
+                _contract_update_allocation_precheck_policy(
+                    contract_update_authority
+                )
             )
-        )
-        allocation_precheck_policy = (
-            _contract_runtime_mf_parallel_allocation_precheck_policy(
-                cardinality_policy
+        else:
+            cardinality_policy = (
+                _contract_runtime_mf_parallel_worker_cardinality_policy(
+                    conn,
+                    project_id=project_id,
+                    record=contract_record,
+                )
             )
-        )
+            allocation_precheck_policy = (
+                _contract_runtime_mf_parallel_allocation_precheck_policy(
+                    cardinality_policy
+                )
+            )
         authoritative_lane_count = int(
             allocation_precheck_policy.get("expected_lane_count") or 0
         )
@@ -18169,28 +18346,33 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             and allocation_precheck_policy.get("verified_batch_child") is False
         )
         retry_rebind_authorities: dict[str, dict[str, Any]] = {}
-        for body in copy_safe_bodies:
-            retry_authority = _parallel_branch_allocate_retry_rebind_authority(
-                conn,
-                project_id=project_id,
-                record=contract_record,
-                body=body,
-            )
-            if not retry_authority:
-                continue
-            lane_task_id = str(body.get("task_id") or "").strip()
-            retry_rebind_authorities[lane_task_id] = retry_authority
-            body["retry_of_runtime_context_id"] = str(
-                retry_authority["prior_runtime_context_id"]
-            )
-            body["retry_of_task_id"] = str(retry_authority["prior_task_id"])
-            body["retry_policy"] = {
-                "attempt": int(retry_authority["requested_attempt"]),
-                "max_attempts": int(retry_authority["max_attempts"]),
-            }
-            body["retry_allocation_rebind_authority"] = dict(
-                retry_authority
-            )
+        if mf_parallel_authority:
+            for body in copy_safe_bodies:
+                retry_authority = (
+                    _parallel_branch_allocate_retry_rebind_authority(
+                        conn,
+                        project_id=project_id,
+                        record=contract_record,
+                        body=body,
+                    )
+                )
+                if not retry_authority:
+                    continue
+                lane_task_id = str(body.get("task_id") or "").strip()
+                retry_rebind_authorities[lane_task_id] = retry_authority
+                body["retry_of_runtime_context_id"] = str(
+                    retry_authority["prior_runtime_context_id"]
+                )
+                body["retry_of_task_id"] = str(
+                    retry_authority["prior_task_id"]
+                )
+                body["retry_policy"] = {
+                    "attempt": int(retry_authority["requested_attempt"]),
+                    "max_attempts": int(retry_authority["max_attempts"]),
+                }
+                body["retry_allocation_rebind_authority"] = dict(
+                    retry_authority
+                )
         batch_target_authority: dict[str, Any] = {}
         if declared_batch_child:
             batch_target_authority = (
@@ -18307,8 +18489,17 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                     "writes_performed": False,
                 },
             )
+        verified_contract_update_single_lane = bool(
+            contract_update_authority
+            and allocation_precheck_policy.get(
+                "verified_contract_update_single_lane"
+            )
+            is True
+        )
         if authoritative_lane_count == 1 and not (
-            verified_batch_child or verified_standalone_single_lane
+            verified_batch_child
+            or verified_standalone_single_lane
+            or verified_contract_update_single_lane
         ):
             raise GovernanceError(
                 "parallel_branch_allocate_precheck_single_lane_authority_required",
@@ -18326,6 +18517,9 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                     ),
                     "standalone_authority_verified": (
                         verified_standalone_single_lane
+                    ),
+                    "contract_update_authority_verified": (
+                        verified_contract_update_single_lane
                     ),
                     "writes_performed": False,
                 },
@@ -18402,6 +18596,18 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                 "atomic_union_authoritative": False,
                 "per_child_contract_authoritative": False,
                 "standalone_contract_authoritative": True,
+            }
+        elif not atomic and verified_contract_update_single_lane:
+            acceptance_scope_closure = {
+                **acceptance_scope_closure,
+                "schema_version": (
+                    "contract_update.rev2_single_lane_acceptance_scope.v1"
+                ),
+                "scope_mode": "contract_update_rev2_single_lane",
+                "atomic_union_authoritative": False,
+                "per_child_contract_authoritative": False,
+                "standalone_contract_authoritative": False,
+                "contract_update_dispatch_authoritative": True,
             }
         all_errors = list(
             dict.fromkeys([*lane_errors, *acceptance_errors])
@@ -18550,6 +18756,8 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
             )
 
         for body in copy_safe_bodies:
+            if contract_update_authority:
+                body["contract_version"] = "contract_update.v1"
             body["acceptance_criteria"] = list(acceptance_scope_criteria or criteria)
             body["allocation_precheck"] = {
                 "schema_version": "parallel_branch_allocate_precheck.receipt.v2",
@@ -19466,6 +19674,11 @@ def _parallel_branch_allocate_contract_revision_payload(
             if isinstance(body.get("retry_policy"), Mapping)
             else {}
         ),
+        "allocation_precheck": (
+            dict(body.get("allocation_precheck") or {})
+            if isinstance(body.get("allocation_precheck"), Mapping)
+            else {}
+        ),
         "branch_ref": str(body.get("branch_ref") or saved_context.get("branch_ref") or ""),
         "target_project_root": str(
             saved_context.get("target_project_root")
@@ -19696,6 +19909,51 @@ def _parallel_branch_allocate_mf_parallel_rev8_record(
         or not _is_mf_parallel_postmerge_revision(record)
         or str(record.get("project_id") or "").strip() != str(project_id)
         or str(record.get("backlog_id") or "").strip() != str(backlog_id)
+    ):
+        return {}
+    return dict(record)
+
+
+def _parallel_branch_allocate_contract_update_rev2_record(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve the exact active ContractUpdate prechecked allocation parent."""
+
+    receipt = (
+        body.get("allocation_precheck")
+        if isinstance(body.get("allocation_precheck"), Mapping)
+        else {}
+    )
+    if str(receipt.get("scope") or "").strip() != (
+        "contract_update_single_lane"
+    ):
+        return {}
+    execution_id = _runtime_context_public_text(
+        body.get("contract_execution_id"),
+        body.get("successor_contract_execution_id"),
+        body.get("current_contract_execution_id"),
+    )
+    if not execution_id:
+        return {}
+    try:
+        record = _contract_runtime_store(conn).get(execution_id)
+    except ContractRuntimeError:
+        return {}
+    authority = _contract_update_rev2_dispatch_allocation_authority(record)
+    if not (
+        authority
+        and str(record.get("project_id") or "").strip() == project_id
+        and str(record.get("backlog_id") or "").strip() == backlog_id
+        and str(record.get("contract_execution_id") or "").strip()
+        == execution_id
+        and int(receipt.get("expected_lane_count") or 0) == 1
+        and receipt.get("atomic") is False
+        and str(receipt.get("cardinality_source") or "").strip()
+        == "contract_update_rev2_dispatch_line"
     ):
         return {}
     return dict(record)
@@ -21894,6 +22152,7 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
     )
     conn = get_connection(project_id)
     rev8_allocation_record: dict[str, Any] = {}
+    contract_update_allocation_record: dict[str, Any] = {}
     effective_body: dict[str, Any] = dict(ctx.body or {})
     batch_route_resolved = False
     batch_target_authority: dict[str, Any] = {}
@@ -21914,6 +22173,47 @@ def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
                 body=ctx.body or {},
             )
         )
+        contract_update_allocation_record = (
+            _parallel_branch_allocate_contract_update_rev2_record(
+                conn,
+                project_id=project_id,
+                backlog_id=str(ctx.body.get("backlog_id") or ""),
+                body=ctx.body or {},
+            )
+        )
+        requested_precheck_scope = str(
+            (
+                ctx.body.get("allocation_precheck")
+                if isinstance(
+                    ctx.body.get("allocation_precheck"), Mapping
+                )
+                else {}
+            ).get("scope")
+            or ""
+        ).strip()
+        if requested_precheck_scope == "contract_update_single_lane" and not (
+            contract_update_allocation_record
+            and allocation_precheck_verification.get("verified") is True
+        ):
+            raise GovernanceError(
+                "parallel_branch_allocate_contract_update_authority_invalid",
+                (
+                    "contract_update allocation requires the exact active rev2 "
+                    "dispatch execution and unchanged signed precheck body"
+                ),
+                409,
+                {
+                    "contract_execution_id": str(
+                        ctx.body.get("contract_execution_id") or ""
+                    ),
+                    "precheck_status": str(
+                        allocation_precheck_verification.get("status") or ""
+                    ),
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                },
+            )
         rev8_allocation_record = (
             _parallel_branch_allocate_mf_parallel_rev8_record(
                 conn,
@@ -57837,6 +58137,73 @@ def _runtime_context_contract_update_allocation_identity_anchor(
         "raw_credentials_persisted": False,
     }
     return {**core, "anchor_hash": _stable_public_hash(core)}
+
+
+def _contract_update_accepted_dispatch_authority(
+    record: Mapping[str, Any],
+    anchor: Mapping[str, Any],
+    revision_body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind the existing allocation anchor to its signed rev2 precheck."""
+
+    receipt = (
+        revision_body.get("allocation_precheck")
+        if isinstance(revision_body.get("allocation_precheck"), Mapping)
+        else {}
+    )
+    if not (
+        _contract_update_rev2_dispatch_allocation_authority(record)
+        and anchor.get("server_derived") is True
+        and receipt.get("schema_version")
+        == "parallel_branch_allocate_precheck.receipt.v2"
+        and receipt.get("status") == "ready"
+        and receipt.get("submit_unchanged") is True
+        and receipt.get("zero_write") is True
+        and receipt.get("expected_lane_count") == 1
+        and receipt.get("atomic") is False
+        and receipt.get("scope") == "contract_update_single_lane"
+        and receipt.get("cardinality_source")
+        == "contract_update_rev2_dispatch_line"
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(receipt.get("authority_hash") or "").strip(),
+        )
+    ):
+        return {}
+    core = {
+        "schema_version": "contract_update.accepted_dispatch_authority.v1",
+        "status": "accepted_allocation",
+        "server_derived": True,
+        "db_verified": True,
+        "project_id": str(record.get("project_id") or ""),
+        "backlog_id": str(record.get("backlog_id") or ""),
+        "contract_execution_id": str(
+            record.get("contract_execution_id") or ""
+        ),
+        "contract_id": CONTRACT_UPDATE_CONTRACT_ID,
+        "contract_revision": "rev2",
+        "allocation_revision_ref": str(
+            anchor.get("allocation_revision_ref") or ""
+        ),
+        "dispatch_event_ref": str(anchor.get("dispatch_event_ref") or ""),
+        "allocation_anchor_hash": str(anchor.get("anchor_hash") or ""),
+        "allocation_precheck_authority_hash": str(
+            receipt.get("authority_hash") or ""
+        ),
+        "runtime_context_id": str(anchor.get("runtime_context_id") or ""),
+        "task_id": str(anchor.get("task_id") or ""),
+        "parent_task_id": str(anchor.get("parent_task_id") or ""),
+        "worker_id": str(anchor.get("worker_id") or ""),
+        "worker_slot_id": str(anchor.get("worker_slot_id") or ""),
+        "worker_role": "mf_sub",
+        "base_commit": str(anchor.get("base_commit") or ""),
+        "target_head_commit": str(anchor.get("target_head_commit") or ""),
+        "owned_files": list(anchor.get("owned_files") or []),
+        "writes_performed": False,
+    }
+    if any(value in ("", []) for value in core.values()):
+        return {}
+    return {**core, "authority_hash": stable_sha256(core)}
 
 
 def _runtime_context_pre_lineage_legacy_dispatch_identity_anchor(
@@ -108623,13 +108990,19 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Hydrate the pre-dispatch writer body from persisted allocation authority."""
 
-    projected = _contract_runtime_apply_mf_parallel_prefill_plan_projection(
-        record
+    contract_update_authority = (
+        _contract_update_rev2_dispatch_allocation_authority(record)
+    )
+    projected = (
+        dict(record)
+        if contract_update_authority
+        else _contract_runtime_apply_mf_parallel_prefill_plan_projection(record)
     )
     record = projected
-    if not _is_mf_parallel_record_contract_id(
+    mf_parallel = _is_mf_parallel_record_contract_id(
         str(record.get("contract_id") or "")
-    ):
+    )
+    if not (mf_parallel or contract_update_authority):
         return projected, {}
     guide = (
         dict(record.get("runtime_guide") or {})
@@ -108641,16 +109014,25 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         if isinstance(guide.get("next_legal_action"), Mapping)
         else {}
     )
-    cardinality_policy = _contract_runtime_mf_parallel_worker_cardinality_policy(
-        conn,
-        project_id=project_id,
-        record=record,
-    )
-    allocation_precheck_policy = (
-        _contract_runtime_mf_parallel_allocation_precheck_policy(
-            cardinality_policy
+    if contract_update_authority:
+        cardinality_policy, allocation_precheck_policy = (
+            _contract_update_allocation_precheck_policy(
+                contract_update_authority
+            )
         )
-    )
+    else:
+        cardinality_policy = (
+            _contract_runtime_mf_parallel_worker_cardinality_policy(
+                conn,
+                project_id=project_id,
+                record=record,
+            )
+        )
+        allocation_precheck_policy = (
+            _contract_runtime_mf_parallel_allocation_precheck_policy(
+                cardinality_policy
+            )
+        )
     guide["effective_worker_cardinality_policy"] = cardinality_policy
     guide["effective_allocation_precheck_policy"] = allocation_precheck_policy
     if next_action:
@@ -108702,6 +109084,7 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         and str(lane.get("task_id") or "").strip()
     }
     candidates: list[tuple[Any, dict[str, Any]]] = []
+    contract_update_authorities: dict[str, dict[str, Any]] = {}
     for context in list_branch_contexts(conn, project_id):
         if str(getattr(context, "backlog_id", "") or "").strip() != backlog_id:
             continue
@@ -108724,13 +109107,43 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
             != execution_id
         ):
             continue
+        if contract_update_authority:
+            anchor = _runtime_context_contract_update_allocation_identity_anchor(
+                conn,
+                project_id=project_id,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                contract_execution_id=execution_id,
+                contract_record=record,
+            )
+            revision_body = (
+                revision_payload.get("payload")
+                if isinstance(revision_payload.get("payload"), Mapping)
+                else {}
+            )
+            accepted_authority = _contract_update_accepted_dispatch_authority(
+                record,
+                anchor,
+                revision_body,
+            )
+            if not accepted_authority:
+                continue
+            contract_update_authorities[runtime_context_id] = (
+                accepted_authority
+            )
         candidates.append((context, revision_payload))
-    policy = _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    policy = (
+        _contract_update_dispatch_authority_policy(record)
+        if contract_update_authority
+        else _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    )
     required_worker_count = (
-        _contract_runtime_mf_parallel_current_generation_worker_count(
-        record,
-        conn=conn,
-        project_id=project_id,
+        1
+        if contract_update_authority
+        else _contract_runtime_mf_parallel_current_generation_worker_count(
+            record,
+            conn=conn,
+            project_id=project_id,
         )
     )
     candidates.sort(
@@ -109004,7 +109417,11 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
         ).strip()
         admitted_lane = admitted_lanes_by_task_id.get(context_task_id, {})
         dispatch_payload = {
-                "schema_version": "mf_parallel.dispatch_bounded_worker.v2",
+                "schema_version": (
+                    "contract_update.dispatch_bounded_worker.v1"
+                    if contract_update_authority
+                    else "mf_parallel.dispatch_bounded_worker.v2"
+                ),
                 "line_instance_id": (
                     "runtime_context:"
                     + runtime_context_id_for_branch_context(context)
@@ -109053,6 +109470,13 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
                 "route_identity": dict(route_identity),
                 **dict(route_identity),
             }
+        if contract_update_authority:
+            dispatch_payload["accepted_dispatch_authority"] = dict(
+                contract_update_authorities.get(
+                    runtime_context_id_for_branch_context(context),
+                    {},
+                )
+            )
         if admitted_lane:
             dispatch_payload["test_files"] = list(
                 admitted_lane.get("test_files") or []
@@ -109177,6 +109601,10 @@ def _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
     next_action["dispatch_copy_safe_body_source"] = (
         "RuntimeContext+ContractRevision+observer_route_token_refs"
     )
+    if contract_update_authority:
+        next_action["accepted_dispatch_authority"] = dict(
+            dispatch_payloads[0]["accepted_dispatch_authority"]
+        )
     guide["next_legal_action"] = next_action
     projection = {
         "schema_version": (
@@ -109495,6 +109923,7 @@ def _runtime_next_action_from_guide(
         if isinstance(guide.get("contract"), Mapping)
         else {}
     )
+    contract_id = str(contract.get("contract_id") or "").strip()
     reconcile_projection = (
         _contract_runtime_observer_reconcile_action_projection(
             guide,
@@ -109506,19 +109935,69 @@ def _runtime_next_action_from_guide(
     if (
         not route_action_scope_blocked
         and line_id == "observer_dispatch_bounded_workers"
-        and str(contract.get("contract_id") or "").strip()
-        == MF_PARALLEL_CONTRACT_ID
+        and contract_id in {
+            MF_PARALLEL_CONTRACT_ID,
+            CONTRACT_UPDATE_CONTRACT_ID,
+        }
     ):
         if (
             next_line.get("copy_safe_dispatch_ready") is not True
             and not persisted_allocation_authority_blocked
         ):
             synthetic_guide = dict(guide)
-            synthetic_guide["next_legal_action"] = {
+            synthetic_next = {
                 **dict(next_line),
                 "owner_role": "mf_sub",
                 "allowed_writer_roles": ["mf_sub"],
             }
+            if contract_id == CONTRACT_UPDATE_CONTRACT_ID:
+                request_lines = [
+                    line
+                    for line in guide.get("completed_lines") or []
+                    if isinstance(line, Mapping)
+                    and str(line.get("line_id") or "").strip()
+                    == "observer_request_contract_update"
+                ]
+                request_payload = (
+                    request_lines[0].get("payload")
+                    if len(request_lines) == 1
+                    and isinstance(request_lines[0].get("payload"), Mapping)
+                    else {}
+                )
+                owned_files = _runtime_context_service_query_values(
+                    request_payload,
+                    "owned_files",
+                    "target_files",
+                )
+                execution_id = str(
+                    execution.get("contract_execution_id") or ""
+                ).strip()
+                backlog_id = str(execution.get("backlog_id") or "").strip()
+                if owned_files and execution_id and backlog_id:
+                    worker_id = _contract_runtime_stable_id(
+                        "contract-update-worker",
+                        execution_id,
+                    )
+                    synthetic_next["bounded_workers"] = [
+                        {
+                            "task_id": _contract_runtime_stable_id(
+                                "contract-update-task",
+                                execution_id,
+                            ),
+                            "parent_task_id": execution_id,
+                            "worker_id": worker_id,
+                            "worker_slot_id": worker_id,
+                            "owned_files": owned_files,
+                            "target_files": owned_files,
+                            "profile_requirements": dict(
+                                _MF_PARALLEL_DEFAULT_PROFILE_REQUIREMENTS
+                            ),
+                            "retry_policy": dict(
+                                _MF_PARALLEL_DEFAULT_RETRY_POLICY
+                            ),
+                        }
+                    ]
+            synthetic_guide["next_legal_action"] = synthetic_next
             allocation_bridge = _contract_runtime_mf_sub_host_bridge_guidance(
                 synthetic_guide
             )
@@ -109566,7 +110045,11 @@ def _runtime_next_action_from_guide(
                 "schema_version": (
                     "contract_runtime.copy_safe_dispatch_submission.v1"
                 ),
-                "mcp_tool": "contract_runtime_submit_line",
+                "mcp_tool": (
+                    "contract_update_submit_line"
+                    if contract_id == CONTRACT_UPDATE_CONTRACT_ID
+                    else "contract_runtime_submit_line"
+                ),
                 "body_source": (
                     "writer_role_safe_copy_payload.copy_payload"
                 ),
@@ -136317,7 +136800,10 @@ def _contract_runtime_is_policy_bound_mf_parallel_dispatch(
     record: Mapping[str, Any],
     write: Mapping[str, Any],
 ) -> bool:
-    policy = _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    policy = (
+        _contract_update_dispatch_authority_policy(record)
+        or _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+    )
     line_ids = {
         str(value or "").strip()
         for value in policy.get("line_ids") or []
@@ -136352,8 +136838,13 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
         record, effective
     ):
         return effective, []
+    contract_update_authority = (
+        _contract_update_rev2_dispatch_allocation_authority(record)
+    )
     authority_policy = (
-        _contract_runtime_mf_parallel_dispatch_authority_policy(record)
+        _contract_update_dispatch_authority_policy(record)
+        if contract_update_authority
+        else _contract_runtime_mf_parallel_dispatch_authority_policy(record)
     )
     required_dispatch_fields = {
         str(value or "").strip()
@@ -136813,6 +137304,44 @@ def _contract_runtime_bind_mf_parallel_dispatch_authority(
             errors.append("persisted runtime context is missing owned_files")
         elif owned_files and owned_files != canonical_owned_files:
             errors.append("dispatch owned_files do not match persisted runtime context")
+        if contract_update_authority:
+            revision = _runtime_context_latest_contract_revision_payload(
+                conn,
+                context,
+            )
+            revision_body = (
+                revision.get("payload")
+                if isinstance(revision.get("payload"), Mapping)
+                else {}
+            )
+            anchor = _runtime_context_contract_update_allocation_identity_anchor(
+                conn,
+                project_id=project_id,
+                context=context,
+                runtime_context_id=runtime_context_id,
+                contract_execution_id=str(
+                    record.get("contract_execution_id") or ""
+                ),
+                contract_record=record,
+            )
+            expected_dispatch_authority = (
+                _contract_update_accepted_dispatch_authority(
+                    record,
+                    anchor,
+                    revision_body,
+                )
+            )
+            supplied_dispatch_authority = supplied_mapping(
+                "accepted_dispatch_authority"
+            )
+            if (
+                not expected_dispatch_authority
+                or supplied_dispatch_authority != expected_dispatch_authority
+            ):
+                errors.append(
+                    "contract_update dispatch requires the exact accepted "
+                    "allocation authority"
+                )
 
     route_sources: list[Mapping[str, Any]] = list(sources)
     for source in sources:
@@ -162220,6 +162749,13 @@ def _contract_update_read(
     record = runtime.current_record(
         contract_execution_id,
         actor_role=actor_role,
+    )
+    record, _allocation_projection = (
+        _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
+            conn,
+            project_id=str(record.get("project_id") or ""),
+            record=record,
+        )
     )
     record = _contract_runtime_apply_blocked_projection(
         conn,
@@ -202993,6 +203529,13 @@ def handle_project_contract_update_line_write(ctx: RequestContext):
                 contract_execution_id,
                 actor_role=actor_role,
             )
+            record, _allocation_projection = (
+                _contract_runtime_mf_parallel_dispatch_copy_safe_projection(
+                    conn,
+                    project_id=project_id,
+                    record=record,
+                )
+            )
             blocked_record = _contract_runtime_apply_blocked_projection(
                 conn,
                 project_id=str(record.get("project_id") or ""),
@@ -203061,13 +203604,28 @@ def handle_project_contract_update_line_write(ctx: RequestContext):
                 body=body,
                 worker_proof=getattr(ctx, "_contract_runtime_mf_sub_proof", None),
             )
-            result = runtime.submit_line_write(
-                contract_execution_id,
-                write,
-                actor_role=actor_role,
-                projected_completed_lines=projected_completed_lines,
-                projection=successor_projection,
+            write, dispatch_errors = (
+                _contract_runtime_bind_mf_parallel_dispatch_authority(
+                    conn,
+                    project_id=project_id,
+                    record=write_record,
+                    write=write,
+                    _required_worker_count_override=1,
+                )
             )
+            if dispatch_errors:
+                result = _contract_runtime_unchanged_line_rejection(
+                    write_record,
+                    dispatch_errors,
+                )
+            else:
+                result = runtime.submit_line_write(
+                    contract_execution_id,
+                    write,
+                    actor_role=actor_role,
+                    projected_completed_lines=projected_completed_lines,
+                    projection=successor_projection,
+                )
         except StalePinnedContractExecutionError as exc:
             response = _contract_runtime_stale_recovery_projection(
                 exc,
