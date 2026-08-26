@@ -94803,6 +94803,357 @@ def _historical_parentless_direct_main_guide(
     )
 
 
+def test_direct_main_no_pass_generation_authorizes_deposit_without_qa_pass(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DIRECT-MAIN-NO-PASS-DEPOSIT"
+    diagnostic_backlog_id = "AC-DIRECT-MAIN-NO-PASS-DEPOSIT-DIAGNOSTIC"
+    project_root = tmp_path / "direct-main-no-pass-deposit"
+    parent_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    task_id, route_token_ref, route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+        )
+    )
+    graph_trace_id = "gqt-20260826-a0b1c2d3e4"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_identity=route_identity,
+        commit_sha=parent_commit,
+        target_project_root=str(project_root),
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_canonical_parentless_direct_main_pre_mutation_body(
+                append_base={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "route_token_ref": route_token_ref,
+                },
+                route_identity=route_identity,
+                allowed_files=["agent/governance/server.py"],
+                graph_trace_ids=[graph_trace_id],
+            ),
+        )
+    )
+    candidate_commit = _commit_test_git_files(
+        project_root,
+        ["agent/governance/server.py"],
+        message=_canonical_parentless_direct_main_commit_message(
+            backlog_id=backlog_id,
+            task_id=task_id,
+            parent_commit=parent_commit,
+        ),
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_canonical_parentless_direct_main_implementation_body(
+                backlog_id=backlog_id,
+                task_id=task_id,
+                route_token_ref=route_token_ref,
+                route_identity=route_identity,
+                commit_sha=candidate_commit,
+            ),
+        )
+    )
+
+    candidate_snapshot_id = "full-direct-main-no-pass-deposit"
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id=candidate_snapshot_id,
+        commit_sha=candidate_commit,
+        snapshot_kind="full",
+        graph_json=_graph(),
+        status="candidate",
+        created_by="qa",
+        notes=json.dumps({"purpose": "exact_no_pass_candidate"}),
+    )
+    generation_id = "bypassgen-direct-main-no-pass-deposit"
+    classification = "partial_admission_materialization_block"
+    root_identity = f"{task_id}:qa_graph_context:rev5"
+    diagnostic_shape = {
+        "source_backlog_id": backlog_id,
+        "contract_execution_id": task_id,
+        "line_id": "qa_graph_context",
+        "no_pass_generation_id": generation_id,
+        "root_bypass_identity": root_identity,
+        "classification": classification,
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+    }
+    _insert_simple_mf_close_backlog(conn, diagnostic_backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'OPEN', chain_trigger_json = ?, "
+        "bypass_policy_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(diagnostic_shape, sort_keys=True),
+            json.dumps(
+                {**diagnostic_shape, "keep_open": True},
+                sort_keys=True,
+            ),
+            diagnostic_backlog_id,
+        ),
+    )
+
+    def bypass_line(line_id, stage_id, role, *, evidence_refs=None):
+        bypass_identity = (
+            root_identity
+            if role == "root"
+            else f"{task_id}:{line_id}:inherited"
+        )
+        return {
+            "actor_role": "observer",
+            "disposition": "proceeded_with_exception",
+            "evidence_kind": "contract_line_bypass",
+            "line_id": line_id,
+            "no_pass_claim": True,
+            "stage_id": stage_id,
+            "status": "waived",
+            "payload": {
+                "schema_version": "contract_line_bypass.v1",
+                "source_backlog_id": backlog_id,
+                "diagnostic_backlog_id": diagnostic_backlog_id,
+                "classification": classification,
+                "bypass_identity": bypass_identity,
+                "no_pass_claim": True,
+                "evidence_refs": list(evidence_refs or []),
+                "no_pass_generation": {
+                    "schema_version": (
+                        "contract_line_bypass_generation_link.v1"
+                    ),
+                    "generation_id": generation_id,
+                    "role": role,
+                    "no_pass_claim": True,
+                    "authoritative_pass_synthesized": False,
+                    "diagnostic_created": role == "root",
+                    "root_bypass_identity": root_identity,
+                    "root_diagnostic_backlog_id": diagnostic_backlog_id,
+                    "root_classification": classification,
+                },
+            },
+        }
+
+    record = server._contract_runtime(conn).store.get(task_id)
+    record["completed_lines"].extend(
+        [
+            bypass_line(
+                "qa_graph_context",
+                "qa_graph_context",
+                "root",
+                evidence_refs=[candidate_snapshot_id],
+            ),
+            bypass_line(
+                "qa_independent_verification",
+                "qa",
+                "inherited_gate",
+            ),
+            bypass_line(
+                "observer_reconcile",
+                "reconcile",
+                "inherited_gate",
+            ),
+        ]
+    )
+    server._contract_runtime(conn).store.update(task_id, record)
+    conn.commit()
+
+    def preflight():
+        return (
+            server.
+            _operator_supervised_direct_main_reconcile_qa_preflight_authority(
+                conn,
+                project_id=PID,
+                target_commit=candidate_commit,
+                current_full_auth={
+                    "route_token_ref": route_token_ref,
+                    "route_token_scope": {
+                        "project_id": PID,
+                        "backlog_id": backlog_id,
+                        "task_id": task_id,
+                    },
+                },
+            )
+        )
+
+    authority = preflight()
+    no_pass = authority["no_pass_continuation_authority"]
+    assert authority["passed"] is False
+    assert authority["qa_passed"] is False
+    assert authority["mutation_allowed"] is True
+    assert authority["authority_mode"] == "no_pass_continuation"
+    assert authority["authoritative_pass_synthesized"] is False
+    assert authority["close_satisfying"] is False
+    assert no_pass["passed"] is True
+    assert no_pass["deposit_only"] is True
+    assert no_pass["close_satisfying"] is False
+    assert no_pass["diagnostic_status"] == "OPEN"
+    assert no_pass["candidate_snapshot_id"] == candidate_snapshot_id
+    assert no_pass["bypassed_line_ids"] == [
+        "observer_reconcile",
+        "qa_graph_context",
+        "qa_independent_verification",
+    ]
+
+    route_evidence = server._current_full_reconcile_route_evidence(
+        {
+            "role": "observer",
+            "role_source": "observer_session_route_token_ref",
+            "observer_session_id": "obs-direct-no-pass-deposit",
+            "route_token_ref": route_token_ref,
+            "route_token_scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+        }
+    )
+    route_evidence["direct_main_qa_preflight_authority"] = copy.deepcopy(
+        authority
+    )
+    conn.execute(
+        "UPDATE graph_snapshots SET status = 'active' "
+        "WHERE project_id = ? AND snapshot_id = ?",
+        (PID, candidate_snapshot_id),
+    )
+    reconcile_event = task_timeline.record_event(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        event_type="graph.reconcile",
+        event_kind="reconcile",
+        phase="reconcile",
+        actor="observer",
+        status="passed",
+        payload={
+            "schema_version": "graph_reconcile_contract_evidence.v1",
+            "current_full_reconcile": True,
+            "snapshot_id": candidate_snapshot_id,
+            "target_commit_sha": candidate_commit,
+        },
+        commit_sha=candidate_commit,
+        post_commit_hooks=False,
+    )
+    store.record_current_full_reconcile_provenance(
+        conn,
+        project_id=PID,
+        snapshot_id=candidate_snapshot_id,
+        target_commit_sha=candidate_commit,
+        request_id="req-direct-no-pass-deposit",
+        request_started_at="2099-08-26T00:00:00Z",
+        route_evidence=route_evidence,
+        reconcile_event_id=int(reconcile_event["id"]),
+        reconcile_event_created_at=str(reconcile_event["created_at"]),
+        marker_created_at="2099-08-26T00:00:01Z",
+        schema_ready=True,
+    )
+    conn.commit()
+
+    post_reconcile = (
+        server._operator_supervised_direct_main_current_full_reconcile_authority(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            contract_execution_id=task_id,
+            record=server._contract_runtime(conn).store.get(task_id),
+        )
+    )
+    assert post_reconcile["authority_mode"] == "no_pass_continuation"
+    assert post_reconcile["qa_passed"] is False
+    assert post_reconcile["qa_event_id"] == 0
+    assert post_reconcile["qa_event_ref"] == ""
+    assert post_reconcile["qa_before_reconcile_verified"] is False
+    assert post_reconcile["no_pass_continuation_verified"] is True
+    assert post_reconcile["no_pass_claim"] is True
+    assert post_reconcile["authoritative_pass_synthesized"] is False
+    assert post_reconcile["deposit_only"] is True
+    assert post_reconcile["close_satisfying"] is False
+    assert post_reconcile["no_pass_generation_id"] == generation_id
+    assert post_reconcile["diagnostic_backlog_id"] == diagnostic_backlog_id
+    assert post_reconcile["active_snapshot_id"] == candidate_snapshot_id
+    assert post_reconcile["no_pass_continuation_authority"][
+        "candidate_snapshot_status"
+    ] == "active"
+
+    no_pass_close = (
+        server._contract_runtime_operator_supervised_direct_main_close_authority_gate(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            record=server._contract_runtime(conn).store.get(task_id),
+            close_commit=candidate_commit,
+        )
+    )
+    assert no_pass_close["passed"] is False
+    assert "current_full_reconcile_qa_pass_close_authority" in (
+        no_pass_close["missing_requirement_ids"]
+    )
+
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'FIXED' WHERE bug_id = ?",
+        (diagnostic_backlog_id,),
+    )
+    conn.commit()
+    closed_diagnostic = preflight()
+    assert closed_diagnostic["passed"] is False
+    assert closed_diagnostic["mutation_allowed"] is False
+    assert "open_exact_no_pass_diagnostic" in closed_diagnostic[
+        "no_pass_continuation_authority"
+    ]["missing_requirement_ids"]
+    assert not (
+        server._operator_supervised_direct_main_current_full_reconcile_authority(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            contract_execution_id=task_id,
+            record=server._contract_runtime(conn).store.get(task_id),
+        )
+    )
+
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'OPEN' WHERE bug_id = ?",
+        (diagnostic_backlog_id,),
+    )
+    duplicated = server._contract_runtime(conn).store.get(task_id)
+    duplicated["completed_lines"].append(
+        copy.deepcopy(duplicated["completed_lines"][-3])
+    )
+    server._contract_runtime(conn).store.update(task_id, duplicated)
+    conn.commit()
+    duplicate_root = preflight()
+    assert duplicate_root["mutation_allowed"] is False
+    assert "unique_exact_no_pass_root" in duplicate_root[
+        "no_pass_continuation_authority"
+    ]["missing_requirement_ids"]
+    assert not (
+        server._operator_supervised_direct_main_current_full_reconcile_authority(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            contract_execution_id=task_id,
+            record=server._contract_runtime(conn).store.get(task_id),
+        )
+    )
+
+
 def test_parentless_direct_main_dirty_scope_normalizes_order_as_exact_set(
     conn,
     monkeypatch,

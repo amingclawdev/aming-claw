@@ -90301,7 +90301,8 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
         if (
             activate_requested
             and direct_main_qa_preflight_authority.get("applicable") is True
-            and direct_main_qa_preflight_authority.get("passed") is not True
+            and direct_main_qa_preflight_authority.get("mutation_allowed")
+            is not True
         ):
             return 409, {
                 "ok": False,
@@ -90310,8 +90311,9 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                     "operator_supervised_direct_main_qa_before_reconcile_required"
                 ),
                 "message": (
-                    "Direct Main current-full reconcile requires one exact "
-                    "authenticated QA Fact before any graph mutation"
+                    "Direct Main current-full reconcile requires either one "
+                    "exact authenticated QA Fact or one exact open no-PASS "
+                    "deposit generation before any graph mutation"
                 ),
                 "rebuild_started": False,
                 "snapshot_materialized": False,
@@ -139537,6 +139539,321 @@ def _operator_supervised_direct_main_persisted_active_route_authority_valid(
     )
 
 
+def _operator_supervised_direct_main_no_pass_continuation_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    target_commit: str,
+    record: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    active_route_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authorize deposit for one exact, open Direct no-PASS generation.
+
+    This is intentionally separate from QA authority.  It only permits the
+    already-implemented commit to reach the canonical graph/runtime world and
+    never satisfies Direct close or rewrites a bypassed business line as PASS.
+    """
+
+    target_commit = str(target_commit or "").strip().lower()
+    missing: list[str] = []
+    completed_lines = [
+        dict(line)
+        for line in record.get("completed_lines") or []
+        if isinstance(line, Mapping)
+    ]
+    implementation_lines = [
+        line
+        for line in completed_lines
+        if str(line.get("line_id") or "").strip()
+        == "observer_implementation"
+    ]
+    binding_hash = str(binding.get("binding_hash") or "").strip()
+    immutable_route_identity = (
+        binding.get("route_identity")
+        if isinstance(binding.get("route_identity"), Mapping)
+        else {}
+    )
+    immutable_route_ref = str(
+        immutable_route_identity.get("route_token_ref") or ""
+    ).strip()
+    active_route_chain = {
+        str(item or "").strip()
+        for item in active_route_authority.get("route_token_ref_chain") or []
+        if str(item or "").strip()
+    }
+    if immutable_route_ref:
+        active_route_chain.add(immutable_route_ref)
+    implementation = implementation_lines[0] if len(implementation_lines) == 1 else {}
+    implementation_payload = (
+        implementation.get("payload")
+        if isinstance(implementation.get("payload"), Mapping)
+        else {}
+    )
+    implementation_route_ref = str(
+        implementation.get("route_token_ref")
+        or implementation_payload.get("route_token_ref")
+        or ""
+    ).strip()
+    if not (
+        len(implementation_lines) == 1
+        and str(implementation.get("commit_sha") or "").strip().lower()
+        == target_commit
+        and str(
+            implementation_payload.get("direct_runtime_binding_hash") or ""
+        ).strip()
+        == binding_hash
+        and binding_hash
+        and implementation_route_ref
+        and implementation_route_ref in active_route_chain
+        and active_route_authority.get("passed") is True
+    ):
+        missing.append("exact_no_pass_implementation_binding")
+
+    bypass_lines = [
+        line
+        for line in completed_lines
+        if str(line.get("evidence_kind") or "").strip()
+        == "contract_line_bypass"
+    ]
+
+    def bypass_parts(line: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        payload = (
+            dict(line.get("payload"))
+            if isinstance(line.get("payload"), Mapping)
+            else {}
+        )
+        generation = (
+            dict(payload.get("no_pass_generation"))
+            if isinstance(payload.get("no_pass_generation"), Mapping)
+            else {}
+        )
+        return payload, generation
+
+    root_lines = []
+    for line in bypass_lines:
+        _payload, generation = bypass_parts(line)
+        if str(generation.get("role") or "").strip() == "root":
+            root_lines.append(line)
+    root_line = root_lines[0] if len(root_lines) == 1 else {}
+    root_payload, root_generation = bypass_parts(root_line)
+    generation_id = str(root_generation.get("generation_id") or "").strip()
+    diagnostic_backlog_id = str(
+        root_payload.get("diagnostic_backlog_id")
+        or root_generation.get("root_diagnostic_backlog_id")
+        or ""
+    ).strip()
+    classification = str(
+        root_payload.get("classification")
+        or root_generation.get("root_classification")
+        or ""
+    ).strip()
+    root_bypass_identity = str(
+        root_payload.get("bypass_identity")
+        or root_generation.get("root_bypass_identity")
+        or ""
+    ).strip()
+    if not (
+        len(root_lines) == 1
+        and str(root_line.get("line_id") or "").strip()
+        == "qa_graph_context"
+        and str(root_line.get("status") or "").strip().lower() == "waived"
+        and root_line.get("no_pass_claim") is True
+        and root_payload.get("schema_version") == "contract_line_bypass.v1"
+        and root_payload.get("no_pass_claim") is True
+        and str(root_payload.get("source_backlog_id") or "").strip()
+        == backlog_id
+        and root_generation.get("schema_version")
+        == "contract_line_bypass_generation_link.v1"
+        and root_generation.get("no_pass_claim") is True
+        and root_generation.get("authoritative_pass_synthesized") is False
+        and root_generation.get("diagnostic_created") is True
+        and generation_id
+        and diagnostic_backlog_id
+        and classification
+        and root_bypass_identity
+    ):
+        missing.append("unique_exact_no_pass_root")
+
+    required_line_ids = {
+        "qa_graph_context",
+        "qa_independent_verification",
+        "observer_reconcile",
+    }
+    generation_lines: dict[str, list[dict[str, Any]]] = {}
+    invalid_generation_line = False
+    for line in bypass_lines:
+        payload, generation = bypass_parts(line)
+        line_id = str(line.get("line_id") or "").strip()
+        line_generation_id = str(generation.get("generation_id") or "").strip()
+        if line_id in required_line_ids:
+            generation_lines.setdefault(line_id, []).append(line)
+        expected_role = "root" if line_id == "qa_graph_context" else "inherited_gate"
+        if line_id in required_line_ids and not (
+            str(line.get("status") or "").strip().lower() == "waived"
+            and line.get("no_pass_claim") is True
+            and payload.get("no_pass_claim") is True
+            and str(payload.get("source_backlog_id") or "").strip()
+            == backlog_id
+            and str(payload.get("diagnostic_backlog_id") or "").strip()
+            == diagnostic_backlog_id
+            and str(payload.get("classification") or "").strip()
+            == classification
+            and line_generation_id == generation_id
+            and str(generation.get("role") or "").strip() == expected_role
+            and str(generation.get("root_bypass_identity") or "").strip()
+            == root_bypass_identity
+            and str(
+                generation.get("root_diagnostic_backlog_id") or ""
+            ).strip()
+            == diagnostic_backlog_id
+            and generation.get("authoritative_pass_synthesized") is False
+        ):
+            invalid_generation_line = True
+    if invalid_generation_line or any(
+        len(generation_lines.get(line_id) or []) != 1
+        for line_id in required_line_ids
+    ):
+        missing.append("exact_no_pass_generation_gate_chain")
+
+    diagnostic_status = ""
+    diagnostic_chain: dict[str, Any] = {}
+    diagnostic_policy: dict[str, Any] = {}
+    if diagnostic_backlog_id:
+        diagnostic_rows = conn.execute(
+            "SELECT status, chain_trigger_json, bypass_policy_json "
+            "FROM backlog_bugs WHERE bug_id = ?",
+            (diagnostic_backlog_id,),
+        ).fetchall()
+    else:
+        diagnostic_rows = []
+    if len(diagnostic_rows) == 1:
+        diagnostic_status = str(diagnostic_rows[0]["status"] or "").strip().upper()
+        diagnostic_chain = backlog_runtime.parse_json_object(
+            diagnostic_rows[0]["chain_trigger_json"]
+        )
+        diagnostic_policy = backlog_runtime.parse_json_object(
+            diagnostic_rows[0]["bypass_policy_json"]
+        )
+    if not (
+        len(diagnostic_rows) == 1
+        and diagnostic_status == "OPEN"
+        and all(
+            str(diagnostic_chain.get(key) or "").strip() == expected
+            for key, expected in (
+                ("source_backlog_id", backlog_id),
+                ("contract_execution_id", contract_execution_id),
+                ("line_id", "qa_graph_context"),
+                ("no_pass_generation_id", generation_id),
+                ("root_bypass_identity", root_bypass_identity),
+                ("classification", classification),
+            )
+        )
+        and diagnostic_chain.get("no_pass_claim") is True
+        and diagnostic_chain.get("authoritative_pass_synthesized") is False
+        and all(
+            str(diagnostic_policy.get(key) or "").strip() == expected
+            for key, expected in (
+                ("source_backlog_id", backlog_id),
+                ("contract_execution_id", contract_execution_id),
+                ("line_id", "qa_graph_context"),
+                ("no_pass_generation_id", generation_id),
+                ("root_bypass_identity", root_bypass_identity),
+                ("classification", classification),
+            )
+        )
+        and diagnostic_policy.get("no_pass_claim") is True
+        and diagnostic_policy.get("authoritative_pass_synthesized") is False
+        and diagnostic_policy.get("keep_open") is True
+    ):
+        missing.append("open_exact_no_pass_diagnostic")
+
+    root_evidence_refs = [
+        str(item or "").strip()
+        for item in root_payload.get("evidence_refs") or []
+        if str(item or "").strip()
+    ]
+    candidate_snapshots: list[dict[str, Any]] = []
+    for evidence_ref in root_evidence_refs:
+        rows = conn.execute(
+            "SELECT snapshot_id, commit_sha, snapshot_kind, status "
+            "FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+            (project_id, evidence_ref),
+        ).fetchall()
+        for row in rows:
+            candidate = dict(row)
+            if (
+                str(candidate.get("commit_sha") or "").strip().lower()
+                == target_commit
+                and str(candidate.get("snapshot_kind") or "").strip()
+                == "full"
+                and str(candidate.get("status") or "").strip().lower()
+                in {"candidate", "active"}
+            ):
+                candidate_snapshots.append(candidate)
+    unique_candidates = {
+        str(candidate.get("snapshot_id") or "").strip(): candidate
+        for candidate in candidate_snapshots
+        if str(candidate.get("snapshot_id") or "").strip()
+    }
+    candidate_snapshot = (
+        next(iter(unique_candidates.values()))
+        if len(unique_candidates) == 1
+        else {}
+    )
+    if not candidate_snapshot:
+        missing.append("unique_exact_no_pass_candidate_snapshot")
+
+    authority = {
+        "schema_version": (
+            "operator_supervised_direct_main."
+            "no_pass_continuation_authority.v1"
+        ),
+        "applicable": bool(bypass_lines),
+        "passed": not missing,
+        "status": "passed" if not missing else "failed",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "target_commit_sha": target_commit,
+        "implementation_commit_sha": str(
+            implementation.get("commit_sha") or ""
+        ).strip().lower(),
+        "implementation_binding_hash": str(
+            implementation_payload.get("direct_runtime_binding_hash") or ""
+        ).strip(),
+        "no_pass_generation_id": generation_id,
+        "root_bypass_identity": root_bypass_identity,
+        "classification": classification,
+        "diagnostic_backlog_id": diagnostic_backlog_id,
+        "diagnostic_status": diagnostic_status,
+        "candidate_snapshot_id": str(
+            candidate_snapshot.get("snapshot_id") or ""
+        ).strip(),
+        "candidate_snapshot_commit": str(
+            candidate_snapshot.get("commit_sha") or ""
+        ).strip().lower(),
+        "candidate_snapshot_status": str(
+            candidate_snapshot.get("status") or ""
+        ).strip().lower(),
+        "bypassed_line_ids": sorted(generation_lines),
+        "qa_passed": False,
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "deposit_only": True,
+        "close_satisfying": False,
+        "diagnostic_keep_open_required": True,
+        "missing_requirement_ids": missing,
+        "zero_write_on_failure": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
     conn,
     *,
@@ -139765,14 +140082,48 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
         if len(qa_verdict_lines) == 1
         else ""
     )
+    no_pass_continuation_authority = (
+        _operator_supervised_direct_main_no_pass_continuation_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=task_id,
+            target_commit=target_commit,
+            record=record,
+            binding=binding,
+            active_route_authority=active_route_authority,
+        )
+    )
+    qa_passed = not missing
+    no_pass_continuation_passed = bool(
+        no_pass_continuation_authority.get("passed") is True
+    )
+    mutation_allowed = bool(qa_passed or no_pass_continuation_passed)
     authority = {
         "schema_version": (
             "operator_supervised_direct_main."
             "reconcile_qa_preflight_authority.v1"
         ),
         "applicable": True,
-        "passed": not missing,
-        "status": "passed" if not missing else "failed",
+        # ``passed`` remains the business QA result.  A no-PASS generation can
+        # authorize deposit, but it must never be projected as QA success.
+        "passed": qa_passed,
+        "qa_passed": qa_passed,
+        "mutation_allowed": mutation_allowed,
+        "authority_mode": (
+            "qa_pass"
+            if qa_passed
+            else "no_pass_continuation"
+            if no_pass_continuation_passed
+            else "blocked"
+        ),
+        "status": (
+            "passed"
+            if qa_passed
+            else "no_pass_continuation"
+            if no_pass_continuation_passed
+            else "failed"
+        ),
         "server_derived": True,
         "caller_claims_trusted": False,
         "project_id": project_id,
@@ -139796,7 +140147,15 @@ def _operator_supervised_direct_main_reconcile_qa_preflight_authority(
         ).strip(),
         "contract_runtime_qa_graph_line_hash": qa_graph_line_hash,
         "contract_runtime_qa_verdict_line_hash": qa_verdict_line_hash,
+        "no_pass_continuation_authority": (
+            no_pass_continuation_authority
+        ),
+        "authoritative_pass_synthesized": False,
+        "close_satisfying": qa_passed,
         "missing_requirement_ids": missing,
+        "mutation_blocking_requirement_ids": (
+            [] if mutation_allowed else list(missing)
+        ),
         "zero_write_on_failure": True,
     }
     authority["authority_hash"] = stable_sha256(authority)
@@ -139915,9 +140274,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 ).strip(),
             }
         )
-    if len(qa_candidates) != 1:
-        return {}
-    qa_authority = qa_candidates[0]
+    qa_authority = qa_candidates[0] if len(qa_candidates) == 1 else {}
     current_qa_graph_lines = [
         line
         for line in record.get("completed_lines") or []
@@ -140008,10 +140365,118 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
         reconcile_event_id = int(
             provenance.get("reconcile_event_id") or 0
         )
+        persisted_no_pass_authority = (
+            qa_preflight.get("no_pass_continuation_authority")
+            if isinstance(
+                qa_preflight.get("no_pass_continuation_authority"),
+                Mapping,
+            )
+            else {}
+        )
+        current_no_pass_authority = (
+            _operator_supervised_direct_main_no_pass_continuation_authority(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+                contract_execution_id=contract_execution_id,
+                target_commit=implementation_commit,
+                record=record,
+                binding=binding,
+                active_route_authority=reconcile_active_route_authority,
+            )
+        )
+        no_pass_identity_fields = (
+            "project_id",
+            "backlog_id",
+            "contract_execution_id",
+            "target_commit_sha",
+            "implementation_commit_sha",
+            "implementation_binding_hash",
+            "no_pass_generation_id",
+            "root_bypass_identity",
+            "classification",
+            "diagnostic_backlog_id",
+            "candidate_snapshot_id",
+            "candidate_snapshot_commit",
+            "bypassed_line_ids",
+        )
+        no_pass_mode_valid = bool(
+            qa_preflight.get("passed") is False
+            and qa_preflight.get("qa_passed") is False
+            and qa_preflight.get("mutation_allowed") is True
+            and str(qa_preflight.get("authority_mode") or "").strip()
+            == "no_pass_continuation"
+            and str(qa_preflight.get("status") or "").strip()
+            == "no_pass_continuation"
+            and int(qa_preflight.get("qa_candidate_count") or 0) == 0
+            and qa_preflight.get("authoritative_pass_synthesized") is False
+            and qa_preflight.get("close_satisfying") is False
+            and not list(
+                qa_preflight.get("mutation_blocking_requirement_ids") or []
+            )
+            and persisted_no_pass_authority.get("passed") is True
+            and persisted_no_pass_authority.get("qa_passed") is False
+            and persisted_no_pass_authority.get("no_pass_claim") is True
+            and persisted_no_pass_authority.get(
+                "authoritative_pass_synthesized"
+            )
+            is False
+            and persisted_no_pass_authority.get("deposit_only") is True
+            and persisted_no_pass_authority.get("close_satisfying") is False
+            and str(
+                persisted_no_pass_authority.get("authority_hash") or ""
+            ).strip()
+            == stable_sha256(
+                {
+                    key: value
+                    for key, value in persisted_no_pass_authority.items()
+                    if key != "authority_hash"
+                }
+            )
+            and current_no_pass_authority.get("passed") is True
+            and current_no_pass_authority.get("qa_passed") is False
+            and current_no_pass_authority.get("no_pass_claim") is True
+            and current_no_pass_authority.get(
+                "authoritative_pass_synthesized"
+            )
+            is False
+            and current_no_pass_authority.get("deposit_only") is True
+            and current_no_pass_authority.get("close_satisfying") is False
+            and all(
+                persisted_no_pass_authority.get(field)
+                == current_no_pass_authority.get(field)
+                for field in no_pass_identity_fields
+            )
+            and str(
+                current_no_pass_authority.get("candidate_snapshot_id") or ""
+            ).strip()
+            == str(provenance.get("snapshot_id") or "").strip()
+        )
+        qa_mode_valid = bool(
+            len(qa_candidates) == 1
+            and int(qa_authority.get("event_id") or 0) > 0
+            and int(qa_authority.get("event_id") or 0) < reconcile_event_id
+            and qa_preflight.get("passed") is True
+            and qa_preflight.get("qa_passed") is True
+            and qa_preflight.get("mutation_allowed") is True
+            and str(qa_preflight.get("authority_mode") or "").strip()
+            == "qa_pass"
+            and str(qa_preflight.get("status") or "").strip() == "passed"
+            and qa_preflight.get("close_satisfying") is True
+            and int(qa_preflight.get("qa_event_id") or 0)
+            == int(qa_authority.get("event_id") or 0)
+            and str(qa_preflight.get("qa_snapshot_id") or "").strip()
+            == str(qa_authority.get("snapshot_id") or "").strip()
+            and str(qa_preflight.get("qa_authority_hash") or "").strip()
+            == str(qa_authority.get("authority_hash") or "").strip()
+            and str(
+                qa_preflight.get("contract_runtime_next_line_id") or ""
+            ).strip()
+            == "observer_reconcile"
+            and not list(qa_preflight.get("missing_requirement_ids") or [])
+        )
         if not (
             reconcile_event_id > 0
-            and int(qa_authority.get("event_id") or 0)
-            < reconcile_event_id
             and isinstance(route_evidence, Mapping)
             and isinstance(marker, Mapping)
             and str(provenance.get("protected_action") or "").strip()
@@ -140039,11 +140504,17 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 "reconcile_qa_preflight_authority.v1"
             )
             and qa_preflight.get("applicable") is True
-            and qa_preflight.get("passed") is True
-            and int(qa_preflight.get("qa_event_id") or 0)
-            == int(qa_authority.get("event_id") or 0)
-            and str(qa_preflight.get("qa_snapshot_id") or "").strip()
-            == str(qa_authority.get("snapshot_id") or "").strip()
+            and qa_preflight.get("server_derived") is True
+            and qa_preflight.get("caller_claims_trusted") is False
+            and str(qa_preflight.get("project_id") or "").strip()
+            == project_id
+            and str(qa_preflight.get("backlog_id") or "").strip()
+            == backlog_id
+            and str(
+                qa_preflight.get("contract_execution_id") or ""
+            ).strip()
+            == contract_execution_id
+            and qa_preflight.get("authoritative_pass_synthesized") is False
             and str(qa_preflight.get("target_commit_sha") or "")
             .strip()
             .lower()
@@ -140062,13 +140533,6 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                 or ""
             ).strip()
             == current_qa_verdict_line_hash
-            and str(
-                qa_preflight.get("contract_runtime_next_line_id")
-                or ""
-            ).strip()
-            == "observer_reconcile"
-            and str(qa_preflight.get("qa_authority_hash") or "").strip()
-            == str(qa_authority.get("authority_hash") or "").strip()
             and str(qa_preflight.get("authority_hash") or "").strip()
             == stable_sha256(
                 {
@@ -140077,6 +140541,7 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
                     if key != "authority_hash"
                 }
             )
+            and (qa_mode_valid or no_pass_mode_valid)
             and marker.get("schema_version")
             == "current_full_reconcile.provenance.v2"
             and marker.get("protected_action")
@@ -140182,19 +140647,69 @@ def _operator_supervised_direct_main_current_full_reconcile_authority(
             "reconcile_event_created_at": str(
                 provenance.get("reconcile_event_created_at") or ""
             ).strip(),
-            "qa_event_ref": str(qa_authority.get("event_ref") or ""),
-            "qa_event_id": int(qa_authority.get("event_id") or 0),
-            "qa_snapshot_id": str(
-                qa_authority.get("snapshot_id") or ""
+            "authority_mode": (
+                "qa_pass" if qa_mode_valid else "no_pass_continuation"
             ),
-            "qa_snapshot_commit": implementation_commit,
-            "qa_session_id": str(
-                qa_authority.get("qa_session_id") or ""
+            "qa_passed": qa_mode_valid,
+            "qa_event_ref": (
+                str(qa_authority.get("event_ref") or "")
+                if qa_mode_valid
+                else ""
             ),
-            "qa_authority_hash": str(
-                qa_authority.get("authority_hash") or ""
+            "qa_event_id": (
+                int(qa_authority.get("event_id") or 0)
+                if qa_mode_valid
+                else 0
             ),
-            "qa_before_reconcile_verified": True,
+            "qa_snapshot_id": (
+                str(qa_authority.get("snapshot_id") or "")
+                if qa_mode_valid
+                else ""
+            ),
+            "qa_snapshot_commit": (
+                implementation_commit if qa_mode_valid else ""
+            ),
+            "qa_session_id": (
+                str(qa_authority.get("qa_session_id") or "")
+                if qa_mode_valid
+                else ""
+            ),
+            "qa_authority_hash": (
+                str(qa_authority.get("authority_hash") or "")
+                if qa_mode_valid
+                else ""
+            ),
+            "qa_before_reconcile_verified": qa_mode_valid,
+            "no_pass_continuation_verified": no_pass_mode_valid,
+            "no_pass_claim": no_pass_mode_valid,
+            "authoritative_pass_synthesized": False,
+            "deposit_only": no_pass_mode_valid,
+            "close_satisfying": qa_mode_valid,
+            "no_pass_continuation_authority": (
+                dict(current_no_pass_authority)
+                if no_pass_mode_valid
+                else {}
+            ),
+            "no_pass_generation_id": (
+                str(
+                    current_no_pass_authority.get(
+                        "no_pass_generation_id"
+                    )
+                    or ""
+                )
+                if no_pass_mode_valid
+                else ""
+            ),
+            "diagnostic_backlog_id": (
+                str(
+                    current_no_pass_authority.get(
+                        "diagnostic_backlog_id"
+                    )
+                    or ""
+                )
+                if no_pass_mode_valid
+                else ""
+            ),
             "immutable_route_identity_preserved": True,
             "provenance_id": str(
                 provenance.get("provenance_id") or ""
@@ -140480,6 +140995,16 @@ def _contract_runtime_operator_supervised_direct_main_close_authority_gate(
         == stable_sha256(dict(current_reconcile_authority))
     ):
         missing.append("current_full_reconcile_authority_still_current")
+    if current_reconcile_authority and not (
+        current_reconcile_authority.get("qa_passed") is True
+        and current_reconcile_authority.get("close_satisfying") is True
+        and current_reconcile_authority.get("deposit_only") is False
+        and current_reconcile_authority.get(
+            "authoritative_pass_synthesized"
+        )
+        is False
+    ):
+        missing.append("current_full_reconcile_qa_pass_close_authority")
 
     close_payload = (
         lines_by_id.get("observer_close_ready", {}).get("payload")
