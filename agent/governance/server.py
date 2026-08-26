@@ -71,6 +71,7 @@ from .contracts.runtime import (
     ContractRuntimeError,
     LINE_EVIDENCE_OPTIONAL_FIELDS,
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
+    MF_PARALLEL_ATOMIC_LANE_WRITER_BINDING_FIELDS,
     _active_failed_qa_line,
     _active_failed_qa_line_index,
     _contains_contract_completion_blocker,
@@ -84,6 +85,7 @@ from .contracts.runtime import (
     _worker_implementation_lineage,
     contract_chain_projection_hash,
     is_legacy_primary_contract_route,
+    mf_parallel_precommit_correction_writer_safe_copy,
     read_backlog_contract_chain_current,
     rebuild_backlog_contract_chain_projection,
     SQLiteContractExecutionStore,
@@ -2672,15 +2674,7 @@ def _runtime_context_implementation_zero_write_details(
 
 
 _RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS = (
-    "backlog_id",
-    "definition_hash",
-    "instruction_bundle_hash",
-    "execution_state_revision",
-    "runtime_guide_hash",
-    "stage_id",
-    "line_id",
-    "evidence_kind",
-    "line_instance_id",
+    MF_PARALLEL_ATOMIC_LANE_WRITER_BINDING_FIELDS
 )
 
 
@@ -29429,7 +29423,8 @@ def _runtime_context_worker_implementation_graph_trace_repair_action(
     ):
         return {}
     try:
-        record = _contract_runtime_store(conn).get(contract_execution_id)
+        runtime = _contract_runtime(conn)
+        record = runtime.store.get(contract_execution_id)
     except (ContractRuntimeError, sqlite3.Error):
         return {}
     implementation = _worker_commit_completed_implementation(
@@ -29561,13 +29556,88 @@ def _runtime_context_worker_implementation_graph_trace_repair_action(
     ):
         return {}
 
-    writer_container = next_action.get("writer_role_safe_copy_payload")
-    writer_copy = dict(
-        writer_container.get("copy_payload")
-        if isinstance(writer_container, Mapping)
-        and isinstance(writer_container.get("copy_payload"), Mapping)
+    correction_intent = {
+        "schema_version": (
+            "runtime_context.precommit_implementation_correction_intent.v1"
+        ),
+        "action": "revise_precommit_worker_implementation",
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "prior_implementation_lineage_ref": prior_lineage_ref,
+    }
+    worker_id = str(
+        getattr(context, "worker_id", "")
+        or getattr(context, "worker_slot_id", "")
+        or ""
+    ).strip()
+    worker_slot_id = str(
+        getattr(context, "worker_slot_id", "") or worker_id
+    ).strip()
+    lane_probe = {
+        "actor_role": "mf_sub",
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "worker_role": "mf_sub",
+        "worker_id": worker_id,
+        "worker_slot_id": worker_slot_id,
+        "lane_id": worker_slot_id,
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+    }
+    try:
+        _lane_state, lane_guide = runtime.mf_parallel_atomic_lane_gate_view(
+            record,
+            (
+                record.get("runtime_guide")
+                if isinstance(record.get("runtime_guide"), Mapping)
+                else {}
+            ),
+            lane_probe,
+            source_record=record,
+        )
+    except (ContractRuntimeError, ContractDefinitionError, KeyError, TypeError):
+        return {}
+    correction_source = dict(lane_guide.get("next_legal_action") or {})
+    correction_writer_source = (
+        deepcopy(dict(lane_guide.get("writer_role_safe_copy_payload") or {}))
+        if isinstance(
+            lane_guide.get("writer_role_safe_copy_payload"), Mapping
+        )
         else {}
     )
+    correction_source_copy = (
+        dict(correction_writer_source.get("copy_payload") or {})
+        if isinstance(correction_writer_source.get("copy_payload"), Mapping)
+        else {}
+    )
+    if not correction_source_copy.get("line_instance_id"):
+        correction_writer_source = deepcopy(
+            dict(next_action.get("writer_role_safe_copy_payload") or {})
+        )
+        correction_source_copy = dict(
+            correction_writer_source.get("copy_payload") or {}
+        )
+        correction_source_copy.update(lane_probe)
+        correction_writer_source["copy_payload"] = correction_source_copy
+    correction_source["writer_role_safe_copy_payload"] = (
+        correction_writer_source
+    )
+    correction_writer_container = (
+        mf_parallel_precommit_correction_writer_safe_copy(
+            correction_source,
+            correction_intent=correction_intent,
+        )
+    )
+    writer_copy = dict(
+        correction_writer_container.get("copy_payload")
+        if isinstance(
+            correction_writer_container.get("copy_payload"), Mapping
+        )
+        else {}
+    )
+    if not writer_copy:
+        return {}
     writer_copy.update(
         {
             "stage_id": "worker_implementation",
@@ -29608,16 +29678,7 @@ def _runtime_context_worker_implementation_graph_trace_repair_action(
     if not isinstance(test_results, Mapping):
         test_results = implementation.get("test_results")
     test_results = dict(test_results) if isinstance(test_results, Mapping) else {}
-    correction_intent = {
-        "schema_version": (
-            "runtime_context.precommit_implementation_correction_intent.v1"
-        ),
-        "action": "revise_precommit_worker_implementation",
-        "contract_execution_id": contract_execution_id,
-        "runtime_context_id": runtime_context_id,
-        "task_id": task_id,
-        "prior_implementation_lineage_ref": prior_lineage_ref,
-    }
+    correction_writer_container["copy_payload"] = dict(writer_copy)
     action_input = {
         **writer_copy,
         "contract_execution_id": contract_execution_id,
@@ -29674,6 +29735,7 @@ def _runtime_context_worker_implementation_graph_trace_repair_action(
             "submit_via": "runtime_context_implementation_evidence",
             "historical_source_mutation_allowed": False,
             "worker_commit_bypass_allowed": False,
+            "writer_role_safe_copy_payload": correction_writer_container,
             "action_input": action_input,
             "redirection": {
                 "schema_version": (
@@ -165905,6 +165967,31 @@ def _contract_runtime_close_gate(
                 lane_binding.get("source_global_runtime_guide_hash") or ""
             ).strip()
             if trusted_worker_implementation_line:
+                correction_intent = canonical_norm_payload.get(
+                    "precommit_implementation_correction_intent"
+                )
+                if (
+                    isinstance(correction_intent, Mapping)
+                    and str(correction_intent.get("action") or "").strip()
+                    == "revise_precommit_worker_implementation"
+                ):
+                    correction_source = dict(
+                        lane_guide.get("next_legal_action") or {}
+                    )
+                    correction_source["writer_role_safe_copy_payload"] = (
+                        lane_guide.get("writer_role_safe_copy_payload") or {}
+                    )
+                    correction_writer_container = (
+                        mf_parallel_precommit_correction_writer_safe_copy(
+                            correction_source,
+                            correction_intent=correction_intent,
+                        )
+                    )
+                    if correction_writer_container:
+                        lane_guide = dict(lane_guide)
+                        lane_guide["writer_role_safe_copy_payload"] = (
+                            correction_writer_container
+                        )
                 lane_hash = _contract_runtime_writer_line_guide_hash(
                     lane_guide,
                     actor_role=actor_role,

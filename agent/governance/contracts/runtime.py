@@ -60,6 +60,22 @@ _MF_PARALLEL_ATOMIC_DISPATCH_LINE = (
     "observer_dispatch_bounded_workers",
 )
 
+# This is the copy-safe writer schema shared by the RuntimeContext facade and
+# the private mf_parallel atomic-lane guide. Keep it source-owned here so a
+# guide projection and its write gate cannot silently validate different
+# field sets.
+MF_PARALLEL_ATOMIC_LANE_WRITER_BINDING_FIELDS = (
+    "backlog_id",
+    "definition_hash",
+    "instruction_bundle_hash",
+    "execution_state_revision",
+    "runtime_guide_hash",
+    "stage_id",
+    "line_id",
+    "evidence_kind",
+    "line_instance_id",
+)
+
 
 class ContractRuntimeError(ValueError):
     """Raised when a contract execution cannot be started or advanced."""
@@ -6770,6 +6786,163 @@ def _bind_mf_parallel_atomic_lane_runtime_guide_hash(
     requested_hash = str(write.get("runtime_guide_hash") or "").strip()
     if source_hash and lane_hash and requested_hash == source_hash:
         write["runtime_guide_hash"] = lane_hash
+
+
+def mf_parallel_precommit_correction_writer_safe_copy(
+    source: Mapping[str, Any],
+    *,
+    correction_intent: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rebind a current worker-commit lane copy to one legal correction.
+
+    The Contract position remains at ``worker_commit``. This helper only
+    derives the authenticated writer payload for the documented append-only
+    precommit ``worker_implementation`` correction. Its hash binds both the
+    current private lane authority and the exact prior-lineage correction
+    intent, so it cannot be reused as an ordinary implementation write or for
+    another worker or lineage.
+    """
+
+    writer_container = source.get("writer_role_safe_copy_payload")
+    if not isinstance(writer_container, Mapping):
+        return {}
+    current_copy = writer_container.get("copy_payload")
+    if not isinstance(current_copy, Mapping):
+        return {}
+    current_copy = dict(current_copy)
+    if any(
+        current_copy.get(field) in (None, "")
+        for field in MF_PARALLEL_ATOMIC_LANE_WRITER_BINDING_FIELDS
+    ):
+        return {}
+    if (
+        isinstance(current_copy.get("execution_state_revision"), bool)
+        or not isinstance(current_copy.get("execution_state_revision"), int)
+        or int(current_copy.get("execution_state_revision") or 0) < 1
+        or str(current_copy.get("actor_role") or "").strip() != "mf_sub"
+        or str(current_copy.get("stage_id") or "").strip() != "worker_commit"
+        or str(current_copy.get("line_id") or "").strip() != "worker_commit"
+        or str(current_copy.get("evidence_kind") or "").strip()
+        != "worker_commit"
+    ):
+        return {}
+
+    intent = dict(correction_intent)
+    required_intent = {
+        "schema_version": (
+            "runtime_context.precommit_implementation_correction_intent.v1"
+        ),
+        "action": "revise_precommit_worker_implementation",
+    }
+    if any(
+        str(intent.get(field) or "").strip() != expected
+        for field, expected in required_intent.items()
+    ):
+        return {}
+    for field in (
+        "contract_execution_id",
+        "runtime_context_id",
+        "task_id",
+        "prior_implementation_lineage_ref",
+    ):
+        if not str(intent.get(field) or "").strip():
+            return {}
+    for intent_field, copy_field in (
+        ("contract_execution_id", "contract_execution_id"),
+        ("runtime_context_id", "runtime_context_id"),
+        ("task_id", "task_id"),
+    ):
+        copy_value = str(current_copy.get(copy_field) or "").strip()
+        if copy_value and str(intent.get(intent_field) or "").strip() != copy_value:
+            return {}
+    runtime_context_id = str(intent.get("runtime_context_id") or "").strip()
+    if str(current_copy.get("line_instance_id") or "").strip() != (
+        f"runtime_context:{runtime_context_id}"
+    ):
+        return {}
+
+    source_binding = {
+        field: current_copy.get(field)
+        for field in MF_PARALLEL_ATOMIC_LANE_WRITER_BINDING_FIELDS
+    }
+    for field in (
+        "project_id",
+        "contract_execution_id",
+        "actor_role",
+        "runtime_context_id",
+        "task_id",
+        "parent_task_id",
+        "worker_role",
+        "lane_id",
+        "worker_slot_id",
+        "worker_id",
+    ):
+        if current_copy.get(field) not in (None, ""):
+            source_binding[field] = current_copy.get(field)
+    authority = {
+        "schema_version": (
+            "contract_runtime.mf_parallel_precommit_correction_writer_authority.v1"
+        ),
+        "source_current_worker_commit_binding": source_binding,
+        "correction_intent": {
+            field: intent[field]
+            for field in (
+                "schema_version",
+                "action",
+                "contract_execution_id",
+                "runtime_context_id",
+                "task_id",
+                "prior_implementation_lineage_ref",
+            )
+        },
+        "correction_line": {
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "evidence_kind": "implementation",
+            "actor_role": "mf_sub",
+        },
+    }
+    correction_hash = stable_sha256(authority)
+    correction_copy = dict(current_copy)
+    correction_copy.update(
+        {
+            "stage_id": "worker_implementation",
+            "line_id": "worker_implementation",
+            "evidence_kind": "implementation",
+            "actor_role": "mf_sub",
+            "runtime_guide_hash": correction_hash,
+        }
+    )
+    safe_copy = deepcopy(dict(writer_container))
+    safe_copy["copy_payload"] = correction_copy
+    alignment = (
+        deepcopy(dict(safe_copy.get("hash_alignment") or {}))
+        if isinstance(safe_copy.get("hash_alignment"), Mapping)
+        else {}
+    )
+    alignment.update(
+        {
+            "required_owner_role": "mf_sub",
+            "required_writer_role": "mf_sub",
+            "required_writer_runtime_guide_hash": correction_hash,
+            "reader_hash_is_writer_hash": False,
+        }
+    )
+    safe_copy["hash_alignment"] = alignment
+    safe_copy["precommit_correction_writer_binding"] = {
+        "schema_version": (
+            "contract_runtime.mf_parallel_precommit_correction_writer_binding.v1"
+        ),
+        "bound": True,
+        "authority": authority,
+        "authority_hash": correction_hash,
+        "source_worker_commit_runtime_guide_hash": str(
+            current_copy.get("runtime_guide_hash") or ""
+        ).strip(),
+        "contract_position_mutated": False,
+        "append_only_correction_only": True,
+    }
+    return safe_copy
 
 
 def _line_shape_allows_contract_completion(line: Mapping[str, Any]) -> bool:

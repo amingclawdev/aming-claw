@@ -21,14 +21,17 @@ from agent.governance.contracts import (
 from agent.governance.contracts.runtime import (
     ContractRetirementError,
     ContractRuntimeError,
+    MF_PARALLEL_ATOMIC_LANE_WRITER_BINDING_FIELDS,
     SQLiteContractExecutionStore,
     StalePinnedContractExecutionError,
+    mf_parallel_precommit_correction_writer_safe_copy,
     read_backlog_contract_chain_current,
 )
 from agent.governance.contracts.hash import stable_sha256
 from agent.governance.server import (
     _contract_runtime_direct_fix_close_authority_gate,
     _contract_runtime_mf_parallel_concurrent_sibling_writer_rebase,
+    _contract_runtime_writer_line_guide_hash,
 )
 
 
@@ -1261,6 +1264,102 @@ def test_contract_runtime_writer_role_safe_copy_payload_for_observer_to_mf_sub()
     accepted = runtime.submit_line_write(execution_id, copy_payload)
     assert accepted["ok"] is True
     assert accepted["record"]["completed_lines"][-1]["actor_role"] == "mf_sub"
+
+
+def test_precommit_correction_rebinds_exact_current_atomic_lane_writer_copy():
+    runtime_context_id = "mfrctx-precommit-writer-binding"
+    contract_execution_id = "cex-precommit-writer-binding"
+    current_hash = stable_sha256({"line": "worker_commit", "revision": 17})
+    current_copy = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-PRECOMMIT-WRITER-BINDING",
+        "contract_execution_id": contract_execution_id,
+        "definition_hash": stable_sha256({"definition": "mf_parallel.v2"}),
+        "instruction_bundle_hash": stable_sha256({"instructions": "worker"}),
+        "execution_state_revision": 17,
+        "runtime_guide_hash": current_hash,
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "actor_role": "mf_sub",
+        "evidence_kind": "worker_commit",
+        "line_instance_id": f"runtime_context:{runtime_context_id}",
+        "runtime_context_id": runtime_context_id,
+        "task_id": "task-precommit-writer-binding",
+        "parent_task_id": "parent-precommit-writer-binding",
+        "worker_role": "mf_sub",
+        "lane_id": "source",
+        "worker_slot_id": "source",
+        "worker_id": "source-repair",
+    }
+    source = {
+        "stage_id": "worker_commit",
+        "line_id": "worker_commit",
+        "evidence_kind": "worker_commit",
+        "writer_role_safe_copy_payload": {
+            "schema_version": "contract_runtime.writer_role_safe_copy_payload.v1",
+            "copy_payload": dict(current_copy),
+            "hash_alignment": {
+                "required_writer_runtime_guide_hash": current_hash,
+            },
+        },
+    }
+    intent = {
+        "schema_version": (
+            "runtime_context.precommit_implementation_correction_intent.v1"
+        ),
+        "action": "revise_precommit_worker_implementation",
+        "contract_execution_id": contract_execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": current_copy["task_id"],
+        "prior_implementation_lineage_ref": "contract-runtime:implementation:prior",
+    }
+
+    safe_copy = mf_parallel_precommit_correction_writer_safe_copy(
+        source,
+        correction_intent=intent,
+    )
+    correction_copy = safe_copy["copy_payload"]
+    assert source["writer_role_safe_copy_payload"]["copy_payload"] == current_copy
+    assert {
+        field: correction_copy[field]
+        for field in MF_PARALLEL_ATOMIC_LANE_WRITER_BINDING_FIELDS
+        if field not in {"runtime_guide_hash", "stage_id", "line_id", "evidence_kind"}
+    } == {
+        field: current_copy[field]
+        for field in MF_PARALLEL_ATOMIC_LANE_WRITER_BINDING_FIELDS
+        if field not in {"runtime_guide_hash", "stage_id", "line_id", "evidence_kind"}
+    }
+    assert correction_copy["stage_id"] == "worker_implementation"
+    assert correction_copy["line_id"] == "worker_implementation"
+    assert correction_copy["evidence_kind"] == "implementation"
+    assert correction_copy["runtime_guide_hash"] != current_hash
+    binding = safe_copy["precommit_correction_writer_binding"]
+    assert binding["bound"] is True
+    assert binding["contract_position_mutated"] is False
+    assert binding["authority_hash"] == correction_copy["runtime_guide_hash"]
+    assert stable_sha256(binding["authority"]) == binding["authority_hash"]
+    correction_guide = {"writer_role_safe_copy_payload": safe_copy}
+    assert _contract_runtime_writer_line_guide_hash(
+        correction_guide,
+        actor_role="mf_sub",
+        stage_id="worker_implementation",
+        line_id="worker_implementation",
+        evidence_kind="implementation",
+    ) == correction_copy["runtime_guide_hash"]
+    assert not _contract_runtime_writer_line_guide_hash(
+        correction_guide,
+        actor_role="mf_sub",
+        stage_id="worker_commit",
+        line_id="worker_commit",
+        evidence_kind="worker_commit",
+    )
+
+    mismatched = dict(intent)
+    mismatched["runtime_context_id"] = "mfrctx-another-lane"
+    assert mf_parallel_precommit_correction_writer_safe_copy(
+        source,
+        correction_intent=mismatched,
+    ) == {}
 
 
 def test_contract_runtime_writer_role_safe_copy_payload_for_mf_sub_to_qa():
