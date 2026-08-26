@@ -34,7 +34,6 @@ if _agent_dir not in sys.path:
 from .errors import GovernanceError, PermissionDeniedError, ValidationError
 from .dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
 from .parallel_branch_runtime import (
-    PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_FIELDS,
     PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS,
     parallel_branch_authority_field_is_nontransferable,
 )
@@ -99342,24 +99341,99 @@ def _caller_timeline_key_is_credential(key: Any) -> bool:
     return compact in _CALLER_TIMELINE_CREDENTIAL_KEY_COMPACT_DENYLIST
 
 
-_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCES = (
-    frozenset(_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS),
-    frozenset(_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS),
-    frozenset(_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS),
-    frozenset(_QA_REVIEW_AUTHORITY_NAMES),
-    frozenset(_QA_REVIEW_AUTHORITY_CONTAINERS),
+_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCE_MARKERS = (
+    "AUTHORITY",
+    "CHECKPOINT_BASELINE",
+    "EXECUTION_ID",
+    "IDENTITY",
+    "PROVENANCE_SECURITY",
 )
-_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset(
-    PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
-    | {
-        field_name
-        for field_source in (
-            _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCES
-        )
-        for field_name in field_source
-        if parallel_branch_authority_field_is_nontransferable(field_name)
+_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXACT_SOURCE_NAMES = frozenset(
+    {"_CONTRACT_RUNTIME_CONTAINER_KEYS"}
+)
+_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES = frozenset(
+    {
+        "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXACT_SOURCE_NAMES",
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES",
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES",
     }
 )
+_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES: tuple[str, ...] = ()
+_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset(
+    PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
+)
+
+
+def _contract_runtime_is_server_canonical_authority_field_source(
+    source_name: Any,
+) -> bool:
+    name = str(source_name or "")
+    if (
+        not name.startswith("_")
+        or name
+        in _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES
+    ):
+        return False
+    if name in _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXACT_SOURCE_NAMES:
+        return True
+    if name.endswith("_FIELDS"):
+        return any(
+            marker in name
+            for marker in (
+                _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCE_MARKERS
+            )
+        )
+    if name.endswith(("_NAMES", "_KEYS", "_CONTAINERS")):
+        return "AUTHORITY" in name
+    return False
+
+
+def _contract_runtime_server_canonical_authority_field_sources(
+) -> dict[str, frozenset[str]]:
+    sources: dict[str, frozenset[str]] = {}
+    for source_name, raw_fields in globals().items():
+        if not _contract_runtime_is_server_canonical_authority_field_source(
+            source_name
+        ):
+            continue
+        if not isinstance(raw_fields, (frozenset, list, set, tuple)):
+            continue
+        if not all(isinstance(field_name, str) for field_name in raw_fields):
+            continue
+        sources[source_name] = frozenset(raw_fields)
+    return dict(sorted(sources.items()))
+
+
+def _contract_runtime_refresh_canonical_authority_field_inventory(
+) -> frozenset[str]:
+    global _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
+    global _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_DENYLIST
+    global _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES
+
+    sources = _contract_runtime_server_canonical_authority_field_sources()
+    derived = frozenset(
+        PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
+        | {
+            field_name
+            for field_source in sources.values()
+            for field_name in field_source
+            if parallel_branch_authority_field_is_nontransferable(field_name)
+        }
+    )
+    _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = derived
+    _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES = tuple(sources)
+    matrix = globals().get(
+        "_CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX"
+    )
+    if isinstance(matrix, dict):
+        matrix["canonical_schema"] = derived
+        _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_DENYLIST = frozenset(
+            re.sub(r"[^a-z0-9]+", "", field_name.casefold())
+            for field_source in matrix.values()
+            for field_name in field_source
+        )
+    return derived
 
 
 _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX = {
@@ -99747,8 +99821,13 @@ def _contract_runtime_key_is_execution_authority_or_credential(
     """Classify keys that cannot cross a retired execution generation."""
 
     key_name = str(key or "").strip()
-    if key_name in PARALLEL_BRANCH_TYPED_AUTHORITY_SAFE_FIELDS:
+    if not parallel_branch_authority_field_is_nontransferable(key_name):
         return False
+    if (
+        key_name.casefold()
+        in _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
+    ):
+        return True
     if _caller_timeline_key_is_credential(key):
         return True
     compact = re.sub(r"[^a-z0-9]+", "", key_name.casefold())
@@ -203103,6 +203182,9 @@ def _run_governance_service():
     except KeyboardInterrupt:
         print("\nShutting down...")
         server.shutdown()
+
+
+_contract_runtime_refresh_canonical_authority_field_inventory()
 
 
 def main():

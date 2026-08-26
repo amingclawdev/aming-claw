@@ -2826,6 +2826,21 @@ def _rev10_failed_qa_fresh_repair_record(
     }
 
 
+_SERVER_CANONICAL_AUTHORITY_PROVEN_GAPS = (
+    "contract_runtime_completed_lines_hash",
+    "timeline_worker_write_hash",
+    "timeline_worker_write_count",
+    "authenticated_qa_binding",
+    "evidence_owner_session",
+    "evidence_owner_session_ref",
+    "submitter_session",
+    "current_full_reconcile",
+    "next_legal_action",
+    "generation",
+    "onboard_service_waiver",
+)
+
+
 _TYPED_AUTHORITY_PROVEN_GAPS = (
     "candidate_diff_sha256",
     "manual_merge_event_ref",
@@ -3114,7 +3129,53 @@ _RETIRED_EXECUTION_AUTHORITY_KEY_CASES = (
         ),
     ),
     ("typed_authority_schema", _TYPED_AUTHORITY_PROVEN_GAPS),
+    (
+        "server_canonical_authority_schema",
+        _SERVER_CANONICAL_AUTHORITY_PROVEN_GAPS,
+    ),
 )
+
+
+def test_failed_qa_repair_server_authority_schemas_have_no_classifier_drift():
+    sources = server._contract_runtime_server_canonical_authority_field_sources()
+    assert {
+        "_CONTRACT_RUNTIME_CONTAINER_KEYS",
+        "_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS",
+        "_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS",
+        "_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS",
+        "_MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS",
+        "_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS",
+        "_RUNTIME_CONTEXT_SERVER_IDENTITY_FIELDS",
+    }.issubset(sources)
+    is_nontransferable = (
+        parallel_branch_runtime
+        .parallel_branch_authority_field_is_nontransferable
+    )
+    derived_server_fields = {
+        field_name
+        for source_fields in sources.values()
+        for field_name in source_fields
+        if is_nontransferable(field_name)
+    }
+    canonical_fields = (
+        server._CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
+    )
+    typed_nontransferable_fields = (
+        parallel_branch_runtime
+        .PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
+    )
+    assert canonical_fields == (
+        derived_server_fields | typed_nontransferable_fields
+    )
+    assert not derived_server_fields - canonical_fields
+    assert not (
+        set(_SERVER_CANONICAL_AUTHORITY_PROVEN_GAPS) - canonical_fields
+    )
+    assert canonical_fields == set(
+        server._CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX[
+            "canonical_schema"
+        ]
+    )
 
 
 def test_failed_qa_repair_typed_authority_schema_has_no_classifier_drift():
@@ -3169,6 +3230,23 @@ def test_failed_qa_repair_classifier_rejects_typed_authority_gaps(
     assert authority_key in (
         parallel_branch_runtime
         .PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
+    )
+    assert (
+        server._contract_runtime_key_is_execution_authority_or_credential(
+            authority_key
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "authority_key", _SERVER_CANONICAL_AUTHORITY_PROVEN_GAPS
+)
+def test_failed_qa_repair_classifier_rejects_server_authority_gaps(
+    authority_key,
+):
+    assert authority_key in (
+        server._CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
     )
     assert (
         server._contract_runtime_key_is_execution_authority_or_credential(
