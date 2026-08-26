@@ -136016,6 +136016,13 @@ def test_mf_parallel_dispatch_ticket_authority_projects_failed_qa_replacement():
     assert current_next["accepted_dispatch_authority"] == current[
         "accepted_dispatch_authority"
     ]
+    rev10_record = copy.deepcopy(record)
+    rev10_record["revision"] = "rev10"
+    rev10_current = server._runtime_current_state_from_record(rev10_record)
+    assert rev10_current["next_legal_action"] == current_next
+    assert rev10_current["accepted_dispatch_authority"] == current[
+        "accepted_dispatch_authority"
+    ]
     qa_authority = server._contract_runtime_qa_ticket_authority(
         record,
         {
@@ -136086,6 +136093,301 @@ def test_mf_parallel_dispatch_ticket_authority_projects_failed_qa_replacement():
             "allocate_bounded_worker_fix"
         )
         assert "accepted_dispatch_authority" not in rejected_current
+
+
+def test_mf_parallel_dispatch_ticket_authority_rejects_pre_qa_generation():
+    record = {
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "revision": "rev10",
+        "contract_execution_id": "cex-rev10-pre-qa-dispatch-rejected",
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "actor_role": "observer",
+                "payload": {
+                    "runtime_context_id": "mfrctx-pre-qa-stale",
+                    "task_id": "pre-qa-stale-worker",
+                    "parent_task_id": "cex-rev10-pre-qa-dispatch-rejected",
+                },
+            },
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "evidence_kind": "independent_verification",
+                "actor_role": "qa",
+                "status": "failed",
+                "payload": {"status": "failed", "verdict": "FAIL"},
+            },
+        ],
+    }
+
+    authority = server._contract_runtime_dispatch_ticket_authority(
+        record,
+        {
+            "next_legal_action": {
+                "line_id": "worker_read_runtime_guide",
+                "runtime_context_id": "mfrctx-pre-qa-stale",
+                "task_id": "pre-qa-stale-worker",
+            }
+        },
+    )
+
+    assert authority == {
+        "status": "invalid",
+        "error": (
+            "canonical ContractRuntime dispatch predates active failed QA and "
+            "cannot authorize worker continuation"
+        ),
+        "failed_qa_source_ref": (
+            "contract_runtime:cex-rev10-pre-qa-dispatch-rejected:"
+            "completed_lines:1"
+        ),
+    }
+
+
+def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
+    backlog_id = "AC-REV10-FAILED-QA-ONBOARD-SOURCE"
+    execution_id = "cex-rev10-failed-qa-onboard-source"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    parent_record = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref="",
+    )
+    acceptance_criteria = [
+        {
+            "id": "AC-REV10-FAILED-QA-ONBOARD-FRESH-ROW",
+            "text": "Onboard advertises the exact fresh repair backlog body.",
+            "required_scope": [
+                "agent/governance/server.py",
+                "agent/tests/test_graph_governance_api.py",
+            ],
+        }
+    ]
+    stale_identity = {
+        "runtime_context_id": "mfrctx-rev10-onboard-stale",
+        "task_id": "rev10-onboard-stale-worker",
+        "parent_task_id": execution_id,
+        "route_token_ref": "rtok-rev10-onboard-stale",
+        "worktree_path": "/tmp/rev10-onboard-stale",
+        "branch_ref": "refs/heads/codex/rev10-onboard-stale",
+        "merge_queue_id": "mq-rev10-onboard-stale",
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_id": server.MF_PARALLEL_CONTRACT_ID,
+        "version": "v2",
+        "revision": "rev10",
+        "definition_hash": "sha256:" + "1" * 64,
+        "contract_execution_id": execution_id,
+        "parent_contract_execution_id": parent_record[
+            "contract_execution_id"
+        ],
+        "root_contract_execution_id": parent_record[
+            "root_contract_execution_id"
+        ],
+        "contract_chain_id": parent_record["contract_chain_id"],
+        "execution_state_revision": 22,
+        "execution_state": {
+            "execution_state_revision": 22,
+            "execution_state_hash": "sha256:" + "2" * 64,
+        },
+        "route_token_ref": stale_identity["route_token_ref"],
+        "metadata": {
+            "acceptance_criteria": acceptance_criteria,
+            "acceptance_scope_closure": {
+                "row_declared_files": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_graph_governance_api.py",
+                ],
+                "required_file_union": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_graph_governance_api.py",
+                ],
+            },
+            "observer_prefill_child_plan": {
+                "row_owned_files": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_graph_governance_api.py",
+                ],
+                "row_test_files": [
+                    "agent/tests/test_graph_governance_api.py"
+                ],
+                "acceptance_criteria": acceptance_criteria,
+            },
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": "sha256:" + "3" * 64,
+            "next_legal_action": {
+                "id": "worker_read_runtime_guide",
+                "action": "record_read_receipt",
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "owner_role": "mf_sub",
+                **stale_identity,
+            },
+        },
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "payload": dict(stale_identity),
+            },
+            {
+                "stage_id": "merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge_result",
+                "status": "completed",
+            },
+            {
+                "stage_id": "merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge_result",
+                "status": "completed",
+            },
+            {
+                "stage_id": "reconcile",
+                "line_id": "observer_reconcile",
+                "actor_role": "observer",
+                "evidence_kind": "reconcile_result",
+                "status": "completed",
+            },
+            {
+                "stage_id": "qa",
+                "line_id": "qa_graph_context",
+                "actor_role": "qa",
+                "evidence_kind": "graph_trace",
+                "status": "completed",
+            },
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "payload": {"status": "failed", "verdict": "FAIL"},
+            },
+        ],
+    }
+    runtime = server._contract_runtime(conn)
+    started_record = runtime.start_execution(
+        server.MF_PARALLEL_CONTRACT_ID,
+        version="v2",
+        revision="rev10",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=execution_id,
+        parent_contract_execution_id=parent_record[
+            "contract_execution_id"
+        ],
+        root_contract_execution_id=parent_record[
+            "root_contract_execution_id"
+        ],
+        contract_chain_id=parent_record["contract_chain_id"],
+        route_token_ref=stale_identity["route_token_ref"],
+        role_binding={
+            "observer": "observer",
+            "mf_sub": "mf_sub",
+            "qa": "qa",
+            "binding_source": "source_backed_rev10_failed_qa_test",
+        },
+        backlog_lineage={
+            "project_id": PID,
+            "backlog_id": backlog_id,
+            "task_id": "rev10-failed-qa-onboard-source",
+        },
+    )
+    record = {
+        **started_record,
+        **record,
+        "definition_hash": started_record["definition_hash"],
+        "metadata": {
+            **dict(started_record.get("metadata") or {}),
+            **record["metadata"],
+        },
+    }
+    child_record = runtime.store.update(
+        execution_id,
+        record,
+        expected_revision=int(
+            started_record.get("execution_state_revision") or 0
+        ),
+    )
+    server.upsert_contract_chain_successor_binding(
+        conn,
+        parent_record=parent_record,
+        child_record=child_record,
+        edge_kind="mf_parallel_child",
+        binding_kind="mf_parallel_child_current",
+    )
+    conn.commit()
+
+    current = server.handle_project_contract_runtime_current_state(
+        _ctx_with_role(
+            {
+                "project_id": PID,
+                "contract_execution_id": execution_id,
+            },
+            "observer",
+            query={"response_view": "cli_current"},
+        )
+    )
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "parallel_worker",
+                "response_view": "compact",
+            },
+        )
+    )
+
+    assert current["next_legal_action"]["id"] == "file_fresh_bounded_row"
+    assert current["next_legal_action"]["actionable"] is True
+    assert "runtime_context_id" not in current["next_legal_action"]
+    assert "accepted_dispatch_authority" not in current["next_legal_action"]
+    action = guide["next_legal_action"]
+    assert action["id"] == "file_fresh_bounded_row"
+    assert action["mcp_tool"] == "backlog_upsert"
+    assert action["actionable"] is True
+    assert action["action_input_ready"] is True
+    assert action["fresh_authority_required"] is True
+    assert action["same_row_resume_allowed"] is False
+    canonical = action["canonical_executable_action"]
+    assert canonical["mcp_tool"] == "backlog_upsert"
+    body = canonical["copy_safe_body"]
+    assert body["bug_id"].startswith(f"{backlog_id}-QA-REPAIR-")
+    assert body["target_files"] == ["agent/governance/server.py"]
+    assert body["test_files"] == [
+        "agent/tests/test_graph_governance_api.py"
+    ]
+    assert body["acceptance_criteria"] == acceptance_criteria
+    assert action["next_after_success"]["body"]["backlog_id"] == body[
+        "bug_id"
+    ]
+    rendered_action = json.dumps(action, sort_keys=True)
+    for identity_field in (
+        "runtime_context_id",
+        "task_id",
+        "route_token_ref",
+        "worktree_path",
+        "branch_ref",
+        "merge_queue_id",
+    ):
+        assert stale_identity[identity_field] not in rendered_action
 
 
 def test_mf_parallel_dispatch_ticket_authority_rejects_conflicting_route_identity():

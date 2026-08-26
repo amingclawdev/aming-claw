@@ -2592,6 +2592,194 @@ def test_mf_parallel_rev9_failed_final_qa_routes_to_same_contract_worker_fix():
     }
 
 
+def test_mf_parallel_rev10_failed_qa_files_copy_safe_fresh_repair_row():
+    acceptance_criteria = [
+        {
+            "id": "AC-REV10-FAILED-QA-FRESH-REPAIR",
+            "text": (
+                "Failed QA must advertise a fresh bounded row without reusing "
+                "the completed worker generation."
+            ),
+            "required_scope": [
+                "agent/governance/server.py",
+                "agent/tests/test_contract_runtime.py",
+            ],
+        }
+    ]
+    old_identity = {
+        "runtime_context_id": "mfrctx-rev10-stale-source",
+        "task_id": "rev10-stale-source-worker",
+        "parent_task_id": "cex-rev10-stale-source",
+        "route_token_ref": "rtok-rev10-stale-source",
+        "worktree_path": "/tmp/rev10-stale-source",
+        "branch_ref": "refs/heads/codex/rev10-stale-source",
+        "merge_queue_id": "mq-rev10-stale-source",
+    }
+    record = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-REV10-FAILED-QA-SOURCE",
+        "contract_id": "mf_parallel.v2",
+        "revision": "rev10",
+        "contract_execution_id": "cex-rev10-stale-source",
+        "route_token_ref": old_identity["route_token_ref"],
+        "metadata": {
+            "acceptance_criteria": acceptance_criteria,
+            "acceptance_scope_closure": {
+                "row_declared_files": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_contract_runtime.py",
+                ],
+                "required_file_union": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_contract_runtime.py",
+                ],
+            },
+            "observer_prefill_child_plan": {
+                "row_owned_files": [
+                    "agent/governance/server.py",
+                    "agent/tests/test_contract_runtime.py",
+                ],
+                "row_test_files": ["agent/tests/test_contract_runtime.py"],
+                "acceptance_criteria": acceptance_criteria,
+                "lanes": [
+                    {
+                        "owned_files": ["agent/governance/server.py"],
+                        "test_files": [],
+                    },
+                    {
+                        "owned_files": [
+                            "agent/tests/test_contract_runtime.py"
+                        ],
+                        "test_files": [
+                            "agent/tests/test_contract_runtime.py"
+                        ],
+                    },
+                ],
+            },
+        },
+        "runtime_guide": {
+            "next_legal_action": {
+                "id": "worker_read_runtime_guide",
+                "action": "record_read_receipt",
+                "stage_id": "worker_read",
+                "line_id": "worker_read_runtime_guide",
+                "owner_role": "mf_sub",
+                **old_identity,
+            }
+        },
+        "completed_lines": [
+            {
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "actor_role": "observer",
+                "evidence_kind": "dispatch_bounded_worker",
+                "payload": dict(old_identity),
+            },
+            {
+                "stage_id": "merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge_result",
+                "status": "completed",
+            },
+            {
+                "stage_id": "merge",
+                "line_id": "observer_merge",
+                "actor_role": "observer",
+                "evidence_kind": "merge_result",
+                "status": "completed",
+            },
+            {
+                "stage_id": "reconcile",
+                "line_id": "observer_reconcile",
+                "actor_role": "observer",
+                "evidence_kind": "reconcile_result",
+                "status": "completed",
+            },
+            {
+                "stage_id": "qa",
+                "line_id": "qa_graph_context",
+                "actor_role": "qa",
+                "evidence_kind": "graph_trace",
+                "status": "completed",
+            },
+            {
+                "stage_id": "qa",
+                "line_id": "qa_independent_verification",
+                "actor_role": "qa",
+                "evidence_kind": "independent_verification",
+                "status": "failed",
+                "payload": {
+                    "status": "failed",
+                    "verdict": "FAIL",
+                    "acceptance_failed": [
+                        "AC-REV10-FAILED-QA-FRESH-REPAIR"
+                    ],
+                },
+            },
+        ],
+    }
+
+    state = server._runtime_current_state_from_record(record)
+    repeated = server._runtime_current_state_from_record(deepcopy(record))
+    response = server._contract_runtime_response(
+        record,
+        actor_role="observer",
+        response_view="cli_current",
+    )
+
+    assert state["readiness_state"] == (
+        "failed_qa_fresh_repair_successor_required"
+    )
+    action = state["next_legal_action"]
+    assert action == repeated["next_legal_action"]
+    assert response["next_legal_action"] == action
+    assert action["id"] == "file_fresh_bounded_row"
+    assert action["action"] == action["mcp_tool"] == "backlog_upsert"
+    assert action["owner_role"] == "observer"
+    assert action["actionable"] is True
+    assert action["action_input_ready"] is True
+    assert action["fresh_authority_required"] is True
+    assert action["source_generation_terminal"] is True
+    assert action["same_row_resume_allowed"] is False
+    assert "accepted_dispatch_authority" not in state
+    assert "mf_sub_host_bridge_guidance" not in state
+    body = action["copy_safe_body"]
+    assert body == action["action_input"]
+    assert body["project_id"] == "aming-claw"
+    assert body["bug_id"].startswith(
+        "AC-REV10-FAILED-QA-SOURCE-QA-REPAIR-"
+    )
+    assert body["status"] == "OPEN"
+    assert body["mf_type"] == "chain_rescue"
+    assert body["target_files"] == ["agent/governance/server.py"]
+    assert body["test_files"] == ["agent/tests/test_contract_runtime.py"]
+    assert body["acceptance_criteria"] == acceptance_criteria
+    assert action["canonical_executable_action"]["copy_safe_body"] == body
+    assert action["next_after_success"]["body"]["backlog_id"] == body[
+        "bug_id"
+    ]
+    assert action["historical_contract_successor"] == {
+        "contract_id": "direct_fix",
+        "status": "terminal_retired",
+        "historical_evidence_readable": True,
+        "scheduler_eligible": False,
+        "authorizes_write": False,
+    }
+    rendered_body = json.dumps(body, sort_keys=True)
+    for identity_field in (
+        "runtime_context_id",
+        "task_id",
+        "route_token_ref",
+        "worktree_path",
+        "branch_ref",
+        "merge_queue_id",
+    ):
+        assert identity_field not in body
+        assert old_identity[identity_field] not in rendered_body
+    assert old_identity["parent_task_id"] in body["provenance_paths"][0]
+
+
 def test_mf_parallel_rev9_postmerge_uses_verified_single_worker_fix_generation(
     monkeypatch,
 ):

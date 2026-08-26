@@ -30065,6 +30065,13 @@ def _runtime_context_contract_runtime_worker_projection(
         guide,
         source="contract_runtime_current_state",
     )
+    canonical_current_next = (
+        current_state.get("next_legal_action")
+        if isinstance(current_state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if canonical_current_next.get("fresh_authority_required") is True:
+        next_action = dict(canonical_current_next)
     if next_action:
         next_action["source_of_authority"] = "contract_runtime_current_state"
         next_action["authority_decision_source"] = (
@@ -106560,6 +106567,197 @@ def _contract_runtime_comparison_base_verdict(
     return {}
 
 
+def _contract_runtime_failed_qa_fresh_repair_action(
+    record: Mapping[str, Any],
+    failed_qa_line: Mapping[str, Any],
+    *,
+    failed_index: int,
+    failed_source_ref: str,
+) -> dict[str, Any]:
+    """Project a copy-safe current-world row from one terminal rev10 failure.
+
+    ``direct_fix`` is retired and the failed ContractRuntime generation is an
+    audit source, not reusable execution authority.  The rev10 enter metadata
+    already freezes the row scope and acceptance criteria, so use only those
+    durable facts to advertise a new observer-owned backlog row.  An incomplete
+    historical record remains readable but deliberately produces no executable
+    body.
+    """
+
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    child_plan = (
+        metadata.get("observer_prefill_child_plan")
+        if isinstance(metadata.get("observer_prefill_child_plan"), Mapping)
+        else {}
+    )
+    acceptance_scope = (
+        metadata.get("acceptance_scope_closure")
+        if isinstance(metadata.get("acceptance_scope_closure"), Mapping)
+        else {}
+    )
+
+    declared_files = _runtime_context_public_file_values(
+        acceptance_scope.get("row_declared_files")
+        or acceptance_scope.get("required_file_union")
+        or child_plan.get("row_owned_files")
+        or []
+    )
+    test_files = _runtime_context_public_file_values(
+        child_plan.get("row_test_files")
+        or metadata.get("test_files")
+        or []
+    )
+    if not test_files:
+        test_files = [
+            path
+            for path in declared_files
+            if Path(path).name.startswith("test_")
+            or "tests" in Path(path).parts
+        ]
+    test_file_set = set(test_files)
+    target_files = [path for path in declared_files if path not in test_file_set]
+    acceptance_criteria = (
+        metadata.get("acceptance_criteria")
+        if isinstance(metadata.get("acceptance_criteria"), list)
+        else child_plan.get("acceptance_criteria")
+        if isinstance(child_plan.get("acceptance_criteria"), list)
+        else []
+    )
+
+    project_id = str(record.get("project_id") or "").strip()
+    source_backlog_id = str(record.get("backlog_id") or "").strip()
+    contract_execution_id = str(
+        record.get("contract_execution_id") or ""
+    ).strip()
+    failure_payload = (
+        failed_qa_line.get("payload")
+        if isinstance(failed_qa_line.get("payload"), Mapping)
+        else {}
+    )
+    repair_suffix = stable_sha256(
+        {
+            "source_backlog_id": source_backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "failed_qa_completed_line_index": failed_index,
+            "failed_qa_line": dict(failed_qa_line),
+        }
+    ).split(":")[-1][:12].upper()
+    fresh_backlog_id = (
+        f"{source_backlog_id}-QA-REPAIR-{repair_suffix}"
+        if source_backlog_id
+        else f"AC-MF-PARALLEL-QA-REPAIR-{repair_suffix}"
+    )
+    required_fields = {
+        "project_id": project_id,
+        "bug_id": fresh_backlog_id,
+        "title": (
+            f"Repair failed QA from {source_backlog_id}"
+            if source_backlog_id
+            else "Repair failed mf_parallel QA"
+        ),
+        "priority": "P0",
+        "status": "OPEN",
+        "target_files": target_files,
+        "test_files": test_files,
+        "acceptance_criteria": deepcopy(acceptance_criteria),
+    }
+    missing_fields = [
+        field
+        for field, value in required_fields.items()
+        if value in ("", None, [], {})
+    ]
+    action_input_ready = not missing_fields
+    action_input: dict[str, Any] = {}
+    if action_input_ready:
+        action_input = {
+            **required_fields,
+            "details_md": (
+                "Fresh independently bounded current-world repair for the "
+                f"failed QA source {failed_source_ref}. The source rev10 "
+                "generation is immutable audit evidence and supplies no worker, "
+                "route, worktree, merge, or write authority to this row."
+            ),
+            "provenance_paths": [failed_source_ref],
+            "mf_type": "chain_rescue",
+            "actor": "observer",
+            "triage_action": "admit",
+        }
+    canonical_action = (
+        _guide_canonical_executable_action(
+            project_id=project_id,
+            action="backlog_upsert",
+            facade="backlog_upsert",
+            mcp_tool="backlog_upsert",
+            body=action_input,
+            backlog_id=fresh_backlog_id,
+        )
+        if action_input_ready
+        else {}
+    )
+    historical_direct_fix = {
+        "contract_id": DIRECT_FIX_CONTRACT_ID,
+        "status": "terminal_retired",
+        "historical_evidence_readable": True,
+        "scheduler_eligible": False,
+        "authorizes_write": False,
+    }
+    return {
+        "schema_version": (
+            "contract_runtime.failed_qa_fresh_repair_successor.v1"
+        ),
+        "id": "file_fresh_bounded_row",
+        "action": "backlog_upsert",
+        "interface": "backlog_upsert",
+        "facade": "backlog_upsert",
+        "mcp_tool": "backlog_upsert",
+        "method": "POST",
+        "owner_role": "observer",
+        "allowed_writer_roles": ["observer"],
+        "actionable": action_input_ready,
+        "action_input_ready": action_input_ready,
+        "action_input": deepcopy(action_input),
+        "copy_safe_body": deepcopy(action_input),
+        "canonical_executable_action": canonical_action,
+        "missing_action_input_fields": missing_fields,
+        "failed_qa_source_ref": failed_source_ref,
+        "failed_qa_status": str(
+            failure_payload.get("status")
+            or failed_qa_line.get("status")
+            or "failed"
+        ).strip(),
+        "source_generation_terminal": True,
+        "same_row_resume_allowed": False,
+        "separate_bounded_successor_row_required": True,
+        "fresh_authority_required": True,
+        "source_runtime_authority_reusable": False,
+        "historical_contract_successor": historical_direct_fix,
+        "forbidden_authority_reuse": [
+            "runtime_context_id",
+            "task_id",
+            "route_token_ref",
+            "worktree_path",
+            "branch_ref",
+            "merge_queue_id",
+            "accepted_dispatch_authority",
+        ],
+        "next_after_success": {
+            "interface": "onboard_route_guide",
+            "role": "observer",
+            "work_type": "parallel_worker",
+            "body": {
+                "project_id": project_id,
+                "backlog_id": fresh_backlog_id,
+                "role": "observer",
+                "work_type": "parallel_worker",
+            },
+        },
+    }
+
+
 def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
     guide = record.get("runtime_guide") if isinstance(record.get("runtime_guide"), Mapping) else {}
     state = record.get("execution_state") if isinstance(record.get("execution_state"), Mapping) else {}
@@ -106888,10 +107086,29 @@ def _runtime_current_state_from_record(record: Mapping[str, Any]) -> dict[str, A
                 f"contract_runtime:{record.get('contract_execution_id', '')}:"
                 f"completed_lines:{failed_index}"
             )
-            bounded_worker_fix = (
-                str(record.get("revision") or "").strip() == "rev9"
-            )
+            revision = str(record.get("revision") or "").strip()
+            bounded_worker_fix = revision == "rev9"
             if replacement_dispatch_ready:
+                return current_state
+            if revision == "rev10":
+                current_state.update(
+                    {
+                        "status": "blocked",
+                        "readiness_state": (
+                            "failed_qa_fresh_repair_successor_required"
+                        ),
+                        "next_legal_action": (
+                            _contract_runtime_failed_qa_fresh_repair_action(
+                                record,
+                                failed_qa_line,
+                                failed_index=failed_index,
+                                failed_source_ref=failed_source_ref,
+                            )
+                        ),
+                    }
+                )
+                current_state.pop("accepted_dispatch_authority", None)
+                current_state.pop("mf_sub_host_bridge_guidance", None)
                 return current_state
             current_state.update(
                 {
@@ -107015,6 +107232,11 @@ def _merge_contract_chain_next_action_context(
     previous_next_action: Mapping[str, Any],
 ) -> dict[str, Any]:
     merged = dict(next_action)
+    if (
+        merged.get("fresh_authority_required") is True
+        or merged.get("same_row_resume_allowed") is False
+    ):
+        return merged
     for key in _CONTRACT_CHAIN_RUNTIME_FRESHNESS_CONTEXT_KEYS:
         if key in merged:
             continue
@@ -107213,7 +107435,19 @@ def _contract_chain_current_with_runtime_freshness(
         guide,
         source="backlog_contract_chain_current",
     )
-    fresh_readiness_state = _runtime_readiness_state_from_guide(guide)
+    canonical_current_next = (
+        current_state.get("next_legal_action")
+        if isinstance(current_state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if canonical_current_next.get("fresh_authority_required") is True:
+        fresh_next_action = dict(canonical_current_next)
+        fresh_next_action.setdefault("source", "backlog_contract_chain_current")
+    fresh_readiness_state = (
+        str(current_state.get("readiness_state") or "").strip()
+        if canonical_current_next.get("fresh_authority_required") is True
+        else _runtime_readiness_state_from_guide(guide)
+    )
     stale_readiness_state = str(current.get("readiness_state") or "")
     readiness_changed = bool(
         fresh_readiness_state
@@ -107389,14 +107623,24 @@ def _contract_chain_current_with_unique_active_mf_parallel(
         if isinstance(projected_record.get("runtime_guide"), Mapping)
         else {}
     )
+    current_state = _runtime_current_state_from_record(projected_record)
     next_action = _runtime_next_action_from_guide(
         guide,
         source="backlog_contract_chain_current",
     )
-    readiness_state = (
-        _runtime_readiness_state_from_guide(guide) or "contract_active"
+    canonical_current_next = (
+        current_state.get("next_legal_action")
+        if isinstance(current_state.get("next_legal_action"), Mapping)
+        else {}
     )
-    current_state = _runtime_current_state_from_record(projected_record)
+    if canonical_current_next.get("fresh_authority_required") is True:
+        next_action = dict(canonical_current_next)
+        next_action.setdefault("source", "backlog_contract_chain_current")
+    readiness_state = (
+        str(current_state.get("readiness_state") or "").strip()
+        if canonical_current_next.get("fresh_authority_required") is True
+        else _runtime_readiness_state_from_guide(guide) or "contract_active"
+    )
     terminal_audit_only = current_state.get("terminal") is True
     revision = int(current_state.get("execution_state_revision") or 0)
     chain_records = [
@@ -109101,6 +109345,7 @@ def _contract_runtime_compact_cli_next_action(
         "evidence_kind",
         "required",
         "actionable",
+        "action_input_ready",
         "source",
         "precedence",
         "contract_execution_id",
@@ -109124,6 +109369,12 @@ def _contract_runtime_compact_cli_next_action(
         "contract_runtime_mutated",
         "global_contract_line_already_completed",
         "failed_qa_replacement_post_read_startup_projection",
+        "failed_qa_source_ref",
+        "fresh_authority_required",
+        "source_generation_terminal",
+        "same_row_resume_allowed",
+        "separate_bounded_successor_row_required",
+        "source_runtime_authority_reusable",
     ):
         if key in projected:
             compact[key] = projected[key]
@@ -109334,6 +109585,14 @@ def _contract_runtime_response(
         actor_role=actor_role,
     )
     current_state = _runtime_current_state_from_record(record)
+    response_next_action = _runtime_next_action_from_guide(guide)
+    current_next_action = (
+        current_state.get("next_legal_action")
+        if isinstance(current_state.get("next_legal_action"), Mapping)
+        else {}
+    )
+    if current_next_action.get("fresh_authority_required") is True:
+        response_next_action = dict(current_next_action)
     response = {
         "schema_version": "contract_runtime.runtime_facade_response.v1",
         "ok": True,
@@ -109348,7 +109607,7 @@ def _contract_runtime_response(
         "runtime_guide_hash": current_state["runtime_guide_hash"],
         "contract_runtime_current_state": current_state,
         "runtime_guide": guide,
-        "next_legal_action": _runtime_next_action_from_guide(guide),
+        "next_legal_action": response_next_action,
         "submit_line_guidance": _contract_runtime_submit_line_guidance(guide),
         "route_token_ref": str(record.get("route_token_ref") or ""),
         "agent_facing_decision_source": "contract_runtime_first_missing_line",
@@ -151738,11 +151997,22 @@ def _onboard_route_guide_compact_service_response(
         if isinstance(next_action.get("action_scope"), Mapping)
         else {}
     )
+    fresh_bounded_successor = bool(
+        next_action.get("fresh_authority_required") is True
+        and next_action.get("same_row_resume_allowed") is False
+    )
     action_backlog_id = str(
-        action_scope.get("backlog_id") or backlog_id
+        (
+            action_scope.get("backlog_id")
+            or action_input.get("bug_id")
+        )
+        if fresh_bounded_successor
+        else (action_scope.get("backlog_id") or backlog_id)
     ).strip()
     action_contract_execution_id = str(
-        action_scope.get("contract_execution_id")
+        ""
+        if fresh_bounded_successor
+        else action_scope.get("contract_execution_id")
         or identity.get("contract_execution_id")
         or ""
     ).strip()
@@ -151761,10 +152031,13 @@ def _onboard_route_guide_compact_service_response(
     canonical_executable_action = (
         deepcopy(dict(source_canonical_executable_action))
         if (
-            finish_runtime_selected
-            and worker_runtime_ready
-            and source_canonical_executable_action
+            (
+                finish_runtime_selected
+                and worker_runtime_ready
+            )
+            or fresh_bounded_successor
         )
+        and source_canonical_executable_action
         else _guide_canonical_executable_action(
             project_id=project_id,
             backlog_id=action_backlog_id,
@@ -151839,6 +152112,7 @@ def _onboard_route_guide_compact_service_response(
             "id": str(next_action.get("id") or ""),
             "action": action,
             "interface": str(next_action.get("interface") or ""),
+            "mcp_tool": canonical_mcp_tool,
             "line_id": str(next_action.get("line_id") or ""),
             "stage_id": str(next_action.get("stage_id") or ""),
             "description": str(
@@ -151881,6 +152155,11 @@ def _onboard_route_guide_compact_service_response(
             "action_input_ready": (
                 bool(next_action.get("action_input_ready"))
                 if "action_input_ready" in next_action
+                else None
+            ),
+            "actionable": (
+                bool(next_action.get("actionable"))
+                if "actionable" in next_action
                 else None
             ),
             "action_input_missing_fields": list(
@@ -151966,6 +152245,37 @@ def _onboard_route_guide_compact_service_response(
                 if next_action.get("separate_bounded_successor_row_required")
                 is True
                 else None
+            ),
+            "fresh_authority_required": (
+                True
+                if next_action.get("fresh_authority_required") is True
+                else None
+            ),
+            "source_runtime_authority_reusable": (
+                False
+                if next_action.get("source_runtime_authority_reusable") is False
+                else None
+            ),
+            "canonical_executable_action": (
+                deepcopy(dict(canonical_executable_action))
+                if fresh_bounded_successor
+                and canonical_executable_action
+                else {}
+            ),
+            "historical_contract_successor": (
+                deepcopy(dict(next_action.get("historical_contract_successor")))
+                if isinstance(
+                    next_action.get("historical_contract_successor"), Mapping
+                )
+                else {}
+            ),
+            "forbidden_authority_reuse": list(
+                next_action.get("forbidden_authority_reuse") or []
+            ),
+            "next_after_success": (
+                deepcopy(dict(next_action.get("next_after_success")))
+                if isinstance(next_action.get("next_after_success"), Mapping)
+                else {}
             ),
             "mf_parallel_enter_allowed": (
                 False
@@ -185976,6 +186286,22 @@ def _contract_runtime_dispatch_ticket_authority(
     if selected.get("status") != "selected":
         return selected
     dispatch_index = int(selected["completed_line_index"])
+    failed_qa_index = _active_failed_qa_line_index(
+        list(record.get("completed_lines") or []),
+        source_record=record,
+    )
+    if failed_qa_index >= 0 and dispatch_index <= failed_qa_index:
+        return {
+            "status": "invalid",
+            "error": (
+                "canonical ContractRuntime dispatch predates active failed QA "
+                "and cannot authorize worker continuation"
+            ),
+            "failed_qa_source_ref": (
+                f"contract_runtime:{record.get('contract_execution_id', '')}:"
+                f"completed_lines:{failed_qa_index}"
+            ),
+        }
     line = selected["line"]
     payload = selected["payload"]
     aggregate_dispatch_ticket_authority = (
@@ -198957,15 +199283,29 @@ def handle_project_contract_runtime_current_state(ctx: RequestContext):
             facade_next_action = _runtime_next_action_from_guide(
                 runtime_guide
             )
-            for identity_field in ("runtime_context_id", "task_id"):
-                requested_identity = _contract_runtime_ref_value(
-                    ctx,
-                    identity_field,
+            facade_current_state = _runtime_current_state_from_record(record)
+            facade_current_next_action = (
+                facade_current_state.get("next_legal_action")
+                if isinstance(
+                    facade_current_state.get("next_legal_action"), Mapping
                 )
-                if requested_identity and not facade_next_action.get(
-                    identity_field
-                ):
-                    facade_next_action[identity_field] = requested_identity
+                else {}
+            )
+            if (
+                facade_current_next_action.get("fresh_authority_required")
+                is True
+            ):
+                facade_next_action = dict(facade_current_next_action)
+            if facade_next_action.get("fresh_authority_required") is not True:
+                for identity_field in ("runtime_context_id", "task_id"):
+                    requested_identity = _contract_runtime_ref_value(
+                        ctx,
+                        identity_field,
+                    )
+                    if requested_identity and not facade_next_action.get(
+                        identity_field
+                    ):
+                        facade_next_action[identity_field] = requested_identity
             facade_projection = _onboard_worker_read_runtime_facade_projection(
                 conn,
                 project_id=project_id,
