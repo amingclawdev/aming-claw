@@ -2934,6 +2934,21 @@ _FRESH_REPAIR_SOURCE_QUALIFIED_SAFE_FIELDS = (
         "/plain/semantic/renewal",
     ),
     (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS",
+        "renewal_supported",
+        True,
+    ),
+    (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS",
+        "renewal_default_ttl_seconds",
+        900,
+    ),
+    (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS",
+        "renewal_max_ttl_seconds",
+        3600,
+    ),
+    (
         "_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS",
         "errors",
         ["plain rejoin diagnostic"],
@@ -2964,6 +2979,10 @@ _FRESH_REPAIR_MIXED_SOURCE_AUTHORITY_NEIGHBORS = (
         "task_id",
     ),
     ("_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS", "lease_id"),
+    ("_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS", "session_token_ref"),
+    ("_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS", "candidate_commit_sha"),
+    ("_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS", "qa_scope_binding_ref"),
+    ("_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS", "merge_event_id"),
     (
         "_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS",
         "replacement_generation",
@@ -2971,6 +2990,19 @@ _FRESH_REPAIR_MIXED_SOURCE_AUTHORITY_NEIGHBORS = (
     (
         "_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS",
         "current_session_token_ref",
+    ),
+)
+
+
+_FRESH_REPAIR_CONTEXTUAL_AUTHORITY_ENVELOPES = (
+    (
+        "_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS",
+        "evidence_kind",
+    ),
+    ("_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS", "identity_mismatches"),
+    (
+        "_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS",
+        "identity_mismatches",
     ),
 )
 
@@ -3557,6 +3589,141 @@ def test_mf_parallel_rev10_failed_qa_rejects_mixed_source_authority_neighbors(
         f"acceptance_criteria[0].historical_context.{field_name}"
     ]
     assert sentinel not in json.dumps(action, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    ("source_name", "target_field"),
+    _FRESH_REPAIR_CONTEXTUAL_AUTHORITY_ENVELOPES,
+)
+def test_mf_parallel_rev10_failed_qa_rejects_contextual_authority_envelopes(
+    source_name,
+    target_field,
+):
+    source_fields = getattr(server, source_name)
+    envelope = {
+        field_name: f"retired-{source_name}-{field_name}"
+        for field_name in source_fields
+    }
+    target_sentinel = f"retired-contextual-{target_field}-sentinel"
+    envelope[target_field] = target_sentinel
+    criterion = {
+        "id": f"AC-REV10-CONTEXTUAL-{target_field.upper()}",
+        "text": "A canonical authority envelope is not semantic prose.",
+        "required_scope": ["agent/governance/server.py"],
+        "historical_context": {"canonical_envelope": envelope},
+    }
+    record = _rev10_failed_qa_fresh_repair_record(
+        [criterion],
+        backlog_id=f"AC-REV10-CONTEXTUAL-{target_field.upper()}",
+        contract_execution_id=f"cex-rev10-contextual-{target_field}",
+    )
+
+    assert source_name in (
+        server._contract_runtime_fresh_repair_canonical_envelope_sources(
+            envelope
+        )
+    )
+    assert server._contract_runtime_key_is_execution_authority_or_credential(
+        target_field,
+        canonical_source_names=(source_name,),
+    ) is True
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+    target_path = (
+        "acceptance_criteria[0].historical_context.canonical_envelope."
+        f"{target_field}"
+    )
+    assert action["actionable"] is False
+    assert action["action_input_ready"] is False
+    assert action["action_input"] == {}
+    assert action["copy_safe_body"] == {}
+    assert target_path in action["unsafe_action_input_paths"]
+    assert target_sentinel not in json.dumps(action, sort_keys=True)
+
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id="aming-claw",
+        backlog_id=record["backlog_id"],
+        role="observer",
+        work_type="parallel_worker",
+        record=record,
+        next_action=action,
+        current_projection={
+            "current_contract_execution_id": record[
+                "contract_execution_id"
+            ],
+            "execution_state_revision": 1,
+            "projection_hash": "sha256:" + "7" * 64,
+            "next_legal_action": action,
+        },
+        runtime_resume={"next_legal_action": action},
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+    assert compact["ok"] is True
+    assert compact["actionable"] is False
+    assert compact["action_input"] == {}
+    assert compact["copy_safe_body"] == {}
+    assert target_path in compact["next_legal_action"][
+        "unsafe_action_input_paths"
+    ]
+    assert target_sentinel not in json.dumps(compact, sort_keys=True)
+
+
+def test_mf_parallel_rev10_failed_qa_unknown_contextual_field_hard_fails():
+    source_name = "_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS"
+    unknown_field = "future_writer_diagnostic_generation_binding"
+    sentinel = "retired-unknown-writer-value-must-not-echo"
+    envelope = {
+        field_name: f"retired-writer-{field_name}"
+        for field_name in getattr(server, source_name)
+    }
+    envelope[unknown_field] = sentinel
+    record = _rev10_failed_qa_fresh_repair_record(
+        [
+            {
+                "id": "AC-REV10-UNKNOWN-CONTEXTUAL-FIELD",
+                "text": "Unknown canonical fields fail closed.",
+                "required_scope": ["agent/governance/server.py"],
+                "historical_context": {"canonical_envelope": envelope},
+            }
+        ]
+    )
+
+    with pytest.raises(server.GovernanceError) as error:
+        server._runtime_current_state_from_record(record)
+
+    assert error.value.code == "contract_runtime_authority_registry_incomplete"
+    assert error.value.status == 503
+    assert error.value.details["actionable"] is False
+    assert error.value.details["writes_performed"] is False
+    assert error.value.details["diagnostic_paths"] == [
+        f"{source_name}.{unknown_field}"
+    ]
+    assert error.value.details["authority_values_exposed"] is False
+    assert sentinel not in json.dumps(error.value.to_dict(), sort_keys=True)
+
+
+def test_mf_parallel_rev10_failed_qa_lone_contextual_labels_remain_semantic():
+    criterion = {
+        "id": "AC-REV10-LONE-CONTEXTUAL-LABELS",
+        "text": "Lone labels do not assert canonical source identity.",
+        "required_scope": ["agent/governance/server.py"],
+        "extra_semantics": {
+            "evidence_kind": "diagnostic",
+            "identity_mismatches": ["plain semantic mismatch"],
+        },
+    }
+    record = _rev10_failed_qa_fresh_repair_record([criterion])
+
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+
+    assert action["actionable"] is True
+    assert action["action_input_ready"] is True
+    assert action["unsafe_action_input_paths"] == []
+    assert action["copy_safe_body"]["acceptance_criteria"] == [criterion]
 
 
 def test_failed_qa_repair_dispatch_runtime_schema_refreshes_future_fields(

@@ -99464,7 +99464,10 @@ _CONTRACT_RUNTIME_SERVER_CANONICAL_AUDITED_SAFE_FIELD_SEMANTICS = {
         {
             "invalid_reason",
             "lease_expires_at",
+            "renewal_default_ttl_seconds",
             "renewal_endpoint",
+            "renewal_max_ttl_seconds",
+            "renewal_supported",
             "schema_version",
             "status",
         }
@@ -99562,9 +99565,7 @@ _CONTRACT_RUNTIME_SERVER_CANONICAL_MIXED_SOURCE_PARTITIONS = {
                 "expired", "expiry_valid", "has_lease", "lease_id",
                 "lease_record_valid", "lease_remaining_ttl_seconds", "now",
                 "raw_session_token_exposed", "raw_session_token_persisted",
-                "renewal_default_ttl_seconds", "renewal_max_ttl_seconds",
-                "renewal_supported", "session_token_ref",
-                "session_token_ref_available",
+                "session_token_ref", "session_token_ref_available",
             }
         ),
     },
@@ -99605,7 +99606,7 @@ def _contract_runtime_is_server_canonical_collection_source(
     if name.startswith("_CONTRACT_RUNTIME_SERVER_CANONICAL_") or name in {
         "_CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS",
         "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
-        "_CONTRACT_RUNTIME_FRESH_REPAIR_AUDITED_SAFE_SEMANTIC_FIELDS",
+        "_CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS",
     }:
         return False
     return bool(
@@ -99829,16 +99830,33 @@ def _contract_runtime_require_canonical_authority_registry_complete(
     audit = _contract_runtime_server_canonical_source_registry_audit()
     if audit.get("complete") is True:
         return audit
-    diagnostic_paths = sorted(
+    _contract_runtime_raise_canonical_authority_registry_incomplete(
+        sorted(
+            {
+                *list(audit.get("unclassified_source_names") or []),
+                *list(audit.get("missing_registered_source_names") or []),
+                *list(audit.get("overlapping_source_names") or []),
+                *list(audit.get("unclassified_field_paths") or []),
+                *list(audit.get("overlapping_field_paths") or []),
+                *list(audit.get("stale_partition_field_paths") or []),
+                *list(audit.get("missing_partition_source_names") or []),
+                *list(
+                    audit.get("unknown_partition_disposition_paths") or []
+                ),
+            }
+        )
+    )
+    return audit
+
+
+def _contract_runtime_raise_canonical_authority_registry_incomplete(
+    diagnostic_paths: Sequence[Any],
+) -> NoReturn:
+    bounded_paths = sorted(
         {
-            *list(audit.get("unclassified_source_names") or []),
-            *list(audit.get("missing_registered_source_names") or []),
-            *list(audit.get("overlapping_source_names") or []),
-            *list(audit.get("unclassified_field_paths") or []),
-            *list(audit.get("overlapping_field_paths") or []),
-            *list(audit.get("stale_partition_field_paths") or []),
-            *list(audit.get("missing_partition_source_names") or []),
-            *list(audit.get("unknown_partition_disposition_paths") or []),
+            str(path or "").strip()
+            for path in diagnostic_paths
+            if str(path or "").strip()
         }
     )[:32]
     raise GovernanceError(
@@ -99855,8 +99873,8 @@ def _contract_runtime_require_canonical_authority_registry_complete(
             "status": "blocked",
             "actionable": False,
             "writes_performed": False,
-            "diagnostic_paths": diagnostic_paths,
-            "diagnostic_path_count": len(diagnostic_paths),
+            "diagnostic_paths": bounded_paths,
+            "diagnostic_path_count": len(bounded_paths),
             "safe_next_step": (
                 "classify every canonical schema field and restart the "
                 "governance runtime"
@@ -100351,24 +100369,87 @@ _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_SUFFIXES = (
     "traceid",
     "traceids",
 )
-_CONTRACT_RUNTIME_FRESH_REPAIR_AUDITED_SAFE_SEMANTIC_FIELDS = frozenset(
+_CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS = frozenset(
     str(field_name).casefold()
     for source_fields in (
         _CONTRACT_RUNTIME_SERVER_CANONICAL_AUDITED_SAFE_FIELD_SEMANTICS.values()
     )
     for field_name in source_fields
 )
+_CONTRACT_RUNTIME_FRESH_REPAIR_CANONICAL_ENVELOPE_REQUIRED_FIELDS = {
+    "_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS": frozenset(
+        {
+            "definition_hash",
+            "execution_state_revision",
+            "instruction_bundle_hash",
+            "line_id",
+            "line_instance_id",
+            "runtime_guide_hash",
+            "stage_id",
+        }
+    ),
+    "_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS": frozenset(
+        {
+            "candidate_commit_sha",
+            "graph_trace_ids",
+            "qa_scope_binding_ref",
+            "qa_session_id",
+            "snapshot_id",
+        }
+    ),
+    "_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS": frozenset(
+        {
+            "contract_execution_id",
+            "current_full_reconcile_marker",
+            "reconcile_event_id",
+            "reconciled_commit_sha",
+            "runtime_context_id",
+        }
+    ),
+}
+
+
+def _contract_runtime_fresh_repair_canonical_envelope_sources(
+    value: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Resolve source schemas only from their distinctive canonical shape."""
+
+    keys = {str(key or "").strip() for key in value}
+    return tuple(
+        source_name
+        for source_name, required_fields in (
+            _CONTRACT_RUNTIME_FRESH_REPAIR_CANONICAL_ENVELOPE_REQUIRED_FIELDS.items()
+        )
+        if required_fields.issubset(keys)
+    )
 
 
 def _contract_runtime_key_is_execution_authority_or_credential(
     key: Any,
+    *,
+    canonical_source_names: Sequence[str] = (),
 ) -> bool:
     """Classify keys that cannot cross a retired execution generation."""
 
     key_name = str(key or "").strip()
-    if key_name.casefold() in (
-        _CONTRACT_RUNTIME_FRESH_REPAIR_AUDITED_SAFE_SEMANTIC_FIELDS
+    canonical_dispositions = tuple(
+        disposition
+        for source_name in canonical_source_names
+        for disposition in (
+            _contract_runtime_server_canonical_field_dispositions(
+                source_name,
+                key_name,
+            )
+        )
+    )
+    if canonical_dispositions:
+        return "authority_leaf" in canonical_dispositions
+    if (
+        not canonical_source_names
+        and key_name.casefold()
+        in _CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS
     ):
+        # A lone semantic label does not assert a canonical source identity.
         return False
     if not parallel_branch_authority_field_is_nontransferable(key_name):
         return False
@@ -100402,11 +100483,42 @@ def _contract_runtime_unsafe_execution_authority_paths(
 
     def collect(child: Any, path: str) -> None:
         if isinstance(child, Mapping):
+            canonical_source_names = (
+                _contract_runtime_fresh_repair_canonical_envelope_sources(
+                    child
+                )
+            )
+            canonical_collection_sources = (
+                _contract_runtime_server_canonical_collection_sources()
+                if canonical_source_names
+                else {}
+            )
             for raw_key, nested in child.items():
                 key = str(raw_key or "").strip()
                 nested_path = f"{path}.{key}" if key else path
+                if canonical_source_names:
+                    missing_source_fields = [
+                        f"{source_name}.{key}"
+                        for source_name in canonical_source_names
+                        if key
+                        not in canonical_collection_sources.get(
+                            source_name,
+                            (),
+                        )
+                        or not (
+                            _contract_runtime_server_canonical_field_dispositions(
+                                source_name,
+                                key,
+                            )
+                        )
+                    ]
+                    if missing_source_fields:
+                        _contract_runtime_raise_canonical_authority_registry_incomplete(
+                            missing_source_fields
+                        )
                 if _contract_runtime_key_is_execution_authority_or_credential(
-                    key
+                    key,
+                    canonical_source_names=canonical_source_names,
                 ):
                     unsafe_paths.append(nested_path)
                     continue

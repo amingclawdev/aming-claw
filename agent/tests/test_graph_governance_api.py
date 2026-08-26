@@ -136218,25 +136218,28 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
         route_token_ref="",
     )
     mixed_qa_diagnostics = {
-        "candidate_specific_issues": ["plain scoped diagnostic"],
-        "candidate_new_failures": ["plain candidate diagnostic"],
+        "candidate_specific_issues": ["x"],
+        "candidate_new_failures": ["x"],
         "base_reproduction": {
             "reproduced": True,
             "total": 1,
-            "failure_identities": ["plain baseline diagnostic"],
+            "failure_identities": ["x"],
         },
         "candidate_suite_counts": {
             "passed": 3,
             "failed": 1,
             "baseline_known_non_green": 1,
         },
-        "refs": ["plain audit label"],
-        "source_qualified_semantics": {
+        "refs": ["x"],
+        "source_semantics": {
             "acceptance_criteria": ["x"],
             "errors": ["x"],
             "identity_mismatches": ["x"],
             "invalid_reason": "x",
             "renewal_endpoint": "/r",
+            "renewal_supported": True,
+            "renewal_default_ttl_seconds": 900,
+            "renewal_max_ttl_seconds": 3600,
             "evidence_kind": "x",
             "harness_type": "x",
         },
