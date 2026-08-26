@@ -29510,11 +29510,9 @@ def _runtime_context_worker_implementation_graph_trace_repair_action(
         parent_task_id=parent_task_id,
         backlog_id=backlog_id,
         fence_token=current_fence_token,
-        explicit_trace_ids=requested,
-        strict_explicit_trace_ids=bool(requested),
+        explicit_trace_ids=[],
+        strict_explicit_trace_ids=False,
     )
-    if fresh_refs.get("db_verified") is not True:
-        return {}
     bounded_fresh_ids = set(
         (fresh_refs.get("bounded_replacement_trace_authority") or {}).keys()
     )
@@ -29523,11 +29521,11 @@ def _runtime_context_worker_implementation_graph_trace_repair_action(
         for trace_id in fresh_refs.get("verified_trace_ids") or []
         if trace_id not in bounded_fresh_ids
     ]
-    if requested and current_generation_ids != requested:
-        return {}
-    if not current_generation_ids:
+    if len(current_generation_ids) != 1:
         return {}
     selected_trace_id = current_generation_ids[0]
+    if requested and requested != [selected_trace_id]:
+        return {}
 
     from .parallel_branch_runtime import (
         runtime_context_fence_token_verifier,

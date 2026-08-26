@@ -4514,6 +4514,60 @@ def test_precommit_directory_fence_corrects_frozen_asset_candidate_through_commi
         record_before_guide
     )
 
+    duplicate_trace_id = f"{active_graph_trace_id}-duplicate"
+    _insert_mf_sub_graph_query_trace(
+        conn,
+        trace_id=duplicate_trace_id,
+        parent_task_id=backlog_id,
+        snapshot_id="scope-mf-parallel-runtime-projection",
+        runtime_context_id=runtime_context.runtime_context_id,
+        task_id=runtime_context.task_id,
+        worker_role="mf_sub",
+        fence_token=replacement["fence_token"],
+        run_id=_mf_sub_run_id(
+            runtime_context.task_id,
+            replacement["fence_token"],
+        ),
+        route_identity=server._runtime_context_latest_route_identity(
+            conn,
+            replacement_context,
+        ),
+        created_at="2026-08-04T06:00:02Z",
+    )
+    conn.commit()
+    ambiguous_guide = (
+        server.handle_graph_governance_parallel_branch_runtime_context_worker_guide(
+            _ctx(
+                {
+                    "project_id": PID,
+                    "runtime_context_id": runtime_context.runtime_context_id,
+                },
+                query={
+                    "parent_task_id": backlog_id,
+                    "fence_token": active_fence_token,
+                    "session_token": active_session_token,
+                    "session_token_ref": replacement["session_token_ref"],
+                    "target_project_root": str(target_root),
+                    "graph_trace_id": active_graph_trace_id,
+                    "view": "compact",
+                },
+            )
+        )
+    )
+    assert ambiguous_guide["next_legal_action"] == "record_worker_commit"
+    assert "revise_precommit_worker_implementation" not in json.dumps(
+        ambiguous_guide,
+        sort_keys=True,
+    )
+    assert runtime.store.get(successor["contract_execution_id"]) == (
+        record_before_guide
+    )
+    conn.execute(
+        "DELETE FROM graph_query_traces WHERE project_id = ? AND trace_id = ?",
+        (PID, duplicate_trace_id),
+    )
+    conn.commit()
+
     def submit_correction(*, intent=correction_intent):
         request_body = {
             **_runtime_context_implementation_writer_binding_for_test(
