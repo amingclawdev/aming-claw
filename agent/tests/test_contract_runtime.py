@@ -2858,6 +2858,21 @@ _TYPED_AUTHORITY_PROVEN_GAPS = (
 )
 
 
+_FRESH_REPAIR_BENIGN_SEMANTIC_KEYS = (
+    "payload",
+    "verification",
+    "artifact_refs",
+    "action",
+    "error",
+    "message",
+    "reason",
+    "current_state",
+    "producer",
+    "query_purpose",
+    "query_source",
+)
+
+
 _RETIRED_EXECUTION_AUTHORITY_KEY_CASES = (
     (
         "credential_session_fence_lease",
@@ -3139,14 +3154,28 @@ _RETIRED_EXECUTION_AUTHORITY_KEY_CASES = (
 def test_failed_qa_repair_server_authority_schemas_have_no_classifier_drift():
     sources = server._contract_runtime_server_canonical_authority_field_sources()
     assert {
-        "_CONTRACT_RUNTIME_CONTAINER_KEYS",
         "_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS",
         "_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS",
         "_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS",
         "_MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS",
         "_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS",
         "_RUNTIME_CONTEXT_SERVER_IDENTITY_FIELDS",
+        "_TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS",
     }.issubset(sources)
+    container_sources = (
+        server._contract_runtime_server_canonical_authority_container_sources()
+    )
+    assert {
+        "_CONTRACT_RUNTIME_CONTAINER_KEYS",
+        "_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS",
+        "_QA_REVIEW_AUTHORITY_CONTAINERS",
+    }.issubset(container_sources)
+    assert set(sources).isdisjoint(container_sources)
+    assert server._CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS == {
+        field_name
+        for source_fields in container_sources.values()
+        for field_name in source_fields
+    }
     is_nontransferable = (
         parallel_branch_runtime
         .parallel_branch_authority_field_is_nontransferable
@@ -3176,6 +3205,48 @@ def test_failed_qa_repair_server_authority_schemas_have_no_classifier_drift():
             "canonical_schema"
         ]
     )
+
+
+def test_failed_qa_repair_dispatch_runtime_schema_refreshes_future_fields(
+    monkeypatch,
+):
+    source_name = "_TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS"
+    future_field = "future_dispatch_generation_binding"
+    original_fields = getattr(server, source_name)
+    assert source_name in (
+        server._contract_runtime_server_canonical_authority_field_sources()
+    )
+    assert (
+        server._contract_runtime_key_is_execution_authority_or_credential(
+            future_field
+        )
+        is False
+    )
+
+    try:
+        monkeypatch.setattr(
+            server,
+            source_name,
+            (*original_fields, future_field),
+        )
+        refreshed = (
+            server._contract_runtime_refresh_canonical_authority_field_inventory()
+        )
+        assert future_field in refreshed
+        assert future_field in (
+            server._contract_runtime_server_canonical_authority_field_sources()[
+                source_name
+            ]
+        )
+        assert (
+            server._contract_runtime_key_is_execution_authority_or_credential(
+                future_field
+            )
+            is True
+        )
+    finally:
+        monkeypatch.setattr(server, source_name, original_fields)
+        server._contract_runtime_refresh_canonical_authority_field_inventory()
 
 
 def test_failed_qa_repair_typed_authority_schema_has_no_classifier_drift():
@@ -3444,6 +3515,92 @@ def test_mf_parallel_rev10_failed_qa_allows_safe_semantic_key_mutations():
         "contract_runtime:cex-rev10-safe-semantic-ac-source:completed_lines:"
     )
     assert "contract_execution_id" not in action["copy_safe_body"]
+
+
+@pytest.mark.parametrize("semantic_key", _FRESH_REPAIR_BENIGN_SEMANTIC_KEYS)
+def test_failed_qa_repair_classifier_allows_benign_semantic_keys(
+    semantic_key,
+):
+    assert (
+        server._contract_runtime_key_is_execution_authority_or_credential(
+            semantic_key
+        )
+        is False
+    )
+
+
+def test_mf_parallel_rev10_failed_qa_preserves_benign_semantic_keys():
+    benign_context = {
+        key: f"benign semantic value for {key}"
+        for key in _FRESH_REPAIR_BENIGN_SEMANTIC_KEYS
+    }
+    acceptance_criteria = [
+        {
+            "id": "AC-REV10-BENIGN-SEMANTIC-KEYS",
+            "text": "Ordinary semantic metadata remains copy-safe.",
+            "required_scope": ["agent/governance/server.py"],
+            "historical_context": benign_context,
+        }
+    ]
+    record = _rev10_failed_qa_fresh_repair_record(
+        acceptance_criteria,
+        backlog_id="AC-REV10-FAILED-QA-BENIGN-SEMANTIC-KEYS",
+        contract_execution_id="cex-rev10-benign-semantic-keys",
+    )
+
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+
+    assert action["actionable"] is True
+    assert action["action_input_ready"] is True
+    assert action["action_input_missing_fields"] == []
+    assert action["unsafe_action_input_paths"] == []
+    assert action["copy_safe_body"]["acceptance_criteria"] == (
+        acceptance_criteria
+    )
+
+
+@pytest.mark.parametrize(
+    "container_key",
+    ("payload", "verification", "artifact_refs", "current_state"),
+)
+def test_mf_parallel_rev10_failed_qa_rejects_authority_inside_safe_container(
+    container_key,
+):
+    sentinel = f"retired-task-inside-{container_key}"
+    record = _rev10_failed_qa_fresh_repair_record(
+        [
+            {
+                "id": "AC-REV10-NESTED-CONTAINER-AUTHORITY",
+                "text": "Container labels do not hide retired authority.",
+                "required_scope": ["agent/governance/server.py"],
+                "historical_context": {
+                    container_key: {"task_id": sentinel},
+                },
+            }
+        ],
+        backlog_id="AC-REV10-FAILED-QA-NESTED-CONTAINER-AUTHORITY",
+        contract_execution_id="cex-rev10-nested-container-authority",
+    )
+
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+
+    assert action["actionable"] is False
+    assert action["action_input_ready"] is False
+    assert action["action_input"] == {}
+    assert action["copy_safe_body"] == {}
+    assert action["canonical_executable_action"] == {}
+    assert action["action_input_missing_fields"] == ["acceptance_criteria"]
+    assert action["unsafe_action_input_paths"] == [
+        (
+            "acceptance_criteria[0].historical_context."
+            f"{container_key}.task_id"
+        )
+    ]
+    assert sentinel not in json.dumps(action, sort_keys=True)
 
 
 def test_mf_parallel_rev10_failed_qa_compact_caps_unsafe_path_diagnostics():

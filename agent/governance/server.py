@@ -99348,21 +99348,51 @@ _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCE_MARKERS = (
     "IDENTITY",
     "PROVENANCE_SECURITY",
 )
-_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXACT_SOURCE_NAMES = frozenset(
+_CONTRACT_RUNTIME_SERVER_CANONICAL_DISPATCH_RUNTIME_SOURCE_MARKERS = (
+    "DISPATCH_RUNTIME",
+)
+_CONTRACT_RUNTIME_SERVER_CANONICAL_CONTAINER_EXACT_SOURCE_NAMES = frozenset(
     {"_CONTRACT_RUNTIME_CONTAINER_KEYS"}
 )
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES = frozenset(
     {
+        "_CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS",
         "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
-        "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXACT_SOURCE_NAMES",
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES",
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_CONTAINER_EXACT_SOURCE_NAMES",
         "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES",
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_DISPATCH_RUNTIME_SOURCE_MARKERS",
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCE_MARKERS",
         "_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES",
     }
 )
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES: tuple[str, ...] = ()
+_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES: tuple[
+    str, ...
+] = ()
+_CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS = frozenset()
 _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset(
     PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
 )
+
+
+def _contract_runtime_is_server_canonical_authority_container_source(
+    source_name: Any,
+) -> bool:
+    """Return whether one source lists mapping containers, not leaf authority."""
+
+    name = str(source_name or "")
+    if (
+        not name.startswith("_")
+        or name
+        in _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES
+    ):
+        return False
+    return bool(
+        name
+        in _CONTRACT_RUNTIME_SERVER_CANONICAL_CONTAINER_EXACT_SOURCE_NAMES
+        or (name.endswith("_CONTAINERS") and "AUTHORITY" in name)
+    )
 
 
 def _contract_runtime_is_server_canonical_authority_field_source(
@@ -99375,16 +99405,23 @@ def _contract_runtime_is_server_canonical_authority_field_source(
         in _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXCLUDED_SOURCE_NAMES
     ):
         return False
-    if name in _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_EXACT_SOURCE_NAMES:
-        return True
+    if _contract_runtime_is_server_canonical_authority_container_source(name):
+        return False
     if name.endswith("_FIELDS"):
-        return any(
+        is_canonical_authority = any(
             marker in name
             for marker in (
                 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_FIELD_SOURCE_MARKERS
             )
         )
-    if name.endswith(("_NAMES", "_KEYS", "_CONTAINERS")):
+        is_dispatch_runtime_contract = any(
+            marker in name
+            for marker in (
+                _CONTRACT_RUNTIME_SERVER_CANONICAL_DISPATCH_RUNTIME_SOURCE_MARKERS
+            )
+        )
+        return is_canonical_authority or is_dispatch_runtime_contract
+    if name.endswith(("_NAMES", "_KEYS")):
         return "AUTHORITY" in name
     return False
 
@@ -99405,13 +99442,34 @@ def _contract_runtime_server_canonical_authority_field_sources(
     return dict(sorted(sources.items()))
 
 
+def _contract_runtime_server_canonical_authority_container_sources(
+) -> dict[str, frozenset[str]]:
+    sources: dict[str, frozenset[str]] = {}
+    for source_name, raw_fields in globals().items():
+        if not _contract_runtime_is_server_canonical_authority_container_source(
+            source_name
+        ):
+            continue
+        if not isinstance(raw_fields, (frozenset, list, set, tuple)):
+            continue
+        if not all(isinstance(field_name, str) for field_name in raw_fields):
+            continue
+        sources[source_name] = frozenset(raw_fields)
+    return dict(sorted(sources.items()))
+
+
 def _contract_runtime_refresh_canonical_authority_field_inventory(
 ) -> frozenset[str]:
+    global _CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS
     global _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
     global _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_DENYLIST
+    global _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES
     global _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES
 
     sources = _contract_runtime_server_canonical_authority_field_sources()
+    container_sources = (
+        _contract_runtime_server_canonical_authority_container_sources()
+    )
     derived = frozenset(
         PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
         | {
@@ -99423,6 +99481,14 @@ def _contract_runtime_refresh_canonical_authority_field_inventory(
     )
     _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = derived
     _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES = tuple(sources)
+    _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES = (
+        tuple(container_sources)
+    )
+    _CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS = frozenset(
+        field_name
+        for field_source in container_sources.values()
+        for field_name in field_source
+    )
     matrix = globals().get(
         "_CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX"
     )
