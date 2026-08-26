@@ -2907,6 +2907,74 @@ _FRESH_REPAIR_MIXED_QA_LEDGER_AUTHORITY_FIELDS = (
 )
 
 
+_FRESH_REPAIR_SOURCE_QUALIFIED_SAFE_FIELDS = (
+    (
+        "_CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS",
+        "evidence_kind",
+        "plain semantic evidence kind",
+    ),
+    (
+        "_ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS",
+        "harness_type",
+        "plain semantic harness type",
+    ),
+    (
+        "_PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS",
+        "acceptance_criteria",
+        ["plain nested acceptance label"],
+    ),
+    (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS",
+        "invalid_reason",
+        "plain lease diagnostic",
+    ),
+    (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS",
+        "renewal_endpoint",
+        "/plain/semantic/renewal",
+    ),
+    (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS",
+        "errors",
+        ["plain rejoin diagnostic"],
+    ),
+    (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS",
+        "identity_mismatches",
+        ["plain identity diagnostic"],
+    ),
+    (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS",
+        "errors",
+        ["plain replacement diagnostic"],
+    ),
+    (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS",
+        "identity_mismatches",
+        ["plain replacement identity diagnostic"],
+    ),
+)
+
+
+_FRESH_REPAIR_MIXED_SOURCE_AUTHORITY_NEIGHBORS = (
+    ("_CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS", "contract_execution_id"),
+    ("_ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS", "runtime_context_id"),
+    (
+        "_PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS",
+        "task_id",
+    ),
+    ("_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS", "lease_id"),
+    (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS",
+        "replacement_generation",
+    ),
+    (
+        "_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS",
+        "current_session_token_ref",
+    ),
+)
+
+
 _RETIRED_EXECUTION_AUTHORITY_KEY_CASES = (
     (
         "credential_session_fence_lease",
@@ -3198,6 +3266,11 @@ def test_failed_qa_repair_server_authority_schemas_have_no_classifier_drift():
     assert registry_audit["stale_partition_field_paths"] == []
     assert registry_audit["missing_partition_source_names"] == []
     assert registry_audit["unknown_partition_disposition_paths"] == []
+    assert len(registry_audit["inventory_source_names"]) == 63
+    assert len(registry_audit["field_inventory_paths"]) >= 849
+    assert len(registry_audit["field_inventory_paths"]) == len(
+        set(registry_audit["field_inventory_paths"])
+    )
     assert set(registry_audit["inventory_source_names"]) == set(
         registry_audit["registered_source_names"]
     )
@@ -3256,7 +3329,21 @@ def test_failed_qa_repair_server_authority_schemas_have_no_classifier_drift():
     )
     assert set(_FRESH_REPAIR_MIXED_QA_LEDGER_BENIGN_FIELDS).issubset(
         mixed_partitions["recursive_container"]
-        | mixed_partitions["audited_non_authority"]
+        | server._CONTRACT_RUNTIME_SERVER_CANONICAL_AUDITED_SAFE_FIELD_SEMANTICS[
+            "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS"
+        ]
+    )
+    expected_source_qualified_safe_paths = {
+        f"{source_name}.{field_name}"
+        for source_name, field_name, _value in (
+            _FRESH_REPAIR_SOURCE_QUALIFIED_SAFE_FIELDS
+        )
+    }
+    assert expected_source_qualified_safe_paths.issubset(
+        registry_audit["audited_non_authority_field_paths"]
+    )
+    assert expected_source_qualified_safe_paths.isdisjoint(
+        registry_audit["authority_leaf_field_paths"]
     )
     assert server._CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS == {
         field_name
@@ -3333,24 +3420,143 @@ def test_failed_qa_repair_mixed_source_audit_flags_unclassified_future_field(
             f"{source_name}.{future_field}"
         ]
 
-        refreshed = (
+        with pytest.raises(server.GovernanceError) as refresh_error:
             server._contract_runtime_refresh_canonical_authority_field_inventory()
+        assert refresh_error.value.code == (
+            "contract_runtime_authority_registry_incomplete"
         )
-        assert future_field not in refreshed
-        assert future_field not in (
-            server._contract_runtime_server_canonical_authority_field_sources()[
-                source_name
+        assert refresh_error.value.details == {
+            "schema_version": "contract_runtime.authority_registry_failure.v1",
+            "status": "blocked",
+            "actionable": False,
+            "writes_performed": False,
+            "diagnostic_paths": [f"{source_name}.{future_field}"],
+            "diagnostic_path_count": 1,
+            "safe_next_step": (
+                "classify every canonical schema field and restart the "
+                "governance runtime"
+            ),
+            "authority_values_exposed": False,
+        }
+
+        record = _rev10_failed_qa_fresh_repair_record(
+            [
+                {
+                    "id": "AC-REV10-REGISTRY-RUNTIME-GATE",
+                    "text": "Registry drift blocks successor projection.",
+                    "required_scope": ["agent/governance/server.py"],
+                }
             ]
         )
-        assert (
-            server._contract_runtime_key_is_execution_authority_or_credential(
-                future_field
-            )
-            is False
-        )
+        with pytest.raises(server.GovernanceError) as runtime_error:
+            server._runtime_current_state_from_record(record)
+        assert runtime_error.value.code == refresh_error.value.code
+        assert runtime_error.value.details == refresh_error.value.details
     finally:
         monkeypatch.setattr(server, source_name, original_fields)
         server._contract_runtime_refresh_canonical_authority_field_inventory()
+
+
+@pytest.mark.parametrize(
+    ("source_name", "field_name", "field_value"),
+    _FRESH_REPAIR_SOURCE_QUALIFIED_SAFE_FIELDS,
+)
+def test_mf_parallel_rev10_failed_qa_preserves_source_qualified_semantics(
+    source_name,
+    field_name,
+    field_value,
+):
+    criterion = {
+        "id": f"AC-REV10-SOURCE-SAFE-{field_name.upper()}",
+        "text": "Source-qualified semantic metadata remains copy-safe.",
+        "required_scope": ["agent/governance/server.py"],
+        "historical_context": {field_name: deepcopy(field_value)},
+    }
+    record = _rev10_failed_qa_fresh_repair_record(
+        [criterion],
+        backlog_id=f"AC-REV10-SOURCE-SAFE-{field_name.upper()}",
+        contract_execution_id=f"cex-rev10-source-safe-{field_name}",
+    )
+
+    assert server._contract_runtime_server_canonical_field_dispositions(
+        source_name,
+        field_name,
+    ) == ("audited_non_authority",)
+    assert (
+        server._contract_runtime_key_is_execution_authority_or_credential(
+            field_name
+        )
+        is False
+    )
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+    assert action["actionable"] is True
+    assert action["action_input_ready"] is True
+    assert action["unsafe_action_input_paths"] == []
+    assert action["copy_safe_body"]["acceptance_criteria"] == [criterion]
+
+    compact = server._onboard_route_guide_compact_service_response(
+        project_id="aming-claw",
+        backlog_id=record["backlog_id"],
+        role="observer",
+        work_type="parallel_worker",
+        record=record,
+        next_action=action,
+        current_projection={
+            "current_contract_execution_id": record[
+                "contract_execution_id"
+            ],
+            "execution_state_revision": 1,
+            "projection_hash": "sha256:" + "6" * 64,
+            "next_legal_action": action,
+        },
+        runtime_resume={"next_legal_action": action},
+        target_files=["agent/governance/server.py"],
+        projection_degraded=False,
+    )
+    assert compact["ok"] is True
+    assert compact["actionable"] is True
+    assert compact["next_legal_action"]["action_input_ready"] is True
+    assert compact["canonical_executable_action"]["copy_safe_body"][
+        "acceptance_criteria"
+    ] == [criterion]
+
+
+@pytest.mark.parametrize(
+    ("source_name", "field_name"),
+    _FRESH_REPAIR_MIXED_SOURCE_AUTHORITY_NEIGHBORS,
+)
+def test_mf_parallel_rev10_failed_qa_rejects_mixed_source_authority_neighbors(
+    source_name,
+    field_name,
+):
+    sentinel = f"retired-{field_name}-sentinel"
+    record = _rev10_failed_qa_fresh_repair_record(
+        [
+            {
+                "id": "AC-REV10-MIXED-SOURCE-AUTHORITY",
+                "text": "Authority beside safe semantics remains blocked.",
+                "required_scope": ["agent/governance/server.py"],
+                "historical_context": {field_name: sentinel},
+            }
+        ]
+    )
+
+    assert server._contract_runtime_server_canonical_field_dispositions(
+        source_name,
+        field_name,
+    ) == ("authority_leaf",)
+    action = server._runtime_current_state_from_record(record)[
+        "next_legal_action"
+    ]
+    assert action["actionable"] is False
+    assert action["action_input"] == {}
+    assert action["copy_safe_body"] == {}
+    assert action["unsafe_action_input_paths"] == [
+        f"acceptance_criteria[0].historical_context.{field_name}"
+    ]
+    assert sentinel not in json.dumps(action, sort_keys=True)
 
 
 def test_failed_qa_repair_dispatch_runtime_schema_refreshes_future_fields(

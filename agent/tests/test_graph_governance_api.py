@@ -118349,6 +118349,49 @@ def test_onboard_route_guide_no_backlog_system_operation_returns_policy(conn):
     assert "actionable" not in compact["next_legal_action"]
 
 
+def test_onboard_route_guide_authority_registry_drift_fails_closed_before_db(
+    conn,
+    monkeypatch,
+):
+    source_name = "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS"
+    future_field = "future_qa_diagnostic_generation_binding"
+    original_fields = getattr(server, source_name)
+    monkeypatch.setattr(
+        server,
+        source_name,
+        {*original_fields, future_field},
+    )
+
+    with pytest.raises(server.GovernanceError) as error:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "role": "observer",
+                    "work_type": "system_operation",
+                    "response_view": "compact",
+                },
+            )
+        )
+
+    assert error.value.code == "contract_runtime_authority_registry_incomplete"
+    assert error.value.status == 503
+    assert error.value.details == {
+        "schema_version": "contract_runtime.authority_registry_failure.v1",
+        "status": "blocked",
+        "actionable": False,
+        "writes_performed": False,
+        "diagnostic_paths": [f"{source_name}.{future_field}"],
+        "diagnostic_path_count": 1,
+        "safe_next_step": (
+            "classify every canonical schema field and restart the "
+            "governance runtime"
+        ),
+        "authority_values_exposed": False,
+    }
+
+
 @pytest.mark.parametrize(
     "work_type",
     [
@@ -136188,6 +136231,15 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
             "baseline_known_non_green": 1,
         },
         "refs": ["plain audit label"],
+        "source_qualified_semantics": {
+            "acceptance_criteria": ["x"],
+            "errors": ["x"],
+            "identity_mismatches": ["x"],
+            "invalid_reason": "x",
+            "renewal_endpoint": "/r",
+            "evidence_kind": "x",
+            "harness_type": "x",
+        },
     }
     acceptance_criteria = [
         {
