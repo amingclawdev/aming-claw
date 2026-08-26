@@ -70187,6 +70187,84 @@ def test_runtime_context_initial_join_accepts_reordered_same_closed_owned_file_s
     assert case["initial_join"]["fence_token"] not in serialized_events
 
 
+def test_runtime_context_initial_join_preserves_directory_owned_prefix_identity(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    requested_owned_files = (
+        "agent/governance/server.py",
+        "agent/governance/dashboard_dist/",
+        "agent/tests/test_graph_governance_api.py",
+        "frontend/dashboard/dist/",
+    )
+    canonical_owned_files = tuple(sorted(requested_owned_files))
+
+    case = _setup_pre_lineage_rejoin_recovery_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="canonical-directory-owned-prefixes",
+        source_backed_contract_runtime=True,
+        dispatch_status="passed",
+        context_owned_files=requested_owned_files,
+        dispatch_owned_files=tuple(reversed(requested_owned_files)),
+    )
+
+    assert case["initial_join"]["ok"] is True
+    anchor = case["initial_join"]["canonical_identity_binding"][
+        "contract_dispatch_identity_anchor"
+    ]
+    assert anchor["owned_files"] == list(canonical_owned_files)
+    assert "agent/governance/dashboard_dist/" in anchor["owned_files"]
+    assert "frontend/dashboard/dist/" in anchor["owned_files"]
+
+
+def test_runtime_context_directory_prefix_identity_drift_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    requested_owned_files = (
+        "agent/governance/server.py",
+        "agent/governance/dashboard_dist/",
+        "agent/tests/test_graph_governance_api.py",
+        "frontend/dashboard/dist/",
+    )
+    dispatch_owned_files = (
+        "agent/governance/server.py",
+        "agent/governance/dashboard_dist",
+        "agent/tests/test_graph_governance_api.py",
+        "frontend/dashboard/dist/",
+    )
+    snapshot: dict[str, Any] = {}
+
+    with pytest.raises(GovernanceError) as rejected:
+        _setup_pre_lineage_rejoin_recovery_case(
+            conn,
+            monkeypatch,
+            tmp_path,
+            suffix="directory-prefix-identity-drift",
+            source_backed_contract_runtime=True,
+            dispatch_status="passed",
+            context_owned_files=requested_owned_files,
+            dispatch_owned_files=dispatch_owned_files,
+            pre_initial_join_snapshot=snapshot,
+        )
+
+    assert rejected.value.code == (
+        "runtime_context_initial_join_dispatch_identity_mismatch"
+    )
+    assert rejected.value.details["next_legal_action"] == (
+        "repair_runtime_context_from_accepted_dispatch_before_initial_join"
+    )
+    assert rejected.value.details["mutation_performed"] is False
+    assert rejected.value.details["timeline_event_persisted"] is False
+    assert rejected.value.details["credential_rotated"] is False
+    assert "\n".join(conn.iterdump()) == snapshot["database_dump"]
+    assert conn.total_changes == snapshot["total_changes"]
+
+
 @pytest.mark.parametrize(
     ("case_name", "dispatch_owned_files", "worker_identity_drift"),
     [

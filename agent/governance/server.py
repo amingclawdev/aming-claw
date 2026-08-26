@@ -57064,10 +57064,11 @@ def _runtime_context_rotate_validated_missing_finish_auth(
 def _runtime_context_closed_canonical_owned_file_set(
     values: Any,
 ) -> tuple[str, ...]:
-    """Return one strict order-independent repo-relative file set.
+    """Return one strict order-independent repo-relative owned-path set.
 
-    Empty, duplicate, absolute, traversal, placeholder, and non-canonical path
-    spellings are invalid.  Returning an empty tuple is therefore a fail-closed
+    A single trailing slash is preserved as a directory-prefix identity. Empty,
+    duplicate, absolute, traversal, placeholder, and other non-canonical path
+    spellings are invalid. Returning an empty tuple is therefore a fail-closed
     result, not an empty file fence.
     """
 
@@ -57089,12 +57090,20 @@ def _runtime_context_closed_canonical_owned_file_set(
             or re.match(r"^[A-Za-z]:/", path)
         ):
             return ()
-        normalized = os.path.normpath(path).replace(os.sep, "/")
+        directory_prefix = path.endswith("/")
+        base_path = path[:-1] if directory_prefix else path
+        normalized_base = os.path.normpath(base_path).replace(os.sep, "/")
+        normalized = (
+            f"{normalized_base}/" if directory_prefix else normalized_base
+        )
         if (
-            normalized != path
-            or normalized in {"", ".", ".."}
-            or normalized.startswith("../")
-            or any(part in {"", ".", ".."} for part in path.split("/"))
+            not base_path
+            or normalized_base != base_path
+            or normalized_base in {"", ".", ".."}
+            or normalized_base.startswith("../")
+            or any(
+                part in {"", ".", ".."} for part in base_path.split("/")
+            )
             or normalized in seen
         ):
             return ()
