@@ -120285,6 +120285,8 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     )
     record = server._contract_runtime(conn).store.get(execution_id)
     assert record["definition_source_sha256"].startswith("sha256:")
+    server._contract_runtime(conn).current_guide(execution_id, actor_role="mf_sub")
+    record = server._contract_runtime(conn).store.get(execution_id)
 
     forged = server.handle_project_contract_update_line_write(
         _ctx_with_role(
@@ -120293,6 +120295,8 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
             method="POST",
             body={
                 "actor_role": "observer",
+                "execution_state_revision": record["execution_state_revision"],
+                "runtime_guide_hash": record["runtime_guide"]["runtime_guide_hash"],
                 "stage_id": "observer_request",
                 "line_id": "observer_request_contract_update",
                 "evidence_kind": "contract_update_request",
@@ -120306,8 +120310,12 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
         conn,
         backlog_id=backlog_id,
         task_id="contract-update-worker",
+        parent_task_id=execution_id,
         fence_token="fence-contract-update-worker",
         token="contract-update-worker-token",
+        target_project_root="/tmp/contract-update-worker",
+        base_commit="contract-update-worker-head",
+        target_head_commit="contract-update-worker-head",
     )
     accepted = server.handle_project_contract_update_line_write(
         _ctx_with_role(
@@ -120328,7 +120336,7 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
                     "worker_runtime_context": {
                         "runtime_context_id": runtime_context.runtime_context_id,
                         "task_id": runtime_context.task_id,
-                        "parent_task_id": backlog_id,
+                        "parent_task_id": execution_id,
                         "worker_role": "mf_sub",
                         "target_project_root": "/tmp/contract-update-worker",
                     },
@@ -120339,7 +120347,38 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
 
     assert accepted["ok"] is True
     assert accepted["actor_role"] == "observer"
-    assert accepted["next_legal_action"]["id"] == "worker_previous_source_proof"
+    assert accepted["next_legal_action"]["id"] == (
+        "observer_dispatch_bounded_workers"
+    )
+    assert accepted["next_legal_action"]["allowed_writer_roles"] == ["observer"]
+
+    dispatch_identity = {
+        "runtime_context_id": runtime_context.runtime_context_id,
+        "task_id": runtime_context.task_id,
+        "parent_task_id": execution_id,
+        "worker_role": "mf_sub",
+        "worker_id": runtime_context.worker_id,
+        "worker_slot_id": runtime_context.worker_slot_id,
+        "target_project_root": runtime_context.target_project_root,
+    }
+    accepted = server.handle_project_contract_update_line_write(
+        _ctx_with_role(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            "observer",
+            method="POST",
+            body={
+                **dispatch_identity,
+                "stage_id": "dispatch",
+                "line_id": "observer_dispatch_bounded_workers",
+                "evidence_kind": "dispatch_bounded_worker",
+                "payload": dispatch_identity,
+            },
+        )
+    )
+
+    assert accepted["ok"] is True
+    assert accepted["actor_role"] == "observer"
+    assert accepted["next_legal_action"]["id"] == "worker_read_runtime_guide"
     assert accepted["next_legal_action"]["allowed_writer_roles"] == ["mf_sub"]
     bridge_guidance = accepted["next_legal_action"]["mf_sub_host_bridge_guidance"]
     assert bridge_guidance["status"] == "mf_sub_runtime_identity_required"
@@ -120387,15 +120426,15 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
     ]
     assert capacity_guidance["preserve_runtime_identity"][
         "runtime_context_id"
-    ] == "<from parallel_branch_allocate/runtime_context>"
+    ] == runtime_context.runtime_context_id
     assert capacity_guidance["preserve_runtime_identity"]["task_id"] == (
-        "<worker task_id from runtime_context>"
+        runtime_context.task_id
     )
     assert capacity_guidance["preserve_runtime_identity"]["parent_task_id"] == (
-        "<parent MF task_id from runtime_context>"
+        execution_id
     )
     assert capacity_guidance["preserve_runtime_identity"]["target_project_root"] == (
-        "<runtime-context canonical target_project_root>"
+        runtime_context.target_project_root
     )
     assert set(capacity_guidance["required_identity_fields"]) == {
         "runtime_context_id",
@@ -120429,6 +120468,86 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
         "mf_sub_host_bridge_guidance"
     ] == bridge_guidance
 
+    worker_identity = {
+        **dispatch_identity,
+        "fence_token": "fence-contract-update-worker",
+        "session_token_ref": runtime_context_session_token_ref(runtime_context),
+        "read_receipt_hash": _fake_sha("contract-update-worker-read"),
+        "launch_text_hash": _fake_sha("contract-update-worker-launch"),
+    }
+    premature_previous_source = server.handle_project_contract_update_line_write(
+        _ctx(
+            {"project_id": PID, "contract_execution_id": execution_id},
+            method="POST",
+            body={
+                **worker_identity,
+                "stage_id": "worker_previous_source",
+                "line_id": "worker_previous_source_proof",
+                "evidence_kind": "contract_previous_source_proof",
+            },
+        )
+    )
+    assert premature_previous_source["ok"] is False
+    assert premature_previous_source["next_legal_action"]["id"] == (
+        "worker_read_runtime_guide"
+    )
+
+    for stage_id, line_id, evidence_kind in [
+        ("worker_read", "worker_read_runtime_guide", "read_receipt"),
+        ("worker_startup", "worker_startup", "mf_subagent_startup"),
+    ]:
+        gate = server.handle_project_contract_update_line_write(
+            _ctx(
+                {"project_id": PID, "contract_execution_id": execution_id},
+                method="POST",
+                body={
+                    **worker_identity,
+                    "stage_id": stage_id,
+                    "line_id": line_id,
+                    "evidence_kind": evidence_kind,
+                    "payload": worker_identity,
+                },
+            )
+        )
+        assert gate["ok"] is True, json.dumps(gate, sort_keys=True)
+
+    graph_snapshot_id = "full-contract-update-worker"
+    _activate_basic_graph(
+        conn,
+        graph_snapshot_id,
+        commit_sha="contract-update-worker-head",
+    )
+    graph_context = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                **worker_identity,
+                "contract_execution_id": execution_id,
+                "session_token": "contract-update-worker-token",
+                "snapshot_id": graph_snapshot_id,
+                "tool": "query_schema",
+                "args": {},
+                "actor": "mf_sub",
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+                "run_id": _mf_sub_run_id(
+                    runtime_context.task_id,
+                    "fence-contract-update-worker",
+                ),
+            },
+        )
+    )
+    assert graph_context["ok"] is True, json.dumps(graph_context, sort_keys=True)
+    assert graph_context["contract_runtime_canonical_line"]["accepted"] is True, (
+        json.dumps(graph_context, sort_keys=True)
+    )
+    assert graph_context["contract_runtime_canonical_line"]["next_legal_action"][
+        "line_id"
+    ] == (
+        "worker_previous_source_proof"
+    )
+
     current = server.handle_project_contract_update_current_state(
         _ctx(
             {"project_id": PID, "contract_execution_id": execution_id},
@@ -120436,7 +120555,7 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
             query={
                 "runtime_context_id": runtime_context.runtime_context_id,
                 "task_id": runtime_context.task_id,
-                "parent_task_id": backlog_id,
+                "parent_task_id": execution_id,
                 "worker_role": "mf_sub",
                 "fence_token": "fence-contract-update-worker",
                 "session_token_ref": runtime_context_session_token_ref(runtime_context),
@@ -120456,7 +120575,7 @@ def test_contract_update_facade_starts_guided_runtime_and_rejects_forged_roles(c
             body={
                 "runtime_context_id": runtime_context.runtime_context_id,
                 "task_id": runtime_context.task_id,
-                "parent_task_id": backlog_id,
+                "parent_task_id": execution_id,
                 "worker_role": "mf_sub",
                 "fence_token": "fence-contract-update-worker",
                 "session_token_ref": runtime_context_session_token_ref(runtime_context),
@@ -122869,18 +122988,35 @@ def test_contract_update_blocked_precheck_pauses_until_hotfix_successor_complete
         conn,
         onboard["contract_execution_id"],
     )
-    started = server.handle_project_contract_update_start(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "route_token_ref": "rtok-contract-update-block",
-            },
-        )
+    execution_id = server._contract_update_execution_id(
+        PID,
+        backlog_id,
+        parent_contract_execution_id=parent["contract_execution_id"],
     )
-    execution_id = started["contract_execution_id"]
+    server._contract_runtime(conn).start_execution(
+        server.CONTRACT_UPDATE_CONTRACT_ID,
+        version="v1",
+        revision="rev1",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=execution_id,
+        parent_contract_execution_id=parent["contract_execution_id"],
+        root_contract_execution_id=parent["root_contract_execution_id"],
+        contract_chain_id=parent["contract_chain_id"],
+        route_token_ref="rtok-contract-update-block",
+        role_binding={
+            "observer": "observer",
+            "mf_sub": "mf_sub",
+            "qa": "qa",
+            "binding_source": "contract_update_facade",
+        },
+        metadata={
+            "facade": "contract_update",
+            "generic_crud_exposed": False,
+            "entrypoint": "onboard_successor",
+        },
+    )
 
     observer_request = server.handle_project_contract_update_line_write(
         _ctx_with_role(
@@ -123052,22 +123188,39 @@ def test_contract_update_blocked_precheck_continues_with_audited_bypass(conn):
             },
         )
     )
-    _complete_source_backed_onboarding(
+    parent = _complete_source_backed_onboarding(
         conn,
         onboard["contract_execution_id"],
     )
-    started = server.handle_project_contract_update_start(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "route_token_ref": "rtok-contract-update-direct",
-            },
-        )
+    execution_id = server._contract_update_execution_id(
+        PID,
+        backlog_id,
+        parent_contract_execution_id=parent["contract_execution_id"],
     )
-    execution_id = started["contract_execution_id"]
+    server._contract_runtime(conn).start_execution(
+        server.CONTRACT_UPDATE_CONTRACT_ID,
+        version="v1",
+        revision="rev1",
+        project_id=PID,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=execution_id,
+        parent_contract_execution_id=parent["contract_execution_id"],
+        root_contract_execution_id=parent["root_contract_execution_id"],
+        contract_chain_id=parent["contract_chain_id"],
+        route_token_ref="rtok-contract-update-direct",
+        role_binding={
+            "observer": "observer",
+            "mf_sub": "mf_sub",
+            "qa": "qa",
+            "binding_source": "contract_update_facade",
+        },
+        metadata={
+            "facade": "contract_update",
+            "generic_crud_exposed": False,
+            "entrypoint": "onboard_successor",
+        },
+    )
 
     for actor_role, stage_id, line_id, evidence_kind in [
         (

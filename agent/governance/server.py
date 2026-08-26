@@ -30385,7 +30385,7 @@ def _runtime_context_source_backed_contract_identity(
     runtime_context_id: str,
     task_id: str,
 ) -> tuple[dict[str, str], dict[str, Any]]:
-    """Find the active mf_parallel ContractRuntime record bound to this worker.
+    """Find the active source-backed ContractRuntime record bound to this worker.
 
     This is a compatibility lookup for older branch contract revisions that do
     not carry the successor contract_execution_id, while their source-backed
@@ -30431,7 +30431,11 @@ def _runtime_context_source_backed_contract_identity(
     dispatch_candidate_ids: set[str] = set()
     for record in records:
         contract_id = str(record.get("contract_id") or "").strip()
-        if not _is_mf_parallel_record_contract_id(contract_id):
+        source_backed_worker_contract = (
+            _is_mf_parallel_record_contract_id(contract_id)
+            or contract_id == CONTRACT_UPDATE_CONTRACT_ID
+        )
+        if not source_backed_worker_contract:
             diagnostic["ignored_counts"]["non_mf_parallel"] += 1
             continue
         execution_id = str(record.get("contract_execution_id") or "").strip()
@@ -30439,7 +30443,15 @@ def _runtime_context_source_backed_contract_identity(
             diagnostic["ignored_counts"]["missing_execution_id"] += 1
             continue
         try:
-            if not runtime.pinned_definition_has_line(execution_id, "worker_commit"):
+            required_worker_line = (
+                "worker_commit"
+                if _is_mf_parallel_record_contract_id(contract_id)
+                else "worker_graph_context"
+            )
+            if not runtime.pinned_definition_has_line(
+                execution_id,
+                required_worker_line,
+            ):
                 diagnostic["ignored_counts"][
                     "missing_worker_commit_definition"
                 ] += 1

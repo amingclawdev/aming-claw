@@ -3077,6 +3077,7 @@ def test_default_registry_exposes_contract_update_definition_and_runtime_path():
     assert definition["contract_id"] == "contract_update"
     assert definition["role"] == "observer"
     assert definition["contract_type"] == "contract_update"
+    assert definition["revision"] == "rev2"
     assert definition["compat_aliases"] == ["contract_update.v1", "update_contract.v1"]
 
     read_model = definition["read_model"]
@@ -3091,6 +3092,30 @@ def test_default_registry_exposes_contract_update_definition_and_runtime_path():
             "observer_request_contract_update",
             "observer",
             "contract_update_request",
+        ),
+        (
+            "dispatch",
+            "observer_dispatch_bounded_workers",
+            "observer",
+            "dispatch_bounded_worker",
+        ),
+        (
+            "worker_read",
+            "worker_read_runtime_guide",
+            "mf_sub",
+            "read_receipt",
+        ),
+        (
+            "worker_startup",
+            "worker_startup",
+            "mf_sub",
+            "mf_subagent_startup",
+        ),
+        (
+            "worker_context",
+            "worker_graph_context",
+            "mf_sub",
+            "graph_trace",
         ),
         (
             "worker_previous_source",
@@ -3134,6 +3159,18 @@ def test_default_registry_exposes_contract_update_definition_and_runtime_path():
     assert "same-revision active semantic mutation is invalid" in (
         definition["instruction_layer"]["inline"][5]
     )
+    assert "query the graph with its bounded identity" in (
+        definition["instruction_layer"]["inline"][6]
+    )
+
+    explicit_rev1 = service.read("contract_update.v1", revision="rev1")
+    assert explicit_rev1["ok"] is True
+    rev1_lines = explicit_rev1["data"]["definition"]["read_model"]["rule_lines"]
+    assert rev1_lines[1]["line_id"] == "worker_previous_source_proof"
+    assert all(
+        line["line_id"] != "observer_dispatch_bounded_workers"
+        for line in rev1_lines
+    )
 
     runtime = ContractRuntime(service.registry)
     record = runtime.start_execution(
@@ -3164,19 +3201,32 @@ def test_default_registry_exposes_contract_update_definition_and_runtime_path():
         ),
     )["record"]
 
+    record = runtime.submit_line_write(
+        "cex-contract-update-runtime-path-test",
+        _runtime_write_from(
+            record,
+            actor_role="observer",
+            stage_id="dispatch",
+            line_id="observer_dispatch_bounded_workers",
+        ),
+    )["record"]
+
     rejected_observer_worker_evidence = runtime.submit_line_write(
         "cex-contract-update-runtime-path-test",
         _runtime_write_from(
             record,
             actor_role="observer",
-            stage_id="worker_previous_source",
-            line_id="worker_previous_source_proof",
+            stage_id="worker_read",
+            line_id="worker_read_runtime_guide",
         ),
     )
     assert rejected_observer_worker_evidence["ok"] is False
     assert "cannot write line" in rejected_observer_worker_evidence["decision"]["errors"][0]
 
     for stage_id, line_id in [
+        ("worker_read", "worker_read_runtime_guide"),
+        ("worker_startup", "worker_startup"),
+        ("worker_context", "worker_graph_context"),
         ("worker_previous_source", "worker_previous_source_proof"),
         ("worker_precheck", "worker_revision_precheck"),
         ("worker_source", "worker_revision_source_proof"),
@@ -3188,16 +3238,41 @@ def test_default_registry_exposes_contract_update_definition_and_runtime_path():
             actor_role="mf_sub",
         )
         record = runtime.store.get("cex-contract-update-runtime-path-test")
+        write = _runtime_write_from(
+            record,
+            actor_role="mf_sub",
+            stage_id=stage_id,
+            line_id=line_id,
+        )
+        if line_id == "worker_read_runtime_guide":
+            write["read_receipt_hash"] = "sha256:" + ("a" * 64)
+        if line_id == "worker_graph_context":
+            graph_trace_id = "gqt-contract-update-runtime-path"
+            graph_identity = {
+                "runtime_context_id": "mfrctx-contract-update-runtime-path",
+                "task_id": "contract-update-runtime-path-worker",
+                "parent_task_id": "cex-contract-update-runtime-path-test",
+                "target_project_root": "/tmp/contract-update-runtime-path",
+                "worker_role": "mf_sub",
+            }
+            write.update(graph_identity)
+            write["graph_trace_ids"] = [graph_trace_id]
+            write["graph_trace_evidence"] = {
+                **graph_identity,
+                "db_verified": True,
+                "graph_trace_ids": [graph_trace_id],
+                "query_source": "mf_subagent",
+                "query_purpose": "subagent_context_build",
+            }
         accepted = runtime.submit_line_write(
             "cex-contract-update-runtime-path-test",
-            _runtime_write_from(
-                record,
-                actor_role="mf_sub",
-                stage_id=stage_id,
-                line_id=line_id,
-            ),
+            write,
         )
-        assert accepted["ok"] is True
+        assert accepted["ok"] is True, (
+            stage_id,
+            line_id,
+            accepted["decision"]["errors"],
+        )
         record = accepted["record"]
 
     runtime.current_guide("cex-contract-update-runtime-path-test", actor_role="observer")
