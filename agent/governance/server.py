@@ -3175,7 +3175,11 @@ def _dev_project_id_claims(
             key = str(raw_key or "")
             item_source = f"{source}.{key}" if key else source
             if key == "project_id" or key.endswith("_project_id"):
-                yield item_source, item
+                if isinstance(item, (list, tuple, set)):
+                    for index, claim in enumerate(item):
+                        yield f"{item_source}[{index}]", claim
+                else:
+                    yield item_source, item
             elif key == "project_ids" or key.endswith("_project_ids"):
                 if isinstance(item, (list, tuple, set)):
                     for index, claim in enumerate(item):
@@ -3324,6 +3328,7 @@ def _dev_write_path_allowed(path: str) -> bool:
         "/api/projects/aming-claw/onboard-route-guide",
         "/api/projects/aming-claw/onboard-route-guide/capsule",
         "/api/projects/aming-claw/observer/route-context/issue",
+        "/api/projects/aming-claw/observer/route-context/renew",
         "/api/graph-governance/aming-claw/query",
         "/api/graph-governance/aming-claw/query-traces/start",
         "/api/graph-governance/aming-claw/reconcile/full",
@@ -3349,14 +3354,17 @@ def _guard_dev_runtime_request(
     path: str,
     path_params: Mapping[str, Any],
     body: Mapping[str, Any],
+    query: Mapping[str, Any] | None = None,
 ) -> None:
     """Enforce the dev plane before a handler opens a DB or mutates state."""
 
     if _runtime_plane() != "dev":
         return
-    project_claims = list(
-        _dev_project_id_claims(path_params, source="path_params")
-    ) + list(_dev_project_id_claims(body, source="body"))
+    project_claims = (
+        list(_dev_project_id_claims(path_params, source="path_params"))
+        + list(_dev_project_id_claims(body, source="body"))
+        + list(_dev_project_id_claims(query or {}, source="query"))
+    )
     for source, claim in project_claims:
         try:
             validate_project_id(claim)
@@ -3384,6 +3392,12 @@ def _guard_dev_runtime_request(
             project_id="aming-claw",
             body=body,
             query={},
+        )
+    if path == "/api/projects/aming-claw/observer/route-context/renew":
+        _ac_dev_direct_route_renew_precheck_from_request(
+            project_id="aming-claw",
+            body=body,
+            query=query or {},
         )
 
     root_required = path in {
@@ -3570,17 +3584,19 @@ class GovernanceHandler(BaseHTTPRequestHandler):
             return
         try:
             request_body = self._read_body() if method == "POST" else {}
+            request_query = self._query_params()
             _guard_dev_runtime_request(
                 method=method,
                 path=urlparse(self.path).path,
                 path_params=path_params,
                 body=request_body,
+                query=request_query,
             )
             ctx = RequestContext(
                 handler=self,
                 method=method,
                 path_params=path_params,
-                query=self._query_params(),
+                query=request_query,
                 body=request_body,
                 request_id=request_id,
                 token=self.headers.get("X-Gov-Token", ""),
@@ -6797,6 +6813,12 @@ def handle_observer_route_context_renew(ctx: RequestContext):
 
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, dict) else {}
+    if _runtime_plane() == "dev":
+        return _handle_ac_dev_direct_route_context_renew(
+            ctx,
+            project_id=project_id,
+            body=body,
+        )
     try:
         header_role = str(ctx.handler.headers.get("X-Caller-Role", "") or "").strip()
     except Exception:
@@ -146568,6 +146590,583 @@ def _handle_ac_dev_direct_route_context_issue(
             idempotent_replay=False,
             contract_execution_id=task_id,
         )
+    finally:
+        conn.close()
+
+
+_AC_DEV_DIRECT_ROUTE_RENEW_SENSITIVE_TOKENS = frozenset(
+    {
+        "token",
+        "route_token",
+        "raw_route_token",
+        "observer_route_token",
+        "session_token",
+        "raw_session_token",
+        "observer_session_token",
+    }
+)
+
+
+def _ac_dev_direct_route_renew_claim_values(
+    body: Mapping[str, Any] | None,
+    query: Mapping[str, Any] | None,
+    *fields: str,
+) -> list[str]:
+    values: list[str] = []
+    for source in (body, query):
+        source_map = source if isinstance(source, Mapping) else {}
+        for field in fields:
+            raw = source_map.get(field)
+            candidates = (
+                list(raw)
+                if isinstance(raw, Sequence)
+                and not isinstance(raw, (str, bytes, bytearray))
+                else [raw]
+            )
+            values.extend(
+                str(value or "").strip()
+                for value in candidates
+                if str(value or "").strip()
+            )
+    return values
+
+
+def _ac_dev_direct_route_renew_secret_fields(
+    value: Any,
+    *,
+    prefix: str,
+) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            field = str(key or "").strip()
+            path = f"{prefix}.{field}" if field else prefix
+            if field in _AC_DEV_DIRECT_ROUTE_RENEW_SENSITIVE_TOKENS and item not in (
+                None,
+                "",
+                [],
+                {},
+            ):
+                found.append(path)
+            found.extend(
+                _ac_dev_direct_route_renew_secret_fields(item, prefix=path)
+            )
+    elif isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        for index, item in enumerate(value):
+            found.extend(
+                _ac_dev_direct_route_renew_secret_fields(
+                    item,
+                    prefix=f"{prefix}[{index}]",
+                )
+            )
+    return sorted(set(found))
+
+
+def _ac_dev_direct_route_renew_rejection(
+    *,
+    code: str,
+    message: str,
+    body: Mapping[str, Any] | None = None,
+    query: Mapping[str, Any] | None = None,
+    mismatch_fields: Sequence[str] = (),
+) -> GovernanceError:
+    """Return one secret-safe, physical-zero-write dev renewal rejection."""
+
+    return GovernanceError(
+        code,
+        message,
+        409,
+        {
+            "schema_version": "ac_dev_direct_route_renew.rejection.v1",
+            "runtime_plane": "dev",
+            "required_endpoint": "http://127.0.0.1:40008",
+            "request_body_hash": stable_sha256(dict(body or {})),
+            "request_query_hash": stable_sha256(dict(query or {})),
+            "mismatch_fields": sorted(
+                {str(field or "").strip() for field in mismatch_fields if field}
+            ),
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "route_registry_mutated": False,
+            "contract_runtime_mutated": False,
+            "public_safe": True,
+            "secret_safe": True,
+            "raw_route_token_exposed": False,
+            "raw_observer_session_token_exposed": False,
+        },
+    )
+
+
+def _ac_dev_direct_route_renew_exact_claim(
+    body: Mapping[str, Any],
+    query: Mapping[str, Any],
+    *,
+    field: str,
+    aliases: Sequence[str],
+) -> str:
+    values = _ac_dev_direct_route_renew_claim_values(body, query, *aliases)
+    unique = sorted(set(values))
+    if len(unique) != 1:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_identity_invalid",
+            message="dev route renewal requires one exact guide-bound identity",
+            body=body,
+            query=query,
+            mismatch_fields=[field],
+        )
+    return unique[0]
+
+
+def _ac_dev_direct_route_renew_precheck(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    query: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Verify the one server-owned dev route/session/world before renewal."""
+
+    query_map = query if isinstance(query, Mapping) else {}
+    if _runtime_plane() != "dev" or project_id != "aming-claw":
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_wrong_runtime",
+            message="Direct route renewal is confined to the AC dev runtime",
+            body=body,
+            query=query_map,
+            mismatch_fields=["runtime_plane"],
+        )
+    secret_fields = [
+        *_ac_dev_direct_route_renew_secret_fields(body, prefix="body"),
+        *_ac_dev_direct_route_renew_secret_fields(query_map, prefix="query"),
+    ]
+    if secret_fields:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_secret_rejected",
+            message="dev route renewal accepts public refs, never raw credentials",
+            body=body,
+            query=query_map,
+            mismatch_fields=secret_fields,
+        )
+    storage_claims = _ac_dev_direct_route_renew_claim_values(
+        body,
+        query_map,
+        "storage_project_id",
+        "route_storage_project_id",
+    )
+    if storage_claims:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_storage_claim_rejected",
+            message="dev route storage authority is server-derived",
+            body=body,
+            query=query_map,
+            mismatch_fields=["storage_project_id"],
+        )
+    project_claim = _ac_dev_direct_route_renew_exact_claim(
+        body,
+        query_map,
+        field="project_id",
+        aliases=("project_id",),
+    )
+    if project_claim != project_id:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_project_mismatch",
+            message="dev route renewal requires the canonical AC project",
+            body=body,
+            query=query_map,
+            mismatch_fields=["project_id"],
+        )
+    caller_role = _ac_dev_direct_route_renew_exact_claim(
+        body,
+        query_map,
+        field="caller_role",
+        aliases=("caller_role",),
+    ).lower()
+    if caller_role != "observer":
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_role_invalid",
+            message="dev route renewal requires caller_role=observer",
+            body=body,
+            query=query_map,
+            mismatch_fields=["caller_role"],
+        )
+    backlog_id = _ac_dev_direct_route_renew_exact_claim(
+        body,
+        query_map,
+        field="backlog_id",
+        aliases=("backlog_id", "bug_id"),
+    )
+    session_id = _ac_dev_direct_route_renew_exact_claim(
+        body,
+        query_map,
+        field="observer_session_id",
+        aliases=("observer_session_id", "observer_session_ref"),
+    )
+    route_token_ref = _ac_dev_direct_route_renew_exact_claim(
+        body,
+        query_map,
+        field="route_token_ref",
+        aliases=("route_token_ref", "observer_route_token_ref"),
+    )
+    task_claim = _ac_dev_direct_route_renew_exact_claim(
+        body,
+        query_map,
+        field="task_id",
+        aliases=("task_id", "contract_execution_id"),
+    )
+    world = _operator_supervised_direct_main_dev_world_authority()
+    if world.get("accepted") is not True:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_world_invalid",
+            message="dev route renewal requires one exact loaded runtime world",
+            body=body,
+            query=query_map,
+            mismatch_fields=["runtime_world"],
+        )
+    records = _operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    if len(records) != 1:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_execution_invalid",
+            message="dev route renewal requires one exact Direct execution",
+            body=body,
+            query=query_map,
+            mismatch_fields=["contract_execution_id"],
+        )
+    record = records[0]
+    task_id = str(record.get("contract_execution_id") or "").strip()
+    if not task_id or task_claim != task_id:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_execution_mismatch",
+            message="dev route renewal execution does not match the current CEX",
+            body=body,
+            query=query_map,
+            mismatch_fields=["task_id", "contract_execution_id"],
+        )
+    selector_claims = _onboard_runtime_selector_claims(body, query_map)
+    selector_mismatches = _operator_supervised_direct_main_request_mismatches(
+        selector_claims,
+        execution_id=task_id,
+        world_authority=world,
+    )
+    if selector_mismatches:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_selector_mismatch",
+            message="dev route renewal selectors do not match the loaded world",
+            body=body,
+            query=query_map,
+            mismatch_fields=[
+                str(item.get("field") or "") for item in selector_mismatches
+            ],
+        )
+    session = observer_session.get_session(
+        conn,
+        project_id=project_id,
+        session_id=session_id,
+    )
+    if not session or str(session.get("computed_status") or "") != "active":
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_session_invalid",
+            message="dev route renewal requires the exact active observer session",
+            body=body,
+            query=query_map,
+            mismatch_fields=["observer_session_id"],
+        )
+
+    from . import observer_route_context
+
+    storage_project_id = _route_registry_storage_project_id(project_id)
+    root_ref = str(record.get("route_token_ref") or "").strip()
+    if not root_ref:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_root_ref_missing",
+            message="current dev Direct execution has no bound route ref",
+            body=body,
+            query=query_map,
+            mismatch_fields=["route_token_ref"],
+        )
+    if route_token_ref != root_ref:
+        try:
+            root_descendant = (
+                observer_route_context.resolve_route_token_ref_renewal_descendant(
+                    conn,
+                    project_id=project_id,
+                    storage_project_id=storage_project_id,
+                    route_token_ref=root_ref,
+                )
+            )
+        except observer_route_context.RouteTokenRefError as exc:
+            raise _ac_dev_direct_route_renew_rejection(
+                code="ac_dev_direct_route_renew_lineage_invalid",
+                message="dev route renewal ref is outside the Direct route lineage",
+                body=body,
+                query=query_map,
+                mismatch_fields=["route_token_ref"],
+            ) from exc
+        renewal = (
+            root_descendant.get("renewal_resolution")
+            if isinstance(root_descendant, Mapping)
+            else {}
+        )
+        chain = list(renewal.get("route_token_ref_chain") or [])
+        if route_token_ref not in chain:
+            raise _ac_dev_direct_route_renew_rejection(
+                code="ac_dev_direct_route_renew_ref_mismatch",
+                message="dev route renewal ref is not bound to the current CEX",
+                body=body,
+                query=query_map,
+                mismatch_fields=["route_token_ref"],
+            )
+    replay_route: dict[str, Any] = {}
+    try:
+        active_route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=storage_project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    except observer_route_context.RouteTokenRefError as exc:
+        if str(getattr(exc, "code", "") or "") != (
+            "route_token_ref_not_active"
+        ) or str((getattr(exc, "details", {}) or {}).get("status") or "") != (
+            "superseded"
+        ):
+            raise _ac_dev_direct_route_renew_rejection(
+                code="ac_dev_direct_route_renew_ref_invalid",
+                message="dev route renewal requires an exact active lineage ref",
+                body=body,
+                query=query_map,
+                mismatch_fields=["route_token_ref"],
+            ) from exc
+        try:
+            replay_route = dict(
+                observer_route_context.resolve_route_token_ref_renewal_descendant(
+                    conn,
+                    project_id=project_id,
+                    storage_project_id=storage_project_id,
+                    route_token_ref=route_token_ref,
+                )
+                or {}
+            )
+        except observer_route_context.RouteTokenRefError as descendant_exc:
+            raise _ac_dev_direct_route_renew_rejection(
+                code="ac_dev_direct_route_renew_descendant_invalid",
+                message="superseded dev route has no exact active descendant",
+                body=body,
+                query=query_map,
+                mismatch_fields=["route_token_ref"],
+            ) from descendant_exc
+        active_route = {}
+    if not active_route and not replay_route:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_ref_unknown",
+            message="dev route renewal ref is not registered in this world",
+            body=body,
+            query=query_map,
+            mismatch_fields=["route_token_ref"],
+        )
+    return {
+        "schema_version": "ac_dev_direct_route_renew.precheck.v1",
+        "accepted": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "observer_session_id": session_id,
+        "route_token_ref": route_token_ref,
+        "storage_project_id": storage_project_id,
+        "world_authority": dict(world),
+        "record": dict(record),
+        "active_route": dict(active_route or {}),
+        "replay_route": dict(replay_route),
+        "idempotent_replay": bool(replay_route),
+        "zero_write_projection": True,
+    }
+
+
+def _ac_dev_direct_route_renew_precheck_from_request(
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    query: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    conn = get_connection(project_id)
+    try:
+        return _ac_dev_direct_route_renew_precheck(
+            conn,
+            project_id=project_id,
+            body=body,
+            query=query,
+        )
+    finally:
+        conn.close()
+
+
+def _ac_dev_direct_route_renew_replay_response(
+    precheck: Mapping[str, Any],
+) -> dict[str, Any]:
+    from . import observer_route_context
+
+    route = dict(precheck.get("replay_route") or {})
+    route_token_ref = str(route.get("route_token_ref") or "").strip()
+    route_identity = {
+        field: str(route.get(field) or "").strip()
+        for field in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+    }
+    route_identity["route_token_ref"] = route_token_ref
+    merge_queue_id = observer_route_context.derive_merge_queue_id(route)
+    return {
+        "schema_version": "observer_route_token_ref.renewal.v1",
+        "ok": True,
+        "project_id": str(precheck.get("project_id") or ""),
+        "previous_route_token_ref": str(
+            precheck.get("route_token_ref") or ""
+        ),
+        "route_token_ref": route_token_ref,
+        "status": "renewed",
+        "renewed": True,
+        "superseded_previous_ref": True,
+        "scope": dict(route.get("scope") or {}),
+        "allowed_actions": list(route.get("allowed_actions") or []),
+        "target_files": list(route.get("target_files") or []),
+        "owned_files": list(route.get("owned_files") or []),
+        "route_identity": route_identity,
+        "renewed_route_token_ref": route,
+        "merge_queue_id": merge_queue_id,
+        "execute_backlog_row_payload": (
+            observer_route_context.build_execute_backlog_row_payload(
+                route,
+                route_token_ref=route_token_ref,
+                merge_queue_id=merge_queue_id,
+            )
+        ),
+        "idempotent_replay": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "dev_world_renewal": True,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+        "raw_route_token_persisted": False,
+        "public_safe": True,
+        "secret_safe": True,
+    }
+
+
+def _handle_ac_dev_direct_route_context_renew(
+    ctx: RequestContext,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Renew only one exact physical dev route; replay retries read-only."""
+
+    from . import observer_route_context
+
+    conn = get_connection(project_id)
+    try:
+        _ac_dev_direct_route_renew_precheck(
+            conn,
+            project_id=project_id,
+            body=body,
+            query=ctx.query,
+        )
+        try:
+            ttl_hours = float(body.get("ttl_hours", 24))
+            renew_within_seconds = int(
+                body.get(
+                    "renew_within_seconds",
+                    observer_route_context.ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise _ac_dev_direct_route_renew_rejection(
+                code="ac_dev_direct_route_renew_options_invalid",
+                message="dev route renewal options are invalid",
+                body=body,
+                query=ctx.query,
+                mismatch_fields=["ttl_hours", "renew_within_seconds"],
+            ) from exc
+        for field in ("allowed_actions", "target_files", "owned_files", "evidence_refs"):
+            if body.get(field) is not None and not isinstance(body.get(field), list):
+                raise _ac_dev_direct_route_renew_rejection(
+                    code="ac_dev_direct_route_renew_options_invalid",
+                    message="dev route renewal list options are invalid",
+                    body=body,
+                    query=ctx.query,
+                    mismatch_fields=[field],
+                )
+        with sqlite_write_lock():
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                precheck = _ac_dev_direct_route_renew_precheck(
+                    conn,
+                    project_id=project_id,
+                    body=body,
+                    query=ctx.query,
+                )
+                if precheck.get("idempotent_replay") is True:
+                    conn.rollback()
+                    return _ac_dev_direct_route_renew_replay_response(precheck)
+                renewed = observer_route_context.renew_route_token_ref(
+                    conn,
+                    project_id=project_id,
+                    storage_project_id=str(precheck["storage_project_id"]),
+                    route_token_ref=str(precheck["route_token_ref"]),
+                    backlog_id=str(precheck["backlog_id"]),
+                    task_id=str(precheck["task_id"]),
+                    caller_role="observer",
+                    allowed_actions=(
+                        _observer_route_context_issue_allowed_actions(
+                            body.get("allowed_actions")
+                        )
+                        if body.get("allowed_actions") is not None
+                        else None
+                    ),
+                    target_files=body.get("target_files"),
+                    owned_files=body.get("owned_files"),
+                    ttl_hours=ttl_hours,
+                    renew_within_seconds=renew_within_seconds,
+                    evidence_refs=body.get("evidence_refs"),
+                    project_root=Path(
+                        str(
+                            (precheck.get("world_authority") or {}).get(
+                                "target_project_root"
+                            )
+                        )
+                    ),
+                    commit=False,
+                )
+                if conn.in_transaction:
+                    conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        result = dict(renewed)
+        result.update(
+            {
+                "idempotent_replay": False,
+                "writes_performed": True,
+                "mutation_performed": True,
+                "dev_world_renewal": True,
+                "public_safe": True,
+                "secret_safe": True,
+            }
+        )
+        return result
     finally:
         conn.close()
 

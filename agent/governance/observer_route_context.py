@@ -1892,6 +1892,7 @@ def persist_route_token_ref(
     storage_project_id: str = "",
     route_token_ref: str,
     token: Mapping[str, Any],
+    commit: bool = True,
 ) -> None:
     """Persist a minted token into the ref registry.
 
@@ -1986,7 +1987,8 @@ def persist_route_token_ref(
                         route_token_ref,
                     ),
                 )
-                conn.commit()
+                if commit:
+                    conn.commit()
             # Idempotent re-issue: same token, already registered.
             return
 
@@ -2030,7 +2032,8 @@ def persist_route_token_ref(
                 now_str,
             ),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
 
 def persist_route_token_ref_lineage(
@@ -3304,6 +3307,7 @@ def renew_route_token_ref(
     now: datetime | None = None,
     evidence_refs: Sequence[str] | None = None,
     project_root: Path | str | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
     """Renew a same-scope route_token_ref and supersede the previous ref."""
 
@@ -3483,6 +3487,19 @@ def renew_route_token_ref(
                 f"renewed_from:{old_ref}",
             ]
         )
+        renewal_now = _utc_datetime(now)
+        stored_issued_at = _parse_utc_datetime(row_dict.get("issued_at"))
+        if stored_issued_at is not None and renewal_now <= stored_issued_at:
+            renewal_now = stored_issued_at + timedelta(seconds=1)
+        elif (
+            stored_issued_at is not None
+            and renewal_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            == stored_issued_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        ):
+            # Refs bind second-precision public issue/expiry timestamps.  A
+            # renewal in the same wall-clock second must still mint a fresh
+            # opaque ref instead of failing after an otherwise-valid precheck.
+            renewal_now = stored_issued_at + timedelta(seconds=1)
         issued = issue_observer_write_route_context(
             project_id=project_id,
             backlog_id=stored_backlog,
@@ -3490,7 +3507,7 @@ def renew_route_token_ref(
             target_files=renewed_target_files,
             allowed_actions=renewed_actions,
             ttl_hours=ttl_hours,
-            now=now,
+            now=renewal_now,
             evidence_refs=evidence,
             project_root=project_root,
             parent_route_identity=parent_lineage or None,
@@ -3561,6 +3578,7 @@ def renew_route_token_ref(
             storage_project_id=registry_project_id,
             route_token_ref=new_ref,
             token=token,
+            commit=False,
         )
         conn.execute(
             "UPDATE observer_route_token_refs SET status=? "
@@ -3573,7 +3591,8 @@ def renew_route_token_ref(
                 REF_STATUS_EXPIRED,
             ),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         new_row = conn.execute(
             "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
             (registry_project_id, new_ref),
@@ -3582,7 +3601,7 @@ def renew_route_token_ref(
 
     expiry_status = route_token_ref_expiry_status(
         new_row_dict.get("expires_at"),
-        now=now,
+        now=renewal_now,
         renew_within_seconds=renew_within_seconds,
         project_id=project_id,
         backlog_id=stored_backlog,

@@ -13168,7 +13168,6 @@ def test_ac_dev_request_guard_allows_candidate_only_and_repair_writes(monkeypatc
         "/api/projects/aming-claw/direct-fix/enter",
         "/api/projects/aming-claw/direct-fix/start",
         "/api/projects/aming-claw/observer-sessions/register",
-        "/api/projects/aming-claw/observer/route-context/renew",
         "/api/role/assign",
     ],
 )
@@ -193510,6 +193509,76 @@ def _prepare_ac_dev_direct_route_bootstrap(
     }
 
 
+def _insert_ac_dev_active_observer_session(
+    conn,
+    *,
+    project_id: str,
+    session_id: str,
+) -> str:
+    observer_session.ensure_schema(conn)
+    now = observer_session._utc_now()
+    conn.execute(
+        """
+        INSERT INTO observer_sessions (
+            session_id, project_id, observer_kind, session_label, pid, cwd,
+            capabilities_json, token_hash, status, registered_at, last_seen_at,
+            closed_at, revoked_at
+        ) VALUES (?, ?, 'codex', 'ac-dev-route-renew', 0, '', '{}',
+                  'ref-only-proof-no-token', ?, ?, ?, '', '')
+        """,
+        (
+            session_id,
+            project_id,
+            observer_session.SESSION_STATUS_ACTIVE,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    return session_id
+
+
+def _prepare_ac_dev_route_renew_case(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    backlog_id: str,
+):
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    project_id = prepared["project_id"]
+    issued = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": project_id},
+            method="POST",
+            body=prepared["issue_body"],
+        )
+    )
+    session_id = _insert_ac_dev_active_observer_session(
+        conn,
+        project_id=project_id,
+        session_id=f"obs-{backlog_id.lower()}",
+    )
+    return {
+        **prepared,
+        "issued": issued,
+        "session_id": session_id,
+        "renew_body": {
+            "project_id": project_id,
+            "caller_role": "observer",
+            "observer_session_id": session_id,
+            "route_token_ref": issued["route_token_ref"],
+            "backlog_id": backlog_id,
+            "task_id": prepared["task_id"],
+        },
+    }
+
+
 def _load_frozen_a258_module(relative_path: str, module_suffix: str):
     """Load an exact frozen-a258 module without checking out or writing files."""
 
@@ -194115,6 +194184,397 @@ def test_ac_dev_route_consumers_reject_malformed_physical_scope_zero_write(
     )
     assert conn.total_changes == before_changes
     assert tuple(conn.iterdump()) == before
+
+
+def test_ac_dev_live_route_renew_is_physical_idempotent_and_stable_invisible(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    case = _prepare_ac_dev_route_renew_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-LIVE-ROUTE-RENEW",
+    )
+    project_id = case["project_id"]
+    backlog_id = "AC-DEV-LIVE-ROUTE-RENEW"
+    task_id = case["task_id"]
+    old_ref = case["issued"]["route_token_ref"]
+    storage_project_id = server.direct_main_dev_storage_project_id(
+        project_id,
+        case["world"]["namespace_hash"],
+    )
+    stable_rows_before = tuple(
+        conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    )
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/projects/aming-claw/observer/route-context/renew",
+        path_params={"project_id": project_id},
+        body=case["renew_body"],
+        query={
+            "project_id": [project_id, project_id],
+            "target_head_commit": [case["commit"], case["commit"]],
+            "target_ref": [
+                server.AC_DEV_BRANCH,
+                f"refs/heads/{server.AC_DEV_BRANCH}",
+            ],
+        },
+    )
+    renewed = server.handle_observer_route_context_renew(
+        _ctx(
+            {"project_id": project_id},
+            method="POST",
+            query={
+                "project_id": [project_id, project_id],
+                "target_head_commit": [case["commit"], case["commit"]],
+            },
+            body=case["renew_body"],
+        )
+    )
+    new_ref = renewed["route_token_ref"]
+    assert renewed["ok"] is True
+    assert renewed["dev_world_renewal"] is True
+    assert renewed["idempotent_replay"] is False
+    assert renewed["writes_performed"] is True
+    assert new_ref and new_ref != old_ref
+    assert conn.execute(
+        "SELECT status FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (storage_project_id, old_ref),
+    ).fetchone()["status"] == "superseded"
+    assert conn.execute(
+        "SELECT status FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (storage_project_id, new_ref),
+    ).fetchone()["status"] == "active"
+    descendant = observer_route_context.resolve_route_token_ref_renewal_descendant(
+        conn,
+        project_id=project_id,
+        storage_project_id=storage_project_id,
+        route_token_ref=old_ref,
+    )
+    assert descendant["route_token_ref"] == new_ref
+    assert descendant["scope"] == {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+    after_first = tuple(conn.iterdump())
+    after_first_changes = conn.total_changes
+    replay = server.handle_observer_route_context_renew(
+        _ctx(
+            {"project_id": project_id},
+            method="POST",
+            body=case["renew_body"],
+        )
+    )
+    assert replay["route_token_ref"] == new_ref
+    assert replay["previous_route_token_ref"] == old_ref
+    assert replay["idempotent_replay"] is True
+    assert replay["writes_performed"] is False
+    assert replay["mutation_performed"] is False
+    assert conn.total_changes == after_first_changes
+    assert tuple(conn.iterdump()) == after_first
+    assert tuple(
+        conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    ) == stable_rows_before
+
+    frozen_routes = _load_frozen_a258_module(
+        "agent/governance/observer_route_context.py",
+        "observer_route_context_renew",
+    )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    assert frozen_routes.resolve_route_token_ref(
+        conn,
+        project_id=project_id,
+        route_token_ref=new_ref,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    ) is None
+    assert server._resolve_route_token_ref_server_side(
+        {"route_token_ref": new_ref},
+        pid=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "attack_kind",
+    [
+        "wrong_scope",
+        "wrong_storage",
+        "wrong_cex",
+        "wrong_ref",
+        "wrong_session",
+        "wrong_repeated_query",
+        "wrong_query_project",
+        "repeated_query_project",
+        "nested_query_project",
+        "raw_secret",
+    ],
+)
+def test_ac_dev_live_route_renew_rejects_wrong_authority_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    attack_kind,
+):
+    backlog_id = f"AC-DEV-LIVE-ROUTE-RENEW-{attack_kind.upper()}"
+    case = _prepare_ac_dev_route_renew_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    body = copy.deepcopy(case["renew_body"])
+    query: dict[str, Any] = {}
+    secret = "never-echo-this-session-secret"
+    if attack_kind == "wrong_scope":
+        body["bug_id"] = "AC-OTHER-BACKLOG"
+    elif attack_kind == "wrong_storage":
+        body["storage_project_id"] = server.direct_main_dev_storage_project_id(
+            case["project_id"],
+            "sha256:" + ("f" * 64),
+        )
+    elif attack_kind == "wrong_cex":
+        body["contract_execution_id"] = "cex-direct-main-wrong"
+    elif attack_kind == "wrong_ref":
+        body["observer_route_token_ref"] = "rtok-wrong-dev-world"
+    elif attack_kind == "wrong_session":
+        body["observer_session_ref"] = "obs-wrong-dev-world"
+    elif attack_kind == "wrong_repeated_query":
+        query["target_head_commit"] = [case["commit"], "0" * 40]
+    elif attack_kind == "wrong_query_project":
+        query["project_id"] = ["other-project"]
+    elif attack_kind == "repeated_query_project":
+        query["project_id"] = [case["project_id"], "other-project"]
+    elif attack_kind == "nested_query_project":
+        query["payload"] = [{"target_project_id": "other-project"}]
+    else:
+        body["session_token"] = secret
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server._guard_dev_runtime_request(
+            method="POST",
+            path="/api/projects/aming-claw/observer/route-context/renew",
+            path_params={"project_id": case["project_id"]},
+            body=body,
+            query=query,
+        )
+
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["mutation_performed"] is False
+    serialized = json.dumps(rejected.value.details, sort_keys=True)
+    assert secret not in serialized
+    assert case["world"]["namespace_hash"] not in serialized
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    ("drift_kind", "expected_code"),
+    [
+        ("session_revoked", "ac_dev_direct_route_renew_session_invalid"),
+        ("cex_ambiguous", "ac_dev_direct_route_renew_execution_invalid"),
+    ],
+)
+def test_ac_dev_live_route_renew_rechecks_authority_inside_write_transaction(
+    conn,
+    monkeypatch,
+    tmp_path,
+    drift_kind,
+    expected_code,
+):
+    backlog_id = f"AC-DEV-LIVE-ROUTE-RENEW-TOCTOU-{drift_kind.upper()}"
+    case = _prepare_ac_dev_route_renew_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    project_id = case["project_id"]
+    storage_project_id = server.direct_main_dev_storage_project_id(
+        project_id,
+        case["world"]["namespace_hash"],
+    )
+    original_precheck = server._ac_dev_direct_route_renew_precheck
+    calls = 0
+    route_rows_after_interleaving = ()
+
+    def precheck_with_interleaving(*args, **kwargs):
+        nonlocal calls, route_rows_after_interleaving
+        calls += 1
+        result = original_precheck(*args, **kwargs)
+        if calls != 1:
+            return result
+        target_conn = args[0]
+        if drift_kind == "session_revoked":
+            target_conn.execute(
+                "UPDATE observer_sessions SET status=?, revoked_at=? "
+                "WHERE project_id=? AND session_id=?",
+                (
+                    observer_session.SESSION_STATUS_REVOKED,
+                    observer_session._utc_now(),
+                    project_id,
+                    case["session_id"],
+                ),
+            )
+        else:
+            physical = target_conn.execute(
+                "SELECT project_id, backlog_id, contract_id, version, "
+                "revision, execution_state_revision, record_json, created_at, "
+                "updated_at FROM contract_runtime_executions "
+                "WHERE contract_execution_id=?",
+                (case["task_id"],),
+            ).fetchone()
+            drift_id = case["task_id"] + "-drift"
+            drift_record = json.loads(physical["record_json"])
+            drift_record["contract_execution_id"] = drift_id
+            target_conn.execute(
+                """
+                INSERT INTO contract_runtime_executions (
+                    contract_execution_id, project_id, backlog_id, contract_id,
+                    version, revision, execution_state_revision, record_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    drift_id,
+                    physical["project_id"],
+                    physical["backlog_id"],
+                    physical["contract_id"],
+                    physical["version"],
+                    physical["revision"],
+                    physical["execution_state_revision"],
+                    json.dumps(drift_record, sort_keys=True),
+                    physical["created_at"],
+                    physical["updated_at"],
+                ),
+            )
+        target_conn.commit()
+        route_rows_after_interleaving = tuple(
+            target_conn.execute(
+                "SELECT * FROM observer_route_token_refs WHERE project_id=? "
+                "ORDER BY route_token_ref",
+                (storage_project_id,),
+            ).fetchall()
+        )
+        return result
+
+    monkeypatch.setattr(
+        server,
+        "_ac_dev_direct_route_renew_precheck",
+        precheck_with_interleaving,
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_observer_route_context_renew(
+            _ctx(
+                {"project_id": project_id},
+                method="POST",
+                body=case["renew_body"],
+            )
+        )
+
+    assert rejected.value.code == expected_code
+    assert calls == 2
+    assert tuple(
+        conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=? "
+            "ORDER BY route_token_ref",
+            (storage_project_id,),
+        ).fetchall()
+    ) == route_rows_after_interleaving
+    assert conn.execute(
+        "SELECT status FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (storage_project_id, case["issued"]["route_token_ref"]),
+    ).fetchone()["status"] == "active"
+
+
+def test_ac_dev_live_route_renew_concurrent_same_ref_writes_once_and_replays(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DEV-LIVE-ROUTE-RENEW-CONCURRENT"
+    case = _prepare_ac_dev_route_renew_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    database = tmp_path / "ac-dev-route-renew-concurrent.db"
+    disk = sqlite3.connect(database)
+    try:
+        conn.backup(disk)
+    finally:
+        disk.close()
+
+    def fresh_connection(_project_id):
+        opened = sqlite3.connect(database, timeout=10, check_same_thread=False)
+        opened.row_factory = sqlite3.Row
+        return opened
+
+    monkeypatch.setattr(server, "get_connection", fresh_connection)
+
+    def renew_once():
+        return server.handle_observer_route_context_renew(
+            _ctx(
+                {"project_id": case["project_id"]},
+                method="POST",
+                body=copy.deepcopy(case["renew_body"]),
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: renew_once(), range(2)))
+
+    assert sorted(result["idempotent_replay"] for result in results) == [
+        False,
+        True,
+    ]
+    assert sorted(result["writes_performed"] for result in results) == [
+        False,
+        True,
+    ]
+    assert len({result["route_token_ref"] for result in results}) == 1
+    new_ref = results[0]["route_token_ref"]
+    storage_project_id = server.direct_main_dev_storage_project_id(
+        case["project_id"],
+        case["world"]["namespace_hash"],
+    )
+    readback = sqlite3.connect(database)
+    readback.row_factory = sqlite3.Row
+    try:
+        assert readback.execute(
+            "SELECT status FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=?",
+            (storage_project_id, case["issued"]["route_token_ref"]),
+        ).fetchone()["status"] == "superseded"
+        assert readback.execute(
+            "SELECT status FROM observer_route_token_refs "
+            "WHERE project_id=? AND route_token_ref=?",
+            (storage_project_id, new_ref),
+        ).fetchone()["status"] == "active"
+        assert readback.execute(
+            "SELECT COUNT(*) FROM observer_route_token_refs "
+            "WHERE project_id=?",
+            (case["project_id"],),
+        ).fetchone()[0] == 0
+    finally:
+        readback.close()
 
 
 def test_ac_dev_first_route_issue_rolls_back_contract_when_route_persist_fails(
