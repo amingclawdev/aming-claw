@@ -36417,6 +36417,9 @@ def _runtime_context_position_bounded_current_action(
             worker_id=worker_id,
             worker_slot_id=worker_slot_id,
             agent_id=worker_id,
+            actual_host_worker_id=str(
+                getattr(context, "actual_host_worker_id", "") or ""
+            ),
             allocation_owner=str(
                 getattr(context, "allocation_owner", "") or worker_id
             ),
@@ -41052,6 +41055,7 @@ def _runtime_context_startup_facade_body(
     worker_id: str,
     worker_slot_id: str,
     agent_id: str,
+    actual_host_worker_id: str,
     allocation_owner: str,
     branch_ref: str,
     base_commit: str,
@@ -41130,7 +41134,9 @@ def _runtime_context_startup_facade_body(
         ),
         "harness_type": "codex",
         "filer_principal": "<actual worker principal filing startup>",
-        "actual_host_worker_id": agent_id or "<allocated governed worker id>",
+        "actual_host_worker_id": (
+            actual_host_worker_id or "<actual host worker id>"
+        ),
         "host_startup_id": host_startup_id or "<host startup event/thread id>",
         "host_session_id": host_session_id or "<host session id>",
         "actual_cwd": worktree_path,
@@ -41554,6 +41560,9 @@ def _runtime_context_worker_recovery_payloads(
     )
     normalized_agent_id = str(agent_id or worker_slot_id or worker_id or "").strip()
     allocated_governed_worker_id = str(worker_id or worker_slot_id or "").strip()
+    normalized_actual_host_worker_id = str(
+        actual_host_worker_id or ""
+    ).strip()
     normalized_allocation_owner = str(
         allocation_owner or normalized_agent_id or worker_slot_id or worker_id or ""
     ).strip()
@@ -41659,7 +41668,7 @@ def _runtime_context_worker_recovery_payloads(
         "agent_id": allocated_governed_worker_id,
         "allocation_owner": normalized_allocation_owner,
         "observer_allocation_owner": normalized_allocation_owner,
-        "actual_host_worker_id": allocated_governed_worker_id,
+        "actual_host_worker_id": normalized_actual_host_worker_id,
         "worker_session_id": normalized_worker_session_id,
         "worker_transcript_ref": normalized_worker_transcript_ref,
         "worker_transcript_path": normalized_worker_transcript_path,
@@ -41693,7 +41702,7 @@ def _runtime_context_worker_recovery_payloads(
         ],
         "opaque_identity_is_role_bearing": False,
         "agent_id": allocated_governed_worker_id,
-        "actual_host_worker_id": allocated_governed_worker_id,
+        "actual_host_worker_id": normalized_actual_host_worker_id,
         "worker_session_id": normalized_worker_session_id,
         "desktop_worker_session_identity_is_independent": True,
     }
@@ -41716,7 +41725,7 @@ def _runtime_context_worker_recovery_payloads(
         ],
         "copy_safe_body_overrides_before_submit": {
             "agent_id": allocated_governed_worker_id,
-            "actual_host_worker_id": allocated_governed_worker_id,
+            "actual_host_worker_id": normalized_actual_host_worker_id,
             "worker_session_id": (
                 normalized_worker_session_id
                 or "<actual Desktop/Codex worker session id>"
@@ -42262,6 +42271,7 @@ def _runtime_context_worker_recovery_payloads(
         worker_id=worker_id,
         worker_slot_id=worker_slot_id,
         agent_id=allocated_governed_worker_id,
+        actual_host_worker_id=normalized_actual_host_worker_id,
         allocation_owner=normalized_allocation_owner,
         branch_ref=normalized_branch_ref,
         base_commit=normalized_base_commit,
@@ -42286,6 +42296,17 @@ def _runtime_context_worker_recovery_payloads(
         worker_identity_pointers=worker_identity_pointers,
         semantic_role_binding=startup_semantic_role_binding,
     )
+    from .parallel_branch_runtime import runtime_context_startup_identity_preflight
+
+    startup_identity_preflight = runtime_context_startup_identity_preflight(
+        startup_body
+    )
+    startup_identity_ready = bool(
+        startup_identity_preflight.get("accepted") is True
+        and _runtime_context_non_placeholder_text(
+            startup_body.get("actual_host_worker_id")
+        )
+    )
     startup_payload = {
         "mf_subagent_startup_gate": {
             "contract_execution_id": contract_execution_id,
@@ -42298,7 +42319,7 @@ def _runtime_context_worker_recovery_payloads(
             "agent_id": allocated_governed_worker_id,
             "allocation_owner": normalized_allocation_owner,
             "observer_allocation_owner": normalized_allocation_owner,
-            "actual_host_worker_id": allocated_governed_worker_id,
+            "actual_host_worker_id": normalized_actual_host_worker_id,
             "worker_session_id": normalized_worker_session_id,
             "host_startup_id": normalized_host_startup_id,
             "host_session_id": normalized_host_session_id,
@@ -43026,12 +43047,15 @@ def _runtime_context_worker_recovery_payloads(
                 active_owned_files_ready
                 and startup_receipt_ready
                 and worktree_authority_ready
+                and startup_identity_ready
             ),
             "status": (
                 "blocked_missing_or_invalid_assigned_worktree"
                 if not worktree_authority_ready
                 else "blocked_missing_or_invalid_active_owned_files"
                 if not active_owned_files_ready and startup_receipt_ready
+                else "blocked_missing_or_invalid_startup_identity"
+                if not startup_identity_ready
                 else "actionable_unique_durable_read_receipt"
                 if trusted_read_receipt_authority
                 else (
@@ -43044,6 +43068,7 @@ def _runtime_context_worker_recovery_payloads(
                     )
                 )
             ),
+            "startup_identity_preflight": dict(startup_identity_preflight),
             "read_receipt_authority": dict(trusted_read_receipt_authority),
             "preconditions": [
                 {
@@ -155931,6 +155956,67 @@ def _onboard_worker_read_runtime_facade_projection(
             "lane_id": worker_slot_id,
         }
     )
+
+    # A consumed bounded rejoin is a terminal checkpoint, not authority to
+    # replay the already accepted read/startup transition.  Project the exact
+    # lane as non-executable so a refreshed Worker Guide cannot advertise a
+    # second replacement after the endpoint has rejected it as consumed.
+    recovery_action = str(
+        getattr(context, "last_recovery_action", "") or ""
+    ).strip()
+    if recovery_action in {
+        "mf_subagent_pre_lineage_session_token_rejoin_issued",
+        _RUNTIME_CONTEXT_REJOIN_FIRST_RECOVERY_ACTION,
+        _RUNTIME_CONTEXT_REJOIN_REPLACEMENT_RECOVERY_ACTION,
+    }:
+        rejoin_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+        bounded_rejoin = _runtime_context_bounded_replacement_rejoin_authority(
+            conn,
+            project_id=project_id,
+            context=context,
+            timeline_events=rejoin_events,
+        )
+        if (
+            bounded_rejoin.get("server_derived") is True
+            and bounded_rejoin.get("applicable") is True
+            and bounded_rejoin.get("eligible") is False
+            and str(bounded_rejoin.get("mode") or "")
+            == "replacement_exhausted"
+        ):
+            exhausted = blocked(
+                "runtime_context_pre_lineage_rejoin_already_consumed",
+                ["bounded_replacement_rejoin_count"],
+            )
+            exhausted[projection_key].update(
+                {
+                    "status": "terminal",
+                    "terminal": True,
+                    "no_pass_successor": True,
+                    "next_legal_action": (
+                        "stop_and_report_bounded_pre_lineage_recovery_exhausted"
+                    ),
+                    "bounded_replacement_rejoin_authority": dict(
+                        bounded_rejoin
+                    ),
+                }
+            )
+            exhausted.update(
+                {
+                    "terminal": True,
+                    "worker_actionable": False,
+                    "replacement_worker_actionable": False,
+                    "authoritative_pass_synthesized": False,
+                    "next_legal_action": (
+                        "stop_and_report_bounded_pre_lineage_recovery_exhausted"
+                    ),
+                }
+            )
+            return exhausted
 
     worktree_liveness = _runtime_context_worker_worktree_liveness(
         project_id,

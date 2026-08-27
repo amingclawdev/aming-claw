@@ -20186,6 +20186,7 @@ def _startup_string_list(value: Any) -> tuple[str, ...]:
 
 
 _STARTUP_COPY_SAFE_IDENTITY_FIELDS = (
+    "actual_host_worker_id",
     "host_startup_id",
     "host_session_id",
     "worker_session_id",
