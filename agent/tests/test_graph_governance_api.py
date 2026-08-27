@@ -144241,6 +144241,16 @@ def test_context_local_post_read_renewed_route_projects_one_startup_body_zero_wr
     assert receipt_authority["route_identity"] == current_route
     assert startup["actionable"] is True
     assert startup["status"] == "actionable_unique_durable_read_receipt"
+    assert startup["copy_safe_body"]["actual_host_worker_id"] == (
+        "<actual host worker id>"
+    )
+    assert startup["copy_safe_body"]["host_startup_id"] == (
+        "<host startup event/thread id>"
+    )
+    assert startup["copy_safe_body"]["host_session_id"] == "<host session id>"
+    assert startup["copy_safe_body"]["worker_session_id"] == (
+        "<actual worker-owned session id>"
+    )
     assert startup["copy_safe_body"]["task_id"] == context.task_id
     assert startup["copy_safe_body"]["parent_task_id"] == context.parent_task_id
     assert startup["copy_safe_body"]["read_receipt_event_id"] == "54"
@@ -144250,6 +144260,22 @@ def test_context_local_post_read_renewed_route_projects_one_startup_body_zero_wr
     } == current_route
     assert conn.total_changes == before_changes
     assert "\n".join(conn.iterdump()) == before_dump
+
+    for mutation in ("placeholder", "missing", "caller_filled"):
+        submission = copy.deepcopy(startup["copy_safe_body"])
+        if mutation == "missing":
+            submission.pop("actual_host_worker_id")
+        elif mutation == "caller_filled":
+            submission["actual_host_worker_id"] = "caller-forged-host-worker"
+            submission["host_startup_id"] = "caller-forged-host-startup"
+            submission["host_session_id"] = "caller-forged-host-session"
+            submission["worker_session_id"] = "caller-forged-worker-session"
+            submission["worker_transcript_ref"] = "codex:caller-forged"
+        decision = runtime_context_startup_identity_preflight(submission)
+        assert decision["accepted"] is False
+        assert decision["submitted_values_echoed"] is False
+        assert conn.total_changes == before_changes
+        assert "\n".join(conn.iterdump()) == before_dump
 
 
 def test_context_local_post_read_renewed_route_projects_startup_after_marker_ref_rotates(

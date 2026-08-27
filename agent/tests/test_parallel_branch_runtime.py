@@ -121,6 +121,7 @@ from agent.governance.parallel_branch_runtime import (
     ("field", "value", "reason"),
     [
         ("actual_host_worker_id", "", "identity_required_nonempty"),
+        ("actual_host_worker_id", None, "required_identity_missing"),
         ("actual_host_worker_id", "<actual host worker id>", "template_marker_forbidden"),
         ("host_startup_id", "", "identity_required_nonempty"),
         ("host_session_id", "${CALLER_SESSION}", "template_marker_forbidden"),
@@ -134,13 +135,19 @@ def test_startup_copy_safe_identity_preflight_is_concrete_and_secret_free(
     reason,
 ) -> None:
     body = {
+        "runtime_context_id": "mfrctx-startup-recovery",
+        "task_id": "worker-startup-recovery",
+        "parent_task_id": "cex-startup-recovery",
         "actual_host_worker_id": "codex-worker:recovery",
         "host_startup_id": "codex-thread:recovery",
         "host_session_id": "codex-session:recovery",
         "worker_session_id": "codex-session:recovery",
         "worker_transcript_ref": "codex:/root/recovery",
     }
-    body[field] = value
+    if value is None:
+        body.pop(field)
+    else:
+        body[field] = value
 
     decision = runtime_context_startup_identity_preflight(body)
 
@@ -148,7 +155,7 @@ def test_startup_copy_safe_identity_preflight_is_concrete_and_secret_free(
     assert {"field": field, "reason": reason} in decision["invalid_fields"]
     assert decision["submitted_values_echoed"] is False
     serialized = json.dumps(decision, sort_keys=True)
-    assert value not in serialized or value == ""
+    assert value is None or value == "" or value not in serialized
     assert "session_token" not in serialized
     assert "fence_token" not in serialized
 
