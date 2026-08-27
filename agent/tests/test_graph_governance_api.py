@@ -27982,6 +27982,132 @@ def test_parallel_branch_allocate_retry_rebinds_contract_runtime_atomically(
     )
 
 
+def test_parallel_branch_allocate_retry_derives_fresh_attempt_two_worktree_for_slug_collision(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    case = _setup_parallel_retry_allocation_rebind_case(
+        conn,
+        tmp_path,
+        monkeypatch,
+        suffix="attempt-two-slug-collision",
+    )
+    prior_context = case["prior_context"]
+    # The retry identities are fresh at the source level but deliberately
+    # normalize to the same lane slug as attempt 1.  Attempt custody, rather
+    # than caller spelling, must keep every derived identity collision-free.
+    case["task_id"] = f"{prior_context.task_id}!"
+    case["worker_id"] = f"{prior_context.worker_slot_id}!"
+    assert case["task_id"] != prior_context.task_id
+    assert case["worker_id"] != prior_context.worker_slot_id
+    assert server._parallel_branch_allocate_slug(case["task_id"]) == (
+        server._parallel_branch_allocate_slug(prior_context.task_id)
+    )
+    assert server._parallel_branch_allocate_slug(case["worker_id"]) == (
+        server._parallel_branch_allocate_slug(prior_context.worker_slot_id)
+    )
+    prior_custody = {
+        field: getattr(prior_context, field)
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "branch_ref",
+            "worktree_path",
+            "merge_queue_id",
+            "base_commit",
+            "target_head_commit",
+        )
+    }
+
+    prechecked = _parallel_retry_allocation_precheck(case)
+
+    copy_body = prechecked["copy_safe_allocation_bodies"][0]
+    assert copy_body["branch_ref"].endswith("-attempt-2")
+    assert Path(copy_body["worktree_path"]).name.endswith("-attempt-2")
+    assert copy_body["merge_queue_id"].endswith("-attempt-2")
+    assert copy_body["worktree_path"] != prior_context.worktree_path
+    assert copy_body["merge_queue_id"] != prior_context.merge_queue_id
+    assert copy_body["target_project_root"] == copy_body["worktree_path"]
+    projection = prechecked["lane_projections"][0]
+    assert projection["canonical_worktree_path"] == copy_body["worktree_path"]
+    assert projection["custody_preflight"]["status"] == "available"
+    assert projection["custody_preflight"]["writes_performed"] is False
+    assert not Path(copy_body["worktree_path"]).exists()
+
+    status, allocated = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=copy_body,
+        )
+    )
+
+    assert status == 201
+    assert allocated["contract_runtime_retry_rebind"]["status"] == "rebound"
+    new_context = get_branch_context(conn, PID, case["task_id"])
+    assert new_context is not None
+    assert new_context.attempt == 2
+    assert new_context.runtime_context_id != prior_context.runtime_context_id
+    assert new_context.worktree_path == copy_body["worktree_path"]
+    assert new_context.merge_queue_id == copy_body["merge_queue_id"]
+    assert Path(new_context.worktree_path).exists()
+    stored_prior = get_branch_context(conn, PID, prior_context.task_id)
+    assert stored_prior is not None
+    assert stored_prior.status == "superseded"
+    assert {
+        field: getattr(stored_prior, field) for field in prior_custody
+    } == prior_custody
+
+
+def test_parallel_branch_allocate_retry_rejects_true_attempt_two_custody_collision_zero_write(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    case = _setup_parallel_retry_allocation_rebind_case(
+        conn,
+        tmp_path,
+        monkeypatch,
+        suffix="attempt-two-foreign-custody",
+    )
+    prior_context = case["prior_context"]
+    case["task_id"] = f"{prior_context.task_id}!"
+    case["worker_id"] = f"{prior_context.worker_slot_id}!"
+    clean = _parallel_retry_allocation_precheck(case)
+    copy_body = clean["copy_safe_allocation_bodies"][0]
+    assert copy_body["branch_ref"].endswith("-attempt-2")
+    assert Path(copy_body["worktree_path"]).name.endswith("-attempt-2")
+    assert copy_body["merge_queue_id"].endswith("-attempt-2")
+    _materialize_precheck_custody(
+        repository_root=case["repository_root"],
+        worktree_path=Path(copy_body["worktree_path"]),
+        branch_ref="refs/heads/collision/attempt-two-foreign-custody",
+        commit_sha=case["candidate_commit"],
+    )
+    before_db = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+    before_git = _allocation_custody_git_snapshot(case["repository_root"])
+
+    with pytest.raises(GovernanceError) as rejected:
+        _parallel_retry_allocation_precheck(case)
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_precheck_custody_collision"
+    )
+    details = rejected.value.details
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    assert details["runtime_context_writes"] == 0
+    assert details["worktree_mutations"] == 0
+    assert details["existing_worktree_touched"] is False
+    assert details["delete_or_adopt_existing_worktree"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_db
+    assert _allocation_custody_git_snapshot(case["repository_root"]) == before_git
+
+
 def test_parallel_branch_allocate_retry_rejects_identical_attempt_two_replay(
     conn,
     tmp_path,

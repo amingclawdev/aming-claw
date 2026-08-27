@@ -18495,6 +18495,11 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
         target_head_commit=target_head_commit,
     )
 
+    try:
+        attempt = max(1, int(lane.get("attempt") or 1))
+    except (TypeError, ValueError):
+        attempt = 1
+    attempt_suffix = f"-attempt-{attempt}" if attempt > 1 else ""
     lane_slug = _parallel_branch_allocate_slug(
         f"{task_id}-{worker_id}"
     )
@@ -18505,7 +18510,9 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
             422,
             {"task_id": task_id, "worker_id": worker_id, "writes_performed": False},
         )
-    canonical_worktree = (repository_root / ".worktrees" / lane_slug).resolve()
+    canonical_worktree = (
+        repository_root / ".worktrees" / f"{lane_slug}{attempt_suffix}"
+    ).resolve()
     try:
         batch_jobs.ensure_worktree_path_safe(repository_root, canonical_worktree)
     except batch_jobs.BatchJobError as exc:
@@ -18519,16 +18526,13 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
         lane.get("branch_prefix") or "codex"
     ) or "codex"
     task_slug = _parallel_branch_allocate_slug(task_id) or "task"
-    try:
-        attempt = max(1, int(lane.get("attempt") or 1))
-    except (TypeError, ValueError):
-        attempt = 1
-    attempt_suffix = f"-attempt-{attempt}" if attempt > 1 else ""
     # Keep this projection byte-for-byte aligned with
     # parallel_branch_runtime.plan_branch_runtime_context.  branch_ref is
     # returned for diagnosis/copy safety even though allocate derives it again.
     branch_ref = f"refs/heads/{branch_prefix}/{task_slug}{attempt_suffix}"
-    merge_queue_id = str(lane.get("merge_queue_id") or f"mq-{lane_slug}").strip()
+    merge_queue_id = str(
+        lane.get("merge_queue_id") or f"mq-{lane_slug}{attempt_suffix}"
+    ).strip()
     custody_preflight = _parallel_branch_allocate_precheck_custody(
         conn,
         project_id=project_id,
