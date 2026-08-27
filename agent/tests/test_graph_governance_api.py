@@ -3548,9 +3548,14 @@ def test_main_never_starts_components_or_binds_before_generation_certificate(
 
     monkeypatch.setattr(server, "_establish_governance_manager_generation", fail_establish)
     monkeypatch.setattr(server, "_run_governance_service", lambda: calls.append("run"))
+    monkeypatch.setattr(
+        server,
+        "_validate_runtime_plane_startup",
+        lambda: calls.append("identity_preflight") or {"status": "ready"},
+    )
     with pytest.raises(server.GovernanceSingletonError, match="certificate_failed"):
         server.main()
-    assert calls == ["establish"]
+    assert calls == ["identity_preflight", "establish"]
 
 
 @pytest.mark.parametrize(
@@ -12567,6 +12572,1591 @@ def test_health_reports_loaded_runtime_identity_and_flags_worktree_drift(monkeyp
         == loaded_sha
     )
     assert content_drift["runtime_loaded_source_sha256"] != loaded_sha
+
+
+def test_health_exposes_exact_ac_runtime_plane_identity(monkeypatch):
+    identity = {
+        "schema_version": "ac_runtime_plane_identity.v1",
+        "plane": "dev",
+        "port": 40008,
+        "expected_port": 40008,
+        "pid": server.SERVER_PID,
+        "bind_host": "127.0.0.1",
+        "worktree_root": "/tmp/ac-dev",
+        "branch": "codex/ac-dev",
+        "expected_branch": "codex/ac-dev",
+        "commit": "b" * 40,
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "project_allowlist": ["aming-claw"],
+        "schema_policy": "verify_only_no_auto_migration",
+        "active_graph_activation_allowed": False,
+        "stable_deploy_allowed": False,
+        "background_workers_enabled": False,
+        "status": "ready",
+        "violations": [],
+    }
+    monkeypatch.setattr(server, "_runtime_plane_identity", lambda: identity)
+    health = server.handle_health(_ctx({"project_id": "aming-claw"}))
+
+    assert health["port"] == server.PORT
+    assert health["bind_host"] == "127.0.0.1"
+    assert health["runtime_plane"] == "dev"
+    assert health["runtime_plane_identity"] == identity
+    assert health["worktree_root"] == "/tmp/ac-dev"
+    assert health["branch"] == "codex/ac-dev"
+    assert health["runtime_commit"] == "b" * 40
+    assert health["stable_anchor_commit"] == server.AC_STABLE_ANCHOR_COMMIT
+
+
+def test_ac_dev_request_guard_rejects_foreign_project_before_handler(monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+
+    with pytest.raises(ValidationError) as raised:
+        server._guard_dev_runtime_request(
+            method="POST",
+            path="/api/backlog/foreign",
+            path_params={"project_id": "foreign"},
+            body={},
+        )
+
+    assert "ac_dev_project_allowlist_rejected" in str(raised.value)
+    assert raised.value.details["zero_write_rejection"] is True
+    assert raised.value.details["writes_performed"] is False
+
+
+def test_ac_dev_zero_write_rejection_projects_successor_stable_anchor(monkeypatch):
+    successor = "c" * 40
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", successor)
+
+    rejected = server._dev_runtime_zero_write_rejection(
+        code="test_successor_anchor",
+        path="/api/test",
+        detail="test",
+    )
+
+    assert rejected.details["stable_anchor_commit"] == successor
+    assert (
+        rejected.details["stable_anchor_source"]
+        == "validated_runtime_plane_environment"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"project_id": ""},
+        {"artifact_refs": {"target_project_id": "content-sys"}},
+        {"payload": {"affected_project_ids": ["aming-claw", "drift-gym"]}},
+        {"verification": {"source_project_id": "../aming-claw"}},
+    ],
+)
+def test_ac_dev_request_guard_rejects_nested_or_empty_project_claims(
+    monkeypatch, body
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+
+    with pytest.raises(ValidationError) as raised:
+        server._guard_dev_runtime_request(
+            method="POST",
+            path="/api/backlog/aming-claw/upsert",
+            path_params={"project_id": "aming-claw"},
+            body=body,
+        )
+
+    assert raised.value.details["zero_write_rejection"] is True
+    assert raised.value.details["writes_performed"] is False
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/api/governance/redeploy-after-merge/aming-claw", {}),
+        ("/api/version-sync/aming-claw", {}),
+        ("/api/graph-governance/aming-claw/reconcile/current-full", {}),
+        (
+            "/api/graph-governance/aming-claw/reconcile/full",
+            {"activate": True},
+        ),
+        (
+            "/api/graph-governance/aming-claw/snapshots/candidate/finalize",
+            {},
+        ),
+    ],
+)
+def test_ac_dev_request_guard_blocks_stable_identity_and_graph_activation(
+    monkeypatch, path, body
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    with pytest.raises(ValidationError) as raised:
+        server._guard_dev_runtime_request(
+            method="POST",
+            path=path,
+            path_params={"project_id": "aming-claw"},
+            body=body,
+        )
+    assert raised.value.details["zero_write_rejection"] is True
+    assert raised.value.details["mutation_performed"] is False
+
+
+def test_ac_dev_request_guard_allows_candidate_only_and_repair_writes(monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/graph-governance/aming-claw/reconcile/current-full",
+        path_params={"project_id": "aming-claw"},
+        body={
+            "activate": False,
+            "project_root": str(server._dev_exact_source_root()),
+        },
+    )
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/backlog/aming-claw/upsert",
+        path_params={"project_id": "aming-claw"},
+        body={"project_id": "aming-claw"},
+    )
+    # This is the actual public MCP-shaped Onboard body: routing-only calls do
+    # not expose project_root and must remain usable on the dev projection.
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/projects/aming-claw/onboard-route-guide",
+        path_params={"project_id": "aming-claw"},
+        body={
+            "project_id": "aming-claw",
+            "backlog_id": "AC-TEST",
+            "role": "observer",
+            "work_type": "direct_main",
+        },
+    )
+    # QA evidence may refer to a detached QA checkout; it does not authorize a
+    # source mutation and therefore is not rewritten as the dev source root.
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/task/aming-claw/timeline",
+        path_params={"project_id": "aming-claw"},
+        body={
+            "project_id": "aming-claw",
+            "target_project_root": "/tmp/qa-detached-read-only",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/graph-governance/aming-claw/parallel-branches/merge-execute",
+        "/api/governance/redeploy-after-merge/aming-claw",
+        "/api/task/aming-claw/create",
+        "/api/branch-service/validate",
+        "/api/projects/aming-claw/direct-fix/enter",
+        "/api/projects/aming-claw/direct-fix/start",
+        "/api/projects/aming-claw/observer-sessions/register",
+        "/api/projects/aming-claw/observer/route-context/issue",
+        "/api/projects/aming-claw/observer/route-context/renew",
+        "/api/role/assign",
+    ],
+)
+def test_ac_dev_request_guard_blocks_source_process_and_unlisted_writes(
+    monkeypatch, path
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    with pytest.raises(ValidationError) as raised:
+        server._guard_dev_runtime_request(
+            method="POST",
+            path=path,
+            path_params={"project_id": "aming-claw"},
+            body={"project_id": "aming-claw"},
+        )
+    assert "ac_dev_mutation_not_allowlisted" in str(raised.value)
+    assert raised.value.details["writes_performed"] is False
+
+
+def test_ac_dev_candidate_graph_rejects_external_or_implicit_source_root(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    path = "/api/graph-governance/aming-claw/reconcile/current-full"
+    for body in (
+        {"activate": False},
+        {"activate": False, "project_root": str(tmp_path)},
+    ):
+        with pytest.raises(ValidationError) as raised:
+            server._guard_dev_runtime_request(
+                method="POST",
+                path=path,
+                path_params={"project_id": "aming-claw"},
+                body=body,
+            )
+        assert raised.value.details["writes_performed"] is False
+
+    with pytest.raises(ValidationError) as raised:
+        server._guard_dev_runtime_request(
+            method="POST",
+            path="/api/graph-governance/aming-claw/query",
+            path_params={"project_id": "aming-claw"},
+            body={
+                "tool": "find_node_by_path",
+                "project_root": str(tmp_path),
+            },
+        )
+    assert raised.value.details["writes_performed"] is False
+
+
+def test_stable_runtime_cannot_start_on_reserved_dev_port(monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(server, "PORT", server.AC_DEV_SERVICE_PORT)
+
+    identity = server._runtime_plane_identity()
+    assert identity["status"] == "invalid"
+    assert "stable_port_mismatch" in identity["violations"]
+    with pytest.raises(server.GovernanceSingletonError):
+        server._validate_runtime_plane_startup()
+
+
+def test_stable_runtime_requires_exact_port_branch_commit_and_anchor(monkeypatch):
+    commit = "b" * 40
+    database_identity = _promotion_database_identity()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", commit)
+    monkeypatch.setattr(server, "PORT", server.AC_STABLE_SERVICE_PORT)
+    monkeypatch.setattr(
+        server,
+        "_git_identity",
+        lambda _root: {
+            "worktree_root": "/tmp/ac-stable",
+            "branch": server.AC_STABLE_BRANCH,
+            "commit": commit,
+            "dirty": "",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "canonical_ac_database_identity",
+        lambda: dict(database_identity),
+    )
+
+    identity = server._validate_runtime_plane_startup()
+
+    assert identity["status"] == "ready"
+    assert identity["branch"] == server.AC_STABLE_BRANCH
+    assert identity["commit"] == commit
+    assert identity["stable_anchor_commit"] == commit
+
+
+def test_dev_runtime_tracks_current_stable_after_bootstrap(monkeypatch, tmp_path):
+    stable = "c" * 40
+    candidate = "d" * 40
+    database_identity = _promotion_database_identity()
+    canonical_shared = tmp_path / "stable" / "shared-volume"
+    canonical_shared.mkdir(parents=True)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", stable)
+    monkeypatch.setenv("AMING_CLAW_HOME", "/tmp/ac-dev-runtime")
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(canonical_shared.resolve()))
+    monkeypatch.setattr(server, "PORT", server.AC_DEV_SERVICE_PORT)
+    monkeypatch.setattr(
+        server,
+        "_git_identity",
+        lambda _root: {
+            "worktree_root": "/tmp/ac-dev",
+            "branch": server.AC_DEV_BRANCH,
+            "commit": candidate,
+            "dirty": "",
+        },
+    )
+    monkeypatch.setattr(server, "_current_stable_runtime_commit", lambda: stable)
+    monkeypatch.setattr(
+        server,
+        "_current_stable_runtime_database_identity",
+        lambda: dict(database_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "canonical_ac_database_identity",
+        lambda: dict(database_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_stable_database_binding",
+        lambda _root: (canonical_shared.resolve(), dict(database_identity)),
+    )
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    class Connection:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: Connection())
+
+    identity = server._validate_runtime_plane_startup()
+
+    assert identity["status"] == "ready"
+    assert identity["stable_anchor_commit"] == stable
+
+
+def test_direct_dev_startup_rejects_alternate_database_before_open(
+    monkeypatch, tmp_path
+):
+    candidate = "d" * 40
+    canonical_shared = tmp_path / "stable" / "shared-volume"
+    canonical_shared.mkdir(parents=True)
+    alternate_shared = tmp_path / "alternate" / "shared-volume"
+    alternate_db = (
+        alternate_shared
+        / "codex-tasks"
+        / "state"
+        / "governance"
+        / "aming-claw"
+        / "governance.db"
+    )
+    alternate_db.parent.mkdir(parents=True)
+    alternate_db.touch()
+    alternate_metadata = alternate_db.stat()
+    alternate_identity = {
+        **_promotion_database_identity(),
+        "device": int(alternate_metadata.st_dev),
+        "inode": int(alternate_metadata.st_ino),
+    }
+    canonical_identity = {
+        **_promotion_database_identity(),
+        "inode": int(alternate_metadata.st_ino) + 1,
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setenv(
+        "AMING_CLAW_STABLE_ANCHOR_COMMIT", server.AC_STABLE_ANCHOR_COMMIT
+    )
+    monkeypatch.setenv("AMING_CLAW_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(alternate_shared.resolve()))
+    monkeypatch.setattr(server, "PORT", server.AC_DEV_SERVICE_PORT)
+    monkeypatch.setattr(
+        server,
+        "_git_identity",
+        lambda _root: {
+            "worktree_root": str(tmp_path / "ac-dev"),
+            "branch": server.AC_DEV_BRANCH,
+            "commit": candidate,
+            "dirty": "",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "canonical_ac_database_identity",
+        lambda: dict(alternate_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_stable_database_binding",
+        lambda _root: (canonical_shared.resolve(), dict(canonical_identity)),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: pytest.fail(
+            "alternate dev DB must fail before any database open"
+        ),
+    )
+
+    with pytest.raises(
+        server.GovernanceSingletonError,
+        match="canonical_stable_database_identity_mismatch",
+    ):
+        server._validate_runtime_plane_startup()
+
+
+def test_generic_runtime_from_ac_dev_checkout_fails_closed(monkeypatch):
+    monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE", raising=False)
+    monkeypatch.delenv("AMING_CLAW_BUILD_COMMIT", raising=False)
+    monkeypatch.setattr(
+        server,
+        "_git_identity",
+        lambda _root: {
+            "worktree_root": "/tmp/ac-dev",
+            "branch": server.AC_DEV_BRANCH,
+            "commit": "b" * 40,
+            "dirty": "",
+        },
+    )
+
+    identity = server._runtime_plane_identity()
+
+    assert identity["plane"] == "generic"
+    assert "ac_dev_checkout_requires_explicit_dev_plane" in identity["violations"]
+    with pytest.raises(server.GovernanceSingletonError):
+        server._validate_runtime_plane_startup()
+
+
+def test_dev_http_branch_service_spawner_is_retired():
+    ctx = _ctx({}, method="POST", body={})
+    ctx.handler = object()
+
+    status, result = server.handle_branch_service_validate(ctx)
+
+    assert status == 410
+    assert result["error"] == "branch_service_http_supervisor_retired"
+    assert result["process_started"] is False
+
+
+def _attach_completion_chain_projections(
+    body: dict[str, Any],
+    *,
+    previous_stable: str,
+    previous_receipt: str,
+    prior_event_id: int,
+) -> None:
+    if previous_stable == server.AC_STABLE_ANCHOR_COMMIT:
+        prior = {
+            "kind": "bootstrap",
+            "stable_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        }
+    else:
+        prior = {
+            "kind": "timeline_receipt",
+            "timeline_event_id": prior_event_id,
+            "receipt_hash": previous_receipt,
+        }
+    body["previous_promotion_receipt_hash"] = previous_receipt
+    body["precheck_receipt"] = {
+        "previous_promotion_receipt_hash": previous_receipt,
+        "prior_promotion_event_id": prior_event_id,
+    }
+    body["promotion_manifest"] = {"prior_promotion": prior}
+
+
+def _promotion_database_identity() -> dict[str, Any]:
+    return {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": 16777229,
+        "inode": 1164244,
+        "stable_relative_path_sha256": "sha256:"
+        + hashlib.sha256(
+            server.AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def test_stable_promotion_completion_requires_exact_runtime_and_is_idempotent(
+    conn, monkeypatch
+):
+    commit = "b" * 40
+    previous = "a" * 40
+    file_fence = ["agent/governance/server.py"]
+    diff_sha256 = "sha256:" + hashlib.sha256(b"exact-diff").hexdigest()
+    verifier_sha256 = "sha256:" + hashlib.sha256(
+        (
+            Path(server.__file__).resolve().parents[2]
+            / "scripts"
+            / "merge-and-deploy.sh"
+        ).read_bytes()
+    ).hexdigest()
+    deploy = {
+        "authorized": True,
+        "mode": "host_supervisor",
+        "stable_port": 40000,
+    }
+    database_identity = _promotion_database_identity()
+    intent = {
+        "schema_version": "ac_stable_promotion_manifest.v1",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-PROMOTION-TEST",
+        "contract_execution_id": "cex-promotion-test",
+        "stable_anchor_commit": previous,
+        "stable_branch": server.AC_STABLE_BRANCH,
+        "branch": server.AC_DEV_BRANCH,
+        "candidate_commit": commit,
+        "file_fence": file_fence,
+        "diff_sha256": diff_sha256,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+    }
+    intent_sha256 = "sha256:" + hashlib.sha256(
+        json.dumps(intent, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    identity = {
+        "schema_version": "ac_runtime_plane_identity.v1",
+        "plane": "stable",
+        "port": 40000,
+        "expected_port": 40000,
+        "pid": server.SERVER_PID,
+        "bind_host": "0.0.0.0",
+        "worktree_root": "/tmp/ac-stable",
+        "branch": server.AC_STABLE_BRANCH,
+        "expected_branch": server.AC_STABLE_BRANCH,
+        "commit": commit,
+        "worktree_dirty": False,
+        "worktree_dirty_files": [],
+        "stable_anchor_commit": commit,
+        "stable_database_identity": database_identity,
+        "project_allowlist": [],
+        "schema_policy": "managed",
+        "active_graph_activation_allowed": True,
+        "stable_deploy_allowed": True,
+        "background_workers_enabled": True,
+        "status": "ready",
+        "violations": [],
+    }
+    monkeypatch.setattr(server, "_runtime_plane_identity", lambda: identity)
+    monkeypatch.setattr(
+        server,
+        "_validate_ac_stable_promotion_durable_evidence",
+        lambda *_args, **_kwargs: None,
+    )
+    body = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-PROMOTION-TEST",
+        "contract_execution_id": "cex-promotion-test",
+        "candidate_commit": commit,
+        "previous_stable_commit": previous,
+        "previous_promotion_receipt_hash": "sha256:" + "4" * 64,
+        "promotion_intent_sha256": intent_sha256,
+        "promotion_manifest_sha256": "sha256:" + "3" * 64,
+        "precheck_receipt_hash": "sha256:" + "2" * 64,
+        "verifier_sha256": verifier_sha256,
+        "diff_sha256": diff_sha256,
+        "file_fence": file_fence,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+        "operator_approval_ref": "operator:test",
+        "health_identity": {
+            "runtime_loaded_version": commit,
+            "runtime_plane_identity": identity,
+            "runtime_stale": False,
+        },
+    }
+    _attach_completion_chain_projections(
+        body,
+        previous_stable=previous,
+        previous_receipt=body["previous_promotion_receipt_hash"],
+        prior_event_id=42,
+    )
+    def git_run(args, **_kwargs):
+        if args[1:3] == ["merge-base", "--is-ancestor"]:
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        if args[1:3] == ["diff", "--no-ext-diff"]:
+            return SimpleNamespace(returncode=0, stdout=b"exact-diff", stderr=b"")
+        if args[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="agent/governance/server.py\n",
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr(server.subprocess, "run", git_run)
+    monkeypatch.setattr(
+        server,
+        "canonical_ac_database_identity",
+        lambda _conn=None: dict(database_identity),
+    )
+    unauthorized = _ctx(
+        {"project_id": "aming-claw"}, method="POST", body=body
+    )
+    with pytest.raises(PermissionDeniedError):
+        server.handle_ac_stable_promotion_complete(unauthorized)
+
+    authorized = _ctx_with_role(
+        {"project_id": "aming-claw"},
+        "coordinator",
+        method="POST",
+        body=body,
+    )
+    authorized.token = "coordinator-token-ref"
+
+    # Receipt and fork detection is project-wide, not scoped to a caller-
+    # selected backlog or the first public timeline page.  Put the conflicting
+    # receipts beyond 5,000 unrelated rows to guard against bounded scans.
+    conn.executemany(
+        """INSERT INTO task_timeline_events(
+               project_id, backlog_id, task_id, event_type, phase, event_kind,
+               actor, status, payload_json, verification_json,
+               artifact_refs_json, commit_sha, created_at
+           ) VALUES (?, '', '', 'test.noise', 'test', 'noise',
+                     'test', 'accepted', '{}', '{}', '{}', '', ?)""",
+        [
+            ("aming-claw", f"2026-08-27T14:{index // 60:02d}:{index % 60:02d}Z")
+            for index in range(5001)
+        ],
+    )
+    conflicting = conn.execute(
+        """INSERT INTO task_timeline_events(
+               project_id, backlog_id, task_id, event_type, phase, event_kind,
+               actor, status, payload_json, verification_json,
+               artifact_refs_json, commit_sha, created_at
+           ) VALUES (?, ?, ?, 'ac.stable_promotion_completed', 'release',
+                     'stable_promotion', 'operator', 'accepted', ?, '{}', '{}', ?, ?)""",
+        (
+            "aming-claw",
+            "AC-FOREIGN-BACKLOG",
+            "cex-foreign",
+            json.dumps(
+                {
+                    "promoted_commit": commit,
+                    "previous_stable_commit": previous,
+                    "promotion_receipt_hash": "sha256:" + "9" * 64,
+                },
+                sort_keys=True,
+            ),
+            commit,
+            "2026-08-27T15:00:00Z",
+        ),
+    )
+    conn.commit()
+    with pytest.raises(server.ValidationError, match="different promotion completion"):
+        server.handle_ac_stable_promotion_complete(authorized)
+    conn.execute("DELETE FROM task_timeline_events WHERE id=?", (conflicting.lastrowid,))
+    conn.commit()
+
+    forked_commit = "c" * 40
+    forked = conn.execute(
+        """INSERT INTO task_timeline_events(
+               project_id, backlog_id, task_id, event_type, phase, event_kind,
+               actor, status, payload_json, verification_json,
+               artifact_refs_json, commit_sha, created_at
+           ) VALUES (?, ?, ?, 'ac.stable_promotion_completed', 'release',
+                     'stable_promotion', 'operator', 'accepted', ?, '{}', '{}', ?, ?)""",
+        (
+            "aming-claw",
+            "AC-FOREIGN-BACKLOG",
+            "cex-foreign",
+            json.dumps(
+                {
+                    "promoted_commit": forked_commit,
+                    "previous_stable_commit": previous,
+                    "promotion_receipt_hash": "sha256:" + "8" * 64,
+                },
+                sort_keys=True,
+            ),
+            forked_commit,
+            "2026-08-27T15:00:00Z",
+        ),
+    )
+    conn.commit()
+    with pytest.raises(server.ValidationError, match="different successor"):
+        server.handle_ac_stable_promotion_complete(authorized)
+    conn.execute("DELETE FROM task_timeline_events WHERE id=?", (forked.lastrowid,))
+    conn.commit()
+
+    substituted = copy.deepcopy(body)
+    substituted["previous_promotion_receipt_hash"] = "sha256:" + "5" * 64
+    substituted_ctx = _ctx_with_role(
+        {"project_id": "aming-claw"},
+        "coordinator",
+        method="POST",
+        body=substituted,
+    )
+    substituted_ctx.token = "coordinator-token-ref"
+    with pytest.raises(
+        server.ValidationError,
+        match="predecessor receipt does not match precheck",
+    ):
+        server.handle_ac_stable_promotion_complete(substituted_ctx)
+
+    first = server.handle_ac_stable_promotion_complete(authorized)
+
+    def expired_gate_must_not_be_revalidated(*_args, **_kwargs):
+        raise AssertionError(
+            "exact durable receipt replay must precede expired signoff validation"
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_validate_ac_stable_promotion_durable_evidence",
+        expired_gate_must_not_be_revalidated,
+    )
+    second = server.handle_ac_stable_promotion_complete(authorized)
+
+    assert first["ok"] is True
+    assert first["idempotent"] is False
+    assert second["idempotent"] is True
+    assert second["timeline_event_id"] == first["timeline_event_id"]
+    assert second["promotion_receipt_hash"] == first["promotion_receipt_hash"]
+    event = task_timeline.list_events(
+        conn, "aming-claw", backlog_id="AC-PROMOTION-TEST"
+    )[0]
+    assert event["event_type"] == "ac.stable_promotion_completed"
+    assert event["commit_sha"] == commit
+    assert event["payload"]["pass_synthesized"] is False
+    assert event["payload"]["promotion_manifest_sha256"] == "sha256:" + "3" * 64
+
+
+def test_stable_promotion_bootstrap_rejects_nonempty_predecessor(
+    conn, monkeypatch
+):
+    candidate = "b" * 40
+    previous = server.AC_STABLE_ANCHOR_COMMIT
+    fence = ["agent/governance/server.py"]
+    diff_hash = "sha256:" + hashlib.sha256(b"exact-diff").hexdigest()
+    verifier_hash = "sha256:" + hashlib.sha256(
+        (
+            Path(server.__file__).resolve().parents[2]
+            / "scripts"
+            / "merge-and-deploy.sh"
+        ).read_bytes()
+    ).hexdigest()
+    deploy = {
+        "authorized": True,
+        "mode": "host_supervisor",
+        "stable_port": 40000,
+    }
+    database_identity = _promotion_database_identity()
+    intent = {
+        "schema_version": "ac_stable_promotion_manifest.v1",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-PROMOTION-BOOTSTRAP",
+        "contract_execution_id": "cex-promotion-bootstrap",
+        "stable_anchor_commit": previous,
+        "stable_branch": server.AC_STABLE_BRANCH,
+        "branch": server.AC_DEV_BRANCH,
+        "candidate_commit": candidate,
+        "file_fence": fence,
+        "diff_sha256": diff_hash,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+    }
+    identity = {
+        "plane": "stable",
+        "status": "ready",
+        "commit": candidate,
+        "stable_anchor_commit": candidate,
+        "stable_database_identity": database_identity,
+    }
+    body = {
+        "backlog_id": "AC-PROMOTION-BOOTSTRAP",
+        "contract_execution_id": "cex-promotion-bootstrap",
+        "candidate_commit": candidate,
+        "previous_stable_commit": previous,
+        "previous_promotion_receipt_hash": "sha256:" + "4" * 64,
+        "promotion_intent_sha256": server.stable_sha256(intent),
+        "promotion_manifest_sha256": "sha256:" + "3" * 64,
+        "precheck_receipt_hash": "sha256:" + "2" * 64,
+        "verifier_sha256": verifier_hash,
+        "diff_sha256": diff_hash,
+        "file_fence": fence,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+        "operator_approval_ref": "operator:bootstrap",
+        "health_identity": {
+            "runtime_loaded_version": candidate,
+            "runtime_plane_identity": identity,
+            "runtime_stale": False,
+        },
+    }
+    _attach_completion_chain_projections(
+        body,
+        previous_stable=previous,
+        previous_receipt=body["previous_promotion_receipt_hash"],
+        prior_event_id=1,
+    )
+    monkeypatch.setattr(server, "_runtime_plane_identity", lambda: identity)
+    ctx = _ctx_with_role(
+        {"project_id": "aming-claw"},
+        "coordinator",
+        method="POST",
+        body=body,
+    )
+    ctx.token = "coordinator-token-ref"
+
+    with pytest.raises(
+        server.ValidationError,
+        match="bootstrap promotion predecessor must be empty",
+    ):
+        server.handle_ac_stable_promotion_complete(ctx)
+
+
+def test_stable_promotion_durable_precheck_rejects_forgery_and_signoff_replay(
+    conn, monkeypatch
+):
+    project_id = "aming-claw"
+    backlog_id = "AC-PROMOTION-DURABLE-TEST"
+    cex = "cex-promotion-durable-test"
+    stable = "c" * 40
+    candidate = "d" * 40
+    fence = ["agent/governance/server.py"]
+    diff_hash = "sha256:" + "1" * 64
+    verifier_hash = "sha256:" + "2" * 64
+    deploy = {"authorized": True, "mode": "host_supervisor", "stable_port": 40000}
+    database_identity = _promotion_database_identity()
+    previous_receipt = "sha256:" + "7" * 64
+    prior_cursor = conn.execute(
+        """INSERT INTO task_timeline_events(
+               project_id, backlog_id, task_id, event_type, phase, event_kind,
+               actor, status, payload_json, verification_json,
+               artifact_refs_json, commit_sha, created_at
+           ) VALUES (?, ?, ?, 'ac.stable_promotion_completed', 'release',
+                     'stable_promotion', 'operator', 'accepted', ?, '{}', '{}', ?, ?)""",
+        (
+            project_id,
+            "AC-PRIOR-PROMOTION",
+            "cex-prior-promotion",
+            json.dumps(
+                {
+                    "promoted_commit": stable,
+                    "promotion_receipt_hash": previous_receipt,
+                    "stable_database_identity": database_identity,
+                },
+                sort_keys=True,
+            ),
+            stable,
+            "2026-08-27T14:00:00Z",
+        ),
+    )
+    prior_event_id = int(prior_cursor.lastrowid)
+    intent = {
+        "schema_version": "ac_stable_promotion_manifest.v1",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": cex,
+        "stable_anchor_commit": stable,
+        "stable_branch": server.AC_STABLE_BRANCH,
+        "branch": server.AC_DEV_BRANCH,
+        "candidate_commit": candidate,
+        "file_fence": fence,
+        "diff_sha256": diff_hash,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+    }
+    intent_hash = server.stable_sha256(intent)
+    authority = {
+        "schema_version": "source_backed_contract_gate_authority.v1",
+        "source": "server_qa_session_verification",
+        "source_of_authority": "qa_session_verification",
+        "authority_hash": "sha256:" + "3" * 64,
+        "qa_session_proof": {
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": cex,
+            "commit_sha": candidate,
+            "principal_id": "qa-principal-promotion",
+            "candidate_review_context": {
+                "candidate_commit_sha": candidate,
+                "comparison_base_commit_sha": stable,
+                "comparison_authority_required": True,
+                "candidate_diff_hash": diff_hash,
+                "changed_files": fence,
+            }
+        },
+    }
+    report_hash = "sha256:" + "4" * 64
+    qa_payload = {
+        "source_backed_contract_gate_authority": authority,
+        "contract_runtime_canonical_line": {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "contract_execution_id": cex,
+            "runtime_guide_hash": "sha256:" + "5" * 64,
+        },
+        "stable_anchor_commit": stable,
+        "promotion_intent_sha256": intent_hash,
+        "file_fence": fence,
+        "stable_database_identity": database_identity,
+    }
+    qa_verification = {
+        "pass_synthesized": False,
+        "promotion_gate_results": {
+            "branch_service": {
+                "test_id": "branch-loopback",
+                "status": "passed",
+                "report_sha256": report_hash,
+                "runtime_plane": "dev",
+                "port": 40008,
+                "bind_host": "127.0.0.1",
+            },
+            "lanes": {
+                lane: {
+                    "test_id": f"lane-{lane}",
+                    "status": "passed",
+                    "report_sha256": report_hash,
+                }
+                for lane in ("direct_main", "mf_parallel", "mf_batch_parallel")
+            },
+        },
+    }
+    qa_cursor = conn.execute(
+        """INSERT INTO task_timeline_events(
+               project_id, backlog_id, task_id, event_type, phase, event_kind,
+               actor, status, payload_json, verification_json,
+               artifact_refs_json, commit_sha, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)""",
+        (
+            project_id,
+            backlog_id,
+            cex,
+            "qa.independent_verification",
+            "qa",
+            "independent_verification",
+            "qa-principal-promotion",
+            "passed",
+            json.dumps(qa_payload, sort_keys=True),
+            json.dumps(qa_verification, sort_keys=True),
+            candidate,
+            "2026-08-27T15:00:00Z",
+        ),
+    )
+    qa_event_id = int(qa_cursor.lastrowid)
+    qa_gate = {"timeline_event_id": qa_event_id, "status": "passed"}
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=30)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    operator_gate = {
+        "status": "approved",
+        "nonce": "6" * 32,
+        "operator_principal_id": "operator-principal-promotion",
+        "expires_at": expires,
+    }
+    prior = {
+        "kind": "timeline_receipt",
+        "timeline_event_id": prior_event_id,
+        "receipt_hash": previous_receipt,
+    }
+    signable_manifest = {
+        **intent,
+        "promotion_intent_sha256": intent_hash,
+        "prior_promotion": prior,
+        "gates": {
+            "qa_verdict": qa_gate,
+            "operator_signoff": operator_gate,
+        },
+    }
+    manifest_hash = server.stable_sha256(signable_manifest)
+    signoff = {
+        "schema_version": "ac_stable_promotion_operator_signoff.v1",
+        "nonce": operator_gate["nonce"],
+        "operator_principal_id": operator_gate["operator_principal_id"],
+        "expires_at": expires,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": cex,
+        "stable_anchor_commit": stable,
+        "candidate_commit": candidate,
+        "promotion_intent_sha256": intent_hash,
+        "promotion_manifest_sha256": manifest_hash,
+        "verifier_sha256": verifier_hash,
+        "diff_sha256": diff_hash,
+        "file_fence": fence,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+    }
+    server._ensure_release_operator_head_queue_schema(conn)
+    signoff_cursor = conn.execute(
+        """INSERT INTO release_operator_head_queue_events(
+               project_id, action, backlog_id, actor, reason,
+               before_json, after_json, created_at
+           ) VALUES (?, 'reorder', '', ?, ?, ?, ?, ?)""",
+        (
+            project_id,
+            operator_gate["operator_principal_id"],
+            json.dumps(signoff, sort_keys=True, separators=(",", ":")),
+            json.dumps({"backlog_ids": [backlog_id]}, sort_keys=True),
+            json.dumps({"backlog_ids": [backlog_id]}, sort_keys=True),
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ),
+    )
+    signoff_event_id = int(signoff_cursor.lastrowid)
+    operator_gate = {**operator_gate, "queue_event_id": signoff_event_id}
+    manifest = {
+        **intent,
+        "promotion_intent_sha256": intent_hash,
+        "promotion_manifest_sha256": manifest_hash,
+        "gates": {
+            "qa_verdict": qa_gate,
+            "operator_signoff": operator_gate,
+        },
+        "prior_promotion": prior,
+    }
+    conn.commit()
+    qa_event = next(
+        event
+        for event in task_timeline.list_events(
+            conn, project_id, backlog_id=backlog_id, task_id=cex
+        )
+        if event["id"] == qa_event_id
+    )
+    signoff_row = dict(
+        conn.execute(
+            "SELECT * FROM release_operator_head_queue_events WHERE id=?",
+            (signoff_event_id,),
+        ).fetchone()
+    )
+    signoff_hash = server.stable_sha256(
+        {
+            key: signoff_row.get(key)
+            for key in (
+                "id",
+                "project_id",
+                "action",
+                "backlog_id",
+                "actor",
+                "reason",
+                "before_json",
+                "after_json",
+                "created_at",
+            )
+        }
+    )
+    precheck_core = {
+        "schema_version": "ac_stable_promotion_precheck_receipt.v1",
+        "verifier_version": "readonly_timeline_projector.v1",
+        "verifier_sha256": verifier_hash,
+        "promotion_intent_sha256": intent_hash,
+        "promotion_manifest_sha256": manifest_hash,
+        "stable_anchor_commit": stable,
+        "candidate_commit": candidate,
+        "diff_sha256": diff_hash,
+        "stable_database_identity": database_identity,
+        "previous_promotion_receipt_hash": previous_receipt,
+        "prior_promotion_event_id": prior_event_id,
+        "gate_event_ids": {
+            "qa_verdict": qa_event_id,
+            "operator_signoff": signoff_event_id,
+        },
+        "operator_approval_ref": (
+            f"release-operator-head-queue-event:{signoff_event_id}"
+        ),
+        "gate_evidence_hashes": {
+            "qa_verdict": server._ac_promotion_event_hash(qa_event),
+            "operator_signoff": signoff_hash,
+        },
+        "pass_synthesized": False,
+        "writes_performed": False,
+    }
+    precheck = {
+        **precheck_core,
+        "receipt_hash": server.stable_sha256(precheck_core),
+    }
+    request_body = {
+        "precheck_receipt": precheck,
+        "precheck_receipt_hash": precheck["receipt_hash"],
+        "promotion_manifest": manifest,
+        "promotion_manifest_sha256": manifest_hash,
+    }
+    monkeypatch.setattr(
+        task_timeline,
+        "_source_backed_qa_session_authority_valid",
+        lambda *_args, **_kwargs: True,
+    )
+    kwargs = {
+        "body": request_body,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": cex,
+        "candidate": candidate,
+        "previous_stable": stable,
+        "file_fence": fence,
+        "diff_sha256": diff_hash,
+        "verifier_sha256": verifier_hash,
+        "promotion_intent_sha256": intent_hash,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+        "operator_approval_ref": precheck["operator_approval_ref"],
+    }
+
+    server._validate_ac_stable_promotion_durable_evidence(conn, **kwargs)
+
+    copied_authority = conn.execute(
+        """INSERT INTO task_timeline_events(
+               project_id, backlog_id, task_id, event_type, phase, event_kind,
+               actor, status, payload_json, verification_json,
+               artifact_refs_json, commit_sha, created_at
+           ) VALUES (?, 'AC-OTHER', 'cex-other', 'observer.copied_qa',
+                     'observer', 'copied_qa', 'observer-principal', 'accepted',
+                     '{}', ?, '{}', ?, ?)""",
+        (
+            project_id,
+            json.dumps(
+                {"source_backed_contract_gate_authority": authority},
+                sort_keys=True,
+            ),
+            candidate,
+            "2026-08-27T15:01:00Z",
+        ),
+    )
+    conn.commit()
+    with pytest.raises(ValidationError, match="authority replay/ambiguity"):
+        server._validate_ac_stable_promotion_durable_evidence(conn, **kwargs)
+    conn.execute(
+        "DELETE FROM task_timeline_events WHERE id=?",
+        (int(copied_authority.lastrowid),),
+    )
+    conn.commit()
+
+    # A stable queue reorder authorized by an observer route ref records an
+    # actor ending in :route_ref.  Even if every claimed manifest/signoff field
+    # is rebuilt consistently around that actor, it is not operator approval.
+    route_principal = "observer:route_ref"
+    route_operator_base = {
+        **{
+            key: operator_gate[key]
+            for key in ("status", "nonce", "expires_at")
+        },
+        "operator_principal_id": route_principal,
+    }
+    route_manifest_hash = server.stable_sha256(
+        {
+            **intent,
+            "promotion_intent_sha256": intent_hash,
+            "prior_promotion": prior,
+            "gates": {
+                "qa_verdict": qa_gate,
+                "operator_signoff": route_operator_base,
+            },
+        }
+    )
+    route_signoff = {
+        **signoff,
+        "operator_principal_id": route_principal,
+        "promotion_manifest_sha256": route_manifest_hash,
+    }
+    route_reason = json.dumps(
+        route_signoff, sort_keys=True, separators=(",", ":")
+    )
+    conn.execute(
+        "UPDATE release_operator_head_queue_events SET actor=?, reason=? WHERE id=?",
+        (route_principal, route_reason, signoff_event_id),
+    )
+    conn.commit()
+    route_signoff_row = dict(
+        conn.execute(
+            "SELECT * FROM release_operator_head_queue_events WHERE id=?",
+            (signoff_event_id,),
+        ).fetchone()
+    )
+    route_signoff_hash = server.stable_sha256(
+        {
+            key: route_signoff_row.get(key)
+            for key in (
+                "id",
+                "project_id",
+                "action",
+                "backlog_id",
+                "actor",
+                "reason",
+                "before_json",
+                "after_json",
+                "created_at",
+            )
+        }
+    )
+    route_manifest = {
+        **manifest,
+        "promotion_manifest_sha256": route_manifest_hash,
+        "gates": {
+            "qa_verdict": qa_gate,
+            "operator_signoff": {
+                **route_operator_base,
+                "queue_event_id": signoff_event_id,
+            },
+        },
+    }
+    route_precheck_core = {
+        **precheck_core,
+        "promotion_manifest_sha256": route_manifest_hash,
+        "gate_evidence_hashes": {
+            **precheck_core["gate_evidence_hashes"],
+            "operator_signoff": route_signoff_hash,
+        },
+    }
+    route_precheck = {
+        **route_precheck_core,
+        "receipt_hash": server.stable_sha256(route_precheck_core),
+    }
+    route_request = {
+        "precheck_receipt": route_precheck,
+        "precheck_receipt_hash": route_precheck["receipt_hash"],
+        "promotion_manifest": route_manifest,
+        "promotion_manifest_sha256": route_manifest_hash,
+    }
+    with pytest.raises(ValidationError, match="operator signoff identity"):
+        server._validate_ac_stable_promotion_durable_evidence(
+            conn,
+            **{
+                **kwargs,
+                "body": route_request,
+            },
+        )
+    conn.execute(
+        "UPDATE release_operator_head_queue_events SET actor=?, reason=? WHERE id=?",
+        (
+            operator_gate["operator_principal_id"],
+            signoff_row["reason"],
+            signoff_event_id,
+        ),
+    )
+    conn.commit()
+
+    forged = copy.deepcopy(request_body)
+    forged["precheck_receipt_hash"] = "sha256:" + "0" * 64
+    with pytest.raises(ValidationError, match="precheck receipt digest"):
+        server._validate_ac_stable_promotion_durable_evidence(
+            conn, **{**kwargs, "body": forged}
+        )
+
+    conn.execute("DELETE FROM task_timeline_events WHERE id=?", (prior_event_id,))
+    with pytest.raises(ValidationError, match="prior promotion receipt"):
+        server._validate_ac_stable_promotion_durable_evidence(conn, **kwargs)
+    conn.rollback()
+
+    conn.execute(
+        """INSERT INTO release_operator_head_queue_events(
+               project_id, action, backlog_id, actor, reason,
+               before_json, after_json, created_at
+           ) VALUES (?, 'reorder', '', ?, ?, ?, ?, ?)""",
+        (
+            project_id,
+            operator_gate["operator_principal_id"],
+            signoff_row["reason"],
+            signoff_row["before_json"],
+            signoff_row["after_json"],
+            signoff_row["created_at"],
+        ),
+    )
+    conn.commit()
+    with pytest.raises(ValidationError, match="nonce replay"):
+        server._validate_ac_stable_promotion_durable_evidence(conn, **kwargs)
+
+
+def test_stable_promotion_concurrent_first_completion_appends_one_receipt(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "promotion-concurrency.db"
+    conn = sqlite3.connect(database, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    candidate = "b" * 40
+    previous = "a" * 40
+    file_fence = ["agent/governance/server.py"]
+    diff_sha256 = "sha256:" + hashlib.sha256(b"exact-diff").hexdigest()
+    verifier_sha256 = "sha256:" + hashlib.sha256(
+        (
+            Path(server.__file__).resolve().parents[2]
+            / "scripts"
+            / "merge-and-deploy.sh"
+        ).read_bytes()
+    ).hexdigest()
+    deploy = {
+        "authorized": True,
+        "mode": "host_supervisor",
+        "stable_port": 40000,
+    }
+    database_identity = _promotion_database_identity()
+    intent = {
+        "schema_version": "ac_stable_promotion_manifest.v1",
+        "project_id": "aming-claw",
+        "backlog_id": "AC-PROMOTION-CONCURRENT",
+        "contract_execution_id": "cex-promotion-concurrent",
+        "stable_anchor_commit": previous,
+        "stable_branch": server.AC_STABLE_BRANCH,
+        "branch": server.AC_DEV_BRANCH,
+        "candidate_commit": candidate,
+        "file_fence": file_fence,
+        "diff_sha256": diff_sha256,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+    }
+    intent_sha256 = server.stable_sha256(intent)
+    identity = {
+        "schema_version": "ac_runtime_plane_identity.v1",
+        "plane": "stable",
+        "port": 40000,
+        "expected_port": 40000,
+        "pid": server.SERVER_PID,
+        "bind_host": "0.0.0.0",
+        "worktree_root": "/tmp/ac-stable",
+        "branch": server.AC_STABLE_BRANCH,
+        "expected_branch": server.AC_STABLE_BRANCH,
+        "commit": candidate,
+        "worktree_dirty": False,
+        "worktree_dirty_files": [],
+        "stable_anchor_commit": candidate,
+        "stable_database_identity": database_identity,
+        "project_allowlist": [],
+        "schema_policy": "managed",
+        "active_graph_activation_allowed": True,
+        "stable_deploy_allowed": True,
+        "background_workers_enabled": True,
+        "status": "ready",
+        "violations": [],
+    }
+    body = {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-PROMOTION-CONCURRENT",
+        "contract_execution_id": "cex-promotion-concurrent",
+        "candidate_commit": candidate,
+        "previous_stable_commit": previous,
+        "previous_promotion_receipt_hash": "sha256:" + "4" * 64,
+        "promotion_intent_sha256": intent_sha256,
+        "promotion_manifest_sha256": "sha256:" + "3" * 64,
+        "precheck_receipt_hash": "sha256:" + "2" * 64,
+        "verifier_sha256": verifier_sha256,
+        "diff_sha256": diff_sha256,
+        "file_fence": file_fence,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+        "operator_approval_ref": "operator:concurrent",
+        "health_identity": {
+            "runtime_loaded_version": candidate,
+            "runtime_plane_identity": identity,
+            "runtime_stale": False,
+        },
+    }
+    _attach_completion_chain_projections(
+        body,
+        previous_stable=previous,
+        previous_receipt=body["previous_promotion_receipt_hash"],
+        prior_event_id=42,
+    )
+
+    def git_run(args, **_kwargs):
+        if args[1:3] == ["merge-base", "--is-ancestor"]:
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        if args[1:3] == ["diff", "--no-ext-diff"]:
+            return SimpleNamespace(returncode=0, stdout=b"exact-diff", stderr=b"")
+        if args[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="agent/governance/server.py\n",
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr(server, "_runtime_plane_identity", lambda: identity)
+    monkeypatch.setattr(server.subprocess, "run", git_run)
+    monkeypatch.setattr(
+        server,
+        "canonical_ac_database_identity",
+        lambda _conn=None: dict(database_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+
+    validation_calls = []
+
+    def slow_valid_gate(*_args, **_kwargs):
+        validation_calls.append(get_ident())
+        time.sleep(0.03)
+
+    monkeypatch.setattr(
+        server,
+        "_validate_ac_stable_promotion_durable_evidence",
+        slow_valid_gate,
+    )
+
+    def complete():
+        ctx = _ctx_with_role(
+            {"project_id": "aming-claw"},
+            "coordinator",
+            method="POST",
+            body=dict(body),
+        )
+        ctx.token = "coordinator-token-ref"
+        return server.handle_ac_stable_promotion_complete(ctx)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _index: complete(), range(2)))
+
+        assert sorted(result["idempotent"] for result in results) == [False, True]
+        assert len(validation_calls) == 1
+        rows = conn.execute(
+            """SELECT id FROM task_timeline_events
+               WHERE project_id='aming-claw'
+                 AND event_type='ac.stable_promotion_completed'"""
+        ).fetchall()
+        assert len(rows) == 1
+        assert {result["timeline_event_id"] for result in results} == {
+            int(rows[0]["id"])
+        }
+    finally:
+        conn.close()
+
+
+def test_branch_service_validate_refuses_any_port_except_40008(
+    tmp_path, monkeypatch
+):
+    worktree = tmp_path / "ac-dev"
+    worktree.mkdir()
+    (worktree / "start_governance.py").write_text("# test\n", encoding="utf-8")
+
+    def git_output(_worktree, args):
+        if args == ["branch", "--show-current"]:
+            return server.AC_DEV_BRANCH
+        if args == ["rev-parse", "--show-toplevel"]:
+            return str(worktree.resolve())
+        if args == ["rev-parse", "HEAD"]:
+            return "b" * 40
+        return ""
+
+    monkeypatch.setattr(server, "_branch_service_git_output", git_output)
+    monkeypatch.setattr(
+        server,
+        "_current_stable_runtime_commit",
+        lambda: server.AC_STABLE_ANCHOR_COMMIT,
+    )
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    result = server.handle_branch_service_validate(
+        _ctx(
+            {},
+            method="POST",
+                body={
+                    "worktree_path": str(worktree),
+                    "port": 40009,
+                    "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+                },
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "ac_dev_reserved_port_required"
+    assert result["required_dev_port"] == 40008
+    assert result["zero_write_rejection"] is True
+
+
+def test_branch_service_launches_guarded_module_with_dev_env(
+    tmp_path, monkeypatch
+):
+    worktree = tmp_path / "ac-dev"
+    worktree.mkdir()
+    (worktree / "start_governance.py").write_text("# legacy wrapper\n", encoding="utf-8")
+    shared = tmp_path / "shared"
+    database = (
+        shared
+        / "codex-tasks"
+        / "state"
+        / "governance"
+        / "aming-claw"
+        / "governance.db"
+    )
+    database.parent.mkdir(parents=True)
+    database.touch()
+    metadata = database.stat()
+    database_identity = {
+        **_promotion_database_identity(),
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+    }
+    candidate = "b" * 40
+
+    def git_output(_worktree, args):
+        values = {
+            ("branch", "--show-current"): server.AC_DEV_BRANCH,
+            ("rev-parse", "--show-toplevel"): str(worktree.resolve()),
+            ("rev-parse", "HEAD"): candidate,
+            ("status", "--porcelain"): "",
+        }
+        return values.get(tuple(args), "")
+
+    monkeypatch.setattr(server, "_branch_service_git_output", git_output)
+    monkeypatch.setattr(
+        server,
+        "_branch_service_stable_database_binding",
+        lambda _worktree: (shared.resolve(), database_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "_current_stable_runtime_commit",
+        lambda: server.AC_STABLE_ANCHOR_COMMIT,
+    )
+    monkeypatch.setattr(server, "_branch_service_port_open", lambda *_: False)
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    launched = {}
+
+    def fake_popen(command, **kwargs):
+        launched.update({"command": command, **kwargs})
+        return SimpleNamespace(pid=43210)
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        server,
+        "_branch_service_poll_health",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "url": "http://127.0.0.1:40008/api/health",
+            "health": {
+                "status": "ok",
+                "port": 40008,
+                "pid": 43210,
+                "runtime_plane": "dev",
+                "bind_host": server.AC_DEV_BIND_HOST,
+                "runtime_plane_identity": {
+                    "bind_host": server.AC_DEV_BIND_HOST,
+                    "worktree_root": str(worktree.resolve()),
+                    "branch": server.AC_DEV_BRANCH,
+                    "commit": candidate,
+                    "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+                    "stable_database_identity": database_identity,
+                    "status": "ready",
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_stop_process",
+        lambda proc: {"stopped": True, "pid": proc.pid},
+    )
+
+    alternate = tmp_path / "alternate-shared"
+    alternate.mkdir()
+    with pytest.raises(
+        ValidationError,
+        match="shared volume identity mismatch",
+    ):
+        server.handle_branch_service_validate(
+            _ctx(
+                {},
+                method="POST",
+                body={
+                    "worktree_path": str(worktree),
+                    "port": 40008,
+                    "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+                    "shared_volume_path": str(alternate),
+                    "stable_database_identity": database_identity,
+                    "runtime_workspace": str(tmp_path / "runtime-alternate"),
+                },
+            )
+        )
+    assert launched == {}
+
+    result = server.handle_branch_service_validate(
+        _ctx(
+            {},
+            method="POST",
+                body={
+                    "worktree_path": str(worktree),
+                    "port": 40008,
+                    "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+                    "shared_volume_path": str(shared),
+                    "stable_database_identity": database_identity,
+                    "runtime_workspace": str(tmp_path / "runtime"),
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert launched["command"] == [
+        sys.executable,
+        "-m",
+        "agent.governance.server",
+    ]
+    assert launched["env"]["AMING_CLAW_RUNTIME_PLANE"] == "dev"
+    assert launched["env"]["GOVERNANCE_PORT"] == "40008"
+    assert launched["env"]["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] == "deny"
+    assert "start_governance.py" not in launched["command"]
 
 
 def _graph(node_id: str = "L7.1") -> dict:

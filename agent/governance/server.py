@@ -19,13 +19,13 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from threading import BoundedSemaphore, Event, RLock, local
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from pathlib import Path
-from typing import Any, Iterable, Mapping, NoReturn, Sequence
+from typing import Any, Iterable, Iterator, Mapping, NoReturn, Sequence
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -42,7 +42,15 @@ import sqlite3
 import time
 
 log = logging.getLogger(__name__)
-from .db import get_connection, DBContext, independent_connection, sqlite_write_lock
+from .db import (
+    AC_DATABASE_STABLE_RELATIVE_PATH,
+    canonical_ac_database_identity,
+    get_connection,
+    DBContext,
+    independent_connection,
+    sqlite_write_lock,
+    validate_project_id,
+)
 from . import role_service
 from . import state_service
 from . import project_service
@@ -134,6 +142,15 @@ import urllib.request
 import zlib
 PORT = int(os.environ.get("GOVERNANCE_PORT", "40000"))
 DASHBOARD_ROUTE_PREFIX = "/dashboard"
+
+AC_STABLE_SERVICE_PORT = 40000
+AC_DEV_SERVICE_PORT = 40008
+AC_DEV_BIND_HOST = "127.0.0.1"
+AC_DEV_BRANCH = "codex/ac-dev"
+AC_STABLE_BRANCH = "codex/direct-no-pass-post-reconcile-r2"
+AC_STABLE_ANCHOR_COMMIT = "a25838f15f949ac434cf78e03f20760e82ff81f0"
+_RUNTIME_PLANE_ENV = "AMING_CLAW_RUNTIME_PLANE"
+_STABLE_ANCHOR_ENV = "AMING_CLAW_STABLE_ANCHOR_COMMIT"
 
 AI_MODEL_CATALOG = {
     "anthropic": [
@@ -374,6 +391,283 @@ def governance_loaded_runtime_identity(worktree_version: str = "") -> dict[str, 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _runtime_plane() -> str:
+    value = os.environ.get(_RUNTIME_PLANE_ENV, "").strip().lower()
+    if value:
+        return value
+    return "stable" if _immutable_build_commit() else "generic"
+
+
+def _runtime_bind_host() -> str:
+    return AC_DEV_BIND_HOST if _runtime_plane() == "dev" else "0.0.0.0"
+
+
+def _current_stable_runtime_commit() -> str:
+    """Read the exact non-stale stable commit; accept legacy health only at a258."""
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{AC_STABLE_SERVICE_PORT}/api/health",
+            timeout=3,
+        ) as response:
+            health = json.load(response)
+    except Exception:
+        return ""
+    loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
+    if not (
+        health.get("status") == "ok"
+        and health.get("service") == "governance"
+        and health.get("port") == AC_STABLE_SERVICE_PORT
+        and health.get("runtime_stale") is False
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", loaded)
+    ):
+        return ""
+    identity = health.get("runtime_plane_identity")
+    if isinstance(identity, Mapping) and identity:
+        if not (
+            health.get("runtime_plane") == "stable"
+            and identity.get("status") == "ready"
+            and identity.get("branch") == AC_STABLE_BRANCH
+            and identity.get("commit") == loaded
+            and identity.get("stable_anchor_commit") == loaded
+        ):
+            return ""
+    elif loaded != AC_STABLE_ANCHOR_COMMIT:
+        return ""
+    return loaded
+
+
+def _current_stable_runtime_database_identity() -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{AC_STABLE_SERVICE_PORT}/api/health",
+            timeout=3,
+        ) as response:
+            health = json.load(response)
+    except Exception:
+        return {}
+    plane_identity = health.get("runtime_plane_identity")
+    database_identity = (
+        plane_identity.get("stable_database_identity")
+        if isinstance(plane_identity, Mapping)
+        else None
+    )
+    return (
+        dict(database_identity)
+        if _ac_stable_database_identity_valid(database_identity)
+        else {}
+    )
+
+
+def _git_identity(root: Path) -> dict[str, str]:
+    def run(*args: str) -> str:
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    return {
+        "worktree_root": run("rev-parse", "--show-toplevel") or str(root),
+        "branch": run("branch", "--show-current"),
+        "commit": run("rev-parse", "HEAD"),
+        "dirty": run("status", "--porcelain"),
+    }
+
+
+def _runtime_plane_identity() -> dict[str, Any]:
+    root = Path(__file__).resolve().parents[2]
+    git_identity = _git_identity(root)
+    plane = _runtime_plane()
+    immutable_commit = _immutable_build_commit()
+    identity_source = "git_worktree"
+    if plane == "stable" and immutable_commit:
+        # Release images do not include .git.  Their exact commit is embedded
+        # at build time and their branch is fixed by the promotion policy that
+        # alone is permitted to build the stable image.
+        git_identity = {
+            "worktree_root": "immutable-release-image",
+            "branch": AC_STABLE_BRANCH,
+            "commit": immutable_commit,
+            "dirty": "",
+        }
+        identity_source = "immutable_build_commit+promotion_branch_policy"
+    stable_anchor = os.environ.get(_STABLE_ANCHOR_ENV, "").strip()
+    if plane == "stable" and not stable_anchor and immutable_commit:
+        stable_anchor = immutable_commit
+    expected_port = (
+        AC_DEV_SERVICE_PORT
+        if plane == "dev"
+        else AC_STABLE_SERVICE_PORT
+        if plane == "stable"
+        else PORT
+    )
+    expected_branch = (
+        AC_DEV_BRANCH
+        if plane == "dev"
+        else AC_STABLE_BRANCH
+        if plane == "stable"
+        else git_identity["branch"]
+    )
+    violations: list[str] = []
+    stable_database_identity: dict[str, object] = {}
+    if plane in {"stable", "dev"}:
+        try:
+            stable_database_identity = canonical_ac_database_identity()
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            violations.append("stable_database_identity_invalid")
+    if plane not in {"generic", "stable", "dev"}:
+        violations.append("runtime_plane_unsupported")
+    elif plane == "dev":
+        if PORT != AC_DEV_SERVICE_PORT:
+            violations.append("dev_port_mismatch")
+        if git_identity["branch"] != AC_DEV_BRANCH:
+            violations.append("dev_branch_mismatch")
+        if not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor.lower()
+        ):
+            violations.append("stable_anchor_invalid")
+        if git_identity["dirty"]:
+            violations.append("dev_worktree_dirty")
+    elif plane == "stable":
+        if PORT != AC_STABLE_SERVICE_PORT:
+            violations.append("stable_port_mismatch")
+        if git_identity["branch"] != AC_STABLE_BRANCH:
+            violations.append("stable_branch_mismatch")
+        if git_identity["dirty"]:
+            violations.append("stable_worktree_dirty")
+        if not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(git_identity["commit"] or "").lower(),
+        ):
+            violations.append("stable_commit_unverifiable")
+        if not stable_anchor:
+            violations.append("stable_anchor_required")
+        elif stable_anchor != git_identity["commit"]:
+            violations.append("stable_anchor_mismatch")
+    elif git_identity["branch"] == AC_DEV_BRANCH:
+        violations.append("ac_dev_checkout_requires_explicit_dev_plane")
+    return {
+        "schema_version": "ac_runtime_plane_identity.v1",
+        "plane": plane,
+        "port": PORT,
+        "expected_port": expected_port,
+        "pid": SERVER_PID,
+        "bind_host": _runtime_bind_host(),
+        "worktree_root": git_identity["worktree_root"],
+        "branch": git_identity["branch"],
+        "expected_branch": expected_branch,
+        "identity_source": identity_source,
+        "commit": git_identity["commit"],
+        "worktree_dirty": bool(git_identity["dirty"]),
+        "worktree_dirty_files": git_identity["dirty"].splitlines(),
+        "stable_anchor_commit": stable_anchor,
+        "stable_database_identity": stable_database_identity,
+        "project_allowlist": ["aming-claw"] if plane == "dev" else [],
+        "schema_policy": "verify_only_no_auto_migration" if plane == "dev" else "managed",
+        "active_graph_activation_allowed": plane != "dev",
+        "stable_deploy_allowed": plane != "dev",
+        "background_workers_enabled": plane != "dev",
+        "status": "ready" if not violations else "invalid",
+        "violations": violations,
+    }
+
+
+def _validate_runtime_plane_startup() -> dict[str, Any]:
+    identity = _runtime_plane_identity()
+    if identity["violations"]:
+        raise GovernanceSingletonError(
+            "ac_dev_runtime_identity_invalid:" + ",".join(identity["violations"])
+        )
+    if identity["plane"] != "dev":
+        return identity
+    root = Path(str(identity["worktree_root"])).resolve()
+    canonical_shared_volume, canonical_database_identity = (
+        _branch_service_stable_database_binding(root)
+    )
+    shared_volume_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
+    if not shared_volume_raw:
+        raise GovernanceSingletonError(
+            "ac_dev_canonical_stable_shared_volume_required"
+        )
+    shared_volume_input = Path(shared_volume_raw).expanduser().absolute()
+    try:
+        supplied_shared_volume = shared_volume_input.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise GovernanceSingletonError(
+            "ac_dev_canonical_stable_shared_volume_unavailable"
+        ) from exc
+    if (
+        shared_volume_input.is_symlink()
+        or supplied_shared_volume != shared_volume_input
+        or supplied_shared_volume != canonical_shared_volume
+        or identity.get("stable_database_identity")
+        != canonical_database_identity
+    ):
+        raise GovernanceSingletonError(
+            "ac_dev_canonical_stable_database_identity_mismatch"
+        )
+    current_stable_commit = _current_stable_runtime_commit()
+    if not current_stable_commit:
+        raise GovernanceSingletonError("ac_dev_current_stable_identity_unavailable")
+    if identity["stable_anchor_commit"] != current_stable_commit:
+        raise GovernanceSingletonError("ac_dev_stable_anchor_not_current")
+    current_stable_database_identity = (
+        _current_stable_runtime_database_identity()
+    )
+    if current_stable_database_identity:
+        if (
+            identity.get("stable_database_identity")
+            != current_stable_database_identity
+        ):
+            raise GovernanceSingletonError(
+                "ac_dev_stable_database_identity_not_current"
+            )
+    elif current_stable_commit != AC_STABLE_ANCHOR_COMMIT:
+        raise GovernanceSingletonError(
+            "ac_dev_current_stable_database_identity_unavailable"
+        )
+    runtime_home_raw = os.environ.get("AMING_CLAW_HOME", "").strip()
+    if not runtime_home_raw:
+        raise GovernanceSingletonError("ac_dev_runtime_home_required")
+    runtime_home = Path(runtime_home_raw).expanduser().resolve()
+    if runtime_home == root or root in runtime_home.parents:
+        raise GovernanceSingletonError("ac_dev_runtime_home_must_be_outside_worktree")
+    try:
+        ancestry = subprocess.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                current_stable_commit,
+                str(identity["commit"]),
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GovernanceSingletonError("ac_dev_stable_anchor_unverifiable") from exc
+    if ancestry.returncode != 0:
+        raise GovernanceSingletonError("ac_dev_stable_anchor_not_ancestor")
+    try:
+        conn = get_connection("aming-claw")
+    except Exception as exc:
+        raise GovernanceSingletonError("ac_dev_database_preflight_failed") from exc
+    else:
+        conn.close()
+    return identity
 
 
 _CURRENT_FULL_BUILD_KEYS: set[tuple[str, str]] = set()
@@ -2075,9 +2369,53 @@ def _establish_governance_manager_generation() -> _GovernanceSingletonLease:
     """Acquire, certify, then publish the sole current manager generation."""
 
     global _GOVERNANCE_SINGLETON_LEASE
-    lease = _acquire_pid_lock()
+    if _runtime_plane() == "dev":
+        runtime_home = Path(os.environ["AMING_CLAW_HOME"]).expanduser().resolve()
+        lock_dir = runtime_home / "state" / "dev-governance"
+        lease = _acquire_pid_lock(lock_dir=lock_dir)
+    else:
+        lease = _acquire_pid_lock()
     try:
-        certificates = _certify_governance_manager_generation(lease)
+        if _runtime_plane() == "dev":
+            # The dev plane needs a process-local generation for build fencing,
+            # but must not append manager identity into the stable shared DB.
+            from . import graph_snapshot_store as store
+
+            receipt = lease.public_receipt()
+            certificate = {
+                "certificate_id": "dev-local:" + str(receipt["generation_id"]),
+                "sequence": 0,
+                "project_id": "aming-claw",
+                "generation_id": str(receipt["generation_id"]),
+                "manager_pid": int(receipt["manager_pid"]),
+                "manager_started_at": str(receipt["manager_started_at"]),
+                "process_start_identity": str(receipt["process_start_identity"]),
+                "manager_start_identity": str(receipt["manager_start_identity"]),
+                "lock_identity": str(receipt["lock_identity"]),
+                "predecessor_certificate_id": "",
+                "predecessor_generation_id": "",
+                "predecessor_sequence": 0,
+                "predecessor_certificate_hash": "",
+                "prior_manager_pid": int(receipt["prior_manager_pid"]),
+                "observed_prior_generation_id": str(
+                    receipt["observed_prior_generation_id"]
+                ),
+                "prior_process_start_identity": str(
+                    receipt["prior_process_start_identity"]
+                ),
+                "prior_pid_death_method": str(receipt["prior_pid_death_method"]),
+                "prior_pid_death_verified_at": str(
+                    receipt["prior_pid_death_verified_at"]
+                ),
+                "certified_at": str(receipt["lock_acquired_at"]),
+                "certificate_hash": "",
+            }
+            certificate["certificate_hash"] = (
+                store._manager_generation_certificate_hash(certificate)
+            )
+            certificates = {"aming-claw": certificate}
+        else:
+            certificates = _certify_governance_manager_generation(lease)
         with _GOVERNANCE_MANAGER_CERTIFICATES_LOCK:
             if _GOVERNANCE_SINGLETON_LEASE is not None:
                 raise GovernanceSingletonError(
@@ -2793,6 +3131,232 @@ def _runtime_context_implementation_writer_binding(
     return binding
 
 
+def _dev_runtime_zero_write_rejection(
+    *,
+    code: str,
+    path: str,
+    detail: str,
+) -> ValidationError:
+    stable_anchor = str(os.environ.get(_STABLE_ANCHOR_ENV) or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor):
+        stable_anchor = ""
+    return ValidationError(
+        code,
+        {
+            "schema_version": "ac_dev_runtime_mutation_boundary.v1",
+            "runtime_plane": "dev",
+            "path": path,
+            "detail": detail,
+            "stable_service_port": AC_STABLE_SERVICE_PORT,
+            "dev_service_port": AC_DEV_SERVICE_PORT,
+            "stable_anchor_commit": stable_anchor,
+            "stable_anchor_source": "validated_runtime_plane_environment",
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "pass_synthesized": False,
+        },
+    )
+
+
+def _dev_project_id_claims(
+    value: Any,
+    *,
+    source: str,
+) -> Iterator[tuple[str, Any]]:
+    """Yield every explicit project-id-shaped value in a request payload."""
+
+    if isinstance(value, Mapping):
+        for raw_key, item in value.items():
+            key = str(raw_key or "")
+            item_source = f"{source}.{key}" if key else source
+            if key == "project_id" or key.endswith("_project_id"):
+                yield item_source, item
+            elif key == "project_ids" or key.endswith("_project_ids"):
+                if isinstance(item, (list, tuple, set)):
+                    for index, claim in enumerate(item):
+                        yield f"{item_source}[{index}]", claim
+                else:
+                    yield item_source, item
+            yield from _dev_project_id_claims(item, source=item_source)
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from _dev_project_id_claims(
+                item,
+                source=f"{source}[{index}]",
+            )
+
+
+_dev_source_root_keys = (
+    "project_root",
+    "target_project_root",
+    "target_graph_root",
+    "worktree_path",
+    "workspace_path",
+    "repo_root",
+)
+
+
+def _dev_exact_source_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _dev_validate_source_root(
+    *,
+    path: str,
+    body: Mapping[str, Any],
+    required: bool,
+) -> None:
+    supplied = [
+        (field, body.get(field))
+        for field in _dev_source_root_keys
+        if body.get(field) not in (None, "")
+    ]
+    if required and not supplied:
+        raise _dev_runtime_zero_write_rejection(
+            code="ac_dev_exact_source_root_required",
+            path=path,
+            detail=(
+                "candidate/source graph writes require an explicit project_root "
+                "equal to the physical codex/ac-dev worktree"
+            ),
+        )
+    expected = _dev_exact_source_root()
+    for field, raw in supplied:
+        try:
+            actual = Path(str(raw)).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise _dev_runtime_zero_write_rejection(
+                code="ac_dev_source_root_invalid",
+                path=path,
+                detail=f"{field}: {exc}",
+            ) from exc
+        if actual != expected:
+            raise _dev_runtime_zero_write_rejection(
+                code="ac_dev_source_root_outside_candidate",
+                path=path,
+                detail=f"{field}: expected {expected}, got {actual}",
+            )
+
+
+def _dev_write_path_allowed(path: str) -> bool:
+    """Narrow repair-plane write surface; everything else is fail-closed."""
+
+    exact = {
+        "/api/task/aming-claw/timeline",
+        "/api/projects/aming-claw/observer-root-route-context",
+        "/api/projects/aming-claw/onboard-route-guide",
+        "/api/projects/aming-claw/onboard-route-guide/capsule",
+        "/api/graph-governance/aming-claw/query",
+        "/api/graph-governance/aming-claw/query-traces/start",
+        "/api/graph-governance/aming-claw/reconcile/full",
+        "/api/graph-governance/aming-claw/reconcile/current-full",
+        "/api/graph-governance/aming-claw/snapshots/import-existing",
+    }
+    if path in exact:
+        return True
+    patterns = (
+        r"^/api/backlog/aming-claw/[^/]+$",
+        r"^/api/projects/aming-claw/observer-sessions/[^/]+/(?:heartbeat|close|revoke)$",
+        r"^/api/projects/aming-claw/(?:onboard-contract|contract-add|contract-update)(?:/.*)?$",
+        r"^/api/projects/aming-claw/contract-runtime(?:/.*)?$",
+        r"^/api/graph-governance/aming-claw/query-traces/[^/]+/finish$",
+        r"^/api/graph-governance/aming-claw/snapshots/[^/]+/e2e/evidence$",
+    )
+    return any(re.fullmatch(pattern, path) for pattern in patterns)
+
+
+def _guard_dev_runtime_request(
+    *,
+    method: str,
+    path: str,
+    path_params: Mapping[str, Any],
+    body: Mapping[str, Any],
+) -> None:
+    """Enforce the dev plane before a handler opens a DB or mutates state."""
+
+    if _runtime_plane() != "dev":
+        return
+    project_claims = list(
+        _dev_project_id_claims(path_params, source="path_params")
+    ) + list(_dev_project_id_claims(body, source="body"))
+    for source, claim in project_claims:
+        try:
+            validate_project_id(claim)
+        except (TypeError, ValueError) as exc:
+            raise _dev_runtime_zero_write_rejection(
+                code="ac_dev_project_allowlist_rejected",
+                path=path,
+                detail=f"{source}: {exc}",
+            ) from exc
+
+    if method not in {"POST", "DELETE"}:
+        return
+    if not _dev_write_path_allowed(path):
+        raise _dev_runtime_zero_write_rejection(
+            code="ac_dev_mutation_not_allowlisted",
+            path=path,
+            detail=(
+                "dev writes are limited to AC repair backlog/timeline/"
+                "ContractRuntime, candidate-only graph, and QA evidence"
+            ),
+        )
+
+    root_required = path in {
+        "/api/graph-governance/aming-claw/reconcile/full",
+        "/api/graph-governance/aming-claw/reconcile/current-full",
+        "/api/graph-governance/aming-claw/snapshots/import-existing",
+    }
+    query_reads_source = path == "/api/graph-governance/aming-claw/query" and str(
+        body.get("tool") or ""
+    ) in {"search_docs", "get_file_excerpt"}
+    query_supplies_source_root = (
+        path == "/api/graph-governance/aming-claw/query"
+        and any(body.get(key) not in (None, "") for key in _dev_source_root_keys)
+    )
+    if root_required or query_reads_source or query_supplies_source_root:
+        _dev_validate_source_root(
+            path=path,
+            body=body,
+            required=root_required or query_reads_source,
+        )
+
+    if "/api/graph-governance/" not in path:
+        return
+    notes_extra = body.get("notes_extra")
+    if (
+        path.endswith("/reconcile/current-full")
+        and isinstance(notes_extra, Mapping)
+        and "_manager_action" in notes_extra
+    ):
+        raise _dev_runtime_zero_write_rejection(
+            code="ac_dev_current_full_manager_action_forbidden",
+            path=path,
+            detail="dev current-full is candidate-build only",
+        )
+    always_activate_paths = (
+        "/reconcile/backfill-escape",
+        "/finalize",
+    )
+    if any(marker in path for marker in always_activate_paths):
+        raise _dev_runtime_zero_write_rejection(
+            code="ac_dev_active_graph_mutation_forbidden",
+            path=path,
+            detail="dev runtime may build candidates but cannot finalize or activate the stable graph",
+        )
+    activate_requested = bool(body.get("activate") or body.get("make_active"))
+    if path.endswith("/reconcile/current-full"):
+        activate_requested = body.get("activate", True) is not False
+    elif path.endswith("/reconcile/pending-scope/catch-up"):
+        activate_requested = body.get("activate", True) is not False
+    if activate_requested:
+        raise _dev_runtime_zero_write_rejection(
+            code="ac_dev_active_graph_mutation_forbidden",
+            path=path,
+            detail="set activate=false and retain the result as a candidate for explicit promotion",
+        )
+
+
 class GovernanceHandler(BaseHTTPRequestHandler):
     """HTTP request handler with routing and middleware."""
 
@@ -2921,12 +3485,19 @@ class GovernanceHandler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "not_found", "message": "Endpoint not found"})
             return
         try:
+            request_body = self._read_body() if method == "POST" else {}
+            _guard_dev_runtime_request(
+                method=method,
+                path=urlparse(self.path).path,
+                path_params=path_params,
+                body=request_body,
+            )
             ctx = RequestContext(
                 handler=self,
                 method=method,
                 path_params=path_params,
                 query=self._query_params(),
-                body=self._read_body() if method == "POST" else {},
+                body=request_body,
                 request_id=request_id,
                 token=self.headers.get("X-Gov-Token", ""),
                 idem_key=self.headers.get("Idempotency-Key", ""),
@@ -194046,6 +194617,7 @@ def handle_health(ctx: RequestContext):
     health_version = get_server_version()
     gov_runtime_version = get_governance_runtime_version()
     loaded_runtime = governance_loaded_runtime_identity(health_version)
+    runtime_plane_identity = _runtime_plane_identity()
     return {
         "status": "ok",
         "service": "governance",
@@ -194070,6 +194642,1001 @@ def handle_health(ctx: RequestContext):
         ),
         "mcp_tool_schema": mcp_tool_schema_compatibility(),
         "pid": SERVER_PID,
+        "bind_host": runtime_plane_identity["bind_host"],
+        "runtime_plane": runtime_plane_identity["plane"],
+        "runtime_plane_identity": runtime_plane_identity,
+        "worktree_root": runtime_plane_identity["worktree_root"],
+        "branch": runtime_plane_identity["branch"],
+        "runtime_commit": runtime_plane_identity["commit"],
+        "stable_anchor_commit": runtime_plane_identity["stable_anchor_commit"],
+    }
+
+
+def _ac_promotion_nested_values(value: Any, key: str) -> Iterator[Any]:
+    if isinstance(value, Mapping):
+        for name, item in value.items():
+            if name == key:
+                yield item
+            yield from _ac_promotion_nested_values(item, key)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _ac_promotion_nested_values(item, key)
+
+
+def _ac_promotion_first_mapping(value: Any, key: str) -> dict[str, Any]:
+    return next(
+        (
+            dict(item)
+            for item in _ac_promotion_nested_values(value, key)
+            if isinstance(item, Mapping)
+        ),
+        {},
+    )
+
+
+def _ac_promotion_contains(value: Any, key: str, expected: Any) -> bool:
+    return any(item == expected for item in _ac_promotion_nested_values(value, key))
+
+
+def _ac_promotion_event_hash(event: Mapping[str, Any]) -> str:
+    return stable_sha256(
+        {
+            key: event.get(key)
+            for key in (
+                "id",
+                "project_id",
+                "backlog_id",
+                "task_id",
+                "event_type",
+                "phase",
+                "event_kind",
+                "actor",
+                "status",
+                "payload",
+                "verification",
+                "artifact_refs",
+                "commit_sha",
+            )
+        }
+    )
+
+
+def _ac_promotion_operator_principal_valid(value: Any) -> bool:
+    """Reject route-ref actors: promotion approval is a human/operator gate."""
+
+    principal = str(value or "")
+    return bool(
+        principal
+        and principal == principal.strip()
+        and len(principal) <= 256
+        and not principal.endswith(":route_ref")
+    )
+
+
+def _ac_stable_database_identity_valid(value: Any) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and set(value)
+        == {
+            "schema_version",
+            "device",
+            "inode",
+            "stable_relative_path_sha256",
+        }
+        and value.get("schema_version") == "ac_stable_database_identity.v1"
+        and isinstance(value.get("device"), int)
+        and not isinstance(value.get("device"), bool)
+        and int(value.get("device")) >= 0
+        and isinstance(value.get("inode"), int)
+        and not isinstance(value.get("inode"), bool)
+        and int(value.get("inode")) > 0
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(value.get("stable_relative_path_sha256") or ""),
+        )
+    )
+
+
+def _ac_promotion_row_to_event(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Decode one private timeline row without a bounded public projection."""
+
+    event = dict(row)
+    for key in ("payload_json", "verification_json", "artifact_refs_json"):
+        try:
+            event[key[:-5]] = json.loads(str(event.get(key) or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            event[key[:-5]] = {}
+    return event
+
+
+def _ac_promotion_timeline_event(
+    conn,
+    *,
+    project_id: str,
+    event_id: int,
+) -> dict[str, Any]:
+    """Read an exact event id; promotion authority must never depend on LIMIT."""
+
+    row = conn.execute(
+        "SELECT * FROM task_timeline_events WHERE project_id=? AND id=?",
+        (project_id, int(event_id)),
+    ).fetchone()
+    return _ac_promotion_row_to_event(row) if row is not None else {}
+
+
+def _ac_promotion_completion_events(conn, project_id: str) -> list[dict[str, Any]]:
+    """Read the complete project-wide promotion chain, not a first-page view."""
+
+    rows = conn.execute(
+        """SELECT * FROM task_timeline_events
+           WHERE project_id=? AND event_type='ac.stable_promotion_completed'
+           ORDER BY id ASC""",
+        (project_id,),
+    ).fetchall()
+    return [_ac_promotion_row_to_event(row) for row in rows]
+
+
+def _validate_ac_stable_promotion_durable_evidence(
+    conn,
+    *,
+    body: Mapping[str, Any],
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    candidate: str,
+    previous_stable: str,
+    file_fence: list[str],
+    diff_sha256: str,
+    verifier_sha256: str,
+    promotion_intent_sha256: str,
+    deploy: Mapping[str, Any],
+    stable_database_identity: Mapping[str, Any],
+    operator_approval_ref: str,
+) -> None:
+    """Re-verify every durable precheck fact inside the deployed stable plane."""
+
+    from . import task_timeline
+
+    fail_details = {"zero_write_rejection": True, "writes_performed": False}
+    precheck = body.get("precheck_receipt")
+    manifest = body.get("promotion_manifest")
+    if not isinstance(precheck, Mapping) or not isinstance(manifest, Mapping):
+        raise ValidationError("promotion completion requires full precheck and manifest", fail_details)
+    precheck = dict(precheck)
+    manifest = dict(manifest)
+    precheck_keys = {
+        "schema_version",
+        "verifier_version",
+        "verifier_sha256",
+        "promotion_intent_sha256",
+        "promotion_manifest_sha256",
+        "stable_anchor_commit",
+        "candidate_commit",
+        "diff_sha256",
+        "stable_database_identity",
+        "previous_promotion_receipt_hash",
+        "prior_promotion_event_id",
+        "gate_event_ids",
+        "operator_approval_ref",
+        "gate_evidence_hashes",
+        "pass_synthesized",
+        "writes_performed",
+        "receipt_hash",
+    }
+    if set(precheck) != precheck_keys:
+        raise ValidationError("promotion precheck receipt has missing or extra fields", fail_details)
+    receipt_hash = str(precheck.get("receipt_hash") or "")
+    receipt_core = {key: value for key, value in precheck.items() if key != "receipt_hash"}
+    if (
+        stable_sha256(receipt_core) != receipt_hash
+        or body.get("precheck_receipt_hash") != receipt_hash
+        or precheck.get("schema_version") != "ac_stable_promotion_precheck_receipt.v1"
+        or precheck.get("verifier_version") != "readonly_timeline_projector.v1"
+        or precheck.get("pass_synthesized") is not False
+        or precheck.get("writes_performed") is not False
+    ):
+        raise ValidationError("promotion precheck receipt digest/policy mismatch", fail_details)
+    manifest_keys = {
+        "schema_version",
+        "project_id",
+        "backlog_id",
+        "contract_execution_id",
+        "stable_anchor_commit",
+        "stable_branch",
+        "branch",
+        "candidate_commit",
+        "file_fence",
+        "diff_sha256",
+        "promotion_intent_sha256",
+        "promotion_manifest_sha256",
+        "gates",
+        "deploy",
+        "stable_database_identity",
+        "prior_promotion",
+    }
+    if set(manifest) != manifest_keys:
+        raise ValidationError("promotion manifest has missing or extra fields", fail_details)
+    expected_manifest_values = {
+        "schema_version": "ac_stable_promotion_manifest.v1",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "stable_anchor_commit": previous_stable,
+        "stable_branch": AC_STABLE_BRANCH,
+        "branch": AC_DEV_BRANCH,
+        "candidate_commit": candidate,
+        "file_fence": file_fence,
+        "diff_sha256": diff_sha256,
+        "promotion_intent_sha256": promotion_intent_sha256,
+        "deploy": dict(deploy),
+        "stable_database_identity": dict(stable_database_identity),
+    }
+    if any(manifest.get(key) != value for key, value in expected_manifest_values.items()):
+        raise ValidationError("promotion manifest does not match deployed request", fail_details)
+    intent = {
+        key: manifest[key]
+        for key in (
+            "schema_version",
+            "project_id",
+            "backlog_id",
+            "contract_execution_id",
+            "stable_anchor_commit",
+            "stable_branch",
+            "branch",
+            "candidate_commit",
+            "file_fence",
+            "diff_sha256",
+            "deploy",
+            "stable_database_identity",
+        )
+    }
+    if stable_sha256(intent) != promotion_intent_sha256:
+        raise ValidationError("promotion intent is not canonical", fail_details)
+    gates = manifest.get("gates")
+    if not isinstance(gates, Mapping) or set(gates) != {"qa_verdict", "operator_signoff"}:
+        raise ValidationError("promotion gates are not canonical", fail_details)
+    qa_gate = gates.get("qa_verdict")
+    operator_gate = gates.get("operator_signoff")
+    if not isinstance(qa_gate, Mapping) or not isinstance(operator_gate, Mapping):
+        raise ValidationError("promotion gate bodies are required", fail_details)
+    if set(qa_gate) != {"timeline_event_id", "status"} or qa_gate.get(
+        "status"
+    ) != "passed":
+        raise ValidationError("QA gate shape/status is not canonical", fail_details)
+    if set(operator_gate) != {
+        "status",
+        "nonce",
+        "operator_principal_id",
+        "expires_at",
+        "queue_event_id",
+    } or operator_gate.get("status") != "approved":
+        raise ValidationError(
+            "operator signoff gate shape/status is not canonical",
+            fail_details,
+        )
+    signable_operator = {
+        key: operator_gate.get(key)
+        for key in ("status", "nonce", "operator_principal_id", "expires_at")
+    }
+    signable_manifest = {
+        **intent,
+        "promotion_intent_sha256": promotion_intent_sha256,
+        "prior_promotion": manifest.get("prior_promotion"),
+        "gates": {
+            "qa_verdict": dict(qa_gate),
+            "operator_signoff": signable_operator,
+        },
+    }
+    manifest_hash = stable_sha256(signable_manifest)
+    if (
+        manifest.get("promotion_manifest_sha256") != manifest_hash
+        or body.get("promotion_manifest_sha256") != manifest_hash
+        or precheck.get("promotion_manifest_sha256") != manifest_hash
+    ):
+        raise ValidationError("promotion manifest digest mismatch", fail_details)
+    for key, expected in (
+        ("verifier_sha256", verifier_sha256),
+        ("promotion_intent_sha256", promotion_intent_sha256),
+        ("stable_anchor_commit", previous_stable),
+        ("candidate_commit", candidate),
+        ("diff_sha256", diff_sha256),
+        ("stable_database_identity", dict(stable_database_identity)),
+        ("operator_approval_ref", operator_approval_ref),
+    ):
+        if precheck.get(key) != expected:
+            raise ValidationError(f"promotion precheck {key} mismatch", fail_details)
+
+    gate_ids = precheck.get("gate_event_ids")
+    evidence_hashes = precheck.get("gate_evidence_hashes")
+    if (
+        not isinstance(gate_ids, Mapping)
+        or set(gate_ids) != {"qa_verdict", "operator_signoff"}
+        or not isinstance(evidence_hashes, Mapping)
+        or set(evidence_hashes) != {"qa_verdict", "operator_signoff"}
+    ):
+        raise ValidationError("promotion precheck gate projection mismatch", fail_details)
+    qa_event_id = int(qa_gate.get("timeline_event_id") or 0)
+    if qa_event_id < 1 or gate_ids.get("qa_verdict") != qa_event_id:
+        raise ValidationError("QA gate event id mismatch", fail_details)
+    qa_event = _ac_promotion_timeline_event(
+        conn,
+        project_id=project_id,
+        event_id=qa_event_id,
+    )
+    if (
+        not qa_event
+        or qa_event.get("backlog_id") != backlog_id
+        or qa_event.get("task_id") != contract_execution_id
+    ):
+        raise ValidationError("durable QA verdict is missing", fail_details)
+    if (
+        qa_event.get("event_type") != "qa.independent_verification"
+        or qa_event.get("event_kind") != "independent_verification"
+        or qa_event.get("phase") != "qa"
+        or str(qa_event.get("status") or "").lower() not in {"pass", "passed"}
+        or qa_event.get("commit_sha") != candidate
+        or evidence_hashes.get("qa_verdict") != _ac_promotion_event_hash(qa_event)
+    ):
+        raise ValidationError("durable QA verdict identity/hash mismatch", fail_details)
+    qa_evidence = {
+        "payload": qa_event.get("payload") or {},
+        "verification": qa_event.get("verification") or {},
+        "artifact_refs": qa_event.get("artifact_refs") or {},
+    }
+    authority = _ac_promotion_first_mapping(
+        qa_evidence,
+        "source_backed_contract_gate_authority",
+    )
+    if not task_timeline._source_backed_qa_session_authority_valid(authority, conn=conn):
+        raise ValidationError("durable QA verdict is not role-bound", fail_details)
+    proof = authority.get("qa_session_proof") if isinstance(authority.get("qa_session_proof"), Mapping) else {}
+    if any(
+        str(proof.get(key) or "") != expected
+        for key, expected in (
+            ("project_id", project_id),
+            ("backlog_id", backlog_id),
+            ("task_id", contract_execution_id),
+            ("commit_sha", candidate),
+            ("principal_id", str(qa_event.get("actor") or "")),
+        )
+    ):
+        raise ValidationError("durable QA authority scope mismatch", fail_details)
+    canonical_line = _ac_promotion_first_mapping(qa_evidence, "contract_runtime_canonical_line")
+    if not (
+        canonical_line.get("stage_id") == "qa"
+        and canonical_line.get("line_id") == "qa_independent_verification"
+        and canonical_line.get("contract_execution_id") == contract_execution_id
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(canonical_line.get("runtime_guide_hash") or ""))
+    ):
+        raise ValidationError("durable QA ContractRuntime line mismatch", fail_details)
+    review = proof.get("candidate_review_context") if isinstance(proof.get("candidate_review_context"), Mapping) else {}
+    if not review:
+        review = _ac_promotion_first_mapping(qa_evidence, "candidate_review_context")
+    if not (
+        review.get("candidate_commit_sha") == candidate
+        and review.get("comparison_base_commit_sha") == previous_stable
+        and review.get("comparison_authority_required") is True
+        and review.get("candidate_diff_hash") == diff_sha256
+        and list(review.get("changed_files") or []) == file_fence
+    ):
+        raise ValidationError("durable QA comparison authority mismatch", fail_details)
+    if not (
+        _ac_promotion_contains(qa_evidence, "stable_anchor_commit", previous_stable)
+        and _ac_promotion_contains(qa_evidence, "promotion_intent_sha256", promotion_intent_sha256)
+        and _ac_promotion_contains(qa_evidence, "file_fence", file_fence)
+        and _ac_promotion_contains(
+            qa_evidence,
+            "stable_database_identity",
+            dict(stable_database_identity),
+        )
+    ):
+        raise ValidationError("durable QA promotion binding mismatch", fail_details)
+    if any(item is True for item in _ac_promotion_nested_values(qa_evidence, "pass_synthesized")):
+        raise ValidationError("durable QA PASS is synthesized", fail_details)
+    promotion_results = _ac_promotion_first_mapping(qa_evidence, "promotion_gate_results")
+    branch_result = promotion_results.get("branch_service") if isinstance(promotion_results.get("branch_service"), Mapping) else {}
+    lanes = promotion_results.get("lanes") if isinstance(promotion_results.get("lanes"), Mapping) else {}
+    if not (
+        branch_result.get("test_id")
+        and branch_result.get("status") == "passed"
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(branch_result.get("report_sha256") or ""))
+        and branch_result.get("runtime_plane") == "dev"
+        and branch_result.get("port") == AC_DEV_SERVICE_PORT
+        and branch_result.get("bind_host") == AC_DEV_BIND_HOST
+        and set(lanes) == {"direct_main", "mf_parallel", "mf_batch_parallel"}
+    ):
+        raise ValidationError("durable QA promotion subresults are incomplete", fail_details)
+    for lane in lanes.values():
+        if not isinstance(lane, Mapping) or not (
+            lane.get("test_id")
+            and lane.get("status") == "passed"
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", str(lane.get("report_sha256") or ""))
+        ):
+            raise ValidationError("durable QA lane subresult is incomplete", fail_details)
+    authority_hash = str(authority.get("authority_hash") or "")
+    authority_rows = conn.execute(
+        """SELECT * FROM task_timeline_events
+           WHERE project_id=?
+           ORDER BY id ASC""",
+        (project_id,),
+    ).fetchall()
+    authority_matches = []
+    for row in authority_rows:
+        event = _ac_promotion_row_to_event(row)
+        evidence = {
+            "payload": event.get("payload") or {},
+            "verification": event.get("verification") or {},
+            "artifact_refs": event.get("artifact_refs") or {},
+        }
+        if _ac_promotion_contains(evidence, "authority_hash", authority_hash):
+            authority_matches.append(event)
+    if len(authority_matches) != 1 or int(authority_matches[0].get("id") or 0) != qa_event_id:
+        raise ValidationError("durable QA authority replay/ambiguity detected", fail_details)
+
+    queue_event_id = int(operator_gate.get("queue_event_id") or 0)
+    if queue_event_id < 1 or gate_ids.get("operator_signoff") != queue_event_id:
+        raise ValidationError("operator signoff event id mismatch", fail_details)
+    signoff_row = conn.execute(
+        "SELECT * FROM release_operator_head_queue_events WHERE id=? AND project_id=?",
+        (queue_event_id, project_id),
+    ).fetchone()
+    if signoff_row is None:
+        raise ValidationError("durable operator signoff is missing", fail_details)
+    signoff_row = dict(signoff_row)
+    try:
+        before = json.loads(signoff_row.get("before_json") or "{}")
+        after = json.loads(signoff_row.get("after_json") or "{}")
+        signoff = json.loads(signoff_row.get("reason") or "")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValidationError("durable operator signoff is malformed", fail_details) from exc
+    expected_signoff = {
+        "schema_version": "ac_stable_promotion_operator_signoff.v1",
+        "nonce": operator_gate.get("nonce"),
+        "operator_principal_id": operator_gate.get("operator_principal_id"),
+        "expires_at": operator_gate.get("expires_at"),
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "stable_anchor_commit": previous_stable,
+        "candidate_commit": candidate,
+        "promotion_intent_sha256": promotion_intent_sha256,
+        "promotion_manifest_sha256": manifest_hash,
+        "verifier_sha256": verifier_sha256,
+        "diff_sha256": diff_sha256,
+        "file_fence": file_fence,
+        "deploy": dict(deploy),
+        "stable_database_identity": dict(stable_database_identity),
+    }
+    if not (
+        _ac_promotion_operator_principal_valid(
+            operator_gate.get("operator_principal_id")
+        )
+        and _ac_promotion_operator_principal_valid(signoff_row.get("actor"))
+        and signoff_row.get("action") == "reorder"
+        and signoff_row.get("backlog_id") == ""
+        and before == after
+        and signoff_row.get("actor") == operator_gate.get("operator_principal_id")
+        and signoff == expected_signoff
+        and signoff_row.get("reason") == json.dumps(signoff, sort_keys=True, separators=(",", ":"))
+        and operator_approval_ref == f"release-operator-head-queue-event:{queue_event_id}"
+    ):
+        raise ValidationError("durable operator signoff identity mismatch", fail_details)
+    try:
+        created = datetime.fromisoformat(str(signoff_row.get("created_at") or "").replace("Z", "+00:00"))
+        expires = datetime.fromisoformat(str(signoff.get("expires_at") or "").replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValidationError("durable operator signoff time is invalid", fail_details) from exc
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if expires <= created or expires - created > timedelta(hours=1) or datetime.now(timezone.utc) >= expires:
+        raise ValidationError("durable operator signoff is expired", fail_details)
+    nonce_rows = []
+    for row in conn.execute(
+        "SELECT id, reason FROM release_operator_head_queue_events WHERE project_id=? AND action='reorder'",
+        (project_id,),
+    ).fetchall():
+        try:
+            parsed = json.loads(row["reason"] or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if parsed.get("schema_version") == "ac_stable_promotion_operator_signoff.v1" and parsed.get("nonce") == signoff.get("nonce"):
+            nonce_rows.append(int(row["id"]))
+    if sorted(nonce_rows) != [queue_event_id]:
+        raise ValidationError("durable operator signoff nonce replay detected", fail_details)
+    signoff_hash = stable_sha256(
+        {
+            key: signoff_row.get(key)
+            for key in (
+                "id",
+                "project_id",
+                "action",
+                "backlog_id",
+                "actor",
+                "reason",
+                "before_json",
+                "after_json",
+                "created_at",
+            )
+        }
+    )
+    if evidence_hashes.get("operator_signoff") != signoff_hash:
+        raise ValidationError("durable operator signoff hash mismatch", fail_details)
+
+    prior = manifest.get("prior_promotion")
+    previous_receipt = str(precheck.get("previous_promotion_receipt_hash") or "")
+    prior_event_id = int(precheck.get("prior_promotion_event_id") or 0)
+    if previous_stable == AC_STABLE_ANCHOR_COMMIT:
+        if prior != {"kind": "bootstrap", "stable_commit": AC_STABLE_ANCHOR_COMMIT} or previous_receipt or prior_event_id:
+            raise ValidationError("bootstrap promotion chain is not canonical", fail_details)
+    else:
+        if not isinstance(prior, Mapping) or prior.get("kind") != "timeline_receipt":
+            raise ValidationError("successor promotion requires prior receipt", fail_details)
+        if prior.get("timeline_event_id") != prior_event_id or prior.get("receipt_hash") != previous_receipt:
+            raise ValidationError("prior promotion receipt projection mismatch", fail_details)
+        prior_events = _ac_promotion_completion_events(conn, project_id)
+        matching_prior = [
+            event
+            for event in prior_events
+            if event.get("event_type") == "ac.stable_promotion_completed"
+            and event.get("commit_sha") == previous_stable
+            and isinstance(event.get("payload"), Mapping)
+            and event["payload"].get("promoted_commit") == previous_stable
+            and event["payload"].get("promotion_receipt_hash") == previous_receipt
+            and event["payload"].get("stable_database_identity")
+            == dict(stable_database_identity)
+        ]
+        if len(matching_prior) != 1 or int(matching_prior[0].get("id") or 0) != prior_event_id:
+            raise ValidationError("prior promotion receipt is missing or ambiguous", fail_details)
+
+
+def _ac_promotion_request_previous_receipt(
+    body: Mapping[str, Any],
+    *,
+    previous_stable: str,
+) -> str:
+    """Bind the persisted chain pointer to both signed request projections.
+
+    This validation intentionally precedes completion idempotency.  Otherwise
+    a caller can substitute the top-level predecessor used to derive the new
+    receipt while presenting a precheck/manifest for a different chain (or a
+    non-empty predecessor for the bootstrap promotion).
+    """
+
+    fail_details = {"zero_write_rejection": True, "writes_performed": False}
+    precheck = body.get("precheck_receipt")
+    manifest = body.get("promotion_manifest")
+    if not isinstance(precheck, Mapping) or not isinstance(manifest, Mapping):
+        raise ValidationError(
+            "promotion completion requires full precheck and manifest",
+            fail_details,
+        )
+    body_previous = str(
+        body.get("previous_promotion_receipt_hash") or ""
+    ).strip()
+    precheck_previous = str(
+        precheck.get("previous_promotion_receipt_hash") or ""
+    ).strip()
+    prior_event_id = precheck.get("prior_promotion_event_id")
+    if isinstance(prior_event_id, bool) or not isinstance(prior_event_id, int):
+        raise ValidationError(
+            "promotion predecessor event id is not canonical",
+            fail_details,
+        )
+    prior = manifest.get("prior_promotion")
+    if body_previous != precheck_previous:
+        raise ValidationError(
+            "promotion predecessor receipt does not match precheck",
+            fail_details,
+        )
+    if previous_stable == AC_STABLE_ANCHOR_COMMIT:
+        if (
+            body_previous
+            or prior_event_id != 0
+            or prior
+            != {
+                "kind": "bootstrap",
+                "stable_commit": AC_STABLE_ANCHOR_COMMIT,
+            }
+        ):
+            raise ValidationError(
+                "bootstrap promotion predecessor must be empty",
+                fail_details,
+            )
+        return ""
+    if (
+        not re.fullmatch(r"sha256:[0-9a-f]{64}", body_previous)
+        or prior_event_id < 1
+        or not isinstance(prior, Mapping)
+        or set(prior) != {"kind", "timeline_event_id", "receipt_hash"}
+        or prior.get("kind") != "timeline_receipt"
+        or prior.get("timeline_event_id") != prior_event_id
+        or prior.get("receipt_hash") != body_previous
+    ):
+        raise ValidationError(
+            "successor promotion predecessor receipt is not canonical",
+            fail_details,
+        )
+    return body_previous
+
+
+@route("POST", "/api/projects/{project_id}/ac-stable-promotion/complete")
+def handle_ac_stable_promotion_complete(ctx: RequestContext):
+    """Persist the chained receipt only from the exact deployed stable runtime."""
+
+    project_id = ctx.get_project_id()
+    if project_id != "aming-claw":
+        raise ValidationError("stable promotion completion is AC-only")
+    if not ctx.token:
+        raise PermissionDeniedError(
+            "anonymous",
+            "ac_stable_promotion_complete",
+            {"explicit_coordinator_token_required": True},
+        )
+    identity = _runtime_plane_identity()
+    if identity.get("plane") != "stable" or identity.get("status") != "ready":
+        raise ValidationError(
+            "stable promotion completion requires the exact ready stable plane",
+            {
+                "runtime_plane": identity.get("plane"),
+                "identity_status": identity.get("status"),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    candidate = str(body.get("candidate_commit") or "").strip().lower()
+    if candidate != identity.get("commit") or candidate != identity.get(
+        "stable_anchor_commit"
+    ):
+        raise ValidationError(
+            "promotion completion candidate does not equal deployed stable identity",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+
+    exact_hash_keys = (
+        "promotion_intent_sha256",
+        "promotion_manifest_sha256",
+        "precheck_receipt_hash",
+        "verifier_sha256",
+        "diff_sha256",
+    )
+    if any(
+        not re.fullmatch(r"sha256:[0-9a-f]{64}", str(body.get(key) or ""))
+        for key in exact_hash_keys
+    ):
+        raise ValidationError(
+            "promotion completion requires exact verifier/intent/precheck/diff hashes",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    contract_execution_id = str(
+        body.get("contract_execution_id") or ""
+    ).strip()
+    approval_ref = str(body.get("operator_approval_ref") or "").strip()
+    file_fence = body.get("file_fence")
+    previous_stable = str(body.get("previous_stable_commit") or "").strip()
+    database_identity = body.get("stable_database_identity")
+    if not backlog_id or not contract_execution_id or not approval_ref:
+        raise ValidationError("promotion completion lineage is incomplete")
+    if (
+        not isinstance(file_fence, list)
+        or not file_fence
+        or len(set(file_fence)) != len(file_fence)
+        or any(
+            not isinstance(item, str)
+            or not item
+            or Path(item).is_absolute()
+            or ".." in Path(item).parts
+            for item in file_fence
+        )
+    ):
+        raise ValidationError("promotion completion file_fence is invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", previous_stable):
+        raise ValidationError("previous stable commit is malformed")
+    if (
+        not _ac_stable_database_identity_valid(database_identity)
+        or identity.get("stable_database_identity") != database_identity
+    ):
+        raise ValidationError(
+            "promotion completion stable database identity mismatch",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    database_identity = dict(database_identity)
+    previous_receipt = _ac_promotion_request_previous_receipt(
+        body,
+        previous_stable=previous_stable,
+    )
+    source_root = Path(__file__).resolve().parents[2]
+    ancestry = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", previous_stable, candidate],
+        cwd=source_root,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    if ancestry.returncode != 0:
+        raise ValidationError("promotion completion is not a linear successor")
+    diff = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "-M",
+            f"{previous_stable}..{candidate}",
+            "--",
+            ".",
+        ],
+        cwd=source_root,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", previous_stable, candidate],
+        cwd=source_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    actual_diff_hash = "sha256:" + hashlib.sha256(diff.stdout).hexdigest()
+    actual_files = changed.stdout.splitlines()
+    if (
+        diff.returncode != 0
+        or changed.returncode != 0
+        or actual_diff_hash != body.get("diff_sha256")
+        or set(actual_files) != set(file_fence)
+        or len(actual_files) != len(file_fence)
+    ):
+        raise ValidationError(
+            "promotion completion diff/fence does not match Git objects",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    expected_verifier_hash = "sha256:" + hashlib.sha256(
+        (source_root / "scripts" / "merge-and-deploy.sh").read_bytes()
+    ).hexdigest()
+    if body.get("verifier_sha256") != expected_verifier_hash:
+        raise ValidationError("promotion verifier hash is not the deployed source")
+    deploy = body.get("deploy")
+    if deploy != {
+        "authorized": True,
+        "mode": "host_supervisor",
+        "stable_port": AC_STABLE_SERVICE_PORT,
+    }:
+        raise ValidationError("promotion completion deploy policy mismatch")
+    canonical_intent = {
+        "schema_version": "ac_stable_promotion_manifest.v1",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "stable_anchor_commit": previous_stable,
+        "stable_branch": AC_STABLE_BRANCH,
+        "branch": AC_DEV_BRANCH,
+        "candidate_commit": candidate,
+        "file_fence": list(file_fence),
+        "diff_sha256": actual_diff_hash,
+        "deploy": dict(deploy),
+        "stable_database_identity": database_identity,
+    }
+    expected_intent_hash = "sha256:" + hashlib.sha256(
+        json.dumps(
+            canonical_intent,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if body.get("promotion_intent_sha256") != expected_intent_hash:
+        raise ValidationError("promotion completion intent digest mismatch")
+
+    supplied_health = body.get("health_identity")
+    if not isinstance(supplied_health, Mapping):
+        raise ValidationError("promotion completion health identity is required")
+    expected_health = {
+        "runtime_loaded_version": candidate,
+        "runtime_plane_identity": identity,
+        "runtime_stale": False,
+    }
+    if dict(supplied_health) != expected_health:
+        raise ValidationError(
+            "promotion completion health identity is stale or caller-rewritten",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+
+    receipt_body = {
+        "schema_version": "ac_stable_promotion_completion_receipt.v1",
+        "verifier_version": "stable_runtime_completion.v1",
+        "promoted_commit": candidate,
+        "previous_stable_commit": str(
+            previous_stable
+        ),
+        "previous_promotion_receipt_hash": previous_receipt,
+        "promotion_intent_sha256": str(body["promotion_intent_sha256"]),
+        "promotion_manifest_sha256": str(body["promotion_manifest_sha256"]),
+        "precheck_receipt_hash": str(body["precheck_receipt_hash"]),
+        "verifier_sha256": str(body["verifier_sha256"]),
+        "diff_sha256": str(body["diff_sha256"]),
+        "file_fence": list(file_fence),
+        "operator_approval_ref": approval_ref,
+        "stable_branch": AC_STABLE_BRANCH,
+        "stable_port": AC_STABLE_SERVICE_PORT,
+        "runtime_identity": dict(identity),
+        "stable_database_identity": database_identity,
+        "pass_synthesized": False,
+    }
+    receipt_hash = "sha256:" + hashlib.sha256(
+        json.dumps(
+            receipt_body,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    from . import task_timeline
+
+    conn = get_connection(project_id)
+    try:
+        session = ctx.require_auth(conn)
+        if str(session.get("role") or "").lower() not in {
+            "coordinator",
+            "operator",
+        }:
+            raise PermissionDeniedError(
+                str(session.get("role") or "unknown"),
+                "ac_stable_promotion_complete",
+            )
+        # Serialize durable-gate validation, project-wide chain replay/fork
+        # detection, and receipt append.  Checking outside this critical
+        # section lets two concurrent completion requests both observe an
+        with sqlite_write_lock():
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                opened_database_identity = canonical_ac_database_identity(conn)
+                if opened_database_identity != database_identity:
+                    raise ValidationError(
+                        "promotion completion opened database identity mismatch",
+                        {
+                            "zero_write_rejection": True,
+                            "writes_performed": False,
+                        },
+                    )
+                # A lost successful response remains replayable after the
+                # one-hour signoff expires.  Authenticate first, then accept
+                # only the byte-equivalent server receipt already in the
+                # project-wide chain; do not re-run mutable gate liveness.
+                completion_events = _ac_promotion_completion_events(
+                    conn, project_id
+                )
+                expected_payload = {
+                    **receipt_body,
+                    "promotion_receipt_hash": receipt_hash,
+                }
+                exact_replays = [
+                    event
+                    for event in completion_events
+                    if event.get("backlog_id") == backlog_id
+                    and event.get("task_id") == contract_execution_id
+                    and event.get("commit_sha") == candidate
+                    and event.get("payload") == expected_payload
+                ]
+                if len(exact_replays) == 1:
+                    conn.rollback()
+                    return {
+                        "ok": True,
+                        "idempotent": True,
+                        "timeline_event_id": exact_replays[0].get("id"),
+                        "promotion_receipt_hash": receipt_hash,
+                        "promoted_commit": candidate,
+                    }
+                if len(exact_replays) > 1:
+                    raise ValidationError(
+                        "promotion completion receipt is duplicated",
+                        {
+                            "conflicting_timeline_event_ids": [
+                                int(event.get("id") or 0)
+                                for event in exact_replays
+                            ],
+                            "zero_write_rejection": True,
+                            "writes_performed": False,
+                        },
+                    )
+
+                _validate_ac_stable_promotion_durable_evidence(
+                    conn,
+                    body=body,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    contract_execution_id=contract_execution_id,
+                    candidate=candidate,
+                    previous_stable=previous_stable,
+                    file_fence=list(file_fence),
+                    diff_sha256=actual_diff_hash,
+                    verifier_sha256=expected_verifier_hash,
+                    promotion_intent_sha256=expected_intent_hash,
+                    deploy=dict(deploy),
+                    stable_database_identity=database_identity,
+                    operator_approval_ref=approval_ref,
+                )
+                # Promotion receipts form one project-wide linear chain. Do
+                # not scope conflicts to a backlog or bounded timeline page.
+                conflicting_candidate = [
+                    int(event.get("id") or 0)
+                    for event in completion_events
+                    if event.get("commit_sha") == candidate
+                ]
+                if conflicting_candidate:
+                    raise ValidationError(
+                        "candidate already has a different promotion completion receipt",
+                        {
+                            "conflicting_timeline_event_ids": conflicting_candidate,
+                            "zero_write_rejection": True,
+                            "writes_performed": False,
+                        },
+                    )
+                forked = []
+                for event in completion_events:
+                    payload = event.get("payload")
+                    if (
+                        isinstance(payload, Mapping)
+                        and payload.get("previous_stable_commit") == previous_stable
+                        and payload.get("promoted_commit") != candidate
+                    ):
+                        forked.append(int(event.get("id") or 0))
+                if forked:
+                    raise ValidationError(
+                        "stable promotion chain already has a different successor",
+                        {
+                            "conflicting_timeline_event_ids": forked,
+                            "zero_write_rejection": True,
+                            "writes_performed": False,
+                        },
+                    )
+                verification = {
+                    "server_derived": True,
+                    "runtime_plane": "stable",
+                    "runtime_identity_status": "ready",
+                    "pass_synthesized": False,
+                }
+                cursor = conn.execute(
+                    """INSERT INTO task_timeline_events(
+                           project_id, backlog_id, task_id, event_type, phase,
+                           event_kind, actor, status, payload_json,
+                           verification_json, artifact_refs_json, commit_sha,
+                           created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)""",
+                    (
+                        project_id,
+                        backlog_id,
+                        contract_execution_id,
+                        "ac.stable_promotion_completed",
+                        "release",
+                        "stable_promotion",
+                        "operator",
+                        "accepted",
+                        json.dumps(expected_payload, sort_keys=True),
+                        json.dumps(verification, sort_keys=True),
+                        candidate,
+                        _utc_now(),
+                    ),
+                )
+                conn.commit()
+                event = {"id": int(cursor.lastrowid)}
+            except Exception:
+                conn.rollback()
+                raise
+    finally:
+        conn.close()
+    return {
+        "ok": True,
+        "idempotent": False,
+        "timeline_event_id": event.get("id"),
+        "promotion_receipt_hash": receipt_hash,
+        "promoted_commit": candidate,
     }
 
 
@@ -194094,6 +195661,59 @@ def _branch_service_git_output(worktree: Path, args: Sequence[str]) -> str:
     except Exception:
         return ""
     return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _branch_service_stable_database_binding(
+    worktree: Path,
+) -> tuple[Path, dict[str, Any]]:
+    proc = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    expected_branch = "refs/heads/" + AC_STABLE_BRANCH
+    roots: list[Path] = []
+    if proc.returncode == 0:
+        for block in proc.stdout.strip().split("\n\n"):
+            values = dict(
+                line.split(" ", 1) if " " in line else (line, "")
+                for line in block.splitlines()
+            )
+            if values.get("branch") == expected_branch and values.get("worktree"):
+                roots.append(Path(values["worktree"]).resolve(strict=True))
+    if len(roots) != 1:
+        raise ValidationError(
+            "branch-service exact stable worktree is unavailable",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    shared = (roots[0] / "shared-volume").absolute()
+    if shared.is_symlink() or shared.resolve(strict=True) != shared:
+        raise ValidationError(
+            "branch-service canonical stable shared volume is invalid",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    database = shared / Path(AC_DATABASE_STABLE_RELATIVE_PATH).relative_to(
+        "shared-volume"
+    )
+    metadata = database.stat(follow_symlinks=False)
+    if database.is_symlink() or not database.is_file() or database.resolve(strict=True) != database:
+        raise ValidationError(
+            "branch-service canonical stable database is invalid",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "stable_relative_path_sha256": "sha256:"
+        + hashlib.sha256(
+            AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+        ).hexdigest(),
+    }
+    return shared, identity
 
 
 def _branch_service_tail(text: str | None, limit: int = 2000) -> str:
@@ -194160,7 +195780,19 @@ def _branch_service_stop_process(proc: subprocess.Popen) -> dict[str, Any]:
 
 @route("POST", "/api/branch-service/validate")
 def handle_branch_service_validate(ctx: RequestContext):
-    """Start and probe an isolated branch governance service on an explicit port."""
+    """Start and probe the bounded AC dev plane from the local CLI only."""
+    if ctx.handler is not None:
+        return 410, {
+            "ok": False,
+            "error": "branch_service_http_supervisor_retired",
+            "message": (
+                "Use the local `aming-claw branch-service validate` command; "
+                "HTTP callers cannot spawn source processes."
+            ),
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "process_started": False,
+        }
     body = ctx.body if isinstance(ctx.body, Mapping) else {}
     raw_worktree = str(
         body.get("worktree_path")
@@ -194183,20 +195815,80 @@ def handle_branch_service_validate(ctx: RequestContext):
             {"worktree_path": str(worktree), "start_script": str(start_script)},
         )
 
+    runtime_commit = _branch_service_git_output(worktree, ["rev-parse", "HEAD"])
+    worktree_root = _branch_service_git_output(
+        worktree, ["rev-parse", "--show-toplevel"]
+    )
+    branch = _branch_service_git_output(worktree, ["branch", "--show-current"])
+    dirty = _branch_service_git_output(worktree, ["status", "--porcelain"])
+    if branch != AC_DEV_BRANCH or Path(worktree_root or worktree).resolve() != worktree:
+        raise ValidationError(
+            "branch-service validation requires the exact AC dev worktree",
+            {
+                "expected_branch": AC_DEV_BRANCH,
+                "actual_branch": branch,
+                "expected_worktree": str(worktree),
+                "actual_worktree": worktree_root,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    if dirty:
+        raise ValidationError(
+            "branch-service validation requires a clean immutable candidate",
+            {
+                "dirty_files": dirty.splitlines(),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    stable_anchor = str(body.get("stable_anchor_commit") or "").strip().lower()
+    current_stable_commit = _current_stable_runtime_commit()
+    if not current_stable_commit:
+        raise ValidationError(
+            "branch-service requires an exact non-stale stable service",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    if stable_anchor != current_stable_commit:
+        raise ValidationError(
+            "branch-service stable anchor does not match current stable",
+            {
+                "expected": current_stable_commit,
+                "actual": stable_anchor,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    anchor_check = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", stable_anchor, runtime_commit],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if anchor_check.returncode != 0:
+        raise ValidationError(
+            "branch-service commit is not descended from the frozen stable anchor"
+        )
+
     try:
         requested_port = int(body.get("port") or body.get("requested_port") or 0)
     except (TypeError, ValueError):
         requested_port = 0
-    if requested_port <= 0 or requested_port > 65535:
-        raise ValidationError("branch-service validation requires a valid port")
-    if requested_port == PORT:
+    if requested_port != AC_DEV_SERVICE_PORT:
         return {
             "ok": False,
-            "schema_version": "branch_service_validation.v1",
-            "error": "branch_service_port_must_differ_from_main",
+            "schema_version": "branch_service_validation.v2",
+            "error": "ac_dev_reserved_port_required",
             "requested_port": requested_port,
             "main_governance_port": PORT,
-            "isolation_status": "refused_main_port",
+            "required_dev_port": AC_DEV_SERVICE_PORT,
+            "isolation_status": "refused_non_reserved_port",
+            "zero_write_rejection": True,
         }
 
     host = str(body.get("host") or "127.0.0.1").strip() or "127.0.0.1"
@@ -194205,7 +195897,7 @@ def handle_branch_service_validate(ctx: RequestContext):
     if _branch_service_port_open(host, requested_port):
         return {
             "ok": False,
-            "schema_version": "branch_service_validation.v1",
+            "schema_version": "branch_service_validation.v2",
             "error": "branch_service_port_in_use",
             "requested_port": requested_port,
             "main_governance_port": PORT,
@@ -194220,7 +195912,17 @@ def handle_branch_service_validate(ctx: RequestContext):
         maximum=120.0,
     )
     keep_running = _truthy_flag(body.get("keep_running"))
-    python_bin = str(body.get("python") or sys.executable).strip() or sys.executable
+    requested_python = str(body.get("python") or sys.executable).strip() or sys.executable
+    if Path(requested_python).expanduser().resolve() != Path(sys.executable).resolve():
+        raise ValidationError(
+            "branch-service local supervisor requires the current Python executable",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "process_started": False,
+            },
+        )
+    python_bin = sys.executable
     runtime_workspace_raw = str(body.get("runtime_workspace") or "").strip()
     if runtime_workspace_raw:
         runtime_workspace = Path(runtime_workspace_raw).expanduser().resolve()
@@ -194228,11 +195930,83 @@ def handle_branch_service_validate(ctx: RequestContext):
         runtime_workspace = Path(
             tempfile.mkdtemp(prefix=f"aming-claw-branch-service-{requested_port}-")
         ).resolve()
-    shared_volume_path = Path(
-        str(body.get("shared_volume_path") or (runtime_workspace / "shared-volume"))
-    ).expanduser().resolve()
+    if runtime_workspace == worktree or worktree in runtime_workspace.parents:
+        raise ValidationError("branch-service runtime workspace must be outside the worktree")
+    shared_volume_raw = str(body.get("shared_volume_path") or "").strip()
+    if not shared_volume_raw:
+        raise ValidationError(
+            "branch-service validation requires an explicit existing shared_volume_path"
+        )
+    canonical_shared_volume, canonical_database_identity = (
+        _branch_service_stable_database_binding(worktree)
+    )
+    shared_volume_input = Path(shared_volume_raw).expanduser().absolute()
+    if shared_volume_input.is_symlink():
+        raise ValidationError(
+            "branch-service shared volume cannot be a symlink",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    shared_volume_path = shared_volume_input.resolve(strict=True)
+    if (
+        shared_volume_path != shared_volume_input
+        or shared_volume_path != canonical_shared_volume
+    ):
+        raise ValidationError(
+            "branch-service shared volume identity mismatch",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    existing_db = (
+        shared_volume_path
+        / "codex-tasks"
+        / "state"
+        / "governance"
+        / "aming-claw"
+        / "governance.db"
+    )
+    if (
+        existing_db.is_symlink()
+        or not existing_db.is_file()
+        or existing_db.resolve(strict=True) != existing_db
+    ):
+        raise ValidationError(
+            "branch-service validation requires an existing aming-claw governance.db",
+            {
+                "database_path": str(existing_db),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    db_metadata = existing_db.stat(follow_symlinks=False)
+    supplied_database_identity = body.get("stable_database_identity")
+    actual_database_identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": int(db_metadata.st_dev),
+        "inode": int(db_metadata.st_ino),
+        "stable_relative_path_sha256": "sha256:"
+        + hashlib.sha256(
+            AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+        ).hexdigest(),
+    }
+    live_database_identity = _current_stable_runtime_database_identity()
+    if (
+        not _ac_stable_database_identity_valid(supplied_database_identity)
+        or dict(supplied_database_identity) != actual_database_identity
+        or actual_database_identity != canonical_database_identity
+        or (
+            live_database_identity
+            and live_database_identity != actual_database_identity
+        )
+        or (not live_database_identity and stable_anchor != AC_STABLE_ANCHOR_COMMIT)
+    ):
+        raise ValidationError(
+            "branch-service stable database identity mismatch",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "process_started": False,
+            },
+        )
     runtime_workspace.mkdir(parents=True, exist_ok=True)
-    shared_volume_path.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
     prior_pythonpath = env.get("PYTHONPATH", "")
@@ -194241,6 +196015,12 @@ def handle_branch_service_validate(ctx: RequestContext):
             "GOVERNANCE_PORT": str(requested_port),
             "AMING_CLAW_HOME": str(runtime_workspace),
             "SHARED_VOLUME_PATH": str(shared_volume_path),
+            _RUNTIME_PLANE_ENV: "dev",
+            _STABLE_ANCHOR_ENV: stable_anchor,
+            "AMING_CLAW_ALLOWED_PROJECT_IDS": "aming-claw",
+            "AMING_CLAW_DB_MIGRATION_POLICY": "verify-only",
+            "AMING_CLAW_ACTIVE_GRAPH_MUTATION": "deny",
+            "AMING_CLAW_STABLE_DEPLOYMENT": "deny",
             "PYTHONPATH": (
                 str(worktree)
                 if not prior_pythonpath
@@ -194248,7 +196028,9 @@ def handle_branch_service_validate(ctx: RequestContext):
             ),
         }
     )
-    command = [python_bin, str(start_script)]
+    # start_governance.py performs a legacy chain-history backfill before the
+    # server's dev-plane preflight. Launch the guarded module directly.
+    command = [python_bin, "-m", "agent.governance.server"]
     try:
         proc = subprocess.Popen(
             command,
@@ -194261,7 +196043,7 @@ def handle_branch_service_validate(ctx: RequestContext):
     except OSError as exc:
         return {
             "ok": False,
-            "schema_version": "branch_service_validation.v1",
+            "schema_version": "branch_service_validation.v2",
             "error": "branch_service_start_failed",
             "detail": str(exc),
             "requested_port": requested_port,
@@ -194273,6 +196055,8 @@ def handle_branch_service_validate(ctx: RequestContext):
                 "GOVERNANCE_PORT": str(requested_port),
                 "AMING_CLAW_HOME": str(runtime_workspace),
                 "SHARED_VOLUME_PATH": str(shared_volume_path),
+                _RUNTIME_PLANE_ENV: "dev",
+                _STABLE_ANCHOR_ENV: stable_anchor,
                 "PYTHONPATH_prefix": str(worktree),
             },
             "isolation_status": "start_failed",
@@ -194281,26 +196065,38 @@ def handle_branch_service_validate(ctx: RequestContext):
     health = probe.get("health") if isinstance(probe.get("health"), Mapping) else {}
     actual_port = int(health.get("port") or 0) if health else 0
     health_pid = int(health.get("pid") or 0) if health else 0
-    runtime_commit = _branch_service_git_output(worktree, ["rev-parse", "HEAD"])
-    worktree_root = _branch_service_git_output(worktree, ["rev-parse", "--show-toplevel"])
-    branch = _branch_service_git_output(worktree, ["branch", "--show-current"])
+    plane_identity = (
+        health.get("runtime_plane_identity")
+        if isinstance(health.get("runtime_plane_identity"), Mapping)
+        else {}
+    )
     isolation_ok = bool(
         probe.get("ok")
         and actual_port == requested_port
-        and requested_port != PORT
+        and requested_port == AC_DEV_SERVICE_PORT
         and health_pid
         and health_pid != SERVER_PID
+        and str(health.get("runtime_plane") or "") == "dev"
+        and str(health.get("bind_host") or "") == AC_DEV_BIND_HOST
+        and str(plane_identity.get("bind_host") or "") == AC_DEV_BIND_HOST
+        and str(plane_identity.get("worktree_root") or "") == str(worktree)
+        and str(plane_identity.get("branch") or "") == AC_DEV_BRANCH
+        and str(plane_identity.get("commit") or "") == runtime_commit
+        and str(plane_identity.get("stable_anchor_commit") or "") == stable_anchor
+        and plane_identity.get("stable_database_identity")
+        == actual_database_identity
+        and str(plane_identity.get("status") or "") == "ready"
     )
 
     stop_result: dict[str, Any] = {}
     if not keep_running:
         stop_result = _branch_service_stop_process(proc)
-    elif not probe.get("ok"):
+    elif not isolation_ok:
         stop_result = _branch_service_stop_process(proc)
 
     return {
         "ok": bool(isolation_ok),
-        "schema_version": "branch_service_validation.v1",
+        "schema_version": "branch_service_validation.v2",
         "requested_port": requested_port,
         "actual_listening_port": actual_port,
         "host": host,
@@ -194314,13 +196110,32 @@ def handle_branch_service_validate(ctx: RequestContext):
         "branch": branch,
         "runtime_commit": runtime_commit,
         "runtime_version": str(health.get("version") or ""),
+        "runtime_plane": str(health.get("runtime_plane") or ""),
+        "runtime_plane_identity": dict(plane_identity),
+        "stable_anchor_commit": stable_anchor,
+        "stable_database_identity": actual_database_identity,
         "health_url": probe.get("url", ""),
         "health": dict(health),
-        "expected_health_fields": ["status", "service", "port", "version", "pid"],
+        "expected_health_fields": [
+            "status",
+            "service",
+            "port",
+            "version",
+            "pid",
+            "runtime_plane",
+            "bind_host",
+            "runtime_plane_identity",
+            "worktree_root",
+            "branch",
+            "runtime_commit",
+            "stable_anchor_commit",
+        ],
         "env": {
             "GOVERNANCE_PORT": str(requested_port),
             "AMING_CLAW_HOME": str(runtime_workspace),
             "SHARED_VOLUME_PATH": str(shared_volume_path),
+            _RUNTIME_PLANE_ENV: "dev",
+            _STABLE_ANCHOR_ENV: stable_anchor,
             "PYTHONPATH_prefix": str(worktree),
         },
         "command": command,
@@ -209229,7 +211044,7 @@ def create_server(port: int = None) -> HTTPServer:
     # handler (e.g. on_task_completed waiting on Z1's 60s busy_timeout DB lock)
     # doesn't starve every other HTTP request — the "post-completion wedge"
     # symptom that blocked the Z0+Z2 verification chain 3× in 30min.
-    server = ThreadingHTTPServer(("0.0.0.0", p), GovernanceHandler)
+    server = ThreadingHTTPServer((_runtime_bind_host(), p), GovernanceHandler)
     return server
 
 
@@ -209245,6 +211060,22 @@ def _run_governance_service():
                 "governance_manager_generation_not_published"
             )
     print(f"Governance v{get_server_version()} (PID {SERVER_PID})")
+
+    if _runtime_plane() == "dev":
+        # A repair service shares only the allowlisted AC database.  It never
+        # joins stable Redis/event workers, performs startup backfills, or owns
+        # the port-40000 lifecycle.
+        server = create_server()
+        print(
+            f"AC dev governance service listening on port {PORT}; "
+            "background workers disabled"
+        )
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down AC dev governance...")
+            server.shutdown()
+        return
 
     # Enable Redis Pub/Sub bridge for EventBus
     from .event_bus import get_event_bus
@@ -209339,6 +211170,7 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stderr,
     )
+    _validate_runtime_plane_startup()
     lease = _establish_governance_manager_generation()
     try:
         _run_governance_service()

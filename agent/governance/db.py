@@ -9,7 +9,9 @@ Manages:
 import os
 import sys
 import sqlite3
+import stat
 import threading
+import hashlib
 from pathlib import Path
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
@@ -21,7 +23,37 @@ from utils import tasks_root
 
 SCHEMA_VERSION = 47
 
+AC_PROJECT_ID = "aming-claw"
+DEV_RUNTIME_PLANE = "dev"
+RUNTIME_PLANE_ENV = "AMING_CLAW_RUNTIME_PLANE"
+
+AC_DATABASE_STABLE_RELATIVE_PATH = (
+    "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
+)
+
 _SQLITE_WRITE_LOCK = threading.RLock()
+
+_DEV_DENIED_SCHEMA_ACTIONS = frozenset(
+    code
+    for name in (
+        "SQLITE_ALTER_TABLE",
+        "SQLITE_ANALYZE",
+        "SQLITE_ATTACH",
+        "SQLITE_CREATE_INDEX",
+        "SQLITE_CREATE_TABLE",
+        "SQLITE_CREATE_TRIGGER",
+        "SQLITE_CREATE_VIEW",
+        "SQLITE_CREATE_VTABLE",
+        "SQLITE_DETACH",
+        "SQLITE_DROP_INDEX",
+        "SQLITE_DROP_TABLE",
+        "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW",
+        "SQLITE_DROP_VTABLE",
+        "SQLITE_REINDEX",
+    )
+    if isinstance((code := getattr(sqlite3, name, None)), int)
+)
 
 
 def sqlite_write_lock() -> threading.RLock:
@@ -34,6 +66,74 @@ def sqlite_write_lock() -> threading.RLock:
     commit blocks, never around model calls or slow external work.
     """
     return _SQLITE_WRITE_LOCK
+
+
+def canonical_ac_database_identity(
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, object]:
+    """Return the public-safe physical identity of the one stable AC DB.
+
+    The identity deliberately excludes the host's absolute path.  Normal
+    SQLite writes preserve device/inode, while file substitution, an alternate
+    shared volume, or a symlink escape changes or invalidates the identity.
+    Stable-plane callers are additionally pinned to
+    ``$AMING_CLAW_HOME/shared-volume``; dev-plane callers may open that same
+    file but cannot nominate a different AC-shaped database.
+    """
+
+    shared_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
+    if not shared_raw:
+        raise RuntimeError("canonical AC database requires SHARED_VOLUME_PATH")
+    shared_input = Path(shared_raw).expanduser().absolute()
+    if shared_input.is_symlink():
+        raise ValueError("canonical AC shared volume cannot be a symlink")
+    shared_root = shared_input.resolve(strict=True)
+    if shared_root != shared_input or not shared_root.is_dir():
+        raise ValueError("canonical AC shared volume identity mismatch")
+    if os.environ.get(RUNTIME_PLANE_ENV, "").strip().lower() == "stable":
+        stable_raw = os.environ.get("AMING_CLAW_HOME", "").strip()
+        if not stable_raw:
+            raise RuntimeError("stable AC database requires AMING_CLAW_HOME")
+        stable_root = Path(stable_raw).expanduser().resolve(strict=True)
+        expected_shared = (stable_root / "shared-volume").absolute()
+        if (
+            expected_shared.is_symlink()
+            or expected_shared.resolve(strict=True) != expected_shared
+            or shared_root != expected_shared
+        ):
+            raise ValueError(
+                "stable AC database must use the stable worktree shared volume"
+            )
+    relative_db = Path(AC_DATABASE_STABLE_RELATIVE_PATH).relative_to(
+        "shared-volume"
+    )
+    db_path = (shared_root / relative_db).absolute()
+    if db_path.is_symlink():
+        raise ValueError("canonical AC database cannot be a symlink")
+    resolved_db = db_path.resolve(strict=True)
+    if resolved_db != db_path:
+        raise ValueError("canonical AC database escaped its stable path")
+    metadata = db_path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("canonical AC database must be a regular file")
+    if conn is not None:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        main_paths = [
+            Path(str(row[2])).resolve(strict=True)
+            for row in rows
+            if str(row[1]) == "main" and str(row[2])
+        ]
+        if main_paths != [resolved_db]:
+            raise ValueError("opened AC database identity mismatch")
+    relative_hash = "sha256:" + hashlib.sha256(
+        AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "stable_relative_path_sha256": relative_hash,
+    }
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -497,6 +597,23 @@ CREATE INDEX IF NOT EXISTS idx_graph_asset_bindings_path
 
 def _governance_root() -> Path:
     """Root directory for governance data."""
+    if _is_dev_runtime():
+        shared_volume = os.environ.get("SHARED_VOLUME_PATH", "").strip()
+        if not shared_volume:
+            raise RuntimeError(
+                "AC dev runtime requires an explicit existing SHARED_VOLUME_PATH"
+            )
+        root = (
+            Path(shared_volume).expanduser().resolve()
+            / "codex-tasks"
+            / "state"
+            / "governance"
+        )
+        if not root.is_dir():
+            raise FileNotFoundError(
+                "AC dev runtime governance root must already exist: " + str(root)
+            )
+        return root
     return Path(tasks_root()) / "state" / "governance"
 
 
@@ -510,6 +627,39 @@ def _normalize_id(pid: str) -> str:
     return s.lower().strip('-')
 
 
+def _is_dev_runtime() -> bool:
+    return os.environ.get(RUNTIME_PLANE_ENV, "").strip().lower() == DEV_RUNTIME_PLANE
+
+
+def validate_project_id(project_id: str) -> str:
+    """Validate one project id before any filesystem or SQLite side effect.
+
+    Stable runtimes retain the historical camelCase/underscore normalization,
+    but path-shaped ids are rejected everywhere.  The AC dev plane is narrower:
+    it accepts only the already-existing ``aming-claw`` project database.
+    """
+
+    raw = str(project_id or "").strip()
+    if (
+        not raw
+        or raw in {".", ".."}
+        or "/" in raw
+        or "\\" in raw
+        or "\x00" in raw
+        or any(part in {".", ".."} for part in raw.replace("\\", "/").split("/"))
+    ):
+        raise ValueError("invalid governance project_id")
+    normalized = _normalize_id(raw)
+    if not normalized:
+        raise ValueError("invalid governance project_id")
+    if _is_dev_runtime() and raw != AC_PROJECT_ID:
+        raise ValueError(
+            "AC dev runtime project allowlist requires exact project_id="
+            + AC_PROJECT_ID
+        )
+    return normalized
+
+
 def _resolve_project_dir(project_id: str) -> Path:
     """Resolve the actual project directory, handling normalize mismatch.
 
@@ -518,9 +668,20 @@ def _resolve_project_dir(project_id: str) -> Path:
     was enforced (P0-1), so the directory on disk doesn't match the normalized
     form ('aming-claw').
     """
+    normalized = validate_project_id(project_id)
     root = _governance_root()
-    normalized = _normalize_id(project_id) if project_id else project_id
     normalized_dir = root / normalized
+    if _is_dev_runtime():
+        if not normalized_dir.is_dir():
+            raise FileNotFoundError(
+                "AC dev runtime project directory must already exist: "
+                + str(normalized_dir)
+            )
+        resolved_root = root.resolve(strict=True)
+        resolved_project = normalized_dir.resolve(strict=True)
+        if resolved_project.parent != resolved_root or resolved_project != normalized_dir:
+            raise ValueError("AC dev runtime project directory identity mismatch")
+        return normalized_dir
     if normalized_dir.exists():
         return normalized_dir
     # Fallback: try raw project_id (handles pre-normalize data)
@@ -534,11 +695,31 @@ def _resolve_project_dir(project_id: str) -> Path:
 def _project_db_path(project_id: str) -> Path:
     """Path to the SQLite database for a specific project."""
     project_dir = _resolve_project_dir(project_id)
+    if _is_dev_runtime():
+        db_path = project_dir / "governance.db"
+        if not db_path.is_file():
+            raise FileNotFoundError(
+                "AC dev runtime governance database must already exist: "
+                + str(db_path)
+            )
+        if db_path.is_symlink():
+            raise ValueError("AC dev runtime governance database cannot be a symlink")
+        resolved_db = db_path.resolve(strict=True)
+        if resolved_db != db_path.absolute():
+            raise ValueError("AC dev runtime governance database identity mismatch")
+        if not stat.S_ISREG(db_path.stat(follow_symlinks=False).st_mode):
+            raise ValueError("AC dev runtime governance database must be a regular file")
+        return db_path
     project_dir.mkdir(parents=True, exist_ok=True)
     return project_dir / "governance.db"
 
 
-def _configure_connection(conn: sqlite3.Connection, busy_timeout: int) -> None:
+def _configure_connection(
+    conn: sqlite3.Connection,
+    busy_timeout: int,
+    *,
+    allow_journal_mode_write: bool = True,
+) -> None:
     """Apply portable SQLite connection settings.
 
     Some shared-volume mounts reject WAL creation even when the DB file exists.
@@ -546,13 +727,14 @@ def _configure_connection(conn: sqlite3.Connection, busy_timeout: int) -> None:
     stays available instead of failing every request.
     """
     conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.OperationalError:
+    if allow_journal_mode_write:
         try:
-            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("PRAGMA journal_mode=WAL")
         except sqlite3.OperationalError:
-            pass
+            try:
+                conn.execute("PRAGMA journal_mode=DELETE")
+            except sqlite3.OperationalError:
+                pass
     try:
         conn.execute("PRAGMA foreign_keys=ON")
     except sqlite3.OperationalError:
@@ -561,6 +743,67 @@ def _configure_connection(conn: sqlite3.Connection, busy_timeout: int) -> None:
         conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
     except sqlite3.OperationalError:
         pass
+
+
+def _verify_existing_schema(conn: sqlite3.Connection) -> None:
+    """Fail closed when a dev-plane database is not already schema-compatible."""
+
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        actual = int(row["value"]) if row else 0
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "AC dev runtime requires an existing schema_meta version"
+        ) from exc
+    if actual != SCHEMA_VERSION:
+        raise RuntimeError(
+            "AC dev runtime schema mismatch: "
+            f"expected {SCHEMA_VERSION}, found {actual}; use an isolated clone "
+            "for migrations before explicit promotion"
+        )
+
+
+def _dev_schema_authorizer(
+    action: int,
+    arg1: str | None,
+    _arg2: str | None,
+    _database: str | None,
+    _source: str | None,
+) -> int:
+    """Permit repair-row DML while denying live schema/attachment mutation."""
+
+    if action in _DEV_DENIED_SCHEMA_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}:
+        if str(arg1 or "").lower() in {"schema_meta", "sqlite_master", "sqlite_schema"}:
+            return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def _connect_existing(db_path: Path, *, timeout: float) -> sqlite3.Connection:
+    absolute = db_path.absolute()
+    before = absolute.stat(follow_symlinks=False)
+    if absolute.is_symlink() or not stat.S_ISREG(before.st_mode):
+        raise ValueError("AC dev runtime governance database must be a non-symlink file")
+    resolved = absolute.resolve(strict=True)
+    if resolved != absolute:
+        raise ValueError("AC dev runtime governance database escaped its canonical path")
+    uri = absolute.as_uri() + "?mode=rw"
+    conn = sqlite3.connect(uri, timeout=timeout, uri=True)
+    database_file = str(conn.execute("PRAGMA database_list").fetchone()[2] or "")
+    after = absolute.stat(follow_symlinks=False)
+    if (
+        Path(database_file).resolve(strict=True) != absolute
+        or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        or absolute.is_symlink()
+    ):
+        conn.close()
+        raise ValueError("AC dev runtime governance database identity changed during open")
+    conn.set_authorizer(_dev_schema_authorizer)
+    return conn
 
 
 def get_connection(project_id: str) -> sqlite3.Connection:
@@ -607,6 +850,20 @@ def get_connection(project_id: str) -> sqlite3.Connection:
     # On Docker restart, stale WAL locks may block new connections.
     # SQLite automatically recovers WAL state on first connect, but only
     # if the -shm file is accessible. Increase timeout to handle this.
+    if _is_dev_runtime():
+        conn = _connect_existing(db_path, timeout=30)
+        try:
+            _verify_existing_schema(conn)
+            _configure_connection(
+                conn,
+                busy_timeout=10000,
+                allow_journal_mode_write=False,
+            )
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
     conn = sqlite3.connect(str(db_path), timeout=30)
     _configure_connection(conn, busy_timeout=10000)
     _ensure_schema(conn)
@@ -1477,6 +1734,20 @@ def independent_connection(project_id: str, busy_timeout: int = 5000) -> sqlite3
         foreign-key enforcement, the given busy_timeout, and ``Row`` factory.
     """
     db_path = _project_db_path(project_id)
+    if _is_dev_runtime():
+        conn = _connect_existing(db_path, timeout=busy_timeout / 1000.0)
+        try:
+            _verify_existing_schema(conn)
+            _configure_connection(
+                conn,
+                busy_timeout=busy_timeout,
+                allow_journal_mode_write=False,
+            )
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
     conn = sqlite3.connect(str(db_path), timeout=busy_timeout / 1000.0)
     _configure_connection(conn, busy_timeout=busy_timeout)
     return conn

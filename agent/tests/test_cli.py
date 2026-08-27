@@ -2988,3 +2988,366 @@ class TestCliMf:
         assert result.exit_code == 0
         payload = json.loads(result.output)
         assert payload["checks"]["route_context_consumption"]["status"] == "pass"
+
+
+class TestACDevRuntimeCli:
+    def test_dev_anchor_tracks_exact_current_stable_health(self, monkeypatch):
+        import agent.cli as cli
+
+        commit = "c" * 40
+        monkeypatch.setattr(
+            cli,
+            "_probe_governance",
+            lambda port: {
+                "status": "ok",
+                "service": "governance",
+                "port": port,
+                "runtime_loaded_version": commit,
+                "runtime_stale": False,
+                "runtime_plane": "stable",
+                "runtime_plane_identity": {
+                    "status": "ready",
+                    "branch": cli.AC_STABLE_BRANCH,
+                    "commit": commit,
+                    "stable_anchor_commit": commit,
+                },
+            },
+        )
+
+        assert cli._current_stable_anchor_commit() == commit
+
+    def test_explicit_stable_runtime_rejects_ac_dev_checkout(self, monkeypatch):
+        import agent.cli as cli
+
+        monkeypatch.setattr(
+            cli,
+            "_source_git_identity",
+            lambda: {
+                "root": "/tmp/ac-dev",
+                "branch": cli.AC_DEV_BRANCH,
+                "commit": "b" * 40,
+                "dirty": "",
+            },
+        )
+        monkeypatch.setattr(
+            cli,
+            "_require_source_checkout_matches_loaded_package",
+            lambda workspace: None,
+        )
+
+        result = CliRunner().invoke(
+            main,
+            ["start", "--runtime-plane", "stable", "--port", "40000"],
+        )
+
+        assert result.exit_code != 0
+        assert cli.AC_STABLE_BRANCH in result.output
+
+    def test_dev_runtime_refuses_non_reserved_port_before_start(self, monkeypatch):
+        import agent.cli as cli
+
+        monkeypatch.setattr(cli, "_require_source_checkout_matches_loaded_package", lambda workspace: None)
+        monkeypatch.setattr(cli, "_probe_governance", lambda port: None)
+        monkeypatch.setattr(cli, "_port_is_open", lambda port: False)
+        result = CliRunner().invoke(
+            main,
+            ["start", "--runtime-plane", "dev", "--port", "40009"],
+        )
+
+        assert result.exit_code != 0
+        assert "reserved to port 40008" in result.output
+
+    def test_dev_runtime_sets_bounded_plane_environment(
+        self, monkeypatch, tmp_path
+    ):
+        import agent.cli as cli
+
+        shared = tmp_path / "shared"
+        db_path = (
+            shared
+            / "codex-tasks"
+            / "state"
+            / "governance"
+            / "aming-claw"
+            / "governance.db"
+        )
+        db_path.parent.mkdir(parents=True)
+        db_path.touch()
+        runtime_root = tmp_path / "runtime"
+        calls = []
+        legacy_start = types.ModuleType("start_governance")
+
+        def reject_legacy_start(_name):
+            pytest.fail("dev startup must not import the legacy backfill wrapper")
+
+        legacy_start.__getattr__ = reject_legacy_start
+        monkeypatch.setitem(sys.modules, "start_governance", legacy_start)
+        monkeypatch.setattr(cli, "_run_dev_governance", lambda: calls.append("guarded"))
+        monkeypatch.setattr(
+            cli,
+            "_current_stable_anchor_commit",
+            lambda: cli.AC_STABLE_ANCHOR_COMMIT,
+        )
+        database_identity = {
+            "schema_version": "ac_stable_database_identity.v1",
+            "device": 1,
+            "inode": 2,
+            "stable_relative_path_sha256": "sha256:" + "1" * 64,
+        }
+        monkeypatch.setattr(
+            cli,
+            "_canonical_stable_database_binding",
+            lambda *_args, **_kwargs: {
+                "shared_volume_path": str(shared.resolve()),
+                "stable_database_identity": database_identity,
+            },
+        )
+        monkeypatch.setattr(
+            cli,
+            "_source_git_identity",
+            lambda: {
+                "root": str(Path(cli.__file__).resolve().parents[1]),
+                "branch": cli.AC_DEV_BRANCH,
+                "commit": "b" * 40,
+                "dirty": "",
+            },
+        )
+        monkeypatch.setattr(cli, "_require_source_checkout_matches_loaded_package", lambda workspace: None)
+        monkeypatch.setattr(cli, "_probe_governance", lambda port: None)
+        monkeypatch.setattr(cli, "_port_is_open", lambda port: False)
+        monkeypatch.setattr(
+            cli,
+            "_governance_start_resource_preflight",
+            lambda: {"status": "already_sufficient"},
+        )
+        monkeypatch.setattr(
+            cli.subprocess,
+            "run",
+            lambda *args, **kwargs: types.SimpleNamespace(
+                returncode=0, stdout="codex/ac-dev\n", stderr=""
+            ),
+        )
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "start",
+                "--runtime-plane",
+                "dev",
+                "--port",
+                "40008",
+                "--runtime-workspace",
+                str(runtime_root),
+                "--shared-volume-path",
+                str(shared),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == ["guarded"]
+        assert os.environ["AMING_CLAW_RUNTIME_PLANE"] == "dev"
+        assert os.environ["AMING_CLAW_STABLE_ANCHOR_COMMIT"] == cli.AC_STABLE_ANCHOR_COMMIT
+        assert os.environ["AMING_CLAW_ALLOWED_PROJECT_IDS"] == "aming-claw"
+        assert os.environ["AMING_CLAW_DB_MIGRATION_POLICY"] == "verify-only"
+        assert os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] == "deny"
+        assert os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] == "deny"
+        for key in (
+            "AMING_CLAW_RUNTIME_PLANE",
+            "AMING_CLAW_STABLE_ANCHOR_COMMIT",
+            "AMING_CLAW_ALLOWED_PROJECT_IDS",
+            "AMING_CLAW_DB_MIGRATION_POLICY",
+            "AMING_CLAW_ACTIVE_GRAPH_MUTATION",
+            "AMING_CLAW_STABLE_DEPLOYMENT",
+            "SHARED_VOLUME_PATH",
+            "AMING_CLAW_HOME",
+            "GOVERNANCE_PORT",
+        ):
+            os.environ.pop(key, None)
+
+    @pytest.mark.parametrize(
+        "identity_override,health_override",
+        [
+            ({"commit": "c" * 40}, {"runtime_loaded_version": "c" * 40}),
+            ({"worktree_root": "/tmp/other-ac-dev"}, {}),
+        ],
+    )
+    def test_existing_dev_service_requires_exact_invoking_checkout_identity(
+        self,
+        monkeypatch,
+        tmp_path,
+        identity_override,
+        health_override,
+    ):
+        import agent.cli as cli
+
+        candidate_root = tmp_path / "ac-dev"
+        candidate_root.mkdir()
+        candidate = "b" * 40
+        stable = "a" * 40
+        source_identity = {
+            "root": str(candidate_root),
+            "branch": cli.AC_DEV_BRANCH,
+            "commit": candidate,
+            "dirty": "",
+        }
+        runtime_identity = {
+            "status": "ready",
+            "bind_host": "127.0.0.1",
+            "worktree_root": str(candidate_root.resolve()),
+            "branch": cli.AC_DEV_BRANCH,
+            "commit": candidate,
+            "stable_anchor_commit": stable,
+        }
+        database_identity = {
+            "schema_version": "ac_stable_database_identity.v1",
+            "device": 1,
+            "inode": 2,
+            "stable_relative_path_sha256": "sha256:" + "1" * 64,
+        }
+        runtime_identity["stable_database_identity"] = database_identity
+        runtime_identity.update(identity_override)
+        health = {
+            "status": "ok",
+            "service": "governance",
+            "port": cli.AC_DEV_SERVICE_PORT,
+            "runtime_plane": "dev",
+            "bind_host": "127.0.0.1",
+            "runtime_loaded_version": candidate,
+            "runtime_stale": False,
+            "runtime_plane_identity": runtime_identity,
+        }
+        health.update(health_override)
+        monkeypatch.setattr(
+            cli, "_require_source_checkout_matches_loaded_package", lambda _workspace: None
+        )
+        monkeypatch.setattr(cli, "_source_git_identity", lambda: source_identity)
+        monkeypatch.setattr(cli, "_current_stable_anchor_commit", lambda: stable)
+        monkeypatch.setattr(
+            cli,
+            "_canonical_stable_database_binding",
+            lambda *_args, **_kwargs: {
+                "shared_volume_path": str((tmp_path / "shared").resolve()),
+                "stable_database_identity": database_identity,
+            },
+        )
+        monkeypatch.setattr(cli, "_probe_governance", lambda _port: health)
+
+        result = CliRunner().invoke(
+            main,
+            ["start", "--runtime-plane", "dev", "--port", "40008"],
+        )
+
+        assert result.exit_code != 0
+        assert "mismatched AC dev runtime identity" in result.output
+
+    def test_branch_service_validate_defaults_to_40008_and_binds_anchor(
+        self, monkeypatch, tmp_path
+    ):
+        import agent.cli as cli
+
+        calls = []
+
+        def fake_local(payload):
+            calls.append(payload)
+            return 200, {
+                "ok": True,
+                "actual_listening_port": 40008,
+                "pid": 123,
+                "worktree_root": str(tmp_path),
+            }
+
+        monkeypatch.setattr(cli, "_local_branch_service_validate", fake_local)
+        monkeypatch.setattr(
+            cli,
+            "_current_stable_anchor_commit",
+            lambda: cli.AC_STABLE_ANCHOR_COMMIT,
+        )
+        database_identity = {
+            "schema_version": "ac_stable_database_identity.v1",
+            "device": 1,
+            "inode": 2,
+            "stable_relative_path_sha256": "sha256:" + "1" * 64,
+        }
+        monkeypatch.setattr(
+            cli,
+            "_canonical_stable_database_binding",
+            lambda *_args, **_kwargs: {
+                "shared_volume_path": str((tmp_path / "shared").resolve()),
+                "stable_database_identity": database_identity,
+            },
+        )
+        monkeypatch.setattr(
+            cli,
+            "_http_json",
+            lambda *args, **kwargs: pytest.fail(
+                "frozen stable service must not spawn the dev runtime"
+            ),
+        )
+        result = CliRunner().invoke(
+            main,
+            [
+                "branch-service",
+                "validate",
+                "--worktree",
+                str(tmp_path),
+                "--shared-volume-path",
+                str(tmp_path / "shared"),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = calls[0]
+        assert payload["port"] == 40008
+        assert payload["stable_anchor_commit"] == cli.AC_STABLE_ANCHOR_COMMIT
+        assert payload["shared_volume_path"] == str((tmp_path / "shared").resolve())
+        assert payload["stable_database_identity"] == database_identity
+
+    def test_dev_database_binding_rejects_alternate_ac_shaped_volume(
+        self, monkeypatch, tmp_path
+    ):
+        import agent.cli as cli
+
+        source = tmp_path / "ac-dev"
+        source.mkdir()
+        stable = tmp_path / "stable"
+        canonical_shared = stable / "shared-volume"
+        database = (
+            canonical_shared
+            / "codex-tasks"
+            / "state"
+            / "governance"
+            / "aming-claw"
+            / "governance.db"
+        )
+        database.parent.mkdir(parents=True)
+        database.touch()
+        alternate = tmp_path / "alternate"
+        alternate.mkdir()
+        monkeypatch.setattr(
+            cli,
+            "_source_git_identity",
+            lambda: {
+                "root": str(source),
+                "branch": cli.AC_DEV_BRANCH,
+                "commit": "b" * 40,
+                "dirty": "",
+            },
+        )
+        monkeypatch.setattr(
+            cli.subprocess,
+            "run",
+            lambda *_args, **_kwargs: types.SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"worktree {stable}\n"
+                    f"branch refs/heads/{cli.AC_STABLE_BRANCH}\n"
+                ),
+                stderr="",
+            ),
+        )
+
+        with pytest.raises(cli.click.ClickException, match="exact stable-worktree"):
+            cli._canonical_stable_database_binding(
+                str(alternate),
+                stable_anchor_commit=cli.AC_STABLE_ANCHOR_COMMIT,
+            )

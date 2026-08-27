@@ -758,3 +758,135 @@ Operator modes are explicit:
 The no-redeploy behavior is part of the contract: the wrapper performs all work
 from the isolated branch/worktree checkout and does not require governance
 service restart, image rebuild, or executor redeploy.
+
+---
+
+## §16 AC Stable/Dev Runtime Isolation and Promotion
+
+AC repair work uses two independent runtime planes:
+
+- The stable service remains on port `40000` and branch
+  `codex/direct-no-pass-post-reconcile-r2`. The first isolation promotion is
+  anchored at `a25838f15f949ac434cf78e03f20760e82ff81f0`; every successor promotion
+  is anchored at the exact current stable HEAD plus the previous durable
+  promotion receipt. Dev work must not checkout, rebase, restart, redeploy, or
+  replace that process. `aming-claw start` keeps its generic multi-project
+  behavior; AC identity gates apply only to explicit `--runtime-plane stable`
+  or `--runtime-plane dev` self-hosting starts.
+- The only dev service is branch `codex/ac-dev` on reserved port `40008`.
+  Its health response binds port, PID, physical worktree, branch, loaded commit,
+  stable anchor, project allowlist, schema policy, and mutation boundary. Each
+  dev start resolves the exact non-stale commit currently loaded on stable
+  `40000`; only the legacy a258 bootstrap health may omit plane identity.
+  Caller-supplied stale anchors and starting dev while stable identity is
+  unavailable fail closed, so successor rows do not remain pinned to a258.
+  Dev also discovers the one exact stable-branch worktree and requires its
+  physical `shared-volume` path and database identity to equal stable health;
+  an alternate AC-shaped database is rejected before a process or DB write.
+  At the frozen a258 bootstrap only, where old health has no DB identity field,
+  the exact stable-worktree database is the sole fallback authority.
+  Reusing an already-listening `40008` is also an exact identity check: the
+  invoking checkout must be clean and its physical root, branch, full commit,
+  loopback bind, loaded runtime, non-stale status, and current stable anchor
+  must all equal the service health identity. A process from another worktree
+  or an older `codex/ac-dev` commit is never treated as the requested service.
+- The dev plane accepts only project `aming-claw` and only an already-existing
+  `shared-volume/codex-tasks/state/governance/aming-claw/governance.db`.
+  Empty, foreign, or traversal-shaped project IDs fail before directory
+  creation, schema execution, or writes. Dev connections verify the existing
+  schema version and never auto-migrate it; schema repairs run against an
+  isolated clone first.
+- Dev may append repair backlog, timeline, ContractRuntime, candidate graph,
+  and independent-QA evidence. It cannot activate/finalize current-full,
+  rewrite stable version identity, run stable deployment endpoints, or join
+  stable Redis/event/background workers.
+- The stable authority plane owns observer-session registration, observer
+  route-context issue/renew, and managed QA role/session issuance. The dev
+  plane never mints these capabilities. An observer first obtains the
+  session/route/QA refs through port `40000`, then port `40008` may consume the
+  already-persisted refs from the shared AC database and append bounded repair
+  evidence. Heartbeat/close/revoke may consume an existing observer ref on the
+  dev plane; they cannot create one. Fresh Onboard routing projections are
+  usable on `40008` with the public MCP body (which has no `project_root`), but
+  any projected authority-mint action must be executed against `40000` before
+  returning to dev. Retired `direct_fix` enter/start is denied on both the dev
+  allowlist and the active Onboard contract.
+- Port `40008` binds only `127.0.0.1`. Branch-service validation is a local CLI
+  supervisor using the current Python executable; the former HTTP process
+  spawner returns `410` and cannot accept a caller-controlled executable.
+
+Downstream work blocked by an AC defect may use the existing evidence-bound
+ContractRuntime bypass and WAIVE path. The bypass must name the AC repair
+backlog and preserve the original failed line; `pass_implied=false` remains
+mandatory. It may restore downstream WIP but cannot synthesize PASS,
+independent QA, close-ready, or stable promotion evidence.
+
+Promotion is a separate operator action. `scripts/merge-and-deploy.sh` rejects
+legacy branch arguments and requires an `ac_stable_promotion_manifest.v1`
+file. The manifest binds the exact current stable HEAD, prior chained receipt
+(or the one-time explicit bootstrap anchor), `codex/ac-dev` candidate, Direct
+Main CEX, exact file fence and binary diff hash, and a canonical promotion
+intent digest and a second digest over the signable manifest. The QA gate is
+one canonical, role-bound `qa.independent_verification` verdict—not three
+aliases for one fact. Its `promotion_gate_results` contains the loopback
+branch-service regression and all three release-candidate lanes; every
+subresult has a test id, PASS status, and report hash. The verdict also binds
+the exact ContractRuntime stage/line, candidate/parent comparison authority,
+stable anchor, file fence, binary diff, and intent, and must be
+non-synthesized. The verdict actor must equal the authenticated QA proof
+principal. An identical QA authority under any other project event or line,
+including an observer-authored copy under another backlog/task, is an
+ambiguous replay and fails closed.
+
+The promotion database is not caller-selectable. The script derives
+`shared-volume/codex-tasks/state/governance/aming-claw/governance.db` from the
+discovered exact stable worktree and rejects a different
+`SHARED_VOLUME_PATH`, symlink, or path escape. A public-safe physical identity
+(`ac_stable_database_identity.v1`: device, inode, and the stable-relative path
+hash, with no absolute host path) is bound through QA evidence, intent,
+manifest, operator signoff, precheck, stable health, prior receipt, and the
+completion receipt. Normal SQLite writes preserve this identity; file
+replacement does not. The projector re-stats it immediately before Git
+mutation, the restarted service reports it from its actual canonical path,
+and completion verifies the database opened by SQLite. Bootstrap uses the
+current canonical stable DB; every successor must equal both stable health and
+the prior receipt's identity.
+
+Operator signoff is a separate user-triggered action on stable `40000`; the
+promotion script never creates it. The operator submits a no-op reorder of the
+existing release-operator queue (`before == after`) whose canonical JSON
+reason uses schema `ac_stable_promotion_operator_signoff.v1` and binds a unique
+32-hex nonce, the operator principal, one-hour expiry, backlog/CEX, expected
+stable HEAD, candidate, intent and signable-manifest digests, verifier hash,
+and diff hash. The returned append-only queue event id is placed in the
+manifest. The read-only projector opens the existing database with `mode=ro`
+and `query_only`, performs no schema setup, verifies the endpoint-authenticated
+actor and exact no-op event, and rejects missing, duplicate, replayed, expired,
+extra, or partially bound evidence before any Git/process mutation. A queue
+actor ending in `:route_ref` is observer-route-derived and can never satisfy
+operator signoff, even if its claimed principal and manifest fields agree.
+Dev `40008` cannot issue either gate.
+
+After all evidence, import, syntax, stable-health, worktree, ancestry, and diff
+checks pass, promotion uses only `git merge --ff-only` so stable HEAD becomes
+the exact reviewed candidate. The host supervisor starts explicit stable mode
+on `40000`; post-health must report the exact loaded candidate, stable branch,
+anchor, ready identity, and `runtime_stale=false`. The stable runtime then
+persists `ac.stable_promotion_completed` with the verifier hash and chained
+receipt. That receipt is mandatory as the next row's anchor authority. The
+projector reads the complete promotion event chain without public timeline
+pagination and runs a second time immediately before the merge CAS, catching
+late expiry, DB replacement, QA/signoff replay, or a concurrent successor.
+Stable completion holds `BEGIN IMMEDIATE` across durable-gate validation,
+project-wide fork/replay detection, and receipt append. A retry after a lost
+successful response may return the one exact authenticated durable receipt
+after signoff expiry; a different candidate, receipt body, backlog, or CEX is
+not idempotent.
+The completion request's predecessor hash must also equal both the precheck
+projection and manifest `prior_promotion` receipt (or be empty in all three
+places for bootstrap) before idempotency or insertion.
+
+The path never targets stale `main`, performs no automatic
+rebase, merge commit,
+fallback merge, force-kill, branch deletion, stable/dev database copy, or
+caller-declared PASS.

@@ -26,15 +26,17 @@ import sys
 import logging
 import json
 import hashlib
+import re
 import time
 import webbrowser
 import socket
 import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 try:
     import click
@@ -46,6 +48,14 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 DEFAULT_GOVERNANCE_URL = "http://localhost:40000"
+AC_STABLE_SERVICE_PORT = 40000
+AC_DEV_SERVICE_PORT = 40008
+AC_DEV_BRANCH = "codex/ac-dev"
+AC_STABLE_BRANCH = "codex/direct-no-pass-post-reconcile-r2"
+AC_STABLE_ANCHOR_COMMIT = "a25838f15f949ac434cf78e03f20760e82ff81f0"
+AC_DATABASE_STABLE_RELATIVE_PATH = (
+    "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
+)
 
 # Governance keeps bounded SQLite state open for each registered project. 4096
 # leaves release-scale descriptor headroom while remaining below ordinary POSIX
@@ -63,6 +73,267 @@ redis_url: "redis://localhost:6379/0"
 max_workers: 4
 db_path: ""
 """
+
+
+def _source_git_identity() -> dict[str, str]:
+    """Return the exact source checkout identity used by the CLI process."""
+
+    root = Path(__file__).resolve().parents[1]
+
+    def run(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    return {
+        "root": run("rev-parse", "--show-toplevel") or str(root),
+        "branch": run("branch", "--show-current"),
+        "commit": run("rev-parse", "HEAD").lower(),
+        "dirty": run("status", "--porcelain"),
+    }
+
+
+def _stable_start_identity_precheck(
+    *,
+    port: int,
+    requested_anchor: str,
+) -> dict[str, str]:
+    """Prevent a dev/dirty checkout from impersonating the stable plane."""
+
+    identity = _source_git_identity()
+    if port != AC_STABLE_SERVICE_PORT:
+        raise click.ClickException(
+            f"AC stable runtime is reserved to port {AC_STABLE_SERVICE_PORT}; got {port}."
+        )
+    if identity["branch"] != AC_STABLE_BRANCH:
+        raise click.ClickException(
+            f"AC stable runtime requires branch {AC_STABLE_BRANCH}; "
+            f"got {identity['branch'] or 'unknown'}."
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", identity["commit"]):
+        raise click.ClickException("AC stable runtime requires an exact Git HEAD commit.")
+    if identity["dirty"]:
+        raise click.ClickException("AC stable runtime requires a clean frozen worktree.")
+    anchor = str(requested_anchor or identity["commit"]).strip().lower()
+    if anchor != identity["commit"]:
+        raise click.ClickException(
+            "AC stable runtime anchor must equal the exact frozen branch HEAD."
+        )
+    return {**identity, "stable_anchor_commit": anchor}
+
+
+def _stable_running_identity_matches(
+    health: Mapping[str, Any],
+    expected: Mapping[str, str],
+) -> bool:
+    identity = health.get("runtime_plane_identity")
+    if not isinstance(identity, Mapping):
+        return False
+    commit = str(expected.get("commit") or "")
+    return bool(
+        health.get("runtime_plane") == "stable"
+        and health.get("port") == AC_STABLE_SERVICE_PORT
+        and health.get("runtime_loaded_version") == commit
+        and health.get("runtime_stale") is False
+        and identity.get("status") == "ready"
+        and identity.get("branch") == AC_STABLE_BRANCH
+        and identity.get("commit") == commit
+        and identity.get("stable_anchor_commit") == commit
+    )
+
+
+def _dev_source_identity_precheck() -> dict[str, str]:
+    """Bind a dev start/reuse decision to this exact clean checkout."""
+
+    identity = _source_git_identity()
+    try:
+        root = str(Path(identity.get("root") or "").resolve(strict=True))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(
+            "AC dev runtime requires an exact physical source worktree."
+        ) from exc
+    commit = str(identity.get("commit") or "").strip().lower()
+    if identity.get("branch") != AC_DEV_BRANCH:
+        raise click.ClickException(
+            f"AC dev runtime requires branch {AC_DEV_BRANCH}; "
+            f"got {identity.get('branch') or 'unknown'}."
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise click.ClickException("AC dev runtime requires an exact Git HEAD commit.")
+    if identity.get("dirty"):
+        raise click.ClickException("AC dev runtime requires a clean immutable candidate.")
+    return {**identity, "root": root, "commit": commit}
+
+
+def _dev_running_identity_matches(
+    health: Mapping[str, Any],
+    expected: Mapping[str, str],
+    *,
+    stable_anchor_commit: str,
+    stable_database_identity: Mapping[str, Any],
+) -> bool:
+    identity = health.get("runtime_plane_identity")
+    if not isinstance(identity, Mapping):
+        return False
+    return bool(
+        health.get("runtime_plane") == "dev"
+        and health.get("port") == AC_DEV_SERVICE_PORT
+        and health.get("bind_host") == "127.0.0.1"
+        and health.get("runtime_loaded_version") == expected.get("commit")
+        and health.get("runtime_stale") is False
+        and identity.get("status") == "ready"
+        and identity.get("bind_host") == "127.0.0.1"
+        and identity.get("worktree_root") == expected.get("root")
+        and identity.get("branch") == AC_DEV_BRANCH
+        and identity.get("commit") == expected.get("commit")
+        and identity.get("stable_anchor_commit") == stable_anchor_commit
+        and identity.get("stable_database_identity")
+        == dict(stable_database_identity)
+    )
+
+
+def _canonical_stable_database_binding(
+    requested_shared_volume: str,
+    *,
+    stable_anchor_commit: str,
+) -> dict[str, Any]:
+    """Bind a dev runtime to the stable branch's physical governance DB."""
+
+    source_root = Path(str(_source_git_identity().get("root") or "")).resolve(
+        strict=True
+    )
+    proc = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=source_root,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise click.ClickException("Stable worktree identity is unavailable.")
+    expected_branch = "refs/heads/" + AC_STABLE_BRANCH
+    roots = []
+    for block in proc.stdout.strip().split("\n\n"):
+        values = dict(
+            line.split(" ", 1) if " " in line else (line, "")
+            for line in block.splitlines()
+        )
+        if values.get("branch") == expected_branch and values.get("worktree"):
+            roots.append(Path(values["worktree"]).resolve(strict=True))
+    if len(roots) != 1:
+        raise click.ClickException("Exact stable branch worktree is unavailable.")
+    stable_root = roots[0]
+    canonical_shared = (stable_root / "shared-volume").absolute()
+    requested = Path(str(requested_shared_volume or "")).expanduser().absolute()
+    try:
+        if (
+            not requested_shared_volume
+            or requested.is_symlink()
+            or canonical_shared.is_symlink()
+            or requested.resolve(strict=True) != canonical_shared.resolve(strict=True)
+            or canonical_shared.resolve(strict=True) != canonical_shared
+        ):
+            raise click.ClickException(
+                "AC dev runtime requires the exact stable-worktree shared volume."
+            )
+        db_path = canonical_shared / Path(
+            AC_DATABASE_STABLE_RELATIVE_PATH
+        ).relative_to("shared-volume")
+        metadata = db_path.stat(follow_symlinks=False)
+        if (
+            db_path.is_symlink()
+            or not db_path.is_file()
+            or db_path.resolve(strict=True) != db_path
+        ):
+            raise click.ClickException(
+                "AC dev runtime canonical stable database identity is invalid."
+            )
+    except (OSError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, click.ClickException):
+            raise
+        raise click.ClickException(
+            "AC dev runtime canonical stable database identity is unavailable."
+        ) from exc
+    relative_hash = "sha256:" + hashlib.sha256(
+        AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+    ).hexdigest()
+    database_identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "stable_relative_path_sha256": relative_hash,
+    }
+    health = _probe_governance(AC_STABLE_SERVICE_PORT) or {}
+    plane_identity = health.get("runtime_plane_identity")
+    health_database_identity = (
+        plane_identity.get("stable_database_identity")
+        if isinstance(plane_identity, Mapping)
+        else None
+    )
+    if health_database_identity is None:
+        if stable_anchor_commit != AC_STABLE_ANCHOR_COMMIT:
+            raise click.ClickException(
+                "Stable service does not expose its database identity."
+            )
+    elif health_database_identity != database_identity:
+        raise click.ClickException(
+            "Stable service database identity differs from the stable worktree."
+        )
+    return {
+        "shared_volume_path": str(canonical_shared),
+        "stable_database_identity": database_identity,
+    }
+
+
+def _current_stable_anchor_commit() -> str:
+    """Resolve the exact currently loaded stable commit, never a stale default."""
+
+    health = _probe_governance(AC_STABLE_SERVICE_PORT)
+    loaded = str((health or {}).get("runtime_loaded_version") or "").strip().lower()
+    if not (
+        health
+        and health.get("status") == "ok"
+        and health.get("service") == "governance"
+        and health.get("port") == AC_STABLE_SERVICE_PORT
+        and health.get("runtime_stale") is False
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", loaded)
+    ):
+        raise click.ClickException(
+            "AC dev runtime requires an exact non-stale stable service on port 40000."
+        )
+    identity = health.get("runtime_plane_identity")
+    if isinstance(identity, Mapping) and identity:
+        if not (
+            health.get("runtime_plane") == "stable"
+            and identity.get("status") == "ready"
+            and identity.get("branch") == AC_STABLE_BRANCH
+            and identity.get("commit") == loaded
+            and identity.get("stable_anchor_commit") == loaded
+        ):
+            raise click.ClickException("Stable service identity is not release-ready.")
+    elif loaded != AC_STABLE_ANCHOR_COMMIT:
+        # a258 predates plane identity fields. It is the only legacy stable
+        # runtime accepted for the one-time bootstrap promotion.
+        raise click.ClickException("Legacy stable health is valid only at the bootstrap anchor.")
+    return loaded
+
+
+def _run_dev_governance() -> None:
+    """Enter the guarded server module without the legacy startup wrapper."""
+
+    from agent.governance.server import main as governance_main
+
+    governance_main()
 
 
 @click.group()
@@ -458,11 +729,92 @@ def _launcher_html(governance_url: str) -> str:
     help="Runtime workspace root for shared-volume/project state. Defaults to the plugin runtime root, not the current project.",
 )
 @click.option("--port", default=40000, type=int, help="Governance HTTP port.")
-def start(workspace, port):
+@click.option(
+    "--runtime-plane",
+    type=click.Choice(["generic", "stable", "dev"]),
+    default="generic",
+    help=(
+        "Runtime plane. Generic preserves the public start contract; AC stable/dev "
+        "are explicit self-hosting modes."
+    ),
+)
+@click.option(
+    "--runtime-workspace",
+    default="",
+    help="Process-local runtime state root for the dev plane; must be outside the source worktree.",
+)
+@click.option(
+    "--shared-volume-path",
+    default="",
+    help="Existing shared-volume root. Required by the dev plane.",
+)
+@click.option(
+    "--stable-anchor-commit",
+    default="",
+    help=(
+        "Exact stable commit. Dev defaults to the currently loaded stable; stable "
+        "defaults to and must equal the checked-out stable branch HEAD."
+    ),
+)
+def start(
+    workspace,
+    port,
+    runtime_plane,
+    runtime_workspace,
+    shared_volume_path,
+    stable_anchor_commit,
+):
     """Start governance in the foreground without spawning plugin-owned workers."""
     _require_source_checkout_matches_loaded_package(workspace)
+    if runtime_plane == "dev":
+        if port != AC_DEV_SERVICE_PORT:
+            raise click.ClickException(
+                f"AC dev runtime is reserved to port {AC_DEV_SERVICE_PORT}; got {port}."
+            )
+        dev_identity = _dev_source_identity_precheck()
+        current_stable_anchor = _current_stable_anchor_commit()
+        stable_anchor_commit = stable_anchor_commit or current_stable_anchor
+        if stable_anchor_commit != current_stable_anchor:
+            raise click.ClickException(
+                "AC dev runtime anchor must equal the currently loaded stable commit."
+            )
+        database_binding = _canonical_stable_database_binding(
+            shared_volume_path,
+            stable_anchor_commit=stable_anchor_commit,
+        )
+        shared_volume_path = str(database_binding["shared_volume_path"])
+        stable_identity = None
+    elif runtime_plane == "stable":
+        stable_identity = _stable_start_identity_precheck(
+            port=port,
+            requested_anchor=stable_anchor_commit,
+        )
+        stable_anchor_commit = stable_identity["commit"]
+    else:
+        stable_identity = None
+        dev_identity = None
+        database_binding = None
     health = _probe_governance(port)
     if health and health.get("status") == "ok" and health.get("service") == "governance":
+        if runtime_plane == "dev":
+            if not _dev_running_identity_matches(
+                health,
+                dev_identity or {},
+                stable_anchor_commit=stable_anchor_commit,
+                stable_database_identity=(database_binding or {}).get(
+                    "stable_database_identity", {}
+                ),
+            ):
+                raise click.ClickException(
+                    "Port 40008 is occupied by governance with a mismatched AC dev runtime identity."
+                )
+        elif runtime_plane == "stable" and not _stable_running_identity_matches(
+            health, stable_identity or {}
+        ):
+            raise click.ClickException(
+                "Port 40000 is occupied by governance whose loaded stable "
+                "branch/commit identity does not match this clean frozen checkout."
+            )
         dashboard = _dashboard_url(f"http://localhost:{port}")
         version = health.get("version") or health.get("runtime_version") or "unknown"
         click.echo(f"Governance already running on port {port} (version {version}).")
@@ -475,24 +827,117 @@ def start(workspace, port):
             "Stop that process or choose a different --port."
         )
     os.environ["GOVERNANCE_PORT"] = str(port)
-    runtime_workspace = Path(workspace).resolve() if workspace else _default_runtime_workspace()
-    os.environ["AMING_CLAW_HOME"] = str(runtime_workspace)
-    os.environ.setdefault("SHARED_VOLUME_PATH", str(runtime_workspace / "shared-volume"))
+    if runtime_plane == "dev":
+        if port != AC_DEV_SERVICE_PORT:
+            raise click.ClickException(
+                f"AC dev runtime is reserved to port {AC_DEV_SERVICE_PORT}; got {port}."
+            )
+        source_root = Path(str((dev_identity or {}).get("root") or "")).resolve()
+        if not re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor_commit
+        ):
+            raise click.ClickException("AC dev runtime requires an exact stable anchor commit.")
+        if not shared_volume_path:
+            raise click.ClickException(
+                "AC dev runtime requires --shared-volume-path pointing to an existing AC database."
+            )
+        shared_root = Path(shared_volume_path).expanduser().resolve()
+        existing_db = (
+            shared_root
+            / "codex-tasks"
+            / "state"
+            / "governance"
+            / "aming-claw"
+            / "governance.db"
+        )
+        if not existing_db.is_file():
+            raise click.ClickException(
+                "AC dev runtime requires the existing aming-claw governance.db; "
+                f"not found at {existing_db}."
+            )
+        if runtime_workspace:
+            runtime_root = Path(runtime_workspace).expanduser().resolve()
+        else:
+            runtime_root = Path(tempfile.gettempdir()) / "aming-claw-dev-40008"
+        runtime_root = runtime_root.resolve()
+        if runtime_root == source_root or source_root in runtime_root.parents:
+            raise click.ClickException(
+                "AC dev runtime workspace must be outside the source worktree."
+            )
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        os.environ["AMING_CLAW_STABLE_ANCHOR_COMMIT"] = stable_anchor_commit
+        os.environ["AMING_CLAW_ALLOWED_PROJECT_IDS"] = "aming-claw"
+        os.environ["AMING_CLAW_DB_MIGRATION_POLICY"] = "verify-only"
+        os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] = "deny"
+        os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] = "deny"
+        os.environ["SHARED_VOLUME_PATH"] = str(shared_root)
+    elif runtime_plane == "stable":
+        runtime_root = Path(workspace).resolve() if workspace else _default_runtime_workspace()
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "stable"
+        os.environ["AMING_CLAW_STABLE_ANCHOR_COMMIT"] = stable_anchor_commit
+        if shared_volume_path:
+            os.environ["SHARED_VOLUME_PATH"] = str(
+                Path(shared_volume_path).expanduser().resolve()
+            )
+        else:
+            os.environ.setdefault("SHARED_VOLUME_PATH", str(runtime_root / "shared-volume"))
+    else:
+        runtime_root = Path(workspace).resolve() if workspace else _default_runtime_workspace()
+        os.environ.pop("AMING_CLAW_RUNTIME_PLANE", None)
+        os.environ.pop("AMING_CLAW_STABLE_ANCHOR_COMMIT", None)
+        if shared_volume_path:
+            os.environ["SHARED_VOLUME_PATH"] = str(
+                Path(shared_volume_path).expanduser().resolve()
+            )
+        else:
+            os.environ.setdefault("SHARED_VOLUME_PATH", str(runtime_root / "shared-volume"))
+    os.environ["AMING_CLAW_HOME"] = str(runtime_root)
     resource_preflight = _governance_start_resource_preflight()
     click.echo(
         "Governance startup resource preflight: "
         + json.dumps(resource_preflight, sort_keys=True),
         err=True,
     )
-    import start_governance
+    if runtime_plane == "dev":
+        # Do not enter start_governance.py: its legacy host bootstrap performs
+        # a chain-history backfill before the server can enforce the dev plane.
+        _run_dev_governance()
+    else:
+        import start_governance
 
-    start_governance.main(workspace_root=runtime_workspace)
+        start_governance.main(workspace_root=runtime_root)
 
 
 @main.group("branch-service")
 def branch_service():
     """Validate isolated branch governance services."""
     pass
+
+
+def _local_branch_service_validate(payload: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Run the candidate's safe supervisor locally, never through frozen 40000."""
+
+    from agent.governance.server import (
+        RequestContext,
+        handle_branch_service_validate,
+    )
+
+    ctx = RequestContext(
+        handler=None,
+        method="POST",
+        path_params={},
+        query={},
+        body=dict(payload),
+        request_id=f"local-branch-service-{os.getpid()}",
+        token="",
+        idem_key="",
+    )
+    result = handle_branch_service_validate(ctx)
+    if isinstance(result, tuple):
+        if isinstance(result[0], int):
+            return int(result[0]), dict(result[1])
+        return int(result[1]), dict(result[0])
+    return 200, dict(result)
 
 
 @branch_service.command("validate")
@@ -503,10 +948,29 @@ def branch_service():
     type=click.Path(file_okay=False, dir_okay=True, path_type=str),
     help="Branch/worker checkout root to start as the service cwd.",
 )
-@click.option("--port", required=True, type=int, help="Explicit non-main governance port.")
-@click.option("--governance-url", default=DEFAULT_GOVERNANCE_URL, help="Main governance service URL.")
+@click.option(
+    "--port",
+    default=AC_DEV_SERVICE_PORT,
+    show_default=True,
+    type=int,
+    help="Reserved AC dev governance port.",
+)
+@click.option(
+    "--governance-url",
+    default=DEFAULT_GOVERNANCE_URL,
+    help="Compatibility-only stable URL; never used to launch the dev process.",
+)
 @click.option("--runtime-workspace", default="", help="Isolated AMING_CLAW_HOME for the branch service.")
-@click.option("--shared-volume-path", default="", help="Isolated SHARED_VOLUME_PATH for the branch service.")
+@click.option(
+    "--shared-volume-path",
+    required=True,
+    help="Existing SHARED_VOLUME_PATH containing aming-claw/governance.db.",
+)
+@click.option(
+    "--stable-anchor-commit",
+    default="",
+    help="Exact current stable release commit; defaults from stable port 40000.",
+)
 @click.option("--python", "python_bin", default="", help="Python executable for the branch service. Defaults to current Python.")
 @click.option("--timeout-sec", default=30.0, type=float, help="Seconds to wait for branch /api/health.")
 @click.option("--keep-running", is_flag=True, help="Leave the validated branch service running.")
@@ -517,26 +981,42 @@ def branch_service_validate(
     governance_url,
     runtime_workspace,
     shared_volume_path,
+    stable_anchor_commit,
     python_bin,
     timeout_sec,
     keep_running,
     json_output,
 ):
-    """Start and health-check a branch governance service without replacing main."""
+    """Start and health-check the candidate through its local safe supervisor."""
+    current_stable_anchor = _current_stable_anchor_commit()
+    stable_anchor_commit = stable_anchor_commit or current_stable_anchor
+    if stable_anchor_commit != current_stable_anchor:
+        raise click.ClickException(
+            "Branch-service anchor must equal the currently loaded stable commit."
+        )
+    database_binding = _canonical_stable_database_binding(
+        shared_volume_path,
+        stable_anchor_commit=stable_anchor_commit,
+    )
     payload: dict[str, Any] = {
         "worktree_path": str(Path(worktree_path).expanduser().resolve()),
         "port": port,
         "timeout_sec": timeout_sec,
         "keep_running": keep_running,
+        "stable_anchor_commit": stable_anchor_commit,
     }
     if runtime_workspace:
         payload["runtime_workspace"] = str(Path(runtime_workspace).expanduser().resolve())
-    if shared_volume_path:
-        payload["shared_volume_path"] = str(Path(shared_volume_path).expanduser().resolve())
+    payload["shared_volume_path"] = database_binding["shared_volume_path"]
+    payload["stable_database_identity"] = database_binding[
+        "stable_database_identity"
+    ]
     if python_bin:
         payload["python"] = python_bin
-    url = governance_url.rstrip("/") + "/api/branch-service/validate"
-    status, result = _http_json("POST", url, payload, timeout=timeout_sec + 20)
+    _ = governance_url
+    status, result = _local_branch_service_validate(payload)
+    result.setdefault("launch_authority", "client_local_candidate_supervisor")
+    result.setdefault("stable_service_contacted", False)
     if json_output or status >= 400 or not result.get("ok"):
         click.echo(json.dumps(result, indent=2, sort_keys=True))
     else:

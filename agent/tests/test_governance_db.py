@@ -3,6 +3,8 @@ import os
 import sys
 import tempfile
 import unittest
+import sqlite3
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -37,6 +39,162 @@ class TestDB(unittest.TestCase):
         self.assertIn("idempotency_keys", table_names)
         self.assertIn("node_history", table_names)
         close_connection(conn)
+
+
+class TestACDevDatabaseIsolation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+        os.environ.pop("AMING_CLAW_RUNTIME_PLANE", None)
+
+    def tearDown(self):
+        for key in (
+            "SHARED_VOLUME_PATH",
+            "AMING_CLAW_RUNTIME_PLANE",
+            "AMING_CLAW_DB_MIGRATION_POLICY",
+            "AMING_CLAW_ALLOWED_PROJECT_IDS",
+        ):
+            os.environ.pop(key, None)
+        self.tmp.cleanup()
+
+    def _create_ac_db(self):
+        from governance.db import get_connection
+
+        conn = get_connection("aming-claw")
+        path = conn.execute("PRAGMA database_list").fetchone()[2]
+        conn.close()
+        return path
+
+    def test_dev_rejects_foreign_empty_and_traversal_before_project_creation(self):
+        from governance.db import get_connection
+
+        self._create_ac_db()
+        root = os.path.join(
+            self.tmp.name, "codex-tasks", "state", "governance"
+        )
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        for project_id in (
+            "",
+            "foreign",
+            "amingClaw",
+            "../aming-claw",
+            "aming-claw/..",
+        ):
+            with self.assertRaises(ValueError):
+                get_connection(project_id)
+        self.assertFalse(os.path.exists(os.path.join(root, "foreign")))
+
+    def test_dev_requires_existing_database_and_never_creates_it(self):
+        from governance.db import get_connection
+
+        root = os.path.join(
+            self.tmp.name,
+            "codex-tasks",
+            "state",
+            "governance",
+            "aming-claw",
+        )
+        os.makedirs(root, exist_ok=True)
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        with self.assertRaises(FileNotFoundError):
+            get_connection("aming-claw")
+        self.assertFalse(os.path.exists(os.path.join(root, "governance.db")))
+
+    def test_dev_schema_mismatch_fails_without_auto_migration(self):
+        from governance.db import get_connection
+
+        path = self._create_ac_db()
+        raw = sqlite3.connect(path)
+        raw.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION - 1),),
+        )
+        raw.commit()
+        raw.close()
+
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        with self.assertRaisesRegex(RuntimeError, "schema mismatch"):
+            get_connection("aming-claw")
+
+        verify = sqlite3.connect(path)
+        value = verify.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        verify.close()
+        self.assertEqual(value, str(SCHEMA_VERSION - 1))
+
+    def test_dev_opens_exact_existing_compatible_database(self):
+        from governance.db import get_connection
+
+        self._create_ac_db()
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        conn = get_connection("aming-claw")
+        value = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(value, str(SCHEMA_VERSION))
+
+    def test_canonical_database_identity_survives_normal_sqlite_writes(self):
+        from governance.db import canonical_ac_database_identity
+
+        path = self._create_ac_db()
+        os.environ["SHARED_VOLUME_PATH"] = str(Path(self.tmp.name).resolve())
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        before = canonical_ac_database_identity()
+        raw = sqlite3.connect(path)
+        raw.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
+            ("identity-write-test", "ok"),
+        )
+        raw.commit()
+        after = canonical_ac_database_identity(raw)
+        raw.close()
+
+        self.assertEqual(after, before)
+        self.assertNotIn("path", after)
+
+    def test_dev_rejects_governance_database_symlink_escape(self):
+        from governance.db import get_connection
+
+        path = self._create_ac_db()
+        outside = os.path.join(self.tmp.name, "outside-governance.db")
+        os.replace(path, outside)
+        os.symlink(outside, path)
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+
+        with self.assertRaisesRegex(ValueError, "cannot be a symlink"):
+            get_connection("aming-claw")
+
+        self.assertTrue(os.path.isfile(outside))
+
+    def test_dev_connection_denies_schema_and_attachment_mutation(self):
+        from governance.db import get_connection
+
+        path = self._create_ac_db()
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        conn = get_connection("aming-claw")
+        with self.assertRaises(sqlite3.DatabaseError):
+            conn.execute("CREATE TABLE dev_should_not_exist (id INTEGER)")
+        with self.assertRaises(sqlite3.DatabaseError):
+            conn.execute(
+                "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+                (str(SCHEMA_VERSION + 1),),
+            )
+        with self.assertRaises(sqlite3.DatabaseError):
+            conn.execute("ATTACH DATABASE ':memory:' AS foreign_db")
+        conn.close()
+
+        verify = sqlite3.connect(path)
+        table = verify.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'dev_should_not_exist'"
+        ).fetchone()
+        version = verify.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        verify.close()
+        self.assertIsNone(table)
+        self.assertEqual(version, str(SCHEMA_VERSION))
 
     def test_schema_version_tracking(self):
         from governance.db import get_connection, close_connection
