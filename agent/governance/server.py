@@ -9403,6 +9403,12 @@ _QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE = (
     "ContractRuntime.rev8_postmerge_qa_authority+"
     "observer_merge.durable_merge_authority"
 )
+_QA_EXISTING_POSTMERGE_COMPARISON_LINEAGE_SOURCE = (
+    "ContractRuntime.completed_lines.observer_dispatch_bounded_workers+"
+    "parallel_branch_runtime_contexts+"
+    "observer_merge.durable_merge_authority+"
+    "parallel_branch_merge_queue_items.ordered_merge_lineage"
+)
 _QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE = _QA_WORKER_COMPARISON_BASE_SOURCE
 _QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE = (
     "task_timeline.accepted_direct_main_worker_implementation+"
@@ -10890,6 +10896,271 @@ def _qa_exact_candidate_direct_main_comparison_failure(
     }
 
 
+def _qa_exact_candidate_direct_main_strict_comparison_authority(
+    *,
+    strict_record: Mapping[str, Any],
+    direct_event: Mapping[str, Any],
+    implementation_event: Mapping[str, Any],
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    project_root: Path,
+    candidate_commit_sha: str,
+    comparison_base: str,
+) -> dict[str, Any]:
+    """Bind strict Direct Main comparison to its immutable pre-mutation world."""
+
+    metadata = (
+        strict_record.get("metadata")
+        if isinstance(strict_record.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    binding_hash = str(binding.get("binding_hash") or "").strip()
+    unsigned_binding = {
+        key: value for key, value in binding.items() if key != "binding_hash"
+    }
+    canonical_root = Path(project_root).resolve()
+    canonical_root_text = str(canonical_root)
+    binding_owned_files = sorted(
+        _runtime_context_service_dedupe(
+            [str(path or "").strip() for path in binding.get("owned_files") or []]
+        )
+    )
+    binding_target_files = sorted(
+        _runtime_context_service_dedupe(
+            [str(path or "").strip() for path in binding.get("target_files") or []]
+        )
+    )
+    direct_identity = _observer_root_route_identity_from_event(direct_event)
+    binding_route_identity = (
+        binding.get("route_identity")
+        if isinstance(binding.get("route_identity"), Mapping)
+        else {}
+    )
+    binding_valid = bool(
+        str(strict_record.get("project_id") or "").strip() == project_id
+        and str(strict_record.get("backlog_id") or "").strip() == backlog_id
+        and str(strict_record.get("contract_execution_id") or "").strip()
+        == task_id
+        and str(strict_record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(strict_record.get("version") or "").strip() == "v1"
+        and str(strict_record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+        and str(binding.get("schema_version") or "").strip()
+        == "operator_supervised_direct_main.runtime_binding.v1"
+        and binding.get("strict_runtime_binding_required") is True
+        and binding.get("server_derived") is True
+        and binding.get("caller_claims_trusted") is False
+        and str(binding.get("project_id") or "").strip() == project_id
+        and str(binding.get("backlog_id") or "").strip() == backlog_id
+        and str(binding.get("contract_execution_id") or "").strip()
+        == task_id
+        and str(binding.get("target_project_root") or "").strip()
+        == canonical_root_text
+        and str(binding.get("worktree_path") or "").strip()
+        == canonical_root_text
+        and binding_owned_files
+        and binding_owned_files == binding_target_files
+        and _observer_root_route_identity_complete(binding_route_identity)
+        and _observer_root_route_identity_complete(direct_identity)
+        and _observer_root_route_identity_key(binding_route_identity)
+        == _observer_root_route_identity_key(direct_identity)
+        and str(binding_route_identity.get("route_token_ref") or "").strip()
+        == str(direct_identity.get("route_token_ref") or "").strip()
+        and binding_hash
+        and binding_hash == stable_sha256(unsigned_binding)
+    )
+    if not binding_valid:
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            "exact_candidate_direct_main_runtime_binding_invalid",
+            field="operator_supervised_direct_main_runtime_binding",
+            expected="one hash-valid exact strict runtime binding",
+            actual="missing_ambiguous_or_invalid",
+        )
+
+    world_ref = (
+        binding.get("pre_mutation_world_ref")
+        if isinstance(binding.get("pre_mutation_world_ref"), Mapping)
+        else {}
+    )
+    world_ref_hash = str(world_ref.get("authority_hash") or "").strip()
+    unsigned_world_ref = {
+        key: value for key, value in world_ref.items() if key != "authority_hash"
+    }
+    direct_payload = (
+        direct_event.get("payload")
+        if isinstance(direct_event.get("payload"), Mapping)
+        else {}
+    )
+    direct_authority = (
+        direct_payload.get("observer_direct_pre_mutation_authority")
+        if isinstance(
+            direct_payload.get("observer_direct_pre_mutation_authority"),
+            Mapping,
+        )
+        else {}
+    )
+    graph_evidence = (
+        direct_authority.get("graph_trace_db_evidence")
+        if isinstance(
+            direct_authority.get("graph_trace_db_evidence"), Mapping
+        )
+        else {}
+    )
+    accepted_world_ref = (
+        graph_evidence.get("accepted_world_ref")
+        if isinstance(graph_evidence.get("accepted_world_ref"), Mapping)
+        else {}
+    )
+    world_ref_valid = bool(
+        str(world_ref.get("schema_version") or "").strip()
+        == "operator_supervised_direct_main.pre_mutation_world_ref.v1"
+        and world_ref.get("accepted") is True
+        and str(world_ref.get("status") or "").strip() == "accepted"
+        and world_ref.get("server_derived") is True
+        and world_ref.get("caller_claims_trusted") is False
+        and world_ref.get("repository_root_exact") is True
+        and str(world_ref.get("project_id") or "").strip() == project_id
+        and str(world_ref.get("target_project_root") or "").strip()
+        == canonical_root_text
+        and str(world_ref.get("worktree_path") or "").strip()
+        == canonical_root_text
+        and world_ref_hash
+        and world_ref_hash == stable_sha256(unsigned_world_ref)
+        and dict(accepted_world_ref) == dict(world_ref)
+    )
+    if not world_ref_valid:
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            "exact_candidate_direct_main_pre_mutation_world_mismatch",
+            field="accepted_pre_mutation_world_ref",
+            expected="runtime-bound hash-valid accepted world",
+            actual="missing_or_mismatched",
+        )
+
+    implementation_payload = (
+        implementation_event.get("payload")
+        if isinstance(implementation_event.get("payload"), Mapping)
+        else {}
+    )
+    prewrite = (
+        implementation_payload.get(
+            "direct_main_implementation_commit_prewrite_authority"
+        )
+        if isinstance(
+            implementation_payload.get(
+                "direct_main_implementation_commit_prewrite_authority"
+            ),
+            Mapping,
+        )
+        else {}
+    )
+    lineage_values = {
+        _contract_runtime_full_commit_value(project_id, value)
+        for value in (
+            binding.get("base_commit"),
+            binding.get("target_head_commit"),
+            world_ref.get("base_commit"),
+            world_ref.get("target_head_commit"),
+            prewrite.get("expected_runtime_base_commit"),
+            prewrite.get("implementation_parent_commit"),
+        )
+    }
+    prewrite_candidate_values = {
+        _contract_runtime_full_commit_value(project_id, value)
+        for value in (
+            implementation_event.get("commit_sha"),
+            prewrite.get("commit_sha"),
+            prewrite.get("resolved_commit_sha"),
+            prewrite.get("canonical_head_commit"),
+        )
+    }
+    if (
+        lineage_values != {comparison_base}
+        or prewrite_candidate_values != {candidate_commit_sha}
+        or str(prewrite.get("expected_runtime_project_root") or "").strip()
+        != canonical_root_text
+        or str(prewrite.get("canonical_project_root") or "").strip()
+        != canonical_root_text
+        or str(prewrite.get("runtime_binding_hash") or "").strip()
+        != binding_hash
+    ):
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            "exact_candidate_direct_main_base_lineage_mismatch",
+            field="pre_mutation_parent_to_candidate_lineage",
+            expected={
+                "comparison_base_commit_sha": comparison_base,
+                "candidate_commit_sha": candidate_commit_sha,
+            },
+            actual={
+                "base_candidates": sorted(lineage_values),
+                "candidate_candidates": sorted(prewrite_candidate_values),
+            },
+        )
+
+    declared_files = sorted(
+        _runtime_context_service_dedupe(
+            [
+                str(path or "").strip()
+                for path in direct_authority.get("row_declared_files") or []
+            ]
+        )
+    )
+    prewrite_changed_files = sorted(
+        _runtime_context_service_dedupe(
+            [
+                str(path or "").strip()
+                for path in prewrite.get("verified_changed_files") or []
+            ]
+        )
+    )
+    try:
+        diff_identity = _qa_exact_candidate_diff_identity(
+            canonical_root,
+            base_commit_sha=comparison_base,
+            candidate_commit_sha=candidate_commit_sha,
+            comparison_base_commit_source=(
+                _QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
+            ),
+        )
+    except _QACandidateOverlayError:
+        diff_identity = {}
+    diff_changed_files = sorted(
+        _runtime_context_service_dedupe(
+            [
+                str(path or "").strip()
+                for path in diff_identity.get("changed_files") or []
+            ]
+        )
+    )
+    if not (
+        declared_files
+        and declared_files == binding_owned_files
+        and declared_files == binding_target_files
+        and declared_files == prewrite_changed_files
+        and declared_files == diff_changed_files
+    ):
+        return _qa_exact_candidate_direct_main_comparison_failure(
+            "exact_candidate_direct_main_file_fence_mismatch",
+            field="parent_to_candidate_changed_files",
+            expected=declared_files,
+            actual=diff_changed_files,
+        )
+    return {
+        "commit_sha": comparison_base,
+        "source": _QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
+        "lineage_source": _QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE,
+    }
+
+
 def _qa_exact_candidate_direct_main_events(
     conn,
     *,
@@ -11085,6 +11356,36 @@ def _qa_exact_candidate_direct_main_comparison_authority(
             expected="available full commit distinct from candidate",
             actual="missing_or_equal_to_candidate",
         )
+    strict_records = _operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    matching_strict_records = [
+        record
+        for record in strict_records
+        if str(record.get("contract_execution_id") or "").strip()
+        == task_id
+    ]
+    if matching_strict_records:
+        if len(strict_records) != 1 or len(matching_strict_records) != 1:
+            return _qa_exact_candidate_direct_main_comparison_failure(
+                "exact_candidate_direct_main_runtime_binding_invalid",
+                field="strict_runtime_record_count",
+                expected=1,
+                actual=len(matching_strict_records),
+            )
+        return _qa_exact_candidate_direct_main_strict_comparison_authority(
+            strict_record=matching_strict_records[0],
+            direct_event=direct_event,
+            implementation_event=authoritative_events[0],
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            project_root=Path(project_root).resolve(),
+            candidate_commit_sha=candidate_commit_sha,
+            comparison_base=comparison_base,
+        )
     return {
         "commit_sha": comparison_base,
         "source": _QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
@@ -11163,7 +11464,7 @@ def _qa_exact_candidate_postmerge_comparison_authority_for_record(
         for key, value in postmerge.items()
         if key != "authority_hash"
     }
-    if not (
+    current_world_verified = bool(
         postmerge.get("verified") is True
         and postmerge.get("server_derived") is True
         and postmerge.get("db_verified") is True
@@ -11190,22 +11491,59 @@ def _qa_exact_candidate_postmerge_comparison_authority_for_record(
         == candidate_commit_sha
         and str(postmerge.get("authority_hash") or "").strip()
         == stable_sha256(unsigned_postmerge)
-    ):
-        return {}
-    comparison = _contract_runtime_server_comparison_authority(
-        conn,
-        project_id=project_id,
-        record=record,
-        expected_candidate_commit=candidate_commit_sha,
     )
-    if not (
-        comparison.get("commit_sha")
-        and comparison.get("source") == _QA_POSTMERGE_COMPARISON_BASE_SOURCE
-    ):
+    if current_world_verified:
+        comparison = _contract_runtime_server_comparison_authority(
+            conn,
+            project_id=project_id,
+            record=record,
+            expected_candidate_commit=candidate_commit_sha,
+        )
+        if not (
+            comparison.get("commit_sha")
+            and comparison.get("source")
+            == _QA_POSTMERGE_COMPARISON_BASE_SOURCE
+        ):
+            return {}
+        return {
+            **comparison,
+            "lineage_source": _QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE,
+        }
+
+    comparison_base = (
+        _contract_runtime_server_postmerge_comparison_base_commit(
+            conn,
+            project_id=project_id,
+            record=record,
+            expected_candidate_commit=candidate_commit_sha,
+        )
+    )
+    if not comparison_base:
+        return {}
+    project_root = project_service.resolve_project_root(
+        project_id,
+        None,
+        fallback_self=True,
+    )
+    if project_root is None:
+        return {}
+    try:
+        _qa_exact_candidate_diff_identity(
+            Path(project_root).resolve(),
+            base_commit_sha=comparison_base,
+            candidate_commit_sha=candidate_commit_sha,
+            comparison_base_commit_source=(
+                _QA_POSTMERGE_COMPARISON_BASE_SOURCE
+            ),
+        )
+    except _QACandidateOverlayError:
         return {}
     return {
-        **comparison,
-        "lineage_source": _QA_POSTMERGE_COMPARISON_LINEAGE_SOURCE,
+        "commit_sha": comparison_base,
+        "source": _QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+        "lineage_source": (
+            _QA_EXISTING_POSTMERGE_COMPARISON_LINEAGE_SOURCE
+        ),
     }
 
 
@@ -11234,6 +11572,16 @@ def _qa_exact_candidate_runtime_comparison_authority(
             contract_execution_id=task_id,
         )
         if postmerge_records:
+            if len(postmerge_records) != 1:
+                return {
+                    "machine_reason": (
+                        "postmerge_comparison_authority_ambiguous"
+                    ),
+                    "source": _QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+                    "lineage_source": (
+                        _QA_EXISTING_POSTMERGE_COMPARISON_LINEAGE_SOURCE
+                    ),
+                }
             resolved_authorities: dict[str, dict[str, str]] = {}
             for record in postmerge_records:
                 authority = (
