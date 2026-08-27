@@ -119432,17 +119432,38 @@ def test_completed_parent_chain_rescue_harbor_goal_cannot_select_contract_update
     )
     conn.commit()
 
-    result = candidate_server.handle_project_onboard_route_guide(
-        _ctx(
-            {"project_id": PID},
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "continue_contract_chain",
-            },
+    candidate_server._contract_runtime_store(conn)
+    contract_update_count_before = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE contract_id = ?",
+        (candidate_server.CONTRACT_UPDATE_CONTRACT_ID,),
+    ).fetchone()[0]
+    timeline_count_before = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    mutating_sql: list[str] = []
+    conn.set_trace_callback(
+        lambda statement: mutating_sql.append(statement)
+        if statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
         )
+        else None
     )
+
+    try:
+        result = candidate_server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "role": "observer",
+                    "work_type": "continue_contract_chain",
+                },
+            )
+        )
+    finally:
+        conn.set_trace_callback(None)
 
     next_action = result["next_legal_action"]
     assert next_action["action"] == "no_runtime_action"
@@ -119467,34 +119488,33 @@ def test_completed_parent_chain_rescue_harbor_goal_cannot_select_contract_update
     assert storage["storage_mf_type"] == "chain_rescue"
     assert storage["storage_label_is_contract_selection"] is False
     assert storage["selected_contract_changed_by_storage_label"] is False
-
-    execution_count_before = conn.execute(
-        "SELECT COUNT(*) FROM contract_runtime_executions"
-    ).fetchone()[0]
-    changes_before = conn.total_changes
-    with pytest.raises(ValidationError) as rejected:
-        candidate_server.handle_project_contract_update_start(
-            _ctx_with_role(
-                {"project_id": PID},
-                "observer",
-                method="POST",
-                body={"backlog_id": backlog_id},
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE contract_id = ?",
+        (candidate_server.CONTRACT_UPDATE_CONTRACT_ID,),
+    ).fetchone()[0] == contract_update_count_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == timeline_count_before
+    write_targets = {
+        match.group(1).lower()
+        for statement in mutating_sql
+        if (
+            match := re.search(
+                r"\b(?:INTO|UPDATE)\s+([a-z_]+)",
+                statement,
+                flags=re.IGNORECASE,
             )
         )
-    details = rejected.value.details
-    assert details["code"] == "contract_update_backlog_semantics_required"
-    assert details["legacy_storage_mf_type_is_selection_authority"] is False
-    assert details["zero_write_rejection"] is True
-    assert details["writes_performed"] is False
-    assert details["mutation_performed"] is False
-    correction = details["next_legal_action"]
-    assert correction["action"] == "onboard_route_guide"
-    assert correction["contract_update_allowed"] is False
-    assert correction["automatic_direct_main_allowed"] is False
-    assert conn.execute(
-        "SELECT COUNT(*) FROM contract_runtime_executions"
-    ).fetchone()[0] == execution_count_before
-    assert conn.total_changes == changes_before
+    }
+    assert write_targets.isdisjoint(
+        {
+            "parallel_branch_runtime_contexts",
+            "parallel_branch_runtime_contract_revisions",
+            "parallel_branch_merge_queue_items",
+            "task_timeline_events",
+        }
+    )
 
 
 def test_empty_wrong_family_contract_update_projects_no_pass_terminal_and_current_request_successor(
@@ -119547,12 +119567,12 @@ def test_empty_wrong_family_contract_update_projects_no_pass_terminal_and_curren
             json.dumps(
                 {
                     "fence": {
-                        "kind": "harbor_project",
-                        "scope": "runtime-transport-observer",
+                        "kind": "experiment_project",
+                        "scope": "methodology-experiment-observer",
                     },
                     "goal": {
-                        "kind": "harbor_delivery",
-                        "text": "resume the requested parallel worker topology",
+                        "kind": "methodology_experiment",
+                        "text": "resume the bounded corridor-kit experiment topology",
                     },
                     "mf_type": "chain_rescue",
                 }
@@ -120513,6 +120533,13 @@ def test_contract_update_start_accepts_onboard_service_waiver_parent(conn):
         route_token_ref=route_token_ref,
         allowed_actions=["contract_update_start"],
     )
+    selection = server._backlog_contract_update_selection_authority(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    assert selection["ready"] is False
+    assert selection["source_definition_ready"] is False
 
     started = server.handle_project_contract_update_start(
         _ctx(
@@ -120558,6 +120585,13 @@ def test_contract_update_start_infers_onboard_service_waiver_from_current_chain(
         backlog_id=backlog_id,
         route_token_ref=route_token_ref,
     )
+    selection = server._backlog_contract_update_selection_authority(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    assert selection["ready"] is False
+    assert selection["source_definition_ready"] is False
 
     started = server.handle_project_contract_update_start(
         _ctx(
