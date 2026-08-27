@@ -25678,6 +25678,524 @@ def test_parallel_branch_allocate_rejects_cross_backlog_ref_before_write(
     assert get_branch_context(conn, PID, body["task_id"]) is None
 
 
+def _setup_atomic_allocation_custody_precheck_case(
+    conn,
+    tmp_path,
+    monkeypatch,
+    *,
+    suffix: str,
+) -> dict[str, Any]:
+    candidate_server, _ = _preload_candidate_server_module()
+    backlog_id = f"AC-ALLOCATE-CUSTODY-{suffix.upper()}"
+    repository_root = tmp_path / "registered-repository"
+    candidate_commit = _init_test_git_repo(repository_root)
+    monkeypatch.setattr(
+        candidate_server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: repository_root,
+    )
+    monkeypatch.setattr(
+        candidate_server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+    monkeypatch.setattr(
+        candidate_server,
+        "_registry_project_config",
+        server._registry_project_config,
+    )
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = [
+        f"src/{suffix}-source.py",
+        f"tests/test_{suffix}.py",
+    ]
+    conn.execute(
+        """
+        UPDATE backlog_bugs
+           SET target_files = ?, test_files = ?, acceptance_criteria = ?
+         WHERE bug_id = ?
+        """,
+        (
+            json.dumps([row_files[0]]),
+            json.dumps([row_files[1]]),
+            json.dumps(
+                [
+                    {
+                        "id": f"AC-ALLOCATE-CUSTODY-{suffix.upper()}",
+                        "required_scope": {
+                            "kind": "files",
+                            "files": row_files,
+                        },
+                    }
+                ]
+            ),
+            backlog_id,
+        ),
+    )
+    contract_execution_id = (
+        _enter_standalone_mf_parallel_for_allocation_precheck(
+            conn,
+            backlog_id=backlog_id,
+            task_id=f"allocate-custody-{suffix}",
+            owned_files=row_files,
+            suffix=f"custody-{suffix}",
+        )
+    )
+    _admit_mf_parallel_prefill_child_plan(
+        conn,
+        contract_execution_id=contract_execution_id,
+    )
+    admitted_plan = server._contract_runtime_mf_parallel_admitted_prefill_child_plan(
+        server._contract_runtime(conn).store.get(contract_execution_id)
+    )
+    lanes = []
+    for index, admitted_lane in enumerate(admitted_plan["lanes"], start=1):
+        route_token_ref = f"rtok-allocate-custody-{suffix}-{index}"
+        _persist_contract_runtime_observer_route_ref(
+            conn,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            route_token_ref=route_token_ref,
+            allowed_actions=[
+                "parallel_branch_allocate",
+                "task_timeline_append",
+            ],
+            target_files=row_files,
+        )
+        lanes.append(
+            {
+                "task_id": admitted_lane["task_id"],
+                "backlog_id": backlog_id,
+                "contract_execution_id": contract_execution_id,
+                "worker_id": admitted_lane["worker_id"],
+                "worker_slot_id": admitted_lane["worker_slot_id"],
+                "route_token_ref": route_token_ref,
+                "owned_files": admitted_lane["owned_files"],
+                "test_files": admitted_lane["test_files"],
+                "test_commands": admitted_lane["test_commands"],
+            }
+        )
+    conn.commit()
+    request_body = {
+        "base_commit": candidate_commit,
+        "target_head_commit": candidate_commit,
+        "expected_lane_count": 2,
+        "expected_worker_count": 2,
+        "lanes": lanes,
+    }
+    clean = candidate_server.handle_graph_governance_parallel_branch_allocate_precheck(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=request_body,
+        )
+    )
+    bodies_by_task = {
+        body["task_id"]: body
+        for body in clean["copy_safe_allocation_bodies"]
+    }
+    return {
+        "backlog_id": backlog_id,
+        "candidate_commit": candidate_commit,
+        "clean": clean,
+        "contract_execution_id": contract_execution_id,
+        "lanes": lanes,
+        "bodies_by_task": bodies_by_task,
+        "repository_root": repository_root,
+        "request_body": request_body,
+        "server": candidate_server,
+    }
+
+
+def _allocation_custody_git_snapshot(repository_root: Path) -> dict[str, str]:
+    return {
+        "branches": subprocess.run(
+            [
+                "git",
+                "for-each-ref",
+                "--format=%(refname):%(objectname)",
+                "refs/heads",
+            ],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout,
+        "worktrees": subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout,
+    }
+
+
+def _materialize_precheck_custody(
+    *,
+    repository_root: Path,
+    worktree_path: Path,
+    branch_ref: str,
+    commit_sha: str,
+) -> None:
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            branch_ref.removeprefix("refs/heads/"),
+            str(worktree_path),
+            commit_sha,
+        ],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _persist_precheck_custody_context(
+    conn,
+    *,
+    case: Mapping[str, Any],
+    body: Mapping[str, Any],
+    runtime_context_id: str,
+    task_id: str | None = None,
+    owned_files: tuple[str, ...] | None = None,
+    status: str = STATE_WORKTREE_READY,
+) -> BranchTaskRuntimeContext:
+    context = BranchTaskRuntimeContext(
+        project_id=PID,
+        task_id=task_id or body["task_id"],
+        runtime_context_id=runtime_context_id,
+        backlog_id=case["backlog_id"],
+        parent_task_id=case["contract_execution_id"],
+        root_task_id=case["contract_execution_id"],
+        stage_task_id=task_id or body["task_id"],
+        stage_type="mf_sub",
+        worker_id=body["worker_id"],
+        worker_slot_id=body["worker_slot_id"],
+        allocation_owner=body["worker_id"],
+        target_project_root=body["worktree_path"],
+        target_files=tuple(body["owned_files"]),
+        owned_files=(
+            owned_files
+            if owned_files is not None
+            else tuple(body["owned_files"])
+        ),
+        branch_ref=body["branch_ref"],
+        worktree_path=body["worktree_path"],
+        base_commit=case["candidate_commit"],
+        head_commit=case["candidate_commit"],
+        target_head_commit=case["candidate_commit"],
+        merge_queue_id=body["merge_queue_id"],
+        status=status,
+    )
+    return upsert_branch_context(conn, context)
+
+
+def test_parallel_branch_allocate_atomic_precheck_rejects_late_lane_collision_zero_write(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    case = _setup_atomic_allocation_custody_precheck_case(
+        conn,
+        tmp_path,
+        monkeypatch,
+        suffix="late-lane-collision",
+    )
+    ordered_bodies = case["clean"]["copy_safe_allocation_bodies"]
+    lane_one, lane_two = ordered_bodies
+    lane_two_worktree = Path(lane_two["worktree_path"])
+    collision_branch = "collision/late-lane-two"
+    _materialize_precheck_custody(
+        repository_root=case["repository_root"],
+        worktree_path=lane_two_worktree,
+        branch_ref=f"refs/heads/{collision_branch}",
+        commit_sha=case["candidate_commit"],
+    )
+    before_db = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+    before_git = _allocation_custody_git_snapshot(case["repository_root"])
+    lane_one_timeline_count = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events "
+        "WHERE project_id = ? AND task_id = ?",
+        (PID, lane_one["task_id"]),
+    ).fetchone()[0]
+    assert lane_one_timeline_count == 0
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", lane_one["branch_ref"]],
+            cwd=case["repository_root"],
+            check=False,
+        ).returncode
+        != 0
+    )
+
+    with pytest.raises(GovernanceError) as rejected:
+        case["server"].handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=case["request_body"],
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_precheck_custody_collision"
+    )
+    details = rejected.value.details
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    assert details["runtime_context_writes"] == 0
+    assert details["worktree_mutations"] == 0
+    assert details["existing_worktree_touched"] is False
+    assert lane_two["task_id"] in json.dumps(details, sort_keys=True)
+    assert lane_two["worktree_path"] in json.dumps(details, sort_keys=True)
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_db
+    assert _allocation_custody_git_snapshot(case["repository_root"]) == before_git
+    assert get_branch_context(conn, PID, lane_one["task_id"]) is None
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM task_timeline_events "
+            "WHERE project_id = ? AND task_id = ?",
+            (PID, lane_one["task_id"]),
+        ).fetchone()[0]
+        == lane_one_timeline_count
+    )
+    assert not Path(lane_one["worktree_path"]).exists()
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", lane_one["branch_ref"]],
+            cwd=case["repository_root"],
+            check=False,
+        ).returncode
+        != 0
+    )
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=lane_two_worktree,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == collision_branch
+    )
+
+
+@pytest.mark.parametrize(
+    "custody_mode",
+    ["mismatch", "ambiguous", "terminal"],
+)
+def test_parallel_branch_allocate_atomic_precheck_fails_closed_for_invalid_custody(
+    conn,
+    tmp_path,
+    monkeypatch,
+    custody_mode,
+):
+    case = _setup_atomic_allocation_custody_precheck_case(
+        conn,
+        tmp_path,
+        monkeypatch,
+        suffix=f"{custody_mode}-custody",
+    )
+    lane_two = case["clean"]["copy_safe_allocation_bodies"][1]
+    lane_two_worktree = Path(lane_two["worktree_path"])
+    _materialize_precheck_custody(
+        repository_root=case["repository_root"],
+        worktree_path=lane_two_worktree,
+        branch_ref=lane_two["branch_ref"],
+        commit_sha=case["candidate_commit"],
+    )
+    _persist_precheck_custody_context(
+        conn,
+        case=case,
+        body=lane_two,
+        runtime_context_id=f"mfrctx-{custody_mode}-primary",
+        owned_files=(
+            ("README.md",)
+            if custody_mode == "mismatch"
+            else tuple(lane_two["owned_files"])
+        ),
+        status=(
+            STATE_MERGED
+            if custody_mode == "terminal"
+            else STATE_WORKTREE_READY
+        ),
+    )
+    if custody_mode == "ambiguous":
+        _persist_precheck_custody_context(
+            conn,
+            case=case,
+            body=lane_two,
+            runtime_context_id="mfrctx-ambiguous-secondary",
+            task_id=f"{lane_two['task_id']}-other-custodian",
+        )
+    conn.commit()
+    before_db = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+    before_git = _allocation_custody_git_snapshot(case["repository_root"])
+
+    with pytest.raises(GovernanceError) as rejected:
+        case["server"].handle_graph_governance_parallel_branch_allocate_precheck(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=case["request_body"],
+            )
+        )
+
+    assert rejected.value.code == (
+        "parallel_branch_allocate_precheck_custody_collision"
+    )
+    details = rejected.value.details
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    assert details["existing_worktree_touched"] is False
+    assert details["collisions"]
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_db
+    assert _allocation_custody_git_snapshot(case["repository_root"]) == before_git
+
+
+def test_parallel_branch_allocate_atomic_precheck_projects_exact_source_backed_rebind(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    case = _setup_atomic_allocation_custody_precheck_case(
+        conn,
+        tmp_path,
+        monkeypatch,
+        suffix="exact-custody",
+    )
+    lane_two = case["clean"]["copy_safe_allocation_bodies"][1]
+    lane_two_worktree = Path(lane_two["worktree_path"])
+    _materialize_precheck_custody(
+        repository_root=case["repository_root"],
+        worktree_path=lane_two_worktree,
+        branch_ref=lane_two["branch_ref"],
+        commit_sha=case["candidate_commit"],
+    )
+    existing = _persist_precheck_custody_context(
+        conn,
+        case=case,
+        body=lane_two,
+        runtime_context_id="mfrctx-exact-source-backed-custody",
+    )
+    conn.commit()
+    before_db = "\n".join(conn.iterdump())
+    before_changes = conn.total_changes
+    before_git = _allocation_custody_git_snapshot(case["repository_root"])
+
+    response = case[
+        "server"
+    ].handle_graph_governance_parallel_branch_allocate_precheck(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=case["request_body"],
+        )
+    )
+
+    assert response["status"] == "ready"
+    body = {
+        item["task_id"]: item
+        for item in response["copy_safe_allocation_bodies"]
+    }[lane_two["task_id"]]
+    rebind = body["allocation_precheck"]["existing_custody_rebind"]
+    assert {
+        key: rebind[key]
+        for key in (
+            "schema_version",
+            "status",
+            "runtime_context_id",
+            "action",
+            "create_worktree",
+            "source",
+            "delete_or_adopt_existing_worktree",
+            "existing_worktree_touched",
+            "writes_performed",
+        )
+    } == {
+        "schema_version": (
+            "parallel_branch_allocate_precheck.existing_custody_rebind.v1"
+        ),
+        "status": "ready",
+        "runtime_context_id": existing.runtime_context_id,
+        "action": "reuse_exact_runtime_context_without_worktree_mutation",
+        "create_worktree": False,
+        "source": "parallel_branch_runtime_contexts+git_worktree_list",
+        "delete_or_adopt_existing_worktree": False,
+        "existing_worktree_touched": False,
+        "writes_performed": False,
+    }
+    assert body["create_worktree"] is False
+    projection = {
+        item["task_id"]: item for item in response["lane_projections"]
+    }[lane_two["task_id"]]
+    custody = projection["custody_preflight"]
+    assert {
+        key: custody[key]
+        for key in (
+            "schema_version",
+            "status",
+            "branch_ref",
+            "worktree_path",
+            "branch_exists",
+            "worktree_exists",
+            "writes_performed",
+            "mutation_performed",
+            "existing_worktree_touched",
+        )
+    } == {
+        "schema_version": "parallel_branch_allocate_precheck.custody.v1",
+        "status": "exact_existing_custody_rebind",
+        "branch_ref": lane_two["branch_ref"],
+        "worktree_path": lane_two["worktree_path"],
+        "branch_exists": True,
+        "worktree_exists": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "existing_worktree_touched": False,
+    }
+    assert response["zero_write_proof"]["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert "\n".join(conn.iterdump()) == before_db
+    assert _allocation_custody_git_snapshot(case["repository_root"]) == before_git
+
+    before_allocate_git = _allocation_custody_git_snapshot(
+        case["repository_root"]
+    )
+    status, allocated = case[
+        "server"
+    ].handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=body,
+        )
+    )
+
+    assert status == 201
+    assert allocated["context"]["runtime_context_id"] == (
+        existing.runtime_context_id
+    )
+    assert allocated["context"]["worktree_path"] == lane_two["worktree_path"]
+    assert allocated["context"]["branch_ref"] == lane_two["branch_ref"]
+    assert Path(lane_two["worktree_path"]).exists()
+    assert _allocation_custody_git_snapshot(case["repository_root"]) == (
+        before_allocate_git
+    )
+
+
 def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unchanged(
     conn,
     tmp_path,
@@ -26006,6 +26524,18 @@ def test_parallel_branch_allocate_precheck_is_zero_write_and_bodies_allocate_unc
     assert all(
         lane["caller_path_projection_applied"] is True
         and lane["materialized"] is False
+        and lane["custody_preflight"]["schema_version"]
+        == "parallel_branch_allocate_precheck.custody.v1"
+        and lane["custody_preflight"]["status"] == "available"
+        and lane["custody_preflight"]["branch_ref"]
+        == lane["canonical_branch_ref"]
+        and lane["custody_preflight"]["worktree_path"]
+        == lane["canonical_worktree_path"]
+        and lane["custody_preflight"]["branch_exists"] is False
+        and lane["custody_preflight"]["worktree_exists"] is False
+        and lane["custody_preflight"]["writes_performed"] is False
+        and lane["custody_preflight"]["mutation_performed"] is False
+        and lane["custody_preflight"]["existing_worktree_touched"] is False
         for lane in response["lane_projections"]
     )
 
