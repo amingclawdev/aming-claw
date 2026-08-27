@@ -143880,11 +143880,39 @@ def _operator_supervised_direct_main_facade_action_projection(
                 "observer_impersonation": False,
             },
         }
+        qa_writer_binding = _contract_runtime_write_from_record(
+            record,
+            actor_role="qa",
+            stage_id=str(runtime_next.get("stage_id") or "").strip(),
+            line_id=line_id,
+            evidence_kind=str(
+                runtime_next.get("evidence_kind") or ""
+            ).strip(),
+        )
+        qa_facade_binding = {
+            field: qa_writer_binding.get(field)
+            for field in (
+                "contract_execution_id",
+                "execution_state_revision",
+                "stage_id",
+                "line_id",
+                "runtime_guide_hash",
+            )
+        }
+        qa_facade_binding["direct_runtime_binding_hash"] = str(
+            binding.get("binding_hash") or ""
+        ).strip()
+        body.update(qa_facade_binding)
         missing = [
             "actor",
             "verification.tests_run",
             "payload.graph_trace_ids",
         ]
+        missing.extend(
+            field
+            for field, value in qa_facade_binding.items()
+            if value in (None, "")
+        )
         if not implementation_commit:
             missing.append("commit_sha")
         return {
@@ -144563,6 +144591,147 @@ def _operator_supervised_direct_main_runtime_line_payload(
         **dict(payload),
         "direct_runtime_binding_hash": str(binding.get("binding_hash") or ""),
     }
+
+
+def _operator_supervised_direct_main_qa_facade_binding(
+    record: Mapping[str, Any],
+    *,
+    actor_role: str,
+    line: Mapping[str, Any],
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the copy-safe Direct QA binding before any runtime write.
+
+    The public timeline facade carries the binding at top level so MCP schema
+    validation cannot silently drop it.  The server independently rebuilds
+    every expected value from the pinned execution and current writer Guide;
+    caller values are equality proofs only and never become authority.
+    """
+
+    binding_fields = (
+        "contract_execution_id",
+        "execution_state_revision",
+        "stage_id",
+        "line_id",
+        "runtime_guide_hash",
+        "direct_runtime_binding_hash",
+    )
+
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    runtime_binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    line_id = str(line.get("line_id") or "").strip()
+    if not (
+        str(record.get("contract_id") or "").strip()
+        == "operator_supervised_direct_main"
+        and str(record.get("revision") or "").strip()
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+        and runtime_binding.get("strict_runtime_binding_required") is True
+        and str(actor_role or "").strip() == "qa"
+        and line_id in {"qa_graph_context", "qa_independent_verification"}
+    ):
+        return {}
+
+    nested_paths: list[str] = []
+
+    def collect_nested(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            for raw_key, child in value.items():
+                key = str(raw_key or "").strip()
+                child_path = f"{path}.{key}" if key else path
+                if key in binding_fields:
+                    nested_paths.append(child_path)
+                collect_nested(child, child_path)
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                collect_nested(child, f"{path}[{index}]")
+
+    for container_key in ("payload", "verification", "artifact_refs"):
+        collect_nested(body.get(container_key), container_key)
+    if nested_paths:
+        raise GovernanceError(
+            "operator_supervised_direct_main_qa_binding_nested",
+            "Direct Main QA runtime binding fields must be top-level",
+            422,
+            {
+                "field": sorted(set(nested_paths))[0],
+                "nested_binding_paths": sorted(set(nested_paths)),
+                "required_top_level_fields": list(
+                    binding_fields
+                ),
+                "caller_claims_trusted": False,
+                "server_derived": True,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+                "writes_performed": False,
+            },
+        )
+
+    expected_write = _contract_runtime_write_from_record(
+        record,
+        actor_role="qa",
+        stage_id=str(line.get("stage_id") or "").strip(),
+        line_id=line_id,
+        evidence_kind=str(line.get("evidence_kind") or "").strip(),
+    )
+    expected = {
+        field: expected_write.get(field)
+        for field in (
+            "contract_execution_id",
+            "execution_state_revision",
+            "stage_id",
+            "line_id",
+            "runtime_guide_hash",
+        )
+    }
+    expected["direct_runtime_binding_hash"] = str(
+        runtime_binding.get("binding_hash") or ""
+    ).strip()
+    mismatches = [
+        {
+            "field": field,
+            "expected": expected_value,
+            "actual": (
+                "missing"
+                if body.get(field) in (None, "")
+                else body.get(field)
+            ),
+        }
+        for field, expected_value in expected.items()
+        if body.get(field) != expected_value
+    ]
+    if mismatches:
+        first = mismatches[0]
+        raise GovernanceError(
+            "operator_supervised_direct_main_qa_binding_mismatch",
+            "Direct Main QA facade binding does not match the current pinned writer line",
+            422,
+            {
+                "field": first["field"],
+                "expected": first["expected"],
+                "actual": first["actual"],
+                "identity_mismatches": mismatches,
+                "required_top_level_fields": list(
+                    binding_fields
+                ),
+                "caller_claims_trusted": False,
+                "server_derived": True,
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+                "writes_performed": False,
+            },
+        )
+    return expected
 
 
 def _operator_supervised_direct_main_expected_line_evidence(
@@ -168949,6 +169118,44 @@ def _contract_runtime_close_line_for_event(
 ) -> dict[str, str]:
     explicit = _contract_runtime_close_explicit_line(body)
     if explicit:
+        metadata = (
+            record.get("metadata")
+            if isinstance(record.get("metadata"), Mapping)
+            else {}
+        )
+        runtime_binding = (
+            metadata.get("operator_supervised_direct_main_runtime_binding")
+            if isinstance(
+                metadata.get("operator_supervised_direct_main_runtime_binding"),
+                Mapping,
+            )
+            else {}
+        )
+        guide = (
+            record.get("runtime_guide")
+            if isinstance(record.get("runtime_guide"), Mapping)
+            else {}
+        )
+        next_line = (
+            guide.get("next_legal_action")
+            if isinstance(guide.get("next_legal_action"), Mapping)
+            else {}
+        )
+        if (
+            str(record.get("contract_id") or "").strip()
+            == "operator_supervised_direct_main"
+            and str(record.get("revision") or "").strip()
+            in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+            and runtime_binding.get("strict_runtime_binding_required") is True
+            and not str(explicit.get("evidence_kind") or "").strip()
+            and str(explicit.get("stage_id") or "").strip()
+            == str(next_line.get("stage_id") or "").strip()
+            and str(explicit.get("line_id") or "").strip()
+            == str(next_line.get("line_id") or "").strip()
+        ):
+            explicit["evidence_kind"] = str(
+                next_line.get("evidence_kind") or ""
+            ).strip()
         return explicit
     contract_id = str(record.get("contract_id") or "").strip()
     if contract_id == "observer_hotfix":
@@ -170215,6 +170422,29 @@ def _contract_runtime_close_gate(
         evidence_kind=line["evidence_kind"],
     )
     canonical_norm_payload = dict(norm_payload)
+    direct_qa_facade_binding = (
+        _operator_supervised_direct_main_qa_facade_binding(
+            authority_record,
+            actor_role=actor_role,
+            line=line,
+            body=body,
+        )
+    )
+    if direct_qa_facade_binding:
+        canonical_norm_payload = (
+            _operator_supervised_direct_main_runtime_line_payload(
+                authority_record,
+                canonical_norm_payload,
+            )
+        )
+        for field in (
+            "contract_execution_id",
+            "execution_state_revision",
+            "stage_id",
+            "line_id",
+            "runtime_guide_hash",
+        ):
+            write[field] = direct_qa_facade_binding[field]
     if (
         actor_role == "mf_sub"
         and str(line.get("line_id") or "").strip()
@@ -171009,6 +171239,34 @@ def _contract_runtime_close_gate(
             record=authority_record,
             write=write,
         )
+    if direct_qa_facade_binding:
+        # The facade fields prove that the caller copied the exact current QA
+        # writer binding.  The Direct Main adapter below remains the sole
+        # canonical writer for its paired graph and verdict runtime lines.
+        return {
+            "schema_version": (
+                _CONTRACT_RUNTIME_CLOSE_EVIDENCE_GATE_SCHEMA_VERSION
+            ),
+            "accepted": True,
+            "status": "validated_submission",
+            "primary_decision_source": True,
+            "agent_facing_decision_source": (
+                "contract_runtime_first_missing_line"
+            ),
+            "meta_contract_gate_decision_source": False,
+            "contract_execution_id": contract_execution_id,
+            "actor_role": actor_role,
+            "requested_event_kind": event_kind,
+            "stage_id": line.get("stage_id", ""),
+            "line_id": line.get("line_id", ""),
+            "evidence_kind": line.get("evidence_kind", ""),
+            "decision": {"ok": True, "errors": []},
+            "next_legal_action": dict(
+                current_state.get("next_legal_action") or {}
+            ),
+            "canonical_submit_required": True,
+            "direct_main_qa_facade_binding_validated": True,
+        }
     result = runtime.submit_line_write(
         contract_execution_id,
         write,
