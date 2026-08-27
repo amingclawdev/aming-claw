@@ -27,6 +27,459 @@ def _tool_properties(name: str) -> dict:
     return tool["inputSchema"]["properties"]
 
 
+def _nested_public_keys(value) -> set[str]:
+    if isinstance(value, dict):
+        return set(value).union(
+            *(_nested_public_keys(child) for child in value.values())
+        )
+    if isinstance(value, list):
+        return set().union(*(_nested_public_keys(child) for child in value))
+    return set()
+
+
+def _managed_allocation_auth_fixture():
+    session_sentinel = "SENTINEL_MANAGED_ALLOCATION_SESSION"
+    fence_sentinel = "SENTINEL_MANAGED_ALLOCATION_FENCE"
+    nested_sentinel = "SENTINEL_MANAGED_ALLOCATION_NESTED"
+    route = {
+        "route_id": "route-managed-allocation",
+        "route_context_hash": "sha256:" + ("1" * 64),
+        "prompt_contract_id": "rprompt-managed-allocation",
+        "prompt_contract_hash": "sha256:" + ("2" * 64),
+        "route_token_ref": "rtok-managed-allocation",
+        "visible_injection_manifest_hash": "sha256:" + ("3" * 64),
+    }
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-managed-allocation",
+        "task_id": "worker-managed-allocation",
+        "parent_task_id": "cex-managed-allocation",
+        "contract_execution_id": "cex-managed-allocation",
+        "target_project_root": "/tmp/managed-allocation",
+        "worker_id": "worker-managed-allocation",
+        "worker_slot_id": "worker-managed-allocation",
+        "agent_id": "worker-managed-allocation",
+        "allocation_owner": "worker-managed-allocation",
+        "actual_host_worker_id": "worker-managed-allocation",
+        "worker_session_id": "desktop-managed-allocation",
+        "host_startup_id": "desktop-managed-allocation",
+        "host_session_id": "desktop-managed-allocation",
+        "session_token_ref": "wstok-managed-allocation",
+        **route,
+    }
+    allocation_args = {
+        key: value
+        for key, value in identity.items()
+        if key not in {"runtime_context_id", "session_token_ref"}
+    }
+    allocation_args.update(
+        {
+            "backlog_id": "AC-MANAGED-ALLOCATION-AUTH",
+            "workspace_root": "/tmp",
+            "worktree_path": identity["target_project_root"],
+            "fence_token": fence_sentinel,
+            "base_commit": "a" * 40,
+            "target_head_commit": "a" * 40,
+            "merge_queue_id": "mq-managed-allocation",
+            "owned_files": ["agent/tests/test_mcp_tools.py"],
+            "create_worktree": False,
+        }
+    )
+    allocation_response = {
+        "ok": True,
+        "project_id": identity["project_id"],
+        "context": {
+            **identity,
+            "fence_token_present": True,
+            "fence_token_hash": "sha256:" + ("6" * 64),
+            "fence_token_redacted": True,
+            "worker_credentials": {
+                "session_token": nested_sentinel,
+                "fence_token": nested_sentinel,
+                "host_envelope": {
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": nested_sentinel,
+                        "AMING_WORKER_FENCE_TOKEN": nested_sentinel,
+                    }
+                },
+            },
+        },
+        "branch_runtime_evidence": {
+            **identity,
+            "route_identity": route,
+            "worker_credentials": {
+                "session_token": nested_sentinel,
+                "fence_token": nested_sentinel,
+            },
+        },
+        "same_owner_worker_session": {
+            "issued": True,
+            "delivery": "worker_host_envelope",
+            "session_token": session_sentinel,
+            "session_token_ref": identity["session_token_ref"],
+            "session_token_hash": "sha256:" + ("4" * 64),
+            "scope": {
+                "project_id": identity["project_id"],
+                "runtime_context_id": identity["runtime_context_id"],
+                "task_id": identity["task_id"],
+                "worker_slot_id": identity["worker_slot_id"],
+            },
+        },
+        "diagnostics": {
+            "raw_session_token": nested_sentinel,
+            "raw_fence_token": nested_sentinel,
+            "token_hash": "sha256:" + ("5" * 64),
+            "padding": "x" * 96_000,
+        },
+    }
+    return {
+        "session_sentinel": session_sentinel,
+        "fence_sentinel": fence_sentinel,
+        "nested_sentinel": nested_sentinel,
+        "route": route,
+        "identity": identity,
+        "allocation_args": allocation_args,
+        "allocation_response": allocation_response,
+    }
+
+
+def _assert_managed_allocation_auth_is_public_safe(result, fixture):
+    serialized = json.dumps(result, sort_keys=True)
+    for sentinel in (
+        fixture["session_sentinel"],
+        fixture["fence_sentinel"],
+        fixture["nested_sentinel"],
+    ):
+        assert sentinel not in serialized
+    assert result["auth_loaded"] is True
+    assert result["session_token_ref"] == fixture["identity"][
+        "session_token_ref"
+    ]
+    assert result["managed_host_envelope_ref"]
+    assert result["managed_host_envelope"] == {
+        **result["managed_host_envelope"],
+        "status": "staged",
+        "process_local": True,
+        "managed_host_envelope_ref": result["managed_host_envelope_ref"],
+        "session_token_ref": fixture["identity"]["session_token_ref"],
+        "runtime_context_id": fixture["identity"]["runtime_context_id"],
+        "task_id": fixture["identity"]["task_id"],
+    }
+    for flag in (
+        "raw_worker_auth_exposed",
+        "raw_session_token_exposed",
+        "raw_fence_token_exposed",
+    ):
+        assert result[flag] is False
+        assert result["managed_host_envelope"][flag] is False
+    public_keys = _nested_public_keys(result)
+    for forbidden in (
+        "same_owner_worker_session",
+        "host_envelope",
+        "worker_credentials",
+        "session_token_hash",
+        "fence_token_hash",
+        "token_hash",
+    ):
+        assert forbidden not in public_keys
+
+
+def test_managed_parallel_allocate_recursively_scrubs_and_stages_opaque_auth():
+    fixture = _managed_allocation_auth_fixture()
+    calls = []
+
+    def api(method, path, data=None):
+        calls.append((method, path, data))
+        return fixture["allocation_response"]
+
+    dispatcher = ToolDispatcher(api, worker_pool=None)
+    result = dispatcher.dispatch(
+        "parallel_branch_allocate",
+        fixture["allocation_args"],
+    )
+
+    _assert_managed_allocation_auth_is_public_safe(result, fixture)
+    assert len(calls) == 1
+    assert calls[0][0] == "POST"
+    assert calls[0][1].endswith("/parallel-branches/allocate")
+    assert dispatcher._host_envelope_continuity.pending_count() == 1
+
+
+def test_managed_parallel_allocate_missing_auth_reports_post_write_truth():
+    fixture = _managed_allocation_auth_fixture()
+    response = dict(fixture["allocation_response"])
+    response["same_owner_worker_session"] = {
+        key: value
+        for key, value in response["same_owner_worker_session"].items()
+        if key != "session_token"
+    }
+    dispatcher = ToolDispatcher(
+        lambda *_args, **_kwargs: response,
+        worker_pool=None,
+    )
+
+    result = dispatcher.dispatch(
+        "parallel_branch_allocate",
+        fixture["allocation_args"],
+    )
+
+    assert result["error"] == "managed_allocation_auth_missing"
+    assert result["http_request_performed"] is True
+    assert result["writes_performed"] is True
+    assert result["zero_write_rejection"] is False
+    serialized = json.dumps(result, sort_keys=True)
+    for sentinel in (
+        fixture["fence_sentinel"],
+        fixture["nested_sentinel"],
+    ):
+        assert sentinel not in serialized
+
+
+def test_managed_allocation_initial_join_rotation_and_continuation_fail_closed():
+    fixture = _managed_allocation_auth_fixture()
+    identity = fixture["identity"]
+    route = fixture["route"]
+    rotated_session = "SENTINEL_MANAGED_ROTATED_SESSION"
+    rotated_fence = "SENTINEL_MANAGED_ROTATED_FENCE"
+    rotated_ref = "wstok-managed-allocation-rotated"
+    calls = []
+    rotation_complete = False
+
+    def api(method, path, data=None):
+        nonlocal rotation_complete
+        calls.append((method, path, dict(data or {})))
+        if path.endswith("/parallel-branches/allocate"):
+            return fixture["allocation_response"]
+        if path.endswith("/session-token/initial-join"):
+            assert data["session_token"] == fixture["session_sentinel"]
+            assert data["fence_token"] == fixture["fence_sentinel"]
+            assert "managed_host_envelope_ref" not in data
+            rotated_identity = {**identity, "session_token_ref": rotated_ref}
+            rotation_complete = True
+            return {
+                "ok": True,
+                "status": "session_token_issued",
+                "delivery": "worker_host_envelope",
+                **rotated_identity,
+                "route_identity": route,
+                "session_token": rotated_session,
+                "fence_token": rotated_fence,
+                "host_envelope": {
+                    **rotated_identity,
+                    "route_identity": route,
+                    "env": {
+                        "AMING_WORKER_SESSION_TOKEN": rotated_session,
+                        "AMING_WORKER_FENCE_TOKEN": rotated_fence,
+                    },
+                },
+            }
+        if method == "GET" and "/worker-guide" in path:
+            query = __import__(
+                "urllib.parse", fromlist=["parse_qs", "urlparse"]
+            ).parse_qs(
+                __import__(
+                    "urllib.parse", fromlist=["urlparse"]
+                ).urlparse(path).query
+            )
+            assert query["session_token"] == [
+                rotated_session
+                if rotation_complete
+                else fixture["session_sentinel"]
+            ]
+            assert query["fence_token"] == [
+                rotated_fence
+                if rotation_complete
+                else fixture["fence_sentinel"]
+            ]
+            return {
+                "ok": True,
+                "status": "worker_guide_ready",
+                "schema_version": (
+                    "runtime_context.worker_guide_compact_response.v1"
+                ),
+                "response_view": "compact",
+                "project_id": identity["project_id"],
+                "runtime_context_id": identity["runtime_context_id"],
+                "task_id": identity["task_id"],
+                "next_legal_action": (
+                    "record_read_receipt"
+                    if rotation_complete
+                    else "request_runtime_context_initial_join_host_envelope"
+                ),
+                "canonical_executable_action": {
+                    "mcp_tool": (
+                        "runtime_context_read_receipt"
+                        if rotation_complete
+                        else "runtime_context_session_token_initial_join"
+                    ),
+                    "copy_safe_body": {
+                        **identity,
+                        "session_token_ref": (
+                            rotated_ref
+                            if rotation_complete
+                            else identity["session_token_ref"]
+                        ),
+                    },
+                },
+                "recursive_diagnostics": {
+                    "session_token": fixture["nested_sentinel"],
+                    "fence_token": fixture["nested_sentinel"],
+                    "padding": "x" * 96_000,
+                },
+            }
+        assert data["session_token"] == rotated_session
+        assert data["fence_token"] == rotated_fence
+        if path.endswith("/parallel-branches/startup"):
+            return {"ok": True, "status": "startup_recorded"}
+        return {"ok": True, "status": "accepted"}
+
+    dispatcher = ToolDispatcher(api, worker_pool=None)
+    allocated = dispatcher.dispatch(
+        "parallel_branch_allocate",
+        fixture["allocation_args"],
+    )
+    allocation_envelope_ref = allocated["managed_host_envelope_ref"]
+    pre_join_guide = dispatcher.dispatch(
+        "runtime_context_worker_guide",
+        {
+            **identity,
+            "managed_host_envelope_ref": allocation_envelope_ref,
+        },
+    )
+    assert pre_join_guide["next_legal_action"] == (
+        "request_runtime_context_initial_join_host_envelope"
+    )
+    assert fixture["nested_sentinel"] not in json.dumps(
+        pre_join_guide,
+        sort_keys=True,
+    )
+    assert len(json.dumps(pre_join_guide).encode()) < 64 * 1024
+    join_args = {
+        **identity,
+        "managed_host_envelope_ref": allocation_envelope_ref,
+        "reason": "rotate allocation auth before worker continuation",
+    }
+    joined = dispatcher.dispatch(
+        "runtime_context_session_token_initial_join",
+        join_args,
+    )
+
+    assert joined["auth_loaded"] is True
+    assert joined["session_token_ref"] == rotated_ref
+    assert joined["managed_host_envelope_ref"] != allocation_envelope_ref
+    assert joined["allocation_auth_revoked"] is True
+    assert joined["previous_managed_host_envelope_revoked"] is True
+    joined_serialized = json.dumps(joined, sort_keys=True)
+    assert rotated_session not in joined_serialized
+    assert rotated_fence not in joined_serialized
+
+    post_join_guide = dispatcher.dispatch(
+        "runtime_context_worker_guide",
+        {
+            **identity,
+            "session_token_ref": rotated_ref,
+            "managed_host_envelope_ref": joined[
+                "managed_host_envelope_ref"
+            ],
+        },
+    )
+    assert post_join_guide["next_legal_action"] == "record_read_receipt"
+    assert fixture["nested_sentinel"] not in json.dumps(
+        post_join_guide,
+        sort_keys=True,
+    )
+
+    call_count = len(calls)
+    for rejected_args in (
+        {**identity, "managed_host_envelope_ref": allocation_envelope_ref},
+        {
+            **identity,
+            "task_id": "worker-cross-allocation",
+            "managed_host_envelope_ref": joined["managed_host_envelope_ref"],
+        },
+    ):
+        rejected = dispatcher.dispatch(
+            "runtime_context_read_receipt",
+            rejected_args,
+        )
+        assert rejected["error"] == (
+            "managed_host_envelope_ref_stale_or_scope_mismatch"
+        )
+        assert rejected["http_request_performed"] is False
+        assert rejected["writes_performed"] is False
+        assert rejected["zero_write_rejection"] is True
+        assert len(calls) == call_count
+
+    current = {
+        **identity,
+        "session_token_ref": rotated_ref,
+        "managed_host_envelope_ref": joined["managed_host_envelope_ref"],
+    }
+    receipt = dispatcher.dispatch("runtime_context_read_receipt", current)
+    assert receipt == {"ok": True, "status": "accepted"}
+    startup = dispatcher.dispatch(
+        "parallel_branch_startup",
+        {**current, "worker_role": "mf_sub"},
+    )
+    assert startup["managed_host_envelope_consumed"] is True
+
+    call_count = len(calls)
+    replay = dispatcher.dispatch("runtime_context_read_receipt", current)
+    assert replay["error"] == (
+        "managed_host_envelope_ref_stale_or_scope_mismatch"
+    )
+    assert replay["http_request_performed"] is False
+    assert replay["writes_performed"] is False
+    assert replay["zero_write_rejection"] is True
+    assert len(calls) == call_count
+
+
+def test_managed_allocation_ref_is_required_and_process_local():
+    fixture = _managed_allocation_auth_fixture()
+    calls = []
+
+    def api(method, path, data=None):
+        calls.append((method, path, data))
+        return fixture["allocation_response"]
+
+    dispatcher = ToolDispatcher(api, worker_pool=None)
+    allocated = dispatcher.dispatch(
+        "parallel_branch_allocate",
+        fixture["allocation_args"],
+    )
+    identity = fixture["identity"]
+    call_count = len(calls)
+    missing = dispatcher.dispatch(
+        "runtime_context_session_token_initial_join",
+        identity,
+    )
+    assert missing["error"] == "managed_host_envelope_ref_required"
+    assert missing["http_request_performed"] is False
+    assert missing["writes_performed"] is False
+    assert missing["zero_write_rejection"] is True
+    assert len(calls) == call_count
+
+    fresh_process_calls = []
+    fresh_process = ToolDispatcher(
+        lambda *args, **kwargs: fresh_process_calls.append((args, kwargs)),
+        worker_pool=None,
+    )
+    lost = fresh_process.dispatch(
+        "runtime_context_session_token_initial_join",
+        {
+            **identity,
+            "managed_host_envelope_ref": allocated[
+                "managed_host_envelope_ref"
+            ],
+        },
+    )
+    assert lost["error"] == "managed_host_envelope_not_loaded"
+    assert lost["http_request_performed"] is False
+    assert lost["writes_performed"] is False
+    assert lost["zero_write_rejection"] is True
+    assert fresh_process_calls == []
+
+
 def test_managed_mcp_host_envelope_stages_injects_and_acks_startup():
     raw_session = "managed-session-secret"
     raw_fence = "managed-fence-secret"

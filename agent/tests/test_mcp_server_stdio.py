@@ -28,6 +28,194 @@ from agent.mcp.tools import ToolDispatcher
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_stdio_parallel_allocate_stages_auth_and_never_serializes_nested_raw():
+    session_sentinel = "SENTINEL_STDIO_ALLOCATION_SESSION"
+    fence_sentinel = "SENTINEL_STDIO_ALLOCATION_FENCE"
+    nested_sentinel = "SENTINEL_STDIO_ALLOCATION_NESTED"
+    identity = {
+        "project_id": "aming-claw",
+        "runtime_context_id": "mfrctx-stdio-allocation",
+        "task_id": "worker-stdio-allocation",
+        "parent_task_id": "cex-stdio-allocation",
+        "contract_execution_id": "cex-stdio-allocation",
+        "target_project_root": "/tmp/stdio-allocation",
+        "worker_id": "worker-stdio-allocation",
+        "worker_slot_id": "worker-stdio-allocation",
+        "agent_id": "worker-stdio-allocation",
+        "allocation_owner": "worker-stdio-allocation",
+        "actual_host_worker_id": "worker-stdio-allocation",
+        "worker_session_id": "desktop-stdio-allocation",
+        "host_startup_id": "desktop-stdio-allocation",
+        "host_session_id": "desktop-stdio-allocation",
+        "session_token_ref": "wstok-stdio-allocation",
+        "route_id": "route-stdio-allocation",
+        "route_context_hash": "sha256:" + ("1" * 64),
+        "prompt_contract_id": "rprompt-stdio-allocation",
+        "prompt_contract_hash": "sha256:" + ("2" * 64),
+        "route_token_ref": "rtok-stdio-allocation",
+        "visible_injection_manifest_hash": "sha256:" + ("3" * 64),
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        calls = []
+
+        def log_message(self, *_args):
+            return None
+
+        def do_POST(self):
+            size = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(size) or b"{}")
+            self.__class__.calls.append((self.path, body))
+            assert self.path.endswith("/parallel-branches/allocate")
+            payload = {
+                "ok": True,
+                "project_id": identity["project_id"],
+                "context": {
+                    **identity,
+                    "fence_token_present": True,
+                    "fence_token_hash": "sha256:" + ("6" * 64),
+                    "fence_token_redacted": True,
+                    "nested": {
+                        "session_token": nested_sentinel,
+                        "fence_token": nested_sentinel,
+                    },
+                },
+                "branch_runtime_evidence": {
+                    **identity,
+                    "route_identity": {
+                        key: identity[key]
+                        for key in (
+                            "route_id",
+                            "route_context_hash",
+                            "prompt_contract_id",
+                            "prompt_contract_hash",
+                            "route_token_ref",
+                            "visible_injection_manifest_hash",
+                        )
+                    },
+                },
+                "same_owner_worker_session": {
+                    "issued": True,
+                    "delivery": "worker_host_envelope",
+                    "session_token": session_sentinel,
+                    "session_token_ref": identity["session_token_ref"],
+                    "session_token_hash": "sha256:" + ("4" * 64),
+                    "scope": {
+                        "project_id": identity["project_id"],
+                        "runtime_context_id": identity[
+                            "runtime_context_id"
+                        ],
+                        "task_id": identity["task_id"],
+                        "worker_slot_id": identity["worker_slot_id"],
+                    },
+                },
+                "oversized_credentials": {
+                    "host_envelope": {
+                        "env": {
+                            "AMING_WORKER_SESSION_TOKEN": nested_sentinel,
+                            "AMING_WORKER_FENCE_TOKEN": nested_sentinel,
+                        }
+                    },
+                    "padding": "x" * 128_000,
+                },
+            }
+            encoded = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    allocation_args = {
+        key: value
+        for key, value in identity.items()
+        if key not in {"runtime_context_id", "session_token_ref"}
+    }
+    allocation_args.update(
+        {
+            "backlog_id": "AC-STDIO-ALLOCATION-AUTH",
+            "workspace_root": "/tmp",
+            "worktree_path": identity["target_project_root"],
+            "fence_token": fence_sentinel,
+            "base_commit": "a" * 40,
+            "target_head_commit": "a" * 40,
+            "merge_queue_id": "mq-stdio-allocation",
+            "owned_files": ["agent/tests/test_mcp_server_stdio.py"],
+            "create_worktree": False,
+        }
+    )
+    try:
+        responses, stderr, returncode = _run_mcp_probe(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "parallel_branch_allocate",
+                        "arguments": allocation_args,
+                    },
+                },
+            ],
+            extra_args=[
+                "--governance-url",
+                f"http://127.0.0.1:{server.server_address[1]}",
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert returncode == 0
+    assert stderr == ""
+    public = json.loads(responses[1]["result"]["content"][0]["text"])
+    serialized = json.dumps(public, sort_keys=True)
+    for sentinel in (session_sentinel, fence_sentinel, nested_sentinel):
+        assert sentinel not in serialized
+    assert len(serialized.encode()) < 64 * 1024
+    assert public["auth_loaded"] is True
+    assert public["session_token_ref"] == identity["session_token_ref"]
+    assert public["managed_host_envelope_ref"]
+    assert public["managed_host_envelope"][
+        "managed_host_envelope_ref"
+    ] == public["managed_host_envelope_ref"]
+    for flag in (
+        "raw_worker_auth_exposed",
+        "raw_session_token_exposed",
+        "raw_fence_token_exposed",
+    ):
+        assert public[flag] is False
+        assert public["managed_host_envelope"][flag] is False
+    def nested_keys(value):
+        if isinstance(value, dict):
+            return set(value).union(
+                *(nested_keys(child) for child in value.values())
+            )
+        if isinstance(value, list):
+            return set().union(*(nested_keys(child) for child in value))
+        return set()
+
+    public_keys = nested_keys(public)
+    for forbidden in (
+        "same_owner_worker_session",
+        "host_envelope",
+        "session_token_hash",
+        "fence_token_hash",
+    ):
+        assert forbidden not in public_keys
+    assert len(Handler.calls) == 1
+
+
 def test_stdio_managed_host_envelope_is_private_until_startup_ack(tmp_path):
     raw_session = "stdio-managed-session-secret"
     raw_fence = "stdio-managed-fence-secret"
