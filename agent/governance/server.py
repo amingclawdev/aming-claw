@@ -151006,6 +151006,7 @@ def _onboard_route_guide_completed_contract_update_action(
     route_token_ref: str,
     route_scope_ready: bool,
     target_files: Sequence[str],
+    selection_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project the exact service-root successor and its bounded route grant."""
 
@@ -151099,6 +151100,9 @@ def _onboard_route_guide_completed_contract_update_action(
             "successor_contract_id": CONTRACT_UPDATE_CONTRACT_ID,
             "legacy_onboard_contract_waived": True,
             "caller_claims_accepted": False,
+            "backlog_contract_source_revision_authority": dict(
+                selection_authority or {}
+            ),
         },
         "next_step": (
             "issue the exact scoped route grant when required, bind its "
@@ -151187,6 +151191,18 @@ def _onboard_route_guide_completed_next_action(
                     continuation_authority.get("route_scope_ready") is True
                 ),
                 target_files=target_files,
+                selection_authority=(
+                    continuation_authority.get(
+                        "backlog_contract_source_revision_authority"
+                    )
+                    if isinstance(
+                        continuation_authority.get(
+                            "backlog_contract_source_revision_authority"
+                        ),
+                        Mapping,
+                    )
+                    else {}
+                ),
             ),
         }
     if selected_work_type == "operator_supervised_direct_main":
@@ -155644,12 +155660,21 @@ def _onboard_route_guide_compact_service_response(
         if isinstance(next_action.get("host_precursor_action"), Mapping)
         else {}
     )
+    compact_scoped_contract_update = bool(
+        str(next_action.get("action") or "") == "contract_update_start"
+        and next_action.get("action_input_copy_safe") is True
+        and isinstance(next_action.get("copy_safe_body"), Mapping)
+        and isinstance(next_action.get("scoped_route_grant"), Mapping)
+    )
     if host_precursor_action:
         action_input = dict(
             host_precursor_action.get("copy_safe_body") or {}
         )
         action_input_path = "host_precursor_action.copy_safe_body"
-    elif next_action.get("action_input_ready") is False:
+    elif (
+        next_action.get("action_input_ready") is False
+        and not compact_scoped_contract_update
+    ):
         # A nested advisory body must never be paired with a deferred facade.
         # Only an explicit host precursor may remain executable while the
         # selected Contract action is not ready.
@@ -155843,7 +155868,10 @@ def _onboard_route_guide_compact_service_response(
         )
         if canonical_body
         and action
-        and next_action.get("action_input_ready") is not False
+        and (
+            next_action.get("action_input_ready") is not False
+            or compact_scoped_contract_update
+        )
         else {}
     )
     blocker_ids = _onboard_guide_capsule_blocker_ids(next_action)
@@ -157898,6 +157926,23 @@ def _onboard_route_guide_service_response(
             **dict(current_projection),
             "failure_domain_disposition": failure_domain_disposition,
         }
+    contract_update_selection_authority = (
+        _backlog_contract_update_selection_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    )
+    wrong_family_contract_update_supersession = (
+        _onboard_wrong_family_contract_update_terminal_supersession(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            current_projection=current_projection,
+            requested_work_type=work_type,
+            selection_authority=contract_update_selection_authority,
+        )
+    )
     onboard_service_continuation_authority = {}
     if (
         str(role or "").strip() == "observer"
@@ -157955,6 +158000,80 @@ def _onboard_route_guide_service_response(
                 ),
                 mf_parallel_entry_authority=mf_parallel_entry_authority,
             )
+    if wrong_family_contract_update_supersession:
+        supersession_authority = dict(
+            wrong_family_contract_update_supersession.get("authority") or {}
+        )
+        terminal_action = dict(
+            wrong_family_contract_update_supersession.get("terminal_action")
+            or {}
+        )
+        parent_resume = {
+            "schema_version": "onboard_route_guide.runtime_resume.v1",
+            "status": "contract_complete",
+            "readiness_state": "contract_complete",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "current_contract_execution_id": _onboard_service_execution_id(
+                project_id,
+                backlog_id,
+            ),
+            "root_contract_execution_id": _onboard_service_execution_id(
+                project_id,
+                backlog_id,
+            ),
+            "contract_chain_id": _onboard_service_chain_id(
+                project_id,
+                backlog_id,
+            ),
+            "next_legal_action": {},
+        }
+        fresh_action = _onboard_route_guide_completed_next_action(
+            role=role,
+            work_type=work_type,
+            runtime_resume=parent_resume,
+            backlog_row_status=backlog_row_status,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+            target_files=target_files,
+            request_body=batch_action_request_body,
+            onboard_service_continuation_authority=(
+                onboard_service_continuation_authority
+            ),
+            mf_parallel_entry_authority=mf_parallel_entry_authority,
+        )
+        if str(fresh_action.get("action") or "") == "no_runtime_action":
+            next_action = terminal_action
+        else:
+            next_action = {
+                **dict(fresh_action),
+                "wrong_family_source_terminal_no_pass": True,
+                "terminal_supersession_authority": supersession_authority,
+                "copy_safe_no_pass_terminal_action": terminal_action,
+                "old_evidence_carry_forward": False,
+            }
+        current_projection = {
+            **dict(current_projection),
+            "readiness_state": "terminal_supersession_ready_no_pass",
+            "next_legal_action": dict(next_action),
+            "scheduler_eligible": False,
+            "resume_eligible": False,
+            "source_execution_write_eligible": False,
+            "terminal_supersession_authority": supersession_authority,
+            "copy_safe_no_pass_terminal_action": terminal_action,
+        }
+        runtime_resume = {
+            **dict(runtime_resume),
+            "status": "terminal_supersession_ready_no_pass",
+            "readiness_state": "terminal_supersession_ready_no_pass",
+            "next_legal_action": dict(next_action),
+            "scheduler_eligible": False,
+            "resume_eligible": False,
+            "source_execution_write_eligible": False,
+            "terminal_supersession_authority": supersession_authority,
+            "copy_safe_no_pass_terminal_action": terminal_action,
+        }
     terminal_supersession_action = (
         _mf_parallel_terminal_supersession_guide_action(
             conn,
@@ -157963,7 +158082,10 @@ def _onboard_route_guide_service_response(
             route_token_ref=requested_route_token_ref or route_token_ref,
             request_body=request_body,
         )
-        if str(role or "").strip() == "observer"
+        if (
+            str(role or "").strip() == "observer"
+            and not wrong_family_contract_update_supersession
+        )
         else {}
     )
     if terminal_supersession_action:
@@ -158003,7 +158125,10 @@ def _onboard_route_guide_service_response(
             current_projection=current_projection,
             runtime_resume=runtime_resume,
         )
-        if not terminal_supersession_action
+        if (
+            not terminal_supersession_action
+            and not wrong_family_contract_update_supersession
+        )
         else {}
     )
     if managed_hotfix_attempt:
@@ -158050,7 +158175,10 @@ def _onboard_route_guide_service_response(
             current_projection=current_projection,
             direct_main_failed_qa_state=direct_main_failed_qa_state,
         )
-        if not terminal_supersession_action
+        if (
+            not terminal_supersession_action
+            and not wrong_family_contract_update_supersession
+        )
         else {}
     )
     if irreversible_runtime_terminal_action:
@@ -162154,6 +162282,390 @@ def _onboard_service_parent_for_successor(
     return record
 
 
+def _backlog_contract_update_selection_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Prove immutable backlog semantics before selecting contract_update.
+
+    ``mf_type=chain_rescue`` is a legacy storage projection.  It is deliberately
+    absent from this decision: the selector requires an explicit, revision-pinned
+    Contract binding that resolves to an immutable source definition.
+    """
+
+    try:
+        row = conn.execute(
+            """
+            SELECT chain_trigger_json, mf_type
+              FROM backlog_bugs
+             WHERE bug_id = ?
+            """,
+            (backlog_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        return {}
+
+    structured_goal = backlog_runtime.parse_json_object(
+        _row_get(row, "chain_trigger_json", "{}")
+    )
+    contract_scope = (
+        structured_goal.get("contract")
+        if isinstance(structured_goal.get("contract"), Mapping)
+        else {}
+    )
+
+    def first_text(*keys: str) -> str:
+        for source in (contract_scope, structured_goal):
+            for key in keys:
+                value = str(source.get(key) or "").strip()
+                if value:
+                    return value
+        return ""
+
+    contract_identifiers = _runtime_context_service_dedupe(
+        [
+            str(source.get(key) or "").strip()
+            for source in (contract_scope, structured_goal)
+            for key in (
+                "root_contract_definition_id",
+                "contract_definition_id",
+                "source_contract_id",
+                "contract_id",
+            )
+            if str(source.get(key) or "").strip()
+        ]
+    )
+    contract_revision_id = first_text(
+        "contract_revision_id",
+        "source_contract_revision_id",
+        "revision",
+    )
+    contract_version = first_text(
+        "contract_version",
+        "source_contract_version",
+        "version",
+    ) or "v1"
+    contract_state = first_text("state", "binding_state").lower()
+    explicit_source_path = first_text(
+        "contract_source_path",
+        "definition_source_path",
+        "source_path",
+    )
+    binding_ready = bool(
+        isinstance(contract_scope, Mapping)
+        and contract_scope
+        and _source_backed_onboarding_enabled(structured_goal)
+        and contract_revision_id
+        and re.fullmatch(r"rev[0-9]+", contract_revision_id)
+        and re.fullmatch(r"v[0-9]+", contract_version)
+        and contract_state in {"bound", "immutable", "pinned"}
+    )
+    definition: Mapping[str, Any] = {}
+    if binding_ready:
+        try:
+            definition = _CONTRACT_DEFINITION_REGISTRY.get(
+                "onboard_contract",
+                version=contract_version,
+                revision=contract_revision_id,
+                include_deprecated=True,
+            )
+        except ContractDefinitionError:
+            definition = {}
+    source_integrity = (
+        definition.get("source_control_integrity")
+        if isinstance(definition.get("source_control_integrity"), Mapping)
+        else {}
+    )
+    load_record = (
+        definition.get("definition_load_record")
+        if isinstance(definition.get("definition_load_record"), Mapping)
+        else {}
+    )
+    definition_source_path = str(
+        source_integrity.get("git_relative_path")
+        or load_record.get("source_path")
+        or explicit_source_path
+        or ""
+    ).strip()
+    definition_ready = bool(
+        definition
+        and str(definition.get("contract_id") or "") == "onboard_contract"
+        and str(definition.get("version") or "") == contract_version
+        and str(definition.get("revision") or "") == contract_revision_id
+        and source_integrity.get("changed_since_head") is False
+        and str(source_integrity.get("drift_status") or "") == "current"
+    )
+    ready = binding_ready and definition_ready
+    missing_requirements: list[str] = []
+    if not binding_ready:
+        missing_requirements.append(
+            "immutable_structured_contract_source_revision_goal"
+        )
+    if not definition_ready:
+        missing_requirements.append(
+            "immutable_source_contract_definition_revision"
+        )
+    authority = {
+        "schema_version": (
+            "onboard_route_guide.backlog_contract_update_selection_authority.v1"
+        ),
+        "ready": ready,
+        "server_derived": True,
+        "caller_claims_accepted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "structured_goal_source": "backlog_bugs.chain_trigger_json.contract",
+        "definition_source": "source_controlled_contract_registry",
+        "structured_goal_ready": binding_ready,
+        "source_definition_ready": definition_ready,
+        "contract_identifiers": contract_identifiers,
+        "contract_version": contract_version if contract_revision_id else "",
+        "contract_revision_id": contract_revision_id,
+        "contract_state": contract_state,
+        "contract_source_path": definition_source_path,
+        "contract_source_sha256": str(
+            definition.get("source_sha256") or ""
+        ),
+        "contract_definition_hash": str(
+            definition.get("definition_hash") or ""
+        ),
+        "missing_requirements": missing_requirements,
+        "legacy_storage_mf_type": str(
+            _row_get(row, "mf_type", "") or ""
+        ).strip(),
+        "legacy_storage_mf_type_is_selection_authority": False,
+        "selection_source": (
+            "immutable_backlog_structured_goal+source_contract_revision"
+        ),
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _onboard_wrong_family_contract_update_terminal_supersession(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    current_projection: Mapping[str, Any],
+    requested_work_type: str,
+    selection_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one empty/no-PASS wrong-family child as terminal and reselectable.
+
+    This is intentionally read-only.  It neither completes Contract lines nor
+    invents dispatch, worker, QA, merge, paid-action, or PASS evidence.  A fresh
+    explicitly typed successor may supersede the projected terminal child while
+    the original ContractRuntime remains immutable audit history.
+    """
+
+    projection = (
+        current_projection
+        if isinstance(current_projection, Mapping)
+        else {}
+    )
+    source_execution_id = str(
+        projection.get("current_contract_execution_id") or ""
+    ).strip()
+    expected_parent_id = _onboard_service_execution_id(project_id, backlog_id)
+    expected_chain_id = _onboard_service_chain_id(project_id, backlog_id)
+    if not (
+        selection_authority
+        and selection_authority.get("ready") is False
+        and str(projection.get("projection_source") or "")
+        == "backlog_contract_chain_current"
+        and str(projection.get("project_id") or "") == project_id
+        and str(projection.get("backlog_id") or "") == backlog_id
+        and str(projection.get("current_contract_id") or "")
+        == CONTRACT_UPDATE_CONTRACT_ID
+        and source_execution_id
+        and str(projection.get("active_child_contract_execution_id") or "")
+        == source_execution_id
+        and str(projection.get("root_contract_execution_id") or "")
+        == expected_parent_id
+        and str(projection.get("contract_chain_id") or "")
+        == expected_chain_id
+    ):
+        return {}
+    try:
+        record = _contract_runtime(conn).current_record(
+            source_execution_id,
+            actor_role="observer",
+        )
+    except ContractRuntimeError:
+        return {}
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    completed_lines = (
+        record.get("completed_lines")
+        if isinstance(record.get("completed_lines"), list)
+        else []
+    )
+    bypass_only = all(
+        isinstance(line, Mapping)
+        and str(line.get("evidence_kind") or "").strip()
+        == "contract_line_bypass"
+        and str(line.get("status") or "").strip().lower() == "waived"
+        and line.get("no_pass_claim") is True
+        for line in completed_lines
+    )
+    if not (
+        str(record.get("project_id") or "") == project_id
+        and str(record.get("backlog_id") or "") == backlog_id
+        and str(record.get("contract_id") or "")
+        == CONTRACT_UPDATE_CONTRACT_ID
+        and str(record.get("parent_contract_execution_id") or "")
+        == expected_parent_id
+        and str(record.get("root_contract_execution_id") or "")
+        == expected_parent_id
+        and str(record.get("contract_chain_id") or "") == expected_chain_id
+        and metadata.get("legacy_onboard_contract_waived") is True
+        and str(metadata.get("entrypoint") or "")
+        == "onboard_service_waiver"
+        and bypass_only
+    ):
+        return {}
+
+    no_pass_generation = _contract_runtime_no_pass_generation(record)
+    persisted_no_pass = bool(
+        no_pass_generation.get("root_generation_persisted") is True
+        and no_pass_generation.get("no_pass_claim") is True
+        and no_pass_generation.get("authoritative_pass_synthesized") is False
+    )
+    guide = _contract_runtime_guide_for_response(
+        record,
+        actor_role="observer",
+    )
+    bypass_guidance = (
+        guide.get("line_bypass_guidance")
+        if isinstance(guide.get("line_bypass_guidance"), Mapping)
+        else {}
+    )
+    if persisted_no_pass:
+        bypass_body = (
+            bypass_guidance.get("inherited_bypass_copy_safe_body")
+            if isinstance(
+                bypass_guidance.get("inherited_bypass_copy_safe_body"),
+                Mapping,
+            )
+            else {}
+        )
+    else:
+        bypass_body = (
+            bypass_guidance.get("create_new_copy_safe_body")
+            if isinstance(
+                bypass_guidance.get("create_new_copy_safe_body"), Mapping
+            )
+            else {}
+        )
+
+    authority = {
+        "schema_version": (
+            "onboard_route_guide.wrong_family_contract_update_"
+            "terminal_supersession.v1"
+        ),
+        "server_derived": True,
+        "projection_only": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "source_contract_execution_id": source_execution_id,
+        "source_execution_state_revision": int(
+            record.get("execution_state_revision") or 0
+        ),
+        "source_completed_line_count": len(completed_lines),
+        "source_completed_lines_mutated": False,
+        "source_execution_write_eligible": False,
+        "source_generation_terminal_projection": True,
+        "source_generation_persisted_no_pass": persisted_no_pass,
+        "no_pass_claim": True,
+        "authoritative_pass_synthesized": False,
+        "dispatch_authority_synthesized": False,
+        "worker_evidence_synthesized": False,
+        "qa_evidence_synthesized": False,
+        "merge_evidence_synthesized": False,
+        "paid_action_authority_synthesized": False,
+        "old_evidence_carry_forward": False,
+        "requested_fresh_work_type": str(requested_work_type or "").strip(),
+        "fresh_typed_successor_selection_allowed": True,
+        "forced_direct_main": False,
+        "selection_rejection": dict(selection_authority),
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    fresh_selection_body = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "<choose an explicit topology-compatible work_type>",
+    }
+    terminal_action = {
+        "schema_version": "onboard_route_guide.next_action.v1",
+        "id": "terminal_supersede_wrong_family_contract_update_no_pass",
+        "action": "contract_runtime_bypass_line",
+        "interface": "contract_runtime_bypass_line",
+        "mcp_tool": "contract_runtime_bypass_line",
+        "method": "POST",
+        "path": (
+            "/api/projects/{project_id}/contract-runtime/"
+            "{contract_execution_id}/line-bypasses"
+        ),
+        "owner_role": "observer",
+        "requires_role": "observer",
+        "copy_safe": True,
+        "copy_safe_body": dict(bypass_body),
+        "action_input": dict(bypass_body),
+        "action_input_ready": False,
+        "action_input_copy_safe": True,
+        "action_input_missing_fields": [
+            "classification",
+            "reason",
+            "decision",
+            "evidence_refs[-1]",
+        ],
+        "host_realization": {
+            "required_replacement_paths": [
+                "copy_safe_body.classification",
+                "copy_safe_body.reason",
+                "copy_safe_body.decision",
+                "copy_safe_body.evidence_refs[-1]",
+            ],
+            "raw_route_token_required": False,
+            "raw_route_token_exposed": False,
+        },
+        "terminal_supersession_authority": dict(authority),
+        "fresh_typed_successor_selection": {
+            "mcp_tool": "onboard_route_guide",
+            "copy_safe_body": fresh_selection_body,
+            "required_replacement_paths": ["copy_safe_body.work_type"],
+            "allowed_work_types": [
+                "mf_parallel",
+                "mf_batch_parallel",
+                "operator_supervised_direct_main",
+            ],
+            "contract_update_allowed": False,
+            "automatic_direct_main_allowed": False,
+        },
+        "next_step": (
+            "preserve the source generation as no-PASS, then rerun Onboard with "
+            "an explicit topology-compatible work_type; do not resume or "
+            "backfill this contract_update execution"
+        ),
+    }
+    return {
+        "authority": authority,
+        "terminal_action": terminal_action,
+        "source_record": record,
+    }
+
+
 def _onboard_service_contract_update_continuation_authority(
     conn,
     *,
@@ -162165,6 +162677,15 @@ def _onboard_service_contract_update_continuation_authority(
 ) -> dict[str, Any]:
     """Prove the one synthetic completed root eligible for contract_update."""
 
+    backlog_selection_authority = (
+        _backlog_contract_update_selection_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+    )
+    if backlog_selection_authority.get("ready") is not True:
+        return {}
     expected_execution_id = _onboard_service_execution_id(project_id, backlog_id)
     expected_chain_id = _onboard_service_chain_id(project_id, backlog_id)
     projection = (
@@ -162263,6 +162784,9 @@ def _onboard_service_contract_update_continuation_authority(
         "parent_contract_execution_id": expected_execution_id,
         "parent_remains_complete": True,
         "canonical_waiver_verified": True,
+        "backlog_contract_source_revision_authority": (
+            backlog_selection_authority
+        ),
         "route_scope_ready": route_scope_ready,
         "caller_claims_accepted": False,
     }
@@ -203386,6 +203910,48 @@ def handle_project_contract_update_start(ctx: RequestContext):
                 "contract_update_start",
                 {"required_role": "observer"},
             )
+        if onboard_service_waiver:
+            selection_authority = (
+                _backlog_contract_update_selection_authority(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                )
+            )
+            if selection_authority.get("ready") is not True:
+                raise ValidationError(
+                    "contract_update requires immutable backlog contract-source revision semantics",
+                    {
+                        "code": (
+                            "contract_update_backlog_semantics_required"
+                        ),
+                        "project_id": project_id,
+                        "backlog_id": backlog_id,
+                        "successor_contract_id": (
+                            CONTRACT_UPDATE_CONTRACT_ID
+                        ),
+                        "selection_authority": selection_authority,
+                        "legacy_storage_mf_type_is_selection_authority": False,
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                        "mutation_performed": False,
+                        "next_legal_action": {
+                            "action": "onboard_route_guide",
+                            "mcp_tool": "onboard_route_guide",
+                            "copy_safe_body": {
+                                "project_id": project_id,
+                                "backlog_id": backlog_id,
+                                "role": "observer",
+                                "work_type": (
+                                    "<choose an explicit topology-compatible "
+                                    "work_type>"
+                                ),
+                            },
+                            "contract_update_allowed": False,
+                            "automatic_direct_main_allowed": False,
+                        },
+                    },
+                )
         try:
             parent_record = _contract_update_parent_for_successor(
                 conn,
