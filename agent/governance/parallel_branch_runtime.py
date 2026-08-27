@@ -20215,6 +20215,22 @@ def runtime_context_startup_identity_preflight(
     """Reject template or transcript-shaped identity values before writes."""
 
     invalid_fields: list[dict[str, str]] = []
+    # Full startup submissions must bind the actual host worker.  Keep the
+    # standalone identity helper backwards compatible for callers that only
+    # validate the legacy identity tuple without attempting a write.
+    if (
+        any(
+            field in payload
+            for field in ("runtime_context_id", "task_id", "parent_task_id")
+        )
+        and "actual_host_worker_id" not in payload
+    ):
+        invalid_fields.append(
+            {
+                "field": "actual_host_worker_id",
+                "reason": "required_identity_missing",
+            }
+        )
     for field in _STARTUP_REQUIRED_CONCRETE_IDENTITY_FIELDS:
         if field not in payload:
             invalid_fields.append(

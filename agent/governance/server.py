@@ -42296,17 +42296,6 @@ def _runtime_context_worker_recovery_payloads(
         worker_identity_pointers=worker_identity_pointers,
         semantic_role_binding=startup_semantic_role_binding,
     )
-    from .parallel_branch_runtime import runtime_context_startup_identity_preflight
-
-    startup_identity_preflight = runtime_context_startup_identity_preflight(
-        startup_body
-    )
-    startup_identity_ready = bool(
-        startup_identity_preflight.get("accepted") is True
-        and _runtime_context_non_placeholder_text(
-            startup_body.get("actual_host_worker_id")
-        )
-    )
     startup_payload = {
         "mf_subagent_startup_gate": {
             "contract_execution_id": contract_execution_id,
@@ -43047,15 +43036,12 @@ def _runtime_context_worker_recovery_payloads(
                 active_owned_files_ready
                 and startup_receipt_ready
                 and worktree_authority_ready
-                and startup_identity_ready
             ),
             "status": (
                 "blocked_missing_or_invalid_assigned_worktree"
                 if not worktree_authority_ready
                 else "blocked_missing_or_invalid_active_owned_files"
                 if not active_owned_files_ready and startup_receipt_ready
-                else "blocked_missing_or_invalid_startup_identity"
-                if not startup_identity_ready
                 else "actionable_unique_durable_read_receipt"
                 if trusted_read_receipt_authority
                 else (
@@ -43068,7 +43054,6 @@ def _runtime_context_worker_recovery_payloads(
                     )
                 )
             ),
-            "startup_identity_preflight": dict(startup_identity_preflight),
             "read_receipt_authority": dict(trusted_read_receipt_authority),
             "preconditions": [
                 {
