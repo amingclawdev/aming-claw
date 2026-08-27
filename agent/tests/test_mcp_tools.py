@@ -1120,6 +1120,87 @@ def test_task_timeline_append_schema_separates_qa_audit_from_close_statuses():
     ]
 
 
+def test_task_timeline_append_schema_exposes_direct_main_qa_runtime_binding_fields():
+    tool = next(
+        item
+        for item in governance_mcp_server.TOOLS
+        if item.get("name") == "task_timeline_append"
+    )
+    properties = tool["inputSchema"]["properties"]
+
+    assert {
+        "contract_execution_id",
+        "execution_state_revision",
+        "stage_id",
+        "line_id",
+        "runtime_guide_hash",
+        "direct_runtime_binding_hash",
+    }.issubset(properties)
+    for key in (
+        "contract_execution_id",
+        "stage_id",
+        "line_id",
+        "runtime_guide_hash",
+        "direct_runtime_binding_hash",
+    ):
+        assert properties[key]["type"] == "string"
+    assert properties["execution_state_revision"]["type"] == "integer"
+
+
+def test_task_timeline_append_dispatch_preserves_top_level_direct_main_qa_binding_header_only(
+    monkeypatch,
+):
+    raw_token = "gov-qa-direct-main-facade-secret"
+    calls = []
+
+    def record_http(method, path, data, *, gov_token=""):
+        calls.append((method, path, data, gov_token))
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        governance_mcp_server,
+        "_http_with_optional_gov_token",
+        record_http,
+    )
+    commit_sha = "a" * 40
+    binding = {
+        "contract_execution_id": "cex-direct-main-qa-facade",
+        "execution_state_revision": 7,
+        "stage_id": "qa_graph_context",
+        "line_id": "qa_graph_context",
+        "runtime_guide_hash": "sha256:" + ("b" * 64),
+        "direct_runtime_binding_hash": "sha256:" + ("c" * 64),
+    }
+
+    governance_mcp_server._dispatch_tool(
+        "task_timeline_append",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "AC-DIRECT-MAIN-QA-FACADE",
+            "task_id": "cex-direct-main-qa-facade",
+            "event_type": "qa.graph_context",
+            "event_kind": "qa_graph_context",
+            "phase": "verification",
+            "actor": "qa:direct-main-facade",
+            "status": "passed",
+            "commit_sha": commit_sha,
+            "qa_session_token": raw_token,
+            "payload": {"graph_trace_ids": ["gqt-direct-main-facade"]},
+            **binding,
+        },
+    )
+
+    assert len(calls) == 1
+    method, path, body, role_token = calls[0]
+    assert method == "POST"
+    assert path == "/api/task/aming-claw/timeline"
+    assert role_token == raw_token
+    assert body is not None
+    assert {key: body[key] for key in binding} == binding
+    assert "qa_session_token" not in body
+    assert raw_token not in json.dumps(body, sort_keys=True)
+
+
 def test_observer_direct_mutation_exception_managed_dispatch_is_literal_and_fail_closed():
     tool = next(
         item
