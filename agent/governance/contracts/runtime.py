@@ -42,6 +42,7 @@ from .instructions import resolve_instruction_bundle
 from .registry import ContractDefinitionRegistry
 from .schema import ContractDefinitionError, is_new_execution_allowed, iter_stage_lines
 from .write_gate import WriteGateDecision
+from ..db import dev_runtime_verify_only, verify_existing_schema_capabilities
 
 
 log = logging.getLogger(__name__)
@@ -58,6 +59,15 @@ _MF_PARALLEL_CONTRACT_IDS = frozenset(
 _MF_PARALLEL_ATOMIC_DISPATCH_LINE = (
     "dispatch",
     "observer_dispatch_bounded_workers",
+)
+
+_DIRECT_MAIN_CANONICAL_CONTRACT_ID = "operator_supervised_direct_main"
+_DIRECT_MAIN_DEV_STORAGE_PREFIX = (
+    "operator_supervised_direct_main.dev_world."
+)
+_DIRECT_MAIN_DEV_PROJECT_PREFIX = "__ac_dev_world__."
+_DIRECT_MAIN_RUNTIME_BINDING_KEY = (
+    "operator_supervised_direct_main_runtime_binding"
 )
 
 # This is the copy-safe writer schema shared by the RuntimeContext facade and
@@ -398,6 +408,180 @@ def _ensure_sqlite_schema_without_implicit_commit(
         )
 
 
+def direct_main_dev_namespace_hash(
+    authority: Mapping[str, Any],
+) -> str:
+    """Hash the stable dev lifecycle, excluding its advancing loaded HEAD."""
+
+    return stable_sha256(
+        {
+            "schema_version": (
+                "operator_supervised_direct_main.dev_runtime_namespace.v1"
+            ),
+            "server_derived": authority.get("server_derived") is True,
+            "caller_claims_trusted": (
+                authority.get("caller_claims_trusted") is True
+            ),
+            "runtime_plane": str(authority.get("runtime_plane") or ""),
+            "runtime_port": int(authority.get("runtime_port") or 0),
+            "bind_host": str(authority.get("bind_host") or ""),
+            "target_project_root": str(
+                authority.get("target_project_root") or ""
+            ),
+            "worktree_path": str(authority.get("worktree_path") or ""),
+            "branch": str(authority.get("branch") or ""),
+            "target_ref": str(authority.get("target_ref") or ""),
+            "stable_anchor_commit": str(
+                authority.get("stable_anchor_commit") or ""
+            ),
+            "stable_database_identity": deepcopy(
+                dict(authority.get("stable_database_identity") or {})
+            ),
+        }
+    )
+
+
+def direct_main_dev_storage_contract_id(namespace_hash: str) -> str:
+    """Return the stable-invisible physical namespace for one dev lifecycle."""
+
+    normalized = str(namespace_hash or "").strip().lower()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", normalized):
+        raise ContractRuntimeError("dev Direct namespace hash is invalid")
+    return _DIRECT_MAIN_DEV_STORAGE_PREFIX + normalized.removeprefix(
+        "sha256:"
+    )
+
+
+def direct_main_dev_storage_project_id(
+    canonical_project_id: str,
+    namespace_hash: str,
+) -> str:
+    """Return a physical project key invisible to frozen stable selectors."""
+
+    project_id = str(canonical_project_id or "").strip()
+    normalized = str(namespace_hash or "").strip().lower()
+    if not project_id:
+        raise ContractRuntimeError("dev Direct canonical project id is required")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", normalized):
+        raise ContractRuntimeError("dev Direct namespace hash is invalid")
+    return (
+        _DIRECT_MAIN_DEV_PROJECT_PREFIX
+        + normalized.removeprefix("sha256:")
+        + "."
+        + project_id
+    )
+
+
+def _contract_runtime_storage_contract_id(record: Mapping[str, Any]) -> str:
+    """Select a physical index namespace without changing canonical JSON.
+
+    Frozen stable a258 selects strict Direct records by the physical
+    ``contract_id`` column.  A dev-world execution therefore uses a lifecycle
+    namespace while its source-backed record JSON retains the exact
+    canonical contract id and definition.  The alternate namespace is accepted
+    only in the dev plane and only when its immutable authority self-hash is
+    exact.
+    """
+
+    canonical = str(record.get("contract_id") or "").strip()
+    if not (
+        dev_runtime_verify_only()
+        and canonical == _DIRECT_MAIN_CANONICAL_CONTRACT_ID
+    ):
+        return canonical
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get(_DIRECT_MAIN_RUNTIME_BINDING_KEY)
+        if isinstance(metadata.get(_DIRECT_MAIN_RUNTIME_BINDING_KEY), Mapping)
+        else {}
+    )
+    authority = (
+        binding.get("runtime_world_authority")
+        if isinstance(binding.get("runtime_world_authority"), Mapping)
+        else {}
+    )
+    authority_hash = str(authority.get("authority_hash") or "").strip()
+    world_hash = str(authority.get("world_hash") or "").strip()
+    namespace_hash = str(authority.get("namespace_hash") or "").strip()
+    if not authority:
+        return canonical
+    expected_world_hash = stable_sha256(
+        {
+            key: value
+            for key, value in authority.items()
+            if key not in {"world_hash", "storage_contract_id", "authority_hash"}
+        }
+    )
+    expected_hash = stable_sha256(
+        {key: value for key, value in authority.items() if key != "authority_hash"}
+    )
+    if not (
+        authority.get("schema_version")
+        == "operator_supervised_direct_main.dev_runtime_world.v1"
+        and authority.get("accepted") is True
+        and authority.get("server_derived") is True
+        and authority.get("runtime_plane") == "dev"
+        and namespace_hash == direct_main_dev_namespace_hash(authority)
+        and world_hash == expected_world_hash
+        and authority_hash == expected_hash
+    ):
+        raise ContractRuntimeError("dev Direct runtime world authority is invalid")
+    storage_contract_id = direct_main_dev_storage_contract_id(namespace_hash)
+    if str(authority.get("storage_contract_id") or "") != storage_contract_id:
+        raise ContractRuntimeError("dev Direct storage namespace is not world-bound")
+    return storage_contract_id
+
+
+def _contract_runtime_storage_project_id(record: Mapping[str, Any]) -> str:
+    canonical_project_id = str(record.get("project_id") or "").strip()
+    storage_contract_id = _contract_runtime_storage_contract_id(record)
+    if storage_contract_id == str(record.get("contract_id") or "").strip():
+        return canonical_project_id
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get(_DIRECT_MAIN_RUNTIME_BINDING_KEY)
+        if isinstance(metadata.get(_DIRECT_MAIN_RUNTIME_BINDING_KEY), Mapping)
+        else {}
+    )
+    authority = (
+        binding.get("runtime_world_authority")
+        if isinstance(binding.get("runtime_world_authority"), Mapping)
+        else {}
+    )
+    return direct_main_dev_storage_project_id(
+        canonical_project_id,
+        str(authority.get("namespace_hash") or ""),
+    )
+
+
+def _require_contract_runtime_storage_consistency(
+    record: Mapping[str, Any],
+    *,
+    physical_project_id: str,
+    physical_backlog_id: str,
+    physical_contract_id: str,
+) -> None:
+    expected_project_id = _contract_runtime_storage_project_id(record)
+    expected_backlog_id = str(record.get("backlog_id") or "").strip()
+    expected_contract_id = _contract_runtime_storage_contract_id(record)
+    if (
+        str(physical_project_id or "") != expected_project_id
+        or str(physical_backlog_id or "") != expected_backlog_id
+        or str(physical_contract_id or "") != expected_contract_id
+    ):
+        raise ContractRuntimeError(
+            "contract runtime physical namespace does not match record authority"
+        )
+
+
 class SQLiteContractExecutionStore:
     """SQLite-backed contract execution store with CAS revision writes."""
 
@@ -472,6 +656,98 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
         self.ensure_schema()
 
     def ensure_schema(self) -> None:
+        if dev_runtime_verify_only():
+            verify_existing_schema_capabilities(
+                self.conn,
+                owner="contract_runtime_execution_store",
+                required_tables=(
+                    "contract_runtime_executions",
+                    "worker_implementation_test_results_corrections",
+                ),
+                required_columns={
+                    "contract_runtime_executions": (
+                        "contract_execution_id",
+                        "project_id",
+                        "backlog_id",
+                        "contract_id",
+                        "version",
+                        "revision",
+                        "parent_contract_execution_id",
+                        "root_contract_execution_id",
+                        "contract_chain_id",
+                        "execution_state_revision",
+                        "record_json",
+                        "created_at",
+                        "updated_at",
+                    ),
+                    "worker_implementation_test_results_corrections": (
+                        "correction_id",
+                        "project_id",
+                        "backlog_id",
+                        "contract_execution_id",
+                        "runtime_context_id",
+                        "task_id",
+                        "source_completed_line_index",
+                        "source_line_instance_id",
+                        "source_implementation_lineage_ref",
+                        "source_line_sha256",
+                        "source_execution_state_revision",
+                        "source_test_results_sha256",
+                        "corrected_test_results_sha256",
+                        "source_authority_sha256",
+                        "source_worker_id",
+                        "source_worker_slot_id",
+                        "source_session_token_ref",
+                        "source_fence_token_hash",
+                        "correction_json",
+                        "created_at",
+                    ),
+                },
+                required_indexes=(
+                    "idx_contract_runtime_backlog",
+                    "idx_contract_runtime_chain",
+                    "idx_worker_implementation_results_correction_source",
+                    "idx_worker_implementation_results_correction_line",
+                ),
+                required_index_definitions={
+                    "idx_contract_runtime_backlog": {
+                        "table": "contract_runtime_executions",
+                        "sql": (
+                            "CREATE INDEX idx_contract_runtime_backlog ON "
+                            "contract_runtime_executions(project_id, backlog_id, "
+                            "contract_id, updated_at)"
+                        ),
+                    },
+                    "idx_contract_runtime_chain": {
+                        "table": "contract_runtime_executions",
+                        "sql": (
+                            "CREATE INDEX idx_contract_runtime_chain ON "
+                            "contract_runtime_executions(contract_chain_id, "
+                            "parent_contract_execution_id)"
+                        ),
+                    },
+                    "idx_worker_implementation_results_correction_source": {
+                        "table": "worker_implementation_test_results_corrections",
+                        "sql": (
+                            "CREATE INDEX idx_worker_implementation_results_correction_source "
+                            "ON worker_implementation_test_results_corrections("
+                            "project_id, contract_execution_id, runtime_context_id, task_id)"
+                        ),
+                    },
+                    "idx_worker_implementation_results_correction_line": {
+                        "table": "worker_implementation_test_results_corrections",
+                        "sql": (
+                            "CREATE UNIQUE INDEX "
+                            "idx_worker_implementation_results_correction_line ON "
+                            "worker_implementation_test_results_corrections("
+                            "source_line_sha256, source_line_instance_id, "
+                            "source_implementation_lineage_ref, source_completed_line_index)"
+                        ),
+                    },
+                },
+            )
+            ensure_contract_chain_mapping_schema(self.conn)
+            return
         _ensure_sqlite_schema_without_implicit_commit(
             self.conn,
             self.SCHEMA_SQL,
@@ -487,6 +763,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
         if not contract_execution_id:
             raise ContractRuntimeError("contract_execution_id is required")
         stored = deepcopy(dict(record))
+        storage_project_id = _contract_runtime_storage_project_id(stored)
+        storage_contract_id = _contract_runtime_storage_contract_id(stored)
         now = _utc_now()
         try:
             self.conn.execute(
@@ -509,9 +787,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
                 """,
                 (
                     contract_execution_id,
-                    str(stored.get("project_id") or ""),
+                    storage_project_id,
                     str(stored.get("backlog_id") or ""),
-                    str(stored.get("contract_id") or ""),
+                    storage_contract_id,
                     str(stored.get("version") or ""),
                     str(stored.get("revision") or ""),
                     str(stored.get("parent_contract_execution_id") or ""),
@@ -527,13 +805,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
             raise ContractRuntimeError(
                 f"contract execution already exists: {contract_execution_id}"
             ) from exc
-        refresh_contract_chain_projection_for_record(self.conn, stored)
+        if storage_contract_id == str(stored.get("contract_id") or ""):
+            refresh_contract_chain_projection_for_record(self.conn, stored)
         return deepcopy(stored)
 
     def get(self, contract_execution_id: str) -> dict[str, Any]:
         row = self.conn.execute(
             """
-            SELECT record_json FROM contract_runtime_executions
+            SELECT project_id, backlog_id, contract_id, record_json
+            FROM contract_runtime_executions
             WHERE contract_execution_id = ?
             """,
             (contract_execution_id,),
@@ -542,8 +822,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
             raise ContractRuntimeError(
                 f"unknown contract execution: {contract_execution_id}"
             )
-        raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[0]
-        return _decode_record(raw)
+        physical_project_id = (
+            str(row["project_id"] or "")
+            if isinstance(row, sqlite3.Row)
+            else str(row[0] or "")
+        )
+        physical_backlog_id = (
+            str(row["backlog_id"] or "")
+            if isinstance(row, sqlite3.Row)
+            else str(row[1] or "")
+        )
+        physical_contract_id = (
+            str(row["contract_id"] or "")
+            if isinstance(row, sqlite3.Row)
+            else str(row[2] or "")
+        )
+        raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[3]
+        record = _decode_record(raw)
+        _require_contract_runtime_storage_consistency(
+            record,
+            physical_project_id=physical_project_id,
+            physical_backlog_id=physical_backlog_id,
+            physical_contract_id=physical_contract_id,
+        )
+        return record
 
     def update(
         self,
@@ -553,10 +855,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
         stored = deepcopy(dict(record))
+        storage_project_id = _contract_runtime_storage_project_id(stored)
+        storage_contract_id = _contract_runtime_storage_contract_id(stored)
+        physical_row = self.conn.execute(
+            "SELECT project_id, backlog_id, contract_id "
+            "FROM contract_runtime_executions "
+            "WHERE contract_execution_id = ?",
+            (contract_execution_id,),
+        ).fetchone()
+        if physical_row is not None:
+            current_storage = tuple(str(value or "") for value in physical_row)
+            expected_storage = (
+                storage_project_id,
+                str(stored.get("backlog_id") or ""),
+                storage_contract_id,
+            )
+            if current_storage != expected_storage:
+                raise ContractRuntimeError(
+                    "contract runtime storage namespace is immutable"
+                )
         params: list[Any] = [
-            str(stored.get("project_id") or ""),
+            storage_project_id,
             str(stored.get("backlog_id") or ""),
-            str(stored.get("contract_id") or ""),
+            storage_contract_id,
             str(stored.get("version") or ""),
             str(stored.get("revision") or ""),
             str(stored.get("parent_contract_execution_id") or ""),
@@ -595,7 +916,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
             raise ContractRuntimeError(
                 f"unknown contract execution: {contract_execution_id}"
             )
-        refresh_contract_chain_projection_for_record(self.conn, stored)
+        if storage_contract_id == str(stored.get("contract_id") or ""):
+            refresh_contract_chain_projection_for_record(self.conn, stored)
         return deepcopy(stored)
 
     def list_by_backlog(
@@ -604,15 +926,37 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
         project_id: str,
         backlog_id: str,
         contract_id: str | None = None,
+        storage_contract_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        params: list[Any] = [project_id, backlog_id]
+        storage_project_id = str(project_id)
+        if storage_contract_id:
+            if not dev_runtime_verify_only():
+                raise ContractRuntimeError(
+                    "storage_contract_id selection is dev-plane only"
+                )
+            suffix = str(storage_contract_id).removeprefix(
+                _DIRECT_MAIN_DEV_STORAGE_PREFIX
+            )
+            if not re.fullmatch(r"[0-9a-f]{64}", suffix):
+                raise ContractRuntimeError(
+                    "dev Direct storage contract namespace is invalid"
+                )
+            storage_project_id = direct_main_dev_storage_project_id(
+                project_id,
+                "sha256:" + suffix,
+            )
+        params: list[Any] = [storage_project_id, backlog_id]
         where = "project_id = ? AND backlog_id = ?"
-        if contract_id:
+        if storage_contract_id:
+            where += " AND contract_id = ?"
+            params.append(str(storage_contract_id))
+        elif contract_id:
             where += " AND contract_id = ?"
             params.append(contract_id)
         rows = self.conn.execute(
             f"""
-            SELECT record_json FROM contract_runtime_executions
+            SELECT project_id, backlog_id, contract_id, record_json
+            FROM contract_runtime_executions
             WHERE {where}
             ORDER BY updated_at DESC, contract_execution_id DESC
             """,
@@ -620,8 +964,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
         ).fetchall()
         records: list[dict[str, Any]] = []
         for row in rows:
-            raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[0]
-            records.append(_decode_record(raw))
+            physical_project_id = (
+                str(row["project_id"] or "")
+                if isinstance(row, sqlite3.Row)
+                else str(row[0] or "")
+            )
+            physical_backlog_id = (
+                str(row["backlog_id"] or "")
+                if isinstance(row, sqlite3.Row)
+                else str(row[1] or "")
+            )
+            physical_contract_id = (
+                str(row["contract_id"] or "")
+                if isinstance(row, sqlite3.Row)
+                else str(row[2] or "")
+            )
+            raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[3]
+            record = _decode_record(raw)
+            _require_contract_runtime_storage_consistency(
+                record,
+                physical_project_id=physical_project_id,
+                physical_backlog_id=physical_backlog_id,
+                physical_contract_id=physical_contract_id,
+            )
+            records.append(record)
         return records
 
     def worker_implementation_test_results_corrections(
@@ -996,6 +1362,109 @@ DIRECT_FIX_QA_EVIDENCE_KINDS = frozenset(
 def ensure_contract_chain_mapping_schema(conn: sqlite3.Connection) -> None:
     """Create durable backlog-to-contract-chain mapping tables."""
 
+    if dev_runtime_verify_only():
+        verify_existing_schema_capabilities(
+            conn,
+            owner="contract_runtime_chain_mapping",
+            required_tables=(
+                "backlog_contract_chain_bindings",
+                "contract_chain_edges",
+                "backlog_contract_chain_current",
+            ),
+            required_columns={
+                "backlog_contract_chain_bindings": (
+                    "id",
+                    "idempotency_key",
+                    "project_id",
+                    "backlog_id",
+                    "contract_chain_id",
+                    "root_contract_execution_id",
+                    "contract_execution_id",
+                    "parent_contract_execution_id",
+                    "contract_id",
+                    "binding_kind",
+                    "generation",
+                    "execution_state_revision",
+                    "source_ref",
+                    "source_hash",
+                    "degraded_flags_json",
+                    "metadata_json",
+                    "created_at",
+                ),
+                "contract_chain_edges": (
+                    "id",
+                    "edge_key",
+                    "project_id",
+                    "backlog_id",
+                    "contract_chain_id",
+                    "parent_contract_execution_id",
+                    "child_contract_execution_id",
+                    "root_contract_execution_id",
+                    "edge_kind",
+                    "generation",
+                    "source_ref",
+                    "source_hash",
+                    "metadata_json",
+                    "created_at",
+                ),
+                "backlog_contract_chain_current": (
+                    "project_id",
+                    "backlog_id",
+                    "contract_chain_id",
+                    "root_contract_execution_id",
+                    "current_contract_execution_id",
+                    "current_contract_id",
+                    "parent_to_resume_contract_execution_id",
+                    "active_child_contract_execution_id",
+                    "readiness_state",
+                    "generation",
+                    "projection_watermark",
+                    "projection_hash",
+                    "active_chain_json",
+                    "next_legal_action_json",
+                    "degraded_flags_json",
+                    "source_refs_json",
+                    "updated_at",
+                ),
+            },
+            required_indexes=(
+                "idx_backlog_contract_chain_bindings_backlog",
+                "idx_backlog_contract_chain_bindings_execution",
+                "idx_contract_chain_edges_backlog",
+                "idx_backlog_contract_chain_current_chain",
+            ),
+            required_index_definitions={
+                "idx_backlog_contract_chain_bindings_backlog": {
+                    "table": "backlog_contract_chain_bindings",
+                    "sql": (
+                        "CREATE INDEX idx_backlog_contract_chain_bindings_backlog "
+                        "ON backlog_contract_chain_bindings(project_id, backlog_id, id)"
+                    ),
+                },
+                "idx_backlog_contract_chain_bindings_execution": {
+                    "table": "backlog_contract_chain_bindings",
+                    "sql": (
+                        "CREATE INDEX idx_backlog_contract_chain_bindings_execution "
+                        "ON backlog_contract_chain_bindings(contract_execution_id, id)"
+                    ),
+                },
+                "idx_contract_chain_edges_backlog": {
+                    "table": "contract_chain_edges",
+                    "sql": (
+                        "CREATE INDEX idx_contract_chain_edges_backlog ON "
+                        "contract_chain_edges(project_id, backlog_id, contract_chain_id, id)"
+                    ),
+                },
+                "idx_backlog_contract_chain_current_chain": {
+                    "table": "backlog_contract_chain_current",
+                    "sql": (
+                        "CREATE INDEX idx_backlog_contract_chain_current_chain ON "
+                        "backlog_contract_chain_current(project_id, contract_chain_id)"
+                    ),
+                },
+            },
+        )
+        return
     _ensure_sqlite_schema_without_implicit_commit(
         conn,
         CONTRACT_CHAIN_MAPPING_SCHEMA_SQL,

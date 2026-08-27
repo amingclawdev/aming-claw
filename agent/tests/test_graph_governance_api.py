@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, fields, replace
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+import ast
 import base64
 import copy
 import errno
@@ -10,6 +11,7 @@ import fcntl
 import gc
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -51,10 +53,12 @@ from agent.governance import server
 from agent.governance import state_reconcile
 from agent.governance import task_timeline
 from agent.governance import dashboard_read_cache
+from agent.governance import db as governance_db
 from agent.governance.checkout_provenance import describe_checkout
 from agent.governance.dashboard_read_cache import DashboardBacklogReadCache
 from agent.governance.contracts.instructions import resolve_instruction_bundle
 from agent.governance.contracts import write_gate as contract_write_gate
+from agent.governance.contracts import runtime as contract_runtime
 from agent.governance.contracts.runtime import (
     ContractRuntimeError,
     SQLiteContractExecutionStore,
@@ -699,7 +703,6 @@ def test_post_startup_rejoin_preserves_canonical_worker_and_host_identity(
         )
     )
     assert startup["ok"] is True
-
     current = get_branch_context(conn, PID, case["task_id"])
     assert current is not None
     assert case["worker_session_id"] != case["host_session_id"]
@@ -3163,6 +3166,419 @@ def test_release_preflight_rejects_unbounded_nonterminal_window_zero_write(
     assert rejected.value.code == "graph_release_preflight_nonterminal_window_unbounded"
     assert rejected.value.details["zero_write_rejection"] is True
     assert conn.total_changes == before
+
+
+def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    _initialize_ac_dev_guide_schema(conn)
+    backlog_id = "AC-DEV-ROUTE-BOUND-WORLD-MATERIALIZATION"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    row_files = ["agent/governance/server.py"]
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files=?, test_files='[]' WHERE bug_id=?",
+        (json.dumps(row_files), backlog_id),
+    )
+    old_task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+    )
+    old_record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": old_task_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev3",
+        "execution_state_revision": 1,
+        "metadata": {
+            "operator_supervised_direct_main_runtime_binding": {
+                "strict_runtime_binding_required": True,
+            }
+        },
+    }
+    conn.execute(
+        """INSERT INTO contract_runtime_executions (
+               contract_execution_id, project_id, backlog_id, contract_id,
+               version, revision, execution_state_revision, record_json,
+               created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            old_task_id,
+            PID,
+            backlog_id,
+            "operator_supervised_direct_main",
+            "v1",
+            "rev3",
+            1,
+            json.dumps(old_record),
+            "2026-08-27T00:00:00Z",
+            "2026-08-27T00:00:00Z",
+        ),
+    )
+    conn.commit()
+
+    root = tmp_path / "ac-dev-materialize"
+    root.mkdir()
+    commit = "e" * 40
+    world = _fixed_ac_dev_direct_world(root, commit)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+        world_authority=world,
+    )
+    route_token_ref = "rtok-ac-dev-route-bound-world"
+    route_identity = {
+        "route_id": "route-ac-dev-route-bound-world",
+        "route_context_hash": _fake_sha("ac-dev-route-context"),
+        "prompt_contract_id": "rprompt-ac-dev-route-bound-world",
+        "prompt_contract_hash": _fake_sha("ac-dev-prompt"),
+        "visible_injection_manifest_hash": _fake_sha("ac-dev-manifest"),
+        "route_token_ref": route_token_ref,
+    }
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=PID,
+        route_token_ref=route_token_ref,
+        token={
+            **route_identity,
+            "caller_role": "observer",
+            "allowed_actions": list(
+                server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            ),
+            "target_files": row_files,
+            "owned_files": row_files,
+            "scope": {
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+            },
+            "expires_at": "2999-01-01T00:00:00Z",
+            "evidence_refs": [f"backlog:{backlog_id}"],
+        },
+    )
+    world_ref = server._operator_supervised_direct_main_world_ref(project_id=PID)
+    first = server._operator_supervised_direct_main_start_runtime(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=route_token_ref,
+        world_ref=world_ref,
+    )
+    assert conn.in_transaction is True
+    conn.rollback()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE contract_execution_id=?",
+        (task_id,),
+    ).fetchone()[0] == 0
+    first = server._operator_supervised_direct_main_start_runtime(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=route_token_ref,
+        world_ref=world_ref,
+    )
+    conn.commit()
+    assert first["contract_execution_id"] == task_id
+    physical = conn.execute(
+        "SELECT contract_id, record_json FROM contract_runtime_executions "
+        "WHERE contract_execution_id=?",
+        (task_id,),
+    ).fetchone()
+    assert physical["contract_id"] == world["storage_contract_id"]
+    assert json.loads(physical["record_json"])["contract_id"] == (
+        "operator_supervised_direct_main"
+    )
+    frozen_visible = conn.execute(
+        "SELECT contract_execution_id FROM contract_runtime_executions "
+        "WHERE project_id=? AND backlog_id=? "
+        "AND contract_id='operator_supervised_direct_main'",
+        (PID, backlog_id),
+    ).fetchall()
+    assert [row["contract_execution_id"] for row in frozen_visible] == [old_task_id]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backlog_contract_chain_bindings "
+        "WHERE contract_execution_id=?",
+        (task_id,),
+    ).fetchone()[0] == 0
+
+    before_retry = conn.total_changes
+    replay = server._operator_supervised_direct_main_start_runtime(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=route_token_ref,
+        world_ref=world_ref,
+    )
+    assert replay["contract_execution_id"] == task_id
+    assert conn.total_changes == before_retry
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE contract_execution_id=?",
+        (task_id,),
+    ).fetchone()[0] == 1
+
+    advanced_commit = "f" * 40
+    advanced_world = _fixed_ac_dev_direct_world(root, advanced_commit)
+    assert advanced_world["namespace_hash"] == world["namespace_hash"]
+    assert advanced_world["world_hash"] != world["world_hash"]
+    assert server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+        world_authority=advanced_world,
+    ) == task_id
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(advanced_world),
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_commit_is_ancestor",
+        lambda project_root, ancestor, descendant: (
+            project_root == root.resolve()
+            and ancestor == commit
+            and descendant == advanced_commit
+        ),
+    )
+    before_restart = conn.total_changes
+    restarted = server._onboard_operator_supervised_direct_main_runtime_response(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+        role="observer",
+        work_type="operator_supervised_direct_main",
+        response_view="compact",
+        request_body={
+            "target_project_root": str(root),
+            "target_head_commit": advanced_commit,
+            "target_ref": server.AC_DEV_BRANCH,
+            "task_id": task_id,
+        },
+    )
+    assert restarted["contract_execution_id"] == task_id
+    assert restarted["runtime_world_authority"] == advanced_world
+    assert restarted["next_legal_action"]["copy_safe_body"]["task_id"] == task_id
+    assert conn.total_changes == before_restart
+    replay_after_restart = server._operator_supervised_direct_main_start_runtime(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_token_ref=route_token_ref,
+        world_ref=server._operator_supervised_direct_main_world_ref(project_id=PID),
+    )
+    assert replay_after_restart["contract_execution_id"] == task_id
+    assert replay_after_restart["execution_state_revision"] == first[
+        "execution_state_revision"
+    ]
+    assert conn.total_changes == before_restart
+
+    unrelated_world = _fixed_ac_dev_direct_world(root, "9" * 40)
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(unrelated_world),
+    )
+    with pytest.raises(GovernanceError) as unrelated:
+        server._operator_supervised_direct_main_strict_records(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+        )
+    assert unrelated.value.code == "ac_dev_direct_main_runtime_world_lineage_invalid"
+    assert unrelated.value.details["writes_performed"] is False
+    assert conn.total_changes == before_restart
+
+
+def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE", raising=False)
+    _initialize_ac_dev_guide_schema(conn)
+    fixed_now = "2026-08-27T00:00:00Z"
+    monkeypatch.setattr(contract_runtime, "_utc_now", lambda: fixed_now)
+    backlog_id = "AC-DEV-FROZEN-REBUILD-PHYSICAL-PROJECT-ISOLATION"
+    stable_execution_id = "cex-stable-frozen-rebuild"
+    stable_record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": stable_execution_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev3",
+        "root_contract_execution_id": stable_execution_id,
+        "contract_chain_id": "cchain-stable-frozen-rebuild",
+        "execution_state_revision": 1,
+        "completed_lines": [],
+        "metadata": {
+            "operator_supervised_direct_main_runtime_binding": {
+                "strict_runtime_binding_required": True,
+            }
+        },
+    }
+    stable_store = SQLiteContractExecutionStore(conn)
+    stable_store.create(stable_record)
+    conn.commit()
+
+    def stable_projection_bytes():
+        return {
+            "bindings": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT * FROM backlog_contract_chain_bindings "
+                    "WHERE project_id=? AND backlog_id=? ORDER BY id",
+                    (PID, backlog_id),
+                ).fetchall()
+            ],
+            "edges": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT * FROM contract_chain_edges "
+                    "WHERE project_id=? AND backlog_id=? ORDER BY id",
+                    (PID, backlog_id),
+                ).fetchall()
+            ],
+            "current": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT * FROM backlog_contract_chain_current "
+                    "WHERE project_id=? AND backlog_id=?",
+                    (PID, backlog_id),
+                ).fetchall()
+            ],
+        }
+
+    before = stable_projection_bytes()
+    before_read = contract_runtime.read_backlog_contract_chain_current(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    assert before_read["current_contract_execution_id"] == stable_execution_id
+    assert before_read["degraded_flags"] == {}
+
+    root = tmp_path / "ac-dev-frozen-rebuild"
+    root.mkdir()
+    world = _fixed_ac_dev_direct_world(root, "d" * 40)
+    dev_execution_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+        world_authority=world,
+    )
+    dev_record = {
+        **stable_record,
+        "contract_execution_id": dev_execution_id,
+        "root_contract_execution_id": dev_execution_id,
+        "contract_chain_id": "cchain-dev-frozen-rebuild",
+        "metadata": {
+            "operator_supervised_direct_main_runtime_binding": {
+                "strict_runtime_binding_required": True,
+                "runtime_world_authority": world,
+            }
+        },
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    dev_store = SQLiteContractExecutionStore(conn)
+    dev_store.create(dev_record)
+    conn.commit()
+    physical = conn.execute(
+        "SELECT project_id, backlog_id, contract_id, record_json "
+        "FROM contract_runtime_executions WHERE contract_execution_id=?",
+        (dev_execution_id,),
+    ).fetchone()
+    expected_storage_project = contract_runtime.direct_main_dev_storage_project_id(
+        PID,
+        world["namespace_hash"],
+    )
+    assert physical["project_id"] == expected_storage_project
+    assert physical["project_id"] != PID
+    assert physical["backlog_id"] == backlog_id
+    assert json.loads(physical["record_json"])["project_id"] == PID
+    assert json.loads(physical["record_json"])["backlog_id"] == backlog_id
+    loaded = dev_store.get(dev_execution_id)
+    assert loaded["project_id"] == PID
+    dev_store.update(
+        dev_execution_id,
+        loaded,
+        expected_revision=loaded["execution_state_revision"],
+    )
+    assert dev_store.get(dev_execution_id) == loaded
+    conn.commit()
+
+    base_source = subprocess.run(
+        [
+            "git",
+            "show",
+            f"{server.AC_STABLE_ANCHOR_COMMIT}:agent/governance/contracts/runtime.py",
+        ],
+        cwd=Path(contract_runtime.__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    frozen_tree = ast.parse(base_source)
+    frozen_rebuild = next(
+        node
+        for node in frozen_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "rebuild_backlog_contract_chain_projection"
+    )
+    current_rebuild = ast.parse(
+        inspect.getsource(
+            contract_runtime.rebuild_backlog_contract_chain_projection
+        )
+    ).body[0]
+    assert ast.dump(current_rebuild, include_attributes=False) == ast.dump(
+        frozen_rebuild,
+        include_attributes=False,
+    )
+
+    monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE", raising=False)
+    rebuilt = contract_runtime.rebuild_backlog_contract_chain_projection(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    conn.commit()
+    after = stable_projection_bytes()
+    after_read = contract_runtime.read_backlog_contract_chain_current(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    assert rebuilt["current_contract_execution_id"] == stable_execution_id
+    assert rebuilt["degraded_flags"] == {}
+    assert after_read == before_read
+    assert after == before
+    assert stable_store.list_by_backlog(
+        project_id=PID,
+        backlog_id=backlog_id,
+    ) == [stable_record]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backlog_contract_chain_bindings "
+        "WHERE contract_execution_id=?",
+        (dev_execution_id,),
+    ).fetchone()[0] == 0
 
 
 def test_release_preflight_accepts_truncated_terminal_history_when_nonterminal_complete(
@@ -192582,3 +192998,1631 @@ def test_worker_guide_receipt_requires_prepare_then_projects_eight_hashes(
         )
     )
     assert startup["ok"] is True
+
+
+def _fixed_ac_dev_direct_world(root: Path, commit: str) -> dict[str, Any]:
+    core = {
+        "schema_version": "operator_supervised_direct_main.dev_runtime_world.v1",
+        "accepted": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "runtime_plane": "dev",
+        "runtime_port": server.AC_DEV_SERVICE_PORT,
+        "bind_host": server.AC_DEV_BIND_HOST,
+        "target_project_root": str(root.resolve()),
+        "worktree_path": str(root.resolve()),
+        "branch": server.AC_DEV_BRANCH,
+        "target_ref": f"refs/heads/{server.AC_DEV_BRANCH}",
+        "target_head_commit": commit,
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "stable_database_identity": {
+            "schema_version": "ac_stable_database_identity.v1",
+            "device": 1,
+            "inode": 2,
+            "stable_relative_path_sha256": "sha256:" + "3" * 64,
+        },
+        "loaded_runtime_commit": commit,
+        "loaded_runtime_source_sha256": "sha256:" + "4" * 64,
+        "runtime_stale": False,
+        "violations": [],
+        "zero_write_projection": True,
+    }
+    core["namespace_hash"] = server.direct_main_dev_namespace_hash(core)
+    world_hash = server.stable_sha256(core)
+    authority = {
+        **core,
+        "world_hash": world_hash,
+        "storage_contract_id": server.direct_main_dev_storage_contract_id(
+            core["namespace_hash"]
+        ),
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    return authority
+
+
+def _initialize_ac_dev_guide_schema(conn) -> None:
+    parallel_branch_runtime.ensure_branch_runtime_schema(conn)
+    SQLiteContractExecutionStore(conn)
+    task_timeline.ensure_schema(conn)
+    observer_route_context._ensure_ref_registry_schema(conn)
+    conn.commit()
+
+
+def test_ac_dev_guide_lazy_schema_reads_are_verify_only_without_ddl(
+    conn,
+    monkeypatch,
+):
+    _initialize_ac_dev_guide_schema(conn)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    denied_actions: list[int] = []
+
+    def authorizer(action, *_args):
+        if action in governance_db._DEV_DENIED_SCHEMA_ACTIONS:
+            denied_actions.append(action)
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    before = conn.total_changes
+    conn.set_authorizer(authorizer)
+    try:
+        parallel_branch_runtime.get_active_integration_epoch(conn, PID)
+        SQLiteContractExecutionStore(conn).list_by_backlog(
+            project_id=PID,
+            backlog_id="AC-DEV-VERIFY-ONLY-NO-DDL",
+        )
+        task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id="AC-DEV-VERIFY-ONLY-NO-DDL",
+        )
+        assert observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=PID,
+            route_token_ref="rtok-dev-verify-only-missing",
+        ) is None
+    finally:
+        conn.set_authorizer(None)
+
+    assert denied_actions == []
+    assert conn.total_changes == before
+
+
+def test_ac_dev_guide_projects_exact_world_cex_and_rejects_stable_claims_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    _initialize_ac_dev_guide_schema(conn)
+    backlog_id = "AC-DEV-GUIDE-WORLD-PARTITION-ZERO-WRITE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    root = tmp_path / "ac-dev-world"
+    root.mkdir()
+    commit = "d" * 40
+    world = _fixed_ac_dev_direct_world(root, commit)
+    old_task_id = server._contract_runtime_stable_id(
+        "cex-direct-main",
+        PID,
+        backlog_id,
+        "operator_supervised_direct_main",
+        "v1",
+        "rev3",
+    )
+    old_record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": old_task_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev3",
+        "execution_state_revision": 1,
+        "metadata": {
+            "operator_supervised_direct_main_runtime_binding": {
+                "strict_runtime_binding_required": True,
+                "target_project_root": "/stable/a258",
+                "target_head_commit": server.AC_STABLE_ANCHOR_COMMIT,
+            }
+        },
+    }
+    conn.execute(
+        """INSERT INTO contract_runtime_executions (
+               contract_execution_id, project_id, backlog_id, contract_id,
+               version, revision, execution_state_revision, record_json,
+               created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            old_task_id,
+            PID,
+            backlog_id,
+            "operator_supervised_direct_main",
+            "v1",
+            "rev3",
+            1,
+            json.dumps(old_record),
+            "2026-08-27T00:00:00Z",
+            "2026-08-27T00:00:00Z",
+        ),
+    )
+    conn.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    denied_actions: list[int] = []
+
+    def authorizer(action, *args):
+        if action in governance_db._DEV_DENIED_SCHEMA_ACTIONS:
+            denied_actions.append(action)
+        return governance_db._dev_schema_authorizer(action, *args)
+
+    conn.set_authorizer(authorizer)
+
+    before = conn.total_changes
+    before_data_version = conn.execute("PRAGMA data_version").fetchone()[0]
+    before_projection = server.stable_sha256(
+        {
+            "contracts": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT contract_execution_id, contract_id, record_json "
+                    "FROM contract_runtime_executions WHERE project_id=? "
+                    "AND backlog_id=? ORDER BY contract_execution_id",
+                    (PID, backlog_id),
+                ).fetchall()
+            ],
+            "timeline": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT id, event_type, payload_json FROM task_timeline_events "
+                    "WHERE project_id=? AND backlog_id=? ORDER BY id",
+                    (PID, backlog_id),
+                ).fetchall()
+            ],
+            "route_refs": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT route_token_ref, task_id, status FROM "
+                    "observer_route_token_refs WHERE project_id=? AND backlog_id=? "
+                    "ORDER BY route_token_ref",
+                    (PID, backlog_id),
+                ).fetchall()
+            ],
+        }
+    )
+    guide = server.handle_project_onboard_route_guide(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "target_project_root": str(root),
+                "target_head_commit": commit,
+                "target_ref": server.AC_DEV_BRANCH,
+            },
+        )
+    )
+    expected_task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+        world_authority=world,
+    )
+    assert guide["contract_execution_id"] == expected_task_id
+    assert guide["contract_execution_id"] != old_task_id
+    assert guide["runtime_world_authority"] == world
+    assert guide["dev_world_partitioned"] is True
+    assert guide["next_legal_action"]["copy_safe_body"]["task_id"] == expected_task_id
+    assert conn.total_changes == before
+    assert conn.execute("PRAGMA data_version").fetchone()[0] == before_data_version
+    after_projection = server.stable_sha256(
+        {
+            "contracts": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT contract_execution_id, contract_id, record_json "
+                    "FROM contract_runtime_executions WHERE project_id=? "
+                    "AND backlog_id=? ORDER BY contract_execution_id",
+                    (PID, backlog_id),
+                ).fetchall()
+            ],
+            "timeline": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT id, event_type, payload_json FROM task_timeline_events "
+                    "WHERE project_id=? AND backlog_id=? ORDER BY id",
+                    (PID, backlog_id),
+                ).fetchall()
+            ],
+            "route_refs": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT route_token_ref, task_id, status FROM "
+                    "observer_route_token_refs WHERE project_id=? AND backlog_id=? "
+                    "ORDER BY route_token_ref",
+                    (PID, backlog_id),
+                ).fetchall()
+            ],
+        }
+    )
+    assert after_projection == before_projection
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "role": "observer",
+                    "work_type": "operator_supervised_direct_main",
+                    "task_id": old_task_id,
+                    "target_head_commit": server.AC_STABLE_ANCHOR_COMMIT,
+                    "target_ref": f"refs/heads/{server.AC_STABLE_BRANCH}",
+                },
+            )
+        )
+    assert rejected.value.code == "ac_direct_main_runtime_candidate_identity_mismatch"
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == before
+    assert denied_actions == []
+
+
+@pytest.mark.parametrize(
+    "selector_alias",
+    ["target_project_root", "target_head_commit", "target_ref", "task_id"],
+)
+@pytest.mark.parametrize(
+    "query_shape",
+    ["wrong_only", "exact_then_wrong", "wrong_then_exact"],
+)
+def test_ac_dev_get_rejects_every_wrong_or_repeated_world_selector_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    selector_alias,
+    query_shape,
+):
+    _initialize_ac_dev_guide_schema(conn)
+    backlog_id = "AC-DEV-GET-MULTIVALUE-WORLD-MISMATCH"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    root = tmp_path / "ac-dev-exact-query-world"
+    root.mkdir()
+    wrong_root = tmp_path / "PRIVATE-SELECTOR-SENTINEL"
+    wrong_root.mkdir()
+    commit = "3" * 40
+    world = _fixed_ac_dev_direct_world(root, commit)
+    execution_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+        world_authority=world,
+    )
+    exact_value, wrong_value = {
+        "target_project_root": (str(root), str(wrong_root)),
+        "target_head_commit": (commit, "2" * 40),
+        "target_ref": (
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+            "refs/heads/PRIVATE-SELECTOR-SENTINEL",
+        ),
+        "task_id": (execution_id, "cex-PRIVATE-SELECTOR-SENTINEL"),
+    }[selector_alias]
+    values = {
+        "wrong_only": [wrong_value],
+        "exact_then_wrong": [exact_value, wrong_value],
+        "wrong_then_exact": [wrong_value, exact_value],
+    }[query_shape]
+    selector_authority = {
+        "dev_refs": [
+            server.AC_DEV_BRANCH,
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+        ],
+        "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": str(root.resolve()),
+        "dev_head_commit": commit,
+        "dev_contract_execution_ids": [execution_id],
+        "server_derived": True,
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(selector_authority),
+    )
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                query={
+                    "backlog_id": [backlog_id],
+                    "role": ["observer"],
+                    "work_type": ["operator_supervised_direct_main"],
+                    selector_alias: values,
+                },
+            )
+        )
+
+    assert rejected.value.code == "ac_direct_main_runtime_candidate_identity_mismatch"
+    assert {
+        item["field"] for item in rejected.value.details["identity_mismatches"]
+    } == {selector_alias}
+    serialized = json.dumps(rejected.value.details, sort_keys=True)
+    assert str(wrong_value) not in serialized
+    assert str(exact_value) not in serialized
+    assert "PRIVATE-SELECTOR-SENTINEL" not in serialized
+    assert rejected.value.details["public_safe"] is True
+    assert rejected.value.details["secret_safe"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+def test_ac_dev_get_accepts_exact_repeated_query_world_selectors_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    _initialize_ac_dev_guide_schema(conn)
+    backlog_id = "AC-DEV-GET-EXACT-MULTIVALUE-WORLD"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    root = tmp_path / "ac-dev-exact-repeated-query"
+    root.mkdir()
+    commit = "1" * 40
+    world = _fixed_ac_dev_direct_world(root, commit)
+    execution_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+        world_authority=world,
+    )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: {
+            "dev_refs": [
+                server.AC_DEV_BRANCH,
+                f"refs/heads/{server.AC_DEV_BRANCH}",
+            ],
+            "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+            "dev_worktree_root": str(root.resolve()),
+            "dev_head_commit": commit,
+            "dev_contract_execution_ids": [execution_id],
+            "server_derived": True,
+        },
+    )
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "backlog_id": [backlog_id],
+                "role": ["observer"],
+                "work_type": ["operator_supervised_direct_main"],
+                "target_project_root": [str(root), str(root)],
+                "target_head_commit": [commit, commit],
+                "target_ref": [
+                    server.AC_DEV_BRANCH,
+                    f"refs/heads/{server.AC_DEV_BRANCH}",
+                ],
+                "task_id": [execution_id, execution_id],
+            },
+        )
+    )
+
+    assert guide["contract_execution_id"] == execution_id
+    assert guide["runtime_world_authority"] == world
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+@pytest.mark.parametrize(
+    (
+        "role",
+        "work_type",
+        "include_backlog",
+        "selector_alias",
+        "claim_source",
+    ),
+    [
+        ("qa", "qa_verification", True, "target_project_root", "body"),
+        ("observer", "capability_query", False, "target_head_commit", "query"),
+        ("", "", True, "target_ref", "repeated_query"),
+        ("", "capability_query", False, "task_id", "repeated_query"),
+    ],
+)
+def test_ac_dev_ingress_rejects_wrong_world_before_every_role_dispatch(
+    conn,
+    monkeypatch,
+    tmp_path,
+    role,
+    work_type,
+    include_backlog,
+    selector_alias,
+    claim_source,
+):
+    _initialize_ac_dev_guide_schema(conn)
+    backlog_id = "AC-DEV-INGRESS-EVERY-ROLE-WRONG-WORLD"
+    if include_backlog:
+        _insert_simple_mf_close_backlog(conn, backlog_id)
+    root = tmp_path / "ac-dev-every-role-exact"
+    wrong_root = tmp_path / "PRIVATE-DEV-INGRESS-WRONG-ROOT"
+    root.mkdir()
+    wrong_root.mkdir()
+    commit = "4" * 40
+    wrong_commit = "5" * 40
+    world = _fixed_ac_dev_direct_world(root, commit)
+    execution_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+        world_authority=world,
+    )
+    exact_value, wrong_value = {
+        "target_project_root": (str(root), str(wrong_root)),
+        "target_head_commit": (commit, wrong_commit),
+        "target_ref": (
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+            "refs/heads/PRIVATE-DEV-INGRESS-WRONG-REF",
+        ),
+        "task_id": (
+            execution_id,
+            "cex-PRIVATE-DEV-INGRESS-WRONG-TASK",
+        ),
+    }[selector_alias]
+    selector_authority = {
+        "dev_refs": [
+            server.AC_DEV_BRANCH,
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+        ],
+        "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": str(root.resolve()),
+        "dev_head_commit": commit,
+        "dev_contract_execution_ids": [execution_id],
+        "server_derived": True,
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(selector_authority),
+    )
+    body: dict[str, Any] = {}
+    query: dict[str, list[str]] = {}
+    if include_backlog:
+        body["backlog_id"] = backlog_id
+    if role:
+        body["role"] = role
+    if work_type:
+        body["work_type"] = work_type
+    if claim_source == "body":
+        body[selector_alias] = wrong_value
+    elif claim_source == "query":
+        query[selector_alias] = [wrong_value]
+    else:
+        query[selector_alias] = [exact_value, wrong_value]
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=body,
+                query=query,
+            )
+        )
+
+    assert rejected.value.code == (
+        "ac_direct_main_runtime_candidate_identity_mismatch"
+    )
+    assert {
+        item["field"] for item in rejected.value.details["identity_mismatches"]
+    } == {selector_alias}
+    assert rejected.value.details["required_endpoint"] == (
+        "http://127.0.0.1:40008"
+    )
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["public_safe"] is True
+    assert rejected.value.details["secret_safe"] is True
+    serialized = json.dumps(rejected.value.details, sort_keys=True)
+    assert str(exact_value) not in serialized
+    assert str(wrong_value) not in serialized
+    assert "PRIVATE-DEV-INGRESS" not in serialized
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+@pytest.mark.parametrize(
+    ("role", "work_type", "include_backlog"),
+    [
+        ("qa", "qa_verification", True),
+        ("observer", "capability_query", False),
+        ("", "", True),
+    ],
+)
+def test_ac_dev_ingress_accepts_exact_world_before_advisory_dispatch_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    role,
+    work_type,
+    include_backlog,
+):
+    _initialize_ac_dev_guide_schema(conn)
+    backlog_id = "AC-DEV-INGRESS-EVERY-ROLE-EXACT-WORLD"
+    if include_backlog:
+        _insert_simple_mf_close_backlog(conn, backlog_id)
+    root = tmp_path / "ac-dev-every-role-accepted"
+    root.mkdir()
+    commit = "6" * 40
+    world = _fixed_ac_dev_direct_world(root, commit)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: {
+            "dev_refs": [
+                server.AC_DEV_BRANCH,
+                f"refs/heads/{server.AC_DEV_BRANCH}",
+            ],
+            "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+            "dev_worktree_root": str(root.resolve()),
+            "dev_head_commit": commit,
+            "dev_contract_execution_ids": [],
+            "server_derived": True,
+        },
+    )
+    if include_backlog:
+        monkeypatch.setattr(
+            server,
+            "_onboard_route_guide_service_response",
+            lambda *_args, **_kwargs: {
+                "ok": True,
+                "selected_role": role,
+                "selected_work_type": work_type,
+                "advisory_dispatch_preserved": True,
+            },
+        )
+    body: dict[str, Any] = {}
+    if include_backlog:
+        body["backlog_id"] = backlog_id
+    if role:
+        body["role"] = role
+    if work_type:
+        body["work_type"] = work_type
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body=body,
+            query={
+                "target_project_root": [str(root), str(root)],
+                "target_head_commit": [commit, commit],
+                "target_ref": [
+                    server.AC_DEV_BRANCH,
+                    f"refs/heads/{server.AC_DEV_BRANCH}",
+                ],
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    if include_backlog:
+        assert result["advisory_dispatch_preserved"] is True
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+def test_ac_dev_verify_only_missing_schema_fails_typed_without_ddl(monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    empty = sqlite3.connect(":memory:")
+    denied_actions: list[int] = []
+
+    def authorizer(action, *_args):
+        if action in governance_db._DEV_DENIED_SCHEMA_ACTIONS:
+            denied_actions.append(action)
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    empty.set_authorizer(authorizer)
+    try:
+        with pytest.raises(
+            governance_db.DevRuntimeSchemaVerificationError
+        ) as rejected:
+            task_timeline.ensure_schema(empty)
+    finally:
+        empty.close()
+    assert rejected.value.code == "ac_dev_verify_only_schema_incompatible"
+    assert rejected.value.details["missing_tables"] == ["task_timeline_events"]
+    assert rejected.value.details["ddl_attempted"] is False
+    assert rejected.value.details["writes_performed"] is False
+    assert denied_actions == []
+
+
+@pytest.mark.parametrize("wrong_table", [False, True])
+def test_ac_dev_verify_only_rejects_stale_or_wrong_owner_index(
+    monkeypatch,
+    wrong_table,
+):
+    monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE", raising=False)
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    task_timeline.ensure_schema(db)
+    db.execute("DROP INDEX idx_task_timeline_task")
+    if wrong_table:
+        db.execute(
+            "CREATE INDEX idx_task_timeline_task ON "
+            "task_timeline_events(project_id, backlog_id, id)"
+        )
+        db.execute("ALTER TABLE task_timeline_events RENAME TO wrong_owner_events")
+        db.execute(
+            "CREATE TABLE task_timeline_events AS SELECT * FROM wrong_owner_events"
+        )
+    else:
+        db.execute(
+            "CREATE INDEX idx_task_timeline_task ON "
+            "task_timeline_events(project_id, task_id, id)"
+        )
+    db.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    before = db.total_changes
+    try:
+        with pytest.raises(
+            governance_db.DevRuntimeSchemaVerificationError
+        ) as rejected:
+            task_timeline.ensure_schema(db)
+    finally:
+        db.close()
+    assert rejected.value.code == "ac_dev_verify_only_schema_incompatible"
+    assert "idx_task_timeline_task" in rejected.value.details["invalid_indexes"]
+    if wrong_table:
+        assert rejected.value.details["invalid_indexes"][
+            "idx_task_timeline_task"
+        ]["actual_table"] == "wrong_owner_events"
+    assert rejected.value.details["writes_performed"] is False
+    assert before == 0
+
+
+def test_ac_dev_verify_only_rejects_missing_required_base_column(monkeypatch):
+    monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE", raising=False)
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    task_timeline.ensure_schema(db)
+    db.execute("ALTER TABLE task_timeline_events DROP COLUMN mf_id")
+    db.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    try:
+        with pytest.raises(
+            governance_db.DevRuntimeSchemaVerificationError
+        ) as rejected:
+            task_timeline.ensure_schema(db)
+    finally:
+        db.close()
+    assert rejected.value.details["missing_columns"] == {
+        "task_timeline_events": ["mf_id"]
+    }
+    assert rejected.value.details["ddl_attempted"] is False
+    assert rejected.value.details["writes_performed"] is False
+
+
+@pytest.mark.parametrize(
+    ("id_definition", "project_definition", "column", "field"),
+    [
+        ("id INTEGER", "project_id TEXT NOT NULL", "id", "pk"),
+        (
+            "id INTEGER PRIMARY KEY AUTOINCREMENT",
+            "project_id BLOB NOT NULL",
+            "project_id",
+            "type",
+        ),
+        (
+            "id INTEGER PRIMARY KEY AUTOINCREMENT",
+            "project_id TEXT",
+            "project_id",
+            "notnull",
+        ),
+    ],
+)
+def test_ac_dev_verify_only_rejects_stale_column_constraints_zero_write(
+    id_definition,
+    project_definition,
+    column,
+    field,
+):
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute(
+        f"CREATE TABLE task_timeline_events ({id_definition}, "
+        f"{project_definition})"
+    )
+    before = db.total_changes
+    denied_actions: list[int] = []
+
+    def authorizer(action, *_args):
+        if action in governance_db._DEV_DENIED_SCHEMA_ACTIONS:
+            denied_actions.append(action)
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    db.set_authorizer(authorizer)
+    try:
+        with pytest.raises(
+            governance_db.DevRuntimeSchemaVerificationError
+        ) as rejected:
+            governance_db.verify_existing_schema_capabilities(
+                db,
+                owner="constraint_regression",
+                required_tables=("task_timeline_events",),
+                required_columns={
+                    "task_timeline_events": ("id", "project_id")
+                },
+            )
+    finally:
+        db.close()
+    details = rejected.value.details["invalid_columns"][
+        "task_timeline_events"
+    ][column]
+    assert details[f"expected_{field}"] != details[f"actual_{field}"]
+    assert rejected.value.details["ddl_attempted"] is False
+    assert rejected.value.details["writes_performed"] is False
+    assert denied_actions == []
+    assert before == 0
+
+
+def test_ac_dev_verify_only_rejects_partial_unique_lookalike_zero_write():
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "CREATE TABLE backlog_contract_chain_bindings ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "idempotency_key TEXT NOT NULL)"
+    )
+    db.execute(
+        "CREATE UNIQUE INDEX attacker_partial_unique ON "
+        "backlog_contract_chain_bindings(idempotency_key) "
+        "WHERE idempotency_key <> 'bypass'"
+    )
+    db.executemany(
+        "INSERT INTO backlog_contract_chain_bindings (idempotency_key) "
+        "VALUES (?)",
+        [("bypass",), ("bypass",)],
+    )
+    before = db.total_changes
+    with pytest.raises(
+        governance_db.DevRuntimeSchemaVerificationError
+    ) as rejected:
+        governance_db.verify_existing_schema_capabilities(
+            db,
+            owner="unique_constraint_regression",
+            required_tables=("backlog_contract_chain_bindings",),
+            required_columns={
+                "backlog_contract_chain_bindings": (
+                    "id",
+                    "idempotency_key",
+                )
+            },
+        )
+    assert rejected.value.details["missing_unique_constraints"] == {
+        "backlog_contract_chain_bindings": [["idempotency_key"]]
+    }
+    assert rejected.value.details["writes_performed"] is False
+    assert db.execute(
+        "SELECT COUNT(*) FROM backlog_contract_chain_bindings "
+        "WHERE idempotency_key='bypass'"
+    ).fetchone()[0] == 2
+    assert db.total_changes == before
+    db.close()
+
+
+def test_ac_dev_verify_only_rejects_application_created_full_unique_lookalike():
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "CREATE TABLE backlog_contract_chain_bindings ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "idempotency_key TEXT NOT NULL)"
+    )
+    db.execute(
+        "CREATE UNIQUE INDEX attacker_full_unique ON "
+        "backlog_contract_chain_bindings(idempotency_key)"
+    )
+    before = db.total_changes
+    with pytest.raises(
+        governance_db.DevRuntimeSchemaVerificationError
+    ) as rejected:
+        governance_db.verify_existing_schema_capabilities(
+            db,
+            owner="unique_constraint_origin_regression",
+            required_tables=("backlog_contract_chain_bindings",),
+            required_columns={
+                "backlog_contract_chain_bindings": (
+                    "id",
+                    "idempotency_key",
+                )
+            },
+        )
+    assert rejected.value.details["missing_unique_constraints"] == {
+        "backlog_contract_chain_bindings": [["idempotency_key"]]
+    }
+    assert db.total_changes == before
+    db.close()
+
+
+def test_ac_dev_verify_only_rejects_unique_expression_index_impostor():
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "CREATE TABLE backlog_contract_chain_bindings ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "idempotency_key TEXT NOT NULL)"
+    )
+    db.execute(
+        "CREATE UNIQUE INDEX attacker_expression_unique ON "
+        "backlog_contract_chain_bindings(lower(idempotency_key))"
+    )
+    before = db.total_changes
+    with pytest.raises(
+        governance_db.DevRuntimeSchemaVerificationError
+    ) as rejected:
+        governance_db.verify_existing_schema_capabilities(
+            db,
+            owner="unique_constraint_expression_regression",
+            required_tables=("backlog_contract_chain_bindings",),
+            required_columns={
+                "backlog_contract_chain_bindings": (
+                    "id",
+                    "idempotency_key",
+                )
+            },
+        )
+    assert rejected.value.details["missing_unique_constraints"] == {
+        "backlog_contract_chain_bindings": [["idempotency_key"]]
+    }
+    assert db.total_changes == before
+    db.close()
+
+
+def test_ac_dev_verify_only_rejects_contract_runtime_execution_identity_without_pk():
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "CREATE TABLE contract_runtime_executions ("
+        "contract_execution_id TEXT, project_id TEXT NOT NULL)"
+    )
+    db.executemany(
+        "INSERT INTO contract_runtime_executions "
+        "(contract_execution_id, project_id) VALUES (?, ?)",
+        [("cex-duplicate", PID), ("cex-duplicate", PID)],
+    )
+    before = db.total_changes
+    with pytest.raises(
+        governance_db.DevRuntimeSchemaVerificationError
+    ) as rejected:
+        governance_db.verify_existing_schema_capabilities(
+            db,
+            owner="contract_runtime_execution_identity_regression",
+            required_tables=("contract_runtime_executions",),
+            required_columns={
+                "contract_runtime_executions": (
+                    "contract_execution_id",
+                    "project_id",
+                )
+            },
+        )
+    assert rejected.value.details["invalid_columns"][
+        "contract_runtime_executions"
+    ]["contract_execution_id"] == {
+        "actual_pk": "0",
+        "expected_pk": "1",
+    }
+    assert db.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions "
+        "WHERE contract_execution_id='cex-duplicate'"
+    ).fetchone()[0] == 2
+    assert db.total_changes == before
+    db.close()
+
+
+def test_ac_dev_verify_only_accepts_exact_pk_notnull_type_and_unique_capabilities():
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "CREATE TABLE backlog_contract_chain_bindings ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "idempotency_key TEXT NOT NULL UNIQUE)"
+    )
+    before = db.total_changes
+    governance_db.verify_existing_schema_capabilities(
+        db,
+        owner="exact_constraint_regression",
+        required_tables=("backlog_contract_chain_bindings",),
+        required_columns={
+            "backlog_contract_chain_bindings": ("id", "idempotency_key")
+        },
+    )
+    db.close()
+    assert before == 0
+
+
+def test_ac_dev_schema_failure_is_public_typed_zero_write_http(monkeypatch):
+    failure = governance_db.DevRuntimeSchemaVerificationError(
+        "task_timeline",
+        missing_tables=("task_timeline_events",),
+    )
+    handler = _bare_handler()
+    handler.path = f"/api/projects/{PID}/onboard-route-guide"
+    handler._find_handler = lambda _method: (
+        lambda _ctx: (_ for _ in ()).throw(failure),
+        {"project_id": PID},
+        None,
+    )
+    handler._read_body = lambda: {}
+    handler._query_params = lambda: {}
+    captured = {}
+    handler._respond = lambda code, body, *_args: captured.update(
+        code=code,
+        body=body,
+    )
+    monkeypatch.setattr(server, "_guard_dev_runtime_request", lambda **_kwargs: None)
+
+    handler._handle("POST")
+
+    assert captured["code"] == 409
+    assert captured["body"]["error"] == "ac_dev_verify_only_schema_incompatible"
+    assert captured["body"]["details"]["ddl_attempted"] is False
+    assert captured["body"]["details"]["writes_performed"] is False
+    assert captured["body"]["details"]["public_safe"] is True
+
+
+def test_stable_direct_guide_rejects_all_dev_authority_aliases_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-STABLE-REJECT-DEV-DIRECT-SELECTORS"
+    SQLiteContractExecutionStore(conn)
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    stable_task_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+    )
+    stable_record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": stable_task_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev3",
+        "execution_state_revision": 1,
+        "metadata": {
+            "operator_supervised_direct_main_runtime_binding": {
+                "strict_runtime_binding_required": True,
+            }
+        },
+    }
+    conn.execute(
+        """INSERT INTO contract_runtime_executions (
+               contract_execution_id, project_id, backlog_id, contract_id,
+               version, revision, execution_state_revision, record_json,
+               created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            stable_task_id,
+            PID,
+            backlog_id,
+            "operator_supervised_direct_main",
+            "v1",
+            "rev3",
+            1,
+            json.dumps(stable_record),
+            "2026-08-27T00:00:00Z",
+            "2026-08-27T00:00:00Z",
+        ),
+    )
+    conn.commit()
+    stable_root = tmp_path / "stable"
+    stable_root.mkdir()
+    dev_root = tmp_path / ".worktrees" / "ac-dev"
+    dev_root.mkdir(parents=True)
+    stable_commit = "a" * 40
+    dev_commit = "b" * 40
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        server,
+        "_runtime_plane_identity",
+        lambda: {
+            "status": "ready",
+            "plane": "stable",
+            "worktree_root": str(stable_root),
+            "branch": server.AC_STABLE_BRANCH,
+            "commit": stable_commit,
+        },
+    )
+    monkeypatch.setattr(server, "get_server_version", lambda: stable_commit)
+    monkeypatch.setattr(
+        server,
+        "governance_loaded_runtime_identity",
+        lambda _version: {
+            "loaded_commit": stable_commit,
+            "loaded_source_sha256": "sha256:" + "c" * 64,
+            "runtime_stale": False,
+        },
+    )
+    body = {
+        "target_project_root": str(dev_root),
+        "target_head_commit": dev_commit,
+        "head_commit": dev_commit,
+        "candidate_commit_sha": dev_commit,
+        "requested_commit": dev_commit,
+        "commit_sha": dev_commit,
+        "base_commit": dev_commit,
+        "target_ref": server.AC_DEV_BRANCH,
+        "branch": server.AC_DEV_BRANCH,
+        "branch_ref": f"refs/heads/{server.AC_DEV_BRANCH}",
+        "requested_branch_ref": f"refs/heads/{server.AC_DEV_BRANCH}",
+        "task_id": "cex-dev-forged",
+        "contract_execution_id": "cex-dev-forged",
+    }
+    before = conn.total_changes
+    with pytest.raises(GovernanceError) as rejected:
+        server._onboard_operator_supervised_direct_main_runtime_response(
+            conn,
+            project_id=PID,
+            backlog_id=backlog_id,
+            route_token_ref="",
+            role="observer",
+            work_type="operator_supervised_direct_main",
+            response_view="compact",
+            request_body=body,
+        )
+    assert rejected.value.code == "ac_direct_main_runtime_candidate_identity_mismatch"
+    assert rejected.value.details["required_endpoint"] == "http://127.0.0.1:40008"
+    fields = {
+        item["field"] for item in rejected.value.details["identity_mismatches"]
+    }
+    assert {
+        "runtime_plane",
+        "target_project_root",
+        "target_head_commit",
+        "head_commit",
+        "candidate_commit_sha",
+        "requested_commit",
+        "commit_sha",
+        "base_commit",
+        "target_ref",
+        "branch",
+        "branch_ref",
+        "requested_branch_ref",
+        "task_id",
+        "contract_execution_id",
+    } <= fields
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before
+
+
+def test_generic_direct_claims_preserve_generic_authority_but_reject_dev_selector(
+    monkeypatch,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "generic")
+    execution_id = "cex-generic-direct"
+    ordinary = server._operator_supervised_direct_main_request_mismatches(
+        {
+            "target_ref": "refs/heads/main",
+            "requested_commit": "a" * 40,
+            "task_id": execution_id,
+        },
+        execution_id=execution_id,
+        world_authority={},
+    )
+    assert ordinary == []
+    dev = server._operator_supervised_direct_main_request_mismatches(
+        {"target_ref": server.AC_DEV_BRANCH, "task_id": execution_id},
+        execution_id=execution_id,
+        world_authority={},
+    )
+    assert dev == [
+        {
+            "field": "runtime_plane",
+            "expected": "dev@127.0.0.1:40008",
+            "actual": "generic",
+        }
+    ]
+
+
+def test_onboard_dev_selector_authority_is_server_derived_from_physical_namespace(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    _initialize_ac_dev_guide_schema(conn)
+    backlog_id = "AC-DEV-SELECTOR-AUTHORITY-PHYSICAL"
+    root = tmp_path / ".worktrees" / "ac-dev"
+    root.mkdir(parents=True)
+    commit = "8" * 40
+    world = _fixed_ac_dev_direct_world(root, commit)
+    execution_id = server._operator_supervised_direct_main_execution_id(
+        PID,
+        backlog_id,
+        revision="rev3",
+        world_authority=world,
+    )
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev3",
+        "execution_state_revision": 1,
+        "metadata": {
+            "operator_supervised_direct_main_runtime_binding": {
+                "strict_runtime_binding_required": True,
+                "runtime_world_authority": world,
+            }
+        },
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    SQLiteContractExecutionStore(conn).create(record)
+    conn.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        server,
+        "_branch_service_git_output",
+        lambda _root, args: (
+            f"worktree {root}\nHEAD {commit}\n"
+            f"branch refs/heads/{server.AC_DEV_BRANCH}\n"
+        )
+        if args == ["worktree", "list", "--porcelain"]
+        else "",
+    )
+
+    before = conn.total_changes
+    authority = server._operator_supervised_direct_main_dev_selector_authority(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+
+    assert authority["server_derived"] is True
+    assert authority["unique_dev_worktree"] is True
+    assert authority["physical_namespace_verified"] is True
+    assert authority["dev_worktree_root"] == str(root.resolve())
+    assert authority["dev_head_commit"] == commit
+    assert authority["dev_contract_execution_ids"] == [execution_id]
+    assert conn.total_changes == before
+
+
+@pytest.mark.parametrize("runtime_plane", ["stable", "generic"])
+@pytest.mark.parametrize(
+    "selector_alias",
+    [
+        "target_ref",
+        "branch",
+        "branch_ref",
+        "requested_branch_ref",
+        "runtime_port",
+        "port",
+        "project_root",
+        "target_project_root",
+        "target_graph_root",
+        "worktree_path",
+        "workspace_path",
+        "repo_root",
+        "target_head_commit",
+        "head_commit",
+        "candidate_commit_sha",
+        "requested_commit",
+        "commit_sha",
+        "base_commit",
+        "task_id",
+        "contract_execution_id",
+    ],
+)
+def test_every_dev_authority_alias_requires_40008_on_stable_and_generic(
+    conn,
+    monkeypatch,
+    tmp_path,
+    runtime_plane,
+    selector_alias,
+):
+    dev_root = tmp_path / ".worktrees" / "ac-dev"
+    dev_root.mkdir(parents=True)
+    dev_root_link = tmp_path / "ac-dev-link"
+    dev_root_link.symlink_to(dev_root, target_is_directory=True)
+    dev_head = "7" * 40
+    dev_execution_id = "cex-direct-main-dev-selector"
+    authority = {
+        "schema_version": "operator_supervised_direct_main.dev_selector_authority.v1",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": PID,
+        "backlog_id": "AC-DEV-ALIAS-INGRESS",
+        "dev_branch": server.AC_DEV_BRANCH,
+        "dev_refs": [
+            server.AC_DEV_BRANCH,
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+        ],
+        "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": str(dev_root.resolve()),
+        "dev_head_commit": dev_head,
+        "dev_contract_execution_ids": [dev_execution_id],
+        "unique_dev_worktree": True,
+        "physical_namespace_verified": True,
+        "zero_write_projection": True,
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    if selector_alias in {
+        "target_ref",
+        "branch",
+        "branch_ref",
+        "requested_branch_ref",
+    }:
+        value: Any = f"refs/heads/{server.AC_DEV_BRANCH}"
+    elif selector_alias in {"runtime_port", "port"}:
+        value = server.AC_DEV_SERVICE_PORT
+    elif selector_alias in server._dev_source_root_keys:
+        value = str(dev_root_link)
+    elif selector_alias in {"task_id", "contract_execution_id"}:
+        value = dev_execution_id
+    else:
+        value = dev_head
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", runtime_plane)
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(authority),
+    )
+    before = conn.total_changes
+
+    with pytest.raises(GovernanceError) as rejected:
+        server._require_onboard_dev_selector_endpoint(
+            conn,
+            project_id=PID,
+            backlog_id=authority["backlog_id"],
+            request_body={selector_alias: value},
+            role="qa",
+            work_type="qa_verification",
+        )
+
+    assert rejected.value.code == "ac_onboard_dev_selector_wrong_endpoint"
+    assert rejected.value.details["required_endpoint"] == (
+        "http://127.0.0.1:40008"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    serialized = json.dumps(rejected.value.details, sort_keys=True)
+    assert str(dev_root) not in serialized
+    assert dev_execution_id not in serialized
+    assert conn.total_changes == before
+
+
+@pytest.mark.parametrize(
+    ("role", "work_type"),
+    [
+        ("qa", "qa_verification"),
+        ("observer", "capability_query"),
+        ("", "capability_query"),
+        ("", ""),
+    ],
+)
+@pytest.mark.parametrize("runtime_plane", ["stable", "generic"])
+def test_onboard_ingress_rejects_dev_selector_before_role_or_work_type_dispatch(
+    conn,
+    monkeypatch,
+    role,
+    work_type,
+    runtime_plane,
+):
+    authority = {
+        "schema_version": "operator_supervised_direct_main.dev_selector_authority.v1",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": PID,
+        "backlog_id": "AC-DEV-SELECTOR-INGRESS-ALL-ROLES",
+        "dev_branch": server.AC_DEV_BRANCH,
+        "dev_refs": [
+            server.AC_DEV_BRANCH,
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+        ],
+        "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": "",
+        "dev_head_commit": "6" * 40,
+        "dev_contract_execution_ids": [],
+        "unique_dev_worktree": True,
+        "physical_namespace_verified": False,
+        "zero_write_projection": True,
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", runtime_plane)
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(authority),
+    )
+    body = {
+        "backlog_id": authority["backlog_id"],
+        "target_head_commit": authority["dev_head_commit"],
+    }
+    if role:
+        body["role"] = role
+    if work_type:
+        body["work_type"] = work_type
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx({"project_id": PID}, method="POST", body=body)
+        )
+
+    assert rejected.value.code == "ac_onboard_dev_selector_wrong_endpoint"
+    assert rejected.value.details["requested_role"] == role
+    assert rejected.value.details["requested_work_type"] == work_type
+    assert rejected.value.details["required_endpoint"] == (
+        "http://127.0.0.1:40008"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+def test_onboard_get_query_dev_selector_is_rejected_at_plane_ingress(
+    conn,
+    monkeypatch,
+):
+    dev_head = "5" * 40
+    authority = {
+        "dev_refs": [
+            server.AC_DEV_BRANCH,
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+        ],
+        "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": "",
+        "dev_head_commit": dev_head,
+        "dev_contract_execution_ids": [],
+        "server_derived": True,
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(authority),
+    )
+    before_rows = tuple(conn.iterdump())
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                query={
+                    "role": ["qa"],
+                    "work_type": ["qa_verification"],
+                    "target_head_commit": [dev_head],
+                },
+            )
+        )
+    assert rejected.value.code == "ac_onboard_dev_selector_wrong_endpoint"
+    assert rejected.value.details["required_endpoint"] == (
+        "http://127.0.0.1:40008"
+    )
+    assert tuple(conn.iterdump()) == before_rows
+
+
+@pytest.mark.parametrize("runtime_plane", ["stable", "generic"])
+@pytest.mark.parametrize(
+    "claim_kind",
+    ["target_ref", "target_head_commit", "target_project_root", "task_id"],
+)
+@pytest.mark.parametrize(
+    "claim_mix",
+    [
+        "body_stable_query_dev",
+        "body_dev_query_stable",
+        "query_stable_then_dev",
+        "query_dev_then_stable",
+    ],
+)
+def test_onboard_ingress_evaluates_every_body_and_repeated_query_selector_claim(
+    conn,
+    monkeypatch,
+    tmp_path,
+    runtime_plane,
+    claim_kind,
+    claim_mix,
+):
+    dev_root = tmp_path / ".worktrees" / "ac-dev"
+    stable_root = tmp_path / "stable"
+    dev_root.mkdir(parents=True)
+    stable_root.mkdir()
+    dev_head = "5" * 40
+    stable_head = "4" * 40
+    dev_execution_id = "cex-direct-main-dev-conflict-selector"
+    authority = {
+        "schema_version": "operator_supervised_direct_main.dev_selector_authority.v1",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": PID,
+        "backlog_id": "AC-DEV-SELECTOR-MULTIVALUE-INGRESS",
+        "dev_branch": server.AC_DEV_BRANCH,
+        "dev_refs": [
+            server.AC_DEV_BRANCH,
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+        ],
+        "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": str(dev_root.resolve()),
+        "dev_head_commit": dev_head,
+        "dev_contract_execution_ids": [dev_execution_id],
+        "unique_dev_worktree": True,
+        "physical_namespace_verified": True,
+        "zero_write_projection": True,
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    stable_value, dev_value = {
+        "target_ref": (
+            "refs/heads/main",
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+        ),
+        "target_head_commit": (stable_head, dev_head),
+        "target_project_root": (str(stable_root), str(dev_root)),
+        "task_id": ("cex-direct-main-stable-selector", dev_execution_id),
+    }[claim_kind]
+    body: dict[str, Any] = {
+        "backlog_id": authority["backlog_id"],
+        "role": "qa",
+        "work_type": "qa_verification",
+    }
+    query: dict[str, list[str]] = {}
+    if claim_mix == "body_stable_query_dev":
+        body[claim_kind] = stable_value
+        query[claim_kind] = [dev_value]
+    elif claim_mix == "body_dev_query_stable":
+        body[claim_kind] = dev_value
+        query[claim_kind] = [stable_value]
+    elif claim_mix == "query_stable_then_dev":
+        query[claim_kind] = [stable_value, dev_value]
+    else:
+        query[claim_kind] = [dev_value, stable_value]
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", runtime_plane)
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(authority),
+    )
+    before = conn.total_changes
+    before_rows = tuple(conn.iterdump())
+
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body=body,
+                query=query,
+            )
+        )
+
+    assert rejected.value.code == "ac_onboard_dev_selector_wrong_endpoint"
+    assert rejected.value.details["required_endpoint"] == (
+        "http://127.0.0.1:40008"
+    )
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before
+    assert tuple(conn.iterdump()) == before_rows
+
+
+def test_ac_dev_direct_world_requires_exact_loaded_nonstale_40008_identity(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "exact-ac-dev-loaded-world"
+    root.mkdir()
+    commit = "f" * 40
+    database_identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": 11,
+        "inode": 12,
+        "stable_relative_path_sha256": "sha256:" + "1" * 64,
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "_dev_exact_source_root", lambda: root.resolve())
+    monkeypatch.setattr(
+        server,
+        "_runtime_plane_identity",
+        lambda: {
+            "status": "ready",
+            "plane": "dev",
+            "port": server.AC_DEV_SERVICE_PORT,
+            "bind_host": server.AC_DEV_BIND_HOST,
+            "worktree_root": str(root),
+            "branch": server.AC_DEV_BRANCH,
+            "commit": commit,
+            "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+            "stable_database_identity": database_identity,
+            "worktree_dirty": False,
+        },
+    )
+    monkeypatch.setattr(server, "get_server_version", lambda: commit)
+    monkeypatch.setattr(
+        server,
+        "governance_loaded_runtime_identity",
+        lambda _version: {
+            "loaded_commit": commit,
+            "loaded_source_sha256": "sha256:" + "2" * 64,
+            "runtime_stale": False,
+        },
+    )
+
+    authority = server._operator_supervised_direct_main_dev_world_authority()
+    assert authority["accepted"] is True
+    assert authority["target_project_root"] == str(root.resolve())
+    assert authority["target_head_commit"] == commit
+    assert authority["stable_database_identity"] == database_identity
+    assert authority["storage_contract_id"].startswith(
+        "operator_supervised_direct_main.dev_world."
+    )
+
+    monkeypatch.setattr(
+        server,
+        "governance_loaded_runtime_identity",
+        lambda _version: {
+            "loaded_commit": commit,
+            "loaded_source_sha256": "sha256:" + "2" * 64,
+            "runtime_stale": True,
+        },
+    )
+    with pytest.raises(GovernanceError) as stale:
+        server._operator_supervised_direct_main_dev_world_authority()
+    assert stale.value.code == "ac_dev_direct_main_runtime_world_invalid"
+    assert "loaded_runtime_stale" in stale.value.details["violations"]
+    assert stale.value.details["writes_performed"] is False
+
+    monkeypatch.setattr(
+        server,
+        "governance_loaded_runtime_identity",
+        lambda _version: {
+            "loaded_commit": commit,
+            "loaded_source_sha256": "",
+            "runtime_stale": False,
+        },
+    )
+    with pytest.raises(GovernanceError) as missing_source:
+        server._operator_supervised_direct_main_dev_world_authority()
+    assert missing_source.value.code == "ac_dev_direct_main_runtime_world_invalid"
+    assert "loaded_runtime_source_sha256_invalid" in missing_source.value.details[
+        "violations"
+    ]
+    assert missing_source.value.details["writes_performed"] is False

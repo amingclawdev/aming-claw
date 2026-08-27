@@ -29,6 +29,7 @@ from .dashboard_read_cache import (
     timeline_database_scope,
     timeline_database_scope_from_path,
 )
+from .db import dev_runtime_verify_only, verify_existing_schema_capabilities
 
 log = logging.getLogger(__name__)
 
@@ -573,6 +574,103 @@ def is_protected_close_evidence(event: dict[str, Any] | None) -> bool:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    if dev_runtime_verify_only():
+        verify_existing_schema_capabilities(
+            conn,
+            owner="task_timeline",
+            required_tables=("task_timeline_events",),
+            required_columns={
+                "task_timeline_events": (
+                    "id",
+                    "project_id",
+                    "backlog_id",
+                    "mf_id",
+                    "task_id",
+                    "attempt_num",
+                    "event_type",
+                    "actor",
+                    "status",
+                    "payload_json",
+                    "verification_json",
+                    "artifact_refs_json",
+                    "trace_id",
+                    "commit_sha",
+                    "created_at",
+                    "phase",
+                    "event_kind",
+                    *_V2_COLUMNS.keys(),
+                )
+            },
+            required_indexes=(
+                "idx_task_timeline_task",
+                "idx_task_timeline_backlog",
+                "idx_task_timeline_trace",
+                "idx_task_timeline_scenario",
+                "idx_task_timeline_correlation",
+                "idx_task_timeline_kind",
+                "idx_task_timeline_project_keyset",
+                "idx_task_timeline_task_keyset",
+            ),
+            required_index_definitions={
+                "idx_task_timeline_task": {
+                    "table": "task_timeline_events",
+                    "sql": (
+                        "CREATE INDEX idx_task_timeline_task ON "
+                        "task_timeline_events(project_id, task_id, attempt_num, id)"
+                    ),
+                },
+                "idx_task_timeline_backlog": {
+                    "table": "task_timeline_events",
+                    "sql": (
+                        "CREATE INDEX idx_task_timeline_backlog ON "
+                        "task_timeline_events(project_id, backlog_id, id)"
+                    ),
+                },
+                "idx_task_timeline_trace": {
+                    "table": "task_timeline_events",
+                    "sql": (
+                        "CREATE INDEX idx_task_timeline_trace ON "
+                        "task_timeline_events(project_id, trace_id, id)"
+                    ),
+                },
+                "idx_task_timeline_scenario": {
+                    "table": "task_timeline_events",
+                    "sql": (
+                        "CREATE INDEX idx_task_timeline_scenario ON "
+                        "task_timeline_events(project_id, scenario_id, id)"
+                    ),
+                },
+                "idx_task_timeline_correlation": {
+                    "table": "task_timeline_events",
+                    "sql": (
+                        "CREATE INDEX idx_task_timeline_correlation ON "
+                        "task_timeline_events(project_id, correlation_id, id)"
+                    ),
+                },
+                "idx_task_timeline_kind": {
+                    "table": "task_timeline_events",
+                    "sql": (
+                        "CREATE INDEX idx_task_timeline_kind ON "
+                        "task_timeline_events(project_id, event_kind, phase, id)"
+                    ),
+                },
+                "idx_task_timeline_project_keyset": {
+                    "table": "task_timeline_events",
+                    "sql": (
+                        "CREATE INDEX idx_task_timeline_project_keyset ON "
+                        "task_timeline_events(project_id, id DESC)"
+                    ),
+                },
+                "idx_task_timeline_task_keyset": {
+                    "table": "task_timeline_events",
+                    "sql": (
+                        "CREATE INDEX idx_task_timeline_task_keyset ON "
+                        "task_timeline_events(project_id, task_id, id DESC)"
+                    ),
+                },
+            },
+        )
+        return
     conn.executescript(SCHEMA_SQL)
     existing = {
         str(row[1])

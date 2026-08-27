@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 from .db import (
     AC_DATABASE_STABLE_RELATIVE_PATH,
     canonical_ac_database_identity,
+    DevRuntimeSchemaVerificationError,
     get_connection,
     DBContext,
     independent_connection,
@@ -92,6 +93,9 @@ from .contracts.runtime import (
     _worker_fence_containment,
     _worker_implementation_lineage,
     contract_chain_projection_hash,
+    direct_main_dev_namespace_hash,
+    direct_main_dev_storage_contract_id,
+    direct_main_dev_storage_project_id,
     is_legacy_primary_contract_route,
     mf_parallel_precommit_correction_writer_safe_copy,
     read_backlog_contract_chain_current,
@@ -3540,6 +3544,23 @@ class GovernanceHandler(BaseHTTPRequestHandler):
             body["request_id"] = request_id
             self._respond(e.status, body)
         except Exception as e:
+            if isinstance(e, DevRuntimeSchemaVerificationError):
+                converted = GovernanceError(
+                    e.code,
+                    "dev runtime schema capability verification failed",
+                    409,
+                    {
+                        **dict(e.details),
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                        "public_safe": True,
+                        "secret_safe": True,
+                    },
+                )
+                body = _public_zero_write_error_response(converted)
+                body["request_id"] = request_id
+                self._respond(converted.status, body)
+                return
             # Backstop: expected parallel branch runtime refusals (stale/absent
             # fence, unknown merge queue selector) are caller-correctable and
             # must never reach the bare internal_error path from any handler.
@@ -143677,6 +143698,655 @@ _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS = frozenset(
 )
 
 
+def _operator_supervised_direct_main_dev_world_authority() -> dict[str, Any]:
+    """Resolve the exact loaded, non-stale 40008 candidate world."""
+
+    if _runtime_plane() != "dev":
+        return {}
+    identity = _runtime_plane_identity()
+    loaded = governance_loaded_runtime_identity(get_server_version())
+    root_raw = str(identity.get("worktree_root") or "").strip()
+    try:
+        root = Path(root_raw).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        root = Path()
+    commit = str(identity.get("commit") or "").strip().lower()
+    stable_anchor = str(
+        identity.get("stable_anchor_commit") or ""
+    ).strip().lower()
+    loaded_commit = str(loaded.get("loaded_commit") or "").strip().lower()
+    loaded_source_sha256 = str(
+        loaded.get("loaded_source_sha256") or ""
+    ).strip().lower()
+    database_identity = (
+        dict(identity.get("stable_database_identity") or {})
+        if isinstance(identity.get("stable_database_identity"), Mapping)
+        else {}
+    )
+    violations: list[str] = []
+    if identity.get("status") != "ready":
+        violations.append("runtime_plane_identity_not_ready")
+    if identity.get("plane") != "dev":
+        violations.append("runtime_plane_not_dev")
+    if int(identity.get("port") or 0) != AC_DEV_SERVICE_PORT:
+        violations.append("runtime_port_not_40008")
+    if identity.get("bind_host") != AC_DEV_BIND_HOST:
+        violations.append("runtime_bind_not_loopback")
+    if identity.get("branch") != AC_DEV_BRANCH:
+        violations.append("runtime_branch_not_dev")
+    if root != _dev_exact_source_root():
+        violations.append("runtime_worktree_root_not_exact_dev_root")
+    if identity.get("worktree_dirty") is True:
+        violations.append("runtime_worktree_dirty")
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        violations.append("runtime_commit_invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor):
+        violations.append("stable_anchor_invalid")
+    if loaded.get("runtime_stale") is not False:
+        violations.append("loaded_runtime_stale")
+    if loaded_commit != commit:
+        violations.append("loaded_runtime_commit_mismatch")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", loaded_source_sha256):
+        violations.append("loaded_runtime_source_sha256_invalid")
+    if not _ac_stable_database_identity_valid(database_identity):
+        violations.append("stable_database_identity_invalid")
+    core = {
+        "schema_version": (
+            "operator_supervised_direct_main.dev_runtime_world.v1"
+        ),
+        "accepted": not violations,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "runtime_plane": "dev",
+        "runtime_port": AC_DEV_SERVICE_PORT,
+        "bind_host": AC_DEV_BIND_HOST,
+        "target_project_root": str(root) if root else "",
+        "worktree_path": str(root) if root else "",
+        "branch": AC_DEV_BRANCH,
+        "target_ref": f"refs/heads/{AC_DEV_BRANCH}",
+        "target_head_commit": commit,
+        "stable_anchor_commit": stable_anchor,
+        "stable_database_identity": database_identity,
+        "loaded_runtime_commit": loaded_commit,
+        "loaded_runtime_source_sha256": loaded_source_sha256,
+        "runtime_stale": bool(loaded.get("runtime_stale")),
+        "violations": violations,
+        "zero_write_projection": True,
+    }
+    core["namespace_hash"] = direct_main_dev_namespace_hash(core)
+    world_hash = stable_sha256(core)
+    authority = {
+        **core,
+        "world_hash": world_hash,
+        "storage_contract_id": direct_main_dev_storage_contract_id(
+            core["namespace_hash"]
+        ),
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    if violations:
+        raise GovernanceError(
+            "ac_dev_direct_main_runtime_world_invalid",
+            "dev Direct Main requires the exact loaded non-stale 40008 world",
+            409,
+            {
+                **authority,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    return authority
+
+
+def _operator_supervised_direct_main_dev_selector_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Discover exact dev selectors without trusting caller-shaped values."""
+
+    repository_root = Path(__file__).resolve().parents[2]
+    listing = _branch_service_git_output(
+        repository_root,
+        ["worktree", "list", "--porcelain"],
+    )
+    dev_rows: list[dict[str, str]] = []
+    for block in listing.split("\n\n") if listing else []:
+        row = {
+            key: value.strip()
+            for line in block.splitlines()
+            for key, separator, value in [line.partition(" ")]
+            if separator
+        }
+        if row.get("branch") == f"refs/heads/{AC_DEV_BRANCH}":
+            dev_rows.append(row)
+    dev_root = ""
+    dev_head = ""
+    if len(dev_rows) == 1:
+        try:
+            dev_root = str(Path(dev_rows[0]["worktree"]).resolve(strict=True))
+        except (KeyError, OSError, RuntimeError, ValueError):
+            dev_root = ""
+        dev_head = str(dev_rows[0].get("HEAD") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", dev_head):
+            dev_head = ""
+
+    execution_ids: list[str] = []
+    try:
+        query = (
+            "SELECT project_id, backlog_id, contract_id, "
+            "contract_execution_id, record_json "
+            "FROM contract_runtime_executions "
+            "WHERE contract_id GLOB "
+            "'operator_supervised_direct_main.dev_world.*'"
+        )
+        rows = conn.execute(query).fetchall()
+    except sqlite3.Error:
+        rows = []
+    for row in rows:
+        physical_project_id = str(row["project_id"] or "")
+        physical_backlog_id = str(row["backlog_id"] or "")
+        physical_contract_id = str(row["contract_id"] or "")
+        execution_id = str(row["contract_execution_id"] or "").strip()
+        try:
+            record = json.loads(str(row["record_json"] or "{}"))
+        except (TypeError, ValueError):
+            continue
+        metadata = record.get("metadata") if isinstance(record, Mapping) else {}
+        binding = (
+            metadata.get("operator_supervised_direct_main_runtime_binding")
+            if isinstance(metadata, Mapping)
+            and isinstance(
+                metadata.get("operator_supervised_direct_main_runtime_binding"),
+                Mapping,
+            )
+            else {}
+        )
+        world = (
+            binding.get("runtime_world_authority")
+            if isinstance(binding.get("runtime_world_authority"), Mapping)
+            else {}
+        )
+        namespace_hash = str(world.get("namespace_hash") or "").strip()
+        try:
+            expected_project_id = direct_main_dev_storage_project_id(
+                project_id,
+                namespace_hash,
+            )
+            expected_contract_id = direct_main_dev_storage_contract_id(
+                namespace_hash
+            )
+        except ContractRuntimeError:
+            continue
+        if (
+            record.get("project_id") == project_id
+            and record.get("contract_id")
+            == "operator_supervised_direct_main"
+            and physical_project_id == expected_project_id
+            and physical_backlog_id
+            == str(record.get("backlog_id") or "").strip()
+            and physical_contract_id == expected_contract_id
+            and execution_id
+            == str(record.get("contract_execution_id") or "").strip()
+        ):
+            execution_ids.append(execution_id)
+    core = {
+        "schema_version": (
+            "operator_supervised_direct_main.dev_selector_authority.v1"
+        ),
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "dev_branch": AC_DEV_BRANCH,
+        "dev_refs": [AC_DEV_BRANCH, f"refs/heads/{AC_DEV_BRANCH}"],
+        "dev_runtime_port": AC_DEV_SERVICE_PORT,
+        "dev_worktree_root": dev_root,
+        "dev_head_commit": dev_head,
+        "dev_contract_execution_ids": sorted(set(execution_ids)),
+        "unique_dev_worktree": len(dev_rows) == 1 and bool(dev_root and dev_head),
+        "physical_namespace_verified": bool(execution_ids),
+        "zero_write_projection": True,
+    }
+    return {**core, "authority_hash": stable_sha256(core)}
+
+
+def _operator_supervised_direct_main_request_claim_values(
+    request_body: Mapping[str, Any] | None,
+    field: str,
+) -> list[Any]:
+    body = request_body if isinstance(request_body, Mapping) else {}
+    raw = body.get(field)
+    if isinstance(raw, Sequence) and not isinstance(
+        raw, (str, bytes, bytearray)
+    ):
+        return list(raw)
+    return [raw]
+
+
+def _operator_supervised_direct_main_request_uses_dev_selector(
+    request_body: Mapping[str, Any] | None,
+    *,
+    selector_authority: Mapping[str, Any] | None = None,
+) -> bool:
+    body = request_body if isinstance(request_body, Mapping) else {}
+    authority = (
+        selector_authority if isinstance(selector_authority, Mapping) else {}
+    )
+
+    dev_refs = set(authority.get("dev_refs") or ()) or {
+        AC_DEV_BRANCH,
+        f"refs/heads/{AC_DEV_BRANCH}",
+    }
+    if any(
+        str(value or "").strip() in dev_refs
+        for field in (
+            "target_ref",
+            "branch",
+            "branch_ref",
+            "requested_branch_ref",
+        )
+        for value in _operator_supervised_direct_main_request_claim_values(
+            body, field
+        )
+    ):
+        return True
+    if any(
+        int(value or 0)
+        == int(authority.get("dev_runtime_port") or AC_DEV_SERVICE_PORT)
+        for field in ("runtime_port", "port")
+        for value in _operator_supervised_direct_main_request_claim_values(
+            body, field
+        )
+        if str(value or "").strip().isdigit()
+    ):
+        return True
+    dev_root = str(authority.get("dev_worktree_root") or "")
+    if dev_root:
+        for field in _dev_source_root_keys:
+            for value in _operator_supervised_direct_main_request_claim_values(
+                body, field
+            ):
+                raw = str(value or "").strip()
+                if not raw:
+                    continue
+                try:
+                    actual = str(Path(raw).expanduser().resolve(strict=True))
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if actual == dev_root:
+                    return True
+    dev_head = str(authority.get("dev_head_commit") or "").strip().lower()
+    if dev_head and any(
+        str(value or "").strip().lower() == dev_head
+        for field in (
+            "target_head_commit",
+            "head_commit",
+            "candidate_commit_sha",
+            "requested_commit",
+            "commit_sha",
+            "base_commit",
+        )
+        for value in _operator_supervised_direct_main_request_claim_values(
+            body, field
+        )
+    ):
+        return True
+    dev_execution_ids = set(authority.get("dev_contract_execution_ids") or ())
+    return bool(
+        dev_execution_ids
+        and any(
+            str(value or "").strip() in dev_execution_ids
+            for field in ("task_id", "contract_execution_id")
+            for value in _operator_supervised_direct_main_request_claim_values(
+                body, field
+            )
+        )
+    )
+
+
+def _operator_supervised_direct_main_request_mismatches(
+    request_body: Mapping[str, Any] | None,
+    *,
+    execution_id: str,
+    world_authority: Mapping[str, Any],
+    selector_authority: Mapping[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    """Reject caller attempts to redirect stable or dev runtime authority."""
+
+    body = request_body if isinstance(request_body, Mapping) else {}
+    plane = _runtime_plane()
+    identity = _runtime_plane_identity()
+    if world_authority:
+        expected_root = str(world_authority.get("target_project_root") or "")
+        expected_head = str(world_authority.get("target_head_commit") or "")
+        expected_ref = str(world_authority.get("target_ref") or "")
+        expected_branch = str(world_authority.get("branch") or "")
+        expected_port = int(
+            world_authority.get("runtime_port") or AC_DEV_SERVICE_PORT
+        )
+    elif plane == "stable":
+        expected_root = str(identity.get("worktree_root") or "")
+        loaded = governance_loaded_runtime_identity(get_server_version())
+        expected_head = str(
+            loaded.get("loaded_commit") or identity.get("commit") or ""
+        ).strip().lower()
+        expected_branch = str(identity.get("branch") or AC_STABLE_BRANCH)
+        expected_ref = f"refs/heads/{expected_branch}"
+        expected_port = AC_STABLE_SERVICE_PORT
+    else:
+        expected_root = ""
+        expected_head = ""
+        expected_branch = ""
+        expected_ref = ""
+        expected_port = 0
+    enforce_loaded_authority = bool(world_authority) or plane == "stable"
+    mismatches: list[dict[str, str]] = []
+    if plane != "dev" and _operator_supervised_direct_main_request_uses_dev_selector(
+        body,
+        selector_authority=selector_authority,
+    ):
+        mismatches.append(
+            {
+                "field": "runtime_plane",
+                "expected": "dev@127.0.0.1:40008",
+                "actual": plane,
+            }
+        )
+    for field in _dev_source_root_keys:
+        for value in _operator_supervised_direct_main_request_claim_values(
+            body, field
+        ):
+            raw = str(value or "").strip()
+            if not raw or not enforce_loaded_authority:
+                continue
+            try:
+                actual = str(Path(raw).expanduser().resolve(strict=True))
+            except (OSError, RuntimeError, ValueError):
+                actual = raw
+            if actual != expected_root:
+                mismatches.append(
+                    {"field": field, "expected": expected_root, "actual": actual}
+                )
+    for field in (
+        "target_head_commit",
+        "head_commit",
+        "candidate_commit_sha",
+        "requested_commit",
+        "commit_sha",
+        "base_commit",
+    ):
+        for value in _operator_supervised_direct_main_request_claim_values(
+            body, field
+        ):
+            actual = str(value or "").strip().lower()
+            if actual and enforce_loaded_authority and actual != expected_head:
+                mismatches.append(
+                    {"field": field, "expected": expected_head, "actual": actual}
+                )
+    for field in (
+        "target_ref",
+        "branch",
+        "branch_ref",
+        "requested_branch_ref",
+    ):
+        for value in _operator_supervised_direct_main_request_claim_values(
+            body, field
+        ):
+            actual = str(value or "").strip()
+            if not actual:
+                continue
+            if not enforce_loaded_authority:
+                continue
+            allowed = {expected_ref, expected_branch}
+            if not expected_ref or actual not in allowed:
+                mismatches.append(
+                    {"field": field, "expected": expected_ref, "actual": actual}
+                )
+    for field in ("runtime_port", "port"):
+        for value in _operator_supervised_direct_main_request_claim_values(
+            body, field
+        ):
+            actual_raw = str(value or "").strip()
+            if not actual_raw or not enforce_loaded_authority:
+                continue
+            actual = int(actual_raw) if actual_raw.isdigit() else -1
+            if actual != expected_port:
+                mismatches.append(
+                    {
+                        "field": field,
+                        "expected": str(expected_port),
+                        "actual": actual_raw,
+                    }
+                )
+    for field in ("task_id", "contract_execution_id"):
+        for value in _operator_supervised_direct_main_request_claim_values(
+            body, field
+        ):
+            actual = str(value or "").strip()
+            if actual and actual != execution_id:
+                mismatches.append(
+                    {"field": field, "expected": execution_id, "actual": actual}
+                )
+    return mismatches
+
+
+def _operator_supervised_direct_main_public_selector_mismatches(
+    mismatches: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Project mismatch fields and one-way hashes, never raw selector values."""
+
+    return [
+        {
+            "field": str(item.get("field") or ""),
+            "expected_value_hash": stable_sha256(
+                {"value": str(item.get("expected") or "")}
+            ),
+            "actual_value_hash": stable_sha256(
+                {"value": str(item.get("actual") or "")}
+            ),
+        }
+        for item in mismatches
+    ]
+
+
+def _raise_operator_supervised_direct_main_selector_mismatch(
+    *,
+    mismatches: Sequence[Mapping[str, Any]],
+    world_authority: Mapping[str, Any],
+    execution_id: str,
+    selector_request: Mapping[str, Any] | None,
+    selector_authority: Mapping[str, Any] | None,
+) -> NoReturn:
+    """Raise one public-safe exact-world rejection for every Onboard role."""
+
+    plane = _runtime_plane()
+    raise GovernanceError(
+        "ac_direct_main_runtime_candidate_identity_mismatch",
+        "caller candidate identity does not match the loaded runtime world",
+        409,
+        {
+            "identity_mismatches": (
+                _operator_supervised_direct_main_public_selector_mismatches(
+                    mismatches
+                )
+            ),
+            "runtime_world_authority": {
+                "schema_version": str(
+                    world_authority.get("schema_version") or ""
+                ),
+                "runtime_plane": str(
+                    world_authority.get("runtime_plane") or ""
+                ),
+                "runtime_port": int(
+                    world_authority.get("runtime_port") or 0
+                ),
+                "namespace_hash": str(
+                    world_authority.get("namespace_hash") or ""
+                ),
+                "world_hash": str(world_authority.get("world_hash") or ""),
+                "authority_hash": str(
+                    world_authority.get("authority_hash") or ""
+                ),
+                "server_derived": (
+                    world_authority.get("server_derived") is True
+                ),
+                "caller_claims_trusted": False,
+            },
+            "contract_execution_id_hash": stable_sha256(
+                {"contract_execution_id": execution_id}
+            ),
+            "runtime_plane": plane,
+            "required_endpoint": (
+                "http://127.0.0.1:40008"
+                if plane == "dev"
+                or _operator_supervised_direct_main_request_uses_dev_selector(
+                    selector_request,
+                    selector_authority=selector_authority,
+                )
+                else ""
+            ),
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "public_safe": True,
+            "secret_safe": True,
+        },
+    )
+
+
+def _require_onboard_dev_selector_endpoint(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    request_body: Mapping[str, Any] | None,
+    role: str,
+    work_type: str,
+) -> dict[str, Any]:
+    """Reject every exact dev authority selector before Onboard dispatch."""
+
+    authority = _operator_supervised_direct_main_dev_selector_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    if _runtime_plane() == "dev":
+        selector_fields = (
+            *_dev_source_root_keys,
+            "target_ref",
+            "branch",
+            "branch_ref",
+            "requested_branch_ref",
+            "runtime_port",
+            "port",
+            "target_head_commit",
+            "head_commit",
+            "candidate_commit_sha",
+            "requested_commit",
+            "commit_sha",
+            "base_commit",
+            "task_id",
+            "contract_execution_id",
+        )
+        has_explicit_selector = any(
+            str(value or "").strip()
+            for field in selector_fields
+            for value in _operator_supervised_direct_main_request_claim_values(
+                request_body,
+                field,
+            )
+        )
+        if not has_explicit_selector:
+            return authority
+        world_authority = (
+            _operator_supervised_direct_main_dev_world_authority()
+        )
+        execution_id = ""
+        task_claimed = any(
+            str(value or "").strip()
+            for field in ("task_id", "contract_execution_id")
+            for value in _operator_supervised_direct_main_request_claim_values(
+                request_body,
+                field,
+            )
+        )
+        if task_claimed and backlog_id:
+            records = _operator_supervised_direct_main_strict_records(
+                conn,
+                project_id=project_id,
+                backlog_id=backlog_id,
+            )
+            if len(records) == 1:
+                execution_id = str(
+                    records[0].get("contract_execution_id") or ""
+                ).strip()
+            elif not records:
+                definition = (
+                    _operator_supervised_direct_main_fresh_definition()
+                )
+                revision = str(definition.get("revision") or "").strip()
+                if revision:
+                    execution_id = (
+                        _operator_supervised_direct_main_execution_id(
+                            project_id,
+                            backlog_id,
+                            revision=revision,
+                            world_authority=world_authority,
+                        )
+                    )
+        mismatches = _operator_supervised_direct_main_request_mismatches(
+            request_body,
+            execution_id=execution_id,
+            world_authority=world_authority,
+            selector_authority=authority,
+        )
+        if mismatches:
+            _raise_operator_supervised_direct_main_selector_mismatch(
+                mismatches=mismatches,
+                world_authority=world_authority,
+                execution_id=execution_id,
+                selector_request=request_body,
+                selector_authority=authority,
+            )
+        return authority
+    if not _operator_supervised_direct_main_request_uses_dev_selector(
+        request_body,
+        selector_authority=authority,
+    ):
+        return authority
+    raise GovernanceError(
+        "ac_onboard_dev_selector_wrong_endpoint",
+        "dev runtime selectors require the isolated 40008 Onboard endpoint",
+        409,
+        {
+            "runtime_plane": _runtime_plane(),
+            "requested_role": str(role or ""),
+            "requested_work_type": str(work_type or ""),
+            "required_endpoint": "http://127.0.0.1:40008",
+            "dev_selector_authority": {
+                "schema_version": str(authority.get("schema_version") or ""),
+                "server_derived": authority.get("server_derived") is True,
+                "caller_claims_trusted": False,
+                "authority_hash": str(authority.get("authority_hash") or ""),
+                "dev_branch": str(authority.get("dev_branch") or ""),
+                "dev_runtime_port": int(
+                    authority.get("dev_runtime_port") or AC_DEV_SERVICE_PORT
+                ),
+                "unique_dev_worktree": (
+                    authority.get("unique_dev_worktree") is True
+                ),
+                "physical_namespace_verified": (
+                    authority.get("physical_namespace_verified") is True
+                ),
+            },
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "public_safe": True,
+            "secret_safe": True,
+        },
+    )
+
+
 def _operator_supervised_direct_main_fresh_definition() -> dict[str, Any]:
     """Resolve authority for a new Direct execution without caller pinning."""
 
@@ -143702,6 +144372,7 @@ def _operator_supervised_direct_main_execution_id(
     backlog_id: str,
     *,
     revision: str = "",
+    world_authority: Mapping[str, Any] | None = None,
 ) -> str:
     """Return the deterministic id for one selected Direct revision."""
 
@@ -143714,13 +144385,77 @@ def _operator_supervised_direct_main_execution_id(
             or ""
         ).strip()
 
-    return _contract_runtime_stable_id(
-        "cex-direct-main",
+    identity_parts: list[Any] = [
         project_id,
         backlog_id,
         "operator_supervised_direct_main",
         "v1",
         selected_revision,
+    ]
+    authority = (
+        dict(world_authority)
+        if isinstance(world_authority, Mapping)
+        else _operator_supervised_direct_main_dev_world_authority()
+        if _runtime_plane() == "dev"
+        else {}
+    )
+    if authority:
+        identity_parts.extend(
+            ("dev_runtime_namespace", authority["namespace_hash"])
+        )
+    return _contract_runtime_stable_id("cex-direct-main", *identity_parts)
+
+
+def _operator_supervised_direct_main_record_matches_dev_world(
+    record: Mapping[str, Any],
+    world_authority: Mapping[str, Any],
+) -> bool:
+    if not world_authority:
+        return True
+    metadata = (
+        record.get("metadata")
+        if isinstance(record.get("metadata"), Mapping)
+        else {}
+    )
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(
+            metadata.get("operator_supervised_direct_main_runtime_binding"),
+            Mapping,
+        )
+        else {}
+    )
+    record_world = (
+        binding.get("runtime_world_authority")
+        if isinstance(binding.get("runtime_world_authority"), Mapping)
+        else {}
+    )
+    if not (
+        record_world.get("namespace_hash")
+        == world_authority.get("namespace_hash")
+        and record_world.get("storage_contract_id")
+        == world_authority.get("storage_contract_id")
+        and record_world.get("target_project_root")
+        == world_authority.get("target_project_root")
+        and record_world.get("branch") == world_authority.get("branch")
+        and record_world.get("stable_anchor_commit")
+        == world_authority.get("stable_anchor_commit")
+        and record_world.get("stable_database_identity")
+        == world_authority.get("stable_database_identity")
+    ):
+        return False
+    initial_head = str(
+        record_world.get("target_head_commit") or ""
+    ).strip().lower()
+    current_head = str(
+        world_authority.get("target_head_commit") or ""
+    ).strip().lower()
+    if initial_head == current_head:
+        return True
+    return _git_commit_is_ancestor(
+        Path(str(world_authority.get("target_project_root") or "")),
+        initial_head,
+        current_head,
     )
 
 
@@ -143731,21 +144466,55 @@ def _operator_supervised_direct_main_strict_records(
     backlog_id: str,
 ) -> list[dict[str, Any]]:
     runtime = _contract_runtime(conn)
+    world_authority = (
+        _operator_supervised_direct_main_dev_world_authority()
+        if _runtime_plane() == "dev"
+        else {}
+    )
     records = runtime.store.list_by_backlog(
         project_id=project_id,
         backlog_id=backlog_id,
         contract_id="operator_supervised_direct_main",
+        storage_contract_id=(
+            str(world_authority.get("storage_contract_id") or "") or None
+        ),
     )
-    return [
+    strict = [
         dict(record)
         for record in records
         if str(record.get("revision") or "").strip()
         in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
         and isinstance(record.get("metadata"), Mapping)
-        and record["metadata"].get(
-            "operator_supervised_direct_main_runtime_binding"
+        and isinstance(
+            record["metadata"].get(
+                "operator_supervised_direct_main_runtime_binding"
+            ),
+            Mapping,
+        )
+        and _operator_supervised_direct_main_record_matches_dev_world(
+            record,
+            world_authority,
         )
     ]
+    if world_authority and records and not strict:
+        raise GovernanceError(
+            "ac_dev_direct_main_runtime_world_lineage_invalid",
+            (
+                "the loaded dev HEAD must preserve the active Direct Main "
+                "namespace and descend from its immutable initial world"
+            ),
+            409,
+            {
+                "runtime_world_authority": dict(world_authority),
+                "candidate_execution_ids": [
+                    str(record.get("contract_execution_id") or "")
+                    for record in records
+                ],
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    return strict
 
 
 def _operator_supervised_direct_main_selected_execution_identity(
@@ -143954,6 +144723,32 @@ def _operator_supervised_direct_main_world_ref(
 ) -> dict[str, Any]:
     """Resolve the one canonical pre-mutation Git world for Direct rev2."""
 
+    dev_world = (
+        _operator_supervised_direct_main_dev_world_authority()
+        if _runtime_plane() == "dev"
+        else {}
+    )
+    if dev_world:
+        authority = {
+            "schema_version": (
+                "operator_supervised_direct_main.pre_mutation_world_ref.v1"
+            ),
+            "accepted": True,
+            "status": "accepted",
+            "server_derived": True,
+            "caller_claims_trusted": False,
+            "project_id": project_id,
+            "target_project_root": dev_world["target_project_root"],
+            "worktree_path": dev_world["worktree_path"],
+            "base_commit": dev_world["target_head_commit"],
+            "target_head_commit": dev_world["target_head_commit"],
+            "repository_root_exact": True,
+            "resolution_error": "",
+            "runtime_world_authority": dict(dev_world),
+            "zero_write_on_failure": True,
+        }
+        authority["authority_hash"] = stable_sha256(authority)
+        return authority
     try:
         project_root = Path(
             project_service.resolve_project_root(
@@ -144023,6 +144818,11 @@ def _operator_supervised_direct_main_start_runtime(
     """Start fresh authority or read one immutable pinned Direct execution."""
 
     runtime = _contract_runtime(conn)
+    dev_world = (
+        _operator_supervised_direct_main_dev_world_authority()
+        if _runtime_plane() == "dev"
+        else {}
+    )
     strict_records = _operator_supervised_direct_main_strict_records(
         conn,
         project_id=project_id,
@@ -144061,6 +144861,7 @@ def _operator_supervised_direct_main_start_runtime(
             project_id,
             backlog_id,
             revision=selected_revision,
+            world_authority=dev_world,
         )
     if str(task_id or "").strip() != execution_id:
         raise GovernanceError(
@@ -144160,6 +144961,8 @@ def _operator_supervised_direct_main_start_runtime(
         "base_commit": head_commit,
         "target_head_commit": head_commit,
         "pre_mutation_world_ref": dict(world_ref),
+        "runtime_world_authority": dict(dev_world),
+        "stable_visible_chain_projection_written": not bool(dev_world),
         "same_execution_retry_allowed": False,
         "same_generation_retry_allowed": False,
         "post_hoc_pass_backfill_allowed": False,
@@ -144179,6 +144982,7 @@ def _operator_supervised_direct_main_start_runtime(
             project_id,
             backlog_id,
             selected_revision,
+            str(dev_world.get("namespace_hash") or ""),
         ),
         route_token_ref=route_token_ref,
         role_binding={
@@ -144202,7 +145006,8 @@ def _operator_supervised_direct_main_start_runtime(
             ),
         },
     )
-    upsert_contract_chain_root_current_binding(conn, record)
+    if not dev_world:
+        upsert_contract_chain_root_current_binding(conn, record)
     return runtime.current_record(execution_id, actor_role="observer")
 
 
@@ -144721,6 +145526,8 @@ def _onboard_operator_supervised_direct_main_runtime_response(
     role: str,
     work_type: str,
     response_view: str,
+    request_body: Mapping[str, Any] | None = None,
+    request_selector_claims: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project fresh Direct authority or one immutable pinned execution.
 
@@ -144736,6 +145543,11 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         in {"direct_main", "operator_supervised_direct_main"}
     ):
         return {}
+    dev_world = (
+        _operator_supervised_direct_main_dev_world_authority()
+        if _runtime_plane() == "dev"
+        else {}
+    )
     strict_records = _operator_supervised_direct_main_strict_records(
         conn,
         project_id=project_id,
@@ -144747,7 +145559,7 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         backlog_id=backlog_id,
         event_kind="observer_direct_implementation_exception",
     )
-    if not strict_records and any(
+    if not dev_world and not strict_records and any(
         _onboard_parentless_direct_main_event_is_accepted(event)
         for event in historical_events
     ):
@@ -144789,6 +145601,31 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             project_id,
             backlog_id,
             revision=selected_revision,
+            world_authority=dev_world,
+        )
+    selector_authority = _operator_supervised_direct_main_dev_selector_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    selector_request = (
+        request_selector_claims
+        if isinstance(request_selector_claims, Mapping)
+        else request_body
+    )
+    claim_mismatches = _operator_supervised_direct_main_request_mismatches(
+        selector_request,
+        execution_id=execution_id,
+        world_authority=dev_world,
+        selector_authority=selector_authority,
+    )
+    if claim_mismatches:
+        _raise_operator_supervised_direct_main_selector_mismatch(
+            mismatches=claim_mismatches,
+            world_authority=dev_world,
+            execution_id=execution_id,
+            selector_request=selector_request,
+            selector_authority=selector_authority,
         )
     target_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
     persisted_ref = (
@@ -144907,6 +145744,11 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             (
                 "contract_definition:operator_supervised_direct_main.v1."
                 f"{selected_revision}"
+            ),
+            *(
+                [f"dev_runtime_world:{dev_world['world_hash']}"]
+                if dev_world
+                else []
             ),
         ],
     }
@@ -145094,6 +145936,8 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "contract_id": "operator_supervised_direct_main",
         "contract_version": "v1",
         "contract_revision": selected_revision,
+        "runtime_world_authority": dict(dev_world),
+        "dev_world_partitioned": bool(dev_world),
         "source_backed_contract_selected": True,
         "onboard_service_proxy_selected": False,
         "target_files": target_files,
@@ -159674,6 +160518,7 @@ def _onboard_route_guide_service_response(
     work_type: str = "",
     response_view: str = "",
     request_body: Mapping[str, Any] | None = None,
+    request_selector_claims: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     from .parallel_branch_runtime import (
         get_active_integration_epoch,
@@ -159720,6 +160565,8 @@ def _onboard_route_guide_service_response(
                     role=role,
                     work_type=work_type,
                     response_view=response_view,
+                    request_body=request_body,
+                    request_selector_claims=request_selector_claims,
                 )
             )
             if direct_repair:
@@ -159889,6 +160736,8 @@ def _onboard_route_guide_service_response(
             role=role,
             work_type=work_type,
             response_view=response_view,
+            request_body=request_body,
+            request_selector_claims=request_selector_claims,
         )
     )
     if direct_main_response:
@@ -164511,8 +165360,25 @@ def _onboard_service_parent_for_successor(
     try:
         record = _contract_runtime_store(conn).get(parent_contract_execution_id)
     except ContractRuntimeError:
+        # A durable row whose canonical JSON no longer agrees with its physical
+        # namespace is drift, not an unknown parent.  The ContractRuntime store
+        # correctly fails closed before returning that record; this bounded
+        # existence probe preserves the more precise public blocker without
+        # decoding or exposing the malformed payload.
+        durable_row_exists = (
+            conn.execute(
+                "SELECT 1 FROM contract_runtime_executions "
+                "WHERE contract_execution_id = ? LIMIT 1",
+                (parent_contract_execution_id,),
+            ).fetchone()
+            is not None
+        )
         _onboard_service_parent_authority_error(
-            "onboard_service_parent_unknown",
+            (
+                "onboard_service_parent_drift"
+                if durable_row_exists
+                else "onboard_service_parent_unknown"
+            ),
             project_id=project_id,
             backlog_id=backlog_id,
             parent_contract_execution_id=parent_contract_execution_id,
@@ -206950,10 +207816,50 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
     route_token_ref = _contract_runtime_ref_value(
         ctx, "route_token_ref", "observer_route_token_ref"
     )
+    selector_claims: dict[str, list[Any]] = {}
+    for field in (
+        *_dev_source_root_keys,
+        "target_ref",
+        "branch",
+        "branch_ref",
+        "requested_branch_ref",
+        "runtime_port",
+        "port",
+        "target_head_commit",
+        "head_commit",
+        "candidate_commit_sha",
+        "requested_commit",
+        "commit_sha",
+        "base_commit",
+        "task_id",
+        "contract_execution_id",
+    ):
+        body_value = body.get(field)
+        if isinstance(body_value, Sequence) and not isinstance(
+            body_value, (str, bytes, bytearray)
+        ):
+            selector_claims[field] = list(body_value)
+        elif body_value not in (None, ""):
+            selector_claims[field] = [body_value]
+        query_value = ctx.query.get(field) if isinstance(ctx.query, Mapping) else None
+        if isinstance(query_value, Sequence) and not isinstance(
+            query_value, (str, bytes, bytearray)
+        ):
+            selector_claims.setdefault(field, []).extend(query_value)
+        elif query_value not in (None, ""):
+            selector_claims.setdefault(field, []).append(query_value)
     queue_view: dict[str, Any] = {}
     with DBContext(project_id) as conn:
         from .parallel_branch_runtime import get_active_integration_epoch
 
+        _require_onboard_dev_selector_endpoint(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            request_body=selector_claims,
+            role=role,
+            work_type=work_type,
+        )
         active_epoch = get_active_integration_epoch(conn, project_id)
         if active_epoch is not None:
             canonical_backlog_id = (
@@ -206969,6 +207875,7 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
                 work_type=work_type,
                 response_view=response_view,
                 request_body=body,
+                request_selector_claims=selector_claims,
             )
         if not backlog_id and work_type and work_type in _ONBOARD_NO_BACKLOG_WORK_TYPES:
             response = _onboard_no_backlog_service_response(
@@ -207040,6 +207947,7 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
             work_type=work_type,
             response_view=response_view,
             request_body=body,
+            request_selector_claims=selector_claims,
         )
     if queue_view:
         selection = dict(queue_view.get("selection") or {})

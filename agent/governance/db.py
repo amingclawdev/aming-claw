@@ -12,7 +12,9 @@ import sqlite3
 import stat
 import threading
 import hashlib
+import re
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -54,6 +56,493 @@ _DEV_DENIED_SCHEMA_ACTIONS = frozenset(
     )
     if isinstance((code := getattr(sqlite3, name, None)), int)
 )
+
+
+# The dev service is deliberately denied migration authority, so a table name
+# and a handful of column names are not a sufficient capability check.  These
+# are the write-critical identity constraints for every table inspected by a
+# dev-plane lazy-schema owner.  Required columns not listed as INTEGER are
+# canonical TEXT columns; every required non-single-column-PK column is NOT
+# NULL.  Keeping this contract here gives all lazy owners one fail-closed
+# interpretation of PRAGMA metadata, including SQLite autoindexes.
+_DEV_SCHEMA_INTEGER_COLUMNS: Mapping[str, frozenset[str]] = {
+    "contract_runtime_executions": frozenset(
+        {"execution_state_revision"}
+    ),
+    "worker_implementation_test_results_corrections": frozenset(
+        {"source_completed_line_index", "source_execution_state_revision"}
+    ),
+    "backlog_contract_chain_bindings": frozenset(
+        {"id", "generation", "execution_state_revision"}
+    ),
+    "contract_chain_edges": frozenset({"id", "generation"}),
+    "backlog_contract_chain_current": frozenset(
+        {"generation", "projection_watermark"}
+    ),
+    "task_timeline_events": frozenset(
+        {
+            "id",
+            "attempt_num",
+            "parent_event_id",
+            "schema_version",
+        }
+    ),
+    "parallel_branch_runtime_contexts": frozenset(
+        {"attempt", "retry_round"}
+    ),
+    "parallel_branch_batch_items": frozenset({"queue_index", "retained"}),
+    "parallel_branch_merge_queue_items": frozenset(
+        {"queue_index", "validation_attempt"}
+    ),
+    "parallel_branch_integration_epochs": frozenset({"merge_cursor"}),
+    "parallel_branch_integration_epoch_worldref_seals": frozenset(
+        {"merge_cursor"}
+    ),
+    "parallel_branch_integration_epoch_release_events": frozenset({"id"}),
+    "parallel_branch_integration_epoch_release_rollovers": frozenset(
+        {"release_event_id", "sequence"}
+    ),
+    "parallel_branch_integration_epoch_release_projection_repairs": frozenset(
+        {"release_event_id"}
+    ),
+}
+
+_DEV_SCHEMA_PRIMARY_KEYS: Mapping[str, tuple[str, ...]] = {
+    "contract_runtime_executions": ("contract_execution_id",),
+    "worker_implementation_test_results_corrections": ("correction_id",),
+    "backlog_contract_chain_bindings": ("id",),
+    "contract_chain_edges": ("id",),
+    "backlog_contract_chain_current": ("project_id", "backlog_id"),
+    "task_timeline_events": ("id",),
+    "observer_route_token_refs": ("project_id", "route_token_ref"),
+    "parallel_branch_runtime_contexts": ("project_id", "task_id"),
+    "parallel_branch_batch_runtimes": ("project_id", "batch_id"),
+    "parallel_branch_batch_items": ("project_id", "batch_id", "task_id"),
+    "parallel_branch_runtime_contract_revisions": (
+        "project_id",
+        "runtime_context_id",
+        "revision_id",
+    ),
+    "parallel_branch_merge_queue_items": (
+        "project_id",
+        "merge_queue_id",
+        "queue_item_id",
+    ),
+    "parallel_branch_integration_epochs": ("project_id", "batch_id"),
+    "parallel_branch_integration_epoch_world_refs": (
+        "project_id",
+        "batch_id",
+        "epoch_id",
+        "world_ref_id",
+    ),
+    "parallel_branch_integration_epoch_worldref_seals": (
+        "project_id",
+        "batch_id",
+        "epoch_id",
+    ),
+    "parallel_branch_integration_epoch_release_events": ("id",),
+    "parallel_branch_integration_epoch_release_rollovers": (
+        "project_id",
+        "batch_id",
+        "queue_item_id",
+        "release_event_id",
+        "sequence",
+    ),
+    "parallel_branch_integration_epoch_release_projection_repairs": (
+        "project_id",
+        "batch_id",
+        "queue_item_id",
+        "release_event_id",
+    ),
+    "parallel_branch_runtime_access_audit": ("audit_id",),
+}
+
+_DEV_SCHEMA_UNIQUE_CONSTRAINTS: Mapping[
+    str, tuple[tuple[str, ...], ...]
+] = {
+    "worker_implementation_test_results_corrections": (
+        (
+            "project_id",
+            "contract_execution_id",
+            "runtime_context_id",
+            "task_id",
+            "source_completed_line_index",
+            "source_line_sha256",
+        ),
+    ),
+    "backlog_contract_chain_bindings": (("idempotency_key",),),
+    "contract_chain_edges": (
+        ("edge_key",),
+        (
+            "project_id",
+            "contract_chain_id",
+            "parent_contract_execution_id",
+            "child_contract_execution_id",
+            "edge_kind",
+        ),
+    ),
+    "parallel_branch_integration_epoch_world_refs": (
+        ("project_id", "batch_id", "epoch_id", "world_kind", "commit_sha"),
+    ),
+    "parallel_branch_integration_epoch_worldref_seals": (
+        ("seal_id",),
+        ("project_id", "merge_queue_id", "queue_item_id"),
+    ),
+    "parallel_branch_integration_epoch_release_events": (
+        ("project_id", "batch_id", "queue_item_id"),
+    ),
+    "parallel_branch_integration_epoch_release_rollovers": (
+        ("project_id", "batch_id", "queue_item_id", "rollover_id"),
+    ),
+    "parallel_branch_integration_epoch_release_projection_repairs": (
+        ("project_id", "batch_id", "queue_item_id", "repair_id"),
+    ),
+}
+
+
+class DevRuntimeSchemaVerificationError(RuntimeError):
+    """A dev-plane schema capability is absent or stale.
+
+    The dev service shares the stable database but has no migration authority.
+    Callers can use ``code``/``details`` as a typed, zero-write failure without
+    parsing SQLite's platform-specific authorization error text.
+    """
+
+    code = "ac_dev_verify_only_schema_incompatible"
+
+    def __init__(
+        self,
+        owner: str,
+        *,
+        missing_tables: Sequence[str] = (),
+        missing_columns: Mapping[str, Sequence[str]] | None = None,
+        missing_indexes: Sequence[str] = (),
+        invalid_indexes: Mapping[str, Mapping[str, str]] | None = None,
+        invalid_columns: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
+        missing_unique_constraints: Mapping[str, Sequence[Sequence[str]]] | None = None,
+    ) -> None:
+        self.details = {
+            "schema_version": "ac_dev_verify_only_schema_capability.v1",
+            "runtime_plane": DEV_RUNTIME_PLANE,
+            "schema_owner": str(owner or "unknown"),
+            "missing_tables": sorted(set(missing_tables)),
+            "missing_columns": {
+                str(table): sorted(set(columns))
+                for table, columns in sorted((missing_columns or {}).items())
+                if columns
+            },
+            "missing_indexes": sorted(set(missing_indexes)),
+            "invalid_indexes": {
+                str(index): {
+                    str(key): str(value)
+                    for key, value in sorted(details.items())
+                }
+                for index, details in sorted((invalid_indexes or {}).items())
+                if details
+            },
+            "invalid_columns": {
+                str(table): {
+                    str(column): {
+                        str(key): str(value)
+                        for key, value in sorted(details.items())
+                    }
+                    for column, details in sorted(columns.items())
+                    if details
+                }
+                for table, columns in sorted((invalid_columns or {}).items())
+                if columns
+            },
+            "missing_unique_constraints": {
+                str(table): [list(columns) for columns in constraints]
+                for table, constraints in sorted(
+                    (missing_unique_constraints or {}).items()
+                )
+                if constraints
+            },
+            "verify_only": True,
+            "ddl_attempted": False,
+            "writes_performed": False,
+            "migration_allowed": False,
+        }
+        summary = ", ".join(
+            part
+            for part in (
+                "tables=" + ",".join(self.details["missing_tables"])
+                if self.details["missing_tables"]
+                else "",
+                "columns="
+                + ",".join(
+                    f"{table}({','.join(columns)})"
+                    for table, columns in self.details["missing_columns"].items()
+                )
+                if self.details["missing_columns"]
+                else "",
+                "indexes=" + ",".join(self.details["missing_indexes"])
+                if self.details["missing_indexes"]
+                else "",
+                "invalid_indexes="
+                + ",".join(self.details["invalid_indexes"])
+                if self.details["invalid_indexes"]
+                else "",
+                "invalid_columns="
+                + ",".join(
+                    f"{table}({','.join(columns)})"
+                    for table, columns in self.details["invalid_columns"].items()
+                )
+                if self.details["invalid_columns"]
+                else "",
+                "unique_constraints="
+                + ",".join(self.details["missing_unique_constraints"])
+                if self.details["missing_unique_constraints"]
+                else "",
+            )
+            if part
+        )
+        super().__init__(
+            f"{self.code}: {self.details['schema_owner']}"
+            + (f": {summary}" if summary else "")
+        )
+
+
+def dev_runtime_verify_only() -> bool:
+    """Return whether this process must inspect, never migrate, SQLite schema."""
+
+    return _is_dev_runtime()
+
+
+def verify_existing_schema_capabilities(
+    conn: sqlite3.Connection,
+    *,
+    owner: str,
+    required_tables: Sequence[str],
+    required_columns: Mapping[str, Sequence[str]] | None = None,
+    required_indexes: Sequence[str] = (),
+    required_index_definitions: Mapping[str, Mapping[str, str]] | None = None,
+) -> None:
+    """Verify exact existing SQLite capabilities without issuing any DDL.
+
+    This helper is intentionally based only on ``sqlite_master`` and read-only
+    ``PRAGMA table_info`` inspection.  It is the common dev-plane counterpart
+    to the stable runtime's lazy schema/migration helpers.
+    """
+
+    identifier = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+    tables = tuple(dict.fromkeys(str(item) for item in required_tables))
+    columns = {
+        str(table): tuple(dict.fromkeys(str(item) for item in values))
+        for table, values in (required_columns or {}).items()
+    }
+    index_definitions = {
+        str(index): {
+            "table": str(definition.get("table") or ""),
+            "sql": str(definition.get("sql") or ""),
+        }
+        for index, definition in (required_index_definitions or {}).items()
+    }
+    indexes = tuple(
+        dict.fromkeys(
+            [str(item) for item in required_indexes]
+            + list(index_definitions)
+        )
+    )
+    for value in (*tables, *columns, *indexes):
+        if not identifier.fullmatch(value):
+            raise ValueError(f"invalid SQLite schema identifier: {value!r}")
+    for values in columns.values():
+        for value in values:
+            if not identifier.fullmatch(value):
+                raise ValueError(f"invalid SQLite schema identifier: {value!r}")
+    for definition in index_definitions.values():
+        table = definition["table"]
+        if not identifier.fullmatch(table):
+            raise ValueError(f"invalid SQLite schema identifier: {table!r}")
+        if not definition["sql"].strip():
+            raise ValueError("required index SQL must be non-empty")
+
+    placeholders = ", ".join("?" for _ in tables)
+    present_tables = set()
+    if tables:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master "
+            f"WHERE type='table' AND name IN ({placeholders})",
+            tables,
+        ).fetchall()
+        present_tables = {
+            str(row["name"] if isinstance(row, sqlite3.Row) else row[0])
+            for row in rows
+        }
+    missing_tables = sorted(set(tables) - present_tables)
+    missing_columns: dict[str, list[str]] = {}
+    table_info: dict[str, dict[str, dict[str, object]]] = {}
+    for table, expected in columns.items():
+        if table not in present_tables:
+            continue
+        rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+        info = {
+            str(row["name"] if isinstance(row, sqlite3.Row) else row[1]): {
+                "type": str(
+                    row["type"] if isinstance(row, sqlite3.Row) else row[2]
+                ).upper(),
+                "notnull": int(
+                    row["notnull"] if isinstance(row, sqlite3.Row) else row[3]
+                ),
+                "pk": int(row["pk"] if isinstance(row, sqlite3.Row) else row[5]),
+            }
+            for row in rows
+        }
+        table_info[table] = info
+        present = set(info)
+        missing = sorted(set(expected) - present)
+        if missing:
+            missing_columns[table] = missing
+
+    invalid_columns: dict[str, dict[str, dict[str, str]]] = {}
+    for table, expected in columns.items():
+        info = table_info.get(table, {})
+        primary_key = _DEV_SCHEMA_PRIMARY_KEYS.get(table, ())
+        integer_columns = _DEV_SCHEMA_INTEGER_COLUMNS.get(table, frozenset())
+        for column in expected:
+            actual = info.get(column)
+            if actual is None:
+                continue
+            expected_type = "INTEGER" if column in integer_columns else "TEXT"
+            expected_pk = (
+                primary_key.index(column) + 1 if column in primary_key else 0
+            )
+            # SQLite reports NOT NULL=0 for a single-column ``PRIMARY KEY``
+            # declaration even though the key is unique and non-null in the
+            # write model.  Composite PK members are reported NOT NULL=1.
+            expected_notnull = int(not (len(primary_key) == 1 and expected_pk))
+            mismatch = {}
+            for key, expected_value in (
+                ("type", expected_type),
+                ("notnull", expected_notnull),
+                ("pk", expected_pk),
+            ):
+                actual_value = actual[key]
+                if actual_value != expected_value:
+                    mismatch[f"expected_{key}"] = str(expected_value)
+                    mismatch[f"actual_{key}"] = str(actual_value)
+            if mismatch:
+                invalid_columns.setdefault(table, {})[column] = mismatch
+
+    missing_unique_constraints: dict[str, list[tuple[str, ...]]] = {}
+    for table in present_tables:
+        required_unique = _DEV_SCHEMA_UNIQUE_CONSTRAINTS.get(table, ())
+        if not required_unique:
+            continue
+        actual_unique: set[tuple[str, ...]] = set()
+        rows = conn.execute(f'PRAGMA index_list("{table}")').fetchall()
+        for row in rows:
+            is_unique = int(
+                row["unique"] if isinstance(row, sqlite3.Row) else row[2]
+            )
+            origin = str(
+                row["origin"] if isinstance(row, sqlite3.Row) else row[3]
+            )
+            is_partial = int(
+                row["partial"] if isinstance(row, sqlite3.Row) else row[4]
+            )
+            # Required tuples in this registry are table-declared UNIQUE
+            # constraints (or PK autoindexes), never arbitrary CREATE INDEX
+            # lookalikes.  Partial or application-created indexes can exclude
+            # exactly the values whose idempotency the runtime depends on.
+            # Explicit business indexes are independently bound by exact SQL
+            # and table ownership below.
+            if (
+                not is_unique
+                or is_partial
+                or origin not in {"u", "pk"}
+            ):
+                continue
+            index_name = str(
+                row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            )
+            index_rows = conn.execute(
+                f'PRAGMA index_xinfo("{index_name}")'
+            ).fetchall()
+            index_columns = tuple(
+                str(
+                    index_row["name"]
+                    if isinstance(index_row, sqlite3.Row)
+                    else index_row[2]
+                )
+                for index_row in index_rows
+                if int(
+                    index_row["key"]
+                    if isinstance(index_row, sqlite3.Row)
+                    else index_row[5]
+                )
+                and (
+                    index_row["name"]
+                    if isinstance(index_row, sqlite3.Row)
+                    else index_row[2]
+                )
+                is not None
+            )
+            actual_unique.add(index_columns)
+        missing = [item for item in required_unique if item not in actual_unique]
+        if missing:
+            missing_unique_constraints[table] = missing
+
+    present_indexes: dict[str, dict[str, str]] = {}
+    if indexes:
+        placeholders = ", ".join("?" for _ in indexes)
+        rows = conn.execute(
+            "SELECT name, tbl_name, sql FROM sqlite_master "
+            f"WHERE type='index' AND name IN ({placeholders})",
+            indexes,
+        ).fetchall()
+        present_indexes = {
+            str(row["name"] if isinstance(row, sqlite3.Row) else row[0]): {
+                "table": str(
+                    row["tbl_name"] if isinstance(row, sqlite3.Row) else row[1]
+                ),
+                "sql": str(
+                    (row["sql"] if isinstance(row, sqlite3.Row) else row[2]) or ""
+                ),
+            }
+            for row in rows
+        }
+    missing_indexes = sorted(set(indexes) - set(present_indexes))
+
+    def normalize_sql(value: str) -> str:
+        normalized = re.sub(
+            r"\s+", " ", str(value or "").strip().rstrip(";")
+        ).lower()
+        return re.sub(r"\s*([(),])\s*", r"\1", normalized)
+
+    invalid_indexes: dict[str, dict[str, str]] = {}
+    for index, expected in index_definitions.items():
+        actual = present_indexes.get(index)
+        if actual is None:
+            continue
+        expected_sql = normalize_sql(expected["sql"])
+        actual_sql = normalize_sql(actual["sql"])
+        if actual["table"] != expected["table"] or actual_sql != expected_sql:
+            invalid_indexes[index] = {
+                "expected_table": expected["table"],
+                "actual_table": actual["table"],
+                "expected_sql": expected_sql,
+                "actual_sql": actual_sql,
+            }
+    if (
+        missing_tables
+        or missing_columns
+        or missing_indexes
+        or invalid_indexes
+        or invalid_columns
+        or missing_unique_constraints
+    ):
+        raise DevRuntimeSchemaVerificationError(
+            owner,
+            missing_tables=missing_tables,
+            missing_columns=missing_columns,
+            missing_indexes=missing_indexes,
+            invalid_indexes=invalid_indexes,
+            invalid_columns=invalid_columns,
+            missing_unique_constraints=missing_unique_constraints,
+        )
 
 
 def sqlite_write_lock() -> threading.RLock:

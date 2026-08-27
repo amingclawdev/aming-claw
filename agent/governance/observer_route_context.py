@@ -61,6 +61,10 @@ from typing import Any
 from agent.governance.mf_subagent_contract import (
     _normalized_action as _gate_normalized_action,
 )
+from agent.governance.db import (
+    dev_runtime_verify_only,
+    verify_existing_schema_capabilities,
+)
 
 
 SCHEMA_VERSION = "aming_observer_write_route_token.v1"
@@ -1769,6 +1773,50 @@ def _token_digest(token: Mapping[str, Any], salt: str) -> str:
 
 def _ensure_ref_registry_schema(conn: sqlite3.Connection) -> None:
     """Create the route_token_ref_registry table if it does not exist."""
+    if dev_runtime_verify_only():
+        verify_existing_schema_capabilities(
+            conn,
+            owner="observer_route_context_ref_registry",
+            required_tables=("observer_route_token_refs",),
+            required_columns={
+                "observer_route_token_refs": (
+                    "project_id",
+                    "route_token_ref",
+                    "token_digest",
+                    "salt",
+                    "route_id",
+                    "route_context_hash",
+                    "prompt_contract_id",
+                    "prompt_contract_hash",
+                    "visible_injection_manifest_hash",
+                    "backlog_id",
+                    "task_id",
+                    "caller_role",
+                    "allowed_actions_json",
+                    "expires_at",
+                    "evidence_refs_json",
+                    "scope_json",
+                    "target_files_json",
+                    "owned_files_json",
+                    *_REF_LINEAGE_COLUMNS.values(),
+                    *_REF_SCOPE_LIST_COLUMNS.values(),
+                    "status",
+                    "issued_at",
+                    "created_at",
+                )
+            },
+            required_indexes=("idx_route_token_refs_status",),
+            required_index_definitions={
+                "idx_route_token_refs_status": {
+                    "table": "observer_route_token_refs",
+                    "sql": (
+                        "CREATE INDEX idx_route_token_refs_status ON "
+                        "observer_route_token_refs(project_id, status, route_token_ref)"
+                    ),
+                }
+            },
+        )
+        return
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS observer_route_token_refs (
