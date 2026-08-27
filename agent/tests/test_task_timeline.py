@@ -22328,5 +22328,353 @@ def test_source_backed_qa_session_authority_hash_alone_is_not_trusted():
     ) == ""
 
 
+_DIRECT_MAIN_QA_FACADE_FIELDS = (
+    "contract_execution_id",
+    "execution_state_revision",
+    "stage_id",
+    "line_id",
+    "runtime_guide_hash",
+    "direct_runtime_binding_hash",
+)
+
+
+def _direct_main_qa_facade_record(
+    *,
+    line_id="qa_graph_context",
+    execution_state_revision=7,
+):
+    if line_id == "qa_graph_context":
+        stage_id = "qa_graph_context"
+        evidence_kind = "graph_trace"
+    else:
+        stage_id = "qa"
+        evidence_kind = "independent_verification"
+    runtime_guide_hash = _fake_sha(
+        f"direct-main-qa-facade-guide-{line_id}-{execution_state_revision}"
+    )
+    next_action = {
+        "stage_id": stage_id,
+        "line_id": line_id,
+        "evidence_kind": evidence_kind,
+        "actor_role": "qa",
+    }
+    return {
+        "project_id": "aming-claw",
+        "backlog_id": "AC-DIRECT-MAIN-QA-FACADE",
+        "contract_execution_id": "cex-direct-main-qa-facade",
+        "contract_id": "operator_supervised_direct_main",
+        "revision": "rev3",
+        "definition_hash": _fake_sha("direct-main-rev3-definition"),
+        "instruction_bundle_hash": _fake_sha("direct-main-rev3-instructions"),
+        "execution_state_revision": execution_state_revision,
+        "execution_state": {
+            "execution_state_revision": execution_state_revision,
+            "execution_state_hash": _fake_sha(
+                f"direct-main-state-{execution_state_revision}"
+            ),
+            "next_action": dict(next_action),
+        },
+        "runtime_guide": {
+            "runtime_guide_hash": runtime_guide_hash,
+            "next_legal_action": dict(next_action),
+            "writer_role_safe_copy_payload": {
+                "copy_payload": {
+                    **next_action,
+                    "runtime_guide_hash": runtime_guide_hash,
+                }
+            },
+        },
+        "completed_lines": [],
+        "metadata": {
+            "generic_crud_exposed": False,
+            "operator_supervised_direct_main_runtime_binding": {
+                "strict_runtime_binding_required": True,
+                "binding_hash": _fake_sha("direct-main-immutable-runtime-binding"),
+            },
+        },
+    }
+
+
+def _direct_main_qa_facade_binding(record):
+    guide = record["runtime_guide"]
+    line = guide["next_legal_action"]
+    return {
+        "contract_execution_id": record["contract_execution_id"],
+        "execution_state_revision": record["execution_state_revision"],
+        "stage_id": line["stage_id"],
+        "line_id": line["line_id"],
+        "runtime_guide_hash": guide["runtime_guide_hash"],
+        "direct_runtime_binding_hash": record["metadata"][
+            "operator_supervised_direct_main_runtime_binding"
+        ]["binding_hash"],
+    }
+
+
+def _assert_direct_main_qa_facade_zero_write(error, expected_code):
+    assert error.code == expected_code
+    assert error.details["zero_contract_runtime_write"] is True
+    assert error.details["zero_timeline_write"] is True
+    assert error.details["writes_performed"] is False
+    assert error.details["caller_claims_trusted"] is False
+    assert error.details["server_derived"] is True
+
+
+def test_direct_main_qa_facade_accepts_exact_current_binding_for_both_qa_lines():
+    from agent.governance import server
+
+    for line_id in ("qa_graph_context", "qa_independent_verification"):
+        record = _direct_main_qa_facade_record(line_id=line_id)
+        line = record["runtime_guide"]["next_legal_action"]
+        expected = _direct_main_qa_facade_binding(record)
+
+        assert server._operator_supervised_direct_main_qa_facade_binding(
+            record,
+            actor_role="qa",
+            line=line,
+            body=expected,
+        ) == expected
+
+
+def test_direct_main_qa_facade_rejects_each_missing_or_mismatched_binding_zero_write():
+    from agent.governance import server
+
+    record = _direct_main_qa_facade_record()
+    line = record["runtime_guide"]["next_legal_action"]
+    exact = _direct_main_qa_facade_binding(record)
+    mismatched_values = {
+        "contract_execution_id": "cex-cross-candidate",
+        "execution_state_revision": exact["execution_state_revision"] - 1,
+        "stage_id": "qa-cross-route",
+        "line_id": "qa_independent_verification",
+        "runtime_guide_hash": _fake_sha("stale-runtime-guide"),
+        "direct_runtime_binding_hash": _fake_sha("cross-route-binding"),
+    }
+
+    case = unittest.TestCase()
+    for field in _DIRECT_MAIN_QA_FACADE_FIELDS:
+        for mode in ("missing", "mismatch"):
+            body = dict(exact)
+            if mode == "missing":
+                body.pop(field)
+            else:
+                body[field] = mismatched_values[field]
+            with case.subTest(field=field, mode=mode):
+                with case.assertRaises(server.GovernanceError) as raised:
+                    server._operator_supervised_direct_main_qa_facade_binding(
+                        record,
+                        actor_role="qa",
+                        line=line,
+                        body=body,
+                    )
+                _assert_direct_main_qa_facade_zero_write(
+                    raised.exception,
+                    "operator_supervised_direct_main_qa_binding_mismatch",
+                )
+                assert raised.exception.details["field"] == field
+
+
+def test_direct_main_qa_facade_rejects_nested_only_and_top_level_conflicts_zero_write():
+    from agent.governance import server
+
+    record = _direct_main_qa_facade_record()
+    line = record["runtime_guide"]["next_legal_action"]
+    exact = _direct_main_qa_facade_binding(record)
+    nested_containers = {
+        "payload": {"claims": {"stage_id": "nested-stage"}},
+        "verification": {"claims": {"runtime_guide_hash": _fake_sha("nested-guide")}},
+        "artifact_refs": [
+            {"claims": {"direct_runtime_binding_hash": _fake_sha("nested-binding")}}
+        ],
+    }
+
+    case = unittest.TestCase()
+    for container, nested_value in nested_containers.items():
+        for mode in ("nested_only", "top_level_conflict"):
+            body = {container: nested_value}
+            if mode == "top_level_conflict":
+                body.update(exact)
+            with case.subTest(container=container, mode=mode):
+                with case.assertRaises(server.GovernanceError) as raised:
+                    server._operator_supervised_direct_main_qa_facade_binding(
+                        record,
+                        actor_role="qa",
+                        line=line,
+                        body=body,
+                    )
+                _assert_direct_main_qa_facade_zero_write(
+                    raised.exception,
+                    "operator_supervised_direct_main_qa_binding_nested",
+                )
+                assert raised.exception.details["nested_binding_paths"]
+                assert raised.exception.details["field"].startswith(container)
+
+
+def test_direct_main_qa_facade_keeps_generic_crud_and_observer_impersonation_forbidden():
+    from agent.governance import server
+
+    record = _direct_main_qa_facade_record()
+    line = record["runtime_guide"]["next_legal_action"]
+    generic_rejection = (
+        server._operator_supervised_direct_main_generic_crud_rejection(record)
+    )
+
+    assert generic_rejection["error"] == (
+        "operator_supervised_direct_main_generic_crud_forbidden"
+    )
+    assert generic_rejection["generic_contract_runtime_submit_line_allowed"] is False
+    assert generic_rejection["zero_write_rejection"] is True
+    assert generic_rejection["writes_performed"] is False
+    assert server._qa_request_has_impersonation_claim(
+        {"payload": {"observer_impersonation": True}}
+    ) is True
+    assert server._operator_supervised_direct_main_qa_facade_binding(
+        record,
+        actor_role="observer",
+        line=line,
+        body=_direct_main_qa_facade_binding(record),
+    ) == {}
+
+
+def test_direct_main_authenticated_qa_facade_validates_then_adapter_submits_paired_lines():
+    from agent.governance import server
+
+    graph_record = _direct_main_qa_facade_record()
+    verification_record = _direct_main_qa_facade_record(
+        line_id="qa_independent_verification",
+        execution_state_revision=8,
+    )
+    completed_record = copy.deepcopy(verification_record)
+    completed_record["execution_state_revision"] = 9
+    completed_record["execution_state"]["execution_state_revision"] = 9
+    completed_record["execution_state"]["execution_state_hash"] = _fake_sha(
+        "direct-main-state-9"
+    )
+    completed_record["execution_state"]["next_action"] = None
+    completed_record["runtime_guide"] = {
+        "runtime_guide_hash": _fake_sha("direct-main-completed-guide"),
+        "next_legal_action": None,
+    }
+
+    class FakeRuntime:
+        def __init__(self):
+            self.record = copy.deepcopy(graph_record)
+            self.writes = []
+
+        def current_record(self, execution_id, *, actor_role=None):
+            assert execution_id == graph_record["contract_execution_id"]
+            assert actor_role in {"observer", "qa"}
+            return copy.deepcopy(self.record)
+
+        def submit_line_write(
+            self,
+            execution_id,
+            write,
+            *,
+            actor_role=None,
+            projected_completed_lines=None,
+            projection=None,
+        ):
+            assert execution_id == graph_record["contract_execution_id"]
+            assert actor_role == "qa"
+            self.writes.append(copy.deepcopy(write))
+            if write["line_id"] == "qa_graph_context":
+                self.record = copy.deepcopy(verification_record)
+            else:
+                assert write["line_id"] == "qa_independent_verification"
+                self.record = copy.deepcopy(completed_record)
+            return {
+                "ok": True,
+                "decision": {"ok": True, "errors": []},
+                "record": copy.deepcopy(self.record),
+            }
+
+    runtime = FakeRuntime()
+    qa_session = {
+        "role": "qa",
+        "principal_id": "qa:facade-regression",
+        "session_id": "ses-qa-facade-regression",
+    }
+
+    binding = _direct_main_qa_facade_binding(graph_record)
+    body = {
+        "project_id": graph_record["project_id"],
+        "backlog_id": graph_record["backlog_id"],
+        "task_id": "qa-direct-main-facade",
+        "actor": "qa:facade-regression",
+        "commit_sha": "a" * 40,
+        "status": "passed",
+        "payload": {"graph_trace_ids": ["gqt-direct-main-facade"]},
+        **binding,
+    }
+    qa_authority = {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session",
+        "verified": True,
+        "role": "qa",
+        "principal_id": qa_session["principal_id"],
+        "qa_session_id": qa_session["session_id"],
+        "graph_trace_ids": ["gqt-direct-main-facade"],
+        "db_verified_graph_trace": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "observer_impersonation": False,
+    }
+
+    with mock.patch.object(server, "_contract_runtime", return_value=runtime), mock.patch.object(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        side_effect=lambda _conn, project_id, record, actor_role: (record, {}),
+    ), mock.patch.object(
+        server,
+        "_onboard_guide_capsule_invalidate_contract_runtime_transition",
+    ):
+        gate_result = server._contract_runtime_close_gate(
+            None,
+            project_id=graph_record["project_id"],
+            body=body,
+            event_kind="verification",
+            norm_payload=body["payload"],
+            normalized_status="passed",
+            trusted_actor_role="qa",
+            trusted_actor_session=qa_session,
+        )
+        assert runtime.writes == []
+        lineage = server._operator_supervised_direct_main_apply_timeline_runtime(
+            None,
+            project_id=graph_record["project_id"],
+            backlog_id=graph_record["backlog_id"],
+            contract_execution_id=graph_record["contract_execution_id"],
+            event_kind="verification",
+            body=body,
+            normalized_payload=body["payload"],
+            trusted_qa_verification_authority=qa_authority,
+        )
+
+    assert gate_result["accepted"] is True
+    assert gate_result["status"] == "validated_submission"
+    assert gate_result["canonical_submit_required"] is True
+    assert gate_result["direct_main_qa_facade_binding_validated"] is True
+    assert gate_result["line_id"] == "qa_graph_context"
+    assert lineage["timeline_facade_adapter"] is True
+    assert [ref["line_id"] for ref in lineage["completed_line_refs"]] == [
+        "qa_graph_context",
+        "qa_independent_verification",
+    ]
+    assert len(runtime.writes) == 2
+    for write, record in zip(runtime.writes, (graph_record, verification_record)):
+        expected = _direct_main_qa_facade_binding(record)
+        for field in _DIRECT_MAIN_QA_FACADE_FIELDS[:-1]:
+            assert write[field] == expected[field]
+        assert write["payload"]["direct_runtime_binding_hash"] == (
+            expected["direct_runtime_binding_hash"]
+        )
+    assert runtime.writes[0]["payload"]["qa_authority"]["source"] == (
+        "server_qa_session_verification"
+    )
+    assert runtime.writes[1]["payload"]["qa_authority"][
+        "qa_session_proof"
+    ]["observer_impersonation"] is False
+
+
 if __name__ == "__main__":
     unittest.main()
