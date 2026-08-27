@@ -134178,6 +134178,288 @@ def _contract_runtime_rev8_two_worker_merge_projection(
     )
 
 
+def _contract_runtime_rev8_superseded_terminal_reconcile_receipt_verified(
+    authority: Mapping[str, Any],
+) -> bool:
+    """Verify one immutable terminal receipt after a later clean deployment.
+
+    This is deliberately narrower than current-full activation.  The ordinary
+    verifier continues to require the receipt itself to name the active HEAD.
+    Rev8+ ordered multi-lane reconciliation may, however, be resumed after a
+    later clean descendant has already become the active current-full world.
+    In that one case the old receipt remains a lane-selection receipt only: it
+    must be the exact fully verified receipt for the CEX merge commit, while an
+    independent current-full provenance proves the clean loaded HEAD.
+    """
+
+    marker = authority.get("current_full_reconcile_marker")
+    marker = marker if isinstance(marker, Mapping) else {}
+    provenance = authority.get("current_full_reconcile_provenance")
+    provenance = provenance if isinstance(provenance, Mapping) else {}
+    marker_scope = marker.get("runtime_context_scope")
+    marker_scope = marker_scope if isinstance(marker_scope, Mapping) else {}
+    route_evidence = marker.get("route_evidence")
+    route_evidence = (
+        route_evidence if isinstance(route_evidence, Mapping) else {}
+    )
+    route_scope = route_evidence.get("runtime_context_scope")
+    route_scope = route_scope if isinstance(route_scope, Mapping) else {}
+    idempotency_scope = route_evidence.get("idempotency_scope")
+    idempotency_scope = (
+        idempotency_scope
+        if isinstance(idempotency_scope, Mapping)
+        else {}
+    )
+    route_token_scope = route_evidence.get("route_token_scope")
+    route_token_scope = (
+        route_token_scope
+        if isinstance(route_token_scope, Mapping)
+        else {}
+    )
+
+    project_id = str(authority.get("project_id") or "").strip()
+    backlog_id = str(authority.get("backlog_id") or "").strip()
+    execution_id = str(
+        authority.get("contract_execution_id") or ""
+    ).strip()
+    runtime_context_id = str(
+        authority.get("runtime_context_id") or ""
+    ).strip()
+    task_id = str(authority.get("task_id") or "").strip()
+    parent_task_id = str(authority.get("parent_task_id") or "").strip()
+    merge_queue_id = str(
+        authority.get("merge_queue_id") or ""
+    ).strip()
+    merged_commit = str(
+        authority.get("merged_commit_sha") or ""
+    ).strip().lower()
+    reconciled_commit = str(
+        authority.get("reconciled_commit_sha") or ""
+    ).strip().lower()
+    provenance_target = str(
+        authority.get("reconcile_provenance_target_commit") or ""
+    ).strip().lower()
+    canonical_head = str(
+        authority.get("canonical_head_commit")
+        or authority.get("current_canonical_commit_sha")
+        or ""
+    ).strip().lower()
+    target_root_text = str(
+        authority.get("target_project_root") or ""
+    ).strip()
+    if not target_root_text:
+        return False
+    target_root = Path(target_root_text)
+    try:
+        canonical_root = str(target_root.resolve())
+    except OSError:
+        return False
+    live_head = _git_head_commit(target_root).strip().lower()
+    runtime_identity = governance_loaded_runtime_identity(live_head)
+    loaded_commit = str(
+        runtime_identity.get("loaded_commit") or ""
+    ).strip().lower()
+    loaded_source_sha256 = str(
+        runtime_identity.get("loaded_source_sha256") or ""
+    ).strip()
+    worktree_source_sha256 = str(
+        runtime_identity.get("worktree_source_sha256") or ""
+    ).strip()
+
+    reconcile_snapshot_id = str(
+        authority.get("reconcile_snapshot_id") or ""
+    ).strip()
+    active_snapshot_id = str(
+        authority.get("active_snapshot_id") or ""
+    ).strip()
+    reconcile_event_id = int(authority.get("reconcile_event_id") or 0)
+    active_reconcile_event_id = int(
+        authority.get(
+            "active_snapshot_current_full_reconcile_event_id"
+        )
+        or 0
+    )
+    provenance_hash = str(
+        provenance.get("provenance_hash") or ""
+    ).strip()
+    active_provenance_hash = str(
+        authority.get("active_snapshot_current_full_provenance_hash") or ""
+    ).strip()
+    required_true_fields = (
+        "db_verified",
+        "live_verified",
+        "canonical_head_verified",
+        "active_snapshot_verified",
+        "active_snapshot_current_full_reconcile_verified",
+        "active_snapshot_current_full_runtime_scope_verified",
+        "active_snapshot_matches_canonical_head",
+        "graph_reconciled",
+        "provenance_verified",
+        "provenance_scope_verified",
+        "durable_order_verified",
+        "reconcile_snapshot_verified",
+        "current_full_reconcile_marker_verified",
+        "contract_execution_scope_verified",
+        "task_scope_verified",
+        "runtime_context_scope_verified",
+        "parent_task_scope_verified",
+        "merge_queue_scope_verified",
+        "trusted_contract_execution_lineage_verified",
+    )
+    scope_identity = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "merge_queue_id": merge_queue_id,
+    }
+    return bool(
+        str(authority.get("schema_version") or "")
+        == "graph_snapshot_store.current_full_reconcile_state.v1"
+        and str(authority.get("source") or "")
+        == "graph_snapshot_store.current_full_reconcile_state"
+        and authority.get("server_derived") is True
+        and all(authority.get(field) is True for field in required_true_fields)
+        and authority.get("current_full_reconcile") is True
+        and str(authority.get("strategy") or "")
+        == "current_full_reconcile"
+        and not authority.get("identity_mismatches")
+        and all(scope_identity.values())
+        and parent_task_id == execution_id
+        and all(
+            str(authority.get(field) or "").strip() == expected
+            for field, expected in (
+                ("expected_contract_execution_id", execution_id),
+                ("expected_runtime_context_id", runtime_context_id),
+                ("expected_task_id", task_id),
+                ("expected_parent_task_id", parent_task_id),
+                ("expected_merge_queue_id", merge_queue_id),
+            )
+        )
+        and str(
+            authority.get("contract_runtime_dispatch_source_ref") or ""
+        ).strip().startswith(f"contract_runtime:{execution_id}:")
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merged_commit)
+        and merged_commit == reconciled_commit == provenance_target
+        and str(authority.get("reconcile_snapshot_commit") or "")
+        .strip()
+        .lower()
+        == merged_commit
+        and str(authority.get("reconcile_snapshot_status") or "")
+        == "superseded"
+        and reconcile_snapshot_id
+        and reconcile_snapshot_id != active_snapshot_id
+        and str(authority.get("source_ref") or "").strip()
+        == f"graph_snapshot:{reconcile_snapshot_id}"
+        and str(authority.get("active_snapshot_status") or "") == "active"
+        and active_snapshot_id
+        and str(authority.get("active_source_ref") or "").strip()
+        == f"graph_snapshot:{active_snapshot_id}"
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", canonical_head)
+        and canonical_head != merged_commit
+        and str(authority.get("active_snapshot_commit") or "")
+        .strip()
+        .lower()
+        == canonical_head
+        and str(
+            authority.get(
+                "active_snapshot_current_full_provenance_target_commit"
+            )
+            or ""
+        )
+        .strip()
+        .lower()
+        == canonical_head
+        and str(
+            authority.get("active_snapshot_current_full_provenance_id") or ""
+        ).strip()
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", active_provenance_hash)
+        and active_reconcile_event_id > reconcile_event_id > int(
+            authority.get("merge_event_id") or 0
+        )
+        and str(authority.get("reconcile_source_ref") or "").strip()
+        == f"timeline:{reconcile_event_id}"
+        and str(authority.get("reconcile_task_id") or "").strip()
+        == task_id
+        and str(
+            authority.get("reconcile_runtime_context_id") or ""
+        ).strip()
+        == runtime_context_id
+        and str(authority.get("active_snapshot_current_full_reconcile_event_created_at") or "").strip()
+        and str(authority.get("reconcile_event_created_at") or "").strip()
+        and str(provenance.get("project_id") or "").strip() == project_id
+        and str(provenance.get("snapshot_id") or "").strip()
+        == reconcile_snapshot_id
+        and str(provenance.get("target_commit_sha") or "")
+        .strip()
+        .lower()
+        == merged_commit
+        and int(provenance.get("reconcile_event_id") or 0)
+        == reconcile_event_id
+        and str(provenance.get("reconcile_event_created_at") or "").strip()
+        == str(authority.get("reconcile_event_created_at") or "").strip()
+        and str(provenance.get("provenance_id") or "").strip()
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", provenance_hash)
+        and str(marker.get("schema_version") or "")
+        == "current_full_reconcile.provenance.v2"
+        and str(marker.get("source") or "") == "graph_governance_api"
+        and marker.get("activate") is True
+        and marker.get("normal_update_path") is True
+        and str(marker.get("protected_action") or "")
+        == "graph_current_full_reconcile"
+        and str(marker.get("snapshot_id") or "").strip()
+        == reconcile_snapshot_id
+        and str(marker.get("target_commit_sha") or "")
+        .strip()
+        .lower()
+        == merged_commit
+        and str(marker.get("provenance_id") or "").strip()
+        == str(provenance.get("provenance_id") or "").strip()
+        and str(marker.get("provenance_hash") or "").strip()
+        == provenance_hash
+        and int(marker.get("reconcile_event_id") or 0)
+        == reconcile_event_id
+        and all(
+            str(marker_scope.get(field) or "").strip() == expected
+            and str(route_scope.get(field) or "").strip() == expected
+            and str(idempotency_scope.get(field) or "").strip() == expected
+            for field, expected in scope_identity.items()
+        )
+        and str(route_token_scope.get("project_id") or "").strip()
+        == project_id
+        and str(route_token_scope.get("backlog_id") or "").strip()
+        == backlog_id
+        and str(route_token_scope.get("task_id") or "").strip() == task_id
+        and canonical_root == target_root_text
+        and live_head == canonical_head
+        and _git_clean_worktree_verified(target_root)
+        and authority.get("reconciled_commit_is_ancestor_of_canonical_head")
+        is True
+        and _git_commit_is_ancestor(
+            target_root,
+            merged_commit,
+            canonical_head,
+        )
+        and str(runtime_identity.get("schema_version") or "")
+        == LOADED_RUNTIME_IDENTITY_SCHEMA
+        and str(runtime_identity.get("identity_source") or "")
+        == "frozen_at_import"
+        and runtime_identity.get("runtime_stale") is False
+        and loaded_commit == live_head == canonical_head
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", loaded_source_sha256)
+        and loaded_source_sha256 == worktree_source_sha256
+        and str(authority.get("authority_hash") or "")
+        == stable_sha256(
+            {
+                key: value
+                for key, value in authority.items()
+                if key != "authority_hash"
+            }
+        )
+    )
+
+
 def _contract_runtime_rev8_terminal_reconcile_receipt_lane_projection(
     conn,
     *,
@@ -134310,10 +134592,16 @@ def _contract_runtime_rev8_terminal_reconcile_receipt_lane_projection(
                 reconcile=recorded_reconcile,
             )
         )
-        if not (
+        terminal_activation_verified = bool(
             _contract_runtime_current_full_reconcile_activation_verified(
                 terminal_authority
             )
+            or _contract_runtime_rev8_superseded_terminal_reconcile_receipt_verified(
+                terminal_authority
+            )
+        )
+        if not (
+            terminal_activation_verified
             and str(
                 terminal_authority.get("runtime_context_id") or ""
             ).strip()
@@ -134634,8 +134922,13 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
             terminal_receipt_projection_verified = bool(
                 stored_lane_identity_source
                 == "terminal_current_full_reconcile_receipt"
-                and _contract_runtime_current_full_reconcile_activation_verified(
-                    terminal_current_full
+                and (
+                    _contract_runtime_current_full_reconcile_activation_verified(
+                        terminal_current_full
+                    )
+                    or _contract_runtime_rev8_superseded_terminal_reconcile_receipt_verified(
+                        terminal_current_full
+                    )
                 )
                 and all(
                     str(terminal_current_full.get(field) or "").strip()
@@ -135841,8 +136134,20 @@ def _contract_runtime_reconcile_record_authority(
     )
     current_full_activation_verified = bool(
         reconcile_event_recorded
-        and _contract_runtime_current_full_reconcile_activation_verified(
-            current_full_authority
+        and (
+            _contract_runtime_current_full_reconcile_activation_verified(
+                current_full_authority
+            )
+            or (
+                _is_mf_parallel_postmerge_revision(record)
+                and str(
+                    merge.get("reconcile_lane_identity_source") or ""
+                ).strip()
+                == "terminal_current_full_reconcile_receipt"
+                and _contract_runtime_rev8_superseded_terminal_reconcile_receipt_verified(
+                    current_full_authority
+                )
+            )
         )
         and str(current_full_authority.get("merge_source_ref") or "")
         == str(authority.get("merge_source_ref") or "")
@@ -136231,8 +136536,13 @@ def _contract_runtime_bind_reconcile_authority(
         and authority.get("reconcile_event_recorded") is True
         and authority.get("current_full_reconcile_activation_verified")
         is True
-        and _contract_runtime_current_full_reconcile_activation_verified(
-            terminal
+        and (
+            _contract_runtime_current_full_reconcile_activation_verified(
+                terminal
+            )
+            or _contract_runtime_rev8_superseded_terminal_reconcile_receipt_verified(
+                terminal
+            )
         )
     ):
         raise GovernanceError(
