@@ -203910,48 +203910,6 @@ def handle_project_contract_update_start(ctx: RequestContext):
                 "contract_update_start",
                 {"required_role": "observer"},
             )
-        if onboard_service_waiver:
-            selection_authority = (
-                _backlog_contract_update_selection_authority(
-                    conn,
-                    project_id=project_id,
-                    backlog_id=backlog_id,
-                )
-            )
-            if selection_authority.get("ready") is not True:
-                raise ValidationError(
-                    "contract_update requires immutable backlog contract-source revision semantics",
-                    {
-                        "code": (
-                            "contract_update_backlog_semantics_required"
-                        ),
-                        "project_id": project_id,
-                        "backlog_id": backlog_id,
-                        "successor_contract_id": (
-                            CONTRACT_UPDATE_CONTRACT_ID
-                        ),
-                        "selection_authority": selection_authority,
-                        "legacy_storage_mf_type_is_selection_authority": False,
-                        "zero_write_rejection": True,
-                        "writes_performed": False,
-                        "mutation_performed": False,
-                        "next_legal_action": {
-                            "action": "onboard_route_guide",
-                            "mcp_tool": "onboard_route_guide",
-                            "copy_safe_body": {
-                                "project_id": project_id,
-                                "backlog_id": backlog_id,
-                                "role": "observer",
-                                "work_type": (
-                                    "<choose an explicit topology-compatible "
-                                    "work_type>"
-                                ),
-                            },
-                            "contract_update_allowed": False,
-                            "automatic_direct_main_allowed": False,
-                        },
-                    },
-                )
         try:
             parent_record = _contract_update_parent_for_successor(
                 conn,
