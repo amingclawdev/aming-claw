@@ -1,14 +1,15 @@
 """Process-local worker host-envelope continuity for non-CLI MCP hosts.
 
-Raw worker authentication is staged in ``HostEnvelopeStore`` and is never
-returned from this layer.  A later worker Guide/read-receipt/startup call may
-borrow the exact identity-bound envelope inside the same MCP process.  The
-successful startup response is the consumption acknowledgement and zeroizes
-the staged credentials.
+Raw worker authentication from allocation or host issuance is staged in
+``HostEnvelopeStore`` and is never returned from this layer.  A later worker
+Guide/read-receipt/startup call may borrow the exact identity-bound envelope
+inside the same MCP process.  The successful startup response is the
+consumption acknowledgement and zeroizes the staged credentials.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import json
@@ -38,6 +39,7 @@ ISSUANCE_TOOLS = frozenset(
         "runtime_context_session_token_rejoin",
     }
 )
+ALLOCATION_TOOLS = frozenset({"parallel_branch_allocate"})
 CONTINUATION_TOOLS = frozenset(
     {
         "graph_query",
@@ -53,7 +55,7 @@ CONTINUATION_TOOLS = frozenset(
         "runtime_context_scope_insufficiency_request",
     }
 )
-MANAGED_TOOLS = ISSUANCE_TOOLS | CONTINUATION_TOOLS
+MANAGED_TOOLS = ALLOCATION_TOOLS | ISSUANCE_TOOLS | CONTINUATION_TOOLS
 
 _ROUTE_FIELDS = (
     "route_id",
@@ -92,13 +94,47 @@ _POST_RESPONSE_SAFE_FIELDS = (
     "audit_event_id",
     "status",
     "delivery",
+    "project_id",
+    "backlog_id",
     "session_token_ref",
+    "managed_host_envelope_ref",
     "runtime_context_id",
     "task_id",
     "parent_task_id",
     "contract_execution_id",
+    "target_project_root",
+    "worker_id",
+    "worker_slot_id",
+    *_ROUTE_FIELDS,
     "expires_at",
     "ttl_seconds",
+)
+
+_PUBLIC_AUTH_FLAG_FIELDS = (
+    "raw_worker_auth_exposed",
+    "raw_session_token_exposed",
+    "raw_fence_token_exposed",
+)
+_ALLOCATION_AUTH_CONTAINER_FIELDS = frozenset(
+    {
+        "auth",
+        "credentials",
+        "credential_bundle",
+        "host_envelope",
+        "same_owner_worker_session",
+        "secrets",
+        "worker_auth",
+        "worker_credentials",
+    }
+)
+_ALLOCATION_AUTH_HASH_FIELDS = frozenset(
+    {
+        "fence_token_hash",
+        "session_token_hash",
+        "token_hash",
+        "token_verifier",
+        "worker_auth_hash",
+    }
 )
 
 
@@ -181,6 +217,63 @@ def _sha256(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _scrub_allocation_auth_payload(
+    value: Any,
+    *,
+    raw_values: tuple[str, ...] = (),
+) -> None:
+    """Recursively remove allocation auth from a model-visible response.
+
+    The allocation facade historically nested its same-owner bearer under a
+    benign-looking response object and also returned the allocation fence in
+    ``context``.  Key-based removal alone is therefore insufficient: known
+    credential containers and any scalar carrying one of the exact delivered
+    raw values are removed as well.  Copy-safe refs remain public.
+    """
+
+    secrets = tuple(item for item in raw_values if item)
+    if isinstance(value, dict):
+        for key in tuple(value):
+            normalized = str(key).strip().lower()
+            child = value.get(key)
+            if normalized.startswith("raw_") and normalized.endswith("_exposed"):
+                value[key] = False
+                continue
+            if (
+                normalized in _ALLOCATION_AUTH_CONTAINER_FIELDS
+                or normalized in _ALLOCATION_AUTH_HASH_FIELDS
+                or normalized in _RAW_RESPONSE_FIELDS
+                or normalized in {
+                    "aming_worker_session_token",
+                    "aming_worker_fence_token",
+                }
+                or (
+                    normalized.startswith("raw_")
+                    and ("token" in normalized or "auth" in normalized)
+                )
+                or normalized.endswith("_token")
+                or normalized.endswith("_token_hash")
+                or normalized.endswith("_token_verifier")
+                or normalized.endswith("_credentials")
+                or normalized.endswith("_worker_auth")
+            ):
+                scrub_host_envelope_payload(child)
+                value.pop(key, None)
+                continue
+            if isinstance(child, str) and any(secret in child for secret in secrets):
+                value.pop(key, None)
+                continue
+            _scrub_allocation_auth_payload(child, raw_values=secrets)
+    elif isinstance(value, list):
+        kept: list[Any] = []
+        for child in value:
+            if isinstance(child, str) and any(secret in child for secret in secrets):
+                continue
+            _scrub_allocation_auth_payload(child, raw_values=secrets)
+            kept.append(child)
+        value[:] = kept
+
+
 @dataclass(frozen=True)
 class _ManagedEnvelope:
     run_id: str
@@ -196,6 +289,7 @@ class ManagedHostEnvelopeContinuity:
     def __init__(self, *, store: HostEnvelopeStore | None = None) -> None:
         self._store = store or HostEnvelopeStore()
         self._entries: dict[str, _ManagedEnvelope] = {}
+        self._revoked_envelope_refs: set[str] = set()
         self._in_flight: set[str] = set()
         self._lock = threading.RLock()
 
@@ -211,6 +305,22 @@ class ManagedHostEnvelopeContinuity:
         """Return whether this exact public worker identity is staged locally."""
 
         return self._entry_for(args) is not None
+
+    def _remember_revoked_ref(self, envelope_ref: str) -> None:
+        normalized = _text(envelope_ref)
+        if not normalized:
+            return
+        with self._lock:
+            self._revoked_envelope_refs.add(normalized)
+            while len(self._revoked_envelope_refs) > 1024:
+                self._revoked_envelope_refs.pop()
+
+    def _is_revoked_ref(self, envelope_ref: str) -> bool:
+        normalized = _text(envelope_ref)
+        if not normalized:
+            return False
+        with self._lock:
+            return normalized in self._revoked_envelope_refs
 
     @staticmethod
     def _preflight_issuance(
@@ -271,6 +381,10 @@ class ManagedHostEnvelopeContinuity:
     ) -> Any:
         if not isinstance(result, dict):
             return result
+        # HTTP adapters and tests may retain the request/result object for
+        # audit.  Public redaction must never mutate that transport record or
+        # any request body it aliases.
+        result = copy.deepcopy(result)
         if result.get("ok") is not True:
             scrub_host_envelope_payload(result)
             return result
@@ -408,22 +522,223 @@ class ManagedHostEnvelopeContinuity:
             binding=binding,
             fence_token_hash=_sha256(raw_fence),
         )
+        if not entry.envelope_ref:
+            return _post_response_error(
+                result,
+                "managed_host_envelope_ref_missing",
+                "Host envelope staging returned no process-local opaque ref.",
+            )
         with self._lock:
+            previous = self._entries.get(run_id)
+            if previous is not None and previous.envelope_ref != entry.envelope_ref:
+                self._remember_revoked_ref(previous.envelope_ref)
             self._entries[run_id] = entry
         scrub_host_envelope_payload(result)
         result.pop("host_envelope", None)
         result["auth_loaded"] = True
+        result["session_token_ref"] = binding["session_token_ref"]
+        result["managed_host_envelope_ref"] = entry.envelope_ref
         result["managed_host_envelope"] = {
             "schema_version": "mcp.managed_host_envelope.v1",
             "status": "staged",
+            "managed_host_envelope_ref": entry.envelope_ref,
             "session_token_ref": binding["session_token_ref"],
             "runtime_context_id": binding["runtime_context_id"],
             "task_id": binding["task_id"],
             "raw_worker_auth_exposed": False,
+            "raw_session_token_exposed": False,
+            "raw_fence_token_exposed": False,
             "process_local": True,
             "startup_consumption_required": True,
         }
         return result
+
+    def _capture_allocation(
+        self,
+        args: Mapping[str, Any],
+        result: Any,
+    ) -> Any:
+        """Stage same-owner allocation auth before returning a public result."""
+
+        if not isinstance(result, dict):
+            return result
+        # The transport adapter may retain aliased request/result objects for
+        # audit; redact a detached public projection only.
+        result = copy.deepcopy(result)
+        if result.get("ok") is not True:
+            _scrub_allocation_auth_payload(result)
+            for field in _PUBLIC_AUTH_FLAG_FIELDS:
+                result[field] = False
+            return result
+
+        session = result.get("same_owner_worker_session")
+        context = result.get("context")
+        session = session if isinstance(session, Mapping) else {}
+        context = context if isinstance(context, Mapping) else {}
+        scope = session.get("scope")
+        scope = scope if isinstance(scope, Mapping) else {}
+        evidence = result.get("branch_runtime_evidence")
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+
+        raw_session = _text(session.get("session_token"))
+        response_fence = _text(context.get("fence_token"))
+        request_fence = _text(args.get("fence_token"))
+        raw_fence = response_fence or request_fence
+        session_token_ref = _text(session.get("session_token_ref"))
+
+        recovery_sources = (context, scope, evidence, args, result)
+
+        def recovery_value(field: str, *aliases: str) -> str:
+            for source in recovery_sources:
+                for candidate in (field, *aliases):
+                    value = _text(source.get(candidate))
+                    if value:
+                        return value
+            return ""
+
+        recovery_identity = {
+            "project_id": recovery_value("project_id"),
+            "backlog_id": recovery_value("backlog_id"),
+            "runtime_context_id": recovery_value("runtime_context_id"),
+            "task_id": recovery_value("task_id"),
+            "parent_task_id": recovery_value("parent_task_id", "root_task_id"),
+            "contract_execution_id": recovery_value(
+                "contract_execution_id",
+                "parent_task_id",
+            ),
+            "target_project_root": recovery_value(
+                "target_project_root",
+                "project_root",
+                "repo_root",
+                "worktree_path",
+            ),
+            "worker_id": recovery_value("worker_id"),
+            "worker_slot_id": recovery_value("worker_slot_id", "worker_id"),
+            "session_token_ref": session_token_ref,
+        }
+
+        # Same-owner issuance is optional for allocations owned by another
+        # principal.  Such responses still receive the recursive public scrub.
+        claims_same_owner_auth = bool(session)
+        if not claims_same_owner_auth:
+            scrub_host_envelope_payload(result)
+            _scrub_allocation_auth_payload(result)
+            result["auth_loaded"] = False
+            for field in _PUBLIC_AUTH_FLAG_FIELDS:
+                result[field] = False
+            return result
+
+        if response_fence and request_fence and not hmac.compare_digest(
+            response_fence,
+            request_fence,
+        ):
+            safe_error = _post_response_error(
+                result,
+                "managed_allocation_auth_mismatch",
+                "Successful allocation fence did not match the exact request authority.",
+                **{
+                    key: value
+                    for key, value in recovery_identity.items()
+                    if value
+                },
+                durable_allocation_accepted=True,
+                retry_requires_fresh_allocation=True,
+            )
+            _scrub_allocation_auth_payload(
+                safe_error,
+                raw_values=(raw_session, response_fence, request_fence),
+            )
+            for field in _PUBLIC_AUTH_FLAG_FIELDS:
+                safe_error[field] = False
+            return safe_error
+
+        if not raw_session or not raw_fence or not session_token_ref:
+            safe_error = _post_response_error(
+                result,
+                "managed_allocation_auth_missing",
+                "Successful same-owner allocation did not deliver complete process-local auth.",
+                **{
+                    key: value
+                    for key, value in recovery_identity.items()
+                    if value
+                },
+                durable_allocation_accepted=True,
+                retry_requires_fresh_allocation=True,
+            )
+            _scrub_allocation_auth_payload(
+                safe_error,
+                raw_values=(raw_session, raw_fence),
+            )
+            for field in _PUBLIC_AUTH_FLAG_FIELDS:
+                safe_error[field] = False
+            return safe_error
+
+        route_sources = (args, result, context, evidence)
+        route: dict[str, str] = {}
+        for source in route_sources:
+            route.update(_route_identity(source))
+
+        sources = recovery_sources
+
+        def first_value(field: str, *aliases: str) -> str:
+            for source in sources:
+                for candidate in (field, *aliases):
+                    value = _text(source.get(candidate))
+                    if value:
+                        return value
+            return ""
+
+        binding: dict[str, str] = {
+            "project_id": first_value("project_id"),
+            "runtime_context_id": first_value("runtime_context_id"),
+            "task_id": first_value("task_id"),
+            "parent_task_id": first_value("parent_task_id", "root_task_id"),
+            "contract_execution_id": first_value(
+                "contract_execution_id",
+                "parent_task_id",
+            ),
+            "target_project_root": first_value(
+                "target_project_root",
+                "project_root",
+                "repo_root",
+                "worktree_path",
+            ),
+            "session_token_ref": session_token_ref,
+        }
+        for field in _WORKER_BINDING_FIELDS:
+            value = first_value(field)
+            if value:
+                binding[field] = value
+        binding.update(route)
+
+        staged_result = result
+        staged_result.update(
+            {
+                key: value
+                for key, value in binding.items()
+                if value and key != "fence_token"
+            }
+        )
+        staged_result["delivery"] = "worker_host_envelope"
+        staged_result["host_envelope"] = {
+            **binding,
+            "route_identity": dict(route),
+            "env": {
+                "AMING_WORKER_SESSION_TOKEN": raw_session,
+                "AMING_WORKER_FENCE_TOKEN": raw_fence,
+            },
+        }
+        captured = self._capture_issuance(args, staged_result)
+        if isinstance(captured, dict):
+            _scrub_allocation_auth_payload(
+                captured,
+                raw_values=(raw_session, raw_fence),
+            )
+            for field in _PUBLIC_AUTH_FLAG_FIELDS:
+                captured[field] = False
+            if captured.get("auth_loaded") is True:
+                captured["allocation_auth_staged"] = True
+        return captured
 
     def _entry_for(self, args: Mapping[str, Any]) -> _ManagedEnvelope | None:
         candidate_binding = {
@@ -568,14 +883,163 @@ class ManagedHostEnvelopeContinuity:
         send: Callable[[dict[str, Any]], Any],
     ) -> Any:
         request_args = dict(args)
+        if tool_name in ALLOCATION_TOOLS:
+            missing = [
+                field
+                for field in ("project_id", "task_id")
+                if not _text(request_args.get(field))
+            ]
+            if missing:
+                return _local_error(
+                    "managed_allocation_identity_incomplete",
+                    "Managed allocation is missing immutable request identity.",
+                    missing_fields=missing,
+                )
+            return self._capture_allocation(request_args, send(request_args))
+
         if tool_name in ISSUANCE_TOOLS:
             preflight = self._preflight_issuance(tool_name, request_args)
             if preflight is not None:
                 return preflight
+            if tool_name == "runtime_context_session_token_initial_join":
+                supplied_managed_ref = _text(
+                    request_args.get("managed_host_envelope_ref")
+                )
+                entry = self._entry_for(request_args)
+                if entry is None and supplied_managed_ref:
+                    with self._lock:
+                        process_has_other_entries = bool(self._entries)
+                    stale_or_replayed = (
+                        process_has_other_entries
+                        or self._is_revoked_ref(supplied_managed_ref)
+                    )
+                    return _local_error(
+                        (
+                            "managed_host_envelope_ref_stale_or_scope_mismatch"
+                            if stale_or_replayed
+                            else "managed_host_envelope_not_loaded"
+                        ),
+                        (
+                            "Managed allocation ref is stale or belongs to another scope."
+                            if stale_or_replayed
+                            else "This MCP process has no exact staged allocation auth."
+                        ),
+                    )
+                if entry is not None:
+                    if not supplied_managed_ref:
+                        return _local_error(
+                            "managed_host_envelope_ref_required",
+                            "Fresh initial join must bind the staged allocation opaque ref.",
+                        )
+                    if not hmac.compare_digest(
+                        supplied_managed_ref,
+                        entry.envelope_ref,
+                    ):
+                        return _local_error(
+                            "managed_host_envelope_ref_stale_or_scope_mismatch",
+                            "Managed allocation ref is stale or belongs to another scope.",
+                        )
+                    rejection = self._validate_continuation(
+                        tool_name,
+                        request_args,
+                        entry,
+                    )
+                    if rejection is not None:
+                        return rejection
+                    request_args.pop("managed_host_envelope_ref", None)
+                    with self._lock:
+                        if entry.run_id in self._in_flight:
+                            return _local_error(
+                                "managed_host_envelope_concurrent_use",
+                                "The exact process-local allocation auth already has an in-flight continuation.",
+                            )
+                        try:
+                            store_state = self._store.synchronize(
+                                entry.run_id,
+                                lease_owner_id=_OWNER_ID,
+                                envelope_ref=entry.envelope_ref,
+                                expected_public_refs=entry.binding,
+                            )
+                        except HostEnvelopeError:
+                            store_state = "unavailable"
+                        if store_state != "active":
+                            self._entries.pop(entry.run_id, None)
+                            self._remember_revoked_ref(entry.envelope_ref)
+                            return _local_error(
+                                "managed_host_envelope_unavailable",
+                                "The process-local allocation auth is absent or expired.",
+                            )
+                        self._in_flight.add(entry.run_id)
+                    try:
+                        delivery = self._store.borrow(
+                            entry.run_id,
+                            lease_owner_id=_OWNER_ID,
+                            envelope_ref=entry.envelope_ref,
+                            expected_public_refs=entry.binding,
+                        )
+                        if delivery is None:
+                            with self._lock:
+                                self._entries.pop(entry.run_id, None)
+                            self._remember_revoked_ref(entry.envelope_ref)
+                            return _local_error(
+                                "managed_host_envelope_unavailable",
+                                "The process-local allocation auth is absent or expired.",
+                            )
+                        enriched = dict(request_args)
+                        temporary_environment: dict[str, str] = {}
+                        try:
+                            delivery.apply_to(temporary_environment)
+                            enriched["session_token"] = temporary_environment[
+                                "AMING_WORKER_SESSION_TOKEN"
+                            ]
+                            enriched["fence_token"] = temporary_environment[
+                                "AMING_WORKER_FENCE_TOKEN"
+                            ]
+                            issuance_result = send(enriched)
+                        finally:
+                            enriched.pop("session_token", None)
+                            enriched.pop("fence_token", None)
+                            temporary_environment.clear()
+                            delivery.discard()
+                        captured = self._capture_issuance(
+                            request_args,
+                            issuance_result,
+                        )
+                    finally:
+                        with self._lock:
+                            self._in_flight.discard(entry.run_id)
+                    if isinstance(captured, dict) and captured.get("auth_loaded") is True:
+                        captured["allocation_auth_revoked"] = True
+                        captured["previous_managed_host_envelope_revoked"] = True
+                        captured["old_managed_host_envelope_ref_reusable"] = False
+                    return captured
+            request_args.pop("managed_host_envelope_ref", None)
             return self._capture_issuance(request_args, send(request_args))
 
         entry = self._entry_for(request_args)
         if entry is None:
+            supplied_managed_ref = _text(
+                request_args.get("managed_host_envelope_ref")
+            )
+            if supplied_managed_ref:
+                with self._lock:
+                    process_has_other_entries = bool(self._entries)
+                stale_or_replayed = (
+                    process_has_other_entries
+                    or self._is_revoked_ref(supplied_managed_ref)
+                )
+                return _local_error(
+                    (
+                        "managed_host_envelope_ref_stale_or_scope_mismatch"
+                        if stale_or_replayed
+                        else "managed_host_envelope_not_loaded"
+                    ),
+                    (
+                        "Managed allocation ref is stale or belongs to another scope."
+                        if stale_or_replayed
+                        else "This MCP process has no exact staged allocation auth."
+                    ),
+                )
             if tool_name == "contract_runtime_submit_line":
                 # This generic facade also serves observer and QA writers.
                 # Borrow worker auth only when an exact managed worker entry
@@ -601,6 +1065,16 @@ class ManagedHostEnvelopeContinuity:
                 "managed_host_envelope_not_loaded",
                 "This MCP process has no exact staged worker host envelope.",
             )
+        supplied_managed_ref = _text(request_args.get("managed_host_envelope_ref"))
+        if supplied_managed_ref and not hmac.compare_digest(
+            supplied_managed_ref,
+            entry.envelope_ref,
+        ):
+            return _local_error(
+                "managed_host_envelope_ref_stale_or_scope_mismatch",
+                "Managed allocation ref is stale or belongs to another scope.",
+            )
+        request_args.pop("managed_host_envelope_ref", None)
         request_args, placeholder_rejection = (
             self._normalize_declared_host_auth_placeholders(request_args)
         )
@@ -739,6 +1213,7 @@ class ManagedHostEnvelopeContinuity:
                 envelope_ref=entry.envelope_ref,
                 expected_public_refs=entry.binding,
             )
+            self._remember_revoked_ref(entry.envelope_ref)
             with self._lock:
                 self._entries.pop(entry.run_id, None)
             result["managed_host_envelope_consumed"] = True

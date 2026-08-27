@@ -3310,6 +3310,14 @@ def _runtime_context_write_schema_properties() -> dict[str, Any]:
 
 def _runtime_context_host_issuance_schema_properties() -> dict[str, Any]:
     properties = _runtime_context_write_schema_properties()
+    properties["managed_host_envelope_ref"] = {
+        "type": "string",
+        "description": (
+            "Process-local opaque allocation-auth ref. Fresh initial join "
+            "must echo the exact ref returned by managed parallel_branch_allocate; "
+            "it is removed before the HTTP request."
+        ),
+    }
     properties["timeout_seconds"] = {
         "type": "integer",
         "minimum": _CONTRACT_RUNTIME_MCP_TIMEOUT_MIN_SECONDS,
