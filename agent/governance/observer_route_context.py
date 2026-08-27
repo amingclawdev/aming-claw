@@ -1196,6 +1196,19 @@ ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS = 15 * 60
 REF_STATUS_ACTIVE = "active"
 REF_STATUS_SUPERSEDED = "superseded"
 REF_STATUS_EXPIRED = "expired"
+
+
+def _route_registry_storage_project_id(
+    project_id: str,
+    storage_project_id: str = "",
+) -> str:
+    """Keep the public scope project distinct from a physical registry key."""
+
+    canonical = _string(project_id)
+    storage = _string(storage_project_id) or canonical
+    if not canonical or not storage:
+        raise ValueError("project_id and route registry storage project are required")
+    return storage
 _REF_LINEAGE_COLUMNS = {
     "parent_route_lineage": "parent_route_lineage_json",
     "child_route_lineage": "child_route_lineage_json",
@@ -1876,6 +1889,7 @@ def persist_route_token_ref(
     conn: sqlite3.Connection,
     *,
     project_id: str,
+    storage_project_id: str = "",
     route_token_ref: str,
     token: Mapping[str, Any],
 ) -> None:
@@ -1889,6 +1903,10 @@ def persist_route_token_ref(
     Thread-safe: holds ``_REF_REGISTRY_LOCK`` around the upsert.
     """
     project_id = _string(project_id)
+    registry_project_id = _route_registry_storage_project_id(
+        project_id,
+        storage_project_id,
+    )
     route_token_ref = _string(route_token_ref)
     if not project_id or not route_token_ref:
         raise ValueError("project_id and route_token_ref are required")
@@ -1899,6 +1917,13 @@ def persist_route_token_ref(
     digest = _token_digest(token, salt)
 
     scope = dict(token.get("scope") or {})
+    if (
+        registry_project_id != project_id
+        and _string(scope.get("project_id")) != project_id
+    ):
+        raise ValueError(
+            "alternate route registry storage requires exact canonical token scope"
+        )
     allowed_actions = list(token.get("allowed_actions") or [])
     evidence_refs = list(token.get("evidence_refs") or [])
     target_files = _dedupe(_string_list(token.get("target_files")))
@@ -1912,7 +1937,7 @@ def persist_route_token_ref(
         row = conn.execute(
             "SELECT * FROM observer_route_token_refs "
             "WHERE project_id=? AND route_token_ref=?",
-            (project_id, route_token_ref),
+            (registry_project_id, route_token_ref),
         ).fetchone()
         if row is not None:
             existing_digest = _token_digest(token, row["salt"])
@@ -1957,7 +1982,7 @@ def persist_route_token_ref(
                         _json_dumps_public_mapping(lineage_payloads["route_lineage"]),
                         _json_dumps_string_list(target_files),
                         _json_dumps_string_list(owned_files),
-                        project_id,
+                        registry_project_id,
                         route_token_ref,
                     ),
                 )
@@ -1979,7 +2004,7 @@ def persist_route_token_ref(
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                project_id,
+                registry_project_id,
                 route_token_ref,
                 digest,
                 salt,
@@ -2012,6 +2037,7 @@ def persist_route_token_ref_lineage(
     conn: sqlite3.Connection,
     *,
     project_id: str,
+    storage_project_id: str = "",
     route_token_ref: str,
     parent_route_lineage: Mapping[str, Any],
     child_route_lineage: Mapping[str, Any],
@@ -2025,6 +2051,10 @@ def persist_route_token_ref_lineage(
     """
 
     project_id = _string(project_id)
+    registry_project_id = _route_registry_storage_project_id(
+        project_id,
+        storage_project_id,
+    )
     route_token_ref = _string(route_token_ref)
     parent = _public_mapping(parent_route_lineage)
     child = _public_mapping(child_route_lineage)
@@ -2047,7 +2077,7 @@ def persist_route_token_ref_lineage(
         row = conn.execute(
             "SELECT * FROM observer_route_token_refs "
             "WHERE project_id=? AND route_token_ref=?",
-            (project_id, route_token_ref),
+            (registry_project_id, route_token_ref),
         ).fetchone()
         if row is None:
             return {}
@@ -2107,7 +2137,7 @@ def persist_route_token_ref_lineage(
                     _json_dumps_public_mapping(final_payloads["parent_route_lineage"]),
                     _json_dumps_public_mapping(final_payloads["child_route_lineage"]),
                     _json_dumps_public_mapping(final_payloads["route_lineage"]),
-                    project_id,
+                    registry_project_id,
                     route_token_ref,
                 ),
             )
@@ -2115,7 +2145,7 @@ def persist_route_token_ref_lineage(
             row = conn.execute(
                 "SELECT * FROM observer_route_token_refs "
                 "WHERE project_id=? AND route_token_ref=?",
-                (project_id, route_token_ref),
+                (registry_project_id, route_token_ref),
             ).fetchone()
             row_dict = dict(row) if row is not None else row_dict
 
@@ -2126,6 +2156,7 @@ def resolve_route_token_ref(
     conn: sqlite3.Connection,
     *,
     project_id: str,
+    storage_project_id: str = "",
     route_token_ref: str,
     route_id: str = "",
     route_context_hash: str = "",
@@ -2150,6 +2181,10 @@ def resolve_route_token_ref(
     - Expired (``expires_at`` in the past) → raises ``RouteTokenRefError``.
     """
     project_id = _string(project_id)
+    registry_project_id = _route_registry_storage_project_id(
+        project_id,
+        storage_project_id,
+    )
     route_token_ref = _string(route_token_ref)
     if not project_id or not route_token_ref:
         return None
@@ -2159,7 +2194,7 @@ def resolve_route_token_ref(
         row = conn.execute(
             "SELECT * FROM observer_route_token_refs "
             "WHERE project_id=? AND route_token_ref=?",
-            (project_id, route_token_ref),
+            (registry_project_id, route_token_ref),
         ).fetchone()
     except sqlite3.OperationalError:
         return None
@@ -2168,6 +2203,20 @@ def resolve_route_token_ref(
         return None
 
     row_dict = dict(row)
+    stored_scope = _row_scope(row_dict)
+    stored_scope_project = _scope_value(stored_scope, "project_id")
+    if stored_scope_project != project_id and (
+        stored_scope_project or registry_project_id != project_id
+    ):
+        raise RouteTokenRefError(
+            "route_token_ref canonical project scope does not match storage authority",
+            code="route_token_ref_storage_scope_mismatch",
+            details={
+                "field": "scope.project_id",
+                "expected": project_id,
+                "actual": stored_scope_project or "missing",
+            },
+        )
     status = _string(row_dict.get("status"))
     if status != REF_STATUS_ACTIVE:
         stored_backlog = backlog_id or _string(row_dict.get("backlog_id"))
@@ -2301,6 +2350,7 @@ def resolve_route_token_ref_renewal_descendant(
     conn: sqlite3.Connection,
     *,
     project_id: str,
+    storage_project_id: str = "",
     route_token_ref: str,
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
@@ -2316,6 +2366,10 @@ def resolve_route_token_ref_renewal_descendant(
     """
 
     project_id = _string(project_id)
+    registry_project_id = _route_registry_storage_project_id(
+        project_id,
+        storage_project_id,
+    )
     requested_ref = _string(route_token_ref)
     if not project_id or not requested_ref:
         return None
@@ -2346,7 +2400,7 @@ def resolve_route_token_ref_renewal_descendant(
         _ensure_ref_registry_schema(conn)
         rows = conn.execute(
             "SELECT * FROM observer_route_token_refs WHERE project_id=?",
-            (project_id,),
+            (registry_project_id,),
         ).fetchall()
     except sqlite3.OperationalError:
         return None
@@ -2358,6 +2412,21 @@ def resolve_route_token_ref_renewal_descendant(
     requested_row = rows_by_ref.get(requested_ref)
     if requested_row is None:
         return None
+    requested_scope_project = _scope_value(
+        _row_scope(requested_row),
+        "project_id",
+    )
+    if requested_scope_project != project_id and (
+        requested_scope_project or registry_project_id != project_id
+    ):
+        fail(
+            "route_token_ref_storage_scope_mismatch",
+            "route-token lineage storage does not match canonical project scope",
+            field="scope.project_id",
+            expected=project_id,
+            actual=requested_scope_project or "missing",
+        )
+    canonical_project_id = project_id
 
     identity_fields = (
         "route_id",
@@ -2381,7 +2450,8 @@ def resolve_route_token_ref_renewal_descendant(
     def exact_scope(row: Mapping[str, Any]) -> dict[str, str]:
         scope = _row_scope(row)
         return {
-            "project_id": _scope_value(scope, "project_id") or project_id,
+            "project_id": _scope_value(scope, "project_id")
+            or canonical_project_id,
             "backlog_id": _string(row.get("backlog_id"))
             or _scope_value(scope, "backlog_id", "bug_id"),
             "task_id": _string(row.get("task_id"))
@@ -2622,7 +2692,8 @@ def resolve_route_token_ref_renewal_descendant(
         if status == REF_STATUS_ACTIVE:
             resolved = resolve_route_token_ref(
                 conn,
-                project_id=project_id,
+                project_id=canonical_project_id,
+                storage_project_id=registry_project_id,
                 route_token_ref=current_ref,
                 now=now,
             )
@@ -2753,6 +2824,7 @@ def verify_route_token_binding(
     conn: sqlite3.Connection,
     *,
     project_id: str,
+    storage_project_id: str = "",
     token: Mapping[str, Any],
     route_token_ref: str = "",
     route_id: str = "",
@@ -2772,6 +2844,10 @@ def verify_route_token_binding(
     """
 
     project_id = _string(project_id)
+    registry_project_id = _route_registry_storage_project_id(
+        project_id,
+        storage_project_id,
+    )
     if not project_id:
         raise RouteTokenRefError("project_id is required for route_token binding")
     if not isinstance(token, Mapping):
@@ -2808,7 +2884,7 @@ def verify_route_token_binding(
             ORDER BY created_at DESC, issued_at DESC, route_token_ref DESC
             """,
             (
-                project_id,
+                registry_project_id,
                 token_route_id,
                 token_route_context_hash,
                 token_prompt_contract_id,
@@ -3070,6 +3146,7 @@ def attach_same_scope_reissue_proof(
     conn: sqlite3.Connection,
     *,
     project_id: str,
+    storage_project_id: str = "",
     route_token_ref: str,
     token: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3095,10 +3172,14 @@ def attach_same_scope_reissue_proof(
         return {}
 
     _ensure_ref_registry_schema(conn)
+    registry_project_id = _route_registry_storage_project_id(
+        project_id,
+        storage_project_id,
+    )
     row = conn.execute(
         "SELECT * FROM observer_route_token_refs "
         "WHERE project_id=? AND route_token_ref=?",
-        (_string(project_id), previous_ref),
+        (registry_project_id, previous_ref),
     ).fetchone()
     if row is None:
         return {}
@@ -3210,6 +3291,7 @@ def renew_route_token_ref(
     conn: sqlite3.Connection,
     *,
     project_id: str,
+    storage_project_id: str = "",
     route_token_ref: str,
     backlog_id: str = "",
     task_id: str = "",
@@ -3226,6 +3308,10 @@ def renew_route_token_ref(
     """Renew a same-scope route_token_ref and supersede the previous ref."""
 
     project_id = _string(project_id)
+    registry_project_id = _route_registry_storage_project_id(
+        project_id,
+        storage_project_id,
+    )
     old_ref = _string(route_token_ref)
     if not project_id or not old_ref:
         raise ValueError("project_id and route_token_ref are required")
@@ -3234,7 +3320,7 @@ def renew_route_token_ref(
     with _REF_REGISTRY_LOCK:
         row = conn.execute(
             "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
-            (project_id, old_ref),
+            (registry_project_id, old_ref),
         ).fetchone()
         if row is None:
             raise RouteTokenRefError(
@@ -3382,6 +3468,7 @@ def renew_route_token_ref(
             carried_same_scope_reissue_proof = attach_same_scope_reissue_proof(
                 conn,
                 project_id=project_id,
+                storage_project_id=registry_project_id,
                 route_token_ref=old_ref,
                 token=proof_token,
             )
@@ -3471,6 +3558,7 @@ def renew_route_token_ref(
         persist_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=registry_project_id,
             route_token_ref=new_ref,
             token=token,
         )
@@ -3479,7 +3567,7 @@ def renew_route_token_ref(
             "WHERE project_id=? AND route_token_ref=? AND status IN (?, ?)",
             (
                 REF_STATUS_SUPERSEDED,
-                project_id,
+                registry_project_id,
                 old_ref,
                 REF_STATUS_ACTIVE,
                 REF_STATUS_EXPIRED,
@@ -3488,7 +3576,7 @@ def renew_route_token_ref(
         conn.commit()
         new_row = conn.execute(
             "SELECT * FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
-            (project_id, new_ref),
+            (registry_project_id, new_ref),
         ).fetchone()
         new_row_dict = dict(new_row) if new_row is not None else {}
 
@@ -3550,6 +3638,7 @@ def supersede_route_token_ref(
     conn: sqlite3.Connection,
     *,
     project_id: str,
+    storage_project_id: str = "",
     route_token_ref: str,
 ) -> bool:
     """Mark a route_token_ref as superseded.
@@ -3566,6 +3655,10 @@ def supersede_route_token_ref(
     project).
     """
     project_id = _string(project_id)
+    registry_project_id = _route_registry_storage_project_id(
+        project_id,
+        storage_project_id,
+    )
     route_token_ref = _string(route_token_ref)
     if not project_id or not route_token_ref:
         return False
@@ -3576,7 +3669,7 @@ def supersede_route_token_ref(
             "WHERE project_id=? AND route_token_ref=? AND status IN (?, ?)",
             (
                 REF_STATUS_SUPERSEDED,
-                project_id,
+                registry_project_id,
                 route_token_ref,
                 REF_STATUS_ACTIVE,
                 REF_STATUS_EXPIRED,

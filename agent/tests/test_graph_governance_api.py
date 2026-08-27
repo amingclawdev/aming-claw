@@ -13168,7 +13168,6 @@ def test_ac_dev_request_guard_allows_candidate_only_and_repair_writes(monkeypatc
         "/api/projects/aming-claw/direct-fix/enter",
         "/api/projects/aming-claw/direct-fix/start",
         "/api/projects/aming-claw/observer-sessions/register",
-        "/api/projects/aming-claw/observer/route-context/issue",
         "/api/projects/aming-claw/observer/route-context/renew",
         "/api/role/assign",
     ],
@@ -193433,6 +193432,803 @@ def test_ac_dev_get_accepts_exact_repeated_query_world_selectors_zero_write(
     assert guide["runtime_world_authority"] == world
     assert conn.total_changes == before
     assert tuple(conn.iterdump()) == before_rows
+
+
+def _prepare_ac_dev_direct_route_bootstrap(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    backlog_id: str,
+):
+    project_id = "aming-claw"
+    _initialize_ac_dev_guide_schema(conn)
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
+        (
+            json.dumps(["agent/governance/server.py"]),
+            json.dumps(["agent/tests/test_graph_governance_api.py"]),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    root = tmp_path / "ac-dev-route-bootstrap"
+    root.mkdir()
+    commit = "9" * 40
+    world = _fixed_ac_dev_direct_world(root, commit)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_selector_authority",
+        lambda *_args, **_kwargs: {
+            "dev_refs": [
+                server.AC_DEV_BRANCH,
+                f"refs/heads/{server.AC_DEV_BRANCH}",
+            ],
+            "dev_runtime_port": server.AC_DEV_SERVICE_PORT,
+            "dev_worktree_root": str(root.resolve()),
+            "dev_head_commit": commit,
+            "dev_contract_execution_ids": [],
+            "server_derived": True,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(conn),
+    )
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": project_id},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "target_project_root": str(root),
+                "target_head_commit": commit,
+                "target_ref": server.AC_DEV_BRANCH,
+            },
+        )
+    )
+    return {
+        "project_id": project_id,
+        "root": root,
+        "commit": commit,
+        "world": world,
+        "guide": guide,
+        "task_id": guide["contract_execution_id"],
+        "issue_body": copy.deepcopy(
+            guide["next_legal_action"]["copy_safe_body"]
+        ),
+    }
+
+
+def _load_frozen_a258_module(relative_path: str, module_suffix: str):
+    """Load an exact frozen-a258 module without checking out or writing files."""
+
+    repository_root = Path(__file__).resolve().parents[2]
+    source = subprocess.check_output(
+        [
+            "git",
+            "show",
+            f"{server.AC_STABLE_ANCHOR_COMMIT}:{relative_path}",
+        ],
+        cwd=repository_root,
+        text=True,
+    )
+    module_name = f"agent.governance._frozen_a258_{module_suffix}"
+    module = type(sys)(module_name)
+    module.__package__ = "agent.governance"
+    module.__file__ = (
+        f"git:{server.AC_STABLE_ANCHOR_COMMIT}:{relative_path}"
+    )
+    sys.modules[module_name] = module
+    exec(compile(source, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_replays(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DEV-DIRECT-ROUTE-BOOTSTRAP-ATOMIC"
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    task_id = prepared["task_id"]
+    project_id = prepared["project_id"]
+    body = prepared["issue_body"]
+    stable_task_id = "cex-direct-main-stable-preserved"
+    stable_record = {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": stable_task_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev3",
+        "execution_state_revision": 1,
+        "metadata": {
+            "operator_supervised_direct_main_runtime_binding": {
+                "strict_runtime_binding_required": True,
+                "target_project_root": "/stable/a258",
+                "target_head_commit": server.AC_STABLE_ANCHOR_COMMIT,
+            }
+        },
+    }
+    conn.execute(
+        """
+        INSERT INTO contract_runtime_executions (
+            contract_execution_id, project_id, backlog_id, contract_id,
+            version, revision, execution_state_revision, record_json,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            stable_task_id,
+            project_id,
+            backlog_id,
+            "operator_supervised_direct_main",
+            "v1",
+            "rev3",
+            1,
+            json.dumps(stable_record),
+            "2026-08-27T00:00:00Z",
+            "2026-08-27T00:00:00Z",
+        ),
+    )
+    stable_issued = observer_route_context.issue_observer_write_route_context(
+        project_id=project_id,
+        backlog_id="AC-STABLE-ROW-PRESERVED",
+        task_id="stable-route-task-preserved",
+        target_files=["agent/stable_preserved.py"],
+    )
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=project_id,
+        route_token_ref=stable_issued["route_token_ref"],
+        token=stable_issued["route_token"],
+    )
+    stable_contract_before = tuple(
+        conn.execute(
+            "SELECT * FROM contract_runtime_executions WHERE project_id=? "
+            "ORDER BY contract_execution_id",
+            (project_id,),
+        ).fetchall()
+    )
+    stable_route_before = tuple(
+        conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?",
+            (stable_issued["route_token_ref"],),
+        ).fetchall()
+    )
+    stable_projection_before = tuple(
+        conn.execute(
+            "SELECT * FROM backlog_contract_chain_current WHERE project_id=? "
+            "ORDER BY backlog_id",
+            (project_id,),
+        ).fetchall()
+    )
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/projects/aming-claw/observer/route-context/issue",
+        path_params={"project_id": project_id},
+        body=body,
+    )
+
+    first = server.handle_observer_route_context_issue(
+        _ctx({"project_id": project_id}, method="POST", body=body)
+    )
+
+    assert first["ok"] is True
+    assert first["contract_execution_id"] == task_id
+    assert first["dev_world_materialized"] is True
+    assert first["atomic_route_and_contract_materialization"] is True
+    assert first["idempotent_replay"] is False
+    assert first["writes_performed"] is True
+    assert first["raw_route_token_exposed"] is False
+    assert first["route_token_public_identity_only"] is True
+    assert first["route_token"]["resolved_from_ref"] is True
+    assert not {
+        "raw_route_token",
+        "token_body",
+        "token_digest",
+        "salt",
+    }.intersection(first["route_token"])
+    route_ref = first["route_token_ref"]
+    physical = conn.execute(
+        """
+        SELECT project_id, backlog_id, contract_id, record_json
+        FROM contract_runtime_executions
+        WHERE contract_execution_id=?
+        """,
+        (task_id,),
+    ).fetchone()
+    assert physical is not None
+    assert physical["project_id"] == server.direct_main_dev_storage_project_id(
+        project_id,
+        prepared["world"]["namespace_hash"],
+    )
+    assert physical["backlog_id"] == backlog_id
+    assert physical["contract_id"] == prepared["world"]["storage_contract_id"]
+    stored_record = json.loads(physical["record_json"])
+    assert stored_record["project_id"] == project_id
+    assert stored_record["backlog_id"] == backlog_id
+    assert stored_record["contract_execution_id"] == task_id
+    assert stored_record["route_token_ref"] == route_ref
+    route_storage_project_id = server.direct_main_dev_storage_project_id(
+        project_id,
+        prepared["world"]["namespace_hash"],
+    )
+    route_row = conn.execute(
+        "SELECT project_id, backlog_id, task_id, status "
+        "FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (route_storage_project_id, route_ref),
+    ).fetchone()
+    assert tuple(route_row) == (
+        route_storage_project_id,
+        backlog_id,
+        task_id,
+        "active",
+    )
+    assert conn.execute(
+        "SELECT 1 FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (project_id, route_ref),
+    ).fetchone() is None
+    assert first["route_token"]["scope"]["project_id"] == project_id
+    assert tuple(
+        conn.execute(
+            "SELECT * FROM contract_runtime_executions WHERE project_id=? "
+            "ORDER BY contract_execution_id",
+            (project_id,),
+        ).fetchall()
+    ) == stable_contract_before
+    assert tuple(
+        conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?",
+            (stable_issued["route_token_ref"],),
+        ).fetchall()
+    ) == stable_route_before
+    assert tuple(
+        conn.execute(
+            "SELECT * FROM backlog_contract_chain_current WHERE project_id=? "
+            "ORDER BY backlog_id",
+            (project_id,),
+        ).fetchall()
+    ) == stable_projection_before
+    counts_after_first = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "contract_runtime_executions",
+            "observer_route_token_refs",
+            "backlog_contract_chain_bindings",
+            "task_timeline_events",
+        )
+    }
+
+    replay = server.handle_observer_route_context_issue(
+        _ctx({"project_id": project_id}, method="POST", body=body)
+    )
+
+    assert replay["ok"] is True
+    assert replay["route_token_ref"] == route_ref
+    assert replay["contract_execution_id"] == task_id
+    assert replay["idempotent_replay"] is True
+    assert replay["writes_performed"] is False
+    assert replay["raw_route_token_exposed"] is False
+    assert replay["route_token_public_identity_only"] is True
+    assert replay["route_token"]["resolved_from_ref"] is True
+    assert {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in counts_after_first
+    } == counts_after_first
+    followup_guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": project_id},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "target_project_root": str(prepared["root"]),
+                "target_head_commit": prepared["commit"],
+                "target_ref": server.AC_DEV_BRANCH,
+                "route_token_ref": route_ref,
+            },
+        )
+    )
+    assert followup_guide["contract_execution_id"] == task_id
+    assert followup_guide["observer_route_context_issue"]["required"] is False
+    assert followup_guide["route_authority"]["accepted"] is True
+    assert followup_guide["route_authority"]["route_token_ref"] == route_ref
+    resolved_dev = server._resolve_route_token_ref_server_side(
+        {"route_token_ref": route_ref},
+        pid=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    assert resolved_dev is not None
+    assert resolved_dev["route_token_ref"] == route_ref
+    dev_gate = server._require_route_token_mutation_gate(
+        _ctx(
+            {"project_id": project_id},
+            method="POST",
+            body={"route_token_ref": route_ref},
+        ),
+        action="task_timeline_append",
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    assert dev_gate["decision"] == "route_token_ref_resolved"
+
+    # Frozen a258 and a promoted/new stable default both select the canonical
+    # physical project id.  They must not resolve or authorize the dev ref.
+    with monkeypatch.context() as stable_runtime:
+        stable_runtime.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+        frozen_routes = _load_frozen_a258_module(
+            "agent/governance/observer_route_context.py",
+            "observer_route_context",
+        )
+        frozen_gate = _load_frozen_a258_module(
+            "agent/governance/mf_subagent_contract.py",
+            "mf_subagent_contract",
+        )
+        stable_before = tuple(conn.iterdump())
+        assert frozen_routes.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        ) is None
+        with pytest.raises(frozen_gate.MfSubagentContractError):
+            frozen_gate.validate_route_token_mutation_gate(
+                {"route_token_ref": route_ref},
+                action="task_timeline_append",
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+                require_server_binding=True,
+                server_binding=None,
+            )
+        assert server._resolve_route_token_ref_server_side(
+            {"route_token_ref": route_ref},
+            pid=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        ) is None
+        with pytest.raises(GovernanceError, match="route_token"):
+            server._require_route_token_mutation_gate(
+                _ctx(
+                    {"project_id": project_id},
+                    method="POST",
+                    body={"route_token_ref": route_ref},
+                ),
+                action="task_timeline_append",
+                project_id=project_id,
+                backlog_id=backlog_id,
+                task_id=task_id,
+            )
+        assert tuple(conn.iterdump()) == stable_before
+
+
+def test_ac_dev_route_storage_scope_partition_supports_renewal_and_binding(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DEV-ROUTE-STORAGE-SCOPE-RENEWAL"
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    project_id = prepared["project_id"]
+    task_id = prepared["task_id"]
+    storage_project_id = server.direct_main_dev_storage_project_id(
+        project_id,
+        prepared["world"]["namespace_hash"],
+    )
+    fixed_now = datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc)
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        target_files=["agent/governance/server.py"],
+        allowed_actions=["task_timeline_append"],
+        now=fixed_now,
+        ttl_hours=1,
+    )
+    old_ref = issued["route_token_ref"]
+    observer_route_context.persist_route_token_ref(
+        conn,
+        project_id=project_id,
+        storage_project_id=storage_project_id,
+        route_token_ref=old_ref,
+        token=issued["route_token"],
+    )
+    stable_before = tuple(
+        conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    )
+    wrong_storage_project_id = server.direct_main_dev_storage_project_id(
+        project_id,
+        "sha256:" + ("f" * 64),
+    )
+    wrong_namespace_before = tuple(conn.iterdump())
+    assert observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=project_id,
+        storage_project_id=wrong_storage_project_id,
+        route_token_ref=old_ref,
+    ) is None
+    with pytest.raises(
+        observer_route_context.RouteTokenRefError,
+        match="unknown; renewal refused",
+    ):
+        observer_route_context.renew_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=wrong_storage_project_id,
+            route_token_ref=old_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+            now=fixed_now + timedelta(minutes=50),
+        )
+    assert tuple(conn.iterdump()) == wrong_namespace_before
+
+    assert observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=project_id,
+        route_token_ref=old_ref,
+    ) is None
+    resolved = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=project_id,
+        storage_project_id=storage_project_id,
+        route_token_ref=old_ref,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        now=fixed_now,
+    )
+    assert resolved["scope"] == {
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+    binding = observer_route_context.verify_route_token_binding(
+        conn,
+        project_id=project_id,
+        storage_project_id=storage_project_id,
+        token=issued["route_token"],
+        route_token_ref=old_ref,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        now=fixed_now,
+    )
+    assert binding["server_issued_binding"] is True
+    assert binding["scope"]["project_id"] == project_id
+
+    renewed = observer_route_context.renew_route_token_ref(
+        conn,
+        project_id=project_id,
+        storage_project_id=storage_project_id,
+        route_token_ref=old_ref,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        caller_role="observer",
+        allowed_actions=["task_timeline_append"],
+        target_files=["agent/governance/server.py"],
+        owned_files=["agent/governance/server.py"],
+        now=fixed_now + timedelta(minutes=50),
+        ttl_hours=1,
+    )
+    new_ref = renewed["route_token_ref"]
+    assert renewed["scope"]["project_id"] == project_id
+    assert new_ref and new_ref != old_ref
+    descendant = observer_route_context.resolve_route_token_ref_renewal_descendant(
+        conn,
+        project_id=project_id,
+        storage_project_id=storage_project_id,
+        route_token_ref=old_ref,
+        now=fixed_now + timedelta(minutes=50),
+    )
+    assert descendant["route_token_ref"] == new_ref
+    assert descendant["scope"]["project_id"] == project_id
+    assert conn.execute(
+        "SELECT status FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (storage_project_id, old_ref),
+    ).fetchone()["status"] == "superseded"
+    assert conn.execute(
+        "SELECT status FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (storage_project_id, new_ref),
+    ).fetchone()["status"] == "active"
+    server._apply_supersession_hook_if_needed(
+        conn,
+        project_id,
+        "route_identity_supersede",
+        "route.identity.superseded",
+        {"route_identity_supersession": {"route_token_ref": new_ref}},
+    )
+    assert conn.execute(
+        "SELECT status FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (storage_project_id, new_ref),
+    ).fetchone()["status"] == "superseded"
+    assert tuple(
+        conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    ) == stable_before
+
+
+def test_ac_dev_route_consumers_reject_malformed_physical_scope_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DEV-ROUTE-STORAGE-SCOPE-TAMPER"
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    project_id = prepared["project_id"]
+    task_id = prepared["task_id"]
+    issued = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": project_id},
+            method="POST",
+            body=prepared["issue_body"],
+        )
+    )
+    route_token_ref = issued["route_token_ref"]
+    storage_project_id = server.direct_main_dev_storage_project_id(
+        project_id,
+        prepared["world"]["namespace_hash"],
+    )
+    tampered_scope = {
+        "project_id": "other-project",
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+    }
+    conn.execute(
+        "UPDATE observer_route_token_refs SET scope_json=? "
+        "WHERE project_id=? AND route_token_ref=?",
+        (
+            json.dumps(tampered_scope, sort_keys=True),
+            storage_project_id,
+            route_token_ref,
+        ),
+    )
+    observer_session.ensure_schema(conn)
+    session_id = "obs-ac-dev-route-storage-scope-tamper"
+    now = observer_session._utc_now()
+    conn.execute(
+        """
+        INSERT INTO observer_sessions (
+            session_id, project_id, observer_kind, session_label, pid, cwd,
+            capabilities_json, token_hash, status, registered_at, last_seen_at,
+            closed_at, revoked_at
+        ) VALUES (?, ?, 'codex', 'route-storage-scope-tamper', 0, '', '{}',
+                  'ref-only-proof-no-token', ?, ?, ?, '', '')
+        """,
+        (
+            session_id,
+            project_id,
+            observer_session.SESSION_STATUS_ACTIVE,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+
+    with pytest.raises(observer_route_context.RouteTokenRefError) as direct_error:
+        observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=storage_project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+    )
+    assert direct_error.value.code == "route_token_ref_storage_scope_mismatch"
+    with pytest.raises(observer_route_context.RouteTokenRefError) as bypass_error:
+        observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=storage_project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    assert bypass_error.value.code == "route_token_ref_storage_scope_mismatch"
+
+    with pytest.raises(observer_route_context.RouteTokenRefError) as central_error:
+        server._resolve_route_token_ref_server_side(
+            {"route_token_ref": route_token_ref},
+            pid=project_id,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    assert central_error.value.code == "route_token_ref_storage_scope_mismatch"
+    assert server._onboard_route_guide_parent_route_resolution(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+    ) == {}
+    binding = server._contract_runtime_route_token_ref_binding(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=route_token_ref,
+    )
+    assert binding["status"] == "invalid"
+    assert binding["route_token_ref_error_code"] == (
+        "route_token_ref_storage_scope_mismatch"
+    )
+
+    with pytest.raises(GovernanceError) as reconcile_error:
+        server._require_current_full_reconcile_auth(
+            _ctx(
+                {"project_id": project_id},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "observer_session_id": session_id,
+                    "observer_route_token_ref": route_token_ref,
+                },
+            ),
+            conn,
+            "graph_current_full_reconcile",
+        )
+    assert reconcile_error.value.code == "observer_route_token_proof_required"
+    assert reconcile_error.value.details["proof_error"] == (
+        "route_token_ref_invalid"
+    )
+    assert reconcile_error.value.details["route_token_ref_error_code"] == (
+        "route_token_ref_storage_scope_mismatch"
+    )
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+def test_ac_dev_first_route_issue_rolls_back_contract_when_route_persist_fails(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DEV-DIRECT-ROUTE-BOOTSTRAP-ROLLBACK"
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    body = prepared["issue_body"]
+    before = tuple(conn.iterdump())
+
+    def reject_route_persistence(*_args, **_kwargs):
+        raise RuntimeError("injected route persistence failure")
+
+    monkeypatch.setattr(
+        observer_route_context,
+        "persist_route_token_ref",
+        reject_route_persistence,
+    )
+
+    with pytest.raises(RuntimeError, match="injected route persistence failure"):
+        server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": prepared["project_id"]},
+                method="POST",
+                body=body,
+            )
+        )
+
+    assert tuple(conn.iterdump()) == before
+    assert conn.execute(
+        "SELECT 1 FROM contract_runtime_executions "
+        "WHERE contract_execution_id=?",
+        (prepared["task_id"],),
+    ).fetchone() is None
+
+
+@pytest.mark.parametrize(
+    "attack_kind",
+    [
+        "wrong_body_file",
+        "wrong_body_cex",
+        "wrong_query_head",
+        "repeated_query_ref",
+        "secret_body_field",
+    ],
+)
+def test_ac_dev_first_route_issue_wrong_world_or_secret_is_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    attack_kind,
+):
+    backlog_id = f"AC-DEV-DIRECT-ROUTE-BOOTSTRAP-REJECT-{attack_kind}"
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    body = copy.deepcopy(prepared["issue_body"])
+    query: dict[str, list[str]] = {}
+    secret = "PRIVATE-DEV-ROUTE-BOOTSTRAP-SENTINEL"
+    if attack_kind == "wrong_body_file":
+        body["target_files"] = [f"agent/{secret}.py"]
+    elif attack_kind == "wrong_body_cex":
+        body["task_id"] = f"cex-{secret}"
+    elif attack_kind == "wrong_query_head":
+        query["target_head_commit"] = ["1" * 40]
+    elif attack_kind == "repeated_query_ref":
+        query["target_ref"] = [
+            server.AC_DEV_BRANCH,
+            f"refs/heads/{secret}",
+        ]
+    else:
+        body["route_token"] = secret
+    before = tuple(conn.iterdump())
+
+    if not query:
+        with pytest.raises((GovernanceError, ValidationError)):
+            server._guard_dev_runtime_request(
+                method="POST",
+                path=(
+                    "/api/projects/aming-claw/observer/route-context/issue"
+                ),
+                path_params={"project_id": prepared["project_id"]},
+                body=body,
+            )
+        assert tuple(conn.iterdump()) == before
+
+    with pytest.raises((GovernanceError, ValidationError)) as rejected:
+        server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": prepared["project_id"]},
+                method="POST",
+                body=body,
+                query=query,
+            )
+        )
+
+    details = getattr(rejected.value, "details", {}) or {}
+    serialized = json.dumps(details, sort_keys=True)
+    assert secret not in serialized
+    assert details.get("writes_performed") is False
+    assert details.get("zero_write_rejection") is True
+    assert details.get("public_safe") is True
+    assert details.get("secret_safe") is True
+    assert tuple(conn.iterdump()) == before
 
 
 @pytest.mark.parametrize(

@@ -3200,6 +3200,78 @@ _dev_source_root_keys = (
     "repo_root",
 )
 
+def _onboard_runtime_selector_keys() -> tuple[str, ...]:
+    return (
+        *_dev_source_root_keys,
+        "target_ref",
+        "branch",
+        "branch_ref",
+        "requested_branch_ref",
+        "runtime_port",
+        "port",
+        "target_head_commit",
+        "head_commit",
+        "candidate_commit_sha",
+        "requested_commit",
+        "commit_sha",
+        "base_commit",
+        "task_id",
+        "contract_execution_id",
+    )
+
+
+def _onboard_runtime_selector_claims(
+    body: Mapping[str, Any] | None,
+    query: Mapping[str, Any] | None,
+) -> dict[str, list[Any]]:
+    """Retain every body/query selector value without precedence collapse."""
+
+    body_map = body if isinstance(body, Mapping) else {}
+    query_map = query if isinstance(query, Mapping) else {}
+    claims: dict[str, list[Any]] = {}
+    for field in _onboard_runtime_selector_keys():
+        body_value = body_map.get(field)
+        if isinstance(body_value, Sequence) and not isinstance(
+            body_value, (str, bytes, bytearray)
+        ):
+            claims[field] = list(body_value)
+        elif body_value not in (None, ""):
+            claims[field] = [body_value]
+        query_value = query_map.get(field)
+        if isinstance(query_value, Sequence) and not isinstance(
+            query_value, (str, bytes, bytearray)
+        ):
+            claims.setdefault(field, []).extend(query_value)
+        elif query_value not in (None, ""):
+            claims.setdefault(field, []).append(query_value)
+    return claims
+
+
+def _route_registry_storage_project_id(project_id: str) -> str:
+    """Map canonical AC route scope to this runtime plane's physical registry."""
+
+    canonical = str(project_id or "").strip()
+    if _runtime_plane() != "dev" or canonical != "aming-claw":
+        return canonical
+    world = _operator_supervised_direct_main_dev_world_authority()
+    namespace_hash = str(world.get("namespace_hash") or "").strip()
+    if world.get("accepted") is not True or not namespace_hash:
+        raise GovernanceError(
+            "ac_dev_route_registry_world_invalid",
+            "dev route registry requires the exact loaded Direct world",
+            409,
+            {
+                "runtime_plane": "dev",
+                "project_id": canonical,
+                "world_hash": str(world.get("world_hash") or ""),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "public_safe": True,
+                "secret_safe": True,
+            },
+        )
+    return direct_main_dev_storage_project_id(canonical, namespace_hash)
+
 
 def _dev_exact_source_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -3251,6 +3323,7 @@ def _dev_write_path_allowed(path: str) -> bool:
         "/api/projects/aming-claw/observer-root-route-context",
         "/api/projects/aming-claw/onboard-route-guide",
         "/api/projects/aming-claw/onboard-route-guide/capsule",
+        "/api/projects/aming-claw/observer/route-context/issue",
         "/api/graph-governance/aming-claw/query",
         "/api/graph-governance/aming-claw/query-traces/start",
         "/api/graph-governance/aming-claw/reconcile/full",
@@ -3304,6 +3377,13 @@ def _guard_dev_runtime_request(
                 "dev writes are limited to AC repair backlog/timeline/"
                 "ContractRuntime, candidate-only graph, and QA evidence"
             ),
+        )
+
+    if path == "/api/projects/aming-claw/observer/route-context/issue":
+        _ac_dev_direct_route_issue_precheck_from_request(
+            project_id="aming-claw",
+            body=body,
+            query={},
         )
 
     root_required = path in {
@@ -3756,6 +3836,7 @@ def _mint_first_run_bootstrap_route_gate(
             observer_route_context.persist_route_token_ref(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=issued["route_token_ref"],
                 token=issued["route_token"],
             )
@@ -6309,6 +6390,13 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, dict) else {}
 
+    if _runtime_plane() == "dev":
+        return _handle_ac_dev_direct_route_context_issue(
+            ctx,
+            project_id=project_id,
+            body=body,
+        )
+
     # Authorization: this endpoint mints a WRITE-authorizing route token, so the
     # caller must declare the observer role. The shared operator gate does not
     # cleanly apply here — in token-free mode anonymous callers get a coordinator
@@ -6613,6 +6701,7 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             observer_route_context.attach_same_scope_reissue_proof(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=str(issued.get("route_token_ref") or ""),
                 token=issued["route_token"],
             )
@@ -6642,6 +6731,7 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             observer_route_context.persist_route_token_ref(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=issued["route_token_ref"],
                 token=issued["route_token"],
             )
@@ -6811,6 +6901,7 @@ def handle_observer_route_context_renew(ctx: RequestContext):
         renewed = observer_route_context.renew_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
@@ -9725,6 +9816,7 @@ def _require_current_full_reconcile_auth(
         resolved = _orc.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
@@ -15700,6 +15792,7 @@ def _observer_graph_query_route_authority(
         resolved = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             renew_within_seconds=observer_route_context.ROUTE_TOKEN_REF_RENEW_WITHIN_SECONDS,
         )
@@ -17712,6 +17805,7 @@ def _contract_runtime_resolve_append_scoped_child_route(
         resolved = observer_route_context.resolve_route_token_ref_renewal_descendant(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
         )
     except observer_route_context.RouteTokenRefError as exc:
@@ -18371,7 +18465,10 @@ def _parallel_branch_allocate_precheck_receipt_signing_key(
              WHERE project_id = ? AND route_token_ref = ?
              LIMIT 1
             """,
-            (str(project_id or "").strip(), normalized_ref),
+            (
+                _route_registry_storage_project_id(project_id),
+                normalized_ref,
+            ),
         ).fetchone()
         if normalized_ref
         else None
@@ -46309,6 +46406,7 @@ def _runtime_context_worker_projected_route_identity(
         resolved = observer_route_context.resolve_route_token_ref_renewal_descendant(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=persisted["route_token_ref"],
         )
     except (observer_route_context.RouteTokenRefError, sqlite3.Error, ValueError) as exc:
@@ -46484,6 +46582,9 @@ def _runtime_context_verified_allocation_route_successor(
         resolved = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=expected_scope["project_id"],
+            storage_project_id=_route_registry_storage_project_id(
+                expected_scope["project_id"]
+            ),
             route_token_ref=exact_identity["route_token_ref"],
             route_id=exact_identity["route_id"],
             route_context_hash=exact_identity["route_context_hash"],
@@ -46503,6 +46604,9 @@ def _runtime_context_verified_allocation_route_successor(
             resolved = observer_route_context.resolve_route_token_ref_renewal_descendant(
                 conn,
                 project_id=expected_scope["project_id"],
+                storage_project_id=_route_registry_storage_project_id(
+                    expected_scope["project_id"]
+                ),
                 route_token_ref=exact_identity["route_token_ref"],
             )
         except (observer_route_context.RouteTokenRefError, sqlite3.Error, ValueError):
@@ -46856,6 +46960,7 @@ def _runtime_context_verified_post_read_route_successor(
         resolved = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=canonical["route_token_ref"],
             route_id=canonical["route_id"],
             route_context_hash=canonical["route_context_hash"],
@@ -48159,6 +48264,7 @@ def _runtime_context_rejoin_resolved_ref_route_identity(
                 _orc.resolve_route_token_ref_renewal_descendant(
                     conn,
                     project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
                     route_token_ref=expected_ref,
                 )
             )
@@ -52177,6 +52283,7 @@ def _runtime_context_safe_ref_prestartup_reissue_authority(
             candidate = observer_route_context.resolve_route_token_ref(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=route_token_ref,
                 backlog_id=str(context.backlog_id or "").strip(),
                 task_id=route_task_id,
@@ -59441,7 +59548,10 @@ def _runtime_context_contract_update_allocation_identity_anchor(
           FROM observer_route_token_refs
          WHERE project_id = ? AND route_token_ref = ? AND status = 'active'
         """,
-        (project_id, allocation_route["route_token_ref"]),
+        (
+            _route_registry_storage_project_id(project_id),
+            allocation_route["route_token_ref"],
+        ),
     ).fetchall()
     if len(route_rows) != 1:
         return {}
@@ -60690,6 +60800,7 @@ def _runtime_context_current_reissue_route_binding(
         resolved = observer_route_context.resolve_route_token_ref_renewal_descendant(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=historical["route_token_ref"],
         )
     except (
@@ -61828,6 +61939,7 @@ def _runtime_context_legacy_v1_rejoin_audit(
             candidate = observer_route_context.resolve_route_token_ref(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=str(
                     route_identity.get("route_token_ref") or ""
                 ).strip(),
@@ -76878,6 +76990,7 @@ def _parallel_branch_finish_gate_route_token_binding(
         resolved = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             route_id=str(route_identity.get("route_id") or ""),
             route_context_hash=str(route_identity.get("route_context_hash") or ""),
@@ -78382,6 +78495,7 @@ def _parallel_branch_merge_route_ref_scope(
         resolved = _orc.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=ref,
         )
     except _orc.RouteTokenRefError:
@@ -104547,6 +104661,7 @@ def _resolve_route_token_ref_server_side(
         resolved = _orc.resolve_route_token_ref(
             conn,
             project_id=pid,
+            storage_project_id=_route_registry_storage_project_id(pid),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
@@ -104612,6 +104727,7 @@ def _verify_route_token_binding_server_side(
         return _orc.verify_route_token_binding(
             conn,
             project_id=pid,
+            storage_project_id=_route_registry_storage_project_id(pid),
             token=token,
             route_token_ref=explicit_ref,
             backlog_id=backlog_id,
@@ -108861,6 +108977,7 @@ def _observer_root_route_identity_from_route_token_ref(
         resolved = _orc.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
@@ -121181,6 +121298,7 @@ def _resolve_contract_runtime_observer_proof(
         resolved = _orc.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=contract_execution_id,
@@ -140890,6 +141008,9 @@ def _contract_runtime_parentless_direct_main_root_route_action_authority(
     """Validate the immutable root route action set shared by entry and close."""
 
     normalized_project_id = str(project_id or "").strip()
+    storage_project_id = _route_registry_storage_project_id(
+        normalized_project_id
+    )
     normalized_route_token_ref = str(route_token_ref or "").strip()
     expected_actions = list(
         _OPERATOR_SUPERVISED_DIRECT_MAIN_HISTORICAL_ROOT_ROUTE_ACTIONS
@@ -140902,7 +141023,7 @@ def _contract_runtime_parentless_direct_main_root_route_action_authority(
             FROM observer_route_token_refs
             WHERE project_id = ? AND route_token_ref = ?
             """,
-            (normalized_project_id, normalized_route_token_ref),
+            (storage_project_id, normalized_route_token_ref),
         ).fetchone()
         if conn is not None
         and normalized_project_id
@@ -141160,6 +141281,7 @@ def _onboard_service_route_token_ref_state(
         resolved = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=task_id,
@@ -144231,26 +144353,9 @@ def _require_onboard_dev_selector_endpoint(
         backlog_id=backlog_id,
     )
     if _runtime_plane() == "dev":
-        selector_fields = (
-            *_dev_source_root_keys,
-            "target_ref",
-            "branch",
-            "branch_ref",
-            "requested_branch_ref",
-            "runtime_port",
-            "port",
-            "target_head_commit",
-            "head_commit",
-            "candidate_commit_sha",
-            "requested_commit",
-            "commit_sha",
-            "base_commit",
-            "task_id",
-            "contract_execution_id",
-        )
         has_explicit_selector = any(
             str(value or "").strip()
-            for field in selector_fields
+            for field in _onboard_runtime_selector_keys()
             for value in _operator_supervised_direct_main_request_claim_values(
                 request_body,
                 field,
@@ -144621,32 +144726,23 @@ def _operator_supervised_direct_main_generic_crud_rejection(
     return result
 
 
-def _operator_supervised_direct_main_route_authority(
-    conn,
+def _operator_supervised_direct_main_route_authority_from_resolved(
     *,
     project_id: str,
     backlog_id: str,
     contract_execution_id: str,
     route_token_ref: str,
+    row_files: Sequence[str],
+    route: Mapping[str, Any] | None,
+    route_error: str = "",
 ) -> dict[str, Any]:
-    """Resolve the exact full-round route and closed backlog file fence."""
+    """Validate one resolved or freshly server-minted exact Direct route."""
 
-    from . import observer_route_context
-
+    route = route if isinstance(route, Mapping) else {}
     route_token_ref = str(route_token_ref or "").strip()
-    row_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
-    try:
-        route = observer_route_context.resolve_route_token_ref(
-            conn,
-            project_id=project_id,
-            route_token_ref=route_token_ref,
-            backlog_id=backlog_id,
-            task_id=contract_execution_id,
-        )
-        route_error = ""
-    except observer_route_context.RouteTokenRefError as exc:
-        route = {}
-        route_error = str(exc)
+    row_files = sorted(
+        {str(path or "").strip() for path in row_files if str(path or "").strip()}
+    )
     allowed_actions = sorted(
         {
             str(action or "").strip()
@@ -144715,6 +144811,44 @@ def _operator_supervised_direct_main_route_authority(
     }
     authority["authority_hash"] = stable_sha256(authority)
     return authority
+
+
+def _operator_supervised_direct_main_route_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+) -> dict[str, Any]:
+    """Resolve the exact full-round route and closed backlog file fence."""
+
+    from . import observer_route_context
+
+    route_token_ref = str(route_token_ref or "").strip()
+    row_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
+    try:
+        route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+        )
+        route_error = ""
+    except observer_route_context.RouteTokenRefError as exc:
+        route = {}
+        route_error = str(exc)
+    return _operator_supervised_direct_main_route_authority_from_resolved(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        route_token_ref=route_token_ref,
+        row_files=row_files,
+        route=route,
+        route_error=route_error,
+    )
 
 
 def _operator_supervised_direct_main_world_ref(
@@ -144804,6 +144938,111 @@ def _operator_supervised_direct_main_world_ref(
     }
     authority["authority_hash"] = stable_sha256(authority)
     return authority
+
+
+def _operator_supervised_direct_main_create_fresh_runtime(
+    conn,
+    runtime: ContractRuntime,
+    *,
+    project_id: str,
+    backlog_id: str,
+    selected_revision: str,
+    execution_id: str,
+    route_token_ref: str,
+    route_authority: Mapping[str, Any],
+    world_ref: Mapping[str, Any],
+    dev_world: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Create one fresh Direct record from server-validated route authority."""
+
+    current_world_ref = _operator_supervised_direct_main_world_ref(
+        project_id=project_id,
+    )
+    if not (
+        world_ref.get("accepted") is True
+        and current_world_ref.get("accepted") is True
+        and stable_sha256(dict(world_ref))
+        == stable_sha256(dict(current_world_ref))
+    ):
+        raise GovernanceError(
+            "operator_supervised_direct_main_world_ref_changed",
+            "Direct Main pre-mutation world changed before execution start",
+            422,
+            {
+                "expected_world_ref": dict(world_ref),
+                "current_world_ref": current_world_ref,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    project_root = Path(str(world_ref["target_project_root"])).resolve()
+    head_commit = str(world_ref["base_commit"])
+    binding = {
+        "schema_version": (
+            "operator_supervised_direct_main.runtime_binding.v1"
+        ),
+        "strict_runtime_binding_required": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "route_identity": dict(route_authority["route_identity"]),
+        "owned_files": list(route_authority["row_declared_files"]),
+        "target_files": list(route_authority["row_declared_files"]),
+        "target_project_root": str(project_root),
+        "worktree_path": str(project_root),
+        "base_commit": head_commit,
+        "target_head_commit": head_commit,
+        "pre_mutation_world_ref": dict(world_ref),
+        "runtime_world_authority": dict(dev_world),
+        "stable_visible_chain_projection_written": not bool(dev_world),
+        "same_execution_retry_allowed": False,
+        "same_generation_retry_allowed": False,
+        "post_hoc_pass_backfill_allowed": False,
+    }
+    binding["binding_hash"] = stable_sha256(binding)
+    record = runtime.start_execution(
+        "operator_supervised_direct_main",
+        version="v1",
+        revision=selected_revision,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        actor_role="observer",
+        contract_execution_id=execution_id,
+        root_contract_execution_id=execution_id,
+        contract_chain_id=_contract_runtime_stable_id(
+            "cchain-direct-main",
+            project_id,
+            backlog_id,
+            selected_revision,
+            str(dev_world.get("namespace_hash") or ""),
+        ),
+        route_token_ref=route_token_ref,
+        role_binding={
+            "observer": "observer",
+            "qa": "qa",
+            "binding_source": (
+                "operator_supervised_direct_main_route_authority"
+            ),
+        },
+        backlog_lineage={
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "task_id": execution_id,
+        },
+        metadata={
+            "facade": "observer_direct_mutation_exception",
+            "generic_crud_exposed": False,
+            "operator_supervised_direct_main_runtime_binding": binding,
+            "operator_supervised_direct_main_route_authority": dict(
+                route_authority
+            ),
+        },
+    )
+    if not dev_world:
+        upsert_contract_chain_root_current_binding(conn, record)
+    return runtime.current_record(execution_id, actor_role="observer")
 
 
 def _operator_supervised_direct_main_start_runtime(
@@ -144921,94 +145160,18 @@ def _operator_supervised_direct_main_start_runtime(
             )
         return runtime.current_record(execution_id, actor_role="observer")
 
-    current_world_ref = _operator_supervised_direct_main_world_ref(
-        project_id=project_id,
-    )
-    if not (
-        world_ref.get("accepted") is True
-        and current_world_ref.get("accepted") is True
-        and stable_sha256(dict(world_ref))
-        == stable_sha256(dict(current_world_ref))
-    ):
-        raise GovernanceError(
-            "operator_supervised_direct_main_world_ref_changed",
-            "Direct Main pre-mutation world changed before execution start",
-            422,
-            {
-                "expected_world_ref": dict(world_ref),
-                "current_world_ref": current_world_ref,
-                "zero_write_rejection": True,
-                "writes_performed": False,
-            },
-        )
-    project_root = Path(str(world_ref["target_project_root"])).resolve()
-    head_commit = str(world_ref["base_commit"])
-    binding = {
-        "schema_version": (
-            "operator_supervised_direct_main.runtime_binding.v1"
-        ),
-        "strict_runtime_binding_required": True,
-        "server_derived": True,
-        "caller_claims_trusted": False,
-        "project_id": project_id,
-        "backlog_id": backlog_id,
-        "contract_execution_id": execution_id,
-        "route_identity": dict(route_authority["route_identity"]),
-        "owned_files": list(route_authority["row_declared_files"]),
-        "target_files": list(route_authority["row_declared_files"]),
-        "target_project_root": str(project_root),
-        "worktree_path": str(project_root),
-        "base_commit": head_commit,
-        "target_head_commit": head_commit,
-        "pre_mutation_world_ref": dict(world_ref),
-        "runtime_world_authority": dict(dev_world),
-        "stable_visible_chain_projection_written": not bool(dev_world),
-        "same_execution_retry_allowed": False,
-        "same_generation_retry_allowed": False,
-        "post_hoc_pass_backfill_allowed": False,
-    }
-    binding["binding_hash"] = stable_sha256(binding)
-    record = runtime.start_execution(
-        "operator_supervised_direct_main",
-        version="v1",
-        revision=selected_revision,
+    return _operator_supervised_direct_main_create_fresh_runtime(
+        conn,
+        runtime,
         project_id=project_id,
         backlog_id=backlog_id,
-        actor_role="observer",
-        contract_execution_id=execution_id,
-        root_contract_execution_id=execution_id,
-        contract_chain_id=_contract_runtime_stable_id(
-            "cchain-direct-main",
-            project_id,
-            backlog_id,
-            selected_revision,
-            str(dev_world.get("namespace_hash") or ""),
-        ),
+        selected_revision=selected_revision,
+        execution_id=execution_id,
         route_token_ref=route_token_ref,
-        role_binding={
-            "observer": "observer",
-            "qa": "qa",
-            "binding_source": (
-                "operator_supervised_direct_main_route_authority"
-            ),
-        },
-        backlog_lineage={
-            "project_id": project_id,
-            "backlog_id": backlog_id,
-            "task_id": execution_id,
-        },
-        metadata={
-            "facade": "observer_direct_mutation_exception",
-            "generic_crud_exposed": False,
-            "operator_supervised_direct_main_runtime_binding": binding,
-            "operator_supervised_direct_main_route_authority": (
-                route_authority
-            ),
-        },
+        route_authority=route_authority,
+        world_ref=world_ref,
+        dev_world=dev_world,
     )
-    if not dev_world:
-        upsert_contract_chain_root_current_binding(conn, record)
-    return runtime.current_record(execution_id, actor_role="observer")
 
 
 def _operator_supervised_direct_main_pre_mutation_fingerprint(
@@ -145954,6 +146117,459 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "raw_route_token_required": False,
         "raw_route_token_exposed": False,
     }
+
+
+def _ac_dev_direct_route_issue_rejection(
+    *,
+    code: str,
+    message: str,
+    body: Mapping[str, Any] | None = None,
+    expected_body: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> GovernanceError:
+    """Build one secret-safe physical-zero-write bootstrap rejection."""
+
+    details = {
+        "schema_version": "ac_dev_direct_route_bootstrap.rejection.v1",
+        "runtime_plane": "dev",
+        "required_endpoint": "http://127.0.0.1:40008",
+        "request_body_hash": stable_sha256(dict(body or {})),
+        "expected_body_hash": stable_sha256(dict(expected_body or {})),
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "mutation_performed": False,
+        "contract_runtime_mutated": False,
+        "route_registry_mutated": False,
+        "public_safe": True,
+        "secret_safe": True,
+        "raw_route_token_exposed": False,
+    }
+    details.update(dict(extra or {}))
+    return GovernanceError(code, message, 409, details)
+
+
+def _ac_dev_direct_route_issue_precheck(
+    conn,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    query: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Prove one request is exactly the current guide-issued Direct route action."""
+
+    if _runtime_plane() != "dev" or project_id != "aming-claw":
+        raise _ac_dev_direct_route_issue_rejection(
+            code="ac_dev_direct_route_bootstrap_wrong_runtime",
+            message="Direct route bootstrap is confined to AC dev runtime",
+            body=body,
+        )
+    backlog_id = str(body.get("backlog_id") or "").strip()
+    task_id = str(body.get("task_id") or "").strip()
+    if not backlog_id or not task_id:
+        raise _ac_dev_direct_route_issue_rejection(
+            code="ac_dev_direct_route_bootstrap_identity_incomplete",
+            message="guide-bound Direct route bootstrap identity is incomplete",
+            body=body,
+            extra={
+                "missing_fields": [
+                    field
+                    for field, value in (
+                        ("backlog_id", backlog_id),
+                        ("task_id", task_id),
+                    )
+                    if not value
+                ]
+            },
+        )
+    selector_claims = _onboard_runtime_selector_claims(body, query)
+    guide = _onboard_operator_supervised_direct_main_runtime_response(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref="",
+        role="observer",
+        work_type="operator_supervised_direct_main",
+        response_view="full",
+        request_body=body,
+        request_selector_claims=selector_claims,
+    )
+    issue_projection = (
+        guide.get("observer_route_context_issue")
+        if isinstance(guide.get("observer_route_context_issue"), Mapping)
+        else {}
+    )
+    expected_body = (
+        dict(issue_projection.get("copy_safe_body") or {})
+        if isinstance(issue_projection.get("copy_safe_body"), Mapping)
+        else {}
+    )
+    if not expected_body or dict(body) != expected_body:
+        raise _ac_dev_direct_route_issue_rejection(
+            code="ac_dev_direct_route_bootstrap_not_guide_bound",
+            message=(
+                "dev route issuance requires the exact current guide copy-safe body"
+            ),
+            body=body,
+            expected_body=expected_body,
+            extra={
+                "contract_execution_id_hash": stable_sha256(
+                    {
+                        "contract_execution_id": str(
+                            guide.get("contract_execution_id") or ""
+                        )
+                    }
+                ),
+                "guide_world_hash": str(
+                    (guide.get("runtime_world_authority") or {}).get(
+                        "world_hash"
+                    )
+                    if isinstance(
+                        guide.get("runtime_world_authority"), Mapping
+                    )
+                    else ""
+                ),
+            },
+        )
+    world = (
+        dict(guide.get("runtime_world_authority") or {})
+        if isinstance(guide.get("runtime_world_authority"), Mapping)
+        else {}
+    )
+    if not world or world.get("accepted") is not True:
+        raise _ac_dev_direct_route_issue_rejection(
+            code="ac_dev_direct_route_bootstrap_world_invalid",
+            message="dev route bootstrap requires one exact loaded runtime world",
+            body=body,
+            expected_body=expected_body,
+        )
+    return {
+        "schema_version": "ac_dev_direct_route_bootstrap.precheck.v1",
+        "accepted": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "guide": guide,
+        "expected_body": expected_body,
+        "world_authority": world,
+        "selected_revision": str(guide.get("contract_revision") or "").strip(),
+        "zero_write_projection": True,
+    }
+
+
+def _ac_dev_direct_route_issue_precheck_from_request(
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+    query: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Middleware-safe read-only wrapper for exact dev route issuance."""
+
+    conn = get_connection(project_id)
+    try:
+        return _ac_dev_direct_route_issue_precheck(
+            conn,
+            project_id=project_id,
+            body=body,
+            query=query,
+        )
+    finally:
+        conn.close()
+
+
+def _ac_dev_direct_route_issue_response(
+    *,
+    project_id: str,
+    issued: Mapping[str, Any],
+    idempotent_replay: bool,
+    contract_execution_id: str,
+) -> dict[str, Any]:
+    """Project one initial or idempotently replayed dev route issue result."""
+
+    route_token = (
+        dict(issued.get("route_token") or {})
+        if isinstance(issued.get("route_token"), Mapping)
+        else {}
+    )
+    route_token_ref = str(issued.get("route_token_ref") or "").strip()
+    route_identity = {
+        key: str(route_token.get(key) or "")
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+        )
+        if str(route_token.get(key) or "").strip()
+    }
+    route_identity["route_token_ref"] = route_token_ref
+    response = {
+        "ok": True,
+        "project_id": project_id,
+        "route_token": route_token,
+        "route_token_ref": route_token_ref,
+        "route_identity": route_identity,
+        "canonical_route_identity": dict(route_identity),
+        "merge_queue_id": str(issued.get("merge_queue_id") or ""),
+        "execute_backlog_row_payload": dict(
+            issued.get("execute_backlog_row_payload") or {}
+        ),
+        "provider": dict(issued.get("provider") or {}),
+        "ref_registered": True,
+        "contract_execution_id": contract_execution_id,
+        "dev_world_materialized": True,
+        "atomic_route_and_contract_materialization": True,
+        "idempotent_replay": idempotent_replay,
+        "writes_performed": not idempotent_replay,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+        "route_token_public_identity_only": True,
+        "public_safe": True,
+        "secret_safe": True,
+    }
+    for key, value in route_identity.items():
+        response.setdefault(key, value)
+    for key in ("parent_route_lineage", "child_route_lineage", "route_lineage"):
+        value = route_token.get(key)
+        if isinstance(value, Mapping):
+            response[key] = dict(value)
+    return response
+
+
+def _ac_dev_direct_route_issue_replay(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    task_id: str,
+    record: Mapping[str, Any],
+    route_storage_project_id: str,
+) -> dict[str, Any]:
+    """Read one existing exact dev CEX+route as an idempotent issue replay."""
+
+    from . import observer_route_context
+
+    route_token_ref = str(record.get("route_token_ref") or "").strip()
+    resolved = observer_route_context.resolve_route_token_ref(
+        conn,
+        project_id=project_id,
+        storage_project_id=route_storage_project_id,
+        route_token_ref=route_token_ref,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    if not isinstance(resolved, Mapping):
+        raise _ac_dev_direct_route_issue_rejection(
+            code="ac_dev_direct_route_bootstrap_replay_route_missing",
+            message="existing dev Direct execution has no active bound route",
+        )
+    token = dict(resolved)
+    token.setdefault("route_token_ref", route_token_ref)
+    merge_queue_id = observer_route_context.derive_merge_queue_id(token)
+    issued = {
+        "route_token": token,
+        "route_token_ref": route_token_ref,
+        "merge_queue_id": merge_queue_id,
+        "execute_backlog_row_payload": (
+            observer_route_context.build_execute_backlog_row_payload(
+                token,
+                route_token_ref=route_token_ref,
+                merge_queue_id=merge_queue_id,
+            )
+        ),
+        "provider": {},
+    }
+    return _ac_dev_direct_route_issue_response(
+        project_id=project_id,
+        issued=issued,
+        idempotent_replay=True,
+        contract_execution_id=task_id,
+    )
+
+
+def _handle_ac_dev_direct_route_context_issue(
+    ctx: RequestContext,
+    *,
+    project_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Atomically materialize the first exact dev Direct CEX and route."""
+
+    from . import observer_route_context
+
+    conn = get_connection(project_id)
+    try:
+        _ac_dev_direct_route_issue_precheck(
+            conn,
+            project_id=project_id,
+            body=body,
+            query=ctx.query,
+        )
+        with sqlite_write_lock():
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                precheck = _ac_dev_direct_route_issue_precheck(
+                    conn,
+                    project_id=project_id,
+                    body=body,
+                    query=ctx.query,
+                )
+                backlog_id = str(precheck["backlog_id"])
+                task_id = str(precheck["task_id"])
+                route_storage_project_id = (
+                    _route_registry_storage_project_id(project_id)
+                )
+                strict_records = _operator_supervised_direct_main_strict_records(
+                    conn,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                )
+                if len(strict_records) == 1:
+                    response = _ac_dev_direct_route_issue_replay(
+                        conn,
+                        project_id=project_id,
+                        backlog_id=backlog_id,
+                        task_id=task_id,
+                        record=strict_records[0],
+                        route_storage_project_id=route_storage_project_id,
+                    )
+                    conn.rollback()
+                    return response
+                if len(strict_records) > 1:
+                    raise _ac_dev_direct_route_issue_rejection(
+                        code="ac_dev_direct_route_bootstrap_execution_ambiguous",
+                        message="dev Direct bootstrap execution is not unique",
+                        body=body,
+                    )
+                orphan_routes = conn.execute(
+                    """
+                    SELECT route_token_ref
+                    FROM observer_route_token_refs
+                    WHERE project_id=? AND backlog_id=? AND task_id=?
+                    """,
+                    (route_storage_project_id, backlog_id, task_id),
+                ).fetchall()
+                if orphan_routes:
+                    raise _ac_dev_direct_route_issue_rejection(
+                        code="ac_dev_direct_route_bootstrap_orphan_route",
+                        message=(
+                            "a route exists without its exact dev Direct execution"
+                        ),
+                        body=body,
+                        extra={"orphan_route_count": len(orphan_routes)},
+                    )
+                expected_body = dict(precheck["expected_body"])
+                world = dict(precheck["world_authority"])
+                issued = observer_route_context.issue_observer_write_route_context(
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                    target_files=list(expected_body.get("target_files") or []),
+                    allowed_actions=list(
+                        expected_body.get("allowed_actions") or []
+                    ),
+                    evidence_refs=list(expected_body.get("evidence_refs") or []),
+                    project_root=Path(
+                        str(world.get("target_project_root") or "")
+                    ),
+                )
+                token = (
+                    issued.get("route_token")
+                    if isinstance(issued.get("route_token"), dict)
+                    else {}
+                )
+                token.setdefault(
+                    "owned_files",
+                    list(expected_body.get("owned_files") or []),
+                )
+                route_token_ref = str(
+                    issued.get("route_token_ref") or ""
+                ).strip()
+                resolved_route = {**dict(token), "route_token_ref": route_token_ref}
+                route_authority = (
+                    _operator_supervised_direct_main_route_authority_from_resolved(
+                        project_id=project_id,
+                        backlog_id=backlog_id,
+                        contract_execution_id=task_id,
+                        route_token_ref=route_token_ref,
+                        row_files=list(expected_body.get("target_files") or []),
+                        route=resolved_route,
+                    )
+                )
+                if route_authority.get("accepted") is not True:
+                    raise _ac_dev_direct_route_issue_rejection(
+                        code="ac_dev_direct_route_bootstrap_route_invalid",
+                        message="server-minted dev Direct route failed exact scope",
+                        body=body,
+                        expected_body=expected_body,
+                    )
+                runtime = _contract_runtime(conn)
+                world_ref = _operator_supervised_direct_main_world_ref(
+                    project_id=project_id,
+                )
+                _operator_supervised_direct_main_create_fresh_runtime(
+                    conn,
+                    runtime,
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    selected_revision=str(precheck["selected_revision"]),
+                    execution_id=task_id,
+                    route_token_ref=route_token_ref,
+                    route_authority=route_authority,
+                    world_ref=world_ref,
+                    dev_world=world,
+                )
+                observer_route_context.persist_route_token_ref(
+                    conn,
+                    project_id=project_id,
+                    storage_project_id=route_storage_project_id,
+                    route_token_ref=route_token_ref,
+                    token=token,
+                )
+                if conn.in_transaction:
+                    conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        resolved = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=route_storage_project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+        if not isinstance(resolved, Mapping):
+            raise RuntimeError(
+                "atomic dev Direct route persistence did not read back"
+            )
+        public_token = dict(resolved)
+        public_token.setdefault("route_token_ref", route_token_ref)
+        public_merge_queue_id = observer_route_context.derive_merge_queue_id(
+            public_token
+        )
+        public_issued = {
+            **dict(issued),
+            "route_token": public_token,
+            "route_token_ref": route_token_ref,
+            "merge_queue_id": public_merge_queue_id,
+            "execute_backlog_row_payload": (
+                observer_route_context.build_execute_backlog_row_payload(
+                    public_token,
+                    route_token_ref=route_token_ref,
+                    merge_queue_id=public_merge_queue_id,
+                )
+            ),
+        }
+        return _ac_dev_direct_route_issue_response(
+            project_id=project_id,
+            issued=public_issued,
+            idempotent_replay=False,
+            contract_execution_id=task_id,
+        )
+    finally:
+        conn.close()
 
 
 def _operator_supervised_direct_main_bound_pre_mutation_events(
@@ -153274,6 +153890,7 @@ def _onboard_route_guide_parent_route_resolution(
         resolved = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
         )
@@ -158598,6 +159215,7 @@ def _onboard_legacy_operator_hotfix_attempt_projection(
             route = observer_route_context.resolve_route_token_ref(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=route_token_ref,
                 backlog_id=target_backlog_id,
                 task_id=target_parent_execution_id,
@@ -162665,6 +163283,7 @@ def _contract_runtime_route_token_ref_binding(
         resolved = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=contract_execution_id,
@@ -162868,6 +163487,7 @@ def _contract_runtime_issue_child_route_token_ref(
         resolved_parent = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=parent_route_token_ref,
             backlog_id=backlog_id,
         )
@@ -162935,6 +163555,7 @@ def _contract_runtime_issue_child_route_token_ref(
         observer_route_context.persist_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=child_ref,
             token=issued.get("route_token")
             if isinstance(issued.get("route_token"), Mapping)
@@ -162954,6 +163575,7 @@ def _contract_runtime_issue_child_route_token_ref(
             observer_route_context.persist_route_token_ref_lineage(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=child_ref,
                 parent_route_lineage=parent_lineage,
                 child_route_lineage=child_lineage,
@@ -163070,6 +163692,7 @@ def _contract_runtime_existing_child_route_token_binding(
             resolved_parent = observer_route_context.resolve_route_token_ref(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=parent_route_token_ref,
                 backlog_id=backlog_id,
             ) or {}
@@ -163183,6 +163806,7 @@ def _direct_fix_issue_child_route_token_ref(
         resolved_parent = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=parent_route_token_ref,
             backlog_id=backlog_id,
         )
@@ -163264,6 +163888,7 @@ def _direct_fix_issue_child_route_token_ref(
         observer_route_context.persist_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=child_ref,
             token=issued.get("route_token")
             if isinstance(issued.get("route_token"), Mapping)
@@ -163283,6 +163908,7 @@ def _direct_fix_issue_child_route_token_ref(
             observer_route_context.persist_route_token_ref_lineage(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=child_ref,
                 parent_route_lineage=parent_lineage,
                 child_route_lineage=child_lineage,
@@ -163379,6 +164005,7 @@ def _direct_fix_existing_child_route_token_binding(
         resolved = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=child_ref,
             backlog_id=backlog_id,
             task_id=child_id,
@@ -163568,6 +164195,7 @@ def _direct_fix_dispatch_route_identity(
         resolved = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=contract_execution_id,
@@ -165930,6 +166558,7 @@ def _onboard_service_contract_update_continuation_authority(
             resolved_route = observer_route_context.resolve_route_token_ref(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=normalized_route_token_ref,
                 backlog_id=backlog_id,
                 task_id=expected_execution_id,
@@ -166024,6 +166653,7 @@ def _observer_hotfix_onboard_service_parent_for_successor(
         route = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
             task_id=parent_contract_execution_id,
@@ -167442,6 +168072,7 @@ def _mf_parallel_successor_runtime_enter(
                 observer_route_context.resolve_route_token_ref(
                     conn,
                     project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
                     route_token_ref=route_token_ref,
                     backlog_id=backlog_id,
                 )
@@ -167899,6 +168530,7 @@ def _mf_parallel_terminal_supersession_route_authority(
             resolved = observer_route_context.resolve_route_token_ref(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=route_ref,
                 backlog_id=backlog_id,
                 task_id=source_execution_id,
@@ -170017,6 +170649,7 @@ def _apply_supersession_hook_if_needed(
         _orc_hook.supersede_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=_ref,
         )
     except Exception as exc:  # noqa: BLE001
@@ -182910,7 +183543,7 @@ def _contract_runtime_parentless_direct_main_materialized_qa_event(
         FROM observer_route_token_refs
         WHERE project_id = ? AND route_token_ref = ?
         """,
-        (project_id, route_token_ref),
+        (_route_registry_storage_project_id(project_id), route_token_ref),
     ).fetchone()
     try:
         registered_actions = set(json.loads(route_row["allowed_actions_json"] or "[]"))
@@ -184279,7 +184912,7 @@ def _contract_runtime_parentless_direct_main_close_authority_gate(
             FROM observer_route_token_refs
             WHERE project_id = ? AND route_token_ref = ?
             """,
-            (project_id, root_ref),
+            (_route_registry_storage_project_id(project_id), root_ref),
         ).fetchone()
         if conn is not None and root_ref
         else None
@@ -192171,6 +192804,7 @@ def _observer_runtime_text_prepare_worker_route_identity(
         resolved = observer_route_context.resolve_route_token_ref(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_token_ref,
             backlog_id=backlog_id,
         )
@@ -192301,6 +192935,7 @@ def _observer_runtime_text_prepare_worker_route_identity(
     observer_route_context.persist_route_token_ref(
         conn,
         project_id=project_id,
+        storage_project_id=_route_registry_storage_project_id(project_id),
         route_token_ref=str(issued.get("route_token_ref") or ""),
         token=issued.get("route_token") if isinstance(issued.get("route_token"), Mapping) else {},
     )
@@ -192318,6 +192953,7 @@ def _observer_runtime_text_prepare_worker_route_identity(
         observer_route_context.persist_route_token_ref_lineage(
             conn,
             project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=str(issued.get("route_token_ref") or ""),
             parent_route_lineage=parent_lineage,
             child_route_lineage=child_lineage,
@@ -192956,6 +193592,7 @@ def _record_bounded_worker_dispatch_event(
             resolved = _orc.resolve_route_token_ref(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=route_token_ref,
                 backlog_id=backlog_id,
                 route_id=str(dispatch.get("route_id") or ""),
@@ -193022,6 +193659,7 @@ def _record_bounded_worker_dispatch_event(
                 registered_lineage = _orc.persist_route_token_ref_lineage(
                     conn,
                     project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
                     route_token_ref=route_token_ref,
                     parent_route_lineage=parent_route_lineage,
                     child_route_lineage=child_route_lineage,
@@ -206633,6 +207271,7 @@ def _require_integration_epoch_release_authority(
             resolved = observer_route_context.resolve_route_token_ref(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=route_token_ref,
                 backlog_id=backlog_id,
                 task_id=task_id,
@@ -207816,38 +208455,7 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
     route_token_ref = _contract_runtime_ref_value(
         ctx, "route_token_ref", "observer_route_token_ref"
     )
-    selector_claims: dict[str, list[Any]] = {}
-    for field in (
-        *_dev_source_root_keys,
-        "target_ref",
-        "branch",
-        "branch_ref",
-        "requested_branch_ref",
-        "runtime_port",
-        "port",
-        "target_head_commit",
-        "head_commit",
-        "candidate_commit_sha",
-        "requested_commit",
-        "commit_sha",
-        "base_commit",
-        "task_id",
-        "contract_execution_id",
-    ):
-        body_value = body.get(field)
-        if isinstance(body_value, Sequence) and not isinstance(
-            body_value, (str, bytes, bytearray)
-        ):
-            selector_claims[field] = list(body_value)
-        elif body_value not in (None, ""):
-            selector_claims[field] = [body_value]
-        query_value = ctx.query.get(field) if isinstance(ctx.query, Mapping) else None
-        if isinstance(query_value, Sequence) and not isinstance(
-            query_value, (str, bytes, bytearray)
-        ):
-            selector_claims.setdefault(field, []).extend(query_value)
-        elif query_value not in (None, ""):
-            selector_claims.setdefault(field, []).append(query_value)
+    selector_claims = _onboard_runtime_selector_claims(body, ctx.query)
     queue_view: dict[str, Any] = {}
     with DBContext(project_id) as conn:
         from .parallel_branch_runtime import get_active_integration_epoch
@@ -211401,7 +212009,7 @@ def _route_registry_renewal_chain_projection(
           FROM observer_route_token_refs
          WHERE project_id=? AND route_token_ref IN ({placeholders})
         """,
-        (project_id, *chain_refs),
+        (_route_registry_storage_project_id(project_id), *chain_refs),
     ).fetchall()
     rows_by_ref = {
         str(dict(row).get("route_token_ref") or "").strip(): dict(row)
@@ -211597,6 +212205,7 @@ def _enrich_timeline_events_with_route_token_lineage(
             resolved = _orc.resolve_route_token_ref_renewal_descendant(
                 conn,
                 project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
                 route_token_ref=route_token_ref,
             )
             renewal = (
@@ -211622,6 +212231,7 @@ def _enrich_timeline_events_with_route_token_lineage(
                 resolved = _orc.resolve_route_token_ref(
                     conn,
                     project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
                     route_token_ref=route_token_ref,
                     backlog_id=str(event.get("backlog_id") or ""),
                     route_id=route_id,
