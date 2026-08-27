@@ -194577,6 +194577,400 @@ def test_ac_dev_live_route_renew_concurrent_same_ref_writes_once_and_replays(
         readback.close()
 
 
+def test_ac_dev_live_route_renew_uses_verify_only_session_reader_under_authorizer(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    backlog_id = "AC-DEV-LIVE-ROUTE-RENEW-VERIFY-ONLY-SESSION"
+    case = _prepare_ac_dev_route_renew_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    project_id = case["project_id"]
+    storage_project_id = server.direct_main_dev_storage_project_id(
+        project_id,
+        case["world"]["namespace_hash"],
+    )
+    stable_before = tuple(
+        conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    )
+    physical_before = conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+        (storage_project_id,),
+    ).fetchone()[0]
+    denied_schema_actions: list[int] = []
+
+    def authorizer(action, *args):
+        if action in governance_db._DEV_DENIED_SCHEMA_ACTIONS:
+            denied_schema_actions.append(action)
+        return governance_db._dev_schema_authorizer(action, *args)
+
+    assert conn.in_transaction is False
+    conn.set_authorizer(authorizer)
+    try:
+        renewed = server.handle_observer_route_context_renew(
+            _ctx(
+                {"project_id": project_id},
+                method="POST",
+                body=case["renew_body"],
+            )
+        )
+    finally:
+        conn.set_authorizer(None)
+
+    assert renewed["ok"] is True
+    assert renewed["writes_performed"] is True
+    assert denied_schema_actions == []
+    assert conn.in_transaction is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+        (storage_project_id,),
+    ).fetchone()[0] == physical_before + 1
+    assert tuple(
+        conn.execute(
+            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    ) == stable_before
+
+
+@pytest.mark.parametrize(
+    ("session_state", "expected_state", "expected_computed"),
+    [
+        ("missing", "missing", "missing"),
+        ("foreign", "foreign", "foreign"),
+        ("idle", "stale", "idle"),
+        ("stale", "stale", "stale"),
+        ("closed", "stale", "closed"),
+        ("revoked", "stale", "revoked"),
+        ("invalid_status", "stale", "active"),
+    ],
+)
+def test_ac_dev_verify_only_session_reader_rejects_nonactive_states_zero_write(
+    conn,
+    monkeypatch,
+    tmp_path,
+    session_state,
+    expected_state,
+    expected_computed,
+):
+    backlog_id = f"AC-DEV-ROUTE-RENEW-SESSION-{session_state.upper()}"
+    case = _prepare_ac_dev_route_renew_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=backlog_id,
+    )
+    session_id = case["session_id"]
+    if session_state == "missing":
+        conn.execute(
+            "DELETE FROM observer_sessions WHERE session_id=?",
+            (session_id,),
+        )
+    elif session_state == "foreign":
+        conn.execute(
+            "UPDATE observer_sessions SET project_id='other-project' "
+            "WHERE session_id=?",
+            (session_id,),
+        )
+    elif session_state == "idle":
+        idle_at = datetime.now(timezone.utc) - timedelta(
+            seconds=observer_session.IDLE_AFTER_SEC + 1
+        )
+        conn.execute(
+            "UPDATE observer_sessions SET last_seen_at=? WHERE session_id=?",
+            (idle_at.strftime("%Y-%m-%dT%H:%M:%SZ"), session_id),
+        )
+    elif session_state == "stale":
+        conn.execute(
+            "UPDATE observer_sessions SET last_seen_at='2000-01-01T00:00:00Z' "
+            "WHERE session_id=?",
+            (session_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE observer_sessions SET status=? WHERE session_id=?",
+            (session_state, session_id),
+        )
+    conn.commit()
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    before_data_version = conn.execute("PRAGMA data_version").fetchone()[0]
+    assert conn.in_transaction is False
+
+    authority = server._ac_dev_read_only_observer_session_authority(
+        conn,
+        project_id=case["project_id"],
+        session_id=session_id,
+    )
+    assert authority["state"] == expected_state
+    assert authority["computed_status"] == expected_computed
+    assert set(authority) == {
+        "schema_version",
+        "state",
+        "session_id",
+        "project_id",
+        "computed_status",
+        "verify_only",
+    }
+    with pytest.raises(GovernanceError) as rejected:
+        server._guard_dev_runtime_request(
+            method="POST",
+            path="/api/projects/aming-claw/observer/route-context/renew",
+            path_params={"project_id": case["project_id"]},
+            body=case["renew_body"],
+            query={},
+        )
+    assert rejected.value.code == "ac_dev_direct_route_renew_session_invalid"
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.in_transaction is False
+    assert conn.total_changes == before_changes
+    assert conn.execute("PRAGMA data_version").fetchone()[0] == before_data_version
+    assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "schema_fault",
+    [
+        "missing_table",
+        "missing_column",
+        "missing_index",
+        "stale_index",
+        "wrong_owner_index",
+    ],
+)
+def test_ac_dev_verify_only_session_schema_faults_are_typed_and_zero_write(
+    conn,
+    monkeypatch,
+    schema_fault,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    observer_session.ensure_schema(conn)
+    if schema_fault == "missing_table":
+        conn.execute("DROP TABLE observer_sessions")
+    elif schema_fault == "missing_column":
+        conn.execute("ALTER TABLE observer_sessions DROP COLUMN observer_kind")
+    elif schema_fault == "missing_index":
+        conn.execute("DROP INDEX idx_observer_sessions_last_seen")
+    elif schema_fault == "stale_index":
+        conn.execute("DROP INDEX idx_observer_sessions_project_status")
+        conn.execute(
+            "CREATE INDEX idx_observer_sessions_project_status "
+            "ON observer_sessions(project_id, session_id)"
+        )
+    else:
+        conn.execute("DROP INDEX idx_observer_sessions_project_status")
+        conn.execute(
+            "CREATE TABLE observer_sessions_wrong_owner ("
+            "project_id TEXT NOT NULL, status TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE INDEX idx_observer_sessions_project_status "
+            "ON observer_sessions_wrong_owner(project_id, status)"
+        )
+    conn.commit()
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    before_data_version = conn.execute("PRAGMA data_version").fetchone()[0]
+    denied_schema_actions: list[int] = []
+
+    def authorizer(action, *args):
+        if action in governance_db._DEV_DENIED_SCHEMA_ACTIONS:
+            denied_schema_actions.append(action)
+        return governance_db._dev_schema_authorizer(action, *args)
+
+    conn.set_authorizer(authorizer)
+    try:
+        with pytest.raises(
+            governance_db.DevRuntimeSchemaVerificationError
+        ) as rejected:
+            server._ac_dev_verify_observer_session_read_schema(conn)
+    finally:
+        conn.set_authorizer(None)
+
+    assert rejected.value.code == "ac_dev_verify_only_schema_incompatible"
+    if schema_fault == "missing_table":
+        assert rejected.value.details["missing_tables"] == [
+            "observer_sessions"
+        ]
+    elif schema_fault == "missing_column":
+        assert rejected.value.details["missing_columns"] == {
+            "observer_sessions": ["observer_kind"]
+        }
+    elif schema_fault == "missing_index":
+        assert rejected.value.details["missing_indexes"] == [
+            "idx_observer_sessions_last_seen"
+        ]
+    else:
+        assert "idx_observer_sessions_project_status" in (
+            rejected.value.details["invalid_indexes"]
+        )
+    assert rejected.value.details["ddl_attempted"] is False
+    assert rejected.value.details["writes_performed"] is False
+    assert denied_schema_actions == []
+    assert conn.in_transaction is False
+    assert conn.total_changes == before_changes
+    assert conn.execute("PRAGMA data_version").fetchone()[0] == before_data_version
+    assert tuple(conn.iterdump()) == before
+
+
+def _replace_observer_session_schema_without_token_unique(conn) -> None:
+    conn.execute("DROP TABLE IF EXISTS observer_sessions")
+    conn.executescript(
+        """
+        CREATE TABLE observer_sessions (
+            session_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            observer_kind TEXT NOT NULL DEFAULT '',
+            session_label TEXT NOT NULL DEFAULT '',
+            pid INTEGER NOT NULL DEFAULT 0,
+            cwd TEXT NOT NULL DEFAULT '',
+            capabilities_json TEXT NOT NULL DEFAULT '{}',
+            token_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            registered_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            closed_at TEXT NOT NULL DEFAULT '',
+            revoked_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_observer_sessions_project_status
+            ON observer_sessions(project_id, status);
+        CREATE INDEX idx_observer_sessions_last_seen
+            ON observer_sessions(project_id, last_seen_at);
+        """
+    )
+
+
+@pytest.mark.parametrize(
+    "unique_impostor",
+    ["application", "partial", "expression", "expression_extra"],
+)
+def test_ac_dev_verify_only_session_rejects_token_hash_unique_impostors(
+    conn,
+    monkeypatch,
+    unique_impostor,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    _replace_observer_session_schema_without_token_unique(conn)
+    suffix = {
+        "application": "",
+        "partial": " WHERE token_hash <> 'bypass'",
+        "expression": "",
+        "expression_extra": "",
+    }[unique_impostor]
+    expression = (
+        "lower(token_hash)"
+        if unique_impostor == "expression"
+        else (
+            "token_hash, lower(status)"
+            if unique_impostor == "expression_extra"
+            else "token_hash"
+        )
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX attacker_observer_session_token_hash ON "
+        f"observer_sessions({expression}){suffix}"
+    )
+    conn.commit()
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    denied_schema_actions: list[int] = []
+
+    def authorizer(action, *args):
+        if action in governance_db._DEV_DENIED_SCHEMA_ACTIONS:
+            denied_schema_actions.append(action)
+        return governance_db._dev_schema_authorizer(action, *args)
+
+    conn.set_authorizer(authorizer)
+    try:
+        with pytest.raises(
+            governance_db.DevRuntimeSchemaVerificationError
+        ) as rejected:
+            server._ac_dev_verify_observer_session_read_schema(conn)
+    finally:
+        conn.set_authorizer(None)
+    assert rejected.value.details["missing_unique_constraints"] == {
+        "observer_sessions": [["token_hash"]]
+    }
+    assert rejected.value.details["writes_performed"] is False
+    assert denied_schema_actions == []
+    assert conn.in_transaction is False
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_code"),
+    [
+        ("missing_schema", "ac_dev_verify_only_schema_incompatible"),
+        ("read_denied", "ac_dev_direct_route_renew_session_read_failed"),
+    ],
+)
+def test_ac_dev_route_renew_session_read_failure_is_typed_zero_write_http(
+    conn,
+    monkeypatch,
+    tmp_path,
+    failure_kind,
+    expected_code,
+):
+    case = _prepare_ac_dev_route_renew_case(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=f"AC-DEV-ROUTE-RENEW-HTTP-{failure_kind.upper()}",
+    )
+    if failure_kind == "missing_schema":
+        conn.execute("DROP TABLE observer_sessions")
+        conn.commit()
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    before_data_version = conn.execute("PRAGMA data_version").fetchone()[0]
+
+    def authorizer(action, arg1, *args):
+        if (
+            failure_kind == "read_denied"
+            and action == sqlite3.SQLITE_READ
+            and str(arg1 or "") == "observer_sessions"
+        ):
+            return sqlite3.SQLITE_DENY
+        return governance_db._dev_schema_authorizer(action, arg1, *args)
+
+    handler = _bare_handler()
+    handler.path = (
+        "/api/projects/aming-claw/observer/route-context/renew"
+    )
+    handler._read_body = lambda: copy.deepcopy(case["renew_body"])
+    handler._query_params = lambda: {}
+    captured: dict[str, Any] = {}
+    handler._respond = lambda code, body, *_args: captured.update(
+        code=code,
+        body=body,
+    )
+    conn.set_authorizer(authorizer)
+    try:
+        handler._handle("POST")
+    finally:
+        conn.set_authorizer(None)
+
+    assert captured["code"] == 409
+    assert captured["body"]["error"] == expected_code
+    serialized = json.dumps(captured["body"], sort_keys=True)
+    assert "not authorized" not in serialized.lower()
+    if failure_kind == "read_denied":
+        assert "observer_sessions" not in serialized
+    assert captured["body"]["details"]["writes_performed"] is False
+    assert conn.in_transaction is False
+    assert conn.total_changes == before_changes
+    assert conn.execute("PRAGMA data_version").fetchone()[0] == before_data_version
+    assert tuple(conn.iterdump()) == before
+
+
 def test_ac_dev_first_route_issue_rolls_back_contract_when_route_persist_fails(
     conn,
     monkeypatch,

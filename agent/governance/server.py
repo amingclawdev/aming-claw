@@ -51,6 +51,7 @@ from .db import (
     independent_connection,
     sqlite_write_lock,
     validate_project_id,
+    verify_existing_schema_capabilities,
 )
 from . import role_service
 from . import state_service
@@ -146721,6 +146722,187 @@ def _ac_dev_direct_route_renew_exact_claim(
     return unique[0]
 
 
+def _ac_dev_verify_observer_session_read_schema(conn) -> None:
+    """Verify the stable-owned observer session schema without lazy DDL."""
+
+    verify_existing_schema_capabilities(
+        conn,
+        owner="observer_session.dev_route_renew",
+        required_tables=("observer_sessions",),
+        required_indexes=(
+            "idx_observer_sessions_project_status",
+            "idx_observer_sessions_last_seen",
+        ),
+        required_index_definitions={
+            "idx_observer_sessions_project_status": {
+                "table": "observer_sessions",
+                "sql": (
+                    "CREATE INDEX idx_observer_sessions_project_status "
+                    "ON observer_sessions(project_id, status)"
+                ),
+            },
+            "idx_observer_sessions_last_seen": {
+                "table": "observer_sessions",
+                "sql": (
+                    "CREATE INDEX idx_observer_sessions_last_seen "
+                    "ON observer_sessions(project_id, last_seen_at)"
+                ),
+            },
+        },
+    )
+    expected_columns = {
+        "session_id": ("TEXT", 0, 1),
+        "project_id": ("TEXT", 1, 0),
+        "observer_kind": ("TEXT", 1, 0),
+        "session_label": ("TEXT", 1, 0),
+        "pid": ("INTEGER", 1, 0),
+        "cwd": ("TEXT", 1, 0),
+        "capabilities_json": ("TEXT", 1, 0),
+        "token_hash": ("TEXT", 1, 0),
+        "status": ("TEXT", 1, 0),
+        "registered_at": ("TEXT", 1, 0),
+        "last_seen_at": ("TEXT", 1, 0),
+        "closed_at": ("TEXT", 1, 0),
+        "revoked_at": ("TEXT", 1, 0),
+    }
+    rows = conn.execute('PRAGMA table_info("observer_sessions")').fetchall()
+    actual_columns = {
+        str(row["name"] if isinstance(row, sqlite3.Row) else row[1]): (
+            str(row["type"] if isinstance(row, sqlite3.Row) else row[2]).upper(),
+            int(row["notnull"] if isinstance(row, sqlite3.Row) else row[3]),
+            int(row["pk"] if isinstance(row, sqlite3.Row) else row[5]),
+        )
+        for row in rows
+    }
+    missing = sorted(set(expected_columns) - set(actual_columns))
+    unexpected = sorted(set(actual_columns) - set(expected_columns))
+    invalid: dict[str, dict[str, str]] = {}
+    for column, expected in expected_columns.items():
+        actual = actual_columns.get(column)
+        if actual is None or actual == expected:
+            continue
+        mismatch: dict[str, str] = {}
+        for field, expected_value, actual_value in zip(
+            ("type", "notnull", "pk"),
+            expected,
+            actual,
+        ):
+            if expected_value != actual_value:
+                mismatch[f"expected_{field}"] = str(expected_value)
+                mismatch[f"actual_{field}"] = str(actual_value)
+        invalid[column] = mismatch
+    if unexpected:
+        invalid["__column_set__"] = {
+            "expected_columns": ",".join(sorted(expected_columns)),
+            "actual_columns": ",".join(sorted(actual_columns)),
+        }
+
+    token_hash_unique = False
+    for index_row in conn.execute(
+        'PRAGMA index_list("observer_sessions")'
+    ).fetchall():
+        unique = int(
+            index_row["unique"]
+            if isinstance(index_row, sqlite3.Row)
+            else index_row[2]
+        )
+        origin = str(
+            index_row["origin"]
+            if isinstance(index_row, sqlite3.Row)
+            else index_row[3]
+        )
+        partial = int(
+            index_row["partial"]
+            if isinstance(index_row, sqlite3.Row)
+            else index_row[4]
+        )
+        if not unique or origin != "u" or partial:
+            continue
+        index_name = str(
+            index_row["name"]
+            if isinstance(index_row, sqlite3.Row)
+            else index_row[1]
+        )
+        escaped_index_name = index_name.replace('"', '""')
+        key_columns = tuple(
+            (
+                str(item["name"] if isinstance(item, sqlite3.Row) else item[2])
+                if (
+                    item["name"] if isinstance(item, sqlite3.Row) else item[2]
+                )
+                is not None
+                else None
+            )
+            for item in conn.execute(
+                f'PRAGMA index_xinfo("{escaped_index_name}")'
+            ).fetchall()
+            if int(item["key"] if isinstance(item, sqlite3.Row) else item[5])
+        )
+        if key_columns == ("token_hash",):
+            token_hash_unique = True
+            break
+    if missing or invalid or not token_hash_unique:
+        raise DevRuntimeSchemaVerificationError(
+            "observer_session.dev_route_renew",
+            missing_columns={"observer_sessions": missing} if missing else {},
+            invalid_columns={"observer_sessions": invalid} if invalid else {},
+            missing_unique_constraints=(
+                {"observer_sessions": (("token_hash",),)}
+                if not token_hash_unique
+                else {}
+            ),
+        )
+
+
+def _ac_dev_read_only_observer_session_authority(
+    conn,
+    *,
+    project_id: str,
+    session_id: str,
+) -> dict[str, Any]:
+    """Read one public session identity without migration or credential data."""
+
+    _ac_dev_verify_observer_session_read_schema(conn)
+    row = conn.execute(
+        "SELECT session_id, project_id, status, last_seen_at "
+        "FROM observer_sessions WHERE session_id=?",
+        (str(session_id or "").strip(),),
+    ).fetchone()
+    if row is None:
+        return {
+            "schema_version": "ac_dev_observer_session_authority.v1",
+            "state": "missing",
+            "session_id": str(session_id or "").strip(),
+            "project_id": str(project_id or "").strip(),
+            "computed_status": "missing",
+            "verify_only": True,
+        }
+    public_row = {
+        "session_id": str(row["session_id"] or "").strip(),
+        "project_id": str(row["project_id"] or "").strip(),
+        "status": str(row["status"] or "").strip(),
+        "last_seen_at": str(row["last_seen_at"] or "").strip(),
+    }
+    if public_row["project_id"] != str(project_id or "").strip():
+        state = "foreign"
+        computed_status = "foreign"
+    else:
+        computed_status = observer_session.computed_session_status(public_row)
+        state = (
+            "active"
+            if public_row["status"] == "active" and computed_status == "active"
+            else "stale"
+        )
+    return {
+        "schema_version": "ac_dev_observer_session_authority.v1",
+        "state": state,
+        "session_id": public_row["session_id"],
+        "project_id": public_row["project_id"],
+        "computed_status": computed_status,
+        "verify_only": True,
+    }
+
+
 def _ac_dev_direct_route_renew_precheck(
     conn,
     *,
@@ -146865,12 +147047,23 @@ def _ac_dev_direct_route_renew_precheck(
                 str(item.get("field") or "") for item in selector_mismatches
             ],
         )
-    session = observer_session.get_session(
-        conn,
-        project_id=project_id,
-        session_id=session_id,
-    )
-    if not session or str(session.get("computed_status") or "") != "active":
+    try:
+        session = _ac_dev_read_only_observer_session_authority(
+            conn,
+            project_id=project_id,
+            session_id=session_id,
+        )
+    except DevRuntimeSchemaVerificationError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        raise _ac_dev_direct_route_renew_rejection(
+            code="ac_dev_direct_route_renew_session_read_failed",
+            message="dev route renewal session verification was unavailable",
+            body=body,
+            query=query_map,
+            mismatch_fields=["observer_session_id"],
+        ) from exc
+    if str(session.get("state") or "") != "active":
         raise _ac_dev_direct_route_renew_rejection(
             code="ac_dev_direct_route_renew_session_invalid",
             message="dev route renewal requires the exact active observer session",
