@@ -17603,6 +17603,404 @@ def _parallel_branch_allocate_precheck_receipt_verification(
     }
 
 
+def _parallel_branch_allocate_precheck_custody(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    task_id: str,
+    worker_id: str,
+    worker_slot_id: str,
+    repository_root: Path,
+    worktree_path: Path,
+    branch_ref: str,
+    base_commit: str,
+    owned_files: Sequence[str],
+) -> dict[str, Any]:
+    """Preflight existing branch/worktree custody without changing either.
+
+    The allocator's worktree helper is intentionally idempotent when the final
+    directory already contains ``.git``.  That behavior is useful for an exact
+    same-lane retry, but it is not sufficient for an atomic multi-lane plan: an
+    unrelated branch or worktree may otherwise be discovered only after an
+    earlier lane has persisted its RuntimeContext.  Resolve the complete
+    physical and RuntimeContext custody here while the precheck is still
+    zero-write.
+    """
+
+    canonical_worktree = worktree_path.expanduser().resolve()
+    normalized_branch = str(branch_ref or "").strip()
+    normalized_base = str(base_commit or "").strip().lower()
+    normalized_files = _runtime_context_public_file_values(owned_files)
+
+    def git_probe(*args: str, allow_missing: bool = False) -> str:
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=str(repository_root),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise GovernanceError(
+                "parallel_branch_allocate_precheck_custody_collision",
+                "parallel allocation custody could not be proven without mutation",
+                409,
+                {
+                    "task_id": task_id,
+                    "field": "git_custody_probe",
+                    "expected": "readable_registered_repository_custody",
+                    "actual": type(exc).__name__,
+                    "collisions": [
+                        {
+                            "kind": "custody_probe_failed",
+                            "branch_ref": normalized_branch,
+                            "worktree_path": str(canonical_worktree),
+                        }
+                    ],
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "mutation_performed": False,
+                    "runtime_context_writes": 0,
+                    "worktree_mutations": 0,
+                    "existing_worktree_touched": False,
+                    "retry_same_world_allowed": True,
+                },
+            ) from exc
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+        if allow_missing:
+            return ""
+        raise GovernanceError(
+            "parallel_branch_allocate_precheck_custody_collision",
+            "parallel allocation custody could not be proven without mutation",
+            409,
+            {
+                "task_id": task_id,
+                "field": "git_custody_probe",
+                "expected": "readable_registered_repository_custody",
+                "actual": "probe_failed",
+                "collisions": [
+                    {
+                        "kind": "custody_probe_failed",
+                        "branch_ref": normalized_branch,
+                        "worktree_path": str(canonical_worktree),
+                    }
+                ],
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "runtime_context_writes": 0,
+                "worktree_mutations": 0,
+                "existing_worktree_touched": False,
+                "retry_same_world_allowed": True,
+            },
+        )
+
+    worktree_rows: list[dict[str, Any]] = []
+    for block in git_probe("worktree", "list", "--porcelain").split("\n\n"):
+        row: dict[str, Any] = {}
+        for line in block.splitlines():
+            key, separator, value = line.partition(" ")
+            if separator:
+                row[key] = value.strip()
+            elif key:
+                row[key] = True
+        if row.get("worktree"):
+            worktree_rows.append(row)
+
+    branch_head = git_probe(
+        "rev-parse",
+        "--verify",
+        normalized_branch,
+        allow_missing=True,
+    ).lower()
+    branch_exists = bool(branch_head)
+    branch_rows = [
+        row
+        for row in worktree_rows
+        if str(row.get("branch") or "").strip() == normalized_branch
+    ]
+    path_rows = [
+        row
+        for row in worktree_rows
+        if Path(str(row.get("worktree") or "")).expanduser().resolve()
+        == canonical_worktree
+    ]
+    path_exists = canonical_worktree.exists()
+
+    context_rows: list[Any] = []
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'parallel_branch_runtime_contexts'"
+    ).fetchone()
+    if table_exists is not None:
+        for row in conn.execute(
+            """
+            SELECT project_id, task_id, runtime_context_id, backlog_id,
+                   parent_task_id, target_project_id, worker_id,
+                   worker_slot_id, branch_ref,
+                   worktree_path, base_commit, head_commit, status,
+                   owned_files_json, target_files_json
+              FROM parallel_branch_runtime_contexts
+             WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchall():
+            row_task_id = str(_row_get(row, "task_id", "") or "").strip()
+            row_branch = str(_row_get(row, "branch_ref", "") or "").strip()
+            row_worktree_text = str(
+                _row_get(row, "worktree_path", "") or ""
+            ).strip()
+            row_worktree = (
+                Path(row_worktree_text).expanduser().resolve()
+                if row_worktree_text
+                else None
+            )
+            if (
+                row_task_id == task_id
+                or row_branch == normalized_branch
+                or row_worktree == canonical_worktree
+            ):
+                context_rows.append(row)
+
+    collision_present = bool(
+        branch_exists or branch_rows or path_rows or path_exists or context_rows
+    )
+    projection = {
+        "schema_version": "parallel_branch_allocate_precheck.custody.v1",
+        "status": "available",
+        "task_id": task_id,
+        "branch_ref": normalized_branch,
+        "worktree_path": str(canonical_worktree),
+        "branch_exists": branch_exists,
+        "worktree_exists": path_exists,
+        "registered_worktree_count": len(path_rows),
+        "branch_checkout_count": len(branch_rows),
+        "runtime_context_candidate_count": len(context_rows),
+        "writes_performed": False,
+        "mutation_performed": False,
+        "existing_worktree_touched": False,
+    }
+    if not collision_present:
+        return projection
+
+    exact_contexts: list[Any] = []
+    context_mismatches: list[dict[str, Any]] = []
+    for row in context_rows:
+        raw_owned_files = _row_get(row, "owned_files_json", "[]") or "[]"
+        raw_target_files = _row_get(row, "target_files_json", "[]") or "[]"
+        try:
+            persisted_files_value = json.loads(str(raw_owned_files))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            persisted_files_value = []
+        if not persisted_files_value:
+            try:
+                persisted_files_value = json.loads(str(raw_target_files))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                persisted_files_value = []
+        persisted_files = _runtime_context_public_file_values(
+            persisted_files_value
+            if isinstance(persisted_files_value, list)
+            else []
+        )
+        persisted_worktree_text = str(
+            _row_get(row, "worktree_path", "") or ""
+        ).strip()
+        persisted_worktree = (
+            str(Path(persisted_worktree_text).expanduser().resolve())
+            if persisted_worktree_text
+            else ""
+        )
+        comparisons = (
+            ("project_id", project_id, str(_row_get(row, "project_id", "") or "")),
+            ("backlog_id", backlog_id, str(_row_get(row, "backlog_id", "") or "")),
+            (
+                "contract_execution_id",
+                contract_execution_id,
+                str(_row_get(row, "parent_task_id", "") or ""),
+            ),
+            ("task_id", task_id, str(_row_get(row, "task_id", "") or "")),
+            (
+                "worker_id",
+                worker_id,
+                str(_row_get(row, "worker_id", "") or ""),
+            ),
+            (
+                "worker_slot_id",
+                worker_slot_id,
+                str(_row_get(row, "worker_slot_id", "") or ""),
+            ),
+            (
+                "target_project_id",
+                project_id,
+                str(_row_get(row, "target_project_id", "") or ""),
+            ),
+            (
+                "branch_ref",
+                normalized_branch,
+                str(_row_get(row, "branch_ref", "") or ""),
+            ),
+            ("worktree_path", str(canonical_worktree), persisted_worktree),
+            (
+                "base_commit",
+                normalized_base,
+                str(_row_get(row, "base_commit", "") or "").lower(),
+            ),
+            (
+                "head_commit",
+                normalized_base,
+                str(_row_get(row, "head_commit", "") or "").lower(),
+            ),
+            (
+                "status",
+                "worktree_ready",
+                str(_row_get(row, "status", "") or ""),
+            ),
+            ("owned_files", normalized_files, persisted_files),
+        )
+        mismatches = [
+            {"field": field, "expected": expected, "actual": actual}
+            for field, expected, actual in comparisons
+            if actual != expected
+        ]
+        if mismatches:
+            context_mismatches.append(
+                {
+                    "runtime_context_id": str(
+                        _row_get(row, "runtime_context_id", "") or ""
+                    ),
+                    "mismatches": mismatches,
+                }
+            )
+        else:
+            exact_contexts.append(row)
+
+    exact_worktree_row = (
+        path_rows[0]
+        if len(path_rows) == 1
+        and len(branch_rows) == 1
+        and path_rows[0] is branch_rows[0]
+        else None
+    )
+    exact_worktree_head = str(
+        (exact_worktree_row or {}).get("HEAD") or ""
+    ).strip().lower()
+    exact_physical_custody = bool(
+        branch_exists
+        and branch_head == normalized_base
+        and path_exists
+        and (canonical_worktree / ".git").exists()
+        and exact_worktree_row is not None
+        and exact_worktree_head == normalized_base
+    )
+    if (
+        len(context_rows) == 1
+        and len(exact_contexts) == 1
+        and exact_physical_custody
+    ):
+        exact = exact_contexts[0]
+        runtime_context_id = str(
+            _row_get(exact, "runtime_context_id", "") or ""
+        ).strip()
+        return {
+            **projection,
+            "status": "exact_existing_custody_rebind",
+            "exact_existing_custody": True,
+            "runtime_context_id": runtime_context_id,
+            "branch_head": branch_head,
+            "worktree_head": exact_worktree_head,
+            "rebind_action": {
+                "schema_version": (
+                    "parallel_branch_allocate_precheck.existing_custody_rebind.v1"
+                ),
+                "status": "ready",
+                "action": "reuse_exact_runtime_context_without_worktree_mutation",
+                "runtime_context_id": runtime_context_id,
+                "create_worktree": False,
+                "source": (
+                    "parallel_branch_runtime_contexts+git_worktree_list"
+                ),
+                "delete_or_adopt_existing_worktree": False,
+                "existing_worktree_touched": False,
+                "writes_performed": False,
+            },
+        }
+
+    collisions: list[dict[str, Any]] = []
+    if branch_exists:
+        collisions.append(
+            {
+                "kind": "branch_ref_exists",
+                "branch_ref": normalized_branch,
+                "expected_head": normalized_base,
+                "actual_head": branch_head,
+                "checkout_paths": sorted(
+                    str(row.get("worktree") or "") for row in branch_rows
+                ),
+            }
+        )
+    if path_exists or path_rows:
+        collisions.append(
+            {
+                "kind": "worktree_path_exists",
+                "worktree_path": str(canonical_worktree),
+                "registered_rows": [dict(row) for row in path_rows],
+            }
+        )
+    if context_rows:
+        collisions.append(
+            {
+                "kind": "runtime_context_custody_exists",
+                "runtime_context_ids": sorted(
+                    str(_row_get(row, "runtime_context_id", "") or "")
+                    for row in context_rows
+                ),
+                "exact_candidate_count": len(exact_contexts),
+                "candidate_mismatches": context_mismatches,
+            }
+        )
+    first_mismatch = (
+        context_mismatches[0]["mismatches"][0]
+        if context_mismatches and context_mismatches[0].get("mismatches")
+        else {
+            "field": "existing_custody",
+            "expected": "unallocated_or_one_exact_source_backed_custodian",
+            "actual": "mismatched_or_ambiguous",
+        }
+    )
+    raise GovernanceError(
+        "parallel_branch_allocate_precheck_custody_collision",
+        (
+            "planned branch/worktree custody is mismatched or ambiguous; "
+            "the atomic allocation group remains zero-write"
+        ),
+        409,
+        {
+            "task_id": task_id,
+            "field": first_mismatch["field"],
+            "expected": first_mismatch["expected"],
+            "actual": first_mismatch["actual"],
+            "collisions": collisions,
+            "custody_preflight": projection,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "runtime_context_writes": 0,
+            "worktree_mutations": 0,
+            "existing_worktree_touched": False,
+            "retry_same_world_allowed": True,
+            "next_legal_action": (
+                "allocate_fresh_branch_and_worktree_or_use_exact_"
+                "source_backed_rebind"
+            ),
+            "delete_or_adopt_existing_worktree": False,
+        },
+    )
+
+
 def _parallel_branch_allocate_precheck_copy_safe_body(
     conn,
     *,
@@ -17783,6 +18181,20 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
     # returned for diagnosis/copy safety even though allocate derives it again.
     branch_ref = f"refs/heads/{branch_prefix}/{task_slug}{attempt_suffix}"
     merge_queue_id = str(lane.get("merge_queue_id") or f"mq-{lane_slug}").strip()
+    custody_preflight = _parallel_branch_allocate_precheck_custody(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=contract_execution_id,
+        task_id=task_id,
+        worker_id=worker_id,
+        worker_slot_id=str(lane.get("worker_slot_id") or worker_id).strip(),
+        repository_root=repository_root,
+        worktree_path=canonical_worktree,
+        branch_ref=branch_ref,
+        base_commit=base_commit,
+        owned_files=owned_files,
+    )
 
     stripped_fields = {
         "project_id",
@@ -17835,7 +18247,10 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
             "retry_policy": retry_policy,
             "route_token_ref": route_token_ref,
             "route_identity": route_identity,
-            "create_worktree": True,
+            "create_worktree": (
+                custody_preflight.get("status")
+                != "exact_existing_custody_rebind"
+            ),
         }
     )
     copy_safe_body.update(route_identity)
@@ -17857,6 +18272,7 @@ def _parallel_branch_allocate_precheck_copy_safe_body(
         "canonical_merge_queue_id": merge_queue_id,
         "commit_verification": commit_verification,
         "path_diagnostics": path_diagnostics,
+        "custody_preflight": custody_preflight,
         "caller_supplied_batch_identity_fields": [
             field
             for field in ("batch_id", "merge_queue_id")
@@ -18755,6 +19171,13 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                 },
             )
 
+        custody_by_task_id = {
+            str(lane.get("task_id") or "").strip(): dict(
+                lane.get("custody_preflight") or {}
+            )
+            for lane in lane_projections
+            if isinstance(lane.get("custody_preflight"), Mapping)
+        }
         for body in copy_safe_bodies:
             if contract_update_authority:
                 body["contract_version"] = "contract_update.v1"
@@ -18773,6 +19196,18 @@ def handle_graph_governance_parallel_branch_allocate_precheck(
                     _PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS
                 ),
             }
+            custody_preflight = custody_by_task_id.get(
+                str(body.get("task_id") or "").strip(),
+                {},
+            )
+            if (
+                custody_preflight.get("status")
+                == "exact_existing_custody_rebind"
+                and isinstance(custody_preflight.get("rebind_action"), Mapping)
+            ):
+                body["allocation_precheck"]["existing_custody_rebind"] = dict(
+                    custody_preflight["rebind_action"]
+                )
             retry_authority = retry_rebind_authorities.get(
                 str(body.get("task_id") or "").strip()
             )
