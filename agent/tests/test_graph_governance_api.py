@@ -66935,6 +66935,7 @@ def test_runtime_context_startup_rejects_template_and_raw_transcript_ids_before_
 
 def _startup_identity_preflight_valid_body() -> dict[str, str]:
     return {
+        "actual_host_worker_id": "codex-worker:startup-identity-preflight",
         "host_startup_id": "codex-thread:startup-identity-preflight",
         "host_session_id": "codex-session:startup-identity-preflight",
         "worker_session_id": "codex-session:startup-identity-preflight",
@@ -66961,6 +66962,11 @@ def test_runtime_context_startup_identity_preflight_accepts_concrete_ref_or_path
 @pytest.mark.parametrize(
     ("case", "expected_field", "expected_reason"),
     [
+        (
+            "empty_actual_host_worker",
+            "actual_host_worker_id",
+            "identity_required_nonempty",
+        ),
         ("empty_host_startup", "host_startup_id", "identity_required_nonempty"),
         ("empty_host_session", "host_session_id", "identity_required_nonempty"),
         ("empty_worker_session", "worker_session_id", "identity_required_nonempty"),
@@ -66992,6 +66998,7 @@ def test_runtime_context_startup_identity_preflight_rejects_empty_missing_or_con
     body = _startup_identity_preflight_valid_body()
     if case.startswith("empty_"):
         field = {
+            "empty_actual_host_worker": "actual_host_worker_id",
             "empty_host_startup": "host_startup_id",
             "empty_host_session": "host_session_id",
             "empty_worker_session": "worker_session_id",
@@ -67022,6 +67029,7 @@ def test_runtime_context_startup_identity_preflight_rejects_empty_missing_or_con
 @pytest.mark.parametrize(
     "case",
     [
+        "empty_actual_host_worker",
         "empty_host_startup",
         "empty_host_session",
         "empty_worker_session",
@@ -67041,6 +67049,7 @@ def test_startup_facades_reject_empty_missing_or_conflicting_identity_zero_write
     body = _startup_identity_preflight_valid_body()
     if case.startswith("empty_"):
         field = {
+            "empty_actual_host_worker": "actual_host_worker_id",
             "empty_host_startup": "host_startup_id",
             "empty_host_session": "host_session_id",
             "empty_worker_session": "worker_session_id",
@@ -71903,6 +71912,23 @@ def test_pre_lineage_rejoin_guide_advertises_one_bounded_replacement(
     )
     assert exhausted["eligible"] is False
     assert exhausted["mode"] == "replacement_exhausted"
+
+    before_exhausted = "\n".join(conn.iterdump())
+    with pytest.raises(GovernanceError) as endpoint_rejection:
+        _pre_lineage_rejoin(
+            case,
+            body_updates={
+                "session_token_ref": runtime_context_session_token_ref(replaced),
+                "reason": "a replay cannot synthesize another replacement",
+            },
+        )
+    assert endpoint_rejection.value.code == (
+        "runtime_context_bounded_replacement_rejoin_exhausted"
+    )
+    assert endpoint_rejection.value.details["mutation_performed"] is False
+    assert endpoint_rejection.value.details["credential_rotated"] is False
+    assert "\n".join(conn.iterdump()) == before_exhausted
+
 
 
 def test_mf_parallel_rev10_terminal_supersession_is_atomic_and_idempotent(
