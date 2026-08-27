@@ -765,6 +765,649 @@ def test_post_startup_rejoin_preserves_canonical_worker_and_host_identity(
     )
 
 
+def test_existing_postmerge_comparison_authority_survives_later_current_full(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    """An immutable atomic candidate stays reviewable after main moves."""
+
+    world = _one_worker_postmerge_comparison_world(conn, monkeypatch, tmp_path)
+    later_commit = _commit_test_git_files(
+        world["project_root"],
+        ("src/later_reconciled_change.py",),
+        message="later current-full reconciliation",
+    )
+    state = world["state"]
+    state["target_alignment"].update(
+        {
+            "head_commit": later_commit,
+            "target_commit": later_commit,
+            "index_clean": True,
+            "worktree_clean": True,
+        }
+    )
+    state["current_full"].update(
+        {
+            "merged_commit_sha": later_commit,
+            "reconciled_commit_sha": later_commit,
+            "reconcile_provenance_target_commit": later_commit,
+            "current_canonical_commit_sha": later_commit,
+            "canonical_head_commit": later_commit,
+            "active_snapshot_id": "full-later-current-full",
+            "active_snapshot_commit": later_commit,
+            "reconcile_snapshot_id": "full-later-current-full",
+        }
+    )
+    state["current_full"]["authority_hash"] = server.stable_sha256(
+        {
+            key: value
+            for key, value in state["current_full"].items()
+            if key != "authority_hash"
+        }
+    )
+    _activate_basic_graph(
+        conn,
+        "full-later-current-full",
+        commit_sha=later_commit,
+    )
+    before_record = server._contract_runtime(conn).store.get(
+        world["record"]["contract_execution_id"]
+    )
+    before_queue = list_merge_queue_items(
+        conn,
+        PID,
+        state["queue_items"][0].merge_queue_id,
+    )
+    before_changes = conn.total_changes
+    forged_proof = {
+        **world["proof"],
+        "comparison_base_commit_sha": "f" * 40,
+        "candidate_review_context": {
+            "comparison_base_commit_sha": "e" * 40,
+            "changed_files": ["caller/forged.py"],
+        },
+    }
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=forged_proof,
+    )
+    exact = server._qa_exact_candidate_diff_identity(
+        world["project_root"],
+        base_commit_sha=authority["commit_sha"],
+        candidate_commit_sha=world["candidate_commit"],
+        comparison_base_commit_source=authority["source"],
+    )
+
+    assert authority == {
+        "commit_sha": world["comparison_base"],
+        "source": server._QA_POSTMERGE_COMPARISON_BASE_SOURCE,
+        "lineage_source": (
+            "ContractRuntime.completed_lines."
+            "observer_dispatch_bounded_workers+"
+            "parallel_branch_runtime_contexts+"
+            "observer_merge.durable_merge_authority+"
+            "parallel_branch_merge_queue_items.ordered_merge_lineage"
+        ),
+    }
+    assert exact["comparison_base_commit_sha"] == world["comparison_base"]
+    assert exact["changed_files"] == ["src/combined.py"]
+    assert exact["candidate_diff_hash"].startswith("sha256:")
+    assert batch_jobs.git_commit(world["project_root"]) == later_commit
+    assert conn.total_changes == before_changes
+    assert server._contract_runtime(conn).store.get(
+        world["record"]["contract_execution_id"]
+    ) == before_record
+    assert list_merge_queue_items(
+        conn,
+        PID,
+        state["queue_items"][0].merge_queue_id,
+    ) == before_queue
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "wrong_backlog",
+        "wrong_cex",
+        "wrong_runtime_context",
+        "missing_queue_lineage",
+        "equal_base_candidate",
+        "duplicate_merge_lineage",
+    ),
+)
+def test_existing_postmerge_comparison_authority_rejects_non_unique_lineage(
+    conn,
+    monkeypatch,
+    tmp_path,
+    mutation,
+):
+    """Existing-runtime recovery remains fail-closed and read-only."""
+
+    world = _one_worker_postmerge_comparison_world(conn, monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_rev8_postmerge_qa_authority",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_apply_mf_parallel_context_projection",
+        lambda _conn, *, record, **_kwargs: (
+            record,
+            {"status": "not_projected"},
+        ),
+    )
+    proof = copy.deepcopy(world["proof"])
+    record = server._contract_runtime(conn).store.get(
+        world["record"]["contract_execution_id"]
+    )
+    if mutation == "wrong_backlog":
+        proof["backlog_id"] = "AC-CROSS-BACKLOG"
+    elif mutation == "wrong_cex":
+        proof["task_id"] = "cex-cross-runtime"
+    elif mutation == "wrong_runtime_context":
+        record["completed_lines"][0]["payload"]["bounded_workers"][0][
+            "runtime_context_id"
+        ] = "mfrctx-cross-runtime"
+        server._contract_runtime(conn).store.update(
+            record["contract_execution_id"], record
+        )
+    elif mutation == "missing_queue_lineage":
+        monkeypatch.setattr(
+            parallel_branch_runtime,
+            "get_merge_queue_item",
+            lambda *_args, **_kwargs: None,
+        )
+    elif mutation == "equal_base_candidate":
+        merge = record["completed_lines"][1]["payload"][
+            "durable_merge_authority"
+        ]
+        merge["target_head_before_merge"] = world["candidate_commit"]
+        server._contract_runtime(conn).store.update(
+            record["contract_execution_id"], record
+        )
+        queue_item = replace(
+            world["state"]["queue_items"][0],
+            target_head_before_merge=world["candidate_commit"],
+        )
+        world["state"]["queue_items"][0] = queue_item
+        upsert_merge_queue_item(
+            conn,
+            queue_item,
+            now_iso="2026-08-27T06:00:00Z",
+        )
+        conn.commit()
+    else:
+        duplicate = copy.deepcopy(record["completed_lines"][1])
+        duplicate["line_instance_id"] = "runtime_context:duplicate-lineage"
+        record["completed_lines"].insert(2, duplicate)
+        record["execution_state_revision"] = len(record["completed_lines"])
+        server._contract_runtime(conn).store.update(
+            record["contract_execution_id"], record
+        )
+    before_record = server._contract_runtime(conn).store.get(
+        world["record"]["contract_execution_id"]
+    )
+    before_queue = list_merge_queue_items(
+        conn,
+        PID,
+        world["state"]["queue_items"][0].merge_queue_id,
+    )
+    before_snapshot = store.get_active_graph_snapshot(conn, PID)
+    before_changes = conn.total_changes
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=proof,
+    )
+
+    assert not authority.get("commit_sha")
+    assert conn.total_changes == before_changes
+    assert server._contract_runtime(conn).store.get(
+        world["record"]["contract_execution_id"]
+    ) == before_record
+    assert list_merge_queue_items(
+        conn,
+        PID,
+        world["state"]["queue_items"][0].merge_queue_id,
+    ) == before_queue
+    assert store.get_active_graph_snapshot(conn, PID) == before_snapshot
+
+
+def _strict_direct_main_comparison_world(
+    conn,
+    monkeypatch,
+    tmp_path,
+    *,
+    suffix: str,
+) -> dict[str, Any]:
+    """Create a real rev3 Direct Main round through its public facades."""
+
+    backlog_id = f"AC-DIRECT-MAIN-COMPARISON-{suffix}"
+    project_root = tmp_path / f"direct-main-comparison-{suffix.lower()}"
+    base_commit = _init_test_git_repo(project_root)
+    monkeypatch.setattr(
+        server.project_service,
+        "resolve_project_root",
+        lambda *_args, **_kwargs: project_root,
+    )
+    task_id, route_token_ref, route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+        )
+    )
+    trace_id = "gqt-20260827-" + server.stable_sha256(
+        {"suffix": suffix}
+    )[7:17]
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=trace_id,
+        snapshot_id=f"full-direct-main-pre-mutation-{suffix.lower()}",
+        query_purpose="gate_validation",
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_identity=route_identity,
+        commit_sha=base_commit,
+        target_project_root=str(project_root),
+    )
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_canonical_parentless_direct_main_pre_mutation_body(
+                append_base={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "route_token_ref": route_token_ref,
+                },
+                route_identity=route_identity,
+                allowed_files=["agent/governance/server.py"],
+                graph_trace_ids=[trace_id],
+            ),
+        )
+    )
+    changed_path = project_root / "agent" / "governance" / "server.py"
+    changed_path.parent.mkdir(parents=True, exist_ok=True)
+    changed_path.write_text(
+        f"DIRECT_MAIN_COMPARISON = {suffix!r}\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "agent/governance/server.py"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "commit",
+            "-m",
+            _canonical_parentless_direct_main_commit_message(
+                backlog_id=backlog_id,
+                task_id=task_id,
+                parent_commit=base_commit,
+            ),
+        ],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate_commit = batch_jobs.git_commit(project_root)
+    server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_canonical_parentless_direct_main_implementation_body(
+                backlog_id=backlog_id,
+                task_id=task_id,
+                route_token_ref=route_token_ref,
+                route_identity=route_identity,
+                commit_sha=candidate_commit,
+            ),
+        )
+    )
+    return {
+        "project_root": project_root,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "route_token_ref": route_token_ref,
+        "route_identity": route_identity,
+        "base_commit": base_commit,
+        "candidate_commit": candidate_commit,
+        "trace_id": trace_id,
+    }
+
+
+def test_strict_direct_main_rev3_comparison_authority_persists_exact_diff(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    """Exercise the DG R3-shaped public round, including exact graph trace."""
+
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix="R3-EXACT",
+    )
+    proof = {
+        "backlog_id": world["backlog_id"],
+        "task_id": world["task_id"],
+        "commit_sha": world["candidate_commit"],
+        "comparison_base_commit_sha": "f" * 40,
+        "changed_files": ["caller/forged.py"],
+    }
+    before_changes = conn.total_changes
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof=proof,
+    )
+    assert authority == {
+        "commit_sha": world["base_commit"],
+        "source": server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE,
+        "lineage_source": server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE,
+    }
+    assert conn.total_changes == before_changes
+
+    _activate_basic_graph(
+        conn,
+        "full-direct-main-r3-exact-candidate",
+        commit_sha=world["candidate_commit"],
+    )
+    qa_scope_binding_ref = server._qa_scope_binding_ref(
+        project_id=PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        commit_sha=world["candidate_commit"],
+    )
+    qa_scope = [
+        f"backlog:{world['backlog_id']}",
+        f"task:{world['task_id']}",
+        f"commit:{world['candidate_commit']}",
+        qa_scope_binding_ref,
+    ]
+    registered = server.role_service.register(
+        conn,
+        "qa:strict-direct-main-r3-comparison",
+        PID,
+        "qa",
+        scope=qa_scope,
+    )
+    conn.commit()
+    query_ctx = _ctx_with_role(
+        {"project_id": PID},
+        "qa",
+        method="POST",
+        body={
+            "snapshot_id": "active",
+            "tool": "query_schema",
+            "query_source": "qa",
+            "query_purpose": "independent_verification",
+            "backlog_id": world["backlog_id"],
+            "task_id": world["task_id"],
+            "commit_sha": world["candidate_commit"],
+            "project_root": str(world["project_root"]),
+        },
+    )
+    query_ctx._session.update(
+        {
+            "session_id": registered["session_id"],
+            "principal_id": "qa:strict-direct-main-r3-comparison",
+            "scope": qa_scope,
+        }
+    )
+
+    queried = server.handle_graph_governance_query(query_ctx)
+    trace = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": PID, "trace_id": queried["trace_id"]})
+    )["trace"]
+    identity = trace["graph_query_identity"]
+    assert identity["candidate_commit_sha"] == world["candidate_commit"]
+    assert identity["comparison_base_commit_sha"] == world["base_commit"]
+    assert identity["comparison_base_commit_source"] == (
+        server._QA_DIRECT_MAIN_COMPARISON_BASE_SOURCE
+    )
+    assert identity["comparison_base_commit_lineage_source"] == (
+        server._QA_DIRECT_MAIN_COMPARISON_LINEAGE_SOURCE
+    )
+    assert identity["changed_files"] == ["agent/governance/server.py"]
+    assert identity["changed_files_source"] == (
+        "server_runtime_context_base_to_exact_candidate_diff"
+    )
+    assert identity["candidate_diff_hash"].startswith("sha256:")
+    assert trace["root_identity"]["comparison_base_commit_sha"] == (
+        world["base_commit"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "machine_reason"),
+    (
+        (
+            "forged_binding_hash",
+            "exact_candidate_direct_main_runtime_binding_invalid",
+        ),
+        (
+            "cross_pre_mutation_world",
+            "exact_candidate_direct_main_pre_mutation_world_mismatch",
+        ),
+        (
+            "base_lineage_mismatch",
+            "exact_candidate_direct_main_base_lineage_mismatch",
+        ),
+        (
+            "file_fence_mismatch",
+            "exact_candidate_direct_main_file_fence_mismatch",
+        ),
+    ),
+)
+def test_strict_direct_main_rev3_comparison_authority_fails_closed_prewrite(
+    conn,
+    monkeypatch,
+    tmp_path,
+    mutation,
+    machine_reason,
+):
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=mutation.upper(),
+    )
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get(world["task_id"])
+    if mutation == "forged_binding_hash":
+        record["metadata"][
+            "operator_supervised_direct_main_runtime_binding"
+        ]["binding_hash"] = "sha256:" + "f" * 64
+        runtime.store.update(world["task_id"], record)
+    elif mutation == "cross_pre_mutation_world":
+        events = task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=world["backlog_id"],
+            task_id=world["task_id"],
+            limit=1000,
+        )
+        target = next(
+            event
+            for event in events
+            if event["event_kind"]
+            == "observer_direct_implementation_exception"
+        )
+        payload = copy.deepcopy(target["payload"])
+        payload["observer_direct_pre_mutation_authority"][
+            "graph_trace_db_evidence"
+        ]["accepted_world_ref"]["base_commit"] = "f" * 40
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True), int(target["id"])),
+        )
+        conn.commit()
+    elif mutation == "base_lineage_mismatch":
+        binding = record["metadata"][
+            "operator_supervised_direct_main_runtime_binding"
+        ]
+        binding["base_commit"] = "f" * 40
+        binding["target_head_commit"] = "f" * 40
+        binding["binding_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in binding.items()
+                if key != "binding_hash"
+            }
+        )
+        runtime.store.update(world["task_id"], record)
+    else:
+        events = task_timeline.list_events(
+            conn,
+            PID,
+            backlog_id=world["backlog_id"],
+            task_id=world["task_id"],
+            limit=1000,
+        )
+        target = next(
+            event
+            for event in events
+            if event["event_kind"] == "implementation"
+        )
+        payload = copy.deepcopy(target["payload"])
+        prewrite = payload[
+            "direct_main_implementation_commit_prewrite_authority"
+        ]
+        prewrite["verified_changed_files"] = ["outside.py"]
+        prewrite["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in prewrite.items()
+                if key != "authority_hash"
+            }
+        )
+        conn.execute(
+            "UPDATE task_timeline_events SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True), int(target["id"])),
+        )
+        conn.commit()
+    before_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        limit=1000,
+    )
+    before_record = runtime.store.get(world["task_id"])
+    before_changes = conn.total_changes
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=PID,
+        proof={
+            "backlog_id": world["backlog_id"],
+            "task_id": world["task_id"],
+            "commit_sha": world["candidate_commit"],
+        },
+    )
+
+    assert authority["machine_reason"] == machine_reason
+    assert authority["fail_closed"] is True
+    assert authority["zero_write_rejection"] is True
+    assert authority["writes_performed"] is False
+    assert authority["identity_mismatches"]
+    assert conn.total_changes == before_changes
+    assert runtime.store.get(world["task_id"]) == before_record
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        limit=1000,
+    ) == before_events
+
+
+@pytest.mark.parametrize(
+    ("mutation", "machine_reason"),
+    (
+        ("cross_project", ""),
+        ("cross_backlog", ""),
+        ("cross_task", ""),
+        (
+            "candidate_mismatch",
+            "exact_candidate_direct_main_implementation_commit_mismatch",
+        ),
+    ),
+)
+def test_strict_direct_main_rev3_comparison_authority_rejects_cross_scope(
+    conn,
+    monkeypatch,
+    tmp_path,
+    mutation,
+    machine_reason,
+):
+    world = _strict_direct_main_comparison_world(
+        conn,
+        monkeypatch,
+        tmp_path,
+        suffix=f"CROSS-{mutation.upper()}",
+    )
+    project_id = PID
+    proof = {
+        "backlog_id": world["backlog_id"],
+        "task_id": world["task_id"],
+        "commit_sha": world["candidate_commit"],
+    }
+    if mutation == "cross_project":
+        project_id = "project-cross-scope"
+    elif mutation == "cross_backlog":
+        proof["backlog_id"] = "AC-CROSS-SCOPE"
+    elif mutation == "cross_task":
+        proof["task_id"] = "cex-direct-main-cross-scope"
+    else:
+        proof["commit_sha"] = world["base_commit"]
+    before_record = server._contract_runtime(conn).store.get(world["task_id"])
+    before_events = task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        limit=1000,
+    )
+    before_changes = conn.total_changes
+
+    authority = server._qa_exact_candidate_runtime_comparison_authority(
+        conn,
+        project_id=project_id,
+        proof=proof,
+    )
+
+    assert not authority.get("commit_sha")
+    if machine_reason:
+        assert authority["machine_reason"] == machine_reason
+        assert authority["zero_write_rejection"] is True
+        assert authority["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert server._contract_runtime(conn).store.get(world["task_id"]) == (
+        before_record
+    )
+    assert task_timeline.list_events(
+        conn,
+        PID,
+        backlog_id=world["backlog_id"],
+        task_id=world["task_id"],
+        limit=1000,
+    ) == before_events
+
 @pytest.mark.parametrize(
     "field",
     [
