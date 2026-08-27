@@ -119014,7 +119014,7 @@ def test_onboard_route_guide_parallel_contracts_still_select_eligible_queue_head
 def test_onboard_route_guide_complete_projection_suppresses_stale_ledger(conn):
     candidate_server, _ = _preload_candidate_server_module()
     backlog_id = "AC-ONBOARD-COMPLETE-PROJECTION-SUPPRESSES-STALE-LEDGER"
-    _insert_simple_mf_close_backlog(conn, backlog_id)
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
 
     first = candidate_server.handle_project_onboard_route_guide(
         _ctx(
@@ -119101,7 +119101,7 @@ def test_completed_onboard_service_open_row_projects_unique_contract_update_in_f
         "agent/governance/server.py",
         "agent/tests/test_graph_governance_api.py",
     ]
-    _insert_simple_mf_close_backlog(conn, backlog_id)
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
     conn.execute(
         "UPDATE backlog_bugs SET status = 'OPEN', target_files = ?, "
         "test_files = '[]' WHERE bug_id = ?",
@@ -119159,6 +119159,21 @@ def test_completed_onboard_service_open_row_projects_unique_contract_update_in_f
     assert next_action["host_realization"]["required_replacement_paths"] == [
         "copy_safe_body.observer_route_token_ref"
     ]
+    selection = next_action["server_derived_authority"][
+        "backlog_contract_source_revision_authority"
+    ]
+    assert selection["ready"] is True
+    assert selection["structured_goal_ready"] is True
+    assert selection["source_definition_ready"] is True
+    assert selection["contract_identifiers"] == ["onboard_contract"]
+    assert selection["contract_version"] == "v1"
+    assert selection["contract_revision_id"] == "rev1"
+    assert selection["contract_state"] == "bound"
+    assert selection["legacy_storage_mf_type"] == "chain_rescue"
+    assert selection["legacy_storage_mf_type_is_selection_authority"] is False
+    assert selection["selection_source"] == (
+        "immutable_backlog_structured_goal+source_contract_revision"
+    )
 
     parent = candidate_server._contract_runtime_store(conn).get(
         parent_execution_id
@@ -119218,7 +119233,7 @@ def test_completed_onboard_service_contract_update_uses_exact_scoped_route_when_
     candidate_server, _ = _preload_candidate_server_module()
     backlog_id = "AC-ONBOARD-COMPLETED-SERVICE-EXACT-CONTRACT-UPDATE-ROUTE"
     target_files = ["agent/governance/server.py"]
-    _insert_simple_mf_close_backlog(conn, backlog_id)
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
     conn.execute(
         "UPDATE backlog_bugs SET status = 'OPEN', target_files = ?, "
         "test_files = '[]' WHERE bug_id = ?",
@@ -119283,7 +119298,7 @@ def test_completed_onboard_service_contract_update_negatives_are_no_action_zero_
 ):
     candidate_server, _ = _preload_candidate_server_module()
     backlog_id = "AC-ONBOARD-COMPLETED-SERVICE-CONTRACT-UPDATE-NEGATIVES"
-    _insert_simple_mf_close_backlog(conn, backlog_id)
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
     parent_execution_id = candidate_server._onboard_service_execution_id(
         PID, backlog_id
     )
@@ -119387,6 +119402,288 @@ def test_completed_onboard_service_contract_update_negatives_are_no_action_zero_
     assert fixed["action"] == "no_runtime_action"
     assert fixed["terminal_backlog_row"] is True
     assert conn.total_changes == before_changes
+
+
+def test_completed_parent_chain_rescue_harbor_goal_cannot_select_contract_update(
+    conn,
+):
+    candidate_server, _ = _preload_candidate_server_module()
+    backlog_id = "AC-ONBOARD-HARBOR-GOAL-NOT-CONTRACT-UPDATE"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'OPEN', chain_trigger_json = ? "
+        "WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "fence": {
+                        "kind": "harbor_project",
+                        "scope": "runtime-transport-observer",
+                    },
+                    "goal": {
+                        "kind": "harbor_delivery",
+                        "text": "transport the bounded observer result",
+                    },
+                    "mf_type": "chain_rescue",
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+
+    result = candidate_server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+            },
+        )
+    )
+
+    next_action = result["next_legal_action"]
+    assert next_action["action"] == "no_runtime_action"
+    assert next_action["id"] == "contract_complete_no_runtime_action"
+    assert next_action.get("mcp_tool") != "contract_update_start"
+    selection = candidate_server._backlog_contract_update_selection_authority(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+    )
+    assert selection["ready"] is False
+    assert selection["structured_goal_ready"] is False
+    assert selection["source_definition_ready"] is False
+    assert selection["contract_identifiers"] == []
+    assert selection["legacy_storage_mf_type"] == "chain_rescue"
+    assert selection["legacy_storage_mf_type_is_selection_authority"] is False
+    assert selection["missing_requirements"] == [
+        "immutable_structured_contract_source_revision_goal",
+        "immutable_source_contract_definition_revision",
+    ]
+    storage = result["work_type_storage_projection"]
+    assert storage["storage_mf_type"] == "chain_rescue"
+    assert storage["storage_label_is_contract_selection"] is False
+    assert storage["selected_contract_changed_by_storage_label"] is False
+
+    execution_count_before = conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0]
+    changes_before = conn.total_changes
+    with pytest.raises(ValidationError) as rejected:
+        candidate_server.handle_project_contract_update_start(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body={"backlog_id": backlog_id},
+            )
+        )
+    details = rejected.value.details
+    assert details["code"] == "contract_update_backlog_semantics_required"
+    assert details["legacy_storage_mf_type_is_selection_authority"] is False
+    assert details["zero_write_rejection"] is True
+    assert details["writes_performed"] is False
+    assert details["mutation_performed"] is False
+    correction = details["next_legal_action"]
+    assert correction["action"] == "onboard_route_guide"
+    assert correction["contract_update_allowed"] is False
+    assert correction["automatic_direct_main_allowed"] is False
+    assert conn.execute(
+        "SELECT COUNT(*) FROM contract_runtime_executions"
+    ).fetchone()[0] == execution_count_before
+    assert conn.total_changes == changes_before
+
+
+def test_empty_wrong_family_contract_update_projects_no_pass_terminal_and_current_request_successor(
+    conn,
+):
+    candidate_server, _ = _preload_candidate_server_module()
+    backlog_id = "AC-ONBOARD-EMPTY-WRONG-FAMILY-CONTRACT-UPDATE"
+    _insert_source_backed_onboarding_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET status = 'OPEN', target_files = ?, "
+        "test_files = '[]' WHERE bug_id = ?",
+        (json.dumps(["agent/governance/server.py"]), backlog_id),
+    )
+    conn.commit()
+
+    legitimate = candidate_server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "continue_contract_chain",
+            },
+        )
+    )
+    assert legitimate["next_legal_action"]["action"] == (
+        "contract_update_start"
+    )
+    started = candidate_server.handle_project_contract_update_start(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body={"backlog_id": backlog_id},
+        )
+    )
+    source_execution_id = started["contract_execution_id"]
+    source_before = candidate_server._contract_runtime_store(conn).get(
+        source_execution_id
+    )
+    assert source_before["contract_id"] == (
+        candidate_server.CONTRACT_UPDATE_CONTRACT_ID
+    )
+    assert source_before["completed_lines"] == []
+
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json = ? WHERE bug_id = ?",
+        (
+            json.dumps(
+                {
+                    "fence": {
+                        "kind": "harbor_project",
+                        "scope": "runtime-transport-observer",
+                    },
+                    "goal": {
+                        "kind": "harbor_delivery",
+                        "text": "resume the requested parallel worker topology",
+                    },
+                    "mf_type": "chain_rescue",
+                }
+            ),
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    timeline_before = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0]
+    mutating_sql: list[str] = []
+    conn.set_trace_callback(
+        lambda statement: mutating_sql.append(statement)
+        if statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+        else None
+    )
+
+    try:
+        result = candidate_server.handle_project_onboard_route_guide(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "backlog_id": backlog_id,
+                    "role": "observer",
+                    "work_type": "mf_parallel",
+                },
+            )
+        )
+    finally:
+        conn.set_trace_callback(None)
+
+    next_action = result["next_legal_action"]
+    assert next_action["action"] == "mf_parallel_enter"
+    assert next_action["work_type"] == "mf_parallel"
+    assert next_action["wrong_family_source_terminal_no_pass"] is True
+    assert next_action["old_evidence_carry_forward"] is False
+    authority = next_action["terminal_supersession_authority"]
+    assert authority["projection_only"] is True
+    assert authority["writes_performed"] is False
+    assert authority["mutation_performed"] is False
+    assert authority["source_contract_execution_id"] == source_execution_id
+    assert authority["source_completed_line_count"] == 0
+    assert authority["source_completed_lines_mutated"] is False
+    assert authority["source_execution_write_eligible"] is False
+    assert authority["source_generation_terminal_projection"] is True
+    assert authority["no_pass_claim"] is True
+    assert authority["authoritative_pass_synthesized"] is False
+    assert authority["dispatch_authority_synthesized"] is False
+    assert authority["worker_evidence_synthesized"] is False
+    assert authority["qa_evidence_synthesized"] is False
+    assert authority["merge_evidence_synthesized"] is False
+    assert authority["paid_action_authority_synthesized"] is False
+    assert authority["requested_fresh_work_type"] == "mf_parallel"
+    assert authority["fresh_typed_successor_selection_allowed"] is True
+    assert authority["forced_direct_main"] is False
+
+    terminal = next_action["copy_safe_no_pass_terminal_action"]
+    assert terminal["action"] == "contract_runtime_bypass_line"
+    assert terminal["mcp_tool"] == "contract_runtime_bypass_line"
+    assert terminal["action_input_ready"] is False
+    assert terminal["action_input_missing_fields"] == [
+        "classification",
+        "reason",
+        "decision",
+        "evidence_refs[-1]",
+    ]
+    fresh = terminal["fresh_typed_successor_selection"]
+    assert fresh["mcp_tool"] == "onboard_route_guide"
+    assert fresh["copy_safe_body"] == {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "<choose an explicit topology-compatible work_type>",
+    }
+    assert fresh["allowed_work_types"] == [
+        "mf_parallel",
+        "mf_batch_parallel",
+        "operator_supervised_direct_main",
+    ]
+    assert fresh["contract_update_allowed"] is False
+    assert fresh["automatic_direct_main_allowed"] is False
+
+    storage = result["work_type_storage_projection"]
+    assert result["selected_work_type"] == "mf_parallel"
+    assert storage["requested_work_type"] == "mf_parallel"
+    assert storage["selected_work_type"] == "mf_parallel"
+    assert storage["selected_contract"] == "mf_parallel"
+    assert storage["storage_mf_type"] == "chain_rescue"
+    assert storage["storage_label_is_contract_selection"] is False
+    assert storage["selected_contract_changed_by_storage_label"] is False
+
+    source_after = candidate_server._contract_runtime_store(conn).get(
+        source_execution_id
+    )
+    assert source_after["completed_lines"] == source_before["completed_lines"]
+    assert source_after["execution_state_revision"] == source_before[
+        "execution_state_revision"
+    ]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events"
+    ).fetchone()[0] == timeline_before
+    write_targets = {
+        match.group(1).lower()
+        for statement in mutating_sql
+        if (
+            match := re.search(
+                r"\b(?:INTO|UPDATE)\s+([a-z_]+)",
+                statement,
+                flags=re.IGNORECASE,
+            )
+        )
+    }
+    assert write_targets == {
+        "backlog_contract_chain_bindings",
+        "contract_chain_edges",
+        "backlog_contract_chain_current",
+    }
+    assert write_targets.isdisjoint(
+        {
+            "backlog_bugs",
+            "contract_runtime_executions",
+            "parallel_branch_runtime_contexts",
+            "parallel_branch_runtime_contract_revisions",
+            "parallel_branch_merge_queue_items",
+            "task_timeline_events",
+        }
+    )
 
 
 def test_timeline_gate_views_suppress_complete_compact_ledger_stale_action(conn):
