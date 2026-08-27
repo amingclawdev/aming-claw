@@ -134178,6 +134178,239 @@ def _contract_runtime_rev8_two_worker_merge_projection(
     )
 
 
+def _contract_runtime_rev8_terminal_reconcile_receipt_lane_projection(
+    conn,
+    *,
+    project_id: str,
+    record: Mapping[str, Any],
+    aggregate_merge: Mapping[str, Any],
+    dispatch_contexts: Sequence[Any],
+) -> dict[str, Any]:
+    """Resolve one exact current-full receipt from the sealed worker lanes.
+
+    The current RuntimeContext projection is a work-progress cursor, not proof
+    of which merged lane performed the terminal current-full reconcile.  After
+    all ordered lane merges complete, that receipt may legitimately belong to
+    another dispatched lane.  Select it only by replaying every exact sealed
+    lane through the unchanged current-full scope verifier.  Zero or multiple
+    verified candidates remain ambiguous.  The explicit resolution status is
+    required so an ambiguous receipt set can never fall back to a single
+    RuntimeContext cursor and accidentally become acceptable.
+    """
+
+    aggregate = dict(aggregate_merge)
+    execution_id = str(record.get("contract_execution_id") or "").strip()
+    backlog_id = str(record.get("backlog_id") or "").strip()
+    merged_commit = str(
+        aggregate.get("merged_commit_sha") or ""
+    ).strip().lower()
+    merge_event_id = int(aggregate.get("merge_event_id") or 0)
+    lane_runtime_context_ids = {
+        str(value or "").strip()
+        for value in aggregate.get("lane_runtime_context_ids") or []
+        if str(value or "").strip()
+    }
+    lane_merge_queue_ids = {
+        str(value or "").strip()
+        for value in aggregate.get("lane_merge_queue_ids") or []
+        if str(value or "").strip()
+    }
+    aggregate_identity = {
+        field: str(aggregate.get(field) or "").strip()
+        for field in (
+            "runtime_context_id",
+            "task_id",
+            "parent_task_id",
+            "merge_queue_id",
+        )
+    }
+    if not (
+        execution_id
+        and backlog_id
+        and merged_commit
+        and merge_event_id > 0
+        and aggregate.get("timeline_verified") is True
+        and aggregate.get("dispatch_lineage_verified") is True
+        and aggregate.get("all_lane_merges_verified") is True
+        and int(aggregate.get("lane_merge_count") or 0) >= 2
+        and len(lane_runtime_context_ids)
+        == int(aggregate.get("lane_merge_count") or 0)
+        and lane_merge_queue_ids
+    ):
+        return {
+            "status": "none",
+            "verified_candidate_count": 0,
+            "projection": {},
+        }
+
+    verified: list[dict[str, Any]] = []
+    seen_context_identities: set[tuple[str, str, str, str]] = set()
+    for context in dispatch_contexts:
+        runtime_context_id, task_id, parent_task_id = (
+            _contract_runtime_context_identity(context)
+        )
+        context_backlog_id = str(
+            getattr(context, "backlog_id", "") or ""
+        ).strip()
+        merge_queue_id = str(
+            getattr(context, "merge_queue_id", "") or ""
+        ).strip()
+        context_identity = (
+            runtime_context_id,
+            task_id,
+            parent_task_id,
+            merge_queue_id,
+        )
+        if not (
+            all(context_identity)
+            and context_identity not in seen_context_identities
+            and context_backlog_id == backlog_id
+            and parent_task_id == execution_id
+            and runtime_context_id in lane_runtime_context_ids
+            and merge_queue_id in lane_merge_queue_ids
+        ):
+            continue
+        seen_context_identities.add(context_identity)
+        candidate_merge = {
+            **aggregate,
+            "runtime_context_id": runtime_context_id,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "merge_queue_id": merge_queue_id,
+            "aggregate_final_merge_identity": aggregate_identity,
+            "reconcile_line_instance_id": (
+                f"runtime_context:{runtime_context_id}"
+            ),
+            "reconcile_lane_identity_source": (
+                "terminal_current_full_reconcile_receipt"
+            ),
+        }
+        timeline_events = _runtime_context_service_timeline_events(
+            conn,
+            project_id=project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+        )
+        recorded_reconcile = (
+            _contract_runtime_completed_merge_reconcile_authority(
+                conn,
+                project_id=project_id,
+                record=record,
+                context=context,
+                timeline_events=timeline_events,
+                merge=candidate_merge,
+            )
+        )
+        terminal_authority = (
+            _contract_runtime_current_full_reconcile_authority_from_merge(
+                conn,
+                project_id=project_id,
+                record=record,
+                merge=candidate_merge,
+                reconcile=recorded_reconcile,
+            )
+        )
+        if not (
+            _contract_runtime_current_full_reconcile_activation_verified(
+                terminal_authority
+            )
+            and str(
+                terminal_authority.get("runtime_context_id") or ""
+            ).strip()
+            == runtime_context_id
+            and str(terminal_authority.get("task_id") or "").strip()
+            == task_id
+            and str(
+                terminal_authority.get("parent_task_id") or ""
+            ).strip()
+            == parent_task_id
+            and str(
+                terminal_authority.get("merge_queue_id") or ""
+            ).strip()
+            == merge_queue_id
+            and str(terminal_authority.get("merged_commit_sha") or "")
+            .strip()
+            .lower()
+            == merged_commit
+            and int(terminal_authority.get("merge_event_id") or 0)
+            == merge_event_id
+            and str(
+                terminal_authority.get("merge_source_ref") or ""
+            ).strip()
+            == str(aggregate.get("merge_source_ref") or "").strip()
+            and str(
+                terminal_authority.get("merge_event_created_at") or ""
+            ).strip()
+            == str(
+                aggregate.get("merge_event_created_at") or ""
+            ).strip()
+            and int(recorded_reconcile.get("reconcile_event_id") or 0)
+            > merge_event_id
+            and str(
+                recorded_reconcile.get("reconcile_source_ref") or ""
+            ).strip()
+            == (
+                "timeline:"
+                f"{int(recorded_reconcile.get('reconcile_event_id') or 0)}"
+            )
+            and str(
+                recorded_reconcile.get("reconcile_task_id") or ""
+            ).strip()
+            == task_id
+            and str(
+                recorded_reconcile.get("reconcile_runtime_context_id")
+                or ""
+            ).strip()
+            == runtime_context_id
+            and candidate_merge.get("all_lane_merges_verified") is True
+            and int(candidate_merge.get("lane_merge_count") or 0)
+            == int(aggregate.get("lane_merge_count") or 0)
+            and {
+                str(value or "").strip()
+                for value in candidate_merge.get("lane_runtime_context_ids")
+                or []
+                if str(value or "").strip()
+            }
+            == lane_runtime_context_ids
+            and {
+                str(value or "").strip()
+                for value in candidate_merge.get("lane_merge_queue_ids")
+                or []
+                if str(value or "").strip()
+            }
+            == lane_merge_queue_ids
+        ):
+            continue
+        projection = {
+            **candidate_merge,
+            "reconcile_source_ref": str(
+                recorded_reconcile.get("reconcile_source_ref") or ""
+            ).strip(),
+            "reconcile_event_id": int(
+                recorded_reconcile.get("reconcile_event_id") or 0
+            ),
+            "reconcile_event_created_at": str(
+                recorded_reconcile.get("reconcile_event_created_at") or ""
+            ).strip(),
+            "reconcile_task_id": task_id,
+            "reconcile_runtime_context_id": runtime_context_id,
+        }
+        projection.pop("authority_hash", None)
+        verified.append(projection)
+
+    return {
+        "status": (
+            "selected"
+            if len(verified) == 1
+            else "ambiguous"
+            if len(verified) > 1
+            else "none"
+        ),
+        "verified_candidate_count": len(verified),
+        "projection": verified[0] if len(verified) == 1 else {},
+    }
+
+
 def _contract_runtime_rev8_selected_reconcile_lane_projection(
     conn,
     *,
@@ -134223,6 +134456,7 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
         == "observer_reconcile"
     )
     restore_reconcile_lane_projection_metadata = selected_line_pending
+    reconcile_lane_identity_source = "RuntimeContext.current_values"
     aggregate_identity = {
         field: str(aggregate.get(field) or "").strip()
         for field in (
@@ -134232,7 +134466,72 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
             "merge_queue_id",
         )
     }
+    dispatch_selection = _contract_runtime_current_dispatch_authority_line(
+        record
+    )
+    if dispatch_selection.get("status") != "selected":
+        return aggregate
+    dispatch_index_value = dispatch_selection.get("completed_line_index")
+    if not isinstance(dispatch_index_value, int) or isinstance(
+        dispatch_index_value, bool
+    ):
+        return aggregate
+    dispatch_index = dispatch_index_value
+    completed_lines = list(record.get("completed_lines") or [])
+    if not (0 <= dispatch_index < len(completed_lines)):
+        return aggregate
+    dispatch_line = completed_lines[dispatch_index]
+    dispatch_contexts = list(
+        _contract_runtime_contexts_for_dispatch_line(
+            conn,
+            project_id=project_id,
+            record=record,
+            line=dispatch_line,
+        )
+    )
+
     if selected_line_pending:
+        terminal_receipt_resolution = (
+            _contract_runtime_rev8_terminal_reconcile_receipt_lane_projection(
+                conn,
+                project_id=project_id,
+                record=record,
+                aggregate_merge=aggregate,
+                dispatch_contexts=dispatch_contexts,
+            )
+        )
+        if terminal_receipt_resolution.get("status") == "selected":
+            projection = terminal_receipt_resolution.get("projection")
+            return (
+                dict(projection)
+                if isinstance(projection, Mapping)
+                else aggregate
+            )
+        if terminal_receipt_resolution.get("status") == "ambiguous":
+            nonactivating = dict(aggregate)
+            nonactivating.update(
+                {
+                    "reconcile_source_ref": "",
+                    "reconcile_event_id": 0,
+                    "reconcile_event_created_at": "",
+                    "reconcile_task_id": "",
+                    "reconcile_runtime_context_id": "",
+                    "current_full_reconcile_activation_verified": False,
+                    "reconcile_receipt_lane_resolution_status": (
+                        "ambiguous"
+                    ),
+                    "reconcile_receipt_lane_verified_candidate_count": int(
+                        terminal_receipt_resolution.get(
+                            "verified_candidate_count"
+                        )
+                        or 0
+                    ),
+                }
+            )
+            nonactivating.pop(
+                "terminal_current_full_reconcile_authority", None
+            )
+            return nonactivating
         runtime_context_projection = (
             _contract_runtime_authoritative_runtime_context_projection(
                 conn,
@@ -134332,13 +134631,64 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
                 or stored_line_instance_id
                 or stored_lane_identity_source
             )
+            terminal_receipt_projection_verified = bool(
+                stored_lane_identity_source
+                == "terminal_current_full_reconcile_receipt"
+                and _contract_runtime_current_full_reconcile_activation_verified(
+                    terminal_current_full
+                )
+                and all(
+                    str(terminal_current_full.get(field) or "").strip()
+                    == expected
+                    for field, expected in (
+                        ("project_id", str(project_id or "").strip()),
+                        (
+                            "backlog_id",
+                            str(record.get("backlog_id") or "").strip(),
+                        ),
+                        ("contract_execution_id", execution_id),
+                        ("runtime_context_id", runtime_context_id),
+                        ("task_id", task_id),
+                        ("parent_task_id", parent_task_id),
+                        ("merge_queue_id", merge_queue_id),
+                        (
+                            "merged_commit_sha",
+                            str(
+                                aggregate.get("merged_commit_sha") or ""
+                            )
+                            .strip()
+                            .lower(),
+                        ),
+                        (
+                            "merge_source_ref",
+                            str(
+                                aggregate.get("merge_source_ref") or ""
+                            ).strip(),
+                        ),
+                    )
+                )
+                and str(
+                    terminal_current_full.get("reconcile_task_id") or ""
+                ).strip()
+                == task_id
+                and str(
+                    terminal_current_full.get(
+                        "reconcile_runtime_context_id"
+                    )
+                    or ""
+                ).strip()
+                == runtime_context_id
+            )
             stored_projection_metadata_verified = bool(
                 stored_projection_metadata_claimed
                 and stored_aggregate_identity == aggregate_identity
                 and stored_line_instance_id
                 == f"runtime_context:{runtime_context_id}"
-                and stored_lane_identity_source
-                == "RuntimeContext.current_values"
+                and (
+                    stored_lane_identity_source
+                    == "RuntimeContext.current_values"
+                    or terminal_receipt_projection_verified
+                )
             )
             if not (
                 line_index > int(
@@ -134443,6 +134793,11 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
                     "restore_reconcile_lane_projection_metadata": (
                         stored_projection_metadata_verified
                     ),
+                    "reconcile_lane_identity_source": (
+                        stored_lane_identity_source
+                        if stored_projection_metadata_verified
+                        else ""
+                    ),
                 }
             )
         if len(receipt_candidates) != 1:
@@ -134453,6 +134808,10 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
                 "restore_reconcile_lane_projection_metadata"
             )
         )
+        if restore_reconcile_lane_projection_metadata:
+            reconcile_lane_identity_source = str(
+                current_values.get("reconcile_lane_identity_source") or ""
+            ).strip()
     runtime_context_id = str(
         current_values.get("runtime_context_id") or ""
     ).strip()
@@ -134484,28 +134843,8 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
     ):
         return aggregate
 
-    dispatch_selection = _contract_runtime_current_dispatch_authority_line(
-        record
-    )
-    if dispatch_selection.get("status") != "selected":
-        return aggregate
-    dispatch_index_value = dispatch_selection.get("completed_line_index")
-    if not isinstance(dispatch_index_value, int) or isinstance(
-        dispatch_index_value, bool
-    ):
-        return aggregate
-    dispatch_index = dispatch_index_value
-    completed_lines = list(record.get("completed_lines") or [])
-    if not (0 <= dispatch_index < len(completed_lines)):
-        return aggregate
-    dispatch_line = completed_lines[dispatch_index]
     matches: list[Any] = []
-    for context in _contract_runtime_contexts_for_dispatch_line(
-        conn,
-        project_id=project_id,
-        record=record,
-        line=dispatch_line,
-    ):
+    for context in dispatch_contexts:
         context_runtime_id, context_task_id, context_parent_task_id = (
             _contract_runtime_context_identity(context)
         )
@@ -134536,7 +134875,7 @@ def _contract_runtime_rev8_selected_reconcile_lane_projection(
                 "aggregate_final_merge_identity": aggregate_identity,
                 "reconcile_line_instance_id": line_instance_id,
                 "reconcile_lane_identity_source": (
-                    "RuntimeContext.current_values"
+                    reconcile_lane_identity_source
                 ),
             }
         )
@@ -134867,6 +135206,77 @@ def _contract_runtime_current_full_reconcile_authority_from_merge(
         ),
         "identity_mismatches": list(merge.get("identity_mismatches") or []),
     }
+    if _is_mf_parallel_postmerge_revision(record):
+        aggregate_identity = (
+            merge.get("aggregate_final_merge_identity")
+            if isinstance(
+                merge.get("aggregate_final_merge_identity"), Mapping
+            )
+            else {}
+        )
+        line_instance_id = str(
+            merge.get("reconcile_line_instance_id") or ""
+        ).strip()
+        lane_identity_source = str(
+            merge.get("reconcile_lane_identity_source") or ""
+        ).strip()
+        aggregate_runtime_context_id = str(
+            aggregate_identity.get("runtime_context_id") or ""
+        ).strip()
+        aggregate_parent_task_id = str(
+            aggregate_identity.get("parent_task_id") or ""
+        ).strip()
+        aggregate_merge_queue_id = str(
+            aggregate_identity.get("merge_queue_id") or ""
+        ).strip()
+        lane_runtime_context_ids = {
+            str(value or "").strip()
+            for value in merge.get("lane_runtime_context_ids") or []
+            if str(value or "").strip()
+        }
+        lane_merge_queue_ids = {
+            str(value or "").strip()
+            for value in merge.get("lane_merge_queue_ids") or []
+            if str(value or "").strip()
+        }
+        if (
+            all(
+                str(aggregate_identity.get(field) or "").strip()
+                for field in (
+                    "runtime_context_id",
+                    "task_id",
+                    "parent_task_id",
+                    "merge_queue_id",
+                )
+            )
+            and aggregate_parent_task_id
+            == str(record.get("contract_execution_id") or "").strip()
+            and aggregate_runtime_context_id in lane_runtime_context_ids
+            and aggregate_merge_queue_id in lane_merge_queue_ids
+            and str(authority.get("runtime_context_id") or "").strip()
+            in lane_runtime_context_ids
+            and str(authority.get("merge_queue_id") or "").strip()
+            in lane_merge_queue_ids
+            and line_instance_id
+            == (
+                "runtime_context:"
+                f"{str(authority.get('runtime_context_id') or '').strip()}"
+            )
+            and lane_identity_source
+            in {
+                "RuntimeContext.current_values",
+                "terminal_current_full_reconcile_receipt",
+            }
+        ):
+            authority.update(
+                {
+                    "aggregate_final_merge_identity": dict(
+                        aggregate_identity
+                    ),
+                    "reconcile_line_instance_id": line_instance_id,
+                    "reconcile_lane_identity_source": lane_identity_source,
+                }
+            )
     authority["authority_hash"] = stable_sha256(authority)
     return authority
 

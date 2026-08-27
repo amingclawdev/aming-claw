@@ -185457,6 +185457,8 @@ def test_rev9_reconcile_authority_uses_selected_lane_with_aggregate_final_merge(
 
     def bind_selected(_conn, **kwargs):
         selected_merge = kwargs["merge"]
+        if kwargs["context"] is reminder:
+            return selected_merge
         assert kwargs["context"] is focus
         assert selected_merge["runtime_context_id"] == focus_runtime_id
         assert selected_merge["task_id"] == focus.task_id
@@ -185482,6 +185484,11 @@ def test_rev9_reconcile_authority_uses_selected_lane_with_aggregate_final_merge(
         server,
         "_contract_runtime_completed_merge_reconcile_authority",
         bind_selected,
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        lambda *_args, **_kwargs: {},
     )
     selected = (
         server._contract_runtime_rev8_selected_reconcile_lane_projection(
@@ -185690,6 +185697,782 @@ def test_rev9_observer_reconcile_binds_selected_lane_current_full_authority(
     )
     assert bound["payload"]["reconcile_authority"] == authority
     assert bound["runtime_context_id"] == runtime_context_id
+
+
+def _rev9_terminal_receipt_lane_resolution_case(monkeypatch):
+    # Mirrors the incident shape: RuntimeContext.current_values points at the
+    # source lane while the one terminal current-full receipt belongs to tests.
+    execution_id = "cex-mf-parallel-6bb88fc59eebce893928"
+    backlog_id = (
+        "AC-MF-PARALLEL-ATOMIC-ALLOCATION-PREFLIGHT-"
+        "COLLISION-ZERO-WRITE-R1-20260827"
+    )
+    source = SimpleNamespace(
+        backlog_id=backlog_id,
+        task_id="ac-atomic-allocation-source",
+        parent_task_id=execution_id,
+        runtime_context_id="mfrctx-c358c2f21e5745d1",
+        merge_queue_id=(
+            "mq-ac-atomic-allocation-source-ac-atomic-allocation-source"
+        ),
+    )
+    tests = SimpleNamespace(
+        backlog_id=backlog_id,
+        task_id="ac-atomic-allocation-tests",
+        parent_task_id=execution_id,
+        runtime_context_id="mfrctx-3d1df86fa89d0627",
+        merge_queue_id=(
+            "mq-ac-atomic-allocation-tests-ac-atomic-allocation-tests"
+        ),
+    )
+    foreign = SimpleNamespace(
+        backlog_id=backlog_id,
+        task_id="rev9-terminal-receipt-foreign",
+        parent_task_id=execution_id,
+        runtime_context_id="mfrctx-rev9-terminal-receipt-foreign",
+        merge_queue_id="mq-rev9-terminal-receipt-foreign",
+    )
+    dispatch_line = {
+        "stage_id": "dispatch",
+        "line_id": "observer_dispatch_bounded_workers",
+        "payload": {},
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": backlog_id,
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev10",
+        "completed_lines": [
+            {
+                "stage_id": "orchestration",
+                "line_id": "observer_prefill_child_contracts",
+                "payload": {},
+            },
+            dispatch_line,
+        ],
+        "runtime_guide": {
+            "next_legal_action": {
+                "stage_id": "observer_reconcile",
+                "line_id": "observer_reconcile",
+            }
+        },
+    }
+    aggregate = {
+        "timeline_verified": True,
+        "authority_verified": True,
+        "dispatch_lineage_verified": True,
+        "all_lane_merges_verified": True,
+        "lane_merge_count": 2,
+        "required_worker_count": 2,
+        "lane_runtime_context_ids": [
+            source.runtime_context_id,
+            tests.runtime_context_id,
+        ],
+        "lane_merge_queue_ids": [
+            source.merge_queue_id,
+            tests.merge_queue_id,
+        ],
+        "runtime_context_id": tests.runtime_context_id,
+        "task_id": tests.task_id,
+        "parent_task_id": execution_id,
+        "backlog_id": backlog_id,
+        "merge_queue_id": tests.merge_queue_id,
+        "merged_commit_sha": (
+            "4373a7527b715e223a128e0b5ac6741243eead45"
+        ),
+        "merge_source_ref": "timeline:901",
+        "merge_event_id": 901,
+        "merge_event_created_at": "2026-08-27T03:20:00Z",
+        "dispatch_completed_line_index": 1,
+        "contract_runtime_dispatch_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:1"
+        ),
+    }
+    state = {
+        source.task_id: {"verified": False},
+        tests.task_id: {"verified": True},
+        foreign.task_id: {"verified": True},
+    }
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_context_identity",
+        lambda context: (
+            context.runtime_context_id,
+            context.task_id,
+            context.parent_task_id,
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_service_timeline_events",
+        lambda *_args, **kwargs: [
+            {
+                "id": 902,
+                "task_id": kwargs["task_id"],
+                "backlog_id": kwargs["backlog_id"],
+                "event_kind": "reconcile",
+            }
+        ],
+    )
+
+    def bind_candidate(_conn, **kwargs):
+        context = kwargs["context"]
+        candidate = dict(kwargs["merge"])
+        configured = state.get(context.task_id, {})
+        calls.append(context.task_id)
+        current_commit = candidate["merged_commit_sha"]
+        candidate.update(
+            {
+                "schema_version": (
+                    "graph_snapshot_store.current_full_reconcile_state.v1"
+                ),
+                "source": (
+                    "graph_snapshot_store.current_full_reconcile_state"
+                ),
+                "server_derived": True,
+                "project_id": PID,
+                "backlog_id": backlog_id,
+                "contract_execution_id": execution_id,
+                "db_verified": configured.get("verified") is True,
+                "live_verified": True,
+                "canonical_head_verified": True,
+                "active_snapshot_verified": True,
+                "active_snapshot_current_full_reconcile_verified": True,
+                "active_snapshot_matches_canonical_head": True,
+                "graph_reconciled": True,
+                "provenance_verified": True,
+                "provenance_scope_verified": True,
+                "durable_order_verified": True,
+                "reconcile_snapshot_verified": True,
+                "contract_execution_scope_verified": True,
+                "task_scope_verified": True,
+                "runtime_context_scope_verified": True,
+                "parent_task_scope_verified": True,
+                "merge_queue_scope_verified": True,
+                "current_full_reconcile": True,
+                "strategy": "current_full_reconcile",
+                "active_snapshot_status": "active",
+                "active_snapshot_commit": current_commit,
+                "canonical_head_commit": current_commit,
+                "current_canonical_commit_sha": current_commit,
+                "reconciled_commit_sha": current_commit,
+                "reconcile_provenance_target_commit": current_commit,
+                "reconcile_source_ref": "timeline:902",
+                "reconcile_event_id": 902,
+                "reconcile_event_created_at": "2026-08-27T03:21:00Z",
+                "reconcile_task_id": context.task_id,
+                "reconcile_runtime_context_id": context.runtime_context_id,
+            }
+        )
+        candidate.update(configured.get("overrides") or {})
+        candidate["authority_hash"] = server.stable_sha256(
+            {
+                key: value
+                for key, value in candidate.items()
+                if key != "authority_hash"
+            }
+        )
+        return candidate
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_completed_merge_reconcile_authority",
+        bind_candidate,
+    )
+    def current_full_candidate(_conn, **kwargs):
+        candidate = dict(kwargs["reconcile"])
+        if server._contract_runtime_current_full_reconcile_activation_verified(
+            candidate
+        ):
+            return candidate
+        task_id = str(kwargs["merge"].get("task_id") or "")
+        context = source if task_id == source.task_id else tests
+        return bind_candidate(
+            _conn,
+            context=context,
+            merge=kwargs["merge"],
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_full_reconcile_authority_from_merge",
+        current_full_candidate,
+    )
+    return SimpleNamespace(
+        execution_id=execution_id,
+        backlog_id=backlog_id,
+        dispatch_line=dispatch_line,
+        record=record,
+        aggregate=aggregate,
+        source=source,
+        tests=tests,
+        foreign=foreign,
+        state=state,
+        calls=calls,
+    )
+
+
+def test_rev10_selected_reconcile_lane_prefers_unique_exact_terminal_receipt(
+    monkeypatch,
+):
+    case = _rev9_terminal_receipt_lane_resolution_case(monkeypatch)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_dispatch_authority_line",
+        lambda _record: {"status": "selected", "completed_line_index": 1},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [case.source, case.tests],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_authoritative_runtime_context_projection",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an exact terminal receipt must precede the WIP current cursor"
+        ),
+    )
+
+    before = server.stable_sha256(case.aggregate)
+    selected = server._contract_runtime_rev8_selected_reconcile_lane_projection(
+        object(),
+        project_id=PID,
+        record=case.record,
+        aggregate_merge=case.aggregate,
+    )
+
+    assert selected["runtime_context_id"] == case.tests.runtime_context_id
+    assert selected["task_id"] == case.tests.task_id
+    assert selected["merge_queue_id"] == case.tests.merge_queue_id
+    assert selected["reconcile_runtime_context_id"] == (
+        case.tests.runtime_context_id
+    )
+    assert selected["reconcile_task_id"] == case.tests.task_id
+    assert selected["reconcile_lane_identity_source"] == (
+        "terminal_current_full_reconcile_receipt"
+    )
+    assert selected["aggregate_final_merge_identity"] == {
+        "runtime_context_id": case.tests.runtime_context_id,
+        "task_id": case.tests.task_id,
+        "parent_task_id": case.execution_id,
+        "merge_queue_id": case.tests.merge_queue_id,
+    }
+    assert server.stable_sha256(case.aggregate) == before
+
+
+def test_rev10_terminal_receipt_selection_ignores_caller_shaped_lane_fields(
+    monkeypatch,
+):
+    case = _rev9_terminal_receipt_lane_resolution_case(monkeypatch)
+    case.record["caller_runtime_context_id"] = case.foreign.runtime_context_id
+    case.record["caller_task_id"] = case.foreign.task_id
+    case.record["caller_merge_queue_id"] = case.foreign.merge_queue_id
+    case.record["runtime_guide"]["next_legal_action"].update(
+        {
+            "runtime_context_id": case.foreign.runtime_context_id,
+            "task_id": case.foreign.task_id,
+            "merge_queue_id": case.foreign.merge_queue_id,
+        }
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_dispatch_authority_line",
+        lambda _record: {"status": "selected", "completed_line_index": 1},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [case.source, case.tests],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_authoritative_runtime_context_projection",
+        lambda *_args, **_kwargs: pytest.fail(
+            "caller-shaped Guide fields cannot override an exact receipt"
+        ),
+    )
+
+    selected = server._contract_runtime_rev8_selected_reconcile_lane_projection(
+        object(),
+        project_id=PID,
+        record=case.record,
+        aggregate_merge=case.aggregate,
+    )
+
+    assert selected["runtime_context_id"] == case.tests.runtime_context_id
+    assert selected["task_id"] == case.tests.task_id
+    assert selected["merge_queue_id"] == case.tests.merge_queue_id
+
+
+def test_rev10_no_terminal_receipt_preserves_current_values_fallback(
+    monkeypatch,
+):
+    case = _rev9_terminal_receipt_lane_resolution_case(monkeypatch)
+    case.state[case.tests.task_id] = {"verified": False}
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_dispatch_authority_line",
+        lambda _record: {"status": "selected", "completed_line_index": 1},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [case.source, case.tests],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_authoritative_runtime_context_projection",
+        lambda *_args, **_kwargs: {
+            "current_values": {
+                "runtime_context_id": case.source.runtime_context_id,
+                "task_id": case.source.task_id,
+                "parent_task_id": case.execution_id,
+                "merge_queue_id": case.source.merge_queue_id,
+            }
+        },
+    )
+
+    selected = server._contract_runtime_rev8_selected_reconcile_lane_projection(
+        object(),
+        project_id=PID,
+        record=case.record,
+        aggregate_merge=case.aggregate,
+    )
+
+    assert selected["runtime_context_id"] == case.source.runtime_context_id
+    assert selected["task_id"] == case.source.task_id
+    assert selected["merge_queue_id"] == case.source.merge_queue_id
+    assert selected["reconcile_lane_identity_source"] == (
+        "RuntimeContext.current_values"
+    )
+    assert server._contract_runtime_current_full_reconcile_activation_verified(
+        selected
+    ) is False
+
+
+def test_rev10_single_lane_current_values_behavior_is_unchanged(monkeypatch):
+    case = _rev9_terminal_receipt_lane_resolution_case(monkeypatch)
+    case.aggregate.update(
+        {
+            "lane_merge_count": 1,
+            "required_worker_count": 1,
+            "lane_runtime_context_ids": [case.source.runtime_context_id],
+            "lane_merge_queue_ids": [case.source.merge_queue_id],
+            "runtime_context_id": case.source.runtime_context_id,
+            "task_id": case.source.task_id,
+            "merge_queue_id": case.source.merge_queue_id,
+        }
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_dispatch_authority_line",
+        lambda _record: {"status": "selected", "completed_line_index": 1},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [case.source],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_authoritative_runtime_context_projection",
+        lambda *_args, **_kwargs: {
+            "current_values": {
+                "runtime_context_id": case.source.runtime_context_id,
+                "task_id": case.source.task_id,
+                "parent_task_id": case.execution_id,
+                "merge_queue_id": case.source.merge_queue_id,
+            }
+        },
+    )
+
+    selected = server._contract_runtime_rev8_selected_reconcile_lane_projection(
+        object(),
+        project_id=PID,
+        record=case.record,
+        aggregate_merge=case.aggregate,
+    )
+
+    assert selected["runtime_context_id"] == case.source.runtime_context_id
+    assert selected["task_id"] == case.source.task_id
+    assert selected["reconcile_lane_identity_source"] == (
+        "RuntimeContext.current_values"
+    )
+
+
+def test_rev10_current_full_authority_hashes_terminal_receipt_lane_metadata(
+    monkeypatch,
+    tmp_path,
+):
+    commit_sha = "4" * 40
+    execution_id = "cex-rev10-terminal-receipt-metadata"
+    runtime_context_id = "mfrctx-rev10-terminal-receipt-metadata"
+    task_id = "rev10-terminal-receipt-metadata"
+    merge_queue_id = "mq-rev10-terminal-receipt-metadata"
+    aggregate_identity = {
+        "runtime_context_id": "mfrctx-rev10-terminal-final-merge",
+        "task_id": "rev10-terminal-final-merge",
+        "parent_task_id": execution_id,
+        "merge_queue_id": "mq-rev10-terminal-final-merge",
+    }
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-REV10-TERMINAL-RECEIPT-METADATA",
+        "contract_execution_id": execution_id,
+        "contract_id": "mf_parallel.v2",
+        "version": "v2",
+        "revision": "rev10",
+    }
+    merge = {
+        "timeline_verified": True,
+        "dispatch_lineage_verified": True,
+        "contract_execution_id": execution_id,
+        "runtime_context_id": runtime_context_id,
+        "task_id": task_id,
+        "parent_task_id": execution_id,
+        "merge_queue_id": merge_queue_id,
+        "merged_commit_sha": commit_sha,
+        "merge_source_ref": "timeline:1001",
+        "merge_event_id": 1001,
+        "merge_event_created_at": "2026-08-27T04:00:00Z",
+        "contract_runtime_dispatch_source_ref": (
+            f"contract_runtime:{execution_id}:completed_lines:1"
+        ),
+        "lane_runtime_context_ids": [
+            runtime_context_id,
+            aggregate_identity["runtime_context_id"],
+        ],
+        "lane_merge_queue_ids": [
+            merge_queue_id,
+            aggregate_identity["merge_queue_id"],
+        ],
+        "aggregate_final_merge_identity": aggregate_identity,
+        "reconcile_line_instance_id": (
+            f"runtime_context:{runtime_context_id}"
+        ),
+        "reconcile_lane_identity_source": (
+            "terminal_current_full_reconcile_receipt"
+        ),
+    }
+    reconcile = {
+        "reconcile_source_ref": "timeline:1002",
+        "reconcile_event_id": 1002,
+        "reconcile_event_created_at": "2026-08-27T04:01:00Z",
+        "reconcile_task_id": task_id,
+        "reconcile_runtime_context_id": runtime_context_id,
+    }
+    state = {
+        "schema_version": (
+            "graph_snapshot_store.current_full_reconcile_state.v1"
+        ),
+        "source": "graph_snapshot_store.current_full_reconcile_state",
+        "db_verified": True,
+        "active_snapshot_status": "active",
+        "active_snapshot_commit": commit_sha,
+        "active_snapshot_verified": True,
+        "active_snapshot_current_full_reconcile_verified": True,
+        "reconcile_snapshot_verified": True,
+        "provenance_verified": True,
+        "provenance_scope_verified": True,
+        "durable_order_verified": True,
+        "contract_execution_scope_verified": True,
+        "task_scope_verified": True,
+        "runtime_context_scope_verified": True,
+        "parent_task_scope_verified": True,
+        "merge_queue_scope_verified": True,
+        "current_full_reconcile": True,
+        "strategy": "current_full_reconcile",
+        "reconciled_commit_sha": commit_sha,
+    }
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_postmerge_canonical_project_root",
+        lambda *_args, **_kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr(
+        server,
+        "_git_head_commit",
+        lambda _root: commit_sha,
+    )
+    monkeypatch.setattr(
+        store,
+        "current_full_reconcile_state",
+        lambda *_args, **_kwargs: dict(state),
+    )
+
+    class ProvenanceConnection:
+        @staticmethod
+        def execute(_sql, _params):
+            return SimpleNamespace(
+                fetchall=lambda: [{"target_commit_sha": commit_sha}]
+            )
+
+    authority = (
+        server._contract_runtime_current_full_reconcile_authority_from_merge(
+            ProvenanceConnection(),
+            project_id=PID,
+            record=record,
+            merge=merge,
+            reconcile=reconcile,
+        )
+    )
+
+    assert authority["aggregate_final_merge_identity"] == aggregate_identity
+    assert authority["reconcile_line_instance_id"] == (
+        f"runtime_context:{runtime_context_id}"
+    )
+    assert authority["reconcile_lane_identity_source"] == (
+        "terminal_current_full_reconcile_receipt"
+    )
+    assert server._contract_runtime_close_authority_hash_matches(authority)
+    assert server._contract_runtime_current_full_reconcile_activation_verified(
+        authority
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "zero",
+        "duplicate_same_lane",
+        "duplicate",
+        "stale",
+        "wrong_active_snapshot",
+        "wrong_commit",
+        "wrong_parent",
+        "wrong_merge_queue",
+        "wrong_lane",
+    ],
+)
+def test_rev10_terminal_receipt_lane_resolution_fails_closed(
+    monkeypatch,
+    failure,
+):
+    case = _rev9_terminal_receipt_lane_resolution_case(monkeypatch)
+    contexts = [case.source, case.tests]
+    if failure == "zero":
+        case.state[case.tests.task_id] = {"verified": False}
+    elif failure == "duplicate_same_lane":
+        # The unchanged current-full store reports db_verified=false when two
+        # provenance rows claim the same lane/event; the resolver must not
+        # reinterpret that rejected cardinality as one selectable receipt.
+        case.state[case.tests.task_id] = {
+            "verified": False,
+            "overrides": {"provenance_candidate_count": 2},
+        }
+    elif failure == "duplicate":
+        case.state[case.source.task_id] = {"verified": True}
+    elif failure == "stale":
+        case.state[case.tests.task_id]["overrides"] = {
+            "active_snapshot_status": "superseded"
+        }
+    elif failure == "wrong_active_snapshot":
+        case.state[case.tests.task_id]["overrides"] = {
+            "active_snapshot_commit": "e" * 40
+        }
+    elif failure == "wrong_commit":
+        case.state[case.tests.task_id]["overrides"] = {
+            "merged_commit_sha": "e" * 40
+        }
+    elif failure == "wrong_parent":
+        case.state[case.tests.task_id]["overrides"] = {
+            "parent_task_id": "cex-wrong-parent"
+        }
+    elif failure == "wrong_merge_queue":
+        case.state[case.tests.task_id]["overrides"] = {
+            "merge_queue_id": "mq-wrong-receipt"
+        }
+    else:
+        case.state[case.tests.task_id] = {"verified": False}
+        contexts = [case.source, case.foreign]
+
+    before = server.stable_sha256(case.aggregate)
+    resolution = (
+        server._contract_runtime_rev8_terminal_reconcile_receipt_lane_projection(
+            object(),
+            project_id=PID,
+            record=case.record,
+            aggregate_merge=case.aggregate,
+            dispatch_contexts=contexts,
+        )
+    )
+
+    assert resolution["status"] == (
+        "ambiguous" if failure == "duplicate" else "none"
+    )
+    assert resolution["projection"] == {}
+    assert server.stable_sha256(case.aggregate) == before
+
+
+def test_rev10_ambiguous_terminal_receipts_do_not_fallback_or_activate(
+    monkeypatch,
+):
+    case = _rev9_terminal_receipt_lane_resolution_case(monkeypatch)
+    case.state[case.source.task_id] = {"verified": True}
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_dispatch_authority_line",
+        lambda _record: {"status": "selected", "completed_line_index": 1},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [case.source, case.tests],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_authoritative_runtime_context_projection",
+        lambda *_args, **_kwargs: pytest.fail(
+            "ambiguous receipts must not fall back to RuntimeContext.current_values"
+        ),
+    )
+
+    projection = server._contract_runtime_rev8_selected_reconcile_lane_projection(
+        object(),
+        project_id=PID,
+        record=case.record,
+        aggregate_merge=case.aggregate,
+    )
+
+    assert projection["reconcile_receipt_lane_resolution_status"] == (
+        "ambiguous"
+    )
+    assert projection["reconcile_receipt_lane_verified_candidate_count"] == 2
+    assert projection["reconcile_event_id"] == 0
+    assert projection["reconcile_source_ref"] == ""
+    assert projection["current_full_reconcile_activation_verified"] is False
+    assert "terminal_current_full_reconcile_authority" not in projection
+
+
+def test_rev10_terminal_receipt_lane_restores_after_completed_line_persisted(
+    monkeypatch,
+):
+    case = _rev9_terminal_receipt_lane_resolution_case(monkeypatch)
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_current_dispatch_authority_line",
+        lambda _record: {"status": "selected", "completed_line_index": 1},
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_contexts_for_dispatch_line",
+        lambda *_args, **_kwargs: [case.source, case.tests],
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_authoritative_runtime_context_projection",
+        lambda *_args, **_kwargs: {
+            "current_values": {
+                "runtime_context_id": case.source.runtime_context_id,
+                "task_id": case.source.task_id,
+                "parent_task_id": case.execution_id,
+                "merge_queue_id": case.source.merge_queue_id,
+            }
+        },
+    )
+
+    initial = server._contract_runtime_rev8_selected_reconcile_lane_projection(
+        object(),
+        project_id=PID,
+        record=case.record,
+        aggregate_merge=case.aggregate,
+    )
+    terminal = (
+        server._contract_runtime_current_full_reconcile_authority_from_merge(
+            object(),
+            project_id=PID,
+            record=case.record,
+            merge=initial,
+            reconcile=initial,
+        )
+    )
+    assert terminal["reconcile_lane_identity_source"] == (
+        "terminal_current_full_reconcile_receipt"
+    )
+    authority = {
+        "schema_version": (
+            "contract_runtime.observer_reconcile_record_authority.v1"
+        ),
+        "source": "contract_runtime.server_reconcile_record_projection",
+        "server_derived": True,
+        "record_verified": True,
+        "merge_projection_verified": True,
+        "dispatch_lineage_verified": True,
+        "project_id": PID,
+        "backlog_id": case.backlog_id,
+        "contract_execution_id": case.execution_id,
+        "runtime_context_id": case.tests.runtime_context_id,
+        "task_id": case.tests.task_id,
+        "parent_task_id": case.execution_id,
+        "merge_queue_id": case.tests.merge_queue_id,
+        "merged_commit_sha": case.aggregate["merged_commit_sha"],
+        "merge_source_ref": case.aggregate["merge_source_ref"],
+        "merge_event_id": case.aggregate["merge_event_id"],
+        "merge_event_created_at": case.aggregate["merge_event_created_at"],
+        "contract_runtime_dispatch_source_ref": case.aggregate[
+            "contract_runtime_dispatch_source_ref"
+        ],
+        "all_lane_merges_verified": True,
+        "lane_merge_count": 2,
+        "lane_runtime_context_ids": list(
+            case.aggregate["lane_runtime_context_ids"]
+        ),
+        "lane_merge_queue_ids": list(
+            case.aggregate["lane_merge_queue_ids"]
+        ),
+        "reconcile_event_recorded": True,
+        "reconcile_source_ref": initial["reconcile_source_ref"],
+        "reconcile_event_id": initial["reconcile_event_id"],
+        "reconcile_event_created_at": initial[
+            "reconcile_event_created_at"
+        ],
+        "reconcile_task_id": case.tests.task_id,
+        "reconcile_runtime_context_id": case.tests.runtime_context_id,
+        "current_full_reconcile_activation_verified": True,
+        "terminal_current_full_reconcile_authority": terminal,
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    completed_line = {
+        "stage_id": "observer_reconcile",
+        "line_id": "observer_reconcile",
+        "actor_role": "observer",
+        "evidence_kind": "reconcile",
+        "status": "passed",
+        "commit_sha": case.aggregate["merged_commit_sha"],
+        "payload": {"reconcile_authority": authority},
+    }
+    persisted = copy.deepcopy(case.record)
+    persisted["completed_lines"].append(completed_line)
+    persisted["runtime_guide"] = {
+        "next_legal_action": {
+            "stage_id": "qa",
+            "line_id": "qa_graph_context",
+        }
+    }
+
+    restored = server._contract_runtime_rev8_selected_reconcile_lane_projection(
+        object(),
+        project_id=PID,
+        record=persisted,
+        aggregate_merge=case.aggregate,
+    )
+
+    assert restored["runtime_context_id"] == case.tests.runtime_context_id
+    assert restored["task_id"] == case.tests.task_id
+    assert restored["merge_queue_id"] == case.tests.merge_queue_id
+    assert restored["reconcile_lane_identity_source"] == (
+        "terminal_current_full_reconcile_receipt"
+    )
+    assert restored["aggregate_final_merge_identity"] == {
+        "runtime_context_id": case.tests.runtime_context_id,
+        "task_id": case.tests.task_id,
+        "parent_task_id": case.execution_id,
+        "merge_queue_id": case.tests.merge_queue_id,
+    }
 
 
 def _bounded_replacement_graph_trace_case(conn, monkeypatch):
