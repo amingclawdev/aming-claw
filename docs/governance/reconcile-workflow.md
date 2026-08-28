@@ -811,60 +811,23 @@ AC repair work uses two independent runtime planes:
 - A private coordination source may opt into a narrower, versioned projection
   without making the project public. This is the only supported Judgment Brain
   configuration; setting `public_safe=true` is deliberately rejected for
-  `judgment-brain`. Do not edit the stable/shared `projects.json` to enable a
-  canary. The project must already be registered, initialized, active, and have
-  existing non-symlink storage. Dev `40008` additionally reads one
-  operator-owned overlay from the exact absolute path in
-  `AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH`. The file must be outside the
-  governance root, regular, non-symlink, at most 64 KiB, and have this complete
-  closed shape (no aliases or extra keys):
+  `judgment-brain`. The operator-owned `projects.json` entry must keep the
+  entire policy and nested projection object at this exact closed shape (no
+  aliases or extra keys):
 
   ```json
   {
-    "schema_version": "ac.dev_external_policy_overlay.v1",
-    "project_id": "judgment-brain",
-    "policy": {
-      "schema_version": "governance_policy.v1",
-      "profile": "private-scoped-coordination",
-      "public_safe": false,
-      "external_coordination_projection": {
-        "schema_version": "ac.external_coordination_projection_policy.v1",
-        "enabled": true,
-        "endpoint_profile": "coordination-read-only.v1",
-        "field_profile": "lifecycle-identifiers-status-counts.v1"
-      }
+    "schema_version": "governance_policy.v1",
+    "profile": "private-scoped-coordination",
+    "public_safe": false,
+    "external_coordination_projection": {
+      "schema_version": "ac.external_coordination_projection_policy.v1",
+      "enabled": true,
+      "endpoint_profile": "coordination-read-only.v1",
+      "field_profile": "lifecycle-identifiers-status-counts-explicit-public-summary.v1"
     }
   }
   ```
-
-  R3 setup is intentionally temporary: create a private temporary directory,
-  write the JSON above to `judgment-brain-policy.json`, resolve its physical
-  absolute path (for example with `pwd -P`), set file mode `0600`, export that
-  path as `AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH`, and only then start
-  dev `40008`. Record the file SHA-256 in the canary receipt. For rollback,
-  stop only dev `40008`, unset the environment variable, and remove the
-  temporary directory. The shared registry bytes must compare equal before and
-  after. An absent overlay preserves the production default and the private
-  projection fails closed. A malformed, cross-project, symlinked, in-root, or
-  project-wide-public overlay also fails closed.
-
-  ```bash
-  overlay_dir="$(mktemp -d "${TMPDIR:-/tmp}/ac-dev-policy.XXXXXX")"
-  overlay_dir="$(cd "$overlay_dir" && pwd -P)"
-  overlay_path="$overlay_dir/judgment-brain-policy.json"
-  install -m 0600 ./judgment-brain-policy.json "$overlay_path"
-  export AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH="$overlay_path"
-  # Start only dev 40008 after recording sha256 "$overlay_path".
-
-  # R3 rollback, after stopping only dev 40008:
-  unset AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH
-  rm -f "$overlay_path"
-  rmdir "$overlay_dir"
-  ```
-
-  Here `./judgment-brain-policy.json` is an operator-reviewed copy of the exact
-  JSON above, not `projects.json` and not a file under the shared governance
-  root.
 
   This registration permits only active graph status, the no-authority Onboard
   redirect, and read-only
@@ -873,17 +836,17 @@ AC repair work uses two independent runtime planes:
   `ac_dev_external_coordination_projection.v1` and folds a stable compact
   backlog read into a closed project/runtime/graph status capsule plus bounded
   intent lifecycle identifiers, status/priority, non-negative counts, contract
-  hash/status, and optional route/decision ID+SHA-256 pairs. The a258 compact
-  service derives legacy `public_safe` and `privacy_level` values without an
-  independently verifiable classification provenance, so the private scoped
-  projection never emits a title, summary, or other content even when those
-  legacy labels say public. Every body, prompt, packet, credential, SQL value,
-  raw event, path, token, and full row remains absent.
+  hash/status, and optional route/decision ID+SHA-256 pairs. A title is emitted only when
+  the stable compact row carries exact `public_safe=true` and
+  `privacy_level="public"`; private titles and every body, prompt, packet,
+  credential, SQL value, raw event, path, token, and full row remain absent.
   The a258 stable compact schema does not currently carry route/decision pairs,
   so those fields remain absent rather than being reconstructed from details or
-  provenance. Do not replace the scoped policy with project-wide
-  `public_safe=true`. This document is an operator configuration template only
-  and does not authorize a live registry edit.
+  provenance. To roll back, remove the entire scoped policy (or set
+  `enabled=false`) and restart only the dev service; discovery then fails closed.
+  Do not replace the scoped policy with project-wide `public_safe=true`. This
+  document is an operator configuration template only and does not authorize a
+  live registry edit.
 - External discovery never opens a non-AC `governance.db`, WAL, SHM, or rollback
   journal. Registration validates those existing paths and rejects symlink or
   non-regular storage, but the dev process has no external SQLite capability.

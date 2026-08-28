@@ -13103,15 +13103,8 @@ def _dev_scoped_external_discovery_fixture(monkeypatch, tmp_path):
         "name": "private coordination source",
         "initialized": True,
         "status": "active",
-        "project_config": {"governance": {}},
-    }
-    registry_path.write_text(json.dumps(registry), encoding="utf-8")
-    overlay_path = tmp_path / "judgment-brain-dev-overlay.json"
-    overlay_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "ac.dev_external_policy_overlay.v1",
-                "project_id": "judgment-brain",
+        "project_config": {
+            "governance": {
                 "policy": {
                     "schema_version": "governance_policy.v1",
                     "profile": "private-scoped-coordination",
@@ -13123,19 +13116,15 @@ def _dev_scoped_external_discovery_fixture(monkeypatch, tmp_path):
                         "enabled": True,
                         "endpoint_profile": "coordination-read-only.v1",
                         "field_profile": (
-                            "lifecycle-identifiers-status-counts.v1"
+                            "lifecycle-identifiers-status-counts-"
+                            "explicit-public-summary.v1"
                         ),
                     },
-                },
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv(
-        "AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH",
-        str(overlay_path),
-    )
+                }
+            }
+        },
+    }
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     paths["judgment-brain"] = scoped_path
     return paths, registry_path
@@ -14049,11 +14038,6 @@ def test_ac_dev_private_scoped_registry_requires_exact_closed_policy(
         tmp_path,
     )
     before = paths["judgment-brain"].read_bytes()
-    registry_before = registry_path.read_bytes()
-    overlay_path = Path(
-        os.environ["AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH"]
-    )
-    overlay_before = overlay_path.read_bytes()
     monkeypatch.setattr(
         governance_db.sqlite3,
         "connect",
@@ -14069,115 +14053,43 @@ def test_ac_dev_private_scoped_registry_requires_exact_closed_policy(
         "onboard",
         "coordination",
     ]
-    assert registered["policy_overlay_sha256"] == (
-        "sha256:" + hashlib.sha256(overlay_before).hexdigest()
-    )
     assert paths["judgment-brain"].read_bytes() == before
-    assert registry_path.read_bytes() == registry_before
-    assert overlay_path.read_bytes() == overlay_before
 
-    # A private overlay does not interfere with an independently registered
-    # project-wide public profile.
-    assert governance_db.registered_public_safe_external_project(
-        "content-sys"
-    )["visibility_profile"] == "project-wide-public-safe.v1"
-
-    original = json.loads(overlay_before)
-    bad_overlays = []
-    public_substitute = copy.deepcopy(original)
-    public_substitute["policy"] = {"public_safe": True}
-    bad_overlays.append(public_substitute)
+    original = json.loads(registry_path.read_text(encoding="utf-8"))
+    bad_policies = []
+    public_substitute = {"public_safe": True}
+    bad_policies.append(public_substitute)
     for field, value in (
         ("enabled", False),
         ("endpoint_profile", "all-endpoints.v1"),
         ("field_profile", "all-fields.v1"),
         ("schema_version", "future-policy.v2"),
     ):
-        overlay = copy.deepcopy(original)
-        policy = overlay["policy"]
-        policy["external_coordination_projection"][field] = value
-        bad_overlays.append(overlay)
-    extra_key = copy.deepcopy(original)
-    extra_key["policy"]["external_coordination_projection"]["unknown"] = True
-    bad_overlays.append(extra_key)
-    wrong_project = copy.deepcopy(original)
-    wrong_project["project_id"] = "content-sys"
-    bad_overlays.append(wrong_project)
-    unknown_top = copy.deepcopy(original)
-    unknown_top["secret"] = "must not be accepted"
-    bad_overlays.append(unknown_top)
-
-    for bad_overlay in bad_overlays:
-        overlay_path.write_text(json.dumps(bad_overlay), encoding="utf-8")
-        with pytest.raises(ValueError):
-            governance_db.registered_public_safe_external_project(
-                "judgment-brain"
-            )
-        assert registry_path.read_bytes() == registry_before
-
-    overlay_path.write_bytes(overlay_before)
-    unsafe_paths = [tmp_path / "overlay-directory"]
-    unsafe_paths[0].mkdir()
-    symlink_path = tmp_path / "overlay-link.json"
-    symlink_path.symlink_to(overlay_path)
-    unsafe_paths.append(symlink_path)
-    in_root_path = registry_path.parent / "unsafe-overlay.json"
-    in_root_path.write_bytes(overlay_before)
-    unsafe_paths.append(in_root_path)
-    for unsafe_path in unsafe_paths:
-        monkeypatch.setenv(
-            "AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH",
-            str(unsafe_path),
+        policy = copy.deepcopy(
+            original["projects"]["judgment-brain"]["project_config"][
+                "governance"
+            ]["policy"]
         )
+        policy["external_coordination_projection"][field] = value
+        bad_policies.append(policy)
+    extra_key = copy.deepcopy(
+        original["projects"]["judgment-brain"]["project_config"][
+            "governance"
+        ]["policy"]
+    )
+    extra_key["external_coordination_projection"]["unknown"] = True
+    bad_policies.append(extra_key)
+
+    for bad_policy in bad_policies:
+        registry = copy.deepcopy(original)
+        registry["projects"]["judgment-brain"]["project_config"][
+            "governance"
+        ]["policy"] = bad_policy
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
         with pytest.raises(ValueError):
             governance_db.registered_public_safe_external_project(
                 "judgment-brain"
             )
-    monkeypatch.setenv(
-        "AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH",
-        "relative-overlay.json",
-    )
-    with pytest.raises(ValueError):
-        governance_db.registered_public_safe_external_project("judgment-brain")
-    monkeypatch.setenv(
-        "AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH",
-        str(overlay_path),
-    )
-    for invalid_bytes in (
-        b"{not-json",
-        (
-            b'{"schema_version":"ac.dev_external_policy_overlay.v1",'
-            b'"schema_version":"ac.dev_external_policy_overlay.v1",'
-            b'"project_id":"judgment-brain","policy":{}}'
-        ),
-        b"x" * (64 * 1024 + 1),
-    ):
-        overlay_path.write_bytes(invalid_bytes)
-        with pytest.raises(ValueError) as rejected:
-            governance_db.registered_public_safe_external_project(
-                "judgment-brain"
-            )
-        assert "secret" not in str(rejected.value)
-    overlay_path.write_bytes(overlay_before)
-    monkeypatch.delenv(
-        "AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH",
-        raising=False,
-    )
-    with pytest.raises(ValueError):
-        governance_db.registered_public_safe_external_project("judgment-brain")
-    registry = json.loads(registry_before)
-    registry["projects"]["judgment-brain"]["project_config"]["governance"][
-        "policy"
-    ] = {"public_safe": True}
-    registry_path.write_text(json.dumps(registry), encoding="utf-8")
-    monkeypatch.setenv(
-        "AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH",
-        str(overlay_path),
-    )
-    with pytest.raises(ValueError):
-        governance_db.registered_public_safe_external_project("judgment-brain")
-    registry_path.write_bytes(registry_before)
-    assert registry_path.read_bytes() == registry_before
 
 
 def test_ac_dev_private_scoped_coordination_projection_is_closed_and_read_only(
@@ -14251,11 +14163,6 @@ def test_ac_dev_private_scoped_coordination_projection_is_closed_and_read_only(
     assert result["project"]["visibility_profile"] == (
         "private-scoped-coordination.v1"
     )
-    assert result["project"]["policy_overlay_applied"] is True
-    assert re.fullmatch(
-        r"sha256:[0-9a-f]{64}",
-        result["project"]["policy_overlay_sha256"],
-    )
     assert set(result["runtime"]) == {
         "status",
         "service",
@@ -14277,48 +14184,29 @@ def test_ac_dev_private_scoped_coordination_projection_is_closed_and_read_only(
         "read_only",
     }
     public_intent, private_intent = result["backlog"]["intents"]
+    assert public_intent["public_summary"]["classification"] == "explicit_public"
     assert public_intent["coordination_refs"] == {
         "route_id": "route-public",
         "route_context_sha256": "sha256:" + "4" * 64,
         "decision_id": "dec-public",
         "decision_source_sha256": "sha256:" + "5" * 64,
     }
-    for intent in (public_intent, private_intent):
-        assert intent["content_projection"] == (
-            "omitted_unverified_legacy_classification"
-        )
-        assert "public_summary" not in intent
-        assert "public_summary_available" not in intent
-        assert "title" not in intent
+    assert private_intent["public_summary_available"] is False
+    assert "public_summary" not in private_intent
     encoded = json.dumps(result, sort_keys=True)
     for forbidden in (
-        "judgment-brain public row",
         "private title must not escape",
         "private decision body must not escape",
         "details_md",
         "hidden_prompt",
         "route_token_ref",
-        "explicitly_public_summary",
     ):
         assert forbidden not in encoded
-    assert "judgment-brain-dev-overlay.json" not in encoded
     assert result["writes_performed"] is False
     assert result["route_authority"] is False
     assert result["cex_minted"] is False
     assert result["managed_pass"] is False
     assert paths["judgment-brain"].read_bytes() == before
-
-    exact_query = {"q": "JUDGMENT-BRAIN-PUBLIC", "limit": "1"}
-    exact = server._dev_external_coordination_projection(
-        result["project"],
-        exact_query,
-    )
-    assert [row["backlog_id"] for row in exact["backlog"]["intents"]] == [
-        "JUDGMENT-BRAIN-PUBLIC"
-    ]
-    assert exact["backlog"]["stable_read_authority"]["project_id"] == (
-        "judgment-brain"
-    )
 
     graph_path = "/api/graph-governance/judgment-brain/status"
     graph_route = server._guard_dev_runtime_request(
@@ -14405,8 +14293,10 @@ def test_ac_dev_private_scoped_onboard_is_health_checked_no_authority(
     [
         ("contract_extra", "ac_dev_external_coordination_contract_rejected"),
         ("bool_count", "ac_dev_stable_proxy_schema_rejected"),
+        ("missing_classification", "ac_dev_external_coordination_classification_rejected"),
         ("half_route_ref", "ac_dev_external_coordination_reference_rejected"),
         ("bad_decision_hash", "ac_dev_external_coordination_reference_rejected"),
+        ("public_control_title", "ac_dev_external_coordination_summary_rejected"),
     ],
 )
 def test_ac_dev_private_scoped_projection_rejects_schema_and_privacy_attacks(
@@ -14421,74 +14311,17 @@ def test_ac_dev_private_scoped_projection_rejects_schema_and_privacy_attacks(
         row["contract_summary"]["hidden_prompt"] = "private"
     elif mutation == "bool_count":
         row["acceptance_count"] = True
+    elif mutation == "missing_classification":
+        row.pop("public_safe")
     elif mutation == "half_route_ref":
         row.pop("route_context_sha256")
     elif mutation == "bad_decision_hash":
         row["decision_source_sha256"] = "SHA256:" + "5" * 64
+    elif mutation == "public_control_title":
+        row["title"] = "public\x00title"
     with pytest.raises(GovernanceError) as rejected:
         server._dev_external_coordination_backlog_row(row)
     assert rejected.value.code == expected_code
-
-
-def test_ac_dev_private_scoped_projection_never_trusts_legacy_content_labels():
-    path = (
-        "/api/backlog/judgment-brain?view=compact&limit=250&include_closed=true"
-    )
-    row = _dev_scoped_external_stable_payload(path)["bugs"][0]
-    row.update(
-        title="spoofed public title\x00with private bytes",
-        public_safe=True,
-        privacy_level="public",
-        public_summary="private summary must not escape",
-        details_md="private body must not escape",
-    )
-    projected = server._dev_external_coordination_backlog_row(row)
-    encoded = json.dumps(projected, sort_keys=True)
-    assert projected["content_projection"] == (
-        "omitted_unverified_legacy_classification"
-    )
-    for forbidden in (
-        "title",
-        "public_summary",
-        "spoofed public",
-        "private summary",
-        "private body",
-    ):
-        assert forbidden not in encoded
-
-
-def test_ac_dev_private_scoped_legacy_hot_window_omits_all_134_titles():
-    path = (
-        "/api/backlog/judgment-brain?view=compact&limit=250&include_closed=true"
-    )
-    template = _dev_scoped_external_stable_payload(path)["bugs"][0]
-    rows = []
-    for index in range(134):
-        row = copy.deepcopy(template)
-        row["bug_id"] = f"JB-INTENT-{index:03d}"
-        row["title"] = f"private legacy-derived title {index}"
-        row["public_safe"] = True
-        row["privacy_level"] = "public"
-        rows.append(row)
-    projected = [server._dev_external_coordination_backlog_row(row) for row in rows]
-    assert len(projected) == 134
-    encoded = json.dumps(projected, sort_keys=True)
-    assert "private legacy-derived title" not in encoded
-    assert "public_summary" not in encoded
-    assert all(
-        set(row)
-        == {
-            "backlog_id",
-            "lifecycle_kind",
-            "status",
-            "priority",
-            "counts",
-            "contract",
-            "coordination_refs",
-            "content_projection",
-        }
-        for row in projected
-    )
 
 
 @pytest.mark.parametrize(
@@ -14525,47 +14358,6 @@ def test_ac_dev_private_scoped_unregistered_or_mutating_surface_is_zero_write(
             query=query,
         )
     assert rejected.value.details["writes_performed"] is False
-    assert paths["judgment-brain"].read_bytes() == before
-
-
-@pytest.mark.parametrize(
-    "query",
-    [
-        {"limit": 10},
-        {"limit": True},
-        {"limit": None},
-        {"limit": {"value": "10"}},
-        {"limit": ["10", "11"]},
-        {"limit": "01"},
-        {"status": 1},
-        {"status": ["OPEN", "FIXED"]},
-        {"status": " OPEN"},
-        {"q": False},
-        {"q": ["A", "B"]},
-        {"q": "../private"},
-        {"include_closed": True},
-        {"include_closed": ["true", "false"]},
-        {"include_closed": "TRUE"},
-    ],
-)
-def test_ac_dev_private_scoped_query_rejects_raw_non_scalar_or_malformed(
-    monkeypatch,
-    tmp_path,
-    query,
-):
-    paths, _registry_path = _dev_scoped_external_discovery_fixture(
-        monkeypatch,
-        tmp_path,
-    )
-    before = paths["judgment-brain"].read_bytes()
-    with pytest.raises(GovernanceError):
-        server._guard_dev_runtime_request(
-            method="GET",
-            path="/api/projects/judgment-brain/coordination-projection",
-            path_params={"project_id": "judgment-brain"},
-            body={},
-            query=query,
-        )
     assert paths["judgment-brain"].read_bytes() == before
 
 

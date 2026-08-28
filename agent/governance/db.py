@@ -37,11 +37,8 @@ _DEV_EXTERNAL_SCOPED_POLICY_SCHEMA = (
 )
 _DEV_EXTERNAL_SCOPED_ENDPOINT_PROFILE = "coordination-read-only.v1"
 _DEV_EXTERNAL_SCOPED_FIELD_PROFILE = (
-    "lifecycle-identifiers-status-counts.v1"
+    "lifecycle-identifiers-status-counts-explicit-public-summary.v1"
 )
-_DEV_EXTERNAL_POLICY_OVERLAY_ENV = "AMING_CLAW_DEV_EXTERNAL_POLICY_OVERLAY_PATH"
-_DEV_EXTERNAL_POLICY_OVERLAY_SCHEMA = "ac.dev_external_policy_overlay.v1"
-_DEV_EXTERNAL_POLICY_OVERLAY_MAX_BYTES = 64 * 1024
 _DEV_EXTERNAL_PUBLIC_ROUTE_KINDS = (
     "backlog_list",
     "backlog_item",
@@ -1264,154 +1261,6 @@ def _registered_external_projection_policy(policy: object) -> dict[str, object]:
     }
 
 
-def _dev_external_scoped_policy_overlay(
-    *,
-    project_id: str,
-    governance_root: Path,
-    registered_policy: object,
-) -> tuple[object, str]:
-    """Load one exact dev-only scoped policy without changing the registry.
-
-    The overlay is deliberately a single-project declaration, not a registry
-    replacement.  It cannot make a project broadly public, redirect storage,
-    or add endpoints.  Its byte digest is returned as provenance; its path is
-    never included in a public response.
-    """
-
-    raw_path = os.environ.get(_DEV_EXTERNAL_POLICY_OVERLAY_ENV)
-    if raw_path is None:
-        return registered_policy, ""
-    if type(raw_path) is not str or not raw_path or raw_path != raw_path.strip():
-        raise ValueError("dev external policy overlay path must be an exact string")
-    overlay_path = Path(raw_path)
-    if not overlay_path.is_absolute():
-        raise ValueError("dev external policy overlay path must be absolute")
-    try:
-        resolved_overlay = overlay_path.resolve(strict=True)
-        resolved_root = governance_root.resolve(strict=True)
-        before = overlay_path.stat(follow_symlinks=False)
-    except (FileNotFoundError, OSError) as exc:
-        raise ValueError("dev external policy overlay is unreadable") from exc
-    if (
-        overlay_path.is_symlink()
-        or resolved_overlay != overlay_path
-        or not stat.S_ISREG(before.st_mode)
-        or overlay_path == resolved_root
-        or resolved_root in overlay_path.parents
-        or before.st_size <= 0
-        or before.st_size > _DEV_EXTERNAL_POLICY_OVERLAY_MAX_BYTES
-    ):
-        raise ValueError("dev external policy overlay path is unsafe")
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(overlay_path, flags)
-        try:
-            opened = os.fstat(fd)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or (opened.st_dev, opened.st_ino, opened.st_size)
-                != (before.st_dev, before.st_ino, before.st_size)
-            ):
-                raise ValueError("dev external policy overlay identity changed")
-            encoded = b""
-            remaining = _DEV_EXTERNAL_POLICY_OVERLAY_MAX_BYTES + 1
-            while remaining > 0:
-                chunk = os.read(fd, min(remaining, 64 * 1024))
-                if not chunk:
-                    break
-                encoded += chunk
-                remaining -= len(chunk)
-            after = os.fstat(fd)
-        finally:
-            os.close(fd)
-    except OSError as exc:
-        raise ValueError("dev external policy overlay is unreadable") from exc
-    if (
-        len(encoded) != before.st_size
-        or len(encoded) > _DEV_EXTERNAL_POLICY_OVERLAY_MAX_BYTES
-        or (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        != (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-    ):
-        raise ValueError("dev external policy overlay identity changed")
-    try:
-        path_after = overlay_path.stat(follow_symlinks=False)
-    except OSError as exc:
-        raise ValueError("dev external policy overlay identity changed") from exc
-    if (
-        overlay_path.is_symlink()
-        or (
-            path_after.st_dev,
-            path_after.st_ino,
-            path_after.st_size,
-            path_after.st_mtime_ns,
-            path_after.st_ctime_ns,
-        )
-        != (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-    ):
-        raise ValueError("dev external policy overlay identity changed")
-
-    def closed_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        value: dict[str, object] = {}
-        for key, item in pairs:
-            if key in value:
-                raise ValueError("dev external policy overlay has duplicate keys")
-            value[key] = item
-        return value
-
-    try:
-        overlay = json.loads(
-            encoded.decode("utf-8"),
-            object_pairs_hook=closed_object,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("dev external policy overlay is invalid JSON") from exc
-    if not (
-        type(overlay) is dict
-        and set(overlay) == {"schema_version", "project_id", "policy"}
-        and overlay.get("schema_version") == _DEV_EXTERNAL_POLICY_OVERLAY_SCHEMA
-        and type(overlay.get("project_id")) is str
-        and overlay.get("project_id") == project_id
-    ):
-        raise ValueError("dev external policy overlay has an invalid closed schema")
-    overlay_policy = overlay["policy"]
-    overlay_projection = _registered_external_projection_policy(overlay_policy)
-    if overlay_projection["visibility_profile"] != _DEV_EXTERNAL_SCOPED_PROFILE:
-        raise ValueError("dev external policy overlay cannot grant public visibility")
-    if registered_policy is not None:
-        registered_projection = _registered_external_projection_policy(
-            registered_policy
-        )
-        if (
-            registered_projection["visibility_profile"]
-            != _DEV_EXTERNAL_SCOPED_PROFILE
-            or registered_policy != overlay_policy
-        ):
-            raise ValueError(
-                "dev external policy overlay cannot broaden or replace registry policy"
-            )
-    return overlay_policy, "sha256:" + hashlib.sha256(encoded).hexdigest()
-
-
 def registered_public_safe_external_project(project_id: str) -> dict:
     """Resolve a registered public or explicitly scoped external projection.
 
@@ -1451,13 +1300,6 @@ def registered_public_safe_external_project(project_id: str) -> dict:
     config = entry.get("project_config")
     governance = config.get("governance") if isinstance(config, Mapping) else None
     policy = governance.get("policy") if isinstance(governance, Mapping) else None
-    overlay_sha256 = ""
-    if not (isinstance(policy, Mapping) and policy.get("public_safe") is True):
-        policy, overlay_sha256 = _dev_external_scoped_policy_overlay(
-            project_id=canonical,
-            governance_root=root,
-            registered_policy=policy,
-        )
     projection_policy = _registered_external_projection_policy(policy)
     if (
         canonical == "judgment-brain"
@@ -1496,7 +1338,6 @@ def registered_public_safe_external_project(project_id: str) -> dict:
         "db_device": int(db_stat.st_dev),
         "db_inode": int(db_stat.st_ino),
         "storage_validated_without_database_open": True,
-        "policy_overlay_sha256": overlay_sha256,
     }
 
 
