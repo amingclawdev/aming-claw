@@ -123686,6 +123686,9 @@ def test_contract_runtime_authority_registry_accepts_structured_build_keys(
     monkeypatch,
 ):
     source_name = "_CURRENT_FULL_BUILD_KEYS"
+    monkeypatch.setattr(server, source_name, set())
+    empty = server._contract_runtime_require_canonical_authority_registry_complete()
+    empty_hash = server.stable_sha256(empty)
     monkeypatch.setattr(
         server,
         source_name,
@@ -123705,11 +123708,22 @@ def test_contract_runtime_authority_registry_accepts_structured_build_keys(
     second = server._contract_runtime_require_canonical_authority_registry_complete()
 
     assert source_name in first["inventory_source_names"]
-    assert source_name in first["audited_non_authority_source_names"]
+    assert source_name in first["structured_non_authority_source_names"]
+    assert first["structured_schema_registry_source_names"] == [source_name]
+    assert first["live_structured_source_names"] == [source_name]
+    assert first["structured_shape_validity"] == {source_name: True}
+    assert first["structured_schema_ids"] == {
+        source_name: "canonical_structured_source.string_pair_set.v1"
+    }
+    assert re.fullmatch(
+        r"sha256:[0-9a-f]{64}",
+        first["structured_schema_hashes"][source_name],
+    )
     assert not any(
         path.startswith(f"{source_name}.")
         for path in first["field_inventory_paths"]
     )
+    assert first_hash == empty_hash
     assert server.stable_sha256(second) == first_hash
     assert server._contract_runtime_refresh_canonical_authority_field_inventory()
 
@@ -123763,19 +123777,46 @@ def test_contract_runtime_authority_registry_scans_new_string_collection(
     assert error.value.details["writes_performed"] is False
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        {
+            "schema_id": "canonical_structured_source.string_triple_set.v1",
+            "container_kind": "set",
+            "entry_kind": "nonempty_string_pair",
+        },
+        {
+            "container_kind": "set",
+            "entry_kind": "nonempty_string_pair",
+        },
+        {
+            "schema_id": "canonical_structured_source.string_pair_set.v1",
+            "container_kind": "list",
+            "entry_kind": "nonempty_string_pair",
+        },
+        {
+            "schema_id": "canonical_structured_source.string_pair_set.v1",
+            "container_kind": "set",
+            "entry_kind": "unreviewed_string_triple",
+        },
+        {
+            "schema_id": "canonical_structured_source.string_pair_set.v1",
+            "container_kind": "set",
+            "entry_kind": "nonempty_string_pair",
+            "unreviewed_extension": True,
+        },
+    ],
+)
 def test_contract_runtime_authority_registry_rejects_structured_shape_tamper(
     monkeypatch,
+    shape,
 ):
     source_name = "_CURRENT_FULL_BUILD_KEYS"
+    accepted = server._contract_runtime_server_canonical_source_registry_audit()
     monkeypatch.setattr(
         server,
         "_CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES",
-        {
-            source_name: {
-                "container_kind": "set",
-                "entry_kind": "unreviewed_string_triple",
-            }
-        },
+        {source_name: shape},
     )
     monkeypatch.setattr(
         server,
@@ -123789,6 +123830,126 @@ def test_contract_runtime_authority_registry_rejects_structured_shape_tamper(
     assert error.value.code == "contract_runtime_authority_registry_incomplete"
     assert error.value.details["diagnostic_paths"] == [source_name]
     assert error.value.details["writes_performed"] is False
+    rejected = server._contract_runtime_server_canonical_source_registry_audit()
+    assert rejected["complete"] is False
+    assert rejected["invalid_structured_shape_source_names"] == [source_name]
+    assert rejected["structured_shape_validity"] == {source_name: False}
+    assert server.stable_sha256(rejected) != server.stable_sha256(accepted)
+
+
+@pytest.mark.parametrize(
+    "build_keys",
+    [set(), {("aming-claw", "full-populated")}],
+)
+def test_contract_runtime_authority_registry_rejects_deleted_shape_metadata(
+    monkeypatch,
+    build_keys,
+):
+    source_name = "_CURRENT_FULL_BUILD_KEYS"
+    accepted = server._contract_runtime_server_canonical_source_registry_audit()
+    monkeypatch.setattr(
+        server,
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES",
+        {},
+    )
+    monkeypatch.setattr(server, source_name, build_keys)
+
+    with pytest.raises(server.GovernanceError) as error:
+        server._contract_runtime_require_canonical_authority_registry_complete()
+
+    assert error.value.details["diagnostic_paths"] == [source_name]
+    audit = server._contract_runtime_server_canonical_source_registry_audit()
+    assert audit["missing_structured_schema_source_names"] == [source_name]
+    assert audit["structured_shape_validity"] == {source_name: False}
+    assert source_name in audit["inventory_source_names"]
+    assert server.stable_sha256(audit) != server.stable_sha256(accepted)
+
+
+def test_contract_runtime_authority_registry_rejects_unused_shape_metadata(
+    monkeypatch,
+):
+    source_name = "_FUTURE_UNUSED_BUILD_KEYS"
+    accepted = server._contract_runtime_server_canonical_source_registry_audit()
+    registry = copy.deepcopy(
+        server._CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES
+    )
+    registry[source_name] = {
+        "schema_id": "canonical_structured_source.string_pair_set.v1",
+        "container_kind": "set",
+        "entry_kind": "nonempty_string_pair",
+    }
+    monkeypatch.setattr(
+        server,
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES",
+        registry,
+    )
+
+    with pytest.raises(server.GovernanceError) as error:
+        server._contract_runtime_require_canonical_authority_registry_complete()
+
+    assert error.value.details["diagnostic_paths"] == [source_name]
+    audit = server._contract_runtime_server_canonical_source_registry_audit()
+    assert audit["unused_structured_schema_source_names"] == [source_name]
+    assert source_name in audit["structured_schema_hashes"]
+    assert server.stable_sha256(audit) != server.stable_sha256(accepted)
+
+
+def test_contract_runtime_authority_registry_future_container_never_disappears(
+    monkeypatch,
+):
+    source_name = "_FUTURE_UNREGISTERED_BUILD_KEYS"
+    audits = []
+    for build_keys in (
+        set(),
+        {("aming-claw", "full-populated")},
+        {("aming-claw",)},
+        {("aming-claw", "full-populated"), "mixed-entry"},
+    ):
+        monkeypatch.setattr(server, source_name, build_keys, raising=False)
+        with pytest.raises(server.GovernanceError) as error:
+            server._contract_runtime_require_canonical_authority_registry_complete()
+        assert error.value.details["diagnostic_paths"] == [source_name]
+        audit = server._contract_runtime_server_canonical_source_registry_audit()
+        assert source_name in audit["inventory_source_names"]
+        assert audit["unclassified_source_names"] == [source_name]
+        audits.append(audit)
+
+    assert audits[0]["malformed_generic_collection_source_names"] == []
+    for audit in audits[1:]:
+        assert audit["malformed_generic_collection_source_names"] == [
+            source_name
+        ]
+    assert server.stable_sha256(audits[0]) != server.stable_sha256(audits[1])
+
+
+def test_contract_runtime_authority_registry_rejects_double_disposition(
+    monkeypatch,
+):
+    source_name = "_CURRENT_FULL_BUILD_KEYS"
+    accepted = server._contract_runtime_server_canonical_source_registry_audit()
+    disposition = {
+        name: frozenset(source_names)
+        for name, source_names in (
+            server._CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION.items()
+        )
+    }
+    disposition["audited_non_authority"] = frozenset(
+        {*disposition["audited_non_authority"], source_name}
+    )
+    monkeypatch.setattr(
+        server,
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION",
+        disposition,
+    )
+
+    with pytest.raises(server.GovernanceError) as error:
+        server._contract_runtime_require_canonical_authority_registry_complete()
+
+    assert error.value.details["diagnostic_paths"] == [source_name]
+    audit = server._contract_runtime_server_canonical_source_registry_audit()
+    assert audit["overlapping_source_names"] == [source_name]
+    assert audit["complete"] is False
+    assert server.stable_sha256(audit) != server.stable_sha256(accepted)
 
 
 @pytest.mark.parametrize(

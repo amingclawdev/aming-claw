@@ -104559,7 +104559,6 @@ _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION = {
             "_CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS",
             "_CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS",
             "_CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS",
-            "_CURRENT_FULL_BUILD_KEYS",
             "_LEGACY_PRIMARY_ROUTE_CLAIM_KEYS",
             "_QA_EXTERNAL_NO_PASS_BASE_REPRODUCTION_REQUIRED_KEYS",
             "_QA_EXTERNAL_NO_PASS_CANDIDATE_COUNTS_REQUIRED_KEYS",
@@ -104571,6 +104570,14 @@ _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION = {
             "_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_CONTRACT_STATE_KEYS",
             "_SEMANTIC_REVISION_FORBIDDEN_KEYS",
             "_TIMELINE_TOP_LEVEL_ROLE_FIELDS",
+        }
+    ),
+    # Structured sources enumerate live identities rather than scalar schema
+    # fields.  Keeping their names in the disposition registry makes source
+    # recognition independent of both current contents and shape metadata.
+    "structured_non_authority": frozenset(
+        {
+            "_CURRENT_FULL_BUILD_KEYS",
         }
     ),
 }
@@ -104742,6 +104749,7 @@ _CONTRACT_RUNTIME_SERVER_CANONICAL_MIXED_SOURCE_PARTITIONS = {
 # exception.
 _CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES = {
     "_CURRENT_FULL_BUILD_KEYS": {
+        "schema_id": "canonical_structured_source.string_pair_set.v1",
         "container_kind": "set",
         "entry_kind": "nonempty_string_pair",
     },
@@ -104766,6 +104774,7 @@ def _contract_runtime_server_canonical_structured_source_shape_valid(
         str(source_name or "")
     )
     if shape != {
+        "schema_id": "canonical_structured_source.string_pair_set.v1",
         "container_kind": "set",
         "entry_kind": "nonempty_string_pair",
     }:
@@ -104799,14 +104808,15 @@ def _contract_runtime_is_server_canonical_collection_source(
         "_CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS",
     }:
         return False
-    if name in _CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES:
-        return _contract_runtime_server_canonical_structured_source_shape_valid(
-            name,
-            raw_fields,
+    structured_source_names = set(
+        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION.get(
+            "structured_non_authority",
+            (),
         )
+    )
     return bool(
-        isinstance(raw_fields, (frozenset, list, set, tuple))
-        and all(isinstance(field_name, str) for field_name in raw_fields)
+        name in structured_source_names
+        or isinstance(raw_fields, (frozenset, list, set, tuple))
     )
 
 
@@ -104819,7 +104829,14 @@ def _contract_runtime_server_canonical_collection_sources(
                 (
                     frozenset()
                     if source_name
-                    in _CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES
+                    in _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION.get(
+                        "structured_non_authority",
+                        (),
+                    )
+                    or not all(
+                        isinstance(field_name, str)
+                        for field_name in raw_fields
+                    )
                     else frozenset(raw_fields)
                 ),
             )
@@ -104882,6 +104899,12 @@ def _contract_runtime_server_canonical_field_dispositions(
         ]
     ):
         return ("audited_non_authority",)
+    if source in (
+        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
+            "structured_non_authority"
+        ]
+    ):
+        return ("structured_non_authority",)
     return ()
 
 
@@ -104902,6 +104925,78 @@ def _contract_runtime_server_canonical_source_registry_audit(
     for disposition, source_names in dispositions.items():
         for source_name in source_names:
             memberships.setdefault(source_name, []).append(disposition)
+    structured_source_names = set(
+        dispositions.get("structured_non_authority", set())
+    )
+    structured_registry_raw = (
+        _CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES
+    )
+    structured_registry_valid = bool(
+        type(structured_registry_raw) is dict
+        and all(
+            type(source_name) is str and type(shape) is dict
+            for source_name, shape in structured_registry_raw.items()
+        )
+    )
+    structured_registry = (
+        structured_registry_raw
+        if structured_registry_valid
+        else {}
+    )
+    structured_registry_source_names = set(structured_registry)
+    live_structured_source_names = {
+        source_name
+        for source_name in structured_source_names
+        if source_name in globals()
+    }
+    missing_structured_schema_sources = sorted(
+        structured_source_names - structured_registry_source_names
+    )
+    unused_structured_schema_sources = sorted(
+        structured_registry_source_names - structured_source_names
+    )
+    missing_live_structured_sources = sorted(
+        structured_source_names - live_structured_source_names
+    )
+    structured_schema_ids = {
+        source_name: str(
+            structured_registry[source_name].get("schema_id") or ""
+        )
+        for source_name in sorted(structured_registry_source_names)
+    }
+    structured_schema_hashes = {
+        source_name: stable_sha256(structured_registry[source_name])
+        for source_name in sorted(structured_registry_source_names)
+    }
+    structured_shape_validity = {
+        source_name: bool(
+            source_name in live_structured_source_names
+            and source_name in structured_registry_source_names
+            and _contract_runtime_server_canonical_structured_source_shape_valid(
+                source_name,
+                globals().get(source_name),
+            )
+        )
+        for source_name in sorted(structured_source_names)
+    }
+    invalid_structured_shape_sources = sorted(
+        source_name
+        for source_name, valid in structured_shape_validity.items()
+        if not valid
+        and source_name not in missing_structured_schema_sources
+        and source_name not in missing_live_structured_sources
+    )
+    malformed_generic_collection_sources = sorted(
+        source_name
+        for source_name in inventory - structured_source_names
+        if not (
+            isinstance(globals().get(source_name), (frozenset, list, set, tuple))
+            and all(
+                type(field_name) is str
+                for field_name in globals().get(source_name)
+            )
+        )
+    )
     overlapping = sorted(
         source_name
         for source_name, source_dispositions in memberships.items()
@@ -104986,6 +105081,12 @@ def _contract_runtime_server_canonical_source_registry_audit(
             or stale_partition_fields
             or missing_partition_sources
             or unknown_partition_dispositions
+            or not structured_registry_valid
+            or missing_structured_schema_sources
+            or unused_structured_schema_sources
+            or missing_live_structured_sources
+            or invalid_structured_shape_sources
+            or malformed_generic_collection_sources
         ),
         "inventory_source_names": sorted(inventory),
         "registered_source_names": sorted(registered),
@@ -104998,6 +105099,34 @@ def _contract_runtime_server_canonical_source_registry_audit(
         "audited_non_authority_source_names": sorted(
             dispositions["audited_non_authority"]
         ),
+        "structured_non_authority_source_names": sorted(
+            structured_source_names
+        ),
+        "structured_schema_registry_valid": structured_registry_valid,
+        "structured_schema_registry_source_names": sorted(
+            structured_registry_source_names
+        ),
+        "live_structured_source_names": sorted(
+            live_structured_source_names
+        ),
+        "missing_structured_schema_source_names": (
+            missing_structured_schema_sources
+        ),
+        "unused_structured_schema_source_names": (
+            unused_structured_schema_sources
+        ),
+        "missing_live_structured_source_names": (
+            missing_live_structured_sources
+        ),
+        "invalid_structured_shape_source_names": (
+            invalid_structured_shape_sources
+        ),
+        "malformed_generic_collection_source_names": (
+            malformed_generic_collection_sources
+        ),
+        "structured_schema_ids": structured_schema_ids,
+        "structured_schema_hashes": structured_schema_hashes,
+        "structured_shape_validity": structured_shape_validity,
         "overlapping_source_names": overlapping,
         "unclassified_source_names": unclassified,
         "missing_registered_source_names": missing,
@@ -105042,6 +105171,28 @@ def _contract_runtime_require_canonical_authority_registry_complete(
                 *list(audit.get("missing_partition_source_names") or []),
                 *list(
                     audit.get("unknown_partition_disposition_paths") or []
+                ),
+                *list(
+                    audit.get("missing_structured_schema_source_names") or []
+                ),
+                *list(
+                    audit.get("unused_structured_schema_source_names") or []
+                ),
+                *list(
+                    audit.get("missing_live_structured_source_names") or []
+                ),
+                *list(
+                    audit.get("invalid_structured_shape_source_names") or []
+                ),
+                *list(
+                    audit.get("malformed_generic_collection_source_names") or []
+                ),
+                *(
+                    []
+                    if audit.get("structured_schema_registry_valid") is True
+                    else [
+                        "_CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES"
+                    ]
                 ),
             }
         )
