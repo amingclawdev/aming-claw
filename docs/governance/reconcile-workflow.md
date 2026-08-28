@@ -790,12 +790,34 @@ AC repair work uses two independent runtime planes:
   loopback bind, loaded runtime, non-stale status, and current stable anchor
   must all equal the service health identity. A process from another worktree
   or an older `codex/ac-dev` commit is never treated as the requested service.
-- The dev plane accepts only project `aming-claw` and only an already-existing
+- The dev plane's **mutation** authority accepts only project `aming-claw` and
+  only an already-existing
   `shared-volume/codex-tasks/state/governance/aming-claw/governance.db`.
-  Empty, foreign, or traversal-shaped project IDs fail before directory
-  creation, schema execution, or writes. Dev connections verify the existing
-  schema version and never auto-migrate it; schema repairs run against an
-  isolated clone first.
+  Empty, foreign, alias, or traversal-shaped project IDs fail before directory
+  creation, schema execution, or writes. AC dev connections verify the
+  existing schema version and never auto-migrate it; schema repairs run
+  against an isolated clone first.
+- A separate discovery capability may read a non-AC project only when its
+  exact normalized key is already initialized and active in `projects.json`,
+  its governance policy says `public_safe=true`, and its project directory and
+  database are existing non-symlink objects under the governance root. The
+  only routes are bounded public-safe backlog list/item, active graph status,
+  and `GET|POST .../onboard-route-guide`. The Onboard result has schema
+  `ac_dev_external_read_only_discovery.v1`, is discovery-only, and directs the
+  caller to stable `40000`; it never mints a route, CEX, ContractRuntime, QA, or
+  session authority and never implies managed PASS. Runtime/source/commit,
+  route, task, CEX, QA-session, mismatched nested-project, and unknown
+  selectors fail before a handler.
+- External discovery bypasses the normal backlog, graph, dashboard, queue, and
+  Onboard handlers. Its dedicated SQLite connection uses URI `mode=ro`,
+  `query_only=ON`, and a deny-write authorizer; it never calls schema setup,
+  migration, backfill, or journal-mode code. Database, WAL, SHM, and rollback
+  journal identity/size/mtime/existence must be identical before and after the
+  read and `total_changes` must remain zero. A WAL database without an already
+  existing stable-owned WAL/SHM pair fails before connect, because a normal
+  read-only SQLite open would otherwise create those sidecars; `immutable=1`
+  is forbidden because it could omit committed WAL content. Every other
+  non-AC surface remains a pre-handler zero-write rejection.
 - Dev may append repair backlog, timeline, ContractRuntime, candidate graph,
   and independent-QA evidence. It cannot activate/finalize current-full,
   rewrite stable version identity, run stable deployment endpoints, or join

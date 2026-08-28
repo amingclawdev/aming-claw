@@ -51,6 +51,9 @@ from .db import (
     independent_connection,
     sqlite_write_lock,
     validate_project_id,
+    validate_project_id_syntax,
+    registered_public_safe_external_project,
+    external_read_only_connection,
     verify_existing_schema_capabilities,
 )
 from . import role_service
@@ -1525,7 +1528,7 @@ def _open_local_directory_picker(
     initial_path: str = "",
     title: str = "Choose project directory",
     timeout_seconds: float = 12.0,
-) -> str:
+) -> str | None:
     """Open a local directory picker and return the selected absolute path."""
     errors: list[str] = []
     if sys.platform == "darwin":
@@ -3349,6 +3352,216 @@ def _dev_write_path_allowed(path: str) -> bool:
     return any(re.fullmatch(pattern, path) for pattern in patterns)
 
 
+_DEV_EXTERNAL_DISCOVERY_SCHEMA_VERSION = (
+    "ac_dev_external_read_only_discovery.v1"
+)
+_DEV_EXTERNAL_ONBOARD_AUTHORITY_SELECTORS = frozenset(
+    {
+        *_onboard_runtime_selector_keys(),
+        "route_token_ref",
+        "observer_route_token_ref",
+        "session_id",
+        "qa_session_id",
+        "runtime_context_id",
+    }
+)
+_DEV_EXTERNAL_ONBOARD_BODY_ALLOWLIST = frozenset(
+    {
+        "project_id",
+        "backlog_id",
+        "bug_id",
+        "role",
+        "actor_role",
+        "work_type",
+        "requested_work_type",
+        "response_view",
+    }
+)
+_DEV_EXTERNAL_ONBOARD_QUERY_ALLOWLIST = _DEV_EXTERNAL_ONBOARD_BODY_ALLOWLIST
+_DEV_EXTERNAL_BACKLOG_LIST_QUERY_ALLOWLIST = frozenset(
+    {"view", "limit", "status", "priority", "include_closed"}
+)
+
+
+def _dev_external_discovery_route(
+    *,
+    method: str,
+    path: str,
+    project_id: str,
+) -> str:
+    """Return one bounded external discovery kind or an empty string."""
+
+    escaped = re.escape(project_id)
+    candidates = (
+        (
+            "backlog_list",
+            "GET",
+            rf"/api/backlog/{escaped}",
+        ),
+        (
+            "backlog_item",
+            "GET",
+            rf"/api/backlog/{escaped}/[^/]+",
+        ),
+        (
+            "graph_status",
+            "GET",
+            rf"/api/graph-governance/{escaped}/status",
+        ),
+        (
+            "onboard",
+            "GET|POST",
+            rf"/api/projects/{escaped}/onboard-route-guide",
+        ),
+    )
+    for kind, allowed_method, pattern in candidates:
+        if re.fullmatch(pattern, path) and method in allowed_method.split("|"):
+            return kind
+    return ""
+
+
+def _dev_external_discovery_rejection(
+    *,
+    code: str,
+    path: str,
+    detail: str,
+) -> ValidationError:
+    rejected = _dev_runtime_zero_write_rejection(
+        code=code,
+        path=path,
+        detail=detail,
+    )
+    rejected.details.update(
+        {
+            "schema_version": _DEV_EXTERNAL_DISCOVERY_SCHEMA_VERSION,
+            "read_only": True,
+            "external_project_mutation_allowed": False,
+            "cex_minted": False,
+            "route_minted": False,
+            "contract_runtime_materialized": False,
+            "managed_pass": False,
+            "pass_implied": False,
+        }
+    )
+    return rejected
+
+
+def _dev_external_discovery_request(
+    *,
+    method: str,
+    path: str,
+    path_params: Mapping[str, Any],
+    body: Mapping[str, Any],
+    query: Mapping[str, Any],
+) -> str:
+    """Validate and identify a registered external discovery request."""
+
+    raw_path_project = str(path_params.get("project_id") or "").strip()
+    if not raw_path_project or raw_path_project == "aming-claw":
+        return ""
+    try:
+        project_id = validate_project_id_syntax(
+            raw_path_project,
+            require_exact=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise _dev_external_discovery_rejection(
+            code="ac_dev_external_project_identity_rejected",
+            path=path,
+            detail=str(exc),
+        ) from exc
+    route_kind = _dev_external_discovery_route(
+        method=method,
+        path=path,
+        project_id=project_id,
+    )
+    if route_kind == "backlog_item" and not path_params.get("bug_id"):
+        # Do not reinterpret reserved endpoints such as ``current-task`` as a
+        # public backlog identifier merely because their URL has two segments.
+        route_kind = ""
+    if not route_kind:
+        return ""
+    try:
+        registered_public_safe_external_project(project_id)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise _dev_external_discovery_rejection(
+            code="ac_dev_external_project_registry_rejected",
+            path=path,
+            detail=str(exc),
+        ) from exc
+    claims = (
+        list(_dev_project_id_claims(path_params, source="path_params"))
+        + list(_dev_project_id_claims(body, source="body"))
+        + list(_dev_project_id_claims(query, source="query"))
+    )
+    for source, claim in claims:
+        try:
+            canonical_claim = validate_project_id_syntax(
+                claim,
+                require_exact=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise _dev_external_discovery_rejection(
+                code="ac_dev_external_project_claim_rejected",
+                path=path,
+                detail=f"{source}: {exc}",
+            ) from exc
+        if canonical_claim != project_id:
+            raise _dev_external_discovery_rejection(
+                code="ac_dev_external_project_claim_mismatch",
+                path=path,
+                detail=f"{source}: project identity mismatch",
+            )
+    if route_kind == "onboard":
+        selector_claims = _onboard_runtime_selector_claims(body, query)
+        forbidden = sorted(
+            key
+            for key in _DEV_EXTERNAL_ONBOARD_AUTHORITY_SELECTORS
+            if key in selector_claims
+            or body.get(key) not in (None, "")
+            or query.get(key) not in (None, "")
+        )
+        unknown_body = sorted(set(body) - _DEV_EXTERNAL_ONBOARD_BODY_ALLOWLIST)
+        unknown_query = sorted(set(query) - _DEV_EXTERNAL_ONBOARD_QUERY_ALLOWLIST)
+        response_views = {
+            str(value or "").strip().lower()
+            for value in (body.get("response_view"), query.get("response_view"))
+            if str(value or "").strip()
+        }
+        if (
+            forbidden
+            or unknown_body
+            or unknown_query
+            or not response_views.issubset({"compact"})
+        ):
+            raise _dev_external_discovery_rejection(
+                code="ac_dev_external_onboard_authority_selector_rejected",
+                path=path,
+                detail=(
+                    "external Onboard discovery accepts no runtime, route, "
+                    "session, source, or commit authority selectors"
+                ),
+            )
+    elif route_kind == "backlog_list":
+        unknown_query = sorted(
+            set(query) - _DEV_EXTERNAL_BACKLOG_LIST_QUERY_ALLOWLIST
+        )
+        view = str(_first_query_value(query, "view") or "").strip().lower()
+        if unknown_query or view not in {"", "compact"}:
+            raise _dev_external_discovery_rejection(
+                code="ac_dev_external_backlog_query_rejected",
+                path=path,
+                detail="external backlog discovery accepts bounded compact filters only",
+            )
+    elif query:
+        raise _dev_external_discovery_rejection(
+            code="ac_dev_external_discovery_query_rejected",
+            path=path,
+            detail="this external discovery endpoint accepts no query selectors",
+        )
+    return route_kind
+
+
 def _guard_dev_runtime_request(
     *,
     method: str,
@@ -3356,11 +3569,20 @@ def _guard_dev_runtime_request(
     path_params: Mapping[str, Any],
     body: Mapping[str, Any],
     query: Mapping[str, Any] | None = None,
-) -> None:
+) -> str | None:
     """Enforce the dev plane before a handler opens a DB or mutates state."""
 
     if _runtime_plane() != "dev":
-        return
+        return None
+    external_route = _dev_external_discovery_request(
+        method=method,
+        path=path,
+        path_params=path_params,
+        body=body,
+        query=query or {},
+    )
+    if external_route:
+        return external_route
     project_claims = (
         list(_dev_project_id_claims(path_params, source="path_params"))
         + list(_dev_project_id_claims(body, source="body"))
@@ -3377,7 +3599,7 @@ def _guard_dev_runtime_request(
             ) from exc
 
     if method not in {"POST", "DELETE"}:
-        return
+        return None
     if not _dev_write_path_allowed(path):
         raise _dev_runtime_zero_write_rejection(
             code="ac_dev_mutation_not_allowlisted",
@@ -3421,7 +3643,7 @@ def _guard_dev_runtime_request(
         )
 
     if "/api/graph-governance/" not in path:
-        return
+        return None
     notes_extra = body.get("notes_extra")
     if (
         path.endswith("/reconcile/current-full")
@@ -3454,6 +3676,321 @@ def _guard_dev_runtime_request(
             path=path,
             detail="set activate=false and retain the result as a candidate for explicit promotion",
         )
+    return None
+
+
+def _dev_external_public_project(project_id: str) -> dict[str, Any]:
+    registered = registered_public_safe_external_project(project_id)
+    return {
+        "project_id": str(registered.get("project_id") or ""),
+        "name": str(registered.get("name") or project_id),
+        "status": "active",
+        "initialized": True,
+        "public_safe": True,
+    }
+
+
+def _dev_external_public_backlog_row(row: sqlite3.Row) -> dict[str, Any] | None:
+    raw = dict(row)
+    privacy_level, public_safe = _backlog_compact_bug_privacy(raw)
+    if not public_safe:
+        return None
+    return {
+        "bug_id": str(raw.get("bug_id") or ""),
+        "title": _compact_preview(raw.get("title"), limit=240),
+        "status": str(raw.get("status") or ""),
+        "priority": str(raw.get("priority") or ""),
+        "created_at": str(raw.get("created_at") or ""),
+        "updated_at": str(raw.get("updated_at") or ""),
+        "fixed_at": str(raw.get("fixed_at") or ""),
+        "privacy_level": privacy_level,
+        "public_safe": True,
+        "compact": True,
+    }
+
+
+def _dev_external_backlog_list_projection(
+    conn: sqlite3.Connection,
+    project_id: str,
+    query: Mapping[str, Any],
+    *,
+    default_limit: int = 20,
+) -> dict[str, Any]:
+    raw_limit = str(_first_query_value(query, "limit", str(default_limit)) or "")
+    try:
+        limit = max(1, min(int(raw_limit), 50))
+    except (TypeError, ValueError) as exc:
+        raise GovernanceError(
+            "ac_dev_external_backlog_limit_invalid",
+            "external backlog discovery limit must be an integer from 1 to 50",
+            400,
+        ) from exc
+    sql = "SELECT * FROM backlog_bugs WHERE 1=1"
+    params: list[Any] = []
+    status_filter = str(_first_query_value(query, "status") or "").strip()
+    priority_filter = str(_first_query_value(query, "priority") or "").strip()
+    if status_filter:
+        sql += " AND UPPER(status) = UPPER(?)"
+        params.append(status_filter)
+    if priority_filter:
+        sql += " AND UPPER(priority) = UPPER(?)"
+        params.append(priority_filter)
+    if not _query_bool(query, "include_closed", True):
+        placeholders = ",".join("?" for _ in _BACKLOG_CLOSED_STATUSES)
+        sql += f" AND UPPER(status) NOT IN ({placeholders})"
+        params.extend(_BACKLOG_CLOSED_STATUSES)
+    sql += " ORDER BY updated_at DESC, created_at DESC, bug_id DESC LIMIT ?"
+    # Fetch a bounded over-window so private rows do not crowd out all public
+    # rows while never turning discovery into an unbounded scan.
+    params.append(min(200, limit * 4))
+    rows = conn.execute(sql, params).fetchall()
+    public_rows = [
+        projected
+        for row in rows
+        if (projected := _dev_external_public_backlog_row(row)) is not None
+    ][:limit]
+    return {
+        "schema_version": "ac_dev_external_public_backlog.v1",
+        "project_id": project_id,
+        "bugs": public_rows,
+        "count": len(public_rows),
+        "limit": limit,
+        "bounded": True,
+        "public_safe": True,
+        "read_only": True,
+    }
+
+
+def _dev_external_backlog_item_projection(
+    conn: sqlite3.Connection,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM backlog_bugs WHERE bug_id = ?",
+        (backlog_id,),
+    ).fetchone()
+    projected = _dev_external_public_backlog_row(row) if row is not None else None
+    if projected is None:
+        raise GovernanceError(
+            "not_found",
+            "public-safe backlog item not found",
+            404,
+            {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "read_only": True,
+                "writes_performed": False,
+            },
+        )
+    return {
+        "schema_version": "ac_dev_external_public_backlog_item.v1",
+        "project_id": project_id,
+        "bug": projected,
+        "bounded": True,
+        "public_safe": True,
+        "read_only": True,
+    }
+
+
+def _dev_external_graph_status_projection(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT r.snapshot_id,
+               r.commit_sha,
+               r.updated_at AS ref_updated_at,
+               s.status AS snapshot_status,
+               s.snapshot_kind,
+               s.created_at AS snapshot_created_at
+          FROM graph_snapshot_refs AS r
+          LEFT JOIN graph_snapshots AS s
+            ON s.project_id = r.project_id
+           AND s.snapshot_id = r.snapshot_id
+         WHERE r.project_id = ? AND r.ref_name = 'active'
+         LIMIT 1
+        """,
+        (project_id,),
+    ).fetchone()
+    return {
+        "schema_version": "ac_dev_external_public_graph_status.v1",
+        "project_id": project_id,
+        "graph_available": row is not None,
+        "active_snapshot_id": str(row["snapshot_id"] or "") if row else "",
+        "active_commit": str(row["commit_sha"] or "") if row else "",
+        "snapshot_status": str(row["snapshot_status"] or "") if row else "",
+        "snapshot_kind": str(row["snapshot_kind"] or "") if row else "",
+        "ref_updated_at": str(row["ref_updated_at"] or "") if row else "",
+        "snapshot_created_at": (
+            str(row["snapshot_created_at"] or "") if row else ""
+        ),
+        "public_safe": True,
+        "read_only": True,
+    }
+
+
+def _dev_external_requested_backlog_id(ctx: "RequestContext") -> str:
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    values = [
+        str(value or "").strip()
+        for value in (
+            body.get("backlog_id"),
+            body.get("bug_id"),
+            _first_query_value(ctx.query, "backlog_id"),
+            _first_query_value(ctx.query, "bug_id"),
+        )
+        if str(value or "").strip()
+    ]
+    if len(set(values)) > 1:
+        raise _dev_external_discovery_rejection(
+            code="ac_dev_external_backlog_identity_mismatch",
+            path=f"/api/projects/{ctx.get_project_id()}/onboard-route-guide",
+            detail="backlog_id and bug_id selectors must identify one exact row",
+        )
+    return values[0] if values else ""
+
+
+def _handle_dev_external_read_only_discovery(
+    ctx: "RequestContext",
+    *,
+    route_kind: str,
+) -> dict[str, Any]:
+    """Serve external discovery without entering any normal managed handler."""
+
+    project_id = validate_project_id_syntax(
+        ctx.path_params.get("project_id", ""),
+        require_exact=True,
+    )
+    project = _dev_external_public_project(project_id)
+    try:
+        with external_read_only_connection(project_id) as conn:
+            if route_kind == "backlog_list":
+                result = _dev_external_backlog_list_projection(
+                    conn,
+                    project_id,
+                    ctx.query,
+                )
+                return {
+                    "ok": True,
+                    **result,
+                    "project": project,
+                    "writes_performed": False,
+                    "managed_pass": False,
+                    "pass_implied": False,
+                }
+            if route_kind == "backlog_item":
+                result = _dev_external_backlog_item_projection(
+                    conn,
+                    project_id,
+                    str(ctx.path_params.get("bug_id") or ""),
+                )
+                return {
+                    "ok": True,
+                    **result,
+                    "project": project,
+                    "writes_performed": False,
+                    "managed_pass": False,
+                    "pass_implied": False,
+                }
+            graph = _dev_external_graph_status_projection(conn, project_id)
+            if route_kind == "graph_status":
+                return {
+                    "ok": True,
+                    **graph,
+                    "project": project,
+                    "writes_performed": False,
+                    "managed_pass": False,
+                    "pass_implied": False,
+                }
+            if route_kind != "onboard":
+                raise GovernanceError(
+                    "ac_dev_external_discovery_route_invalid",
+                    "external discovery route is not supported",
+                    404,
+                )
+            backlog_id = _dev_external_requested_backlog_id(ctx)
+            backlog = (
+                _dev_external_backlog_item_projection(
+                    conn,
+                    project_id,
+                    backlog_id,
+                )
+                if backlog_id
+                else _dev_external_backlog_list_projection(
+                    conn,
+                    project_id,
+                    {},
+                    default_limit=10,
+                )
+            )
+            body = ctx.body if isinstance(ctx.body, Mapping) else {}
+            role = str(
+                body.get("role")
+                or body.get("actor_role")
+                or _first_query_value(ctx.query, "role")
+                or _first_query_value(ctx.query, "actor_role")
+                or ""
+            ).strip()
+            work_type = str(
+                body.get("work_type")
+                or body.get("requested_work_type")
+                or _first_query_value(ctx.query, "work_type")
+                or _first_query_value(ctx.query, "requested_work_type")
+                or ""
+            ).strip()
+            return {
+                "ok": True,
+                "schema_version": _DEV_EXTERNAL_DISCOVERY_SCHEMA_VERSION,
+                "status": "read_only_discovery_only",
+                "discovery_available": True,
+                "runtime_plane": "dev",
+                "project_id": project_id,
+                "role": role,
+                "work_type": work_type,
+                "project": project,
+                "backlog": backlog,
+                "graph": graph,
+                "route_authority_accepted": False,
+                "read_only": True,
+                "writes_performed": False,
+                "mutation_allowed": False,
+                "cex_minted": False,
+                "route_minted": False,
+                "contract_runtime_materialized": False,
+                "managed_pass": False,
+                "pass_implied": False,
+                "next_legal_action": {
+                    "action": "call_stable_onboard_route_guide",
+                    "service_port": AC_STABLE_SERVICE_PORT,
+                    "method": ctx.method,
+                    "endpoint": f"/api/projects/{project_id}/onboard-route-guide",
+                    "reason": (
+                        "the AC dev plane exposes discovery only; stable authority "
+                        "must mint any route or ContractRuntime execution"
+                    ),
+                },
+            }
+    except GovernanceError:
+        raise
+    except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+        raise GovernanceError(
+            "ac_dev_external_read_only_proof_failed",
+            "external read-only discovery could not prove zero-change access",
+            409,
+            {
+                "schema_version": _DEV_EXTERNAL_DISCOVERY_SCHEMA_VERSION,
+                "project_id": project_id,
+                "read_only": True,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "mutation_performed": False,
+                "managed_pass": False,
+                "pass_implied": False,
+                "detail": str(exc),
+            },
+        ) from exc
 
 
 class GovernanceHandler(BaseHTTPRequestHandler):
@@ -3586,7 +4123,7 @@ class GovernanceHandler(BaseHTTPRequestHandler):
         try:
             request_body = self._read_body() if method == "POST" else {}
             request_query = self._query_params()
-            _guard_dev_runtime_request(
+            dev_external_route = _guard_dev_runtime_request(
                 method=method,
                 path=urlparse(self.path).path,
                 path_params=path_params,
@@ -3603,7 +4140,14 @@ class GovernanceHandler(BaseHTTPRequestHandler):
                 token=self.headers.get("X-Gov-Token", ""),
                 idem_key=self.headers.get("Idempotency-Key", ""),
             )
-            result = handler(ctx)
+            result = (
+                _handle_dev_external_read_only_discovery(
+                    ctx,
+                    route_kind=dev_external_route,
+                )
+                if dev_external_route
+                else handler(ctx)
+            )
             # Streaming handlers (SSE) write headers + body directly via
             # self.wfile and return the STREAMED_RESPONSE sentinel; skip the
             # normal JSON response path so we don't double-write.

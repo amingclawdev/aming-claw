@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import threading
 import hashlib
+import json
 import re
 from pathlib import Path
 from collections.abc import Mapping, Sequence
@@ -1116,16 +1117,12 @@ def _normalize_id(pid: str) -> str:
     return s.lower().strip('-')
 
 
-def _is_dev_runtime() -> bool:
-    return os.environ.get(RUNTIME_PLANE_ENV, "").strip().lower() == DEV_RUNTIME_PLANE
+def validate_project_id_syntax(project_id: str, *, require_exact: bool = False) -> str:
+    """Validate a project identifier without consulting or changing storage.
 
-
-def validate_project_id(project_id: str) -> str:
-    """Validate one project id before any filesystem or SQLite side effect.
-
-    Stable runtimes retain the historical camelCase/underscore normalization,
-    but path-shaped ids are rejected everywhere.  The AC dev plane is narrower:
-    it accepts only the already-existing ``aming-claw`` project database.
+    ``require_exact`` is used by the dev-plane external discovery boundary.  It
+    deliberately rejects aliases (including camelCase and underscores) so one
+    registered database has exactly one request identity.
     """
 
     raw = str(project_id or "").strip()
@@ -1141,12 +1138,251 @@ def validate_project_id(project_id: str) -> str:
     normalized = _normalize_id(raw)
     if not normalized:
         raise ValueError("invalid governance project_id")
+    if require_exact and (
+        raw != normalized
+        or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", normalized)
+    ):
+        raise ValueError("governance project_id must use its exact normalized key")
+    return normalized
+
+
+def _is_dev_runtime() -> bool:
+    return os.environ.get(RUNTIME_PLANE_ENV, "").strip().lower() == DEV_RUNTIME_PLANE
+
+
+def validate_project_id(project_id: str) -> str:
+    """Validate one project id before any filesystem or SQLite side effect.
+
+    Stable runtimes retain the historical camelCase/underscore normalization,
+    but path-shaped ids are rejected everywhere.  The AC dev plane is narrower:
+    it accepts only the already-existing ``aming-claw`` project database.
+    """
+
+    raw = str(project_id or "").strip()
+    normalized = validate_project_id_syntax(raw)
     if _is_dev_runtime() and raw != AC_PROJECT_ID:
         raise ValueError(
             "AC dev runtime project allowlist requires exact project_id="
             + AC_PROJECT_ID
         )
     return normalized
+
+
+def _external_read_path_identity(path: Path, *, kind: str) -> os.stat_result:
+    """Resolve one existing non-symlink external discovery storage object."""
+
+    absolute = path.absolute()
+    try:
+        before = absolute.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"registered {kind} does not exist") from exc
+    if absolute.is_symlink():
+        raise ValueError(f"registered {kind} cannot be a symlink")
+    expected_mode = stat.S_ISDIR if kind == "project directory" else stat.S_ISREG
+    if not expected_mode(before.st_mode):
+        raise ValueError(f"registered {kind} has an invalid file type")
+    if absolute.resolve(strict=True) != absolute:
+        raise ValueError(f"registered {kind} escaped its canonical path")
+    return before
+
+
+def registered_public_safe_external_project(project_id: str) -> dict:
+    """Resolve a registered public-safe project for dev read-only discovery.
+
+    This reader intentionally bypasses ``project_service`` because that module's
+    registry helper may create the registry parent.  Every path here must exist
+    already and is opened without a write-capable helper.
+    """
+
+    if not _is_dev_runtime():
+        raise RuntimeError("external read-only discovery is dev-plane only")
+    canonical = validate_project_id_syntax(project_id, require_exact=True)
+    if canonical == AC_PROJECT_ID:
+        raise ValueError("external discovery requires a non-AC project")
+    root = _governance_root()
+    _external_read_path_identity(root, kind="project directory")
+    registry_path = root / "projects.json"
+    _external_read_path_identity(registry_path, kind="project registry")
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("registered project registry is unreadable") from exc
+    projects = registry.get("projects") if isinstance(registry, Mapping) else None
+    entry = projects.get(canonical) if isinstance(projects, Mapping) else None
+    if not isinstance(entry, Mapping):
+        raise ValueError("external project is not registered")
+    if str(entry.get("project_id") or "") != canonical:
+        raise ValueError("external project registry key does not match project_id")
+    if entry.get("initialized") is not True:
+        raise ValueError("external project is not initialized")
+    if str(entry.get("status") or "").strip().lower() != "active":
+        raise ValueError("external project is not active")
+    config = entry.get("project_config")
+    governance = config.get("governance") if isinstance(config, Mapping) else None
+    policy = governance.get("policy") if isinstance(governance, Mapping) else None
+    if not isinstance(policy, Mapping) or policy.get("public_safe") is not True:
+        raise ValueError("external project is not registered public-safe")
+
+    project_dir = root / canonical
+    _external_read_path_identity(project_dir, kind="project directory")
+    if project_dir.parent.resolve(strict=True) != root.resolve(strict=True):
+        raise ValueError("registered project directory escaped governance root")
+    db_path = project_dir / "governance.db"
+    db_stat = _external_read_path_identity(db_path, kind="governance database")
+    if db_path.parent.resolve(strict=True) != project_dir.resolve(strict=True):
+        raise ValueError("registered governance database escaped project directory")
+    return {
+        "project_id": canonical,
+        "name": str(entry.get("name") or canonical),
+        "status": "active",
+        "initialized": True,
+        "public_safe": True,
+        "db_path": db_path,
+        "db_device": int(db_stat.st_dev),
+        "db_inode": int(db_stat.st_ino),
+    }
+
+
+def _external_database_fingerprint(db_path: Path) -> tuple[tuple[str, bool, int, int, int, int], ...]:
+    result: list[tuple[str, bool, int, int, int, int]] = []
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        candidate = Path(str(db_path) + suffix)
+        try:
+            current = candidate.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            result.append((suffix or "database", False, 0, 0, 0, 0))
+            continue
+        result.append(
+            (
+                suffix or "database",
+                True,
+                int(current.st_dev),
+                int(current.st_ino),
+                int(current.st_size),
+                int(current.st_mtime_ns),
+            )
+        )
+    return tuple(result)
+
+
+_EXTERNAL_DENIED_WRITE_ACTIONS = frozenset(
+    code
+    for name in (
+        "SQLITE_INSERT",
+        "SQLITE_UPDATE",
+        "SQLITE_DELETE",
+        "SQLITE_ALTER_TABLE",
+        "SQLITE_ANALYZE",
+        "SQLITE_ATTACH",
+        "SQLITE_CREATE_INDEX",
+        "SQLITE_CREATE_TABLE",
+        "SQLITE_CREATE_TRIGGER",
+        "SQLITE_CREATE_VIEW",
+        "SQLITE_CREATE_VTABLE",
+        "SQLITE_DETACH",
+        "SQLITE_DROP_INDEX",
+        "SQLITE_DROP_TABLE",
+        "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW",
+        "SQLITE_DROP_VTABLE",
+        "SQLITE_REINDEX",
+    )
+    if isinstance((code := getattr(sqlite3, name, None)), int)
+)
+
+
+def _external_read_authorizer(
+    action: int,
+    arg1: str | None,
+    arg2: str | None,
+    _database: str | None,
+    _source: str | None,
+) -> int:
+    if action in _EXTERNAL_DENIED_WRITE_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == getattr(sqlite3, "SQLITE_PRAGMA", -1) and arg2 not in (None, ""):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+class ExternalReadOnlyConnection:
+    """Context-bound external reader with exact storage zero-change proof."""
+
+    def __init__(self, project_id: str, *, busy_timeout: int = 5000):
+        self.project = registered_public_safe_external_project(project_id)
+        self.db_path = Path(self.project["db_path"])
+        self.busy_timeout = int(busy_timeout)
+        self.before = _external_database_fingerprint(self.db_path)
+        self.conn: sqlite3.Connection | None = None
+
+    def __enter__(self) -> sqlite3.Connection:
+        # SQLite's ordinary read-only WAL open creates ``-wal``/``-shm`` when
+        # they are absent.  The dev plane must never be the process that does
+        # that.  WAL databases therefore require an already-live companion
+        # pair (normally owned by the stable service); otherwise discovery
+        # fails before sqlite3.connect.  We intentionally do not use
+        # ``immutable=1`` because it can ignore committed WAL content.
+        with self.db_path.open("rb") as database_file:
+            header = database_file.read(20)
+        wal_mode = len(header) >= 20 and header[18:20] == b"\x02\x02"
+        before_by_name = {item[0]: item for item in self.before}
+        if wal_mode and not (
+            before_by_name.get("-wal", ("", False))[1]
+            and before_by_name.get("-shm", ("", False))[1]
+        ):
+            raise RuntimeError(
+                "external WAL database lacks stable-owned WAL/SHM companions"
+            )
+        uri = self.db_path.absolute().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(
+            uri,
+            timeout=self.busy_timeout / 1000.0,
+            uri=True,
+        )
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute(f"PRAGMA busy_timeout={self.busy_timeout}")
+            database_file = str(conn.execute("PRAGMA database_list").fetchone()[2] or "")
+            if Path(database_file).resolve(strict=True) != self.db_path.absolute():
+                raise ValueError("external read-only database identity mismatch")
+            conn.set_authorizer(_external_read_authorizer)
+            if _external_database_fingerprint(self.db_path) != self.before:
+                raise RuntimeError("external database changed while opening read-only connection")
+        except Exception:
+            conn.close()
+            raise
+        self.conn = conn
+        return conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        close_error: Exception | None = None
+        if self.conn is not None:
+            try:
+                if self.conn.total_changes != 0:
+                    close_error = RuntimeError(
+                        "external read-only connection reported SQLite changes"
+                    )
+            finally:
+                self.conn.close()
+        after = _external_database_fingerprint(self.db_path)
+        if after != self.before and close_error is None:
+            close_error = RuntimeError(
+                "external database or SQLite companion metadata changed during read"
+            )
+        if close_error is not None and exc_type is None:
+            raise close_error
+        return False
+
+
+def external_read_only_connection(
+    project_id: str,
+    *,
+    busy_timeout: int = 5000,
+) -> ExternalReadOnlyConnection:
+    """Return the only connection allowed for non-AC reads on the dev plane."""
+
+    return ExternalReadOnlyConnection(project_id, busy_timeout=busy_timeout)
 
 
 def _resolve_project_dir(project_id: str) -> Path:

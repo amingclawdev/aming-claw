@@ -13046,6 +13046,379 @@ def test_ac_dev_request_guard_rejects_foreign_project_before_handler(monkeypatch
     assert raised.value.details["writes_performed"] is False
 
 
+def _dev_external_discovery_fixture(monkeypatch, tmp_path):
+    project_ids = ("content-sys", "drift-gym", "charting-loop")
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(tmp_path))
+    monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE", raising=False)
+    owners = {}
+    paths = {}
+    for index, project_id in enumerate(project_ids, start=1):
+        conn = governance_db.get_connection(project_id)
+        db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO backlog_bugs(
+                bug_id, title, status, priority, details_md,
+                bypass_policy_json, created_at, updated_at
+            ) VALUES (?, ?, 'OPEN', 'P0', 'private details are not projected',
+                      '{}', '2026-08-28T00:00:00Z', '2026-08-28T00:00:01Z')
+            """,
+            (f"{project_id.upper()}-PUBLIC", f"{project_id} public row"),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO backlog_bugs(
+                bug_id, title, status, priority, details_md,
+                bypass_policy_json, created_at, updated_at
+            ) VALUES (?, ?, 'OPEN', 'P1', 'must stay private',
+                      '{"public_safe": false}',
+                      '2026-08-28T00:00:00Z', '2026-08-28T00:00:02Z')
+            """,
+            (f"{project_id.upper()}-PRIVATE", f"{project_id} private row"),
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS graph_snapshots (
+              project_id TEXT NOT NULL,
+              snapshot_id TEXT NOT NULL,
+              commit_sha TEXT NOT NULL,
+              parent_snapshot_id TEXT NOT NULL DEFAULT '',
+              snapshot_kind TEXT NOT NULL,
+              ref_name TEXT NOT NULL DEFAULT '',
+              branch_ref TEXT NOT NULL DEFAULT '',
+              graph_sha256 TEXT NOT NULL DEFAULT '',
+              inventory_sha256 TEXT NOT NULL DEFAULT '',
+              drift_sha256 TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              created_by TEXT NOT NULL DEFAULT '',
+              notes TEXT NOT NULL DEFAULT '',
+              PRIMARY KEY(project_id, snapshot_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS graph_snapshot_refs (
+              project_id TEXT NOT NULL,
+              ref_name TEXT NOT NULL,
+              snapshot_id TEXT NOT NULL,
+              commit_sha TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(project_id, ref_name)
+            )
+            """
+        )
+        snapshot_id = f"full-{index:012x}"
+        commit = f"{index:x}" * 40
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO graph_snapshots(
+                project_id, snapshot_id, commit_sha, snapshot_kind,
+                status, created_at
+            ) VALUES (?, ?, ?, 'full', 'active', '2026-08-28T00:00:00Z')
+            """,
+            (project_id, snapshot_id, commit),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO graph_snapshot_refs(
+                project_id, ref_name, snapshot_id, commit_sha, updated_at
+            ) VALUES (?, 'active', ?, ?, '2026-08-28T00:00:01Z')
+            """,
+            (project_id, snapshot_id, commit),
+        )
+        conn.commit()
+        # Retain one stable owner so WAL/SHM are existing, stable-owned
+        # companions throughout the dev read proof window.
+        conn.execute("SELECT 1 FROM schema_meta LIMIT 1").fetchone()
+        owners[project_id] = conn
+        paths[project_id] = db_path
+
+    root = tmp_path / "codex-tasks" / "state" / "governance"
+    (root / "projects.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "projects": {
+                    project_id: {
+                        "project_id": project_id,
+                        "name": project_id,
+                        "initialized": True,
+                        "status": "active",
+                        "project_config": {
+                            "governance": {
+                                "policy": {"public_safe": True}
+                            }
+                        },
+                    }
+                    for project_id in project_ids
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    return owners, paths
+
+
+def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
+    monkeypatch, tmp_path
+):
+    owners, paths = _dev_external_discovery_fixture(monkeypatch, tmp_path)
+    before = {
+        project_id: governance_db._external_database_fingerprint(path)
+        for project_id, path in paths.items()
+    }
+    # If a dedicated projector accidentally falls through to any normal
+    # schema/authority handler, the test must fail immediately.
+    monkeypatch.setattr(
+        server,
+        "_ensure_backlog_read_schema",
+        lambda *_args, **_kwargs: pytest.fail("external read invoked backlog DDL"),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda *_args, **_kwargs: pytest.fail("external read used write connection"),
+    )
+    monkeypatch.setattr(
+        server,
+        "DBContext",
+        lambda *_args, **_kwargs: pytest.fail("external read entered managed DBContext"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_require_canonical_authority_registry_complete",
+        lambda *_args, **_kwargs: pytest.fail("external read entered ContractRuntime"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_onboard_route_guide_service_response",
+        lambda *_args, **_kwargs: pytest.fail("external read entered managed Onboard"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_route_registry_storage_project_id",
+        lambda *_args, **_kwargs: pytest.fail("external read entered route registry"),
+    )
+    try:
+        for project_id in paths:
+            route = server._guard_dev_runtime_request(
+                method="GET",
+                path=f"/api/backlog/{project_id}",
+                path_params={"project_id": project_id},
+                body={},
+                query={"view": "compact", "limit": "5"},
+            )
+            assert route == "backlog_list"
+            backlog = server._handle_dev_external_read_only_discovery(
+                _ctx(
+                    {"project_id": project_id},
+                    query={"view": "compact", "limit": "5"},
+                ),
+                route_kind=route,
+            )
+            assert backlog["count"] == 1
+            assert backlog["bugs"][0]["bug_id"].endswith("-PUBLIC")
+            assert "details_md" not in backlog["bugs"][0]
+            assert "route" not in json.dumps(backlog, sort_keys=True).lower()
+
+            item_route = server._guard_dev_runtime_request(
+                method="GET",
+                path=f"/api/backlog/{project_id}/{project_id.upper()}-PUBLIC",
+                path_params={
+                    "project_id": project_id,
+                    "bug_id": f"{project_id.upper()}-PUBLIC",
+                },
+                body={},
+                query={},
+            )
+            assert item_route == "backlog_item"
+            item = server._handle_dev_external_read_only_discovery(
+                _ctx(
+                    {
+                        "project_id": project_id,
+                        "bug_id": f"{project_id.upper()}-PUBLIC",
+                    }
+                ),
+                route_kind=item_route,
+            )
+            assert item["bug"]["public_safe"] is True
+
+            graph_route = server._guard_dev_runtime_request(
+                method="GET",
+                path=f"/api/graph-governance/{project_id}/status",
+                path_params={"project_id": project_id},
+                body={},
+                query={},
+            )
+            assert graph_route == "graph_status"
+            graph = server._handle_dev_external_read_only_discovery(
+                _ctx({"project_id": project_id}),
+                route_kind=graph_route,
+            )
+            assert graph["graph_available"] is True
+            assert len(graph["active_commit"]) == 40
+
+            onboard_body = {
+                "project_id": project_id,
+                "backlog_id": f"{project_id.upper()}-PUBLIC",
+                "role": "observer",
+                "work_type": "direct_main",
+            }
+            onboard_route = server._guard_dev_runtime_request(
+                method="POST",
+                path=f"/api/projects/{project_id}/onboard-route-guide",
+                path_params={"project_id": project_id},
+                body=onboard_body,
+                query={},
+            )
+            assert onboard_route == "onboard"
+            onboard = server._handle_dev_external_read_only_discovery(
+                _ctx(
+                    {"project_id": project_id},
+                    method="POST",
+                    body=onboard_body,
+                ),
+                route_kind=onboard_route,
+            )
+            assert onboard["schema_version"] == "ac_dev_external_read_only_discovery.v1"
+            assert onboard["status"] == "read_only_discovery_only"
+            assert onboard["route_authority_accepted"] is False
+            assert onboard["cex_minted"] is False
+            assert onboard["route_minted"] is False
+            assert onboard["contract_runtime_materialized"] is False
+            assert onboard["managed_pass"] is False
+            assert onboard["pass_implied"] is False
+            encoded = json.dumps(onboard, sort_keys=True)
+            assert "cex-" not in encoded
+            assert "route_token_ref" not in encoded
+            assert "contract_execution_id" not in encoded
+            assert "/Users/" not in encoded
+
+        # Exercise the real middleware dispatch: the matched normal handler is
+        # a tripwire and must be bypassed by the pre-handler discovery route.
+        handler = _bare_handler()
+        handler.path = "/api/projects/content-sys/onboard-route-guide"
+        handler._find_handler = lambda _method: (
+            lambda _ctx: pytest.fail("external request reached matched handler"),
+            {"project_id": "content-sys"},
+            "",
+        )
+        handler._read_body = lambda: {
+            "project_id": "content-sys",
+            "backlog_id": "CONTENT-SYS-PUBLIC",
+            "role": "observer",
+            "work_type": "direct_main",
+        }
+        handler._query_params = lambda: {}
+        captured = {}
+        handler._respond = lambda code, body, *_args: captured.update(
+            code=code,
+            body=body,
+        )
+        handler._handle("POST")
+        assert captured["code"] == 200
+        assert captured["body"]["status"] == "read_only_discovery_only"
+        assert captured["body"]["writes_performed"] is False
+        for project_id, path in paths.items():
+            assert governance_db._external_database_fingerprint(path) == before[project_id]
+            assert owners[project_id].total_changes > 0
+    finally:
+        for owner in owners.values():
+            owner.close()
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/api/backlog/content-sys/upsert"),
+        ("POST", "/api/task/content-sys/timeline"),
+        ("POST", "/api/graph-governance/content-sys/query"),
+        ("POST", "/api/graph-governance/content-sys/reconcile/current-full"),
+        ("POST", "/api/graph-governance/content-sys/snapshots/candidate/finalize"),
+        ("POST", "/api/projects/content-sys/observer/route-context/issue"),
+        ("POST", "/api/projects/content-sys/observer-sessions/register"),
+        ("POST", "/api/projects/content-sys/contract-runtime/evidence"),
+        ("POST", "/api/projects/content-sys/bypass"),
+    ],
+)
+def test_ac_dev_external_mutation_surfaces_fail_before_handler(
+    monkeypatch, tmp_path, method, path
+):
+    owners, paths = _dev_external_discovery_fixture(monkeypatch, tmp_path)
+    before = governance_db._external_database_fingerprint(paths["content-sys"])
+    try:
+        with pytest.raises(ValidationError) as raised:
+            server._guard_dev_runtime_request(
+                method=method,
+                path=path,
+                path_params={"project_id": "content-sys"},
+                body={"project_id": "content-sys"},
+                query={},
+            )
+        assert raised.value.details["writes_performed"] is False
+        assert governance_db._external_database_fingerprint(paths["content-sys"]) == before
+    finally:
+        for owner in owners.values():
+            owner.close()
+
+
+def test_ac_dev_external_discovery_rejects_selectors_alias_and_nested_mismatch(
+    monkeypatch, tmp_path
+):
+    owners, _paths = _dev_external_discovery_fixture(monkeypatch, tmp_path)
+    try:
+        cases = (
+            (
+                "/api/projects/content-sys/onboard-route-guide",
+                {"project_id": "content-sys", "route_token_ref": "rtok-forbidden"},
+                {},
+            ),
+            (
+                "/api/projects/content-sys/onboard-route-guide",
+                {
+                    "project_id": "content-sys",
+                    "nested": {"target_project_id": "drift-gym"},
+                },
+                {},
+            ),
+            (
+                "/api/projects/content_sys/onboard-route-guide",
+                {"project_id": "content_sys"},
+                {},
+            ),
+            (
+                "/api/projects/content-sys/onboard-route-guide",
+                {"project_id": "content-sys", "task_id": "task-forbidden"},
+                {},
+            ),
+        )
+        for path, body, query in cases:
+            with pytest.raises(ValidationError):
+                server._guard_dev_runtime_request(
+                    method="POST",
+                    path=path,
+                    path_params={"project_id": path.split("/")[3]},
+                    body=body,
+                    query=query,
+                )
+
+        with pytest.raises(ValidationError) as unregistered:
+            server._guard_dev_runtime_request(
+                method="GET",
+                path="/api/backlog/unregistered",
+                path_params={"project_id": "unregistered"},
+                body={},
+                query={},
+            )
+        assert "registry" in str(unregistered.value).lower()
+    finally:
+        for owner in owners.values():
+            owner.close()
+
+
 def test_ac_dev_zero_write_rejection_projects_successor_stable_anchor(monkeypatch):
     successor = "c" * 40
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")

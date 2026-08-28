@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 import sqlite3
+import json
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -64,6 +65,148 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
         path = conn.execute("PRAGMA database_list").fetchone()[2]
         conn.close()
         return path
+
+    def _create_registered_external_db(
+        self,
+        project_id="content-sys",
+        *,
+        initialized=True,
+        status="active",
+        public_safe=True,
+    ):
+        from governance.db import get_connection
+
+        conn = get_connection(project_id)
+        path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        conn.close()
+        root = path.parent.parent
+        registry = root / "projects.json"
+        registry.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "projects": {
+                        project_id: {
+                            "project_id": project_id,
+                            "name": project_id,
+                            "initialized": initialized,
+                            "status": status,
+                            "project_config": {
+                                "governance": {
+                                    "policy": {"public_safe": public_safe}
+                                }
+                            },
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    @staticmethod
+    def _database_metadata(path):
+        result = []
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            candidate = Path(str(path) + suffix)
+            if not candidate.exists():
+                result.append((suffix, False, 0, 0, 0, 0))
+                continue
+            current = candidate.stat(follow_symlinks=False)
+            result.append(
+                (
+                    suffix,
+                    True,
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_size,
+                    current.st_mtime_ns,
+                )
+            )
+        return result
+
+    def test_dev_external_reader_requires_exact_registered_public_safe_identity(self):
+        from governance.db import registered_public_safe_external_project
+
+        self._create_registered_external_db()
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        registered = registered_public_safe_external_project("content-sys")
+        self.assertEqual(registered["project_id"], "content-sys")
+        self.assertTrue(registered["public_safe"])
+        for rejected in ("content_sys", "contentSys", "../content-sys", "missing"):
+            with self.subTest(rejected=rejected), self.assertRaises(
+                (FileNotFoundError, ValueError)
+            ):
+                registered_public_safe_external_project(rejected)
+
+    def test_dev_external_reader_is_query_only_and_storage_metadata_is_exact(self):
+        from governance.db import external_read_only_connection
+
+        path = self._create_registered_external_db()
+        # A live stable owner supplies the existing WAL/SHM pair.  The dev
+        # reader is forbidden from creating either companion itself.
+        stable_owner = sqlite3.connect(path)
+        stable_owner.execute("SELECT value FROM schema_meta LIMIT 1").fetchone()
+        before = self._database_metadata(path)
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        try:
+            with external_read_only_connection("content-sys") as conn:
+                self.assertEqual(conn.execute("PRAGMA query_only").fetchone()[0], 1)
+                self.assertEqual(conn.total_changes, 0)
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT value FROM schema_meta WHERE key='schema_version'"
+                    ).fetchone()
+                )
+                for statement in (
+                    "CREATE TABLE forbidden_external_write (id INTEGER)",
+                    "UPDATE schema_meta SET value='0' WHERE key='schema_version'",
+                    "PRAGMA user_version=1",
+                    "ATTACH DATABASE ':memory:' AS forbidden",
+                ):
+                    with self.subTest(statement=statement), self.assertRaises(
+                        sqlite3.DatabaseError
+                    ):
+                        conn.execute(statement)
+                self.assertEqual(conn.total_changes, 0)
+            self.assertEqual(self._database_metadata(path), before)
+        finally:
+            stable_owner.close()
+
+    def test_dev_external_reader_fails_before_creating_missing_wal_companions(self):
+        from governance.db import external_read_only_connection
+
+        path = self._create_registered_external_db()
+        before = self._database_metadata(path)
+        self.assertFalse(Path(str(path) + "-wal").exists())
+        self.assertFalse(Path(str(path) + "-shm").exists())
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        with self.assertRaisesRegex(RuntimeError, "stable-owned WAL/SHM"):
+            with external_read_only_connection("content-sys"):
+                self.fail("missing stable-owned WAL/SHM must fail before connect")
+        self.assertEqual(self._database_metadata(path), before)
+
+    def test_dev_external_reader_rejects_inactive_private_and_symlink_storage(self):
+        from governance.db import registered_public_safe_external_project
+
+        for status, public_safe in (("paused", True), ("active", False)):
+            with self.subTest(status=status, public_safe=public_safe):
+                self._create_registered_external_db(
+                    status=status,
+                    public_safe=public_safe,
+                )
+                os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+                with self.assertRaises(ValueError):
+                    registered_public_safe_external_project("content-sys")
+                os.environ.pop("AMING_CLAW_RUNTIME_PLANE", None)
+
+        path = self._create_registered_external_db()
+        outside = Path(self.tmp.name) / "outside-external.db"
+        path.replace(outside)
+        path.symlink_to(outside)
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            registered_public_safe_external_project("content-sys")
 
     def test_dev_rejects_foreign_empty_and_traversal_before_project_creation(self):
         from governance.db import get_connection
