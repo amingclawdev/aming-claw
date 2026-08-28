@@ -123643,7 +123643,7 @@ def test_onboard_route_guide_authority_registry_drift_fails_closed_before_db(
         "status": "blocked",
         "actionable": False,
         "writes_performed": False,
-        "diagnostic_paths": [f"{source_name}.{future_field}"],
+        "diagnostic_paths": [source_name],
         "diagnostic_path_count": 1,
         "safe_next_step": (
             "classify every canonical schema field and restart the "
@@ -123672,16 +123672,24 @@ def test_contract_runtime_authority_registry_fresh_import_is_complete():
     assert "_CURRENT_FULL_BUILD_KEYS" in audit["registered_source_names"]
     assert audit["raw_source_signatures"]["_CURRENT_FULL_BUILD_KEYS"]["raw_type"] == "set"
     assert audit["registry_schema_hash"] == (
-        "sha256:7f04557fabb202c10e5970ccb74ed55a1740939d1e425c847407966c8cbe89de"
+        "sha256:abe31dfab2165c02ed2d7bac8627abf8c933f3712b40ea1743f7204afbe44fed"
     )
     assert audit["golden_record_count"] == 63
     assert audit["golden_entry_count"] == 849
     for record in server._CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS:
         raw = getattr(server, record.source_name)
         if record.entry_schema_id == "scalar_string.v1":
-            assert set(raw) == {name for name, _ in record.field_partitions}
+            assert tuple(name for name, _ in record.field_partitions) == (
+                record.expected_fields
+            )
+            if record.container_type in {"tuple", "list"}:
+                assert tuple(raw) == record.expected_fields
+            else:
+                assert len(raw) == len(record.expected_fields)
+                assert set(raw) == set(record.expected_fields)
         else:
             assert record.disposition == "structured_non_authority"
+            assert record.expected_fields == ()
             assert record.field_partitions == ()
 
 
@@ -123943,6 +123951,73 @@ def test_contract_runtime_authority_registry_top_level_audit_validates_once(monk
     )
     assert server._contract_runtime_server_canonical_source_registry_audit()["complete"]
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "source_name",
+    [
+        record.source_name
+        for record in server._CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS
+        if record.container_type == "tuple"
+    ],
+)
+@pytest.mark.parametrize("mutation", ["duplicate", "reorder"])
+def test_contract_runtime_authority_registry_rejects_each_tuple_raw_semantics_drift(
+    monkeypatch, source_name, mutation
+):
+    raw = tuple(getattr(server, source_name))
+    assert len(raw) >= 2
+    mutated = (
+        (*raw, raw[0])
+        if mutation == "duplicate"
+        else (raw[1], raw[0], *raw[2:])
+    )
+    monkeypatch.setattr(server, source_name, mutated)
+    with pytest.raises(server.GovernanceError) as error:
+        server._contract_runtime_require_canonical_authority_registry_complete()
+    assert source_name in error.value.details["diagnostic_paths"]
+
+
+def test_contract_runtime_fresh_repair_inference_rejects_compound_and_old_map(
+    monkeypatch,
+):
+    context = server._contract_runtime_require_canonical_authority_registry_complete()
+    compound = {
+        "definition_hash": "x",
+        "qa_session_id": "y",
+        "reconcile_event_id": "z",
+    }
+    monkeypatch.setattr(
+        server,
+        "_CONTRACT_RUNTIME_FRESH_REPAIR_CANONICAL_ENVELOPE_REQUIRED_FIELDS",
+        {"attacker": frozenset(compound)},
+        raising=False,
+    )
+    assert server._contract_runtime_fresh_repair_canonical_envelope_sources(
+        compound,
+        validated_authority_context=context,
+    ) == ()
+
+
+def test_contract_runtime_authority_registry_compound_record_and_live_cannot_self_certify(
+    monkeypatch,
+):
+    records = server._CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS
+    source_name = records[0].source_name
+    raw = tuple(getattr(server, source_name))
+    tampered = records[0]._replace(
+        expected_fields=(*records[0].expected_fields, "attacker_field"),
+        field_partitions=(*records[0].field_partitions, ("attacker_field", "authority_leaf")),
+    )
+    monkeypatch.setattr(
+        server,
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS",
+        (tampered, *records[1:]),
+    )
+    monkeypatch.setattr(server, source_name, (*raw, "attacker_field"))
+    with pytest.raises(server.GovernanceError) as error:
+        server._contract_runtime_require_canonical_authority_registry_complete()
+    assert "registry.golden_ordered_hash" in error.value.details["diagnostic_paths"]
 
 
 @pytest.mark.parametrize(
