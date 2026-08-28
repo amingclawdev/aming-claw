@@ -161917,6 +161917,1393 @@ def _mf_parallel_terminal_supersession_guide_action(
     return action
 
 
+_AC_PROMOTION_SUCCESSOR_BACKLOG_ID = (
+    "AC-ONBOARD-EXACT-PROMOTION-SUCCESSOR-ROUTE-P0-20260827"
+)
+_AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT = (
+    "b8b727828f9bffd690e44e2f50be99a50d137c69"
+)
+_AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID = (
+    "cex-direct-main-1655ad2770197c31e57b"
+)
+_AC_PROMOTION_SUCCESSOR_FILE_FENCE = (
+    "agent/governance/server.py",
+    "agent/tests/test_graph_governance_api.py",
+    "docs/governance/reconcile-workflow.md",
+)
+_AC_PROMOTION_SUCCESSOR_ROUTE_ACTION = "ac_stable_promotion_prepare"
+_AC_PROMOTION_ROLLBACK_BLOCKER_ID = (
+    "AC-PROMOTION-ACTIVATION-ROLLBACK-RESTART-P0-20260827"
+)
+
+
+def _ac_promotion_successor_git_bytes(
+    root: Path,
+    args: Sequence[str],
+    *,
+    timeout: int = 10,
+) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=root,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GovernanceError(
+            "promotion_successor_git_authority_unavailable",
+            "the exact promotion successor Git authority is unavailable",
+            409,
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "public_safe": True,
+            },
+        ) from exc
+    if completed.returncode != 0:
+        raise GovernanceError(
+            "promotion_successor_git_authority_unavailable",
+            "the exact promotion successor Git authority is unavailable",
+            409,
+            {
+                "git_operation": str(args[0] if args else ""),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "public_safe": True,
+            },
+        )
+    return completed.stdout
+
+
+def _ac_promotion_successor_stable_health() -> dict[str, Any]:
+    """Read stable health once and return only its public-safe authority."""
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{AC_STABLE_SERVICE_PORT}/api/health",
+            timeout=3,
+        ) as response:
+            health = json.load(response)
+    except Exception as exc:
+        raise GovernanceError(
+            "promotion_successor_stable_health_unavailable",
+            "the exact stable health authority is unavailable",
+            409,
+            {
+                "required_endpoint": "http://127.0.0.1:40000/api/health",
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "public_safe": True,
+            },
+        ) from exc
+    loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
+    identity = (
+        dict(health.get("runtime_plane_identity") or {})
+        if isinstance(health.get("runtime_plane_identity"), Mapping)
+        else {}
+    )
+    database_identity = (
+        dict(identity.get("stable_database_identity") or {})
+        if isinstance(identity.get("stable_database_identity"), Mapping)
+        else {}
+    )
+    exact = bool(
+        health.get("status") == "ok"
+        and health.get("service") == "governance"
+        and int(health.get("port") or 0) == AC_STABLE_SERVICE_PORT
+        and health.get("runtime_stale") is False
+        and loaded == AC_STABLE_ANCHOR_COMMIT
+        and (
+            not identity
+            or (
+                identity.get("plane") == "stable"
+                and identity.get("status") == "ready"
+                and identity.get("branch") == AC_STABLE_BRANCH
+                and identity.get("commit") == loaded
+                and identity.get("stable_anchor_commit") == loaded
+            )
+        )
+        and (
+            not database_identity
+            or _ac_stable_database_identity_valid(database_identity)
+        )
+    )
+    if not exact:
+        raise GovernanceError(
+            "promotion_successor_stable_health_mismatch",
+            "stable health is not the exact frozen promotion anchor",
+            409,
+            {
+                "expected_loaded_commit": AC_STABLE_ANCHOR_COMMIT,
+                "observed_loaded_commit": loaded,
+                "runtime_stale": bool(health.get("runtime_stale")),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "public_safe": True,
+            },
+        )
+    return {
+        "schema_version": "ac_stable_health_authority.v1",
+        "status": "exact",
+        "runtime_loaded_version": loaded,
+        "runtime_stale": False,
+        "port": AC_STABLE_SERVICE_PORT,
+        "pid": int(health.get("pid") or identity.get("pid") or 0),
+        "runtime_plane_identity": identity,
+        "stable_database_identity": database_identity,
+        "health_hash": stable_sha256(
+            {
+                "runtime_loaded_version": loaded,
+                "runtime_stale": False,
+                "port": AC_STABLE_SERVICE_PORT,
+                "pid": int(health.get("pid") or identity.get("pid") or 0),
+                "runtime_plane_identity": identity,
+            }
+        ),
+    }
+
+
+def _ac_promotion_successor_candidate_authority() -> dict[str, Any]:
+    """Project distinct implementation and full stable-promotion deltas."""
+
+    world = _operator_supervised_direct_main_dev_world_authority()
+    candidate = str(world.get("target_head_commit") or "").strip().lower()
+    if candidate == _AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT:
+        return {
+            "status": "baseline_only",
+            "candidate_commit": candidate,
+            "runtime_world_authority": world,
+        }
+    root = Path(str(world.get("target_project_root") or "")).resolve()
+    parents = _ac_promotion_successor_git_bytes(
+        root, ["rev-list", "--parents", "-n", "1", candidate]
+    ).decode("ascii", errors="strict").split()
+    if (
+        len(parents) != 2
+        or parents[0] != candidate
+        or parents[1] != _AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT
+        or world.get("branch") != AC_DEV_BRANCH
+        or int(world.get("runtime_port") or 0) != AC_DEV_SERVICE_PORT
+        or world.get("runtime_stale") is not False
+        or str(world.get("stable_anchor_commit") or "").strip().lower()
+        != AC_STABLE_ANCHOR_COMMIT
+    ):
+        raise GovernanceError(
+            "promotion_successor_candidate_lineage_mismatch",
+            "the loaded candidate is not the exact single descendant of b8",
+            409,
+            {
+                "baseline_commit": _AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT,
+                "candidate_commit": candidate,
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    def delta(base_commit: str) -> dict[str, Any]:
+        changed = _ac_promotion_successor_git_bytes(
+            root,
+            [
+                "diff",
+                "--name-only",
+                "-z",
+                base_commit,
+                candidate,
+                "--",
+                ".",
+            ],
+        )
+        changed_files = sorted(
+            item.decode("utf-8", errors="surrogateescape")
+            for item in changed.split(b"\0")
+            if item
+        )
+        binary_diff = _ac_promotion_successor_git_bytes(
+            root,
+            [
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--binary",
+                "--full-index",
+                "-M",
+                f"{base_commit}..{candidate}",
+                "--",
+                ".",
+            ],
+        )
+        source_hashes = {
+            path: "sha256:"
+            + hashlib.sha256(
+                _ac_promotion_successor_git_bytes(
+                    root, ["show", f"{candidate}:{path}"]
+                )
+            ).hexdigest()
+            for path in changed_files
+        }
+        projected = {
+            "base_commit": base_commit,
+            "candidate_commit": candidate,
+            "file_fence": changed_files,
+            "file_fence_sha256": stable_sha256(changed_files),
+            "diff_sha256": "sha256:"
+            + hashlib.sha256(binary_diff).hexdigest(),
+            "diff_byte_length": len(binary_diff),
+            "source_sha256": source_hashes,
+        }
+        projected["delta_hash"] = stable_sha256(projected)
+        return projected
+
+    implementation_delta = delta(_AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT)
+    expected_files = sorted(_AC_PROMOTION_SUCCESSOR_FILE_FENCE)
+    if implementation_delta["file_fence"] != expected_files:
+        raise GovernanceError(
+            "promotion_successor_candidate_file_fence_mismatch",
+            "the loaded candidate does not match the exact row implementation fence",
+            409,
+            {
+                "expected_file_fence": expected_files,
+                "changed_file_count": len(implementation_delta["file_fence"]),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    if not _git_commit_is_ancestor(root, AC_STABLE_ANCHOR_COMMIT, candidate):
+        raise GovernanceError(
+            "promotion_successor_stable_anchor_not_ancestor",
+            "the full promotion candidate does not descend from stable a258",
+            409,
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    promotion_delta = delta(AC_STABLE_ANCHOR_COMMIT)
+    if not promotion_delta["file_fence"]:
+        raise GovernanceError(
+            "promotion_successor_promotion_delta_empty",
+            "the full stable promotion delta must be non-empty",
+            409,
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    tree_sha = _ac_promotion_successor_git_bytes(
+        root, ["rev-parse", f"{candidate}^{{tree}}"]
+    ).decode("ascii", errors="strict").strip().lower()
+    authority = {
+        "schema_version": "ac_promotion_successor_candidate_authority.v1",
+        "status": "candidate_projected",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "baseline_commit": _AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT,
+        "candidate_commit": candidate,
+        "candidate_parent_commit": parents[1],
+        "candidate_tree_sha": tree_sha,
+        "implementation_delta": implementation_delta,
+        "promotion_delta": promotion_delta,
+        # Compatibility aliases are explicitly the promotion delta consumed
+        # by the existing stable verifier, never the row implementation delta.
+        "file_fence": list(promotion_delta["file_fence"]),
+        "diff_sha256": str(promotion_delta["diff_sha256"]),
+        "source_sha256": dict(promotion_delta["source_sha256"]),
+        "runtime_world_authority": world,
+        "stable_database_identity": dict(
+            world.get("stable_database_identity") or {}
+        ),
+        "writes_performed": False,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _ac_promotion_successor_request_mismatches(
+    request_body: Mapping[str, Any] | None,
+    request_selector_claims: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any],
+) -> list[str]:
+    body = dict(request_body or {})
+    selector = dict(request_selector_claims or {})
+    implementation_delta = (
+        dict(candidate.get("implementation_delta") or {})
+        if isinstance(candidate.get("implementation_delta"), Mapping)
+        else {}
+    )
+    promotion_delta = (
+        dict(candidate.get("promotion_delta") or {})
+        if isinstance(candidate.get("promotion_delta"), Mapping)
+        else {}
+    )
+    expected = {
+        "candidate_commit": candidate.get("candidate_commit"),
+        "target_head_commit": candidate.get("candidate_commit"),
+        "stable_anchor_commit": AC_STABLE_ANCHOR_COMMIT,
+        "contract_execution_id": _AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        "task_id": _AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        "diff_sha256": promotion_delta.get("diff_sha256"),
+        "file_fence": promotion_delta.get("file_fence"),
+        "implementation_diff_sha256": implementation_delta.get("diff_sha256"),
+        "implementation_file_fence": implementation_delta.get("file_fence"),
+        "promotion_diff_sha256": promotion_delta.get("diff_sha256"),
+        "promotion_file_fence": promotion_delta.get("file_fence"),
+    }
+    mismatches: list[str] = []
+    for field, exact in expected.items():
+        values: list[Any] = []
+        for source in (body, selector):
+            if field not in source:
+                continue
+            supplied = source[field]
+            if isinstance(exact, list):
+                values.append(supplied)
+            else:
+                values.extend(
+                    supplied if isinstance(supplied, list) else [supplied]
+                )
+        if any(value != exact for value in values):
+            mismatches.append(field)
+    return sorted(set(mismatches))
+
+
+_AC_PROMOTION_SUCCESSOR_ACTIVATION_ALIASES = frozenset(
+    {
+        "activate",
+        "activation",
+        "activation_authorized",
+        "deploy",
+        "deploy_runtime",
+        "deploy_ready",
+        "execute",
+        "redeploy",
+        "restart",
+        "merge",
+        "promote",
+        "promotion",
+        "stable_promotion",
+        "promotion_manifest",
+        "ac_stable_promotion_complete",
+    }
+)
+
+
+def _ac_promotion_successor_activation_claim_fields(value: Any) -> list[str]:
+    """Find explicit activation/deploy aliases without exposing their values."""
+
+    matches: list[str] = []
+
+    def requested(item: Any) -> bool:
+        if isinstance(item, list):
+            return any(requested(child) for child in item)
+        if isinstance(item, Mapping):
+            return bool(item)
+        if isinstance(item, bool):
+            return item
+        if isinstance(item, (int, float)):
+            return item != 0
+        return str(item or "").strip().lower() not in {
+            "",
+            "false",
+            "no",
+            "none",
+            "disabled",
+            "0",
+        }
+
+    def walk(item: Any, source: str) -> None:
+        if isinstance(item, Mapping):
+            for raw_key, child in item.items():
+                key = str(raw_key or "").strip()
+                raw_alias = key.lower()
+                requested_prefix = raw_alias.startswith("requested_")
+                normalized_key = (
+                    raw_alias.removeprefix("requested_")
+                    if requested_prefix
+                    else raw_alias
+                )
+                public_alias = (
+                    f"requested_{normalized_key}"
+                    if requested_prefix
+                    else normalized_key
+                )
+                if normalized_key in _AC_PROMOTION_SUCCESSOR_ACTIVATION_ALIASES and requested(child):
+                    matches.append(f"{source}.{public_alias}")
+                if normalized_key in {"action", "operation", "system_operation"}:
+                    action_values = child if isinstance(child, list) else [child]
+                    if any(
+                        any(
+                            token in str(action or "").strip().lower()
+                            for token in (
+                                "activate",
+                                "deploy",
+                                "merge",
+                                "promot",
+                                "restart",
+                            )
+                        )
+                        for action in action_values
+                    ):
+                        matches.append(f"{source}.{public_alias}")
+                walk(child, source)
+        elif isinstance(item, list):
+            for child in item:
+                walk(child, source)
+
+    wrapped = value if isinstance(value, Mapping) else {}
+    for source in ("body", "selectors", "query"):
+        walk(wrapped.get(source), source)
+    return sorted(set(matches))
+
+
+def _ac_promotion_successor_rollback_authority(
+    conn,
+    *,
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project rollback custody; C can never be unlocked by row status alone."""
+
+    row = conn.execute(
+        """SELECT bug_id, status, fixed_at, "commit", updated_at
+             FROM backlog_bugs WHERE bug_id=?""",
+        (_AC_PROMOTION_ROLLBACK_BLOCKER_ID,),
+    ).fetchone()
+    if row is None:
+        return {
+            "schema_version": "ac_promotion_activation_rollback_authority.v1",
+            "accepted": False,
+            "status": "missing",
+            "backlog_id": _AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+            "server_derived": True,
+            "candidate_c_deploy_unlock_allowed": False,
+            "fresh_descendant_d_required": True,
+            "writes_performed": False,
+        }
+    fix_commit = str(row["commit"] or "").strip().lower()
+    candidate_commit = str(candidate.get("candidate_commit") or "").strip().lower()
+    world = (
+        candidate.get("runtime_world_authority")
+        if isinstance(candidate.get("runtime_world_authority"), Mapping)
+        else {}
+    )
+    root_raw = str(world.get("target_project_root") or "").strip()
+    fix_is_descendant = False
+    if (
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", fix_commit)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_commit)
+        and root_raw
+    ):
+        fix_is_descendant = _git_commit_is_ancestor(
+            Path(root_raw), candidate_commit, fix_commit
+        ) and fix_commit != candidate_commit
+    projected = {
+        "schema_version": "ac_promotion_activation_rollback_authority.v1",
+        "accepted": False,
+        "status": str(row["status"] or "").strip().upper(),
+        "backlog_id": str(row["bug_id"] or "").strip(),
+        "fixed_at": str(row["fixed_at"] or "").strip(),
+        "fix_commit": fix_commit,
+        "fix_commit_present": bool(fix_commit),
+        "fix_commit_descends_from_candidate_c": fix_is_descendant,
+        "candidate_c_deploy_unlock_allowed": False,
+        "fresh_descendant_d_required": True,
+        "required_future_authority": {
+            "candidate_parent_includes_c": True,
+            "candidate_parent_includes_rollback_fix": True,
+            "full_promotion_delta_base": AC_STABLE_ANCHOR_COMMIT,
+            "fresh_qa_required": True,
+            "fresh_operator_signoff_required": True,
+        },
+        "updated_at": str(row["updated_at"] or "").strip(),
+        "server_derived": True,
+        "writes_performed": False,
+    }
+    projected["authority_hash"] = stable_sha256(projected)
+    return projected
+
+
+def _ac_promotion_successor_implementation_record(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    candidate_commit: str,
+) -> dict[str, Any]:
+    records = _operator_supervised_direct_main_strict_records(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    if len(records) != 1:
+        raise GovernanceError(
+            "promotion_successor_direct_main_execution_ambiguous",
+            "one exact durable Direct Main execution is required",
+            409,
+            {
+                "record_count": len(records),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    record = records[0]
+    if str(record.get("contract_execution_id") or "") != (
+        _AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID
+    ):
+        raise GovernanceError(
+            "promotion_successor_direct_main_execution_mismatch",
+            "the durable Direct Main execution is not the exact successor CEX",
+            409,
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    implementation = [
+        dict(line)
+        for line in (record.get("completed_lines") or [])
+        if isinstance(line, Mapping)
+        and str(line.get("line_id") or "") == "observer_implementation"
+        and str(line.get("status") or "").lower() in {"pass", "passed"}
+    ]
+    if (
+        len(implementation) != 1
+        or str(implementation[0].get("commit_sha") or "").lower()
+        != candidate_commit
+    ):
+        raise GovernanceError(
+            "promotion_successor_implementation_not_current",
+            "the exact candidate implementation is not durable in the current CEX",
+            409,
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    binding = (
+        metadata.get("operator_supervised_direct_main_runtime_binding")
+        if isinstance(metadata.get("operator_supervised_direct_main_runtime_binding"), Mapping)
+        else {}
+    )
+    route_identity = (
+        binding.get("route_identity")
+        if isinstance(binding.get("route_identity"), Mapping)
+        else {}
+    )
+    implementation_ref = str(
+        implementation[0].get("route_token_ref")
+        or (implementation[0].get("payload") or {}).get("route_token_ref")
+        or ""
+    ).strip()
+    if not implementation_ref or implementation_ref != str(
+        route_identity.get("route_token_ref") or ""
+    ).strip():
+        raise GovernanceError(
+            "promotion_successor_implementation_route_mismatch",
+            "the current implementation route is not the immutable CEX route",
+            409,
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    return {
+        "record": record,
+        "implementation": implementation[0],
+        "implementation_route_ref": implementation_ref,
+        "binding_hash": str(binding.get("binding_hash") or ""),
+    }
+
+
+def _ac_promotion_successor_route_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    route_token_ref: str,
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    from . import observer_route_context
+
+    ref = str(route_token_ref or "").strip()
+    if not ref:
+        return {}
+    try:
+        route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=project_id,
+            route_token_ref=ref,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    route = dict(route or {})
+    implementation_delta = dict(candidate.get("implementation_delta") or {})
+    promotion_delta = dict(candidate.get("promotion_delta") or {})
+    expected_files = sorted(implementation_delta.get("file_fence") or [])
+    expected_evidence_refs = sorted(
+        {
+            f"backlog:{backlog_id}",
+            f"contract_runtime:{contract_execution_id}",
+            f"candidate_commit:{candidate.get('candidate_commit')}",
+            f"candidate_tree:{candidate.get('candidate_tree_sha')}",
+            f"stable_anchor:{AC_STABLE_ANCHOR_COMMIT}",
+            f"promotion_diff:{promotion_delta.get('diff_sha256')}",
+            (
+                "promotion_file_fence:"
+                f"{promotion_delta.get('file_fence_sha256')}"
+            ),
+            f"candidate_authority:{candidate.get('authority_hash')}",
+            (
+                "stable_database_identity:"
+                f"{stable_sha256(candidate.get('stable_database_identity') or {})}"
+            ),
+        }
+    )
+    actual_evidence_refs = sorted(
+        str(item or "").strip()
+        for item in (route.get("evidence_refs") or [])
+        if str(item or "").strip()
+    )
+    route_identity = {
+        key: str(route.get(key) or "").strip()
+        for key in (
+            "route_id",
+            "route_context_hash",
+            "prompt_contract_id",
+            "prompt_contract_hash",
+            "visible_injection_manifest_hash",
+            "route_token_ref",
+        )
+    }
+    allowed_actions = [
+        str(item or "").strip()
+        for item in (route.get("allowed_actions") or [])
+        if str(item or "").strip()
+    ]
+    accepted = bool(
+        route
+        and str(route.get("caller_role") or "") == "observer"
+        and allowed_actions == [_AC_PROMOTION_SUCCESSOR_ROUTE_ACTION]
+        and sorted(route.get("target_files") or []) == expected_files
+        and sorted(route.get("owned_files") or []) == expected_files
+        and actual_evidence_refs == expected_evidence_refs
+        and str(route.get("route_token_ref") or "") == ref
+        and all(route_identity.values())
+    )
+    if not accepted:
+        return {}
+    authority = {
+        "schema_version": "ac_promotion_successor_route_authority.v1",
+        "accepted": True,
+        "source": "canonical_stable_route_registry",
+        "required_endpoint": "http://127.0.0.1:40000",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": contract_execution_id,
+        "route_token_ref": ref,
+        "candidate_commit": str(candidate.get("candidate_commit") or ""),
+        "candidate_tree_sha": str(candidate.get("candidate_tree_sha") or ""),
+        "stable_anchor_commit": AC_STABLE_ANCHOR_COMMIT,
+        "promotion_delta_hash": str(promotion_delta.get("delta_hash") or ""),
+        "evidence_refs_hash": stable_sha256(expected_evidence_refs),
+        "route_identity": route_identity,
+        "writes_performed": False,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
+def _ac_promotion_successor_qa_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    candidate: Mapping[str, Any],
+    promotion_intent_sha256: str,
+) -> dict[str, Any]:
+    from . import task_timeline
+
+    rows = conn.execute(
+        """SELECT * FROM task_timeline_events
+           WHERE project_id=? AND backlog_id=? AND task_id=?
+             AND event_type='qa.independent_verification'
+           ORDER BY id ASC""",
+        (project_id, backlog_id, contract_execution_id),
+    ).fetchall()
+    valid: list[dict[str, Any]] = []
+    for row in rows:
+        event = _ac_promotion_row_to_event(row)
+        evidence = {
+            "payload": event.get("payload") or {},
+            "verification": event.get("verification") or {},
+            "artifact_refs": event.get("artifact_refs") or {},
+        }
+        authority = _ac_promotion_first_mapping(
+            evidence, "source_backed_contract_gate_authority"
+        )
+        proof = authority.get("qa_session_proof") if isinstance(authority.get("qa_session_proof"), Mapping) else {}
+        line = _ac_promotion_first_mapping(evidence, "contract_runtime_canonical_line")
+        review = proof.get("candidate_review_context") if isinstance(proof.get("candidate_review_context"), Mapping) else {}
+        if not review:
+            review = _ac_promotion_first_mapping(evidence, "candidate_review_context")
+        results = _ac_promotion_first_mapping(evidence, "promotion_gate_results")
+        branch = results.get("branch_service") if isinstance(results.get("branch_service"), Mapping) else {}
+        lanes = results.get("lanes") if isinstance(results.get("lanes"), Mapping) else {}
+        authority_hash = str(authority.get("authority_hash") or "")
+        replay_count = 0
+        if authority_hash:
+            for project_row in conn.execute(
+                "SELECT * FROM task_timeline_events WHERE project_id=?",
+                (project_id,),
+            ).fetchall():
+                projected = _ac_promotion_row_to_event(project_row)
+                projected_evidence = {
+                    "payload": projected.get("payload") or {},
+                    "verification": projected.get("verification") or {},
+                    "artifact_refs": projected.get("artifact_refs") or {},
+                }
+                if _ac_promotion_contains(projected_evidence, "authority_hash", authority_hash):
+                    replay_count += 1
+        lane_pass = bool(
+            set(lanes) == {"direct_main", "mf_parallel", "mf_batch_parallel"}
+            and all(
+                isinstance(item, Mapping)
+                and item.get("status") == "passed"
+                and item.get("test_id")
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", str(item.get("report_sha256") or ""))
+                for item in lanes.values()
+            )
+        )
+        if bool(
+            event.get("event_kind") == "independent_verification"
+            and event.get("phase") == "qa"
+            and str(event.get("status") or "").lower() in {"pass", "passed"}
+            and str(event.get("commit_sha") or "").lower() == candidate["candidate_commit"]
+            and task_timeline._source_backed_qa_session_authority_valid(authority, conn=conn)
+            and proof.get("project_id") == project_id
+            and proof.get("backlog_id") == backlog_id
+            and proof.get("task_id") == contract_execution_id
+            and proof.get("commit_sha") == candidate["candidate_commit"]
+            and proof.get("principal_id") == event.get("actor")
+            and line.get("stage_id") == "qa"
+            and line.get("line_id") == "qa_independent_verification"
+            and line.get("contract_execution_id") == contract_execution_id
+            and review.get("candidate_commit_sha") == candidate["candidate_commit"]
+            and review.get("comparison_base_commit_sha") == AC_STABLE_ANCHOR_COMMIT
+            and review.get("comparison_authority_required") is True
+            and review.get("candidate_diff_hash") == candidate["diff_sha256"]
+            and list(review.get("changed_files") or []) == candidate["file_fence"]
+            and _ac_promotion_contains(evidence, "stable_anchor_commit", AC_STABLE_ANCHOR_COMMIT)
+            and _ac_promotion_contains(evidence, "promotion_intent_sha256", promotion_intent_sha256)
+            and _ac_promotion_contains(evidence, "file_fence", candidate["file_fence"])
+            and _ac_promotion_contains(evidence, "stable_database_identity", candidate["stable_database_identity"])
+            and not any(item is True for item in _ac_promotion_nested_values(evidence, "pass_synthesized"))
+            and branch.get("status") == "passed"
+            and branch.get("test_id")
+            and branch.get("runtime_plane") == "dev"
+            and branch.get("port") == AC_DEV_SERVICE_PORT
+            and branch.get("bind_host") == AC_DEV_BIND_HOST
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", str(branch.get("report_sha256") or ""))
+            and lane_pass
+            and replay_count == 1
+        ):
+            valid.append({"event": event, "evidence": evidence, "authority": authority, "promotion_gate_results": results})
+    if len(valid) != 1:
+        return {
+            "accepted": False,
+            "event_count": len(rows),
+            "valid_event_count": len(valid),
+            "status": "missing" if not rows else "invalid_or_ambiguous",
+        }
+    selected = valid[0]
+    return {
+        "accepted": True,
+        "status": "passed",
+        "timeline_event_id": int(selected["event"]["id"]),
+        "event_hash": _ac_promotion_event_hash(selected["event"]),
+        "actor": str(selected["event"].get("actor") or ""),
+        "authority_hash": str(selected["authority"].get("authority_hash") or ""),
+        "promotion_gate_results": selected["promotion_gate_results"],
+    }
+
+
+def _ac_promotion_successor_signoff_projection(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    candidate: Mapping[str, Any],
+    qa: Mapping[str, Any],
+    intent: Mapping[str, Any],
+    promotion_intent_sha256: str,
+    verifier_sha256: str,
+) -> dict[str, Any]:
+    rows = conn.execute(
+        """SELECT * FROM release_operator_head_queue_events
+           WHERE project_id=? AND action='reorder' ORDER BY id ASC""",
+        (project_id,),
+    ).fetchall()
+    valid: list[dict[str, Any]] = []
+    nonce_counts: dict[str, int] = {}
+    parsed_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for raw in rows:
+        row = dict(raw)
+        try:
+            reason = json.loads(str(row.get("reason") or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if reason.get("schema_version") != "ac_stable_promotion_operator_signoff.v1":
+            continue
+        nonce = str(reason.get("nonce") or "")
+        nonce_counts[nonce] = nonce_counts.get(nonce, 0) + 1
+        parsed_rows.append((row, reason))
+    for row, reason in parsed_rows:
+        nonce = str(reason.get("nonce") or "")
+        operator_gate = {
+            "status": "approved",
+            "nonce": nonce,
+            "operator_principal_id": reason.get("operator_principal_id"),
+            "expires_at": reason.get("expires_at"),
+        }
+        signable_manifest = {
+            **dict(intent),
+            "promotion_intent_sha256": promotion_intent_sha256,
+            "prior_promotion": {
+                "kind": "bootstrap",
+                "stable_commit": AC_STABLE_ANCHOR_COMMIT,
+            },
+            "gates": {
+                "qa_verdict": {
+                    "timeline_event_id": qa.get("timeline_event_id"),
+                    "status": "passed",
+                },
+                "operator_signoff": operator_gate,
+            },
+        }
+        manifest_hash = stable_sha256(signable_manifest)
+        expected = {
+            "schema_version": "ac_stable_promotion_operator_signoff.v1",
+            "nonce": nonce,
+            "operator_principal_id": reason.get("operator_principal_id"),
+            "expires_at": reason.get("expires_at"),
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": contract_execution_id,
+            "stable_anchor_commit": AC_STABLE_ANCHOR_COMMIT,
+            "candidate_commit": candidate["candidate_commit"],
+            "promotion_intent_sha256": promotion_intent_sha256,
+            "promotion_manifest_sha256": manifest_hash,
+            "verifier_sha256": verifier_sha256,
+            "diff_sha256": candidate["diff_sha256"],
+            "file_fence": candidate["file_fence"],
+            "deploy": intent["deploy"],
+            "stable_database_identity": candidate["stable_database_identity"],
+        }
+        try:
+            before = json.loads(str(row.get("before_json") or "{}"))
+            after = json.loads(str(row.get("after_json") or "{}"))
+            created = datetime.fromisoformat(str(row.get("created_at") or "").replace("Z", "+00:00"))
+            expires = datetime.fromisoformat(str(reason.get("expires_at") or "").replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if bool(
+            reason == expected
+            and str(row.get("reason") or "") == json.dumps(reason, sort_keys=True, separators=(",", ":"))
+            and row.get("backlog_id") == ""
+            and before == after
+            and _ac_promotion_operator_principal_valid(row.get("actor"))
+            and row.get("actor") == reason.get("operator_principal_id")
+            and re.fullmatch(r"[0-9a-f]{32}", nonce)
+            and nonce_counts.get(nonce) == 1
+            and expires > created
+            and expires - created <= timedelta(hours=1)
+            and datetime.now(timezone.utc) < expires
+        ):
+            valid.append({"row": row, "reason": reason, "operator_gate": operator_gate, "manifest_hash": manifest_hash})
+    if len(valid) != 1:
+        return {
+            "accepted": False,
+            "candidate_signoff_count": len(parsed_rows),
+            "valid_signoff_count": len(valid),
+            "status": "missing" if not parsed_rows else "invalid_or_ambiguous",
+        }
+    selected = valid[0]
+    row = selected["row"]
+    return {
+        "accepted": True,
+        "status": "approved",
+        "queue_event_id": int(row["id"]),
+        "operator_principal_id": selected["reason"]["operator_principal_id"],
+        "nonce": selected["reason"]["nonce"],
+        "expires_at": selected["reason"]["expires_at"],
+        "manifest_hash": selected["manifest_hash"],
+        "operator_approval_ref": f"release-operator-head-queue-event:{int(row['id'])}",
+        "event_hash": stable_sha256(
+            {
+                key: row.get(key)
+                for key in (
+                    "id", "project_id", "action", "backlog_id", "actor",
+                    "reason", "before_json", "after_json", "created_at",
+                )
+            }
+        ),
+    }
+
+
+def _ac_promotion_successor_response(
+    *,
+    project_id: str,
+    backlog_id: str,
+    state: str,
+    response_view: str,
+    next_action: Mapping[str, Any],
+    details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    operation = {
+        "kind": "read_only_state_machine",
+        "id": "ac_stable_promotion_successor",
+        "backlog_id": _AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        "state": state,
+        "preparation_only": True,
+        "activation_authorized": False,
+        "deploy_ready": False,
+        "rollback_enforced": False,
+        "satisfies_gate": False,
+        "authorizes_write": False,
+    }
+    system_index = {
+        "schema_version": "onboard_contract.system_operation_index.v1",
+        "operations": {"ac_stable_promotion_successor": operation},
+    }
+    response = {
+        "schema_version": "onboard_route_guide.ac_promotion_successor.v1",
+        "ok": True,
+        "response_view": str(response_view or "full"),
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "selected_backlog_source": "exact_promotion_successor_row",
+        "promotion_successor_state": state,
+        "next_legal_action": dict(next_action),
+        "system_operation_index": system_index,
+        "onboard_route_guide": {
+            "schema_version": "onboard_contract.route_guide.v1",
+            "system_operation_index": system_index,
+            "next_legal_action": dict(next_action),
+        },
+        "preparation_only": True,
+        "activation_authorized": False,
+        "deploy_ready": False,
+        "rollback_enforced": False,
+        "satisfies_gate": False,
+        "authorizes_write": False,
+        "writes_performed": False,
+        "zero_write_projection": True,
+        "raw_route_token_required": False,
+        "raw_route_token_exposed": False,
+        "public_safe": True,
+        "secret_safe": True,
+    }
+    response.update(deepcopy(dict(details or {})))
+    return response
+
+
+def _ac_promotion_successor_activation_preguard(
+    *,
+    request_context: RequestContext | None = None,
+    project_id: str,
+    backlog_id: str,
+    response_view: str = "",
+    request_body: Mapping[str, Any] | None = None,
+    request_selector_claims: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Block exact-row activation claims before any durable state discovery."""
+
+    if project_id != "aming-claw" or backlog_id != _AC_PROMOTION_SUCCESSOR_BACKLOG_ID:
+        return {}
+    activation_claim_fields = _ac_promotion_successor_activation_claim_fields(
+        {
+            "body": dict(request_body or {}),
+            "selectors": dict(request_selector_claims or {}),
+            "query": dict(
+                request_context.query
+                if request_context is not None
+                and isinstance(request_context.query, Mapping)
+                else {}
+            ),
+        }
+    )
+    if not activation_claim_fields:
+        return {}
+    return _ac_promotion_successor_response(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        state="activation_rollback_blocked",
+        response_view=response_view,
+        next_action={
+            "code": "activation_rollback_not_enforced",
+            "blocker_id": _AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+            "action": "stop_and_transfer_custody_to_rollback_backlog",
+            "actionable": False,
+            "activation_claim_fields": activation_claim_fields,
+            "preparation_only": True,
+            "activation_authorized": False,
+            "deploy_ready": False,
+            "rollback_enforced": False,
+            "satisfies_gate": False,
+            "authorizes_write": False,
+            "writes_performed": False,
+        },
+    )
+
+
+def _ac_promotion_successor_route_guide_overlay(
+    conn,
+    *,
+    request_context: RequestContext | None = None,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str = "",
+    role: str = "",
+    work_type: str = "",
+    response_view: str = "",
+    request_body: Mapping[str, Any] | None = None,
+    request_selector_claims: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project the exact b8->C promotion preparation without activation."""
+
+    activation_blocker = _ac_promotion_successor_activation_preguard(
+        request_context=request_context,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        response_view=response_view,
+        request_body=request_body,
+        request_selector_claims=request_selector_claims,
+    )
+    if activation_blocker:
+        return activation_blocker
+    if project_id != "aming-claw" or backlog_id != _AC_PROMOTION_SUCCESSOR_BACKLOG_ID:
+        return {}
+    if _runtime_plane() != "dev":
+        return _ac_promotion_successor_response(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            state="wrong_runtime_plane",
+            response_view=response_view,
+            next_action={
+                "code": "promotion_successor_requires_dev_projection",
+                "required_endpoint": "http://127.0.0.1:40008",
+                "actionable": False,
+            },
+        )
+    try:
+        candidate = _ac_promotion_successor_candidate_authority()
+        if candidate.get("status") == "baseline_only":
+            return _ac_promotion_successor_response(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                state="baseline_only",
+                response_view=response_view,
+                next_action={
+                    "code": "promotion_successor_descendant_not_materialized",
+                    "action": "materialize_exact_descendant_candidate",
+                    "actionable": False,
+                    "baseline_commit": _AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT,
+                    "writes_performed": False,
+                },
+                details={"candidate_authority": candidate},
+            )
+        mismatches = _ac_promotion_successor_request_mismatches(
+            request_body, request_selector_claims, candidate
+        )
+        if mismatches:
+            raise GovernanceError(
+                "promotion_successor_caller_claim_mismatch",
+                "caller promotion claims do not equal server-derived authority",
+                409,
+                {
+                    "mismatch_fields": mismatches,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "secret_safe": True,
+                },
+            )
+        stable_health = _ac_promotion_successor_stable_health()
+        health_db = dict(stable_health.get("stable_database_identity") or {})
+        if health_db and health_db != candidate["stable_database_identity"]:
+            raise GovernanceError(
+                "promotion_successor_stable_database_identity_mismatch",
+                "stable health and dev candidate do not share the canonical database",
+                409,
+                {"zero_write_rejection": True, "writes_performed": False},
+            )
+        implementation = _ac_promotion_successor_implementation_record(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            candidate_commit=candidate["candidate_commit"],
+        )
+        body = dict(request_body or {})
+        promotion_ref = str(body.get("promotion_route_token_ref") or "").strip()
+        if promotion_ref and promotion_ref == str(route_token_ref or "").strip():
+            raise GovernanceError(
+                "promotion_successor_implementation_route_nontransferable",
+                "the dev implementation route cannot authorize stable promotion",
+                409,
+                {"zero_write_rejection": True, "writes_performed": False},
+            )
+        promotion_route = _ac_promotion_successor_route_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=_AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+            route_token_ref=promotion_ref,
+            candidate=candidate,
+        )
+        implementation_delta = dict(candidate["implementation_delta"])
+        promotion_delta = dict(candidate["promotion_delta"])
+        expected_route_evidence_refs = [
+            f"backlog:{backlog_id}",
+            f"contract_runtime:{_AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID}",
+            f"candidate_commit:{candidate['candidate_commit']}",
+            f"candidate_tree:{candidate['candidate_tree_sha']}",
+            f"stable_anchor:{AC_STABLE_ANCHOR_COMMIT}",
+            f"promotion_diff:{promotion_delta['diff_sha256']}",
+            (
+                "promotion_file_fence:"
+                f"{promotion_delta['file_fence_sha256']}"
+            ),
+            f"candidate_authority:{candidate['authority_hash']}",
+            (
+                "stable_database_identity:"
+                f"{stable_sha256(candidate['stable_database_identity'])}"
+            ),
+        ]
+        route_issue_body = {
+            "project_id": project_id,
+            "caller_role": "observer",
+            "backlog_id": backlog_id,
+            "task_id": _AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+            "target_files": list(implementation_delta["file_fence"]),
+            "owned_files": list(implementation_delta["file_fence"]),
+            "allowed_actions": [_AC_PROMOTION_SUCCESSOR_ROUTE_ACTION],
+            "evidence_refs": expected_route_evidence_refs,
+        }
+        common = {
+            "candidate_authority": candidate,
+            "stable_health_authority": stable_health,
+            "contract_execution_id": _AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+            "implementation_authority": {
+                "commit_sha": candidate["candidate_commit"],
+                "binding_hash": implementation["binding_hash"],
+                "implementation_route_nontransferable": True,
+            },
+        }
+        if not promotion_route:
+            return _ac_promotion_successor_response(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                state="promotion_route_missing",
+                response_view=response_view,
+                next_action={
+                    "code": "promotion_successor_canonical_route_required",
+                    "action": "observer_route_context_issue",
+                    "mcp_tool": "observer_route_context_issue",
+                    "required_endpoint": "http://127.0.0.1:40000",
+                    "copy_safe_body": route_issue_body,
+                    "bind_response_field": "promotion_route_token_ref",
+                    "generic_route_ref_transfer_allowed": False,
+                    "dev_route_ref_transfer_allowed": False,
+                    "actionable": True,
+                    "authorizes_write": False,
+                },
+                details=common,
+            )
+        canonical_deploy = {
+            "authorized": True,
+            "mode": "host_supervisor",
+            "stable_port": AC_STABLE_SERVICE_PORT,
+        }
+        intent = {
+            "schema_version": "ac_stable_promotion_manifest.v1",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": _AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+            "stable_anchor_commit": AC_STABLE_ANCHOR_COMMIT,
+            "stable_branch": AC_STABLE_BRANCH,
+            "branch": AC_DEV_BRANCH,
+            "candidate_commit": candidate["candidate_commit"],
+            "file_fence": promotion_delta["file_fence"],
+            "diff_sha256": promotion_delta["diff_sha256"],
+            "deploy": canonical_deploy,
+            "stable_database_identity": candidate["stable_database_identity"],
+        }
+        promotion_intent_sha256 = stable_sha256(intent)
+        verifier_sha256 = "sha256:" + hashlib.sha256(
+            (Path(__file__).resolve().parents[2] / "scripts" / "merge-and-deploy.sh").read_bytes()
+        ).hexdigest()
+        qa = _ac_promotion_successor_qa_projection(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=_AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+            candidate=candidate,
+            promotion_intent_sha256=promotion_intent_sha256,
+        )
+        common.update(
+            {
+                "promotion_route_authority": promotion_route,
+                "promotion_intent_sha256": promotion_intent_sha256,
+                "verifier_sha256": verifier_sha256,
+            }
+        )
+        if qa.get("accepted") is not True:
+            return _ac_promotion_successor_response(
+                project_id=project_id,
+                backlog_id=backlog_id,
+                state="route_ready_qa_missing",
+                response_view=response_view,
+                next_action={
+                    "code": "promotion_successor_exact_candidate_qa_required",
+                    "action": "qa.independent_verification",
+                    "owner_role": "qa",
+                    "actionable": False,
+                    "observer_may_submit": False,
+                    "candidate_commit": candidate["candidate_commit"],
+                    "comparison_base_commit": AC_STABLE_ANCHOR_COMMIT,
+                    "required_file_fence": promotion_delta["file_fence"],
+                    "required_diff_sha256": promotion_delta["diff_sha256"],
+                    "required_gate_results": [
+                        "branch_service",
+                        "direct_main",
+                        "mf_parallel",
+                        "mf_batch_parallel",
+                    ],
+                    "pass_synthesized": False,
+                    "writes_performed": False,
+                },
+                details={**common, "qa_projection": qa},
+            )
+        rollback_authority = _ac_promotion_successor_rollback_authority(
+            conn,
+            candidate=candidate,
+        )
+        common["qa_projection"] = qa
+        common["rollback_enforcement_authority"] = rollback_authority
+        non_executable_preparation = {
+            "schema_version": (
+                "ac_stable_promotion_preparation_non_executable.v1"
+            ),
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "contract_execution_id": (
+                _AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID
+            ),
+            "stable_anchor_commit": AC_STABLE_ANCHOR_COMMIT,
+            "candidate_commit": candidate["candidate_commit"],
+            "candidate_tree_sha": candidate["candidate_tree_sha"],
+            "implementation_delta": implementation_delta,
+            "promotion_delta": promotion_delta,
+            "promotion_intent_sha256": promotion_intent_sha256,
+            "verifier_sha256": verifier_sha256,
+            "stable_database_identity": candidate[
+                "stable_database_identity"
+            ],
+            "qa_timeline_event_id": qa["timeline_event_id"],
+            "deploy": {
+                "authorized": False,
+                "mode": "blocked_pending_descendant_rollback_successor",
+                "stable_port": AC_STABLE_SERVICE_PORT,
+            },
+            "old_script_consumable_manifest": False,
+            "candidate_c_deploy_unlock_allowed": False,
+            "fresh_descendant_d_required": True,
+            "preparation_only": True,
+            "activation_authorized": False,
+            "deploy_ready": False,
+            "rollback_enforced": False,
+            "satisfies_gate": False,
+            "authorizes_write": False,
+            "writes_performed": False,
+        }
+        return _ac_promotion_successor_response(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            state="qa_ready_rollback_missing",
+            response_view=response_view,
+            next_action={
+                "code": "activation_rollback_not_enforced",
+                "blocker_id": _AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+                "action": "transfer_custody_to_rollback_backlog",
+                "actionable": False,
+                "operator_signoff_requested": False,
+                "old_script_consumable_manifest_emitted": False,
+                "candidate_c_deploy_unlock_allowed": False,
+                "fresh_descendant_d_required": True,
+                "preparation_only": True,
+                "activation_authorized": False,
+                "deploy_ready": False,
+                "rollback_enforced": False,
+                "satisfies_gate": False,
+                "authorizes_write": False,
+                "writes_performed": False,
+            },
+            details={
+                **common,
+                "promotion_preparation": non_executable_preparation,
+            },
+        )
+    except GovernanceError as exc:
+        return _ac_promotion_successor_response(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            state="degraded",
+            response_view=response_view,
+            next_action={
+                "code": exc.code,
+                "action": "stop_and_recover_exact_promotion_authority",
+                "actionable": False,
+                "recovery": "repair the reported exact authority and re-read Onboard",
+                "writes_performed": False,
+            },
+            details={
+                "projection_degraded": True,
+                "projection_degraded_reason": {
+                    "code": exc.code,
+                    "details": dict(exc.details or {}),
+                },
+            },
+        )
+    except (sqlite3.DatabaseError, OSError, RuntimeError, TypeError, ValueError):
+        return _ac_promotion_successor_response(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            state="degraded",
+            response_view=response_view,
+            next_action={
+                "code": "promotion_successor_projection_authority_unavailable",
+                "action": "stop_and_recover_exact_promotion_authority",
+                "actionable": False,
+                "recovery": (
+                    "repair the bounded read authority and re-read Onboard"
+                ),
+                "writes_performed": False,
+            },
+            details={
+                "projection_degraded": True,
+                "projection_degraded_reason": {
+                    "code": (
+                        "promotion_successor_projection_authority_unavailable"
+                    ),
+                    "public_safe": True,
+                    "secret_safe": True,
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                },
+            },
+        )
+
+
 def _onboard_route_guide_service_response(
     conn,
     *,
@@ -161930,6 +163317,16 @@ def _onboard_route_guide_service_response(
     request_body: Mapping[str, Any] | None = None,
     request_selector_claims: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    activation_blocker = _ac_promotion_successor_activation_preguard(
+        request_context=request_context,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        response_view=response_view,
+        request_body=request_body,
+        request_selector_claims=request_selector_claims,
+    )
+    if activation_blocker:
+        return activation_blocker
     from .parallel_branch_runtime import (
         get_active_integration_epoch,
         integration_epoch_resume_payload,
@@ -162137,6 +163534,20 @@ def _onboard_route_guide_service_response(
             "raw_route_token_required": False,
             "raw_route_token_exposed": False,
         }
+    promotion_successor = _ac_promotion_successor_route_guide_overlay(
+        conn,
+        request_context=request_context,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        route_token_ref=route_token_ref,
+        role=role,
+        work_type=work_type,
+        response_view=response_view,
+        request_body=request_body,
+        request_selector_claims=request_selector_claims,
+    )
+    if promotion_successor:
+        return promotion_successor
     direct_main_response = (
         _onboard_operator_supervised_direct_main_runtime_response(
             conn,
@@ -209206,7 +210617,6 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
 @route("POST", "/api/projects/{project_id}/onboard-route-guide")
 def handle_project_onboard_route_guide(ctx: RequestContext):
     """Return the role/work-type onboard guide service without starting legacy root contract."""
-    _contract_runtime_require_canonical_authority_registry_complete()
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, Mapping) else {}
     response_view = str(
@@ -209236,7 +210646,6 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
         or _first_query_value(ctx.query, "requested_work_type")
         or ""
     ).strip()
-    _require_onboard_route_guide_work_type(work_type)
     backlog_id = str(
         body.get("backlog_id")
         or body.get("bug_id")
@@ -209248,6 +210657,18 @@ def handle_project_onboard_route_guide(ctx: RequestContext):
         ctx, "route_token_ref", "observer_route_token_ref"
     )
     selector_claims = _onboard_runtime_selector_claims(body, ctx.query)
+    activation_blocker = _ac_promotion_successor_activation_preguard(
+        request_context=ctx,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        response_view=response_view,
+        request_body=body,
+        request_selector_claims=selector_claims,
+    )
+    if activation_blocker:
+        return activation_blocker
+    _contract_runtime_require_canonical_authority_registry_complete()
+    _require_onboard_route_guide_work_type(work_type)
     queue_view: dict[str, Any] = {}
     with DBContext(project_id) as conn:
         from .parallel_branch_runtime import get_active_integration_epoch

@@ -890,3 +890,69 @@ The path never targets stale `main`, performs no automatic
 rebase, merge commit,
 fallback merge, force-kill, branch deletion, stable/dev database copy, or
 caller-declared PASS.
+
+### §16.1 Exact Promotion-Successor Onboard State Machine
+
+Backlog `AC-ONBOARD-EXACT-PROMOTION-SUCCESSOR-ROUTE-P0-20260827` is a
+read-only Onboard system operation. It is projected after active-epoch and
+entered-batch custody, before Direct Main or generic Onboard routing. The
+projector owns no activation capability and exposes these ordered states:
+
+1. `baseline_only`: the loaded dev runtime is still exact baseline
+   `b8b727828f9bffd690e44e2f50be99a50d137c69`; the typed blocker is
+   `promotion_successor_descendant_not_materialized`.
+2. `candidate_projected`: the loaded, clean `40008` HEAD is one direct child
+   of the baseline. Git separately proves `implementation_delta` from b8 to C
+   (the exact three-file row fence) and `promotion_delta` from stable a258 to C
+   (the complete stable-verifier fence, binary diff bytes/hash, and per-file
+   source hashes). Promotion authority always consumes the latter; the former
+   is provenance only. The projection also binds the candidate tree, canonical
+   DB identity, stable health, strict Direct Main CEX, and current
+   implementation route. Caller claims must equal server-derived authority.
+3. `promotion_route_missing`: Onboard projects one explicit
+   `observer_route_context_issue` precursor for stable `40000`. A generic
+   current ref or a dev-world ref cannot be transferred; only a separately
+   resolved canonical stable registry ref with the exact backlog/CEX/row fence
+   and an exact singleton `ac_stable_promotion_prepare` action advances the
+   state. Route ID, context hash, prompt ID/hash, injection-manifest hash, and
+   token ref must all be non-empty. Its evidence
+   refs additionally bind C, the candidate tree, a258, the complete promotion
+   diff and fence hashes, candidate-authority hash, and DB-identity hash; an
+   old-C, missing-evidence, or stale route is not transferable.
+4. `route_ready_qa_missing`: the next custody belongs to independent QA. One
+   exact-C, role-bound, non-synthesized `qa.independent_verification` verdict
+   must bind the a258 comparison, file fence, diff and DB identity and include
+   PASS subresults for branch service plus `direct_main`, `mf_parallel`, and
+   `mf_batch_parallel`.
+5. `qa_ready_rollback_missing`: QA transfers custody directly to backlog
+   `AC-PROMOTION-ACTIVATION-ROLLBACK-RESTART-P0-20260827`. While that durable
+   row is absent, OPEN, or even projected FIXED, candidate C does not request
+   operator signoff and does not emit `ac_stable_promotion_manifest.v1` or any
+   old-script-consumable artifact. Row status, `fixed_at`, and `fix_commit` are
+   diagnostic only and can never unlock C. A bounded preparation record uses a
+   distinct non-executable schema and `deploy.authorized=false`.
+6. The rollback repair must land as a descendant D after C. Only a future,
+   fresh D-bound successor may prove the full a258-to-D promotion delta, both C
+   and rollback-fix ancestry, fresh exact-D independent QA, and a new
+   manifest-bound operator signoff. C has no `qa_ready_signoff_missing` or
+   `manifest_prepared` transition.
+
+Every state is zero-write and public-safe. Compact and full views preserve the
+same state and next action. Every response has
+`preparation_only=true` and
+`activation_authorized=deploy_ready=rollback_enforced=satisfies_gate=authorizes_write=false`.
+The operation never merges, restarts, deploys, activates a graph, records QA,
+closes a backlog, or calls the post-deploy completion service. Stale,
+ambiguous, replayed, or degraded evidence produces a typed recovery blocker;
+it never falls through to an empty confirmation or implicit activation.
+Any explicit activation, deploy, redeploy, restart, merge, promote, promotion,
+execution, completion, or manifest request alias (including `requested_*`
+carrier aliases) is intercepted before state discovery and returns
+`activation_rollback_not_enforced`; this fail-closed path performs no health
+call and cannot emit a consumable manifest. The same stateless preguard runs at
+both HTTP and service ingress before authority-registry, active-integration-
+epoch, entered-batch, or database state discovery; the later overlay repeats
+the check only as defense in depth.
+Public blocker diagnostics expose only the fixed claim source and canonical
+activation alias; recursive caller-controlled ancestor keys and values are
+never copied into responses or logs.

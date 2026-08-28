@@ -196276,3 +196276,1370 @@ def test_ac_dev_direct_world_requires_exact_loaded_nonstale_40008_identity(
         "violations"
     ]
     assert missing_source.value.details["writes_performed"] is False
+
+
+def _promotion_successor_candidate_fixture(commit: str = "c" * 40) -> dict[str, Any]:
+    database_identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": 17,
+        "inode": 23,
+        "stable_relative_path_sha256": "sha256:" + "d" * 64,
+    }
+    implementation_files = sorted(server._AC_PROMOTION_SUCCESSOR_FILE_FENCE)
+    promotion_files = sorted(
+        [*implementation_files, "agent/governance/previous-isolation.py"]
+    )
+    implementation_delta = {
+        "base_commit": server._AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT,
+        "candidate_commit": commit,
+        "file_fence": implementation_files,
+        "file_fence_sha256": server.stable_sha256(implementation_files),
+        "diff_sha256": "sha256:" + "1" * 64,
+        "diff_byte_length": 101,
+        "source_sha256": {
+            path: "sha256:" + "2" * 64 for path in implementation_files
+        },
+    }
+    implementation_delta["delta_hash"] = server.stable_sha256(
+        implementation_delta
+    )
+    promotion_delta = {
+        "base_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "candidate_commit": commit,
+        "file_fence": promotion_files,
+        "file_fence_sha256": server.stable_sha256(promotion_files),
+        "diff_sha256": "sha256:" + "f" * 64,
+        "diff_byte_length": 701562,
+        "source_sha256": {
+            path: "sha256:" + "3" * 64 for path in promotion_files
+        },
+    }
+    promotion_delta["delta_hash"] = server.stable_sha256(promotion_delta)
+    authority = {
+        "schema_version": "ac_promotion_successor_candidate_authority.v1",
+        "status": "candidate_projected",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "baseline_commit": server._AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT,
+        "candidate_commit": commit,
+        "candidate_parent_commit": server._AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT,
+        "candidate_tree_sha": "e" * 40,
+        "implementation_delta": implementation_delta,
+        "promotion_delta": promotion_delta,
+        "file_fence": promotion_files,
+        "diff_sha256": promotion_delta["diff_sha256"],
+        "source_sha256": promotion_delta["source_sha256"],
+        "runtime_world_authority": {"world_hash": "sha256:" + "a" * 64},
+        "stable_database_identity": database_identity,
+        "writes_performed": False,
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    return authority
+
+
+def _promotion_successor_health_fixture(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": "ac_stable_health_authority.v1",
+        "status": "exact",
+        "runtime_loaded_version": server.AC_STABLE_ANCHOR_COMMIT,
+        "runtime_stale": False,
+        "port": server.AC_STABLE_SERVICE_PORT,
+        "pid": 12345,
+        "runtime_plane_identity": {},
+        "stable_database_identity": candidate["stable_database_identity"],
+        "health_hash": "sha256:" + "b" * 64,
+    }
+
+
+def _promotion_successor_implementation_fixture(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "record": {
+            "contract_execution_id": (
+                server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID
+            )
+        },
+        "implementation": {
+            "line_id": "observer_implementation",
+            "status": "passed",
+            "commit_sha": candidate["candidate_commit"],
+        },
+        "implementation_route_ref": "rtok-dev-implementation-nontransferable",
+        "binding_hash": "sha256:" + "c" * 64,
+    }
+
+
+def test_promotion_successor_candidate_authority_uses_real_single_commit_git_fence(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "promotion-successor-git"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+    for path in server._AC_PROMOTION_SUCCESSOR_FILE_FENCE:
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "stable-anchor"], cwd=root, check=True)
+    stable_anchor = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+    previous_isolation = root / "agent/governance/previous-isolation.py"
+    previous_isolation.write_text("prior promotion content\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "b8-baseline"], cwd=root, check=True)
+    baseline = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+    monkeypatch.setattr(
+        server, "_AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT", baseline
+    )
+    monkeypatch.setattr(server, "AC_STABLE_ANCHOR_COMMIT", stable_anchor)
+    for path in server._AC_PROMOTION_SUCCESSOR_FILE_FENCE:
+        (root / path).write_text(f"candidate:{path}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "candidate"], cwd=root, check=True)
+    candidate = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+    world = _fixed_ac_dev_direct_world(root, candidate)
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+
+    authority = server._ac_promotion_successor_candidate_authority()
+
+    assert authority["status"] == "candidate_projected"
+    assert authority["candidate_commit"] == candidate
+    assert authority["candidate_parent_commit"] == baseline
+    assert authority["implementation_delta"]["file_fence"] == sorted(
+        server._AC_PROMOTION_SUCCESSOR_FILE_FENCE
+    )
+    assert authority["implementation_delta"]["base_commit"] == baseline
+    assert authority["promotion_delta"]["base_commit"] == stable_anchor
+    assert authority["promotion_delta"]["file_fence"] == sorted(
+        [
+            *server._AC_PROMOTION_SUCCESSOR_FILE_FENCE,
+            "agent/governance/previous-isolation.py",
+        ]
+    )
+    verifier_diff = subprocess.check_output(
+        [
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "-M",
+            f"{stable_anchor}..{candidate}",
+            "--",
+            ".",
+        ],
+        cwd=root,
+    )
+    assert authority["promotion_delta"]["diff_sha256"] == (
+        "sha256:" + hashlib.sha256(verifier_diff).hexdigest()
+    )
+    assert authority["promotion_delta"]["diff_byte_length"] == len(verifier_diff)
+    assert set(authority["promotion_delta"]["source_sha256"]) == set(
+        authority["promotion_delta"]["file_fence"]
+    )
+    assert set(authority["implementation_delta"]["source_sha256"]) == set(
+        server._AC_PROMOTION_SUCCESSOR_FILE_FENCE
+    )
+
+
+@pytest.mark.parametrize(
+    ("qa_ready", "rollback_status", "rollback_fix_commit", "expected_state"),
+    [
+        (False, "OPEN", "", "route_ready_qa_missing"),
+        (True, "OPEN", "", "qa_ready_rollback_missing"),
+        (True, "FIXED", "", "qa_ready_rollback_missing"),
+        (True, "FIXED", "0" * 40, "qa_ready_rollback_missing"),
+    ],
+)
+def test_promotion_successor_overlay_progresses_read_only_and_never_authorizes_activation(
+    conn,
+    monkeypatch,
+    qa_ready,
+    rollback_status,
+    rollback_fix_commit,
+    expected_state,
+):
+    candidate = _promotion_successor_candidate_fixture()
+    health = _promotion_successor_health_fixture(candidate)
+    implementation = _promotion_successor_implementation_fixture(candidate)
+    route = {
+        "accepted": True,
+        "route_token_ref": "rtok-canonical-stable-promotion",
+        "authority_hash": "sha256:" + "9" * 64,
+    }
+    qa = {
+        "accepted": qa_ready,
+        "status": "passed" if qa_ready else "missing",
+        "timeline_event_id": 41,
+        "event_hash": "sha256:" + "7" * 64,
+        "promotion_gate_results": {
+            "branch_service": {"status": "passed"},
+            "lanes": {
+                lane: {"status": "passed"}
+                for lane in ("direct_main", "mf_parallel", "mf_batch_parallel")
+            },
+        },
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_candidate_authority",
+        lambda: copy.deepcopy(candidate),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_stable_health",
+        lambda: copy.deepcopy(health),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_implementation_record",
+        lambda *_args, **_kwargs: copy.deepcopy(implementation),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_route_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(route),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_qa_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(qa),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_signoff_projection",
+        lambda *_args, **_kwargs: pytest.fail(
+            "candidate C must never request or consume an operator signoff"
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_rollback_authority",
+        lambda _conn, **_kwargs: {
+            "accepted": False,
+            "status": rollback_status,
+            "backlog_id": server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+            "fix_commit": rollback_fix_commit,
+            "candidate_c_deploy_unlock_allowed": False,
+            "fresh_descendant_d_required": True,
+            "writes_performed": False,
+        },
+    )
+    monkeypatch.setattr(Path, "read_bytes", lambda _self: b"verifier")
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    body = {
+        "promotion_route_token_ref": route["route_token_ref"],
+        "candidate_commit": candidate["candidate_commit"],
+        "contract_execution_id": (
+            server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID
+        ),
+        "file_fence": candidate["file_fence"],
+        "diff_sha256": candidate["diff_sha256"],
+    }
+
+    full = server._ac_promotion_successor_route_guide_overlay(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        route_token_ref="rtok-dev-implementation-nontransferable",
+        role="observer",
+        work_type="system_operation",
+        response_view="full",
+        request_body=body,
+    )
+    compact = server._ac_promotion_successor_route_guide_overlay(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        route_token_ref="rtok-dev-implementation-nontransferable",
+        role="observer",
+        work_type="system_operation",
+        response_view="compact",
+        request_body=body,
+    )
+
+    assert full["promotion_successor_state"] == expected_state, full.get(
+        "projection_degraded_reason"
+    )
+    assert compact["promotion_successor_state"] == expected_state
+    assert full["next_legal_action"] == compact["next_legal_action"]
+    operation = full["system_operation_index"]["operations"][
+        "ac_stable_promotion_successor"
+    ]
+    assert operation["state"] == expected_state
+    for field in (
+        "activation_authorized",
+        "deploy_ready",
+        "rollback_enforced",
+        "satisfies_gate",
+        "authorizes_write",
+    ):
+        assert full[field] is False
+        assert operation[field] is False
+    assert full["preparation_only"] is True
+    assert full["writes_performed"] is False
+    if expected_state == "qa_ready_rollback_missing":
+        assert full["next_legal_action"]["code"] == (
+            "activation_rollback_not_enforced"
+        )
+        assert full["next_legal_action"]["operator_signoff_requested"] is False
+        assert "promotion_manifest" not in full
+        assert full["promotion_preparation"]["deploy"]["authorized"] is False
+        assert full["promotion_preparation"][
+            "old_script_consumable_manifest"
+        ] is False
+        assert full["promotion_preparation"][
+            "candidate_c_deploy_unlock_allowed"
+        ] is False
+        assert full["promotion_preparation"][
+            "fresh_descendant_d_required"
+        ] is True
+        assert full["rollback_enforcement_authority"]["status"] == (
+            rollback_status
+        )
+        assert full["rollback_enforcement_authority"]["accepted"] is False
+        assert "operator_signoff_projection" not in full
+        assert "promotion_preflight" not in full
+    assert tuple(conn.iterdump()) == before
+    assert conn.total_changes == before_changes
+    assert "route_token\"" not in json.dumps(full, sort_keys=True)
+
+
+def test_promotion_successor_route_missing_projects_stable_precursor_and_rejects_dev_ref(
+    conn,
+    monkeypatch,
+):
+    candidate = _promotion_successor_candidate_fixture()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_candidate_authority",
+        lambda: copy.deepcopy(candidate),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_stable_health",
+        lambda: _promotion_successor_health_fixture(candidate),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_implementation_record",
+        lambda *_args, **_kwargs: _promotion_successor_implementation_fixture(
+            candidate
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_route_authority",
+        lambda *_args, **_kwargs: {},
+    )
+    before = tuple(conn.iterdump())
+
+    result = server._ac_promotion_successor_route_guide_overlay(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        route_token_ref="rtok-dev-current",
+        role="observer",
+        work_type="system_operation",
+        request_body={},
+    )
+    assert result["promotion_successor_state"] == "promotion_route_missing"
+    action = result["next_legal_action"]
+    assert action["required_endpoint"] == "http://127.0.0.1:40000"
+    assert action["copy_safe_body"]["allowed_actions"] == [
+        server._AC_PROMOTION_SUCCESSOR_ROUTE_ACTION
+    ]
+    assert action["dev_route_ref_transfer_allowed"] is False
+    assert action["generic_route_ref_transfer_allowed"] is False
+
+    rejected = server._ac_promotion_successor_route_guide_overlay(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        route_token_ref="rtok-dev-current",
+        role="observer",
+        work_type="system_operation",
+        request_body={"promotion_route_token_ref": "rtok-dev-current"},
+    )
+    assert rejected["promotion_successor_state"] == "degraded"
+    assert rejected["next_legal_action"]["code"] == (
+        "promotion_successor_implementation_route_nontransferable"
+    )
+    assert tuple(conn.iterdump()) == before
+
+
+def test_promotion_successor_rollback_row_never_unlocks_candidate_c(
+    conn,
+):
+    candidate = _promotion_successor_candidate_fixture()
+    conn.execute(
+        "DELETE FROM backlog_bugs WHERE bug_id=?",
+        (server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,),
+    )
+    conn.commit()
+
+    missing = server._ac_promotion_successor_rollback_authority(
+        conn,
+        candidate=candidate,
+    )
+    assert missing["accepted"] is False
+    assert missing["candidate_c_deploy_unlock_allowed"] is False
+    assert missing["fresh_descendant_d_required"] is True
+
+    conn.execute(
+        """INSERT INTO backlog_bugs(
+               bug_id, title, status, fixed_at, "commit", created_at, updated_at
+           ) VALUES (?, ?, 'FIXED', ?, '', ?, ?)""",
+        (
+            server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+            "Rollback enforcement repair",
+            "2026-08-27T20:00:00Z",
+            "2026-08-27T19:00:00Z",
+            "2026-08-27T20:00:00Z",
+        ),
+    )
+    conn.commit()
+    fixed_without_commit = server._ac_promotion_successor_rollback_authority(
+        conn,
+        candidate=candidate,
+    )
+    assert fixed_without_commit["status"] == "FIXED"
+    assert fixed_without_commit["fix_commit_present"] is False
+    assert fixed_without_commit["accepted"] is False
+    assert fixed_without_commit["candidate_c_deploy_unlock_allowed"] is False
+
+    conn.execute(
+        'UPDATE backlog_bugs SET "commit"=? WHERE bug_id=?',
+        ("0" * 40, server._AC_PROMOTION_ROLLBACK_BLOCKER_ID),
+    )
+    conn.commit()
+    fixed_nonancestor = server._ac_promotion_successor_rollback_authority(
+        conn,
+        candidate=candidate,
+    )
+    assert fixed_nonancestor["fix_commit_present"] is True
+    assert fixed_nonancestor["fix_commit_descends_from_candidate_c"] is False
+    assert fixed_nonancestor["accepted"] is False
+    assert fixed_nonancestor["candidate_c_deploy_unlock_allowed"] is False
+    assert fixed_nonancestor["required_future_authority"] == {
+        "candidate_parent_includes_c": True,
+        "candidate_parent_includes_rollback_fix": True,
+        "full_promotion_delta_base": server.AC_STABLE_ANCHOR_COMMIT,
+        "fresh_qa_required": True,
+        "fresh_operator_signoff_required": True,
+    }
+
+
+def test_promotion_successor_baseline_and_claim_drift_are_explicit_zero_write(
+    conn,
+    monkeypatch,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_candidate_authority",
+        lambda: {
+            "status": "baseline_only",
+            "candidate_commit": server._AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT,
+            "runtime_world_authority": {},
+        },
+    )
+    baseline = server._ac_promotion_successor_route_guide_overlay(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        work_type="system_operation",
+    )
+    assert baseline["promotion_successor_state"] == "baseline_only"
+    assert baseline["next_legal_action"]["code"] == (
+        "promotion_successor_descendant_not_materialized"
+    )
+
+    candidate = _promotion_successor_candidate_fixture()
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_candidate_authority",
+        lambda: copy.deepcopy(candidate),
+    )
+    drift = server._ac_promotion_successor_route_guide_overlay(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        work_type="system_operation",
+        request_body={
+            "candidate_commit": "0" * 40,
+            "file_fence": ["PRIVATE-SENTINEL.txt"],
+        },
+    )
+    assert drift["promotion_successor_state"] == "degraded"
+    assert drift["next_legal_action"]["code"] == (
+        "promotion_successor_caller_claim_mismatch"
+    )
+    assert drift["projection_degraded_reason"]["details"][
+        "mismatch_fields"
+    ] == ["candidate_commit", "file_fence"]
+    assert "PRIVATE-SENTINEL" not in json.dumps(drift, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    ("body", "selector_claims"),
+    [
+        ({"activate": True}, {}),
+        ({"deploy": {"authorized": True}}, {}),
+        ({"action": "merge"}, {}),
+        ({"action": "promote"}, {}),
+        ({"action": "stable_promotion"}, {}),
+        ({"operation": "restart"}, {}),
+        ({"promotion": True}, {}),
+        ({"requested_action": "deploy"}, {}),
+        ({"execute": True}, {}),
+        ({"promotion_manifest": {"schema_version": "forged"}}, {}),
+        ({}, {"activate": [False, True]}),
+        ({}, {"operation": ["status", "redeploy"]}),
+    ],
+)
+def test_promotion_successor_every_activation_alias_is_rollback_blocked_before_service(
+    conn,
+    monkeypatch,
+    body,
+    selector_claims,
+):
+    monkeypatch.setattr(
+        server.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "activation blocker must not call stable health"
+        ),
+    )
+    before = tuple(conn.iterdump())
+    result = server._ac_promotion_successor_route_guide_overlay(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        role="observer",
+        work_type="system_operation",
+        request_body=body,
+        request_selector_claims=selector_claims,
+    )
+    assert result["promotion_successor_state"] == (
+        "activation_rollback_blocked"
+    )
+    assert result["next_legal_action"]["code"] == (
+        "activation_rollback_not_enforced"
+    )
+    assert result["next_legal_action"]["blocker_id"] == (
+        server._AC_PROMOTION_ROLLBACK_BLOCKER_ID
+    )
+    assert result["activation_authorized"] is False
+    assert result["deploy_ready"] is False
+    assert "promotion_manifest" not in result
+    assert tuple(conn.iterdump()) == before
+
+
+def test_promotion_successor_repeated_query_deploy_alias_is_blocked_before_health(
+    conn,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        server.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "query activation blocker must not call stable health"
+        ),
+    )
+    result = server._ac_promotion_successor_route_guide_overlay(
+        conn,
+        request_context=SimpleNamespace(
+            query={"deploy": ["false", "true"]}
+        ),
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        role="observer",
+        work_type="system_operation",
+        request_body={},
+        request_selector_claims={},
+    )
+    assert result["promotion_successor_state"] == (
+        "activation_rollback_blocked"
+    )
+    assert result["next_legal_action"]["activation_claim_fields"] == [
+        "query.deploy"
+    ]
+
+
+@pytest.mark.parametrize("response_view", ["compact", "full"])
+def test_promotion_successor_service_preguard_precedes_active_epoch_and_state_reads(
+    conn,
+    monkeypatch,
+    response_view,
+):
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_active_integration_epoch",
+        lambda *_args, **_kwargs: pytest.fail(
+            "activation preguard must precede active epoch discovery"
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_entered_batch_successor_resume_projection",
+        lambda *_args, **_kwargs: pytest.fail(
+            "activation preguard must precede entered-batch discovery"
+        ),
+    )
+    monkeypatch.setattr(
+        server.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "activation preguard must precede stable health discovery"
+        ),
+    )
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+
+    result = server._onboard_route_guide_service_response(
+        conn,
+        request_context=SimpleNamespace(
+            query={"operation": ["status", "restart-PRIVATE-SENTINEL"]}
+        ),
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        role="qa",
+        work_type="qa_verification",
+        response_view=response_view,
+        request_body={"requested_action": "deploy-PRIVATE-SENTINEL"},
+        request_selector_claims={"action": ["status", "promote"]},
+    )
+
+    assert result["promotion_successor_state"] == "activation_rollback_blocked"
+    assert result["next_legal_action"]["code"] == (
+        "activation_rollback_not_enforced"
+    )
+    assert result["next_legal_action"]["activation_claim_fields"] == [
+        "body.requested_action",
+        "query.operation",
+        "selectors.action",
+    ]
+    assert result["activation_authorized"] is False
+    assert result["deploy_ready"] is False
+    assert result["writes_performed"] is False
+    assert tuple(conn.iterdump()) == before
+    assert conn.total_changes == before_changes
+    assert "PRIVATE-SENTINEL" not in json.dumps(result, sort_keys=True)
+
+
+@pytest.mark.parametrize("response_view", ["compact", "full"])
+def test_promotion_successor_preguard_sanitizes_nested_caller_keys(
+    conn,
+    caplog,
+    response_view,
+):
+    sentinel = "PRIVATE-NESTED-KEY-SENTINEL"
+    result = server._onboard_route_guide_service_response(
+        conn,
+        request_context=SimpleNamespace(
+            query={
+                sentinel: {
+                    "requested_action": ["status", "deploy"]
+                }
+            }
+        ),
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        response_view=response_view,
+        request_body={sentinel: {"operation": "restart"}},
+        request_selector_claims={
+            sentinel: {"promotion": True},
+        },
+    )
+
+    assert result["promotion_successor_state"] == "activation_rollback_blocked"
+    assert result["next_legal_action"]["activation_claim_fields"] == [
+        "body.operation",
+        "query.requested_action",
+        "selectors.promotion",
+    ]
+    envelope = json.dumps(result, sort_keys=True)
+    assert sentinel not in envelope
+    assert sentinel not in caplog.text
+    assert result["writes_performed"] is False
+
+
+@pytest.mark.parametrize(
+    ("body_alias", "query_alias"),
+    [
+        ({"action": "promote"}, {"operation": ["status", "restart"]}),
+        (
+            {"requested_action": "deploy-PRIVATE-SENTINEL"},
+            {"execute": ["false", "true"]},
+        ),
+        (
+            {"PRIVATE-NESTED-KEY-SENTINEL": {"promotion": True}},
+            {
+                "PRIVATE-NESTED-QUERY-SENTINEL": {
+                    "requested_action": ["status", "deploy"]
+                }
+            },
+        ),
+    ],
+)
+def test_promotion_successor_http_preguard_precedes_registry_db_and_active_epoch(
+    monkeypatch,
+    body_alias,
+    query_alias,
+):
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_require_canonical_authority_registry_complete",
+        lambda: pytest.fail(
+            "activation preguard must precede authority-registry discovery"
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "DBContext",
+        lambda *_args, **_kwargs: pytest.fail(
+            "activation preguard must not open the governance database"
+        ),
+    )
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+                "role": "qa",
+                "work_type": "invalid-but-preguard-must-win",
+                "response_view": "full",
+                **body_alias,
+            },
+            query=query_alias,
+        )
+    )
+
+    assert result["promotion_successor_state"] == "activation_rollback_blocked"
+    assert result["next_legal_action"]["code"] == (
+        "activation_rollback_not_enforced"
+    )
+    assert result["activation_authorized"] is False
+    assert result["deploy_ready"] is False
+    assert result["writes_performed"] is False
+    assert "PRIVATE-SENTINEL" not in json.dumps(result, sort_keys=True)
+    assert "PRIVATE-NESTED-KEY-SENTINEL" not in json.dumps(
+        result, sort_keys=True
+    )
+    assert "PRIVATE-NESTED-QUERY-SENTINEL" not in json.dumps(
+        result, sort_keys=True
+    )
+
+
+def test_promotion_successor_rejects_multi_parent_candidate_before_diff(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "multi-parent-candidate"
+    root.mkdir()
+    candidate = "c" * 40
+    world = _fixed_ac_dev_direct_world(root, candidate)
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_git_bytes",
+        lambda _root, _args, **_kwargs: (
+            f"{candidate} {server._AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT} "
+            f"{'d' * 40}\n"
+        ).encode("ascii"),
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._ac_promotion_successor_candidate_authority()
+    assert rejected.value.code == (
+        "promotion_successor_candidate_lineage_mismatch"
+    )
+
+
+def test_promotion_successor_overlay_precedes_direct_and_generic_onboard_routing(
+    conn,
+    monkeypatch,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_candidate_authority",
+        lambda: {
+            "status": "baseline_only",
+            "candidate_commit": server._AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT,
+            "runtime_world_authority": {},
+        },
+    )
+    before = tuple(conn.iterdump())
+
+    result = server._onboard_route_guide_service_response(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        route_token_ref="",
+        role="observer",
+        work_type="operator_supervised_direct_main",
+        response_view="compact",
+        request_body={},
+    )
+
+    assert result["promotion_successor_state"] == "baseline_only"
+    assert result["next_legal_action"]["code"] == (
+        "promotion_successor_descendant_not_materialized"
+    )
+    assert result["selected_backlog_source"] == (
+        "exact_promotion_successor_row"
+    )
+    assert result["onboard_route_guide"]["system_operation_index"][
+        "operations"
+    ]["ac_stable_promotion_successor"]["preparation_only"] is True
+    assert tuple(conn.iterdump()) == before
+
+
+def _insert_promotion_successor_qa_event(
+    conn,
+    *,
+    candidate: Mapping[str, Any],
+    intent_hash: str,
+) -> int:
+    task_timeline.ensure_schema(conn)
+    authority = {
+        "schema_version": "source_backed_contract_gate_authority.v1",
+        "source": "server_qa_session_verification",
+        "source_of_authority": "qa_session_verification",
+        "authority_hash": "sha256:" + "3" * 64,
+        "qa_session_proof": {
+            "project_id": "aming-claw",
+            "backlog_id": server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+            "task_id": server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+            "commit_sha": candidate["candidate_commit"],
+            "principal_id": "qa-promotion-successor",
+            "candidate_review_context": {
+                "candidate_commit_sha": candidate["candidate_commit"],
+                "comparison_base_commit_sha": server.AC_STABLE_ANCHOR_COMMIT,
+                "comparison_authority_required": True,
+                "candidate_diff_hash": candidate["diff_sha256"],
+                "changed_files": candidate["file_fence"],
+            },
+        },
+    }
+    report_hash = "sha256:" + "4" * 64
+    payload = {
+        "source_backed_contract_gate_authority": authority,
+        "contract_runtime_canonical_line": {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "contract_execution_id": (
+                server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID
+            ),
+            "runtime_guide_hash": "sha256:" + "5" * 64,
+        },
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "promotion_intent_sha256": intent_hash,
+        "file_fence": candidate["file_fence"],
+        "stable_database_identity": candidate["stable_database_identity"],
+    }
+    verification = {
+        "pass_synthesized": False,
+        "promotion_gate_results": {
+            "branch_service": {
+                "test_id": "branch-loopback",
+                "status": "passed",
+                "report_sha256": report_hash,
+                "runtime_plane": "dev",
+                "port": server.AC_DEV_SERVICE_PORT,
+                "bind_host": server.AC_DEV_BIND_HOST,
+            },
+            "lanes": {
+                lane: {
+                    "test_id": f"lane-{lane}",
+                    "status": "passed",
+                    "report_sha256": report_hash,
+                }
+                for lane in ("direct_main", "mf_parallel", "mf_batch_parallel")
+            },
+        },
+    }
+    cursor = conn.execute(
+        """INSERT INTO task_timeline_events(
+               project_id, backlog_id, task_id, event_type, phase, event_kind,
+               actor, status, payload_json, verification_json,
+               artifact_refs_json, commit_sha, created_at
+           ) VALUES (?, ?, ?, 'qa.independent_verification', 'qa',
+                     'independent_verification', ?, 'passed', ?, ?, '{}', ?, ?)""",
+        (
+            "aming-claw",
+            server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+            server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+            "qa-promotion-successor",
+            json.dumps(payload, sort_keys=True),
+            json.dumps(verification, sort_keys=True),
+            candidate["candidate_commit"],
+            "2026-08-27T18:00:00Z",
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def test_promotion_successor_qa_requires_exact_c_three_lanes_and_unique_role_authority(
+    conn,
+    monkeypatch,
+):
+    candidate = _promotion_successor_candidate_fixture()
+    deploy = {
+        "authorized": True,
+        "mode": "host_supervisor",
+        "stable_port": server.AC_STABLE_SERVICE_PORT,
+    }
+    intent = {
+        "schema_version": "ac_stable_promotion_manifest.v1",
+        "project_id": "aming-claw",
+        "backlog_id": server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        "contract_execution_id": server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "stable_branch": server.AC_STABLE_BRANCH,
+        "branch": server.AC_DEV_BRANCH,
+        "candidate_commit": candidate["candidate_commit"],
+        "file_fence": candidate["file_fence"],
+        "diff_sha256": candidate["diff_sha256"],
+        "deploy": deploy,
+        "stable_database_identity": candidate["stable_database_identity"],
+    }
+    intent_hash = server.stable_sha256(intent)
+    event_id = _insert_promotion_successor_qa_event(
+        conn, candidate=candidate, intent_hash=intent_hash
+    )
+    monkeypatch.setattr(
+        task_timeline,
+        "_source_backed_qa_session_authority_valid",
+        lambda _authority, **_kwargs: True,
+    )
+
+    accepted = server._ac_promotion_successor_qa_projection(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        candidate=candidate,
+        promotion_intent_sha256=intent_hash,
+    )
+    assert accepted["accepted"] is True
+    assert accepted["timeline_event_id"] == event_id
+    assert set(accepted["promotion_gate_results"]["lanes"]) == {
+        "direct_main",
+        "mf_parallel",
+        "mf_batch_parallel",
+    }
+
+    row = conn.execute(
+        "SELECT verification_json FROM task_timeline_events WHERE id=?",
+        (event_id,),
+    ).fetchone()
+    verification = json.loads(row["verification_json"])
+    verification["promotion_gate_results"]["lanes"].pop("mf_batch_parallel")
+    conn.execute(
+        "UPDATE task_timeline_events SET verification_json=? WHERE id=?",
+        (json.dumps(verification, sort_keys=True), event_id),
+    )
+    conn.commit()
+    missing_lane = server._ac_promotion_successor_qa_projection(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        candidate=candidate,
+        promotion_intent_sha256=intent_hash,
+    )
+    assert missing_lane["accepted"] is False
+
+    conn.execute(
+        "UPDATE task_timeline_events SET commit_sha=? WHERE id=?",
+        (server._AC_PROMOTION_SUCCESSOR_BASELINE_COMMIT, event_id),
+    )
+    conn.commit()
+    baseline_qa = server._ac_promotion_successor_qa_projection(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        candidate=candidate,
+        promotion_intent_sha256=intent_hash,
+    )
+    assert baseline_qa["accepted"] is False
+
+
+def test_promotion_successor_operator_signoff_is_candidate_manifest_bound_and_replay_safe(
+    conn,
+):
+    server._ensure_release_operator_head_queue_schema(conn)
+    candidate = _promotion_successor_candidate_fixture()
+    qa = {
+        "accepted": True,
+        "timeline_event_id": 41,
+    }
+    deploy = {
+        "authorized": True,
+        "mode": "host_supervisor",
+        "stable_port": server.AC_STABLE_SERVICE_PORT,
+    }
+    intent = {
+        "schema_version": "ac_stable_promotion_manifest.v1",
+        "project_id": "aming-claw",
+        "backlog_id": server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        "contract_execution_id": server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "stable_branch": server.AC_STABLE_BRANCH,
+        "branch": server.AC_DEV_BRANCH,
+        "candidate_commit": candidate["candidate_commit"],
+        "file_fence": candidate["file_fence"],
+        "diff_sha256": candidate["diff_sha256"],
+        "deploy": deploy,
+        "stable_database_identity": candidate["stable_database_identity"],
+    }
+    intent_hash = server.stable_sha256(intent)
+    nonce = "6" * 32
+    created = datetime.now(timezone.utc).replace(microsecond=0)
+    expires = created + timedelta(minutes=30)
+    operator_gate = {
+        "status": "approved",
+        "nonce": nonce,
+        "operator_principal_id": "operator-promotion-successor",
+        "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    signable_manifest = {
+        **intent,
+        "promotion_intent_sha256": intent_hash,
+        "prior_promotion": {
+            "kind": "bootstrap",
+            "stable_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        },
+        "gates": {
+            "qa_verdict": {"timeline_event_id": 41, "status": "passed"},
+            "operator_signoff": operator_gate,
+        },
+    }
+    manifest_hash = server.stable_sha256(signable_manifest)
+    verifier_hash = "sha256:" + "7" * 64
+    reason = {
+        "schema_version": "ac_stable_promotion_operator_signoff.v1",
+        "nonce": nonce,
+        "operator_principal_id": "operator-promotion-successor",
+        "expires_at": operator_gate["expires_at"],
+        "project_id": "aming-claw",
+        "backlog_id": server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        "contract_execution_id": server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "candidate_commit": candidate["candidate_commit"],
+        "promotion_intent_sha256": intent_hash,
+        "promotion_manifest_sha256": manifest_hash,
+        "verifier_sha256": verifier_hash,
+        "diff_sha256": candidate["diff_sha256"],
+        "file_fence": candidate["file_fence"],
+        "deploy": deploy,
+        "stable_database_identity": candidate["stable_database_identity"],
+    }
+    cursor = conn.execute(
+        """INSERT INTO release_operator_head_queue_events(
+               project_id, action, backlog_id, actor, reason, before_json,
+               after_json, created_at
+           ) VALUES (?, 'reorder', '', ?, ?, '{}', '{}', ?)""",
+        (
+            "aming-claw",
+            "operator-promotion-successor",
+            json.dumps(reason, sort_keys=True, separators=(",", ":")),
+            created.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ),
+    )
+    conn.commit()
+
+    accepted = server._ac_promotion_successor_signoff_projection(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        candidate=candidate,
+        qa=qa,
+        intent=intent,
+        promotion_intent_sha256=intent_hash,
+        verifier_sha256=verifier_hash,
+    )
+    assert accepted["accepted"] is True
+    assert accepted["queue_event_id"] == int(cursor.lastrowid)
+    assert accepted["manifest_hash"] == manifest_hash
+
+    conn.execute(
+        "UPDATE release_operator_head_queue_events SET actor=? WHERE id=?",
+        ("observer-derived:route_ref", int(cursor.lastrowid)),
+    )
+    conn.commit()
+    foreign = server._ac_promotion_successor_signoff_projection(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        candidate=candidate,
+        qa=qa,
+        intent=intent,
+        promotion_intent_sha256=intent_hash,
+        verifier_sha256=verifier_hash,
+    )
+    assert foreign["accepted"] is False
+    conn.execute(
+        "UPDATE release_operator_head_queue_events SET actor=? WHERE id=?",
+        ("operator-promotion-successor", int(cursor.lastrowid)),
+    )
+    conn.commit()
+
+    expired_reason = dict(reason)
+    expired_reason["expires_at"] = "2026-08-27T00:00:00Z"
+    conn.execute(
+        "UPDATE release_operator_head_queue_events SET reason=? WHERE id=?",
+        (
+            json.dumps(expired_reason, sort_keys=True, separators=(",", ":")),
+            int(cursor.lastrowid),
+        ),
+    )
+    conn.commit()
+    expired = server._ac_promotion_successor_signoff_projection(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        candidate=candidate,
+        qa=qa,
+        intent=intent,
+        promotion_intent_sha256=intent_hash,
+        verifier_sha256=verifier_hash,
+    )
+    assert expired["accepted"] is False
+    conn.execute(
+        "UPDATE release_operator_head_queue_events SET reason=? WHERE id=?",
+        (
+            json.dumps(reason, sort_keys=True, separators=(",", ":")),
+            int(cursor.lastrowid),
+        ),
+    )
+    conn.commit()
+
+    conn.execute(
+        """INSERT INTO release_operator_head_queue_events(
+               project_id, action, backlog_id, actor, reason, before_json,
+               after_json, created_at
+           ) VALUES (?, 'reorder', '', ?, ?, '{}', '{}', ?)""",
+        (
+            "aming-claw",
+            "operator-promotion-successor",
+            json.dumps(reason, sort_keys=True, separators=(",", ":")),
+            created.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ),
+    )
+    conn.commit()
+    replay = server._ac_promotion_successor_signoff_projection(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        candidate=candidate,
+        qa=qa,
+        intent=intent,
+        promotion_intent_sha256=intent_hash,
+        verifier_sha256=verifier_hash,
+    )
+    assert replay["accepted"] is False
+    assert replay["status"] == "invalid_or_ambiguous"
+
+
+def test_promotion_successor_route_resolver_uses_canonical_stable_storage_only(
+    conn,
+    monkeypatch,
+):
+    observed: dict[str, Any] = {}
+    candidate = _promotion_successor_candidate_fixture()
+    promotion_delta = candidate["promotion_delta"]
+    evidence_refs = sorted(
+        {
+            f"backlog:{server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID}",
+            (
+                "contract_runtime:"
+                f"{server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID}"
+            ),
+            f"candidate_commit:{candidate['candidate_commit']}",
+            f"candidate_tree:{candidate['candidate_tree_sha']}",
+            f"stable_anchor:{server.AC_STABLE_ANCHOR_COMMIT}",
+            f"promotion_diff:{promotion_delta['diff_sha256']}",
+            (
+                "promotion_file_fence:"
+                f"{promotion_delta['file_fence_sha256']}"
+            ),
+            f"candidate_authority:{candidate['authority_hash']}",
+            (
+                "stable_database_identity:"
+                f"{server.stable_sha256(candidate['stable_database_identity'])}"
+            ),
+        }
+    )
+
+    def resolve(_conn, **kwargs):
+        observed.update(kwargs)
+        return {
+            "caller_role": "observer",
+            "allowed_actions": [server._AC_PROMOTION_SUCCESSOR_ROUTE_ACTION],
+            "target_files": candidate["implementation_delta"]["file_fence"],
+            "owned_files": candidate["implementation_delta"]["file_fence"],
+            "evidence_refs": evidence_refs,
+            "route_token_ref": "rtok-stable-promotion",
+            "route_id": "route-stable-promotion",
+            "route_context_hash": "sha256:" + "1" * 64,
+            "prompt_contract_id": "prompt-stable-promotion",
+            "prompt_contract_hash": "sha256:" + "2" * 64,
+            "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+        }
+
+    monkeypatch.setattr(observer_route_context, "resolve_route_token_ref", resolve)
+    authority = server._ac_promotion_successor_route_authority(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        route_token_ref="rtok-stable-promotion",
+        candidate=candidate,
+    )
+    assert authority["accepted"] is True
+    assert authority["source"] == "canonical_stable_route_registry"
+    assert observed["project_id"] == "aming-claw"
+    assert observed["storage_project_id"] == "aming-claw"
+
+    def resolve_without_evidence(_conn, **kwargs):
+        route = resolve(_conn, **kwargs)
+        route.pop("evidence_refs")
+        return route
+
+    monkeypatch.setattr(
+        observer_route_context,
+        "resolve_route_token_ref",
+        resolve_without_evidence,
+    )
+    missing_evidence = server._ac_promotion_successor_route_authority(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        route_token_ref="rtok-stable-promotion",
+        candidate=candidate,
+    )
+    assert missing_evidence == {}
+
+    def resolve_overbroad_actions(_conn, **kwargs):
+        route = resolve(_conn, **kwargs)
+        route["allowed_actions"] = [
+            server._AC_PROMOTION_SUCCESSOR_ROUTE_ACTION,
+            "task_timeline.record_event",
+        ]
+        return route
+
+    monkeypatch.setattr(
+        observer_route_context,
+        "resolve_route_token_ref",
+        resolve_overbroad_actions,
+    )
+    overbroad = server._ac_promotion_successor_route_authority(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        route_token_ref="rtok-stable-promotion",
+        candidate=candidate,
+    )
+    assert overbroad == {}
+
+    def resolve_duplicate_action(_conn, **kwargs):
+        route = resolve(_conn, **kwargs)
+        route["allowed_actions"] = [
+            server._AC_PROMOTION_SUCCESSOR_ROUTE_ACTION,
+            server._AC_PROMOTION_SUCCESSOR_ROUTE_ACTION,
+        ]
+        return route
+
+    monkeypatch.setattr(
+        observer_route_context,
+        "resolve_route_token_ref",
+        resolve_duplicate_action,
+    )
+    duplicate_action = server._ac_promotion_successor_route_authority(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        route_token_ref="rtok-stable-promotion",
+        candidate=candidate,
+    )
+    assert duplicate_action == {}
+
+    for identity_field in (
+        "route_id",
+        "route_context_hash",
+        "prompt_contract_id",
+        "prompt_contract_hash",
+        "visible_injection_manifest_hash",
+        "route_token_ref",
+    ):
+        def resolve_missing_identity(_conn, *, _field=identity_field, **kwargs):
+            route = resolve(_conn, **kwargs)
+            route[_field] = ""
+            return route
+
+        monkeypatch.setattr(
+            observer_route_context,
+            "resolve_route_token_ref",
+            resolve_missing_identity,
+        )
+        missing_identity = server._ac_promotion_successor_route_authority(
+            conn,
+            project_id="aming-claw",
+            backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+            contract_execution_id=(
+                server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID
+            ),
+            route_token_ref="rtok-stable-promotion",
+            candidate=candidate,
+        )
+        assert missing_identity == {}, identity_field
+
+    monkeypatch.setattr(observer_route_context, "resolve_route_token_ref", resolve)
+
+    stale_candidate = copy.deepcopy(candidate)
+    stale_candidate["candidate_commit"] = "0" * 40
+    rejected = server._ac_promotion_successor_route_authority(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_SUCCESSOR_BACKLOG_ID,
+        contract_execution_id=server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID,
+        route_token_ref="rtok-stable-promotion",
+        candidate=stale_candidate,
+    )
+    assert rejected == {}
