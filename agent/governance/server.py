@@ -26,7 +26,7 @@ from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from threading import BoundedSemaphore, Event, RLock, local
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, NoReturn, Sequence
+from typing import Any, Iterable, Iterator, Mapping, NamedTuple, NoReturn, Sequence
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -104490,270 +104490,263 @@ def _caller_timeline_key_is_credential(key: Any) -> bool:
     return compact in _CALLER_TIMELINE_CREDENTIAL_KEY_COMPACT_DENYLIST
 
 
-# Every module-level string collection whose name ends in one of the canonical
-# schema suffixes has one explicit disposition.  Authority leaves feed the
-# nontransferable classifier.  Recursive containers are inventory only: their
-# names do not become authority merely because they hold mappings.  Audited
-# non-authority collections are response/projection schemas and never feed the
-# classifier.  The audit below fails closed in tests when a new collection is
-# added without making this choice.
-_CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION = {
-    "authority_leaf": frozenset(
-        {
-            "_CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS",
-            "_CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS",
-            "_CONTRACT_RUNTIME_EXECUTION_ID_FIELDS",
-            "_CONTRACT_RUNTIME_LINE_WRITE_PROTOCOL_FIELDS",
-            "_CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS",
-            "_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS",
-            "_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS",
-            "_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS",
-            "_DESKTOP_EXECUTION_TICKET_RESOLVE_FIELDS",
-            "_FINISH_GATE_PARENT_LINEAGE_REQUIRED_FIELDS",
-            "_GUIDE_RAW_AUTH_BODY_FIELDS",
-            "_INTEGRATION_EPOCH_RELEASE_RAW_CREDENTIAL_FIELDS",
-            "_INTEGRATION_EPOCH_RELEASE_ROUTE_PROOF_FIELDS",
-            "_MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS",
-            "_MF_PARALLEL_LANE_INTENT_FIELDS",
-            "_MF_SUB_HOST_BRIDGE_REQUIRED_FIELDS",
-            "_OBSERVER_HOTFIX_ATTEMPT_ALLOWED_FIELDS",
-            "_ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS",
-            "_PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS",
-            "_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS",
-            "_PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_KEYS",
-            "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS",
-            "_QA_REVIEW_AUTHORITY_NAMES",
-            "_ROUTE_ACTION_SCOPE_LINEAGE_KEYS",
-            "_ROUTE_GATE_PAYLOAD_KEYS",
-            "_ROUTE_REGISTRY_IDENTITY_FIELDS",
-            "_RUNTIME_CONTEXT_GRAPH_TRACE_ID_KEYS",
-            "_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS",
-            "_RUNTIME_CONTEXT_LEGACY_REJOIN_BASELINE_KEYS",
-            "_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS",
-            "_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS",
-            "_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS",
-            "_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS",
-            "_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS",
-            "_RUNTIME_CONTEXT_SERVER_IDENTITY_FIELDS",
-            "_TIMELINE_BOUNDED_DISPATCH_RUNTIME_LINEAGE_FIELDS",
-            "_TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS",
-            "_TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS",
-        }
+class _ContractRuntimeCanonicalSourceRecord(NamedTuple):
+    record_schema_id: str
+    source_name: str
+    disposition: str
+    container_type: str
+    entry_schema_id: str
+    projection_policy: str
+    field_partitions: tuple[tuple[str, str], ...]
+
+
+_CONTRACT_RUNTIME_CANONICAL_DISPOSITIONS = frozenset(
+    {"authority_leaf", "recursive_container", "audited_non_authority"}
+)
+_CONTRACT_RUNTIME_CANONICAL_CONTAINER_TYPES = frozenset(
+    {"frozenset", "list", "set", "tuple"}
+)
+_CONTRACT_RUNTIME_CANONICAL_ENTRY_SCHEMAS = frozenset(
+    {"scalar_string.v1", "nonempty_string_pair_set.v1"}
+)
+_CONTRACT_RUNTIME_CANONICAL_PROJECTION_POLICIES = frozenset(
+    {
+        "all_audited_non_authority.v1",
+        "all_recursive_container.v1",
+        "explicit_partition.v1",
+        "typed_authority_classifier.v1",
+    }
+)
+_CONTRACT_RUNTIME_CANONICAL_FIELD_DISPOSITIONS = frozenset(
+    {"authority_leaf", "recursive_container", "audited_non_authority"}
+)
+
+
+# Single closed authority source registry.  Every record binds its source name,
+# exact runtime container, entry schema, source disposition, and projection
+# policy in one immutable object.  No parallel disposition/shape/partition map
+# participates in discovery or classification.
+_CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS = (
+    *(
+        _ContractRuntimeCanonicalSourceRecord(
+            "canonical_source_record.v1",
+            source_name,
+            "authority_leaf",
+            container_type,
+            "scalar_string.v1",
+            "typed_authority_classifier.v1",
+            (),
+        )
+        for source_name, container_type in (
+            ("_CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS", "tuple"),
+            ("_CONTRACT_RUNTIME_EXECUTION_ID_FIELDS", "tuple"),
+            ("_CONTRACT_RUNTIME_LINE_WRITE_PROTOCOL_FIELDS", "tuple"),
+            ("_CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS", "tuple"),
+            ("_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS", "set"),
+            ("_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS", "set"),
+            ("_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS", "set"),
+            ("_DESKTOP_EXECUTION_TICKET_RESOLVE_FIELDS", "frozenset"),
+            ("_FINISH_GATE_PARENT_LINEAGE_REQUIRED_FIELDS", "tuple"),
+            ("_GUIDE_RAW_AUTH_BODY_FIELDS", "set"),
+            ("_INTEGRATION_EPOCH_RELEASE_RAW_CREDENTIAL_FIELDS", "tuple"),
+            ("_INTEGRATION_EPOCH_RELEASE_ROUTE_PROOF_FIELDS", "tuple"),
+            ("_MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS", "tuple"),
+            ("_MF_PARALLEL_LANE_INTENT_FIELDS", "frozenset"),
+            ("_MF_SUB_HOST_BRIDGE_REQUIRED_FIELDS", "tuple"),
+            ("_OBSERVER_HOTFIX_ATTEMPT_ALLOWED_FIELDS", "frozenset"),
+            ("_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS", "tuple"),
+            ("_PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_KEYS", "set"),
+            ("_QA_REVIEW_AUTHORITY_NAMES", "set"),
+            ("_ROUTE_ACTION_SCOPE_LINEAGE_KEYS", "tuple"),
+            ("_ROUTE_GATE_PAYLOAD_KEYS", "tuple"),
+            ("_ROUTE_REGISTRY_IDENTITY_FIELDS", "tuple"),
+            ("_RUNTIME_CONTEXT_GRAPH_TRACE_ID_KEYS", "set"),
+            ("_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS", "tuple"),
+            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_BASELINE_KEYS", "frozenset"),
+            ("_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS", "tuple"),
+            ("_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS", "tuple"),
+            ("_RUNTIME_CONTEXT_SERVER_IDENTITY_FIELDS", "tuple"),
+            ("_TIMELINE_BOUNDED_DISPATCH_RUNTIME_LINEAGE_FIELDS", "tuple"),
+            ("_TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS", "tuple"),
+            ("_TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS", "frozenset"),
+        )
     ),
-    "recursive_container": frozenset(
-        {
-            "_CONTRACT_RUNTIME_CONTAINER_KEYS",
-            "_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS",
-            "_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_CONTAINERS",
-            "_QA_REVIEW_AUTHORITY_CONTAINERS",
-            "_SERVER_PROJECTED_TIMELINE_KEYS",
-        }
-    ),
-    "audited_non_authority": frozenset(
-        {
-            "_BACKLOG_TRIAGE_SUCCESSOR_JSON_FIELDS",
-            "_BACKLOG_TRIAGE_SUCCESSOR_SCALAR_FIELDS",
-            "_CONTRACT_CHAIN_RUNTIME_FRESHNESS_COMPARE_KEYS",
-            "_CONTRACT_CHAIN_RUNTIME_FRESHNESS_CONTEXT_KEYS",
-            "_CONTRACT_RUNTIME_QA_FAILURE_COUNT_FIELDS",
-            "_CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS",
-            "_CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS",
-            "_CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS",
-            "_LEGACY_PRIMARY_ROUTE_CLAIM_KEYS",
-            "_QA_EXTERNAL_NO_PASS_BASE_REPRODUCTION_REQUIRED_KEYS",
-            "_QA_EXTERNAL_NO_PASS_CANDIDATE_COUNTS_REQUIRED_KEYS",
-            "_RESUMED_SUCCESSOR_STATUS_FIELDS",
-            "_RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_COUNT_FIELDS",
-            "_RUNTIME_CONTEXT_LEGACY_REJOIN_PAYLOAD_KEYS",
-            "_RUNTIME_CONTEXT_LEGACY_REJOIN_PRE_LINEAGE_PAYLOAD_KEYS",
-            "_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_ACTIONABLE_KEYS",
-            "_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_CONTRACT_STATE_KEYS",
-            "_SEMANTIC_REVISION_FORBIDDEN_KEYS",
-            "_TIMELINE_TOP_LEVEL_ROLE_FIELDS",
-        }
-    ),
-    # Structured sources enumerate live identities rather than scalar schema
-    # fields.  Keeping their names in the disposition registry makes source
-    # recognition independent of both current contents and shape metadata.
-    "structured_non_authority": frozenset(
-        {
-            "_CURRENT_FULL_BUILD_KEYS",
-        }
-    ),
-}
-# Some canonical collections combine execution-binding leaves with diagnostic,
-# semantic, or recursive evidence fields.  These sources must enumerate every
-# field explicitly: a future field is neither silently trusted nor blanket
-# denied until its disposition is reviewed.  The audited-safe policy is
-# source-qualified because a label such as ``evidence_kind`` is ordinary prose
-# in a copied acceptance criterion but remains writer authority in the
-# implementation-writer binding schema.
-_CONTRACT_RUNTIME_SERVER_CANONICAL_AUDITED_SAFE_FIELD_SEMANTICS = {
-    "_CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS": frozenset(
-        {"actor_role", "backlog_id", "evidence_kind", "project_id"}
-    ),
-    "_ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS": frozenset(
-        {"harness_type", "owned_files", "project_id", "role", "worker_role"}
-    ),
-    "_PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS": frozenset(
-        {
-            "acceptance_criteria",
-            "backlog_id",
-            "owned_files",
-            "project_id",
-            "target_files",
-        }
-    ),
-    "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS": frozenset(
-        {
-            "base_failure_identities",
-            "candidate_failure_identities",
-            "candidate_new_failures",
-            "candidate_specific_issues",
-            "no_pass_claim",
-            "overall_release_pass_claimed",
-            "refs",
-            "schema_version",
-        }
-    ),
-    "_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS": frozenset(
-        {
-            "invalid_reason",
-            "lease_expires_at",
-            "renewal_default_ttl_seconds",
-            "renewal_endpoint",
-            "renewal_max_ttl_seconds",
-            "renewal_supported",
-            "schema_version",
-            "status",
-        }
-    ),
-    "_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS": frozenset(
-        {
-            "applicable",
-            "caller_claims_trusted",
-            "eligible",
-            "errors",
-            "identity_mismatches",
-            "mode",
-            "schema_version",
-            "server_derived",
-        }
-    ),
-    "_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS": frozenset(
-        {
-            "applicable",
-            "caller_claims_trusted",
-            "eligible",
-            "errors",
-            "identity_mismatches",
-            "mode",
-            "schema_version",
-            "server_derived",
-        }
-    ),
-}
-_CONTRACT_RUNTIME_SERVER_CANONICAL_MIXED_SOURCE_PARTITIONS = {
-    "_CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS": {
-        "authority_leaf": frozenset(
-            {
-                "contract_execution_id",
-                "definition_hash",
-                "execution_state_revision",
-                "instruction_bundle_hash",
-                "line_id",
-                "line_instance_id",
-                "runtime_guide_hash",
-                "stage_id",
-            }
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1",
+        "_CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS",
+        "authority_leaf",
+        "set",
+        "scalar_string.v1",
+        "explicit_partition.v1",
+        (
+            ("actor_role", "audited_non_authority"),
+            ("backlog_id", "audited_non_authority"),
+            ("contract_execution_id", "authority_leaf"),
+            ("definition_hash", "authority_leaf"),
+            ("evidence_kind", "audited_non_authority"),
+            ("execution_state_revision", "authority_leaf"),
+            ("instruction_bundle_hash", "authority_leaf"),
+            ("line_id", "authority_leaf"),
+            ("line_instance_id", "authority_leaf"),
+            ("project_id", "audited_non_authority"),
+            ("runtime_guide_hash", "authority_leaf"),
+            ("stage_id", "authority_leaf"),
         ),
-    },
-    "_ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS": {
-        "authority_leaf": frozenset(
-            {
-                "actual_cwd", "actual_git_root", "actual_host_worker_id",
-                "agent_id", "base_commit", "branch", "branch_head",
-                "branch_ref", "contract_execution_id", "fence_token",
-                "filer_principal", "head_commit", "host_session_id",
-                "host_startup_id", "launch_text_hash", "merge_queue_id",
-                "now_iso", "observer_command_id", "parent_task_id",
-                "prompt_contract_hash", "prompt_contract_id",
-                "read_receipt_event_id", "read_receipt_hash",
-                "route_context_hash", "route_id", "route_token_ref",
-                "runtime_context_id", "session_token", "session_token_ref",
-                "session_token_surrogate", "startup_source",
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1",
+        "_ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS",
+        "authority_leaf",
+        "frozenset",
+        "scalar_string.v1",
+        "explicit_partition.v1",
+        tuple(
+            (field_name, "audited_non_authority")
+            for field_name in ("harness_type", "owned_files", "project_id", "role", "worker_role")
+        )
+        + tuple(
+            (field_name, "authority_leaf")
+            for field_name in (
+                "actual_cwd", "actual_git_root", "actual_host_worker_id", "agent_id",
+                "base_commit", "branch", "branch_head", "branch_ref",
+                "contract_execution_id", "fence_token", "filer_principal", "head_commit",
+                "host_session_id", "host_startup_id", "launch_text_hash", "merge_queue_id",
+                "now_iso", "observer_command_id", "parent_task_id", "prompt_contract_hash",
+                "prompt_contract_id", "read_receipt_event_id", "read_receipt_hash",
+                "route_context_hash", "route_id", "route_token_ref", "runtime_context_id",
+                "session_token", "session_token_ref", "session_token_surrogate", "startup_source",
                 "target_head_commit", "target_project_root", "task_id",
-                "visible_injection_manifest_hash", "worker_id",
-                "worker_session_id", "worker_slot_id",
-                "worker_transcript_path", "worker_transcript_ref",
-            }
+                "visible_injection_manifest_hash", "worker_id", "worker_session_id",
+                "worker_slot_id", "worker_transcript_path", "worker_transcript_ref",
+            )
         ),
-    },
-    "_PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS": {
-        "authority_leaf": frozenset(
-            {
-                "allocation_precheck", "base_commit", "branch_ref",
-                "contract_execution_id", "merge_queue_id", "route_identity",
-                "target_head_commit", "target_project_root", "task_id",
-                "worker_id", "worker_slot_id", "workspace_root",
-                "worktree_path", "worktree_root",
-            }
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1",
+        "_PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS",
+        "authority_leaf",
+        "tuple",
+        "scalar_string.v1",
+        "explicit_partition.v1",
+        tuple(
+            (field_name, "audited_non_authority")
+            for field_name in ("acceptance_criteria", "backlog_id", "owned_files", "project_id", "target_files")
+        )
+        + tuple(
+            (field_name, "authority_leaf")
+            for field_name in (
+                "allocation_precheck", "base_commit", "branch_ref", "contract_execution_id",
+                "merge_queue_id", "route_identity", "target_head_commit", "target_project_root",
+                "task_id", "worker_id", "worker_slot_id", "workspace_root", "worktree_path",
+                "worktree_root",
+            )
         ),
-    },
-    "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS": {
-        "authority_leaf": frozenset(
-            {
-                "base_commit_sha",
-                "candidate_commit_sha",
-            }
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1",
+        "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS",
+        "authority_leaf",
+        "set",
+        "scalar_string.v1",
+        "explicit_partition.v1",
+        (
+            ("base_commit_sha", "authority_leaf"),
+            ("base_failure_identities", "audited_non_authority"),
+            ("base_reproduction", "recursive_container"),
+            ("candidate_commit_sha", "authority_leaf"),
+            ("candidate_failure_identities", "audited_non_authority"),
+            ("candidate_new_failures", "audited_non_authority"),
+            ("candidate_specific_issues", "audited_non_authority"),
+            ("candidate_suite_counts", "recursive_container"),
+            ("no_pass_claim", "audited_non_authority"),
+            ("overall_release_pass_claimed", "audited_non_authority"),
+            ("refs", "audited_non_authority"),
+            ("schema_version", "audited_non_authority"),
         ),
-        "recursive_container": frozenset(
-            {
-                "base_reproduction",
-                "candidate_suite_counts",
-            }
-        ),
-    },
-    "_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS": {
-        "authority_leaf": frozenset(
-            {
-                "authorization_valid", "canonical_no_lease", "clock_valid",
-                "expired", "expiry_valid", "has_lease", "lease_id",
-                "lease_record_valid", "lease_remaining_ttl_seconds", "now",
-                "raw_session_token_exposed", "raw_session_token_persisted",
-                "session_token_ref", "session_token_ref_available",
-            }
-        ),
-    },
-    "_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS": {
-        "authority_leaf": frozenset(
-            {"last_recovery_action", "replacement_generation"}
-        ),
-    },
-    "_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS": {
-        "authority_leaf": frozenset(
-            {
+    ),
+    *(
+        _ContractRuntimeCanonicalSourceRecord(
+            "canonical_source_record.v1", source_name, "authority_leaf", "frozenset",
+            "scalar_string.v1", "explicit_partition.v1", field_partitions,
+        )
+        for source_name, field_partitions in (
+            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS", tuple(
+                (field_name, "audited_non_authority") for field_name in (
+                    "invalid_reason", "lease_expires_at", "renewal_default_ttl_seconds",
+                    "renewal_endpoint", "renewal_max_ttl_seconds", "renewal_supported",
+                    "schema_version", "status",
+                )
+            ) + tuple((field_name, "authority_leaf") for field_name in (
+                "authorization_valid", "canonical_no_lease", "clock_valid", "expired",
+                "expiry_valid", "has_lease", "lease_id", "lease_record_valid",
+                "lease_remaining_ttl_seconds", "now", "raw_session_token_exposed",
+                "raw_session_token_persisted", "session_token_ref",
+                "session_token_ref_available",
+            ))),
+            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS", tuple(
+                (field_name, "audited_non_authority") for field_name in (
+                    "applicable", "caller_claims_trusted", "eligible", "errors",
+                    "identity_mismatches", "mode", "schema_version", "server_derived",
+                )
+            ) + (("last_recovery_action", "authority_leaf"), ("replacement_generation", "authority_leaf"))),
+            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS", tuple(
+                (field_name, "audited_non_authority") for field_name in (
+                    "applicable", "caller_claims_trusted", "eligible", "errors",
+                    "identity_mismatches", "mode", "schema_version", "server_derived",
+                )
+            ) + tuple((field_name, "authority_leaf") for field_name in (
                 "actual_worker_write_baseline", "current_session_token_ref",
                 "expected_worker_write_baseline", "last_recovery_action",
                 "replacement_generation", "source_event_ref",
-            }
-        ),
-    },
-}
-# Canonical-looking module collections normally enumerate scalar field names.
-# A small number instead carry live structured identities.  Register their
-# exact shape here so an empty container and a populated container receive the
-# same audited disposition.  The shape registry is deliberately source-bound:
-# an unregistered string collection is still discovered by the generic audit,
-# while an unregistered or malformed structured collection cannot inherit this
-# exception.
-_CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES = {
-    "_CURRENT_FULL_BUILD_KEYS": {
-        "schema_id": "canonical_structured_source.string_pair_set.v1",
-        "container_kind": "set",
-        "entry_kind": "nonempty_string_pair",
-    },
-}
+            ))),
+        )
+    ),
+    *(
+        _ContractRuntimeCanonicalSourceRecord(
+            "canonical_source_record.v1", source_name, "recursive_container", container_type,
+            "scalar_string.v1", "all_recursive_container.v1", (),
+        )
+        for source_name, container_type in (
+            ("_CONTRACT_RUNTIME_CONTAINER_KEYS", "tuple"),
+            ("_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS", "set"),
+            ("_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_CONTAINERS", "tuple"),
+            ("_QA_REVIEW_AUTHORITY_CONTAINERS", "set"),
+            ("_SERVER_PROJECTED_TIMELINE_KEYS", "frozenset"),
+        )
+    ),
+    *(
+        _ContractRuntimeCanonicalSourceRecord(
+            "canonical_source_record.v1", source_name, "audited_non_authority", container_type,
+            "scalar_string.v1", "all_audited_non_authority.v1", (),
+        )
+        for source_name, container_type in (
+            ("_BACKLOG_TRIAGE_SUCCESSOR_JSON_FIELDS", "tuple"),
+            ("_BACKLOG_TRIAGE_SUCCESSOR_SCALAR_FIELDS", "tuple"),
+            ("_CONTRACT_CHAIN_RUNTIME_FRESHNESS_COMPARE_KEYS", "tuple"),
+            ("_CONTRACT_CHAIN_RUNTIME_FRESHNESS_CONTEXT_KEYS", "tuple"),
+            ("_CONTRACT_RUNTIME_QA_FAILURE_COUNT_FIELDS", "frozenset"),
+            ("_CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS", "frozenset"),
+            ("_CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS", "frozenset"),
+            ("_CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS", "tuple"),
+            ("_LEGACY_PRIMARY_ROUTE_CLAIM_KEYS", "tuple"),
+            ("_QA_EXTERNAL_NO_PASS_BASE_REPRODUCTION_REQUIRED_KEYS", "set"),
+            ("_QA_EXTERNAL_NO_PASS_CANDIDATE_COUNTS_REQUIRED_KEYS", "set"),
+            ("_RESUMED_SUCCESSOR_STATUS_FIELDS", "frozenset"),
+            ("_RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_COUNT_FIELDS", "tuple"),
+            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_PAYLOAD_KEYS", "frozenset"),
+            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_PRE_LINEAGE_PAYLOAD_KEYS", "frozenset"),
+            ("_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_ACTIONABLE_KEYS", "tuple"),
+            ("_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_CONTRACT_STATE_KEYS", "tuple"),
+            ("_SEMANTIC_REVISION_FORBIDDEN_KEYS", "set"),
+            ("_TIMELINE_TOP_LEVEL_ROLE_FIELDS", "frozenset"),
+        )
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", "_CURRENT_FULL_BUILD_KEYS",
+        "audited_non_authority", "set", "nonempty_string_pair_set.v1",
+        "all_audited_non_authority.v1", (),
+    ),
+)
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES: tuple[str, ...] = ()
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES: tuple[
     str, ...
@@ -104764,89 +104757,161 @@ _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset(
 )
 
 
-def _contract_runtime_server_canonical_structured_source_shape_valid(
+def _contract_runtime_is_server_canonical_collection_source_name(
     source_name: Any,
+) -> bool:
+    name = source_name if type(source_name) is str else ""
+    return bool(
+        name.startswith("_")
+        and name.endswith(("_FIELDS", "_NAMES", "_KEYS", "_CONTAINERS"))
+        and not name.startswith("_CONTRACT_RUNTIME_SERVER_CANONICAL_")
+        and name
+        not in {
+            "_CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS",
+            "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
+            "_CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS",
+        }
+    )
+
+
+def _contract_runtime_canonical_source_record_registry_meta_audit(
+) -> dict[str, Any]:
+    """Validate the one closed registry before inspecting live source values."""
+
+    raw_registry = _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS
+    errors: list[str] = []
+    normalized: list[dict[str, Any]] = []
+    records: list[_ContractRuntimeCanonicalSourceRecord] = []
+    if type(raw_registry) is not tuple:
+        errors.append("registry.container_type")
+    else:
+        for index, raw_record in enumerate(raw_registry):
+            path = f"registry.records[{index}]"
+            if type(raw_record) is not _ContractRuntimeCanonicalSourceRecord:
+                errors.append(f"{path}.record_type")
+                continue
+            values = tuple(raw_record)
+            if not all(type(value) is str for value in values[:6]):
+                errors.append(f"{path}.scalar_types")
+                continue
+            partitions = raw_record.field_partitions
+            if type(partitions) is not tuple or any(
+                type(pair) is not tuple
+                or len(pair) != 2
+                or any(type(value) is not str for value in pair)
+                for pair in partitions
+            ):
+                errors.append(f"{path}.field_partitions")
+                continue
+            if raw_record.record_schema_id != "canonical_source_record.v1":
+                errors.append(f"{path}.record_schema_id")
+            if not _contract_runtime_is_server_canonical_collection_source_name(
+                raw_record.source_name
+            ):
+                errors.append(f"{path}.source_name")
+            if raw_record.disposition not in _CONTRACT_RUNTIME_CANONICAL_DISPOSITIONS:
+                errors.append(f"{path}.disposition")
+            if raw_record.container_type not in _CONTRACT_RUNTIME_CANONICAL_CONTAINER_TYPES:
+                errors.append(f"{path}.container_type")
+            if raw_record.entry_schema_id not in _CONTRACT_RUNTIME_CANONICAL_ENTRY_SCHEMAS:
+                errors.append(f"{path}.entry_schema_id")
+            if raw_record.projection_policy not in _CONTRACT_RUNTIME_CANONICAL_PROJECTION_POLICIES:
+                errors.append(f"{path}.projection_policy")
+            partition_names = [name for name, _ in partitions]
+            if len(partition_names) != len(set(partition_names)):
+                errors.append(f"{path}.duplicate_partition_field")
+            if any(
+                disposition not in _CONTRACT_RUNTIME_CANONICAL_FIELD_DISPOSITIONS
+                for _, disposition in partitions
+            ):
+                errors.append(f"{path}.partition_disposition")
+            policy_contract = {
+                "all_audited_non_authority.v1": ("audited_non_authority", False),
+                "all_recursive_container.v1": ("recursive_container", False),
+                "explicit_partition.v1": ("authority_leaf", True),
+                "typed_authority_classifier.v1": ("authority_leaf", False),
+            }.get(raw_record.projection_policy)
+            if policy_contract is None or raw_record.disposition != policy_contract[0]:
+                errors.append(f"{path}.policy_disposition")
+            elif bool(partitions) is not policy_contract[1]:
+                errors.append(f"{path}.policy_partition_shape")
+            if (
+                raw_record.entry_schema_id == "nonempty_string_pair_set.v1"
+                and raw_record.container_type != "set"
+            ):
+                errors.append(f"{path}.schema_container_type")
+            normalized.append(
+                {
+                    "record_schema_id": raw_record.record_schema_id,
+                    "source_name": raw_record.source_name,
+                    "disposition": raw_record.disposition,
+                    "container_type": raw_record.container_type,
+                    "entry_schema_id": raw_record.entry_schema_id,
+                    "projection_policy": raw_record.projection_policy,
+                    "field_partitions": [list(pair) for pair in partitions],
+                }
+            )
+            records.append(raw_record)
+    source_names = [record.source_name for record in records]
+    duplicate_names = sorted(
+        name for name in set(source_names) if source_names.count(name) != 1
+    )
+    errors.extend(f"registry.duplicate_source.{name}" for name in duplicate_names)
+    normalized = sorted(normalized, key=lambda item: item["source_name"])
+    return {
+        "complete": not errors,
+        "diagnostic_paths": sorted(set(errors)),
+        "records": tuple(records) if not errors else (),
+        "normalized_records": normalized,
+        "registry_schema_hash": stable_sha256(normalized),
+    }
+
+
+def _contract_runtime_canonical_raw_source_signature(raw_fields: Any) -> dict[str, Any]:
+    entry_shapes: list[Any] = []
+    if type(raw_fields) in (frozenset, list, set, tuple):
+        for entry in raw_fields:
+            if type(entry) is tuple:
+                entry_shapes.append(
+                    ["tuple", len(entry), [type(value).__name__ for value in entry]]
+                )
+            else:
+                entry_shapes.append(type(entry).__name__)
+    return {
+        "raw_type": type(raw_fields).__name__,
+        "item_count": len(raw_fields) if type(raw_fields) in (frozenset, list, set, tuple) else None,
+        "entry_shape_digest": stable_sha256(sorted(entry_shapes, key=repr)),
+    }
+
+
+def _contract_runtime_canonical_entry_shape_valid(
+    record: _ContractRuntimeCanonicalSourceRecord,
     raw_fields: Any,
 ) -> bool:
-    """Validate one explicitly registered non-scalar collection source."""
-
-    shape = _CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES.get(
-        str(source_name or "")
+    expected_type = {"frozenset": frozenset, "list": list, "set": set, "tuple": tuple}.get(
+        record.container_type
     )
-    if shape != {
-        "schema_id": "canonical_structured_source.string_pair_set.v1",
-        "container_kind": "set",
-        "entry_kind": "nonempty_string_pair",
-    }:
+    if expected_type is None or type(raw_fields) is not expected_type:
         return False
-    return bool(
-        type(raw_fields) is set
-        and all(
+    if record.entry_schema_id == "scalar_string.v1":
+        return all(type(field) is str for field in raw_fields)
+    if record.entry_schema_id == "nonempty_string_pair_set.v1":
+        return all(
             type(entry) is tuple
             and len(entry) == 2
-            and all(
-                type(value) is str and bool(value.strip())
-                for value in entry
-            )
+            and all(type(value) is str and bool(value.strip()) for value in entry)
             for entry in raw_fields
         )
-    )
-
-
-def _contract_runtime_is_server_canonical_collection_source(
-    source_name: Any,
-    raw_fields: Any,
-) -> bool:
-    name = str(source_name or "")
-    if not name.startswith("_") or not name.endswith(
-        ("_FIELDS", "_NAMES", "_KEYS", "_CONTAINERS")
-    ):
-        return False
-    if name.startswith("_CONTRACT_RUNTIME_SERVER_CANONICAL_") or name in {
-        "_CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS",
-        "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
-        "_CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS",
-    }:
-        return False
-    structured_source_names = set(
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION.get(
-            "structured_non_authority",
-            (),
-        )
-    )
-    return bool(
-        name in structured_source_names
-        or isinstance(raw_fields, (frozenset, list, set, tuple))
-    )
+    return False
 
 
 def _contract_runtime_server_canonical_collection_sources(
 ) -> dict[str, frozenset[str]]:
-    return dict(
-        sorted(
-            (
-                source_name,
-                (
-                    frozenset()
-                    if source_name
-                    in _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION.get(
-                        "structured_non_authority",
-                        (),
-                    )
-                    or not all(
-                        isinstance(field_name, str)
-                        for field_name in raw_fields
-                    )
-                    else frozenset(raw_fields)
-                ),
-            )
-            for source_name, raw_fields in globals().items()
-            if _contract_runtime_is_server_canonical_collection_source(
-                source_name,
-                raw_fields,
-            )
-        )
-    )
+    audit = _contract_runtime_require_canonical_authority_registry_complete()
+    return {
+        source_name: frozenset(fields)
+        for source_name, fields in audit["scalar_source_fields"].items()
+    }
 
 
 def _contract_runtime_server_canonical_field_dispositions(
@@ -104855,177 +104920,79 @@ def _contract_runtime_server_canonical_field_dispositions(
 ) -> tuple[str, ...]:
     source = str(source_name or "")
     field = str(field_name or "")
-    audited_safe_fields = (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_AUDITED_SAFE_FIELD_SEMANTICS.get(
-            source
-        )
-    )
-    mixed_partitions = (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_MIXED_SOURCE_PARTITIONS.get(source)
-    )
-    if isinstance(audited_safe_fields, (frozenset, set)) or isinstance(
-        mixed_partitions, Mapping
-    ):
-        field_dispositions: list[str] = []
-        if field in (audited_safe_fields or ()):
-            field_dispositions.append("audited_non_authority")
-        field_dispositions.extend(
-            disposition
-            for disposition, partition_fields in (
-                mixed_partitions or {}
-            ).items()
-            if field in partition_fields
-        )
-        return tuple(field_dispositions)
-    if source in (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
-            "authority_leaf"
-        ]
-    ):
-        return (
-            ("authority_leaf",)
-            if parallel_branch_authority_field_is_nontransferable(field)
-            else ("audited_non_authority",)
-        )
-    if source in (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
-            "recursive_container"
-        ]
-    ):
+    meta = _contract_runtime_canonical_source_record_registry_meta_audit()
+    if not meta["complete"]:
+        return ()
+    record = next((item for item in meta["records"] if item.source_name == source), None)
+    if record is None:
+        return ()
+    if record.projection_policy == "explicit_partition.v1":
+        return tuple(disposition for name, disposition in record.field_partitions if name == field)
+    if record.projection_policy == "typed_authority_classifier.v1":
+        return (("authority_leaf",) if parallel_branch_authority_field_is_nontransferable(field) else ("audited_non_authority",))
+    if record.projection_policy == "all_recursive_container.v1":
         return ("recursive_container",)
-    if source in (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
-            "audited_non_authority"
-        ]
-    ):
+    if record.projection_policy == "all_audited_non_authority.v1":
         return ("audited_non_authority",)
-    if source in (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
-            "structured_non_authority"
-        ]
-    ):
-        return ("structured_non_authority",)
     return ()
 
 
 def _contract_runtime_server_canonical_source_registry_audit(
 ) -> dict[str, Any]:
-    collection_sources = (
-        _contract_runtime_server_canonical_collection_sources()
-    )
-    inventory = set(collection_sources)
-    dispositions = {
-        disposition: set(source_names)
-        for disposition, source_names in (
-            _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION.items()
-        )
+    meta = _contract_runtime_canonical_source_record_registry_meta_audit()
+    if not meta["complete"]:
+        return {
+            "complete": False,
+            "diagnostic_paths": meta["diagnostic_paths"],
+            "registry_schema_hash": meta["registry_schema_hash"],
+            "semantic_registry_hash": stable_sha256({"registry": meta["normalized_records"], "complete": False}),
+        }
+    records = {record.source_name: record for record in meta["records"]}
+    live_candidates = {
+        name
+        for name, value in globals().items()
+        if _contract_runtime_is_server_canonical_collection_source_name(name)
+        and type(value) in (frozenset, list, set, tuple)
     }
-    registered = set().union(*dispositions.values())
-    memberships: dict[str, list[str]] = {}
-    for disposition, source_names in dispositions.items():
-        for source_name in source_names:
-            memberships.setdefault(source_name, []).append(disposition)
-    structured_source_names = set(
-        dispositions.get("structured_non_authority", set())
-    )
-    structured_registry_raw = (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES
-    )
-    structured_registry_valid = bool(
-        type(structured_registry_raw) is dict
-        and all(
-            type(source_name) is str and type(shape) is dict
-            for source_name, shape in structured_registry_raw.items()
-        )
-    )
-    structured_registry = (
-        structured_registry_raw
-        if structured_registry_valid
-        else {}
-    )
-    structured_registry_source_names = set(structured_registry)
-    live_structured_source_names = {
-        source_name
-        for source_name in structured_source_names
-        if source_name in globals()
-    }
-    missing_structured_schema_sources = sorted(
-        structured_source_names - structured_registry_source_names
-    )
-    unused_structured_schema_sources = sorted(
-        structured_registry_source_names - structured_source_names
-    )
-    missing_live_structured_sources = sorted(
-        structured_source_names - live_structured_source_names
-    )
-    structured_schema_ids = {
-        source_name: str(
-            structured_registry[source_name].get("schema_id") or ""
-        )
-        for source_name in sorted(structured_registry_source_names)
-    }
-    structured_schema_hashes = {
-        source_name: stable_sha256(structured_registry[source_name])
-        for source_name in sorted(structured_registry_source_names)
-    }
-    structured_shape_validity = {
-        source_name: bool(
-            source_name in live_structured_source_names
-            and source_name in structured_registry_source_names
-            and _contract_runtime_server_canonical_structured_source_shape_valid(
-                source_name,
-                globals().get(source_name),
-            )
-        )
-        for source_name in sorted(structured_source_names)
-    }
-    invalid_structured_shape_sources = sorted(
-        source_name
-        for source_name, valid in structured_shape_validity.items()
-        if not valid
-        and source_name not in missing_structured_schema_sources
-        and source_name not in missing_live_structured_sources
-    )
-    malformed_generic_collection_sources = sorted(
-        source_name
-        for source_name in inventory - structured_source_names
-        if not (
-            isinstance(globals().get(source_name), (frozenset, list, set, tuple))
-            and all(
-                type(field_name) is str
-                for field_name in globals().get(source_name)
-            )
-        )
-    )
-    overlapping = sorted(
-        source_name
-        for source_name, source_dispositions in memberships.items()
-        if len(source_dispositions) != 1
-    )
-    unclassified = sorted(inventory - registered)
-    missing = sorted(registered - inventory)
+    registered = set(records)
+    unclassified = sorted(live_candidates - registered)
+    missing = sorted(registered - live_candidates)
+    invalid_shapes: list[str] = []
+    stale_partitions: list[str] = []
     field_memberships: dict[str, tuple[str, ...]] = {}
-    for source_name, source_fields in collection_sources.items():
-        if source_name not in registered:
+    scalar_source_fields: dict[str, list[str]] = {}
+    raw_signatures: dict[str, dict[str, Any]] = {}
+    source_validation: dict[str, bool] = {}
+    for source_name in sorted(registered & live_candidates):
+        record = records[source_name]
+        raw_fields = globals()[source_name]
+        raw_signatures[source_name] = _contract_runtime_canonical_raw_source_signature(raw_fields)
+        valid = _contract_runtime_canonical_entry_shape_valid(record, raw_fields)
+        source_validation[source_name] = valid
+        if not valid:
+            invalid_shapes.append(source_name)
             continue
-        for field_name in source_fields:
-            field_path = f"{source_name}.{field_name}"
-            field_memberships[field_path] = (
-                _contract_runtime_server_canonical_field_dispositions(
-                    source_name,
-                    field_name,
-                )
+        if record.entry_schema_id != "scalar_string.v1":
+            scalar_source_fields[source_name] = []
+            continue
+        fields = list(raw_fields)
+        scalar_source_fields[source_name] = sorted(fields)
+        for field_name in fields:
+            path = f"{source_name}.{field_name}"
+            field_memberships[path] = _contract_runtime_server_canonical_field_dispositions(source_name, field_name)
+        if record.projection_policy == "explicit_partition.v1":
+            live_fields = set(fields)
+            partition_fields = {name for name, _ in record.field_partitions}
+            stale_partitions.extend(
+                f"{source_name}.{name}" for name in sorted(partition_fields - live_fields)
             )
-    unclassified_fields = sorted(
-        field_path
-        for field_path, field_dispositions in field_memberships.items()
-        if not field_dispositions
-    )
-    overlapping_fields = sorted(
-        field_path
-        for field_path, field_dispositions in field_memberships.items()
-        if len(field_dispositions) > 1
-    )
+    unclassified_fields = sorted(path for path, dispositions in field_memberships.items() if not dispositions)
+    overlapping_fields = sorted(path for path, dispositions in field_memberships.items() if len(dispositions) != 1)
+    field_memberships: dict[str, tuple[str, ...]] = {}
+    for source_name, fields in scalar_source_fields.items():
+        for field_name in fields:
+            path = f"{source_name}.{field_name}"
+            field_memberships[path] = _contract_runtime_server_canonical_field_dispositions(source_name, field_name)
     field_paths_by_disposition = {
         disposition: sorted(
             field_path
@@ -105038,96 +105005,21 @@ def _contract_runtime_server_canonical_source_registry_audit(
             "audited_non_authority",
         )
     }
-    stale_partition_fields: list[str] = []
-    missing_partition_sources: list[str] = []
-    unknown_partition_dispositions: list[str] = []
-    for source_name, source_partitions in (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_MIXED_SOURCE_PARTITIONS.items()
-    ):
-        source_fields = collection_sources.get(source_name)
-        if source_fields is None:
-            missing_partition_sources.append(source_name)
-            continue
-        for disposition, partition_fields in source_partitions.items():
-            if disposition not in field_paths_by_disposition:
-                unknown_partition_dispositions.append(
-                    f"{source_name}.{disposition}"
-                )
-                continue
-            stale_partition_fields.extend(
-                f"{source_name}.{field_name}"
-                for field_name in partition_fields
-                if field_name not in source_fields
-            )
-    for source_name, safe_fields in (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_AUDITED_SAFE_FIELD_SEMANTICS.items()
-    ):
-        source_fields = collection_sources.get(source_name)
-        if source_fields is None:
-            missing_partition_sources.append(source_name)
-            continue
-        stale_partition_fields.extend(
-            f"{source_name}.{field_name}"
-            for field_name in safe_fields
-            if field_name not in source_fields
-        )
+    diagnostics = sorted(set(unclassified + missing + invalid_shapes + stale_partitions + unclassified_fields + overlapping_fields))
+    semantic_payload = {
+        "registry": meta["normalized_records"],
+        "live_source_names": sorted(live_candidates),
+        "source_validation": source_validation,
+        "complete": not diagnostics,
+    }
     return {
-        "complete": not (
-            overlapping
-            or unclassified
-            or missing
-            or unclassified_fields
-            or overlapping_fields
-            or stale_partition_fields
-            or missing_partition_sources
-            or unknown_partition_dispositions
-            or not structured_registry_valid
-            or missing_structured_schema_sources
-            or unused_structured_schema_sources
-            or missing_live_structured_sources
-            or invalid_structured_shape_sources
-            or malformed_generic_collection_sources
-        ),
-        "inventory_source_names": sorted(inventory),
+        "complete": not diagnostics,
+        "diagnostic_paths": diagnostics,
+        "inventory_source_names": sorted(live_candidates),
         "registered_source_names": sorted(registered),
-        "authority_leaf_source_names": sorted(
-            dispositions["authority_leaf"]
-        ),
-        "recursive_container_source_names": sorted(
-            dispositions["recursive_container"]
-        ),
-        "audited_non_authority_source_names": sorted(
-            dispositions["audited_non_authority"]
-        ),
-        "structured_non_authority_source_names": sorted(
-            structured_source_names
-        ),
-        "structured_schema_registry_valid": structured_registry_valid,
-        "structured_schema_registry_source_names": sorted(
-            structured_registry_source_names
-        ),
-        "live_structured_source_names": sorted(
-            live_structured_source_names
-        ),
-        "missing_structured_schema_source_names": (
-            missing_structured_schema_sources
-        ),
-        "unused_structured_schema_source_names": (
-            unused_structured_schema_sources
-        ),
-        "missing_live_structured_source_names": (
-            missing_live_structured_sources
-        ),
-        "invalid_structured_shape_source_names": (
-            invalid_structured_shape_sources
-        ),
-        "malformed_generic_collection_source_names": (
-            malformed_generic_collection_sources
-        ),
-        "structured_schema_ids": structured_schema_ids,
-        "structured_schema_hashes": structured_schema_hashes,
-        "structured_shape_validity": structured_shape_validity,
-        "overlapping_source_names": overlapping,
+        "authority_leaf_source_names": sorted(name for name, record in records.items() if record.disposition == "authority_leaf"),
+        "recursive_container_source_names": sorted(name for name, record in records.items() if record.disposition == "recursive_container"),
+        "audited_non_authority_source_names": sorted(name for name, record in records.items() if record.disposition == "audited_non_authority"),
         "unclassified_source_names": unclassified,
         "missing_registered_source_names": missing,
         "field_inventory_paths": sorted(field_memberships),
@@ -105142,13 +105034,12 @@ def _contract_runtime_server_canonical_source_registry_audit(
         ],
         "unclassified_field_paths": unclassified_fields,
         "overlapping_field_paths": overlapping_fields,
-        "stale_partition_field_paths": sorted(stale_partition_fields),
-        "missing_partition_source_names": sorted(
-            missing_partition_sources
-        ),
-        "unknown_partition_disposition_paths": sorted(
-            unknown_partition_dispositions
-        ),
+        "stale_partition_field_paths": sorted(stale_partitions),
+        "scalar_source_fields": scalar_source_fields,
+        "raw_source_signatures": raw_signatures,
+        "source_shape_validity": source_validation,
+        "registry_schema_hash": meta["registry_schema_hash"],
+        "semantic_registry_hash": stable_sha256(semantic_payload),
     }
 
 
@@ -105160,42 +105051,7 @@ def _contract_runtime_require_canonical_authority_registry_complete(
     if audit.get("complete") is True:
         return audit
     _contract_runtime_raise_canonical_authority_registry_incomplete(
-        sorted(
-            {
-                *list(audit.get("unclassified_source_names") or []),
-                *list(audit.get("missing_registered_source_names") or []),
-                *list(audit.get("overlapping_source_names") or []),
-                *list(audit.get("unclassified_field_paths") or []),
-                *list(audit.get("overlapping_field_paths") or []),
-                *list(audit.get("stale_partition_field_paths") or []),
-                *list(audit.get("missing_partition_source_names") or []),
-                *list(
-                    audit.get("unknown_partition_disposition_paths") or []
-                ),
-                *list(
-                    audit.get("missing_structured_schema_source_names") or []
-                ),
-                *list(
-                    audit.get("unused_structured_schema_source_names") or []
-                ),
-                *list(
-                    audit.get("missing_live_structured_source_names") or []
-                ),
-                *list(
-                    audit.get("invalid_structured_shape_source_names") or []
-                ),
-                *list(
-                    audit.get("malformed_generic_collection_source_names") or []
-                ),
-                *(
-                    []
-                    if audit.get("structured_schema_registry_valid") is True
-                    else [
-                        "_CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES"
-                    ]
-                ),
-            }
-        )
+        audit.get("diagnostic_paths") or ["_CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS"]
     )
     return audit
 
@@ -105241,22 +105097,16 @@ def _contract_runtime_is_server_canonical_authority_container_source(
     """Return whether one source lists mapping containers, not leaf authority."""
 
     name = str(source_name or "")
-    return name in (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
-            "recursive_container"
-        ]
-    )
+    meta = _contract_runtime_canonical_source_record_registry_meta_audit()
+    return bool(meta["complete"] and any(record.source_name == name and record.disposition == "recursive_container" for record in meta["records"]))
 
 
 def _contract_runtime_is_server_canonical_authority_field_source(
     source_name: Any,
 ) -> bool:
     name = str(source_name or "")
-    return name in (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_DISPOSITION[
-            "authority_leaf"
-        ]
-    )
+    meta = _contract_runtime_canonical_source_record_registry_meta_audit()
+    return bool(meta["complete"] and any(record.source_name == name and record.disposition == "authority_leaf" for record in meta["records"]))
 
 
 def _contract_runtime_server_canonical_authority_field_sources(
@@ -105722,10 +105572,9 @@ _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_SUFFIXES = (
 )
 _CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS = frozenset(
     str(field_name).casefold()
-    for source_fields in (
-        _CONTRACT_RUNTIME_SERVER_CANONICAL_AUDITED_SAFE_FIELD_SEMANTICS.values()
-    )
-    for field_name in source_fields
+    for record in _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS
+    for field_name, disposition in record.field_partitions
+    if disposition == "audited_non_authority"
 )
 _CONTRACT_RUNTIME_FRESH_REPAIR_CANONICAL_ENVELOPE_REQUIRED_FIELDS = {
     "_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS": frozenset(
