@@ -3378,13 +3378,6 @@ _DEV_EXTERNAL_ONBOARD_QUERY_ALLOWLIST = _DEV_EXTERNAL_ONBOARD_BODY_ALLOWLIST
 _DEV_EXTERNAL_BACKLOG_LIST_QUERY_ALLOWLIST = frozenset(
     {"view", "limit", "status", "priority", "include_closed"}
 )
-_DEV_EXTERNAL_COORDINATION_QUERY_ALLOWLIST = frozenset(
-    {"limit", "status", "priority", "include_closed"}
-)
-_DEV_EXTERNAL_SCOPED_PROFILE = "private-scoped-coordination.v1"
-_DEV_EXTERNAL_COORDINATION_SCHEMA_VERSION = (
-    "ac_dev_external_coordination_projection.v1"
-)
 
 
 def _dev_external_discovery_route(
@@ -3416,11 +3409,6 @@ def _dev_external_discovery_route(
             "onboard",
             "GET|POST",
             rf"/api/projects/{escaped}/onboard-route-guide",
-        ),
-        (
-            "coordination",
-            "GET",
-            rf"/api/projects/{escaped}/coordination-projection",
         ),
     )
     for kind, allowed_method, pattern in candidates:
@@ -3491,24 +3479,13 @@ def _dev_external_discovery_request(
     if not route_kind:
         return ""
     try:
-        registered = registered_public_safe_external_project(project_id)
+        registered_public_safe_external_project(project_id)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise _dev_external_discovery_rejection(
             code="ac_dev_external_project_registry_rejected",
             path=path,
             detail=str(exc),
         ) from exc
-    allowed_route_kinds = registered.get("allowed_route_kinds")
-    if (
-        type(allowed_route_kinds) is not list
-        or not all(type(item) is str for item in allowed_route_kinds)
-        or route_kind not in allowed_route_kinds
-    ):
-        raise _dev_external_discovery_rejection(
-            code="ac_dev_external_projection_endpoint_rejected",
-            path=path,
-            detail="external registry profile does not allow this endpoint",
-        )
     claims = (
         list(_dev_project_id_claims(path_params, source="path_params"))
         + list(_dev_project_id_claims(body, source="body"))
@@ -3562,29 +3539,16 @@ def _dev_external_discovery_request(
                     "session, source, or commit authority selectors"
                 ),
             )
-    elif route_kind in {"backlog_list", "coordination"}:
-        allowlist = (
-            _DEV_EXTERNAL_COORDINATION_QUERY_ALLOWLIST
-            if route_kind == "coordination"
-            else _DEV_EXTERNAL_BACKLOG_LIST_QUERY_ALLOWLIST
-        )
+    elif route_kind == "backlog_list":
         unknown_query = sorted(
-            set(query) - allowlist
+            set(query) - _DEV_EXTERNAL_BACKLOG_LIST_QUERY_ALLOWLIST
         )
-        view = (
-            str(_first_query_value(query, "view") or "").strip().lower()
-            if route_kind == "backlog_list"
-            else ""
-        )
+        view = str(_first_query_value(query, "view") or "").strip().lower()
         if unknown_query or view not in {"", "compact"}:
             raise _dev_external_discovery_rejection(
-                code=(
-                    "ac_dev_external_coordination_query_rejected"
-                    if route_kind == "coordination"
-                    else "ac_dev_external_backlog_query_rejected"
-                ),
+                code="ac_dev_external_backlog_query_rejected",
                 path=path,
-                detail="external projection accepts bounded compact filters only",
+                detail="external backlog discovery accepts bounded compact filters only",
             )
     elif query:
         raise _dev_external_discovery_rejection(
@@ -3714,21 +3678,12 @@ def _guard_dev_runtime_request(
 
 def _dev_external_public_project(project_id: str) -> dict[str, Any]:
     registered = registered_public_safe_external_project(project_id)
-    project = {
+    return {
         "project_id": str(registered.get("project_id") or ""),
         "status": "active",
         "initialized": True,
-        "public_safe": registered.get("project_public_safe") is True,
+        "public_safe": True,
     }
-    if registered.get("visibility_profile") == _DEV_EXTERNAL_SCOPED_PROFILE:
-        project.update(
-            visibility_profile=_DEV_EXTERNAL_SCOPED_PROFILE,
-            field_profile=str(registered.get("field_profile") or ""),
-            policy_schema_version=str(
-                registered.get("policy_schema_version") or ""
-            ),
-        )
-    return project
 
 
 _DEV_STABLE_PROXY_ORIGIN = "http://127.0.0.1:40000"
@@ -4099,11 +4054,7 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
     }
 
 
-def _dev_stable_external_public_read_window(
-    paths: Sequence[str],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Read bounded stable paths under one frozen loopback identity."""
-
+def _dev_stable_external_public_get_many(paths: Sequence[str]) -> list[dict[str, Any]]:
     if not paths or len(paths) > 3:
         raise _dev_stable_proxy_failure(
             "ac_dev_stable_proxy_path_rejected",
@@ -4125,11 +4076,7 @@ def _dev_stable_external_public_read_window(
             "stable identity changed across the bounded GET",
             status=409,
         )
-    return before, payloads
-
-
-def _dev_stable_external_public_get_many(paths: Sequence[str]) -> list[dict[str, Any]]:
-    return _dev_stable_external_public_read_window(paths)[1]
+    return payloads
 
 
 def _dev_stable_external_public_get(path: str) -> dict[str, Any]:
@@ -4249,255 +4196,6 @@ def _dev_external_public_backlog_row(
         "public_safe": True,
         "compact": True,
     }
-
-
-def _dev_external_coordination_count_fields() -> tuple[str, ...]:
-    return (
-        "target_file_count",
-        "test_file_count",
-        "acceptance_count",
-        "required_doc_count",
-        "provenance_count",
-    )
-
-
-def _dev_external_coordination_contract_fields() -> frozenset[str]:
-    return frozenset(
-        {
-            "has_contract",
-            "template_id",
-            "contract_instance_id",
-            "required_evidence_count",
-            "optional_evidence_count",
-            "source_of_truth",
-            "projection_schema_version",
-            "projection_status",
-            "projection_watermark",
-            "stale",
-            "divergent",
-            "contract_hash",
-        }
-    )
-
-
-def _dev_external_coordination_reference_pair(
-    raw: Mapping[str, Any],
-    *,
-    id_field: str,
-    hash_field: str,
-    id_pattern: str,
-) -> dict[str, str]:
-    present = id_field in raw or hash_field in raw
-    if not present:
-        return {}
-    identifier = raw.get(id_field)
-    digest = raw.get(hash_field)
-    if not (
-        type(identifier) is str
-        and re.fullmatch(id_pattern, identifier)
-        and type(digest) is str
-        and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
-    ):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_external_coordination_reference_rejected",
-            f"stable compact row has an invalid {id_field}/{hash_field} pair",
-            status=409,
-        )
-    return {id_field: identifier, hash_field: digest}
-
-
-def _dev_external_coordination_backlog_row(
-    raw: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Project one private-project intent without exposing private content."""
-
-    bug_id = raw.get("bug_id")
-    status = raw.get("status")
-    priority = raw.get("priority")
-    title = raw.get("title")
-    if not (
-        type(bug_id) is str
-        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,191}", bug_id)
-        and type(status) is str
-        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", status)
-        and type(priority) is str
-        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", priority)
-        and type(title) is str
-        and len(title) <= 16 * 1024
-    ):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_stable_proxy_schema_rejected",
-            "stable compact intent lacks a bounded typed lifecycle identity",
-        )
-    counts: dict[str, int] = {}
-    for field in _dev_external_coordination_count_fields():
-        value = raw.get(field)
-        if type(value) is not int or value < 0 or value > 1_000_000:
-            raise _dev_stable_proxy_failure(
-                "ac_dev_stable_proxy_schema_rejected",
-                f"stable compact intent has an invalid {field}",
-            )
-        counts[field] = value
-
-    contract = raw.get("contract_summary")
-    if not isinstance(contract, Mapping) or set(contract) != (
-        _dev_external_coordination_contract_fields()
-    ):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_external_coordination_contract_rejected",
-            "stable compact intent contract summary is not the closed schema",
-            status=409,
-        )
-    string_fields = (
-        "template_id",
-        "contract_instance_id",
-        "source_of_truth",
-        "projection_schema_version",
-        "projection_status",
-        "contract_hash",
-    )
-    if not all(
-        type(contract.get(field)) is str
-        and len(contract.get(field)) <= 256
-        and not any(ord(char) < 0x20 for char in contract.get(field))
-        for field in string_fields
-    ):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_external_coordination_contract_rejected",
-            "stable compact intent contract strings are invalid",
-            status=409,
-        )
-    if contract.get("contract_hash") and not re.fullmatch(
-        r"sha256:[0-9a-f]{64}", contract["contract_hash"]
-    ):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_external_coordination_contract_rejected",
-            "stable compact intent contract hash is invalid",
-            status=409,
-        )
-    if not (
-        type(contract.get("has_contract")) is bool
-        and type(contract.get("stale")) is bool
-        and type(contract.get("divergent")) is bool
-        and all(
-            type(contract.get(field)) is int and contract.get(field) >= 0
-            for field in (
-                "required_evidence_count",
-                "optional_evidence_count",
-                "projection_watermark",
-            )
-        )
-    ):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_external_coordination_contract_rejected",
-            "stable compact intent contract lifecycle fields are invalid",
-            status=409,
-        )
-
-    public_safe = raw.get("public_safe")
-    privacy_level = raw.get("privacy_level")
-    if not (
-        type(public_safe) is bool
-        and type(privacy_level) is str
-        and (
-            (public_safe is True and privacy_level == "public")
-            or (public_safe is False and privacy_level in {"private", "restricted"})
-        )
-    ):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_external_coordination_classification_rejected",
-            "stable compact intent lacks an exact supported privacy classification",
-            status=409,
-        )
-
-    refs = {
-        **_dev_external_coordination_reference_pair(
-            raw,
-            id_field="route_id",
-            hash_field="route_context_sha256",
-            id_pattern=r"route-[A-Za-z0-9][A-Za-z0-9._:-]{0,185}",
-        ),
-        **_dev_external_coordination_reference_pair(
-            raw,
-            id_field="decision_id",
-            hash_field="decision_source_sha256",
-            id_pattern=r"dec-[A-Za-z0-9][A-Za-z0-9._:-]{0,187}",
-        ),
-    }
-    projected = {
-        "backlog_id": bug_id,
-        "lifecycle_kind": "backlog_intent",
-        "status": status,
-        "priority": priority,
-        "counts": counts,
-        "contract": {
-            "has_contract": contract["has_contract"],
-            "contract_hash": contract["contract_hash"],
-            "projection_status": contract["projection_status"],
-            "required_evidence_count": contract["required_evidence_count"],
-            "optional_evidence_count": contract["optional_evidence_count"],
-            "stale": contract["stale"],
-            "divergent": contract["divergent"],
-        },
-        "coordination_refs": refs,
-        "public_summary_available": public_safe,
-    }
-    if public_safe:
-        if any(ord(char) < 0x20 and char not in "\t\n\r" for char in title):
-            raise _dev_stable_proxy_failure(
-                "ac_dev_external_coordination_summary_rejected",
-                "stable compact intent public title contains control bytes",
-                status=409,
-            )
-        projected["public_summary"] = {
-            "title": _compact_preview(title, limit=240),
-            "classification": "explicit_public",
-        }
-    return projected
-
-
-def _dev_external_coordination_filters(
-    query: Mapping[str, Any],
-    *,
-    default_limit: int = 20,
-) -> tuple[int, str, str, bool]:
-    raw_limit = _first_query_value(query, "limit", str(default_limit))
-    if type(raw_limit) is not str or not re.fullmatch(r"[1-9][0-9]?", raw_limit):
-        raise GovernanceError(
-            "ac_dev_external_coordination_limit_rejected",
-            "coordination projection limit must be an exact integer string from 1 to 50",
-            400,
-        )
-    limit = int(raw_limit)
-    if limit > 50:
-        raise GovernanceError(
-            "ac_dev_external_coordination_limit_rejected",
-            "coordination projection limit must be an exact integer string from 1 to 50",
-            400,
-        )
-    filters = []
-    for field in ("status", "priority"):
-        raw = _first_query_value(query, field, "")
-        if type(raw) is not str or not re.fullmatch(
-            r"(?:|[A-Za-z0-9][A-Za-z0-9._:-]{0,63})", raw
-        ):
-            raise GovernanceError(
-                "ac_dev_external_coordination_filter_rejected",
-                f"coordination projection {field} filter is invalid",
-                400,
-            )
-        filters.append(raw)
-    raw_include_closed = _first_query_value(query, "include_closed", "true")
-    if type(raw_include_closed) is not str or raw_include_closed not in {
-        "true",
-        "false",
-    }:
-        raise GovernanceError(
-            "ac_dev_external_coordination_filter_rejected",
-            "coordination projection include_closed must be true or false",
-            400,
-        )
-    return limit, filters[0], filters[1], raw_include_closed == "true"
 
 
 def _dev_external_stable_backlog_list_path(
@@ -4622,45 +4320,6 @@ def _dev_external_backlog_list_projection(
         "limit": limit,
         "bounded": True,
         "public_safe": True,
-        "read_only": True,
-        "stable_read_authority": authority,
-    }
-
-
-def _dev_external_scoped_backlog_list_from_stable(
-    project_id: str,
-    stable: Mapping[str, Any],
-    query: Mapping[str, Any],
-) -> dict[str, Any]:
-    limit, status_filter, priority_filter, include_closed = (
-        _dev_external_coordination_filters(query)
-    )
-    rows, authority = _dev_external_validate_backlog_list(project_id, stable)
-    projected_rows = [
-        _dev_external_coordination_backlog_row(row) for row in rows
-    ]
-    intents = [
-        row
-        for row in projected_rows
-        if (not status_filter or row["status"].upper() == status_filter.upper())
-        and (
-            not priority_filter
-            or row["priority"].upper() == priority_filter.upper()
-        )
-        and (
-            include_closed
-            or row["status"].upper() not in _BACKLOG_CLOSED_STATUSES
-        )
-    ][:limit]
-    return {
-        "schema_version": "ac_dev_external_scoped_backlog.v1",
-        "project_id": project_id,
-        "intents": intents,
-        "count": len(intents),
-        "limit": limit,
-        "bounded": True,
-        "project_public_safe": False,
-        "projection_public_safe": True,
         "read_only": True,
         "stable_read_authority": authority,
     }
@@ -4821,10 +4480,12 @@ def _dev_external_backlog_item_projection(
     }
 
 
-def _dev_external_graph_status_from_stable(
+def _dev_external_graph_status_projection(
     project_id: str,
-    stable: Mapping[str, Any],
 ) -> dict[str, Any]:
+    stable = _dev_stable_external_public_get(
+        f"/api/graph-governance/{quote(project_id, safe='')}/status"
+    )
     if not (
         stable.get("ok") is True
         and type(stable.get("project_id")) is str
@@ -4862,84 +4523,6 @@ def _dev_external_graph_status_from_stable(
         "active_ref": "active" if active_snapshot_id else "",
         "public_safe": True,
         "read_only": True,
-    }
-
-
-def _dev_external_graph_status_projection(
-    project_id: str,
-) -> dict[str, Any]:
-    stable = _dev_stable_external_public_get(
-        f"/api/graph-governance/{quote(project_id, safe='')}/status"
-    )
-    return _dev_external_graph_status_from_stable(project_id, stable)
-
-
-def _dev_external_coordination_projection(
-    project: Mapping[str, Any],
-    query: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return one closed project/runtime/graph/intent coordination capsule."""
-
-    project_id = str(project.get("project_id") or "")
-    if project.get("visibility_profile") != _DEV_EXTERNAL_SCOPED_PROFILE:
-        raise _dev_external_discovery_rejection(
-            code="ac_dev_external_projection_profile_rejected",
-            path=f"/api/projects/{project_id}/coordination-projection",
-            detail="coordination projection requires the private scoped profile",
-        )
-    stable_identity, payloads = _dev_stable_external_public_read_window(
-        [
-            _dev_external_stable_backlog_list_path(project_id),
-            f"/api/graph-governance/{quote(project_id, safe='')}/status",
-        ]
-    )
-    stable_backlog, stable_graph = payloads
-    backlog_projection = _dev_external_scoped_backlog_list_from_stable(
-        project_id,
-        stable_backlog,
-        query,
-    )
-    health = stable_identity.get("required_health_tuple")
-    if not isinstance(health, Mapping):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_stable_proxy_identity_rejected",
-            "stable read window omitted its typed health tuple",
-            status=409,
-        )
-    runtime = {
-        "status": health["status"],
-        "service": health["service"],
-        "port": health["port"],
-        "runtime_loaded_version": health["runtime_loaded_version"],
-        "runtime_stale": health["runtime_stale"],
-        "identity_sha256": stable_identity["required_health_tuple_sha256"],
-    }
-    return {
-        "schema_version": _DEV_EXTERNAL_COORDINATION_SCHEMA_VERSION,
-        "project": dict(project),
-        "runtime": runtime,
-        "graph": _dev_external_graph_status_from_stable(
-            project_id,
-            stable_graph,
-        ),
-        "backlog": backlog_projection,
-        "allowed_data_classes": [
-            "project_status",
-            "runtime_status",
-            "graph_status",
-            "intent_lifecycle_identifiers_status_counts",
-            "route_decision_ids_with_hashes",
-            "explicitly_public_summary",
-        ],
-        "bounded": True,
-        "read_only": True,
-        "writes_performed": False,
-        "mutation_allowed": False,
-        "route_authority": False,
-        "cex_minted": False,
-        "contract_runtime_materialized": False,
-        "managed_pass": False,
-        "pass_implied": False,
     }
 
 
@@ -4984,18 +4567,6 @@ def _handle_dev_external_read_only_discovery(
             "managed_pass": False,
             "pass_implied": False,
         }
-        if (
-            project.get("visibility_profile") == _DEV_EXTERNAL_SCOPED_PROFILE
-            and route_kind in {"backlog_list", "backlog_item"}
-        ):
-            raise _dev_external_discovery_rejection(
-                code="ac_dev_external_projection_endpoint_rejected",
-                path=f"/api/backlog/{project_id}",
-                detail=(
-                    "private scoped profiles expose backlog only inside "
-                    "coordination projection"
-                ),
-            )
         if route_kind == "backlog_list":
             return {
                 **common,
@@ -5016,11 +4587,6 @@ def _handle_dev_external_read_only_discovery(
             return {
                 **common,
                 **_dev_external_graph_status_projection(project_id),
-            }
-        if route_kind == "coordination":
-            return {
-                **common,
-                **_dev_external_coordination_projection(project, ctx.query),
             }
         if route_kind != "onboard":
             raise GovernanceError(
@@ -214262,24 +213828,6 @@ def handle_project_release_operator_head_queue(ctx: RequestContext):
                 "next_selection": one_shot.get("selection") or {},
             }
         return response
-
-
-@route("GET", "/api/projects/{project_id}/coordination-projection")
-def handle_project_coordination_projection(ctx: RequestContext):
-    """Middleware-only dev projection; stable/generic runtimes expose no data."""
-
-    raise GovernanceError(
-        "external_coordination_projection_not_available",
-        "external coordination projection is available only through the AC dev guard",
-        404,
-        {
-            "project_id": ctx.get_project_id(),
-            "read_only": True,
-            "writes_performed": False,
-            "managed_pass": False,
-            "pass_implied": False,
-        },
-    )
 
 
 @route("GET", "/api/projects/{project_id}/onboard-route-guide")

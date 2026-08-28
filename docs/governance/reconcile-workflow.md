@@ -808,45 +808,6 @@ AC repair work uses two independent runtime planes:
   session authority and never implies managed PASS. Runtime/source/commit,
   route, task, CEX, QA-session, mismatched nested-project, and unknown
   selectors fail before a handler.
-- A private coordination source may opt into a narrower, versioned projection
-  without making the project public. This is the only supported Judgment Brain
-  configuration; setting `public_safe=true` is deliberately rejected for
-  `judgment-brain`. The operator-owned `projects.json` entry must keep the
-  entire policy and nested projection object at this exact closed shape (no
-  aliases or extra keys):
-
-  ```json
-  {
-    "schema_version": "governance_policy.v1",
-    "profile": "private-scoped-coordination",
-    "public_safe": false,
-    "external_coordination_projection": {
-      "schema_version": "ac.external_coordination_projection_policy.v1",
-      "enabled": true,
-      "endpoint_profile": "coordination-read-only.v1",
-      "field_profile": "lifecycle-identifiers-status-counts-explicit-public-summary.v1"
-    }
-  }
-  ```
-
-  This registration permits only active graph status, the no-authority Onboard
-  redirect, and read-only
-  `GET /api/projects/{project_id}/coordination-projection`; direct private
-  backlog list/item routes remain rejected. The coordination response is
-  `ac_dev_external_coordination_projection.v1` and folds a stable compact
-  backlog read into a closed project/runtime/graph status capsule plus bounded
-  intent lifecycle identifiers, status/priority, non-negative counts, contract
-  hash/status, and optional route/decision ID+SHA-256 pairs. A title is emitted only when
-  the stable compact row carries exact `public_safe=true` and
-  `privacy_level="public"`; private titles and every body, prompt, packet,
-  credential, SQL value, raw event, path, token, and full row remain absent.
-  The a258 stable compact schema does not currently carry route/decision pairs,
-  so those fields remain absent rather than being reconstructed from details or
-  provenance. To roll back, remove the entire scoped policy (or set
-  `enabled=false`) and restart only the dev service; discovery then fails closed.
-  Do not replace the scoped policy with project-wide `public_safe=true`. This
-  document is an operator configuration template only and does not authorize a
-  live registry edit.
 - External discovery never opens a non-AC `governance.db`, WAL, SHM, or rollback
   journal. Registration validates those existing paths and rejects symlink or
   non-regular storage, but the dev process has no external SQLite capability.
