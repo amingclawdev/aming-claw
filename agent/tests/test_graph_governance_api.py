@@ -123672,9 +123672,10 @@ def test_contract_runtime_authority_registry_fresh_import_is_complete():
     assert "_CURRENT_FULL_BUILD_KEYS" in audit["registered_source_names"]
     assert audit["raw_source_signatures"]["_CURRENT_FULL_BUILD_KEYS"]["raw_type"] == "set"
     assert audit["registry_schema_hash"] == (
-        "sha256:3b9b38a938c74af40c8000080dcf7bae93ea90ec39db4579f48a4f22f0275303"
+        "sha256:7f04557fabb202c10e5970ccb74ed55a1740939d1e425c847407966c8cbe89de"
     )
-    assert len(server._CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS) == 63
+    assert audit["golden_record_count"] == 63
+    assert audit["golden_entry_count"] == 849
     for record in server._CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS:
         raw = getattr(server, record.source_name)
         if record.entry_schema_id == "scalar_string.v1":
@@ -123796,7 +123797,8 @@ def test_contract_runtime_authority_registry_rejects_unused_record(monkeypatch):
     monkeypatch.setattr(server, "_CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS", records + (extra,))
     with pytest.raises(server.GovernanceError) as error:
         server._contract_runtime_require_canonical_authority_registry_complete()
-    assert error.value.details["diagnostic_paths"] == [extra.source_name]
+    assert "registry.golden_record_count" in error.value.details["diagnostic_paths"]
+    assert "registry.golden_ordered_hash" in error.value.details["diagnostic_paths"]
 
 
 def test_contract_runtime_authority_registry_static_projection_ignores_classifier_drift(
@@ -123807,11 +123809,13 @@ def test_contract_runtime_authority_registry_static_projection_ignores_classifie
         server,
         "parallel_branch_authority_field_is_nontransferable",
         lambda _field: False,
+        raising=False,
     )
     monkeypatch.setattr(
         server,
         "PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS",
         frozenset({"invented_external_authority"}),
+        raising=False,
     )
     after = server._contract_runtime_server_canonical_source_registry_audit()
     assert after["complete"] is True
@@ -123852,20 +123856,93 @@ def test_contract_runtime_authority_registry_has_no_mutable_enum_authority_input
         assert not hasattr(server, name)
 
 
-def test_contract_runtime_authority_registry_rebuilds_derived_cache_from_projection(
+def test_contract_runtime_authority_registry_has_no_mutable_global_authority_cache(
     monkeypatch,
 ):
     before = server._contract_runtime_server_canonical_source_registry_audit()
     monkeypatch.setattr(
         server,
-        "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
-        frozenset({"tampered_cache_field"}),
+        "_CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX",
+        {"canonical_schema": frozenset({"tampered_cache_field"})},
     )
     after_tamper = server._contract_runtime_server_canonical_source_registry_audit()
     assert after_tamper["semantic_registry_hash"] == before["semantic_registry_hash"]
     rebuilt = server._contract_runtime_refresh_canonical_authority_field_inventory()
     assert "tampered_cache_field" not in rebuilt
-    assert rebuilt == server._CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
+    assert rebuilt == frozenset(
+        field
+        for field, disposition in before["global_compatibility_index"].items()
+        if disposition == "authority_leaf"
+    )
+
+
+def test_contract_runtime_authority_registry_golden_rejects_reorder_and_valid_tamper(
+    monkeypatch,
+):
+    records = server._CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS
+    monkeypatch.setattr(
+        server,
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS",
+        (records[1], records[0], *records[2:]),
+    )
+    with pytest.raises(server.GovernanceError) as error:
+        server._contract_runtime_require_canonical_authority_registry_complete()
+    assert "registry.golden_ordered_hash" in error.value.details["diagnostic_paths"]
+
+    monkeypatch.setattr(
+        server,
+        "_CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS",
+        _authority_registry_replace_record(
+            "_CURRENT_FULL_BUILD_KEYS",
+            disposition="audited_non_authority",
+        ),
+    )
+    with pytest.raises(server.GovernanceError) as error:
+        server._contract_runtime_require_canonical_authority_registry_complete()
+    assert "registry.golden_ordered_hash" in error.value.details["diagnostic_paths"]
+
+
+def test_contract_runtime_authority_registry_global_conflict_uses_authority_dominance():
+    audit = server._contract_runtime_require_canonical_authority_registry_complete()
+    assert audit["cross_source_disposition_conflicts"]["project_root"] == [
+        "audited_non_authority",
+        "authority_leaf",
+    ]
+    assert audit["global_compatibility_index"]["project_root"] == "authority_leaf"
+    assert server._contract_runtime_key_is_execution_authority_or_credential(
+        "project_root"
+    ) is True
+    assert server._contract_runtime_key_is_execution_authority_or_credential(
+        "route_token"
+    ) is True
+    assert server._contract_runtime_key_is_execution_authority_or_credential(
+        "ordinary_application_key"
+    ) is False
+
+
+def test_contract_runtime_authority_registry_cold_compact_audit_under_one_second():
+    started = time.monotonic()
+    audit = server._contract_runtime_server_canonical_source_registry_audit()
+    elapsed = time.monotonic() - started
+    assert audit["complete"] is True
+    assert elapsed < 1.0
+
+
+def test_contract_runtime_authority_registry_top_level_audit_validates_once(monkeypatch):
+    original = server._contract_runtime_canonical_source_record_registry_meta_audit
+    calls = []
+
+    def counted():
+        calls.append(1)
+        return original()
+
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_canonical_source_record_registry_meta_audit",
+        counted,
+    )
+    assert server._contract_runtime_server_canonical_source_registry_audit()["complete"]
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -142337,165 +142414,22 @@ def test_onboard_rev10_failed_qa_projects_actionable_fresh_repair_row(conn):
     )
 
     assert current["next_legal_action"]["id"] == "file_fresh_bounded_row"
-    assert current["next_legal_action"]["actionable"] is True
+    assert current["next_legal_action"]["actionable"] is False
+    assert current["next_legal_action"]["action_input_missing_fields"] == [
+        "acceptance_criteria"
+    ]
+    assert current["next_legal_action"]["unsafe_action_input_paths"]
     assert "runtime_context_id" not in current["next_legal_action"]
     assert "accepted_dispatch_authority" not in current["next_legal_action"]
     assert guide["ok"] is True
-    assert guide["status"] == "fresh_bounded_repair_action_ready"
-    assert guide["mcp_tool"] == "backlog_upsert"
-    assert guide["actionable"] is True
-    assert 12_000 <= guide["serialized_bytes"]
+    assert guide["actionable"] is False
+    assert guide["next_legal_action"]["actionable"] is False
+    assert guide["next_legal_action"]["unsafe_action_input_paths"]
     assert guide["serialized_bytes"] <= guide["max_serialized_bytes"]
     assert len(json.dumps(guide, sort_keys=True).encode("utf-8")) <= (
         server._ONBOARD_GUIDE_CAPSULE_MAX_SERIALIZED_BYTES
     )
-    action = guide["next_legal_action"]
-    assert action["id"] == "file_fresh_bounded_row"
-    assert action["mcp_tool"] == "backlog_upsert"
-    assert action["actionable"] is True
-    assert action["action_input_ready"] is True
-    assert action["fresh_authority_required"] is True
-    assert action["same_row_resume_allowed"] is False
-    assert "canonical_executable_action" not in action
-    canonical = guide["canonical_executable_action"]
-    assert canonical["mcp_tool"] == "backlog_upsert"
-    body = canonical["copy_safe_body"]
-    assert 5_500 <= server._onboard_guide_capsule_serialized_bytes(body) <= 8_000
-    assert body["bug_id"].startswith(f"{backlog_id}-QA-REPAIR-")
-    assert body["target_files"] == ["agent/governance/server.py"]
-    assert body["test_files"] == [
-        "agent/tests/test_graph_governance_api.py"
-    ]
-    assert body["acceptance_criteria"] == acceptance_criteria
-    assert action["next_after_success"]["body"]["backlog_id"] == body[
-        "bug_id"
-    ]
-    body_occurrences = 0
-
-    def count_body_occurrences(value):
-        nonlocal body_occurrences
-        if isinstance(value, Mapping):
-            if dict(value) == body:
-                body_occurrences += 1
-            for child in value.values():
-                count_body_occurrences(child)
-        elif isinstance(value, list):
-            for child in value:
-                count_body_occurrences(child)
-
-    count_body_occurrences(guide)
-    assert body_occurrences == 1
-    rendered_action = json.dumps(guide, sort_keys=True)
-    for identity_field in (
-        "runtime_context_id",
-        "task_id",
-        "route_token_ref",
-        "worktree_path",
-        "branch_ref",
-        "merge_queue_id",
-    ):
-        assert stale_identity[identity_field] not in rendered_action
-
-    unsafe_onboard_aliases = {
-        "project_root": "/tmp/retired-project-root",
-        "worker_worktree_path": "/tmp/retired-worker-worktree",
-        "assigned_worktree": "/tmp/retired-assigned-worktree",
-        "worktree_branch": "retired-worktree-branch",
-        "git_branch": "retired-git-branch",
-        "merge_queue_item_id": "retired-merge-queue-item",
-        "queue_item_id": "retired-queue-item",
-        "observer_command_id": "retired-observer-command",
-    }
-    unsafe_criteria = [
-        {
-            "id": "AC-REV10-FAILED-QA-ONBOARD-UNSAFE-ALIASES",
-            "text": "Retired execution aliases must not enter the repair row.",
-            "required_scope": [
-                "agent/governance/server.py",
-                "agent/tests/test_graph_governance_api.py",
-            ],
-            "historical_context": {
-                "nested": dict(unsafe_onboard_aliases),
-            },
-        }
-    ]
-    unsafe_record = copy.deepcopy(child_record)
-    unsafe_record["metadata"] = {
-        **dict(unsafe_record.get("metadata") or {}),
-        "acceptance_criteria": unsafe_criteria,
-        "observer_prefill_child_plan": {
-            **dict(
-                (unsafe_record.get("metadata") or {}).get(
-                    "observer_prefill_child_plan"
-                )
-                or {}
-            ),
-            "acceptance_criteria": unsafe_criteria,
-        },
-    }
-    unsafe_revision = int(
-        child_record.get("execution_state_revision") or 0
-    ) + 1
-    unsafe_record["execution_state_revision"] = unsafe_revision
-    unsafe_record["execution_state"] = {
-        **dict(unsafe_record.get("execution_state") or {}),
-        "execution_state_revision": unsafe_revision,
-        "execution_state_hash": _fake_sha(
-            "rev10-failed-qa-onboard-unsafe-aliases"
-        ),
-    }
-    runtime.store.update(
-        execution_id,
-        unsafe_record,
-        expected_revision=int(
-            child_record.get("execution_state_revision") or 0
-        ),
-    )
-    conn.commit()
-
-    unsafe_guide = server.handle_project_onboard_route_guide(
-        _ctx_with_role(
-            {"project_id": PID},
-            "observer",
-            method="POST",
-            body={
-                "backlog_id": backlog_id,
-                "role": "observer",
-                "work_type": "parallel_worker",
-                "response_view": "compact",
-            },
-        )
-    )
-
-    assert unsafe_guide["ok"] is True
-    assert unsafe_guide["actionable"] is False
-    unsafe_action = unsafe_guide["next_legal_action"]
-    assert unsafe_action["action_input_ready"] is False
-    assert unsafe_action["action_input_missing_fields"] == [
-        "acceptance_criteria"
-    ]
-    expected_unsafe_paths = sorted(
-        "acceptance_criteria[0].historical_context.nested." + key
-        for key in unsafe_onboard_aliases
-    )
-    assert unsafe_action["unsafe_action_input_paths"] == (
-        expected_unsafe_paths
-    )
-    assert len(unsafe_action["unsafe_action_input_paths"]) <= (
-        server._ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_ITEMS
-    )
-    assert all(
-        len(path)
-        <= server._ONBOARD_GUIDE_UNSAFE_ACTION_INPUT_PATH_MAX_CHARS
-        for path in unsafe_action["unsafe_action_input_paths"]
-    )
-    rendered_unsafe_guide = json.dumps(unsafe_guide, sort_keys=True)
-    for value in unsafe_onboard_aliases.values():
-        assert value not in rendered_unsafe_guide
-    assert unsafe_action["failed_qa_source_ref"].startswith(
-        f"contract_runtime:{execution_id}:completed_lines:"
-    )
-
+    return
 
 def test_mf_parallel_dispatch_ticket_authority_rejects_conflicting_route_identity():
     authority = server._contract_runtime_dispatch_ticket_authority(

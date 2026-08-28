@@ -26,6 +26,7 @@ from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from threading import BoundedSemaphore, Event, RLock, local
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping, NamedTuple, NoReturn, Sequence
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
@@ -34,10 +35,6 @@ if _agent_dir not in sys.path:
 
 from .errors import GovernanceError, PermissionDeniedError, ValidationError
 from .dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
-from .parallel_branch_runtime import (
-    PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS,
-    parallel_branch_authority_field_is_nontransferable,
-)
 import logging
 import sqlite3
 import time
@@ -104819,14 +104816,6 @@ _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS = (
     ),
 )
 
-_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES: tuple[str, ...] = ()
-_CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES: tuple[
-    str, ...
-] = ()
-_CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS = frozenset()
-_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset()
-
-
 def _contract_runtime_is_server_canonical_collection_source_name(
     source_name: Any,
 ) -> bool:
@@ -104837,9 +104826,6 @@ def _contract_runtime_is_server_canonical_collection_source_name(
         and not name.startswith("_CONTRACT_RUNTIME_SERVER_CANONICAL_")
         and name
         not in {
-            "_CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS",
-            "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
-            "_CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS",
             "_CONTRACT_RUNTIME_FRESH_REPAIR_CANONICAL_ENVELOPE_REQUIRED_FIELDS",
             "_RUNTIME_CONTEXT_PUBLIC_ERROR_ACTION_KEYS",
             "_TIMELINE_WARM_CACHE_RESOURCE_KEYS",
@@ -104935,13 +104921,59 @@ def _contract_runtime_canonical_source_record_registry_meta_audit(
         name for name in set(source_names) if source_names.count(name) != 1
     )
     errors.extend(f"registry.duplicate_source.{name}" for name in duplicate_names)
-    normalized = sorted(normalized, key=lambda item: item["source_name"])
+    ordered_registry_hash = stable_sha256(normalized)
+    entry_count = sum(len(record.field_partitions) for record in records)
+    # Compile-time closure constants. They are intentionally literals rather
+    # than values recomputed from the live registry and accepted as authority.
+    if len(records) != 63:
+        errors.append("registry.golden_record_count")
+    if entry_count != 849:
+        errors.append("registry.golden_entry_count")
+    if ordered_registry_hash != (
+        "sha256:7f04557fabb202c10e5970ccb74ed55a1740939d1e425c847407966c8cbe89de"
+    ):
+        errors.append("registry.golden_ordered_hash")
+    source_field_dispositions: dict[str, dict[str, str]] = {}
+    global_dispositions: dict[str, set[str]] = {}
+    for record in records:
+        partition = dict(record.field_partitions)
+        source_field_dispositions[record.source_name] = partition
+        for field_name, disposition in record.field_partitions:
+            global_dispositions.setdefault(field_name, set()).add(disposition)
+    dominance = {
+        field_name: (
+            "authority_leaf"
+            if "authority_leaf" in dispositions
+            else "recursive_container"
+            if "recursive_container" in dispositions
+            else "audited_non_authority"
+        )
+        for field_name, dispositions in global_dispositions.items()
+    }
+    conflicts = {
+        field_name: sorted(dispositions)
+        for field_name, dispositions in global_dispositions.items()
+        if len(dispositions) > 1
+    }
+    immutable_source_index = MappingProxyType(
+        {
+            source_name: MappingProxyType(dict(dispositions))
+            for source_name, dispositions in source_field_dispositions.items()
+        }
+    )
+    immutable_global_index = MappingProxyType(dict(dominance))
     return {
         "complete": not errors,
         "diagnostic_paths": sorted(set(errors)),
         "records": tuple(records) if not errors else (),
         "normalized_records": normalized,
-        "registry_schema_hash": stable_sha256(normalized),
+        "registry_schema_hash": ordered_registry_hash,
+        "golden_record_count": len(records),
+        "golden_entry_count": entry_count,
+        "field_dispositions_by_source": immutable_source_index,
+        "global_compatibility_index": immutable_global_index,
+        "cross_source_disposition_conflicts": conflicts,
+        "cross_source_conflict_hash": stable_sha256(conflicts),
     }
 
 
@@ -105001,14 +105033,8 @@ def _contract_runtime_server_canonical_field_dispositions(
     meta = _contract_runtime_canonical_source_record_registry_meta_audit()
     if not meta["complete"]:
         return ()
-    record = next((item for item in meta["records"] if item.source_name == source), None)
-    if record is None:
-        return ()
-    return tuple(
-        disposition
-        for name, disposition in record.field_partitions
-        if name == field
-    )
+    disposition = meta["field_dispositions_by_source"].get(source, {}).get(field)
+    return (disposition,) if disposition else ()
 
 
 def _contract_runtime_server_canonical_source_registry_audit(
@@ -105052,7 +105078,10 @@ def _contract_runtime_server_canonical_source_registry_audit(
         scalar_source_fields[source_name] = sorted(fields)
         for field_name in fields:
             path = f"{source_name}.{field_name}"
-            field_memberships[path] = _contract_runtime_server_canonical_field_dispositions(source_name, field_name)
+            disposition = meta["field_dispositions_by_source"].get(
+                source_name, {}
+            ).get(field_name)
+            field_memberships[path] = (disposition,) if disposition else ()
         live_fields = set(fields)
         partition_fields = {name for name, _ in record.field_partitions}
         stale_partitions.extend(
@@ -105067,7 +105096,10 @@ def _contract_runtime_server_canonical_source_registry_audit(
     for source_name, fields in scalar_source_fields.items():
         for field_name in fields:
             path = f"{source_name}.{field_name}"
-            field_memberships[path] = _contract_runtime_server_canonical_field_dispositions(source_name, field_name)
+            disposition = meta["field_dispositions_by_source"].get(
+                source_name, {}
+            ).get(field_name)
+            field_memberships[path] = (disposition,) if disposition else ()
     field_paths_by_disposition = {
         disposition: sorted(
             field_path
@@ -105121,6 +105153,12 @@ def _contract_runtime_server_canonical_source_registry_audit(
         "raw_source_signatures": raw_signatures,
         "source_shape_validity": source_validation,
         "registry_schema_hash": meta["registry_schema_hash"],
+        "golden_record_count": meta["golden_record_count"],
+        "golden_entry_count": meta["golden_entry_count"],
+        "field_dispositions_by_source": meta["field_dispositions_by_source"],
+        "global_compatibility_index": meta["global_compatibility_index"],
+        "cross_source_disposition_conflicts": meta["cross_source_disposition_conflicts"],
+        "cross_source_conflict_hash": meta["cross_source_conflict_hash"],
         "semantic_registry_hash": stable_sha256(semantic_payload),
     }
 
@@ -105193,89 +105231,48 @@ def _contract_runtime_is_server_canonical_authority_field_source(
 
 def _contract_runtime_server_canonical_authority_field_sources(
 ) -> dict[str, frozenset[str]]:
-    inventory = _contract_runtime_server_canonical_collection_sources()
+    audit = _contract_runtime_require_canonical_authority_registry_complete()
     return {
-        source_name: partition_fields
-        for source_name in sorted(inventory)
+        source_name: frozenset(
+            field_name
+            for field_name, disposition in dispositions.items()
+            if disposition == "authority_leaf"
+        )
+        for source_name, dispositions in audit["field_dispositions_by_source"].items()
         if (
-            partition_fields := frozenset(
-                field_name
-                for field_name in inventory[source_name]
-                if "authority_leaf"
-                in _contract_runtime_server_canonical_field_dispositions(
-                    source_name,
-                    field_name,
-                )
-            )
+            any(disposition == "authority_leaf" for disposition in dispositions.values())
         )
     }
 
 
 def _contract_runtime_server_canonical_authority_container_sources(
 ) -> dict[str, frozenset[str]]:
-    inventory = _contract_runtime_server_canonical_collection_sources()
+    audit = _contract_runtime_require_canonical_authority_registry_complete()
     return {
-        source_name: partition_fields
-        for source_name in sorted(inventory)
+        source_name: frozenset(
+            field_name
+            for field_name, disposition in dispositions.items()
+            if disposition == "recursive_container"
+        )
+        for source_name, dispositions in audit["field_dispositions_by_source"].items()
         if (
-            partition_fields := frozenset(
-                field_name
-                for field_name in inventory[source_name]
-                if "recursive_container"
-                in _contract_runtime_server_canonical_field_dispositions(
-                    source_name,
-                    field_name,
-                )
-            )
+            any(disposition == "recursive_container" for disposition in dispositions.values())
         )
     }
 
 
 def _contract_runtime_refresh_canonical_authority_field_inventory(
 ) -> frozenset[str]:
-    global _CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS
-    global _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
-    global _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_DENYLIST
-    global _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES
-    global _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES
-
-    _contract_runtime_require_canonical_authority_registry_complete()
-    sources = _contract_runtime_server_canonical_authority_field_sources()
-    container_sources = (
-        _contract_runtime_server_canonical_authority_container_sources()
-    )
-    derived = frozenset(
+    audit = _contract_runtime_require_canonical_authority_registry_complete()
+    return frozenset(
         field_name
-        for field_source in sources.values()
-        for field_name in field_source
+        for field_name, disposition in audit["global_compatibility_index"].items()
+        if disposition == "authority_leaf"
     )
-    _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = derived
-    _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES = tuple(sources)
-    _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES = (
-        tuple(container_sources)
-    )
-    _CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS = frozenset(
-        field_name
-        for field_source in container_sources.values()
-        for field_name in field_source
-    )
-    matrix = globals().get(
-        "_CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX"
-    )
-    if isinstance(matrix, dict):
-        matrix["canonical_schema"] = derived
-        _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_DENYLIST = frozenset(
-            re.sub(r"[^a-z0-9]+", "", field_name.casefold())
-            for field_source in matrix.values()
-            for field_name in field_source
-        )
-    return derived
 
 
 _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_ALIAS_MATRIX = {
-    "canonical_schema": (
-        _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
-    ),
+    "canonical_schema": frozenset(),
     "credential": frozenset(
         {
             "access_token",
@@ -105649,12 +105646,6 @@ _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_SUFFIXES = (
     "traceid",
     "traceids",
 )
-_CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS = frozenset(
-    str(field_name).casefold()
-    for record in _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS
-    for field_name, disposition in record.field_partitions
-    if disposition == "audited_non_authority"
-)
 _CONTRACT_RUNTIME_FRESH_REPAIR_CANONICAL_ENVELOPE_REQUIRED_FIELDS = {
     "_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS": frozenset(
         {
@@ -105707,48 +105698,33 @@ def _contract_runtime_key_is_execution_authority_or_credential(
     key: Any,
     *,
     canonical_source_names: Sequence[str] = (),
+    validated_authority_context: Mapping[str, Any] | None = None,
 ) -> bool:
     """Classify keys that cannot cross a retired execution generation."""
 
     key_name = str(key or "").strip()
+    context = validated_authority_context or (
+        _contract_runtime_require_canonical_authority_registry_complete()
+    )
     canonical_dispositions = tuple(
         disposition
         for source_name in canonical_source_names
-        for disposition in (
-            _contract_runtime_server_canonical_field_dispositions(
-                source_name,
-                key_name,
-            )
+        if (
+            disposition := context["field_dispositions_by_source"]
+            .get(source_name, {})
+            .get(key_name)
         )
     )
     if canonical_dispositions:
         return "authority_leaf" in canonical_dispositions
-    if (
-        not canonical_source_names
-        and key_name.casefold()
-        in _CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS
-    ):
-        # A lone semantic label does not assert a canonical source identity.
+    if canonical_source_names:
         return False
-    if not parallel_branch_authority_field_is_nontransferable(key_name):
+    disposition = context["global_compatibility_index"].get(key_name)
+    if disposition is None:
+        # Arbitrary acceptance prose may contain application-specific keys.
+        # Only the validated global index can classify an unscoped key.
         return False
-    if (
-        key_name.casefold()
-        in _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
-    ):
-        return True
-    if _caller_timeline_key_is_credential(key):
-        return True
-    compact = re.sub(r"[^a-z0-9]+", "", key_name.casefold())
-    if not compact:
-        return False
-    return bool(
-        compact
-        in _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_DENYLIST
-        or compact.endswith(
-            _CONTRACT_RUNTIME_EXECUTION_AUTHORITY_KEY_COMPACT_SUFFIXES
-        )
-    )
+    return disposition in {"authority_leaf", "recursive_container"}
 
 
 def _contract_runtime_unsafe_execution_authority_paths(
@@ -105759,6 +105735,13 @@ def _contract_runtime_unsafe_execution_authority_paths(
     """Return key paths carrying retired authority without copying values."""
 
     unsafe_paths: list[str] = []
+    authority_context = (
+        _contract_runtime_require_canonical_authority_registry_complete()
+    )
+    canonical_collection_sources = {
+        source_name: frozenset(fields)
+        for source_name, fields in authority_context["scalar_source_fields"].items()
+    }
 
     def collect(child: Any, path: str) -> None:
         if isinstance(child, Mapping):
@@ -105766,11 +105749,6 @@ def _contract_runtime_unsafe_execution_authority_paths(
                 _contract_runtime_fresh_repair_canonical_envelope_sources(
                     child
                 )
-            )
-            canonical_collection_sources = (
-                _contract_runtime_server_canonical_collection_sources()
-                if canonical_source_names
-                else {}
             )
             for raw_key, nested in child.items():
                 key = str(raw_key or "").strip()
@@ -105784,11 +105762,9 @@ def _contract_runtime_unsafe_execution_authority_paths(
                             source_name,
                             (),
                         )
-                        or not (
-                            _contract_runtime_server_canonical_field_dispositions(
-                                source_name,
-                                key,
-                            )
+                        or key
+                        not in authority_context["field_dispositions_by_source"].get(
+                            source_name, {}
                         )
                     ]
                     if missing_source_fields:
@@ -105798,6 +105774,7 @@ def _contract_runtime_unsafe_execution_authority_paths(
                 if _contract_runtime_key_is_execution_authority_or_credential(
                     key,
                     canonical_source_names=canonical_source_names,
+                    validated_authority_context=authority_context,
                 ):
                     unsafe_paths.append(nested_path)
                     continue
