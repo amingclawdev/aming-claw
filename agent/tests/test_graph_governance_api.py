@@ -11670,6 +11670,26 @@ class _CountingNoCloseConn(_NoCloseConn):
         return self._conn.commit()
 
 
+def _file_backed_backlog_read_schema_conn(tmp_path: Path) -> sqlite3.Connection:
+    db_path = tmp_path / "governance.db"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    server._ensure_backlog_read_schema(connection)
+    return connection
+
+
+def _sqlite_schema_snapshot(connection: sqlite3.Connection) -> tuple[tuple, ...]:
+    return tuple(
+        tuple(row)
+        for row in connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "ORDER BY type, name"
+        ).fetchall()
+    )
+
+
 def _ctx(path_params: dict, *, method: str = "GET", query: dict | None = None, body: dict | None = None):
     return server.RequestContext(
         None,
@@ -28730,6 +28750,288 @@ def test_audit_recovery_backlog_close_uses_archive_and_qa_without_mf_worker_gate
             )
         )
     assert exc_info.value.code == "mf_timeline_gate_failed"
+
+
+def test_ac_dev_backlog_read_schema_verify_only_succeeds_without_any_write(
+    monkeypatch,
+    tmp_path,
+):
+    connection = _file_backed_backlog_read_schema_conn(tmp_path)
+    denied_actions: list[tuple[int, str | None]] = []
+
+    def tracked_dev_authorizer(action, arg1, arg2, database, source):
+        decision = governance_db._dev_schema_authorizer(
+            action,
+            arg1,
+            arg2,
+            database,
+            source,
+        )
+        if decision == sqlite3.SQLITE_DENY:
+            denied_actions.append((action, arg1))
+        return decision
+
+    before_schema = _sqlite_schema_snapshot(connection)
+    before_temp_schema = tuple(
+        tuple(row)
+        for row in connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_temp_master "
+            "ORDER BY type, name"
+        ).fetchall()
+    )
+    before_changes = connection.total_changes
+    before_data_version = connection.execute("PRAGMA data_version").fetchone()[0]
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(connection),
+    )
+    server._backlog_read_cache_clear()
+    connection.set_authorizer(tracked_dev_authorizer)
+    try:
+        server._ac_dev_verify_backlog_read_schema(connection)
+        result = server.handle_backlog_list(
+            _ctx(
+                {"project_id": "aming-claw"},
+                query={"view": "compact", "limit": "1"},
+            )
+        )
+
+        assert result["count"] == 0
+        assert result["limit"] == 1
+        assert connection.total_changes == before_changes
+        assert connection.execute("PRAGMA data_version").fetchone()[0] == before_data_version
+        assert _sqlite_schema_snapshot(connection) == before_schema
+        assert tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_temp_master "
+                "ORDER BY type, name"
+            ).fetchall()
+        ) == before_temp_schema
+        assert connection.in_transaction is False
+        assert denied_actions == []
+    finally:
+        connection.set_authorizer(None)
+        connection.close()
+
+
+def test_stable_backlog_read_schema_initialization_remains_handler_owned(
+    monkeypatch,
+    tmp_path,
+):
+    connection = sqlite3.connect(tmp_path / "governance.db")
+    connection.row_factory = sqlite3.Row
+    _ensure_schema(connection)
+    store.ensure_schema(connection)
+    connection.commit()
+    wrapped = _CountingNoCloseConn(connection)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: wrapped)
+    server._backlog_read_cache_clear()
+
+    try:
+        result = server.handle_backlog_list(
+            _ctx(
+                {"project_id": "aming-claw"},
+                query={"view": "compact", "limit": "1"},
+            )
+        )
+
+        assert result["count"] == 0
+        assert wrapped.commit_calls == 1
+        server._ac_dev_verify_backlog_read_schema(connection)
+        assert connection.execute(
+            "SELECT generation FROM dashboard_backlog_cache_generation "
+            "WHERE resource='backlog'"
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_component"),
+    [
+        ("missing_table", "generation_table"),
+        ("wrong_table_object", "generation_table"),
+        ("wrong_columns", "generation_table_columns"),
+        ("missing_index", "keyset_index"),
+        ("wrong_index_definition", "keyset_index_definition"),
+        ("wrong_index_owner", "keyset_index_definition"),
+        ("missing_trigger_insert", "trigger_insert"),
+        ("missing_trigger_update", "trigger_update"),
+        ("missing_trigger_delete", "trigger_delete"),
+        ("wrong_trigger_insert", "trigger_insert_definition"),
+        ("wrong_trigger_update", "trigger_update_definition"),
+        ("wrong_trigger_delete", "trigger_delete_definition"),
+        ("wrong_trigger_literal", "trigger_insert_definition"),
+        ("wrong_trigger_owner", "trigger_insert_definition"),
+        ("missing_seed", "backlog_generation_seed"),
+        ("wrong_seed", "backlog_generation_seed"),
+    ],
+)
+def test_ac_dev_backlog_read_schema_mismatch_is_typed_and_zero_write(
+    monkeypatch,
+    tmp_path,
+    fault,
+    expected_component,
+):
+    connection = _file_backed_backlog_read_schema_conn(tmp_path)
+    if fault == "missing_table":
+        connection.execute("DROP TABLE dashboard_backlog_cache_generation")
+    elif fault == "wrong_table_object":
+        connection.execute("DROP TABLE dashboard_backlog_cache_generation")
+        connection.execute(
+            "CREATE VIEW dashboard_backlog_cache_generation AS "
+            "SELECT 'backlog' AS resource, 1 AS generation, 'now' AS updated_at"
+        )
+    elif fault == "wrong_columns":
+        connection.execute("DROP TABLE dashboard_backlog_cache_generation")
+        connection.execute(
+            "CREATE TABLE dashboard_backlog_cache_generation "
+            "(resource TEXT PRIMARY KEY, generation TEXT, updated_at TEXT)"
+        )
+    elif fault == "missing_index":
+        connection.execute("DROP INDEX idx_backlog_bugs_dashboard_keyset")
+    elif fault == "wrong_index_definition":
+        connection.execute("DROP INDEX idx_backlog_bugs_dashboard_keyset")
+        connection.execute(
+            "CREATE INDEX idx_backlog_bugs_dashboard_keyset "
+            "ON backlog_bugs(bug_id)"
+        )
+    elif fault == "wrong_index_owner":
+        connection.execute("DROP INDEX idx_backlog_bugs_dashboard_keyset")
+        connection.execute(
+            "CREATE INDEX idx_backlog_bugs_dashboard_keyset ON schema_meta(key)"
+        )
+    elif fault.startswith("missing_trigger_"):
+        event = fault.removeprefix("missing_trigger_")
+        connection.execute(
+            f"DROP TRIGGER trg_dashboard_backlog_cache_{event}"
+        )
+    elif fault.startswith("wrong_trigger_") and fault not in {
+        "wrong_trigger_literal",
+        "wrong_trigger_owner",
+    }:
+        event = fault.removeprefix("wrong_trigger_")
+        connection.execute(
+            f"DROP TRIGGER trg_dashboard_backlog_cache_{event}"
+        )
+        connection.execute(
+            f"CREATE TRIGGER trg_dashboard_backlog_cache_{event} "
+            f"AFTER {event.upper()} ON backlog_bugs BEGIN SELECT 1; END"
+        )
+    elif fault == "wrong_trigger_literal":
+        connection.execute("DROP TRIGGER trg_dashboard_backlog_cache_insert")
+        connection.execute(
+            "CREATE TRIGGER trg_dashboard_backlog_cache_insert "
+            "AFTER INSERT ON backlog_bugs BEGIN "
+            "UPDATE dashboard_backlog_cache_generation "
+            "SET generation=generation+1, updated_at=CURRENT_TIMESTAMP "
+            "WHERE resource='BACKLOG'; END"
+        )
+    elif fault == "wrong_trigger_owner":
+        connection.execute("DROP TRIGGER trg_dashboard_backlog_cache_insert")
+        connection.execute(
+            "CREATE TRIGGER trg_dashboard_backlog_cache_insert "
+            "AFTER INSERT ON schema_meta BEGIN SELECT 1; END"
+        )
+    elif fault == "missing_seed":
+        connection.execute(
+            "DELETE FROM dashboard_backlog_cache_generation "
+            "WHERE resource='backlog'"
+        )
+    elif fault == "wrong_seed":
+        connection.execute(
+            "UPDATE dashboard_backlog_cache_generation SET generation=0 "
+            "WHERE resource='backlog'"
+        )
+    else:
+        raise AssertionError(f"unhandled test fault: {fault}")
+    connection.commit()
+
+    denied_actions: list[tuple[int, str | None]] = []
+
+    def tracked_dev_authorizer(action, arg1, arg2, database, source):
+        decision = governance_db._dev_schema_authorizer(
+            action,
+            arg1,
+            arg2,
+            database,
+            source,
+        )
+        if decision == sqlite3.SQLITE_DENY:
+            denied_actions.append((action, arg1))
+        return decision
+
+    before_schema = _sqlite_schema_snapshot(connection)
+    before_changes = connection.total_changes
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    connection.set_authorizer(tracked_dev_authorizer)
+    try:
+        with pytest.raises(GovernanceError) as exc_info:
+            server._ac_dev_verify_backlog_read_schema(connection)
+
+        error = exc_info.value
+        assert error.code == "ac_dev_backlog_read_schema_incompatible"
+        assert error.status == 409
+        assert expected_component in error.details["incompatible_components"]
+        assert error.details["ddl_attempted"] is False
+        assert error.details["dml_attempted"] is False
+        assert error.details["commit_attempted"] is False
+        assert error.details["temp_object_attempted"] is False
+        assert error.details["backfill_attempted"] is False
+        assert error.details["journal_mode_attempted"] is False
+        assert error.details["writes_performed"] is False
+        assert connection.total_changes == before_changes
+        assert _sqlite_schema_snapshot(connection) == before_schema
+        assert connection.in_transaction is False
+        assert denied_actions == []
+    finally:
+        connection.set_authorizer(None)
+        connection.close()
+
+
+def test_ac_dev_backlog_read_schema_mismatch_is_http_409_not_raw_500(
+    monkeypatch,
+    tmp_path,
+):
+    connection = _file_backed_backlog_read_schema_conn(tmp_path)
+    connection.execute("DROP INDEX idx_backlog_bugs_dashboard_keyset")
+    connection.commit()
+    before_changes = connection.total_changes
+    connection.set_authorizer(governance_db._dev_schema_authorizer)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(connection),
+    )
+    handler = _bare_handler()
+    handler.path = "/api/backlog/aming-claw?view=compact&limit=1"
+    captured: dict[str, Any] = {}
+    handler._respond = lambda code, body, *_args: captured.update(
+        code=code,
+        body=body,
+    )
+    try:
+        handler._handle("GET")
+
+        assert captured["code"] == 409
+        assert captured["body"]["error"] == (
+            "ac_dev_backlog_read_schema_incompatible"
+        )
+        assert captured["body"]["details"]["incompatible_components"] == [
+            "keyset_index"
+        ]
+        assert captured["body"]["details"]["writes_performed"] is False
+        assert captured["body"]["details"]["ddl_attempted"] is False
+        assert "not authorized" not in json.dumps(captured["body"]).lower()
+        assert connection.total_changes == before_changes
+    finally:
+        connection.set_authorizer(None)
+        connection.close()
 
 
 def test_backlog_list_server_search_supports_status_priority_and_pagination(conn):

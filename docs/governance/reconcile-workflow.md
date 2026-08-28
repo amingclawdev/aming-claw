@@ -797,6 +797,19 @@ AC repair work uses two independent runtime planes:
   creation, schema execution, or writes. AC dev connections verify the
   existing schema version and never auto-migrate it; schema repairs run
   against an isolated clone first.
+- Stable/generic remains the sole initializer for the optimized backlog-read
+  schema. It creates the exact dashboard keyset index, generation table and
+  `resource=backlog` seed, and the insert/update/delete generation triggers,
+  then preserves the existing commit behavior. An optimized own-project read
+  on dev instead performs a pure verification of those stable-owned objects:
+  exact generation columns and primary key, exact index owner and normalized
+  SQL, exact trigger owner/event/body, and a valid seed. This path issues no
+  DDL, DML, commit, temporary object, migration, backfill, or journal-mode
+  operation; the normal pagination, authority, generation, cache, and response
+  budgets are unchanged. Any missing or drifted object fails before the read
+  with HTTP 409 `ac_dev_backlog_read_schema_incompatible`, bounded public-safe
+  component names, and explicit `writes_performed=false`. Dev does not repair
+  or lazily initialize this schema.
 - A separate discovery capability may read a non-AC project only when its
   exact normalized key is already initialized and active in `projects.json`,
   its governance policy says `public_safe=true`, and its project directory and

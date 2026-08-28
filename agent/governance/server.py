@@ -205357,48 +205357,189 @@ def _append_backlog_filters(sql: str, params: list[Any], ctx: RequestContext) ->
     return sql, params
 
 
+_BACKLOG_READ_SCHEMA_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_backlog_bugs_dashboard_keyset
+    ON backlog_bugs(updated_at DESC, created_at DESC, bug_id DESC)
+"""
+_BACKLOG_READ_SCHEMA_TABLE_DEFINITION = (
+    (("resource", "TEXT", 0, None, 1), "resource TEXT PRIMARY KEY"),
+    (("generation", "INTEGER", 1, "1", 0), "generation INTEGER NOT NULL DEFAULT 1"),
+    (("updated_at", "TEXT", 1, "''", 0), "updated_at TEXT NOT NULL DEFAULT ''"),
+)
+_BACKLOG_READ_SCHEMA_TABLE_COLUMNS = tuple(
+    metadata for metadata, _sql in _BACKLOG_READ_SCHEMA_TABLE_DEFINITION
+)
+_BACKLOG_READ_SCHEMA_TABLE_SQL = (
+    "CREATE TABLE IF NOT EXISTS dashboard_backlog_cache_generation (\n    "
+    + ",\n    ".join(sql for _metadata, sql in _BACKLOG_READ_SCHEMA_TABLE_DEFINITION)
+    + "\n)"
+)
+_BACKLOG_READ_SCHEMA_RESOURCE = "backlog"
+_BACKLOG_READ_SCHEMA_SEED_SQL = f"""
+INSERT OR IGNORE INTO dashboard_backlog_cache_generation
+    (resource, generation, updated_at)
+VALUES ('{_BACKLOG_READ_SCHEMA_RESOURCE}', 1, CURRENT_TIMESTAMP)
+"""
+_BACKLOG_READ_SCHEMA_TRIGGER_SQL = {
+    event: f"""
+CREATE TRIGGER IF NOT EXISTS trg_dashboard_backlog_cache_{event.lower()}
+AFTER {event} ON backlog_bugs
+BEGIN
+    UPDATE dashboard_backlog_cache_generation
+       SET generation = generation + 1,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE resource = '{_BACKLOG_READ_SCHEMA_RESOURCE}';
+END
+"""
+    for event in ("INSERT", "UPDATE", "DELETE")
+}
+
+
+def _backlog_read_schema_normalized_sql(value: Any) -> str:
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        str(value or "").strip().rstrip(";"),
+    )
+    normalized = normalized.replace(" IF NOT EXISTS ", " ")
+    return re.sub(r"\s*([(),;])\s*", r"\1", normalized)
+
+
 def _ensure_backlog_read_schema(conn: sqlite3.Connection) -> None:
-    """Install the indexed keyset and exact mutation-generation triggers."""
+    """Stable-owned indexed keyset and mutation-generation initialization."""
 
     conn.executescript(
-        """
-        CREATE INDEX IF NOT EXISTS idx_backlog_bugs_dashboard_keyset
-            ON backlog_bugs(updated_at DESC, created_at DESC, bug_id DESC);
-        CREATE TABLE IF NOT EXISTS dashboard_backlog_cache_generation (
-            resource TEXT PRIMARY KEY,
-            generation INTEGER NOT NULL DEFAULT 1,
-            updated_at TEXT NOT NULL DEFAULT ''
-        );
-        INSERT OR IGNORE INTO dashboard_backlog_cache_generation
-            (resource, generation, updated_at)
-        VALUES ('backlog', 1, CURRENT_TIMESTAMP);
-        CREATE TRIGGER IF NOT EXISTS trg_dashboard_backlog_cache_insert
-        AFTER INSERT ON backlog_bugs
-        BEGIN
-            UPDATE dashboard_backlog_cache_generation
-               SET generation = generation + 1,
-                   updated_at = CURRENT_TIMESTAMP
-             WHERE resource = 'backlog';
-        END;
-        CREATE TRIGGER IF NOT EXISTS trg_dashboard_backlog_cache_update
-        AFTER UPDATE ON backlog_bugs
-        BEGIN
-            UPDATE dashboard_backlog_cache_generation
-               SET generation = generation + 1,
-                   updated_at = CURRENT_TIMESTAMP
-             WHERE resource = 'backlog';
-        END;
-        CREATE TRIGGER IF NOT EXISTS trg_dashboard_backlog_cache_delete
-        AFTER DELETE ON backlog_bugs
-        BEGIN
-            UPDATE dashboard_backlog_cache_generation
-               SET generation = generation + 1,
-                   updated_at = CURRENT_TIMESTAMP
-             WHERE resource = 'backlog';
-        END;
-        """
+        ";\n".join(
+            (
+                _BACKLOG_READ_SCHEMA_INDEX_SQL,
+                _BACKLOG_READ_SCHEMA_TABLE_SQL,
+                _BACKLOG_READ_SCHEMA_SEED_SQL,
+                *_BACKLOG_READ_SCHEMA_TRIGGER_SQL.values(),
+            )
+        )
+        + ";"
     )
     conn.commit()
+
+
+def _ac_dev_backlog_read_schema_incompatible(
+    components: Sequence[str],
+) -> GovernanceError:
+    return GovernanceError(
+        "ac_dev_backlog_read_schema_incompatible",
+        "AC dev optimized backlog reads require the exact stable-owned schema",
+        409,
+        {
+            "schema_version": "ac_dev_backlog_read_schema.verify_only.v1",
+            "runtime_plane": "dev",
+            "schema_owner": "stable_backlog_read_initialization",
+            "incompatible_components": sorted(set(components))[:16],
+            "verify_only": True,
+            "ddl_attempted": False,
+            "dml_attempted": False,
+            "commit_attempted": False,
+            "temp_object_attempted": False,
+            "backfill_attempted": False,
+            "journal_mode_attempted": False,
+            "migration_allowed": False,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "public_safe": True,
+            "secret_safe": True,
+        },
+    )
+
+
+def _ac_dev_verify_backlog_read_schema(conn: sqlite3.Connection) -> None:
+    """Verify stable-owned backlog read objects without DDL, DML, or commit."""
+
+    problems: list[str] = []
+    try:
+        table = conn.execute(
+            "SELECT type, tbl_name FROM sqlite_master WHERE name=?",
+            ("dashboard_backlog_cache_generation",),
+        ).fetchone()
+        if not table or tuple(table) != (
+            "table",
+            "dashboard_backlog_cache_generation",
+        ):
+            problems.append("generation_table")
+        else:
+            columns = tuple(
+                (
+                    str(row[1]),
+                    str(row[2]).upper(),
+                    int(row[3]),
+                    None if row[4] is None else str(row[4]),
+                    int(row[5]),
+                )
+                for row in conn.execute(
+                    'PRAGMA table_info("dashboard_backlog_cache_generation")'
+                ).fetchall()
+            )
+            if columns != _BACKLOG_READ_SCHEMA_TABLE_COLUMNS:
+                problems.append("generation_table_columns")
+
+        index = conn.execute(
+            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name=?",
+            ("idx_backlog_bugs_dashboard_keyset",),
+        ).fetchone()
+        if not index:
+            problems.append("keyset_index")
+        elif (
+            str(index[0]) != "index"
+            or str(index[1]) != "backlog_bugs"
+            or _backlog_read_schema_normalized_sql(index[2])
+            != _backlog_read_schema_normalized_sql(
+                _BACKLOG_READ_SCHEMA_INDEX_SQL
+            )
+        ):
+            problems.append("keyset_index_definition")
+
+        for event, expected_sql in _BACKLOG_READ_SCHEMA_TRIGGER_SQL.items():
+            name = f"trg_dashboard_backlog_cache_{event.lower()}"
+            trigger = conn.execute(
+                "SELECT type, tbl_name, sql FROM sqlite_master WHERE name=?",
+                (name,),
+            ).fetchone()
+            if not trigger:
+                problems.append(f"trigger_{event.lower()}")
+            elif (
+                str(trigger[0]) != "trigger"
+                or str(trigger[1]) != "backlog_bugs"
+                or _backlog_read_schema_normalized_sql(trigger[2])
+                != _backlog_read_schema_normalized_sql(expected_sql)
+            ):
+                problems.append(f"trigger_{event.lower()}_definition")
+
+        if not {
+            "generation_table",
+            "generation_table_columns",
+        }.intersection(problems):
+            seeds = conn.execute(
+                "SELECT resource, generation, updated_at "
+                "FROM dashboard_backlog_cache_generation "
+                "WHERE resource=?",
+                (_BACKLOG_READ_SCHEMA_RESOURCE,),
+            ).fetchall()
+            valid_seed = bool(
+                len(seeds) == 1
+                and type(seeds[0][0]) is str
+                and seeds[0][0] == _BACKLOG_READ_SCHEMA_RESOURCE
+                and type(seeds[0][1]) is int
+                and seeds[0][1] >= 1
+                and type(seeds[0][2]) is str
+                and bool(seeds[0][2])
+            )
+            if not valid_seed:
+                problems.append("backlog_generation_seed")
+    except sqlite3.Error:
+        raise _ac_dev_backlog_read_schema_incompatible(
+            ["schema_read_failed"]
+        ) from None
+    if problems:
+        raise _ac_dev_backlog_read_schema_incompatible(problems)
 
 
 def _backlog_read_authority(
@@ -205613,7 +205754,10 @@ def handle_backlog_list(ctx: RequestContext):
     conn = get_connection(pid)
     try:
         if optimized:
-            _ensure_backlog_read_schema(conn)
+            if _runtime_plane() == "dev":
+                _ac_dev_verify_backlog_read_schema(conn)
+            else:
+                _ensure_backlog_read_schema(conn)
         generation, authority_generation = (
             _backlog_read_authority(conn, pid)
             if optimized
