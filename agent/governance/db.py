@@ -30,6 +30,27 @@ AC_PROJECT_ID = "aming-claw"
 DEV_RUNTIME_PLANE = "dev"
 RUNTIME_PLANE_ENV = "AMING_CLAW_RUNTIME_PLANE"
 
+_DEV_EXTERNAL_PUBLIC_PROFILE = "project-wide-public-safe.v1"
+_DEV_EXTERNAL_SCOPED_PROFILE = "private-scoped-coordination.v1"
+_DEV_EXTERNAL_SCOPED_POLICY_SCHEMA = (
+    "ac.external_coordination_projection_policy.v1"
+)
+_DEV_EXTERNAL_SCOPED_ENDPOINT_PROFILE = "coordination-read-only.v1"
+_DEV_EXTERNAL_SCOPED_FIELD_PROFILE = (
+    "lifecycle-identifiers-status-counts-explicit-public-summary.v1"
+)
+_DEV_EXTERNAL_PUBLIC_ROUTE_KINDS = (
+    "backlog_list",
+    "backlog_item",
+    "graph_status",
+    "onboard",
+)
+_DEV_EXTERNAL_SCOPED_ROUTE_KINDS = (
+    "graph_status",
+    "onboard",
+    "coordination",
+)
+
 AC_DATABASE_STABLE_RELATIVE_PATH = (
     "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
 )
@@ -1186,12 +1207,68 @@ def _external_read_path_identity(path: Path, *, kind: str) -> os.stat_result:
     return before
 
 
+def _registered_external_projection_policy(policy: object) -> dict[str, object]:
+    """Return one closed dev-discovery profile or reject the registry entry."""
+
+    if not isinstance(policy, Mapping):
+        raise ValueError("external project has no typed governance policy")
+    if policy.get("public_safe") is True:
+        return {
+            "visibility_profile": _DEV_EXTERNAL_PUBLIC_PROFILE,
+            "field_profile": "public-safe-compact-backlog.v1",
+            "policy_schema_version": str(policy.get("schema_version") or ""),
+            "project_public_safe": True,
+            "allowed_route_kinds": list(_DEV_EXTERNAL_PUBLIC_ROUTE_KINDS),
+        }
+
+    expected_policy_keys = {
+        "schema_version",
+        "profile",
+        "public_safe",
+        "external_coordination_projection",
+    }
+    projection = policy.get("external_coordination_projection")
+    expected_projection_keys = {
+        "schema_version",
+        "enabled",
+        "endpoint_profile",
+        "field_profile",
+    }
+    if not (
+        set(policy) == expected_policy_keys
+        and policy.get("schema_version") == "governance_policy.v1"
+        and policy.get("profile") == "private-scoped-coordination"
+        and policy.get("public_safe") is False
+        and isinstance(projection, Mapping)
+        and set(projection) == expected_projection_keys
+        and projection.get("schema_version")
+        == _DEV_EXTERNAL_SCOPED_POLICY_SCHEMA
+        and projection.get("enabled") is True
+        and projection.get("endpoint_profile")
+        == _DEV_EXTERNAL_SCOPED_ENDPOINT_PROFILE
+        and projection.get("field_profile")
+        == _DEV_EXTERNAL_SCOPED_FIELD_PROFILE
+    ):
+        raise ValueError(
+            "external private project lacks the exact closed scoped projection policy"
+        )
+    return {
+        "visibility_profile": _DEV_EXTERNAL_SCOPED_PROFILE,
+        "field_profile": _DEV_EXTERNAL_SCOPED_FIELD_PROFILE,
+        "policy_schema_version": _DEV_EXTERNAL_SCOPED_POLICY_SCHEMA,
+        "project_public_safe": False,
+        "allowed_route_kinds": list(_DEV_EXTERNAL_SCOPED_ROUTE_KINDS),
+    }
+
+
 def registered_public_safe_external_project(project_id: str) -> dict:
-    """Resolve a registered public-safe project for dev read-only discovery.
+    """Resolve a registered public or explicitly scoped external projection.
 
     This reader intentionally bypasses ``project_service`` because that module's
     registry helper may create the registry parent.  Every path here must exist
-    already and is opened without a write-capable helper.
+    already and is opened without a write-capable helper.  A private project is
+    accepted only by the exact closed coordination profile above; a broad
+    ``public_safe`` flag is neither inferred nor substituted for that profile.
     """
 
     if not _is_dev_runtime():
@@ -1211,17 +1288,27 @@ def registered_public_safe_external_project(project_id: str) -> dict:
     entry = projects.get(canonical) if isinstance(projects, Mapping) else None
     if not isinstance(entry, Mapping):
         raise ValueError("external project is not registered")
-    if str(entry.get("project_id") or "") != canonical:
+    if (
+        type(entry.get("project_id")) is not str
+        or entry.get("project_id") != canonical
+    ):
         raise ValueError("external project registry key does not match project_id")
     if entry.get("initialized") is not True:
         raise ValueError("external project is not initialized")
-    if str(entry.get("status") or "").strip().lower() != "active":
+    if type(entry.get("status")) is not str or entry.get("status") != "active":
         raise ValueError("external project is not active")
     config = entry.get("project_config")
     governance = config.get("governance") if isinstance(config, Mapping) else None
     policy = governance.get("policy") if isinstance(governance, Mapping) else None
-    if not isinstance(policy, Mapping) or policy.get("public_safe") is not True:
-        raise ValueError("external project is not registered public-safe")
+    projection_policy = _registered_external_projection_policy(policy)
+    if (
+        canonical == "judgment-brain"
+        and projection_policy["visibility_profile"]
+        != _DEV_EXTERNAL_SCOPED_PROFILE
+    ):
+        raise ValueError(
+            "judgment-brain is private and requires the exact scoped projection policy"
+        )
 
     project_dir = root / canonical
     _external_read_path_identity(project_dir, kind="project directory")
@@ -1246,7 +1333,8 @@ def registered_public_safe_external_project(project_id: str) -> dict:
         "name": str(entry.get("name") or canonical),
         "status": "active",
         "initialized": True,
-        "public_safe": True,
+        "public_safe": projection_policy["project_public_safe"],
+        **projection_policy,
         "db_device": int(db_stat.st_dev),
         "db_inode": int(db_stat.st_ino),
         "storage_validated_without_database_open": True,

@@ -13088,6 +13088,48 @@ def _dev_external_discovery_fixture(monkeypatch, tmp_path):
     return paths
 
 
+def _dev_scoped_external_discovery_fixture(monkeypatch, tmp_path):
+    paths = _dev_external_discovery_fixture(monkeypatch, tmp_path)
+    monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE", raising=False)
+    conn = governance_db.get_connection("judgment-brain")
+    scoped_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    conn.close()
+    registry_path = (
+        tmp_path / "codex-tasks" / "state" / "governance" / "projects.json"
+    )
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["projects"]["judgment-brain"] = {
+        "project_id": "judgment-brain",
+        "name": "private coordination source",
+        "initialized": True,
+        "status": "active",
+        "project_config": {
+            "governance": {
+                "policy": {
+                    "schema_version": "governance_policy.v1",
+                    "profile": "private-scoped-coordination",
+                    "public_safe": False,
+                    "external_coordination_projection": {
+                        "schema_version": (
+                            "ac.external_coordination_projection_policy.v1"
+                        ),
+                        "enabled": True,
+                        "endpoint_profile": "coordination-read-only.v1",
+                        "field_profile": (
+                            "lifecycle-identifiers-status-counts-"
+                            "explicit-public-summary.v1"
+                        ),
+                    },
+                }
+            }
+        },
+    }
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    paths["judgment-brain"] = scoped_path
+    return paths, registry_path
+
+
 def _dev_external_stable_payload(path):
     match = re.fullmatch(
         (
@@ -13176,6 +13218,51 @@ def _dev_external_stable_payload(path):
             "pending_scope_reconcile": [{"private": "must not escape"}],
         }
     raise AssertionError(f"unexpected stable proxy path: {path}")
+
+
+def _dev_scoped_external_stable_payload(path):
+    payload = copy.deepcopy(_dev_external_stable_payload(path))
+    if "?view=compact" not in path:
+        if re.search(r"/JUDGMENT-BRAIN-PRIVATE$", path):
+            payload["title"] = "private title must not escape"
+            payload["priority"] = "P1"
+            payload["created_at"] = ""
+            payload["updated_at"] = ""
+        return payload
+    for row in payload["bugs"]:
+        row.update(
+            target_file_count=2,
+            test_file_count=1,
+            acceptance_count=3,
+            required_doc_count=1,
+            provenance_count=4,
+            contract_summary={
+                "has_contract": True,
+                "template_id": "",
+                "contract_instance_id": "cex-public-safe-id",
+                "required_evidence_count": 2,
+                "optional_evidence_count": 1,
+                "source_of_truth": "contract_runtime",
+                "projection_schema_version": "contract_projection.v1",
+                "projection_status": "current",
+                "projection_watermark": 7,
+                "stale": False,
+                "divergent": False,
+                "contract_hash": "sha256:" + "3" * 64,
+            },
+        )
+    for row in payload["bugs"]:
+        if row["public_safe"] is True:
+            row.update(
+                route_id="route-public",
+                route_context_sha256="sha256:" + "4" * 64,
+                decision_id="dec-public",
+                decision_source_sha256="sha256:" + "5" * 64,
+            )
+        else:
+            row["title"] = "private title must not escape"
+            row["details_md"] = "private decision body must not escape"
+    return payload
 
 
 def _dev_stable_health_payload(
@@ -13860,6 +13947,12 @@ def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
             {"project_id": project_id}, query={"view": "compact", "limit": "5"},
         )
         assert backlog["count"] == 1
+        assert backlog["project"] == {
+            "project_id": project_id,
+            "status": "active",
+            "initialized": True,
+            "public_safe": True,
+        }
         assert "details_md" not in backlog["bugs"][0]
         assert "route_token_ref" not in backlog["bugs"][0]
         assert backlog["stable_read_authority"]["project_id"] == project_id
@@ -13934,6 +14027,338 @@ def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
     assert not any("onboard-route-guide" in path for path in proxied_paths)
     for project_id, path in paths.items():
         assert path.read_bytes() == before[project_id]
+
+
+def test_ac_dev_private_scoped_registry_requires_exact_closed_policy(
+    monkeypatch,
+    tmp_path,
+):
+    paths, registry_path = _dev_scoped_external_discovery_fixture(
+        monkeypatch,
+        tmp_path,
+    )
+    before = paths["judgment-brain"].read_bytes()
+    monkeypatch.setattr(
+        governance_db.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("registry proof opened SQLite"),
+    )
+    registered = governance_db.registered_public_safe_external_project(
+        "judgment-brain"
+    )
+    assert registered["visibility_profile"] == "private-scoped-coordination.v1"
+    assert registered["project_public_safe"] is False
+    assert registered["allowed_route_kinds"] == [
+        "graph_status",
+        "onboard",
+        "coordination",
+    ]
+    assert paths["judgment-brain"].read_bytes() == before
+
+    original = json.loads(registry_path.read_text(encoding="utf-8"))
+    bad_policies = []
+    public_substitute = {"public_safe": True}
+    bad_policies.append(public_substitute)
+    for field, value in (
+        ("enabled", False),
+        ("endpoint_profile", "all-endpoints.v1"),
+        ("field_profile", "all-fields.v1"),
+        ("schema_version", "future-policy.v2"),
+    ):
+        policy = copy.deepcopy(
+            original["projects"]["judgment-brain"]["project_config"][
+                "governance"
+            ]["policy"]
+        )
+        policy["external_coordination_projection"][field] = value
+        bad_policies.append(policy)
+    extra_key = copy.deepcopy(
+        original["projects"]["judgment-brain"]["project_config"][
+            "governance"
+        ]["policy"]
+    )
+    extra_key["external_coordination_projection"]["unknown"] = True
+    bad_policies.append(extra_key)
+
+    for bad_policy in bad_policies:
+        registry = copy.deepcopy(original)
+        registry["projects"]["judgment-brain"]["project_config"][
+            "governance"
+        ]["policy"] = bad_policy
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
+        with pytest.raises(ValueError):
+            governance_db.registered_public_safe_external_project(
+                "judgment-brain"
+            )
+
+
+def test_ac_dev_private_scoped_coordination_projection_is_closed_and_read_only(
+    monkeypatch,
+    tmp_path,
+):
+    paths, _registry_path = _dev_scoped_external_discovery_fixture(
+        monkeypatch,
+        tmp_path,
+    )
+    before = paths["judgment-brain"].read_bytes()
+    stable_health = {
+        "required_health_tuple": {
+            "status": "ok",
+            "service": "governance",
+            "port": 40000,
+            "runtime_loaded_version": server._DEV_LEGACY_STABLE_HEALTH_COMMIT,
+            "runtime_stale": False,
+            "pid": 61297,
+        },
+        "required_health_tuple_sha256": "sha256:" + "6" * 64,
+        "legacy_a258_health": True,
+    }
+
+    def stable_window(request_paths):
+        return stable_health, [
+            _dev_scoped_external_stable_payload(path) for path in request_paths
+        ]
+
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_read_window",
+        stable_window,
+    )
+    for name in (
+        "get_connection",
+        "DBContext",
+        "_onboard_route_guide_service_response",
+        "_contract_runtime_require_canonical_authority_registry_complete",
+    ):
+        monkeypatch.setattr(
+            server,
+            name,
+            lambda *_args, _name=name, **_kwargs: pytest.fail(
+                f"scoped projection entered {_name}"
+            ),
+        )
+    monkeypatch.setattr(
+        governance_db.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("scoped projection opened SQLite"),
+    )
+    path = "/api/projects/judgment-brain/coordination-projection"
+    query = {"limit": "10", "include_closed": "true"}
+    route = server._guard_dev_runtime_request(
+        method="GET",
+        path=path,
+        path_params={"project_id": "judgment-brain"},
+        body={},
+        query=query,
+    )
+    assert route == "coordination"
+    result = server._handle_dev_external_read_only_discovery(
+        _ctx({"project_id": "judgment-brain"}, method="GET", query=query),
+        route_kind=route,
+    )
+    assert result["schema_version"] == (
+        "ac_dev_external_coordination_projection.v1"
+    )
+    assert result["project"]["public_safe"] is False
+    assert result["project"]["visibility_profile"] == (
+        "private-scoped-coordination.v1"
+    )
+    assert set(result["runtime"]) == {
+        "status",
+        "service",
+        "port",
+        "runtime_loaded_version",
+        "runtime_stale",
+        "identity_sha256",
+    }
+    assert result["runtime"]["port"] == 40000
+    assert "pid" not in result["runtime"]
+    assert set(result["graph"]) == {
+        "schema_version",
+        "project_id",
+        "graph_available",
+        "active_snapshot_id",
+        "active_commit",
+        "active_ref",
+        "public_safe",
+        "read_only",
+    }
+    public_intent, private_intent = result["backlog"]["intents"]
+    assert public_intent["public_summary"]["classification"] == "explicit_public"
+    assert public_intent["coordination_refs"] == {
+        "route_id": "route-public",
+        "route_context_sha256": "sha256:" + "4" * 64,
+        "decision_id": "dec-public",
+        "decision_source_sha256": "sha256:" + "5" * 64,
+    }
+    assert private_intent["public_summary_available"] is False
+    assert "public_summary" not in private_intent
+    encoded = json.dumps(result, sort_keys=True)
+    for forbidden in (
+        "private title must not escape",
+        "private decision body must not escape",
+        "details_md",
+        "hidden_prompt",
+        "route_token_ref",
+    ):
+        assert forbidden not in encoded
+    assert result["writes_performed"] is False
+    assert result["route_authority"] is False
+    assert result["cex_minted"] is False
+    assert result["managed_pass"] is False
+    assert paths["judgment-brain"].read_bytes() == before
+
+    graph_path = "/api/graph-governance/judgment-brain/status"
+    graph_route = server._guard_dev_runtime_request(
+        method="GET",
+        path=graph_path,
+        path_params={"project_id": "judgment-brain"},
+        body={},
+        query={},
+    )
+    graph = server._handle_dev_external_read_only_discovery(
+        _ctx({"project_id": "judgment-brain"}),
+        route_kind=graph_route,
+    )
+    assert graph_route == "graph_status"
+    assert graph["active_commit"] == "1" * 40
+    assert graph["project"]["public_safe"] is False
+
+
+def test_ac_dev_private_scoped_onboard_is_health_checked_no_authority(
+    monkeypatch,
+    tmp_path,
+):
+    _dev_scoped_external_discovery_fixture(monkeypatch, tmp_path)
+    frozen = {
+        "required_health_tuple": {
+            "status": "ok",
+            "service": "governance",
+            "port": 40000,
+            "runtime_loaded_version": server._DEV_LEGACY_STABLE_HEALTH_COMMIT,
+            "runtime_stale": False,
+            "pid": 61297,
+        }
+    }
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_health_identity",
+        lambda: copy.deepcopy(frozen),
+    )
+    monkeypatch.setattr(
+        server,
+        "_onboard_route_guide_service_response",
+        lambda *_args, **_kwargs: pytest.fail("scoped Onboard entered authority"),
+    )
+    body = {
+        "project_id": "judgment-brain",
+        "backlog_id": "JUDGMENT-BRAIN-PUBLIC",
+        "role": "observer",
+        "work_type": "direct_main",
+    }
+    path = "/api/projects/judgment-brain/onboard-route-guide"
+    route = server._guard_dev_runtime_request(
+        method="POST",
+        path=path,
+        path_params={"project_id": "judgment-brain"},
+        body=body,
+        query={},
+    )
+    result = server._handle_dev_external_read_only_discovery(
+        _ctx({"project_id": "judgment-brain"}, method="POST", body=body),
+        route_kind=route,
+    )
+    assert result["status"] == "read_only_discovery_only"
+    assert result["project"]["public_safe"] is False
+    assert result["stable_health_verified"] is True
+    for field in (
+        "route_authority",
+        "route_authority_accepted",
+        "cex_minted",
+        "route_minted",
+        "contract_runtime_materialized",
+        "timeline_written",
+        "graph_mutated",
+        "close_authority_minted",
+        "session_minted",
+        "qa_authority_minted",
+        "managed_pass",
+        "pass_implied",
+    ):
+        assert result[field] is False
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ("contract_extra", "ac_dev_external_coordination_contract_rejected"),
+        ("bool_count", "ac_dev_stable_proxy_schema_rejected"),
+        ("missing_classification", "ac_dev_external_coordination_classification_rejected"),
+        ("half_route_ref", "ac_dev_external_coordination_reference_rejected"),
+        ("bad_decision_hash", "ac_dev_external_coordination_reference_rejected"),
+        ("public_control_title", "ac_dev_external_coordination_summary_rejected"),
+    ],
+)
+def test_ac_dev_private_scoped_projection_rejects_schema_and_privacy_attacks(
+    mutation,
+    expected_code,
+):
+    path = (
+        "/api/backlog/judgment-brain?view=compact&limit=250&include_closed=true"
+    )
+    row = _dev_scoped_external_stable_payload(path)["bugs"][0]
+    if mutation == "contract_extra":
+        row["contract_summary"]["hidden_prompt"] = "private"
+    elif mutation == "bool_count":
+        row["acceptance_count"] = True
+    elif mutation == "missing_classification":
+        row.pop("public_safe")
+    elif mutation == "half_route_ref":
+        row.pop("route_context_sha256")
+    elif mutation == "bad_decision_hash":
+        row["decision_source_sha256"] = "SHA256:" + "5" * 64
+    elif mutation == "public_control_title":
+        row["title"] = "public\x00title"
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_coordination_backlog_row(row)
+    assert rejected.value.code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "query"),
+    [
+        ("POST", "/api/projects/judgment-brain/coordination-projection", {}),
+        ("GET", "/api/backlog/judgment-brain", {}),
+        ("GET", "/api/projects/judgment-brain/private-decisions", {}),
+        (
+            "GET",
+            "/api/projects/judgment-brain/coordination-projection",
+            {"raw": "true"},
+        ),
+    ],
+)
+def test_ac_dev_private_scoped_unregistered_or_mutating_surface_is_zero_write(
+    monkeypatch,
+    tmp_path,
+    method,
+    path,
+    query,
+):
+    paths, _registry_path = _dev_scoped_external_discovery_fixture(
+        monkeypatch,
+        tmp_path,
+    )
+    before = paths["judgment-brain"].read_bytes()
+    with pytest.raises(ValidationError) as rejected:
+        server._guard_dev_runtime_request(
+            method=method,
+            path=path,
+            path_params={"project_id": "judgment-brain"},
+            body={"project_id": "judgment-brain"} if method == "POST" else {},
+            query=query,
+        )
+    assert rejected.value.details["writes_performed"] is False
+    assert paths["judgment-brain"].read_bytes() == before
 
 
 def test_ac_dev_external_onboard_requires_unchanged_stable_health(monkeypatch, tmp_path):
