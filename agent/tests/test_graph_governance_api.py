@@ -13257,6 +13257,15 @@ def _dev_external_paginated_backlog_payload(
     }
 
 
+def _dev_sized_stable_payload(payload, *, wire_bytes=None):
+    exact_bytes = (
+        int(wire_bytes)
+        if wire_bytes is not None
+        else len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    )
+    return payload, exact_bytes
+
+
 def _dev_stable_health_payload(
     anchor=server._DEV_LEGACY_STABLE_HEALTH_COMMIT,
     *,
@@ -13622,11 +13631,64 @@ def test_ac_dev_stable_proxy_transport_contract_fails_closed(
     assert raised.value.details["writes_performed"] is False
 
 
+def test_ac_dev_stable_proxy_can_return_exact_received_payload_size(monkeypatch):
+    encoded = b'{"ok": true, "padding": "wire spaces are counted"}'
+
+    def reply(_path, _request_index):
+        return 200, {"Content-Type": "application/json"}, encoded
+
+    httpd, thread, requests = _start_dev_proxy_http(monkeypatch, reply)
+    try:
+        payload, received_bytes = server._dev_stable_proxy_json(
+            "/api/test",
+            max_bytes=len(encoded),
+            return_size=True,
+        )
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+    assert payload == {"ok": True, "padding": "wire spaces are counted"}
+    assert received_bytes == len(encoded)
+    assert len(requests) == 1
+
+
+def test_ac_dev_sized_stable_read_preserves_health_window_on_size_rejection(
+    monkeypatch,
+):
+    health_checks = []
+    identity = {"required_health_tuple": {"pid": 61297}}
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_health_identity",
+        lambda: health_checks.append(True) or identity,
+    )
+
+    def rejected_read(_path, *, max_bytes, return_size=False):
+        assert max_bytes == 123
+        assert return_size is True
+        raise server._dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_size_rejected",
+            "test sentinel",
+        )
+
+    monkeypatch.setattr(server, "_dev_stable_proxy_json", rejected_read)
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_stable_external_public_get_with_size(
+            "/api/backlog/content-sys?view=compact",
+            max_bytes=123,
+        )
+    assert rejected.value.code == "ac_dev_stable_proxy_size_rejected"
+    assert health_checks == [True, True]
+
+
 def test_ac_dev_stable_proxy_bad_schema_private_and_transport_fail_closed(monkeypatch):
     monkeypatch.setattr(
         server,
-        "_dev_stable_external_public_get",
-        lambda _path: {"view": "full", "bugs": []},
+        "_dev_stable_external_public_get_with_size",
+        lambda _path, **_kwargs: _dev_sized_stable_payload(
+            {"view": "full", "bugs": []}
+        ),
     )
     with pytest.raises(GovernanceError) as bad_list:
         server._dev_external_backlog_list_projection("content-sys", {})
@@ -13784,8 +13846,10 @@ def test_ac_dev_external_backlog_query_is_exact_and_bounded(
 ):
     monkeypatch.setattr(
         server,
-        "_dev_stable_external_public_get",
-        lambda _path: pytest.fail("invalid query reached stable transport"),
+        "_dev_stable_external_public_get_with_size",
+        lambda _path, **_kwargs: pytest.fail(
+            "invalid query reached stable transport"
+        ),
     )
     with pytest.raises(GovernanceError) as rejected:
         server._dev_external_backlog_list_projection("content-sys", query)
@@ -13797,11 +13861,18 @@ def test_ac_dev_external_backlog_query_is_exact_and_bounded(
 def test_ac_dev_external_backlog_bridges_offset_with_bounded_keyset_pages(monkeypatch):
     paths = []
 
-    def stable_get(path):
+    def stable_get(path, *, max_bytes):
         paths.append(path)
-        return _dev_external_paginated_backlog_payload(path, total_rows=70)
+        payload = _dev_external_paginated_backlog_payload(path, total_rows=70)
+        sized = _dev_sized_stable_payload(payload)
+        assert sized[1] <= max_bytes
+        return sized
 
-    monkeypatch.setattr(server, "_dev_stable_external_public_get", stable_get)
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
+    )
     result = server._dev_external_backlog_list_projection(
         "generic-system",
         {
@@ -13846,8 +13917,10 @@ def test_ac_dev_external_backlog_bridges_offset_with_bounded_keyset_pages(monkey
 def test_ac_dev_external_backlog_honors_one_row_caller_limit(monkeypatch):
     monkeypatch.setattr(
         server,
-        "_dev_stable_external_public_get",
-        lambda path: _dev_external_paginated_backlog_payload(path, total_rows=3),
+        "_dev_stable_external_public_get_with_size",
+        lambda path, **_kwargs: _dev_sized_stable_payload(
+            _dev_external_paginated_backlog_payload(path, total_rows=3)
+        ),
     )
     result = server._dev_external_backlog_list_projection(
         "generic-system",
@@ -13860,14 +13933,78 @@ def test_ac_dev_external_backlog_honors_one_row_caller_limit(monkeypatch):
     assert result["next_offset"] == 1
 
 
+@pytest.mark.parametrize(
+    ("requested_status", "row_statuses"),
+    [
+        ("OPEN", ["OPEN", "MF_IN_PROGRESS"]),
+        ("CLOSED", ["FIXED", "WAIVED"]),
+        ("CUSTOM_READY", ["custom_ready"]),
+    ],
+)
+def test_ac_dev_external_backlog_mirrors_stable_status_filter_semantics(
+    monkeypatch,
+    requested_status,
+    row_statuses,
+):
+    def stable_get(path, *, max_bytes):
+        payload = _dev_external_paginated_backlog_payload(
+            path,
+            total_rows=len(row_statuses),
+        )
+        for row, status in zip(payload["bugs"], row_statuses):
+            row["status"] = status
+        sized = _dev_sized_stable_payload(payload)
+        assert sized[1] <= max_bytes
+        return sized
+
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
+    )
+    result = server._dev_external_backlog_list_projection(
+        "generic-system",
+        {"limit": str(len(row_statuses)), "status": requested_status},
+    )
+    assert [row["status"] for row in result["bugs"]] == row_statuses
+
+
+def test_ac_dev_external_backlog_custom_status_remains_exact(monkeypatch):
+    def stable_get(path, *, max_bytes):
+        payload = _dev_external_paginated_backlog_payload(path, total_rows=1)
+        payload["bugs"][0]["status"] = "OTHER_READY"
+        sized = _dev_sized_stable_payload(payload)
+        assert sized[1] <= max_bytes
+        return sized
+
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_backlog_list_projection(
+            "generic-system",
+            {"limit": "1", "status": "CUSTOM_READY"},
+        )
+    assert rejected.value.code == "ac_dev_stable_proxy_backlog_filter_drift"
+
+
 def test_ac_dev_external_backlog_generic_210_rows_has_no_name_branch(monkeypatch):
     paths = []
 
-    def stable_get(path):
+    def stable_get(path, *, max_bytes):
         paths.append(path)
-        return _dev_external_paginated_backlog_payload(path, total_rows=210)
+        payload = _dev_external_paginated_backlog_payload(path, total_rows=210)
+        sized = _dev_sized_stable_payload(payload)
+        assert sized[1] <= max_bytes
+        return sized
 
-    monkeypatch.setattr(server, "_dev_stable_external_public_get", stable_get)
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
+    )
     result = server._dev_external_backlog_list_projection(
         "generic-system",
         {"limit": "50", "offset": "160", "include_closed": "true"},
@@ -13883,18 +14020,65 @@ def test_ac_dev_external_backlog_generic_210_rows_has_no_name_branch(monkeypatch
     assert all("generic-system" in path for path in paths)
 
 
-def test_ac_dev_external_backlog_aggregate_cap_stops_before_third_fetch(monkeypatch):
-    paths = []
+def test_ac_dev_external_backlog_uses_exact_remaining_transport_budget(monkeypatch):
+    max_bytes_seen = []
+    received_sizes = iter((100_000, 160_000))
 
-    def stable_get(path):
-        paths.append(path)
-        return _dev_external_paginated_backlog_payload(
-            path,
-            total_rows=120,
-            padding_bytes=140_000,
+    def stable_get(path, *, max_bytes):
+        max_bytes_seen.append(max_bytes)
+        payload = _dev_external_paginated_backlog_payload(path, total_rows=70)
+        return _dev_sized_stable_payload(
+            payload,
+            wire_bytes=next(received_sizes),
         )
 
-    monkeypatch.setattr(server, "_dev_stable_external_public_get", stable_get)
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
+    )
+    result = server._dev_external_backlog_list_projection(
+        "generic-system",
+        {"limit": "5", "offset": "55"},
+    )
+    assert max_bytes_seen == [262_144, 162_144]
+    assert result["pagination"]["aggregate_transported_bytes"] == 260_000
+    assert result["pagination"]["aggregate_transported_bytes"] <= 262_144
+    assert len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= 262_144
+
+
+def test_ac_dev_external_backlog_projection_envelope_has_independent_cap():
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_backlog_projection_envelope(
+            {"public_projection": "x" * (256 * 1024)}
+        )
+    assert (
+        rejected.value.code
+        == "ac_dev_external_backlog_projection_size_rejected"
+    )
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["projected_envelope_bytes"] > 256 * 1024
+
+
+def test_ac_dev_external_backlog_aggregate_cap_stops_after_sentinel(monkeypatch):
+    max_bytes_seen = []
+
+    def stable_get(path, *, max_bytes):
+        max_bytes_seen.append(max_bytes)
+        if len(max_bytes_seen) == 1:
+            payload = _dev_external_paginated_backlog_payload(path, total_rows=120)
+            return _dev_sized_stable_payload(payload, wire_bytes=140_000)
+        assert max_bytes == 122_144
+        raise server._dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_size_rejected",
+            "test response crossed max_bytes + 1 sentinel",
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
+    )
     with pytest.raises(GovernanceError) as rejected:
         server._dev_external_backlog_list_projection(
             "generic-system",
@@ -13904,23 +14088,30 @@ def test_ac_dev_external_backlog_aggregate_cap_stops_before_third_fetch(monkeypa
     assert rejected.value.details["zero_write_rejection"] is True
     assert rejected.value.details["writes_performed"] is False
     assert rejected.value.details["budget"]["max_aggregate_bytes"] == 256 * 1024
-    assert rejected.value.details["budget"]["pages_observed"] == 2
-    assert len(paths) == 2
+    assert rejected.value.details["budget"]["pages_observed"] == 1
+    assert max_bytes_seen == [262_144, 122_144]
 
 
 def test_ac_dev_external_backlog_row_budget_exhaustion_is_explicit(monkeypatch):
     paths = []
     private_indexes = tuple(range(500))
 
-    def stable_get(path):
+    def stable_get(path, *, max_bytes):
         paths.append(path)
-        return _dev_external_paginated_backlog_payload(
+        payload = _dev_external_paginated_backlog_payload(
             path,
             total_rows=500,
             private_indexes=private_indexes,
         )
+        sized = _dev_sized_stable_payload(payload, wire_bytes=1_000)
+        assert sized[1] <= max_bytes
+        return sized
 
-    monkeypatch.setattr(server, "_dev_stable_external_public_get", stable_get)
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
+    )
     with pytest.raises(GovernanceError) as rejected:
         server._dev_external_backlog_list_projection(
             "generic-system",
@@ -13946,7 +14137,7 @@ def test_ac_dev_external_backlog_row_budget_exhaustion_is_explicit(monkeypatch):
 def test_ac_dev_external_backlog_pages_fail_closed_on_drift(monkeypatch, drift):
     calls = 0
 
-    def stable_get(path):
+    def stable_get(path, *, max_bytes):
         nonlocal calls
         calls += 1
         payload = _dev_external_paginated_backlog_payload(path, total_rows=70)
@@ -13957,14 +14148,20 @@ def test_ac_dev_external_backlog_pages_fail_closed_on_drift(monkeypatch, drift):
         elif calls == 2 and drift == "scope_extra":
             payload["scope"]["facets"] = ["changed-between-pages"]
         elif calls == 2 and drift == "row_filter":
-            payload["bugs"][0]["status"] = "IN_PROGRESS"
+            payload["bugs"][0]["status"] = "FIXED"
         elif calls == 1 and drift == "cursor":
             payload["next_cursor"] = "bk1.0000"
         elif calls == 2 and drift == "duplicate":
             payload["bugs"][0]["bug_id"] = "GENERIC-SYSTEM-ROW-0000"
-        return payload
+        sized = _dev_sized_stable_payload(payload)
+        assert sized[1] <= max_bytes
+        return sized
 
-    monkeypatch.setattr(server, "_dev_stable_external_public_get", stable_get)
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
+    )
     with pytest.raises(GovernanceError) as rejected:
         server._dev_external_backlog_list_projection(
             "generic-system",
@@ -13983,11 +14180,13 @@ def test_ac_dev_external_backlog_private_rows_do_not_fill_public_offset(monkeypa
     private_indexes = tuple(range(50))
     monkeypatch.setattr(
         server,
-        "_dev_stable_external_public_get",
-        lambda path: _dev_external_paginated_backlog_payload(
-            path,
-            total_rows=70,
-            private_indexes=private_indexes,
+        "_dev_stable_external_public_get_with_size",
+        lambda path, **_kwargs: _dev_sized_stable_payload(
+            _dev_external_paginated_backlog_payload(
+                path,
+                total_rows=70,
+                private_indexes=private_indexes,
+            )
         ),
     )
     result = server._dev_external_backlog_list_projection(
@@ -14179,10 +14378,22 @@ def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
         proxied_paths.extend(request_paths)
         return [_dev_external_stable_payload(path) for path in request_paths]
 
+    def stable_get_with_size(path, *, max_bytes):
+        proxied_paths.append(path)
+        payload = _dev_external_stable_payload(path)
+        sized = _dev_sized_stable_payload(payload)
+        assert sized[1] <= max_bytes
+        return sized
+
     monkeypatch.setattr(
         server,
         "_dev_stable_external_public_get_many",
         stable_get_many,
+    )
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get_with_size,
     )
     stable_health_checks = []
     monkeypatch.setattr(
@@ -14444,6 +14655,81 @@ def test_ac_dev_external_discovery_rejects_selectors_alias_and_nested_mismatch(
             query={},
         )
     assert "registry" in str(unregistered.value).lower()
+
+
+@pytest.mark.parametrize(
+    ("raw_query", "retained_field", "expected_code"),
+    [
+        (
+            "unknown=&limit=5",
+            "unknown",
+            "ac_dev_external_backlog_query_rejected",
+        ),
+        (
+            "include_closed=&include_closed=false",
+            "include_closed",
+            "ac_dev_external_backlog_query_conflict",
+        ),
+        (
+            "status=&status=OPEN",
+            "status",
+            "ac_dev_external_backlog_query_conflict",
+        ),
+        (
+            "priority=&limit=5",
+            "priority",
+            "ac_dev_external_backlog_filter_invalid",
+        ),
+    ],
+)
+def test_ac_dev_external_backlog_http_boundary_retains_and_rejects_blank_queries(
+    monkeypatch,
+    tmp_path,
+    raw_query,
+    retained_field,
+    expected_code,
+):
+    _dev_external_discovery_fixture(monkeypatch, tmp_path)
+    handler = _bare_handler()
+    handler.path = f"/api/backlog/content-sys?{raw_query}"
+    query = handler._query_params()
+    retained = query[retained_field]
+    assert retained == "" or "" in retained
+    path = "/api/backlog/content-sys"
+    try:
+        route = server._guard_dev_runtime_request(
+            method="GET",
+            path=path,
+            path_params={"project_id": "content-sys"},
+            body={},
+            query=query,
+        )
+    except GovernanceError as exc:
+        assert expected_code in str(exc)
+        return
+    assert route == "backlog_list"
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        lambda *_args, **_kwargs: pytest.fail(
+            "blank query reached stable transport"
+        ),
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_backlog_list_projection("content-sys", query)
+    assert rejected.value.code == expected_code
+    assert rejected.value.details["zero_write_rejection"] is True
+
+
+def test_query_blank_preservation_is_not_global(monkeypatch):
+    handler = _bare_handler()
+    handler.path = "/api/backlog/content-sys?unknown=&limit=5"
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    assert handler._query_params() == {"limit": "5"}
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    handler.path = "/api/backlog/aming-claw?unknown=&limit=5"
+    assert handler._query_params() == {"limit": "5"}
 
 
 def test_ac_dev_zero_write_rejection_projects_successor_stable_anchor(monkeypatch):

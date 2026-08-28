@@ -3753,7 +3753,8 @@ def _dev_stable_proxy_json(
     path: str,
     *,
     max_bytes: int,
-) -> dict[str, Any]:
+    return_size: bool = False,
+) -> dict[str, Any] | tuple[dict[str, Any], int]:
     """GET one exact stable loopback path without credentials or redirects."""
 
     if (
@@ -3849,6 +3850,8 @@ def _dev_stable_proxy_json(
             "ac_dev_stable_proxy_schema_rejected",
             "stable GET response must be a JSON object",
         )
+    if return_size:
+        return payload, len(payload_bytes)
     return payload
 
 
@@ -4094,6 +4097,47 @@ def _dev_stable_external_public_get(path: str) -> dict[str, Any]:
     return _dev_stable_external_public_get_many([path])[0]
 
 
+def _dev_stable_external_public_get_with_size(
+    path: str,
+    *,
+    max_bytes: int,
+) -> tuple[dict[str, Any], int]:
+    """Read one stable payload and retain its exact transported byte count."""
+
+    before = _dev_stable_proxy_health_identity()
+    result: dict[str, Any] | tuple[dict[str, Any], int] | None = None
+    read_error: GovernanceError | None = None
+    try:
+        result = _dev_stable_proxy_json(
+            path,
+            max_bytes=min(max_bytes, _DEV_STABLE_PROXY_RESPONSE_BYTES),
+            return_size=True,
+        )
+    except GovernanceError as exc:
+        read_error = exc
+    after = _dev_stable_proxy_health_identity()
+    if stable_sha256(after) != stable_sha256(before):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_identity_drift",
+            "stable identity changed across the bounded GET",
+            status=409,
+        )
+    if read_error is not None:
+        raise read_error
+    if not (
+        isinstance(result, tuple)
+        and len(result) == 2
+        and isinstance(result[0], dict)
+        and type(result[1]) is int
+        and 1 <= result[1] <= min(max_bytes, _DEV_STABLE_PROXY_RESPONSE_BYTES)
+    ):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable sized GET omitted its exact transported byte count",
+        )
+    return result
+
+
 def _dev_external_raw_backlog_binding(
     raw: Mapping[str, Any],
     *,
@@ -4277,7 +4321,7 @@ def _dev_external_parse_backlog_list_query(
             detail=f"unknown selectors: {', '.join(unknown)}",
         )
     view = _dev_external_exact_query_scalar(project_id, query, "view", "compact")
-    if view not in {"", "compact"}:
+    if view != "compact":
         raise _dev_external_backlog_query_failure(
             project_id,
             code="ac_dev_external_backlog_query_rejected",
@@ -4330,6 +4374,12 @@ def _dev_external_parse_backlog_list_query(
     filters: dict[str, str] = {}
     for key in ("status", "priority"):
         value = _dev_external_exact_query_scalar(project_id, query, key, "")
+        if key in query and not value:
+            raise _dev_external_backlog_query_failure(
+                project_id,
+                code="ac_dev_external_backlog_filter_invalid",
+                detail=f"{key} cannot be explicitly blank",
+            )
         if value and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", value):
             raise _dev_external_backlog_query_failure(
                 project_id,
@@ -4540,6 +4590,10 @@ def _dev_external_backlog_status_matches(status: str, requested: str) -> bool:
     actual = status.upper()
     if not normalized or normalized == "ALL":
         return True
+    if normalized == "OPEN":
+        return actual not in _BACKLOG_CLOSED_STATUSES
+    if normalized == "CLOSED":
+        return actual in _BACKLOG_CLOSED_STATUSES
     return actual == normalized
 
 
@@ -4562,6 +4616,24 @@ def _dev_external_backlog_budget_failure(
         "aggregate_bytes_observed": aggregate_bytes,
     }
     return rejected
+
+
+def _dev_external_backlog_projection_envelope(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    projected_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    if projected_bytes > _DEV_STABLE_PROXY_RESPONSE_BYTES:
+        rejected = _dev_stable_proxy_failure(
+            "ac_dev_external_backlog_projection_size_rejected",
+            "external backlog projection exceeded its public response envelope",
+            status=409,
+        )
+        rejected.details.update(
+            projected_envelope_bytes=projected_bytes,
+            projected_envelope_bytes_max=_DEV_STABLE_PROXY_RESPONSE_BYTES,
+        )
+        raise rejected
+    return payload
 
 
 def _dev_external_backlog_list_projection(
@@ -4600,28 +4672,54 @@ def _dev_external_backlog_list_projection(
             _DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS,
             _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS - scanned_rows,
         )
-        stable = _dev_stable_external_public_get(
-            _dev_external_stable_backlog_list_path(
-                project_id,
-                limit=page_limit,
-                cursor=cursor,
-                status=requested["status"],
-                priority=requested["priority"],
-                include_closed=requested["include_closed"],
-            )
+        remaining_bytes = (
+            _DEV_STABLE_PROXY_BACKLOG_AGGREGATE_BYTES - aggregate_bytes
         )
-        page_bytes = len(
-            json.dumps(
-                stable,
-                ensure_ascii=False,
-            ).encode("utf-8")
-        )
-        aggregate_bytes += page_bytes
-        if aggregate_bytes > _DEV_STABLE_PROXY_BACKLOG_AGGREGATE_BYTES:
+        if remaining_bytes <= 0:
             raise _dev_external_backlog_budget_failure(
                 "ac_dev_stable_proxy_aggregate_size_rejected",
-                "stable backlog keyset scan exceeded its aggregate wire-envelope budget",
-                pages=pages + 1,
+                "stable backlog keyset scan exhausted its aggregate wire-byte budget",
+                pages=pages,
+                rows=scanned_rows,
+                aggregate_bytes=aggregate_bytes,
+            )
+        try:
+            stable, page_bytes = _dev_stable_external_public_get_with_size(
+                _dev_external_stable_backlog_list_path(
+                    project_id,
+                    limit=page_limit,
+                    cursor=cursor,
+                    status=requested["status"],
+                    priority=requested["priority"],
+                    include_closed=requested["include_closed"],
+                ),
+                max_bytes=remaining_bytes,
+            )
+        except GovernanceError as exc:
+            if (
+                exc.code == "ac_dev_stable_proxy_size_rejected"
+                and remaining_bytes < _DEV_STABLE_PROXY_RESPONSE_BYTES
+            ):
+                raise _dev_external_backlog_budget_failure(
+                    "ac_dev_stable_proxy_aggregate_size_rejected",
+                    "stable backlog page exceeded the remaining aggregate wire-byte budget",
+                    pages=pages,
+                    rows=scanned_rows,
+                    aggregate_bytes=(
+                        aggregate_bytes + remaining_bytes + 1
+                    ),
+                ) from exc
+            raise
+        aggregate_bytes += page_bytes
+        if (
+            page_bytes < 1
+            or page_bytes > remaining_bytes
+            or aggregate_bytes > _DEV_STABLE_PROXY_BACKLOG_AGGREGATE_BYTES
+        ):
+            raise _dev_external_backlog_budget_failure(
+                "ac_dev_stable_proxy_aggregate_size_rejected",
+                "stable backlog keyset scan exceeded its aggregate transported-byte budget",
+                pages=pages,
                 rows=scanned_rows,
                 aggregate_bytes=aggregate_bytes,
             )
@@ -4693,7 +4791,7 @@ def _dev_external_backlog_list_projection(
     stop = start + requested["limit"]
     selected_rows = public_rows[start:stop]
     has_more = len(public_rows) > stop
-    return {
+    return _dev_external_backlog_projection_envelope({
         "schema_version": "ac_dev_external_public_backlog.v1",
         "project_id": project_id,
         "bugs": selected_rows,
@@ -4716,11 +4814,11 @@ def _dev_external_backlog_list_projection(
             "strategy": "bounded_stable_keyset_bridge",
             "pages_read": pages,
             "rows_scanned": scanned_rows,
-            "aggregate_wire_envelope_bytes": aggregate_bytes,
+            "aggregate_transported_bytes": aggregate_bytes,
             "page_rows_max": _DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS,
             "page_count_max": _DEV_STABLE_PROXY_BACKLOG_MAX_PAGES,
             "row_count_max": _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS,
-            "aggregate_wire_envelope_bytes_max": (
+            "aggregate_transported_bytes_max": (
                 _DEV_STABLE_PROXY_BACKLOG_AGGREGATE_BYTES
             ),
         },
@@ -4728,7 +4826,7 @@ def _dev_external_backlog_list_projection(
         "public_safe": True,
         "read_only": True,
         "stable_read_authority": authority or {},
-    }
+    })
 
 
 def _dev_external_backlog_item_projection(
@@ -4978,13 +5076,13 @@ def _handle_dev_external_read_only_discovery(
             "pass_implied": False,
         }
         if route_kind == "backlog_list":
-            return {
+            return _dev_external_backlog_projection_envelope({
                 **common,
                 **_dev_external_backlog_list_projection(
                     project_id,
                     ctx.query,
                 ),
-            }
+            })
         if route_kind == "backlog_item":
             return {
                 **common,
@@ -5141,7 +5239,16 @@ class GovernanceHandler(BaseHTTPRequestHandler):
 
     def _query_params(self) -> dict:
         parsed = urlparse(self.path)
-        return {k: v[0] if len(v) == 1 else v for k, v in parse_qs(parsed.query).items()}
+        external_dev_backlog_list = bool(
+            _runtime_plane() == "dev"
+            and re.fullmatch(r"/api/backlog/([^/]+)", parsed.path.rstrip("/"))
+            and parsed.path.rstrip("/").rsplit("/", 1)[-1] != "aming-claw"
+        )
+        values = parse_qs(
+            parsed.query,
+            keep_blank_values=external_dev_backlog_list,
+        )
+        return {key: item[0] if len(item) == 1 else item for key, item in values.items()}
 
     def _respond(self, code: int, body: dict, extra_headers: dict | None = None):
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")

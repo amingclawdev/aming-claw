@@ -846,11 +846,23 @@ AC repair work uses two independent runtime planes:
 - External compact backlog discovery accepts only exact bounded selectors:
   canonical integer `limit=1..50`, canonical integer `offset=0..399`, bounded
   `status`/`priority` tokens, and lowercase `include_closed=true|false`.
-  Unknown selectors and conflicting repeats fail before transport. The dev
-  projector never forwards a positive numeric offset to stable. It walks stable
-  keyset cursors with at most 50 rows per page, nine pages, 450 rows, and a
-  total wire-envelope budget no larger than the existing 256 KiB single-page
-  cap. Every page must preserve exact project, generation, authority
+  Unknown selectors, explicit blank scalars, and conflicting repeats fail
+  before transport. Blank occurrences are preserved only while parsing this
+  dev external list route so validation can see them; other query parsing keeps
+  its existing behavior. `status=OPEN` follows the producer's open class (any
+  status outside the closed-status set), `status=CLOSED` follows its closed
+  class (including `FIXED` and `WAIVED`), empty/`ALL` is the wildcard, and every
+  other status token is exact case-insensitive. The dev projector never forwards
+  a positive numeric offset to stable. It walks stable keyset cursors with at
+  most 50 rows per page, nine pages, 450 rows, and total exact transported
+  backlog-page bytes no larger than the existing 256 KiB single-page cap. Each
+  page read receives only the remaining aggregate byte allowance; the transport
+  reads at most that allowance plus its one-byte oversize sentinel. Every page
+  contributes its exact received raw payload-byte length, never a reserialized
+  approximation. Independently, both the list projection and its final
+  public HTTP wrapper must fit the 256 KiB projected-response envelope or fail
+  with typed `ac_dev_external_backlog_projection_size_rejected`. Every page
+  must preserve exact project, generation, authority
   generation, filter scope, compact view, keyset pagination, cursor, and raw
   JSON types. A cursor cycle, duplicate row, filter/generation drift, one-page
   oversize, aggregate oversize, or exhausted scan budget is a typed zero-write
