@@ -104733,6 +104733,19 @@ _CONTRACT_RUNTIME_SERVER_CANONICAL_MIXED_SOURCE_PARTITIONS = {
         ),
     },
 }
+# Canonical-looking module collections normally enumerate scalar field names.
+# A small number instead carry live structured identities.  Register their
+# exact shape here so an empty container and a populated container receive the
+# same audited disposition.  The shape registry is deliberately source-bound:
+# an unregistered string collection is still discovered by the generic audit,
+# while an unregistered or malformed structured collection cannot inherit this
+# exception.
+_CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES = {
+    "_CURRENT_FULL_BUILD_KEYS": {
+        "container_kind": "set",
+        "entry_kind": "nonempty_string_pair",
+    },
+}
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES: tuple[str, ...] = ()
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES: tuple[
     str, ...
@@ -104741,6 +104754,34 @@ _CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS = frozenset()
 _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset(
     PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
 )
+
+
+def _contract_runtime_server_canonical_structured_source_shape_valid(
+    source_name: Any,
+    raw_fields: Any,
+) -> bool:
+    """Validate one explicitly registered non-scalar collection source."""
+
+    shape = _CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES.get(
+        str(source_name or "")
+    )
+    if shape != {
+        "container_kind": "set",
+        "entry_kind": "nonempty_string_pair",
+    }:
+        return False
+    return bool(
+        type(raw_fields) is set
+        and all(
+            type(entry) is tuple
+            and len(entry) == 2
+            and all(
+                type(value) is str and bool(value.strip())
+                for value in entry
+            )
+            for entry in raw_fields
+        )
+    )
 
 
 def _contract_runtime_is_server_canonical_collection_source(
@@ -104758,6 +104799,11 @@ def _contract_runtime_is_server_canonical_collection_source(
         "_CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS",
     }:
         return False
+    if name in _CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES:
+        return _contract_runtime_server_canonical_structured_source_shape_valid(
+            name,
+            raw_fields,
+        )
     return bool(
         isinstance(raw_fields, (frozenset, list, set, tuple))
         and all(isinstance(field_name, str) for field_name in raw_fields)
@@ -104770,7 +104816,12 @@ def _contract_runtime_server_canonical_collection_sources(
         sorted(
             (
                 source_name,
-                frozenset(raw_fields),
+                (
+                    frozenset()
+                    if source_name
+                    in _CONTRACT_RUNTIME_SERVER_CANONICAL_STRUCTURED_SOURCE_SHAPES
+                    else frozenset(raw_fields)
+                ),
             )
             for source_name, raw_fields in globals().items()
             if _contract_runtime_is_server_canonical_collection_source(
