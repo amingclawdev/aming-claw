@@ -9942,8 +9942,8 @@ def observer_direct_pre_mutation_authority_gate(
         event,
         {"approval_ref", "operator_approval_ref"},
     )
-    event_allowed_files = _normalised_file_set(
-        _event_deep_string_list(
+    event_allowed_scope = _canonical_repo_relative_file_scope(
+        _event_deep_file_values(
             event,
             {
                 "allowed_files",
@@ -9953,21 +9953,33 @@ def observer_direct_pre_mutation_authority_gate(
             },
         )
     )
-    row_scope = _normalised_file_set(list(row_declared_files or []))
-    exact_dirty_scope_shapes = [
-        value
-        for value in dirty_scope_shapes
-        if _truthy(value.get("exact_match"))
-        and _normalised_file_set(
-            _event_deep_string_list(
+    row_file_scope = _canonical_repo_relative_file_scope(
+        list(row_declared_files or [])
+    )
+    event_allowed_files = event_allowed_scope["files"]
+    row_scope = row_file_scope["files"]
+    dirty_file_scopes = [
+        _canonical_repo_relative_file_scope(
+            _event_deep_file_values(
                 dict(value),
                 {"allowed_files", "target_files", "owned_files"},
             )
         )
-        == row_scope
+        for value in dirty_scope_shapes
+    ]
+    exact_dirty_scope_shapes = [
+        value
+        for value, dirty_scope in zip(dirty_scope_shapes, dirty_file_scopes)
+        if _truthy(value.get("exact_match"))
+        and dirty_scope["valid"]
+        and row_file_scope["valid"]
+        and dirty_scope["files"] == row_scope
     ]
     allowed_files_exact_row_scope = bool(
-        row_scope and event_allowed_files == row_scope
+        row_file_scope["valid"]
+        and event_allowed_scope["valid"]
+        and row_scope
+        and event_allowed_files == row_scope
     )
     graph_trace_gate = (
         dict(pre_mutation_graph_trace_gate)
@@ -10045,9 +10057,23 @@ def observer_direct_pre_mutation_authority_gate(
         "exception_projection": exception,
         "server_gate_shape": server_gate_shape,
         "operator_approval_shape": operator_approval_shape,
-        "dirty_scope_shapes": dirty_scope_shapes,
+        "dirty_scope_shapes": (
+            dirty_scope_shapes
+            if event_allowed_scope["valid"]
+            and row_file_scope["valid"]
+            and all(scope["valid"] for scope in dirty_file_scopes)
+            else []
+        ),
         "row_declared_files": sorted(row_scope),
         "event_allowed_files": sorted(event_allowed_files),
+        "file_scope_validation": {
+            "row_declared": _public_file_scope_validation(row_file_scope),
+            "event_allowed": _public_file_scope_validation(event_allowed_scope),
+            "dirty_scopes": [
+                _public_file_scope_validation(scope)
+                for scope in dirty_file_scopes
+            ],
+        },
         "pre_implementation_graph_trace_gate": graph_trace_gate,
         "graph_trace_db_evidence": dict(graph_trace_db_evidence),
         "identity_mismatches": graph_trace_identity_mismatches,
@@ -10056,37 +10082,119 @@ def observer_direct_pre_mutation_authority_gate(
     }
 
 
-def _normalised_file_set(values: list[str]) -> set[str]:
-    return {str(value or "").strip().replace("\\", "/").lstrip("./") for value in values if str(value or "").strip()}
+def _event_deep_file_values(
+    event: dict[str, Any], keys: Collection[str]
+) -> list[Any]:
+    values: list[Any] = []
+    for value in _event_field_values(event, keys):
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, Mapping):
+                    candidates = [item.get(key) for key in ("path", "file", "name")]
+                    values.append(next((candidate for candidate in candidates if candidate is not None), item))
+                else:
+                    values.append(item)
+        else:
+            values.append(value)
+    unique: list[Any] = []
+    for value in values:
+        if not any(
+            type(value) is type(existing) and value == existing
+            for existing in unique
+        ):
+            unique.append(value)
+    return unique
+
+
+def _canonical_repo_relative_file_scope(values: Any) -> dict[str, Any]:
+    """Pure lexical file-fence normalization; never resolves against the host."""
+
+    entries = list(values) if isinstance(values, (list, tuple)) else [values]
+    files: set[str] = set()
+    reason_counts: dict[str, int] = {}
+    for value in entries:
+        reason = ""
+        canonical = ""
+        if not isinstance(value, str):
+            reason = "non_string"
+        elif not value or not value.strip():
+            reason = "blank"
+        elif value != value.strip():
+            reason = "surrounding_whitespace"
+        elif any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value):
+            reason = "control_character"
+        elif value.startswith(("/", "\\", "//")):
+            reason = "absolute_path"
+        elif re.match(r"^[A-Za-z]:", value):
+            reason = "windows_drive_path"
+        else:
+            canonical = value.replace("\\", "/")
+            if canonical.startswith("/"):
+                reason = "absolute_path"
+            elif re.match(r"^[A-Za-z]:", canonical):
+                reason = "windows_drive_path"
+            elif canonical.startswith("./"):
+                canonical = canonical[2:]
+            if not reason and "//" in canonical:
+                reason = "empty_component"
+            elif not reason and canonical.endswith("/"):
+                reason = "trailing_slash"
+            elif not reason and not canonical:
+                reason = "blank"
+            elif not reason and any(
+                part in {"", ".", ".."} for part in canonical.split("/")
+            ):
+                reason = "non_relative_component"
+        if reason:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        else:
+            files.add(canonical)
+    invalid_count = sum(reason_counts.values())
+    return {
+        "valid": invalid_count == 0,
+        "files": files,
+        "invalid_count": invalid_count,
+        "invalid_reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
+def _public_file_scope_validation(scope: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "valid": scope.get("valid") is True,
+        "invalid_count": int(scope.get("invalid_count") or 0),
+        "invalid_reason_counts": dict(scope.get("invalid_reason_counts") or {}),
+    }
 
 
 def _observer_direct_changed_file_scope(
     implementation: Mapping[str, Any],
     contract: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    changed_files = _event_deep_string_list(
+    changed_files = _event_deep_file_values(
         _mapping(implementation),
         {"changed_files", "worker_changed_files", "owned_changed_files"},
     )
     close_context = _mapping(_mapping(contract).get("close_context"))
-    allowed_files = _dedupe_nonempty(
-        [
-            *_string_list(close_context.get("target_files")),
-            *_string_list(close_context.get("test_files")),
-            *_string_list(close_context.get("owned_files")),
-            *_string_list(close_context.get("allowed_files")),
-            *_string_list(close_context.get("allowed_changed_files")),
-        ]
-    )
-    changed_set = _normalised_file_set(changed_files)
-    allowed_set = _normalised_file_set(allowed_files)
+    allowed_files: list[Any] = []
+    for key in ("target_files", "test_files", "owned_files", "allowed_files", "allowed_changed_files"):
+        value = close_context.get(key)
+        if value is not None:
+            allowed_files.extend(value if isinstance(value, (list, tuple)) else [value])
+    changed_scope = _canonical_repo_relative_file_scope(changed_files)
+    allowed_scope = _canonical_repo_relative_file_scope(allowed_files)
+    changed_set = changed_scope["files"]
+    allowed_set = allowed_scope["files"]
     unexpected = sorted(changed_set - allowed_set) if allowed_set else []
     return {
-        "changed_files": changed_files,
-        "allowed_files": allowed_files,
+        "changed_files": sorted(changed_set) if changed_scope["valid"] else [],
+        "allowed_files": sorted(allowed_set) if allowed_scope["valid"] else [],
         "unexpected_changed_files": unexpected,
-        "passed": bool(changed_files) and not unexpected,
-        "enforced": bool(allowed_set),
+        "passed": bool(changed_set) and changed_scope["valid"] and allowed_scope["valid"] and not unexpected,
+        "enforced": bool(allowed_set) and allowed_scope["valid"],
+        "validation": {
+            "changed": _public_file_scope_validation(changed_scope),
+            "allowed": _public_file_scope_validation(allowed_scope),
+        },
     }
 
 

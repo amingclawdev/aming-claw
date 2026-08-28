@@ -22676,5 +22676,75 @@ def test_direct_main_authenticated_qa_facade_validates_then_adapter_submits_pair
     ]["observer_impersonation"] is False
 
 
+def test_repo_relative_file_scope_preserves_dotfiles_and_set_semantics():
+    from agent.governance import task_timeline
+
+    scope = task_timeline._canonical_repo_relative_file_scope(
+        [
+            ".gitignore",
+            "./.gitignore",
+            r".\.gitignore",
+            "dir/.env",
+            r"dir\file.py",
+            r".\dir\file.py",
+            ".gitignore",
+        ]
+    )
+
+    assert scope["valid"] is True
+    assert scope["invalid_count"] == 0
+    assert scope["files"] == {".gitignore", "dir/.env", "dir/file.py"}
+    assert "gitignore" not in scope["files"]
+
+
+def test_repo_relative_file_scope_rejects_malformed_entries_without_echo():
+    from agent.governance import task_timeline
+
+    secret = "PRIVATE-FILE-SENTINEL"
+    malformed = [
+        "",
+        " ",
+        None,
+        7,
+        f"dir/{secret}\x00.py",
+        "/absolute.py",
+        r"C:\absolute.py",
+        r"C:relative.py",
+        r"\\server\share\file.py",
+        r"\rooted.py",
+        "../escape.py",
+        "dir/../escape.py",
+        "dir/./file.py",
+        "././file.py",
+        "dir//file.py",
+        "dir/",
+        " spaced.py",
+    ]
+
+    scope = task_timeline._canonical_repo_relative_file_scope(malformed)
+    public = task_timeline._public_file_scope_validation(scope)
+
+    assert scope["valid"] is False
+    assert scope["invalid_count"] == len(malformed)
+    assert scope["files"] == set()
+    assert secret not in json.dumps(public, sort_keys=True)
+    assert set(public) == {"valid", "invalid_count", "invalid_reason_counts"}
+
+
+def test_observer_direct_changed_scope_rejects_invalid_side_without_raw_leakage():
+    from agent.governance import task_timeline
+
+    secret = "PRIVATE-FILE-SENTINEL"
+    result = task_timeline._observer_direct_changed_file_scope(
+        {"payload": {"changed_files": [f"../{secret}.py"]}},
+        {"close_context": {"target_files": [".gitignore"]}},
+    )
+
+    assert result["passed"] is False
+    assert result["changed_files"] == []
+    assert result["validation"]["changed"]["invalid_count"] == 1
+    assert secret not in json.dumps(result, sort_keys=True)
+
+
 if __name__ == "__main__":
     unittest.main()

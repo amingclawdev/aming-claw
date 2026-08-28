@@ -100655,6 +100655,103 @@ def test_parentless_direct_main_pre_mutation_accepts_contract_root_bound_trace(
     assert accepted["task_id"] == parent_execution_id
 
 
+def test_parentless_direct_main_prewrite_preserves_dotfile_fence_and_rejects_malformed(
+    conn,
+):
+    backlog_id = "CONTENT-DIRECT-MAIN-DOTFILE-FENCE"
+    task_id, route_token_ref, route_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=backlog_id,
+            row_files=[".gitignore", "dir/.env"],
+            historical_onboard_service=True,
+        )
+    )
+    graph_trace_id = "gqt-20260828-d07f11efac"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=graph_trace_id,
+        backlog_id=backlog_id,
+        task_id=task_id,
+        route_identity=route_identity,
+    )
+
+    accepted = server.handle_task_timeline_append(
+        _ctx_with_role(
+            {"project_id": PID},
+            "observer",
+            method="POST",
+            body=_canonical_parentless_direct_main_pre_mutation_body(
+                append_base={
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "route_token_ref": route_token_ref,
+                },
+                route_identity=route_identity,
+                allowed_files=[r".\.gitignore", r".\dir\.env"],
+                graph_trace_ids=[graph_trace_id],
+            ),
+        )
+    )
+    authority = accepted["payload"]["observer_direct_pre_mutation_authority"]
+    assert authority["accepted"] is True
+    assert authority["row_declared_files"] == [".gitignore", "dir/.env"]
+    assert authority["event_allowed_files"] == [".gitignore", "dir/.env"]
+
+    malformed_backlog = f"{backlog_id}-MALFORMED"
+    malformed_task, malformed_ref, malformed_identity = (
+        _parentless_direct_main_pre_mutation_graph_scope(
+            conn,
+            backlog_id=malformed_backlog,
+            row_files=[".gitignore"],
+            historical_onboard_service=True,
+        )
+    )
+    malformed_trace = "gqt-20260828-badf11eabc"
+    _insert_observer_graph_query_trace(
+        conn,
+        trace_id=malformed_trace,
+        backlog_id=malformed_backlog,
+        task_id=malformed_task,
+        route_identity=malformed_identity,
+    )
+    before = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id = ?",
+        (malformed_backlog,),
+    ).fetchone()[0]
+    secret = "PRIVATE-DOTFILE-SENTINEL"
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_task_timeline_append(
+            _ctx_with_role(
+                {"project_id": PID},
+                "observer",
+                method="POST",
+                body=_canonical_parentless_direct_main_pre_mutation_body(
+                    append_base={
+                        "backlog_id": malformed_backlog,
+                        "task_id": malformed_task,
+                        "route_token_ref": malformed_ref,
+                    },
+                    route_identity=malformed_identity,
+                    allowed_files=[f"../{secret}"],
+                    graph_trace_ids=[malformed_trace],
+                ),
+            )
+        )
+    after = conn.execute(
+        "SELECT COUNT(*) FROM task_timeline_events WHERE backlog_id = ?",
+        (malformed_backlog,),
+    ).fetchone()[0]
+    assert rejected.value.code == "parentless_direct_main_pre_mutation_authority_incomplete"
+    assert before == after
+    assert secret not in json.dumps(rejected.value.details, sort_keys=True)
+    assert rejected.value.details["file_scope_validation"]["event_allowed"] == {
+        "valid": False,
+        "invalid_count": 1,
+        "invalid_reason_counts": {"non_relative_component": 1},
+    }
+
+
 @pytest.mark.parametrize(
     ("missing_case", "missing_requirement_id"),
     [
