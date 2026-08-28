@@ -205378,6 +205378,20 @@ _BACKLOG_READ_SCHEMA_TABLE_DEFINITION = (
 _BACKLOG_READ_SCHEMA_TABLE_COLUMNS = tuple(
     metadata for metadata, _sql in _BACKLOG_READ_SCHEMA_TABLE_DEFINITION
 )
+# Exact direct-read subset bound from observer_session.SCHEMA_SQL's canonical
+# observer_command_queue definition. Recovery-only columns and indexes are not
+# part of the optimized backlog projection contract.
+_BACKLOG_READ_OBSERVER_COMMAND_COLUMNS = {
+    "command_id": ("TEXT", 0, None, 1),
+    "project_id": ("TEXT", 1, None, 0),
+    "payload_json": ("TEXT", 1, "'{}'", 0),
+    "status": ("TEXT", 1, "'queued'", 0),
+    "error": ("TEXT", 1, "''", 0),
+    "completed_at": ("TEXT", 1, "''", 0),
+    "claimed_at": ("TEXT", 1, "''", 0),
+    "created_at": ("TEXT", 1, None, 0),
+    "result_json": ("TEXT", 1, "'{}'", 0),
+}
 _BACKLOG_READ_SCHEMA_TABLE_SQL = (
     "CREATE TABLE IF NOT EXISTS dashboard_backlog_cache_generation (\n    "
     + ",\n    ".join(sql for _metadata, sql in _BACKLOG_READ_SCHEMA_TABLE_DEFINITION)
@@ -205489,6 +205503,38 @@ def _ac_dev_verify_backlog_read_schema(conn: sqlite3.Connection) -> None:
             )
             if columns != _BACKLOG_READ_SCHEMA_TABLE_COLUMNS:
                 problems.append("generation_table_columns")
+
+        command_table = conn.execute(
+            "SELECT type, tbl_name FROM sqlite_master WHERE name=?",
+            ("observer_command_queue",),
+        ).fetchone()
+        if not command_table or tuple(command_table) != (
+            "table",
+            "observer_command_queue",
+        ):
+            problems.append("observer_command_queue")
+        else:
+            command_columns = {
+                str(row[1]): (
+                    str(row[2]).upper(),
+                    int(row[3]),
+                    None if row[4] is None else str(row[4]),
+                    int(row[5]),
+                )
+                for row in conn.execute(
+                    'PRAGMA table_info("observer_command_queue")'
+                ).fetchall()
+            }
+            for name, expected in _BACKLOG_READ_OBSERVER_COMMAND_COLUMNS.items():
+                actual = command_columns.get(name)
+                if actual is None:
+                    problems.append(
+                        f"observer_command_queue_column_{name}"
+                    )
+                elif actual != expected:
+                    problems.append(
+                        f"observer_command_queue_column_{name}_definition"
+                    )
 
         index = conn.execute(
             "SELECT type, tbl_name, sql FROM sqlite_master WHERE name=?",

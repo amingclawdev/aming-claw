@@ -11690,6 +11690,38 @@ def _sqlite_schema_snapshot(connection: sqlite3.Connection) -> tuple[tuple, ...]
     )
 
 
+_OBSERVER_COMMAND_DIRECT_TEST_COLUMN_SQL = {
+    "command_id": "command_id TEXT PRIMARY KEY",
+    "project_id": "project_id TEXT NOT NULL",
+    "payload_json": "payload_json TEXT NOT NULL DEFAULT '{}'",
+    "status": "status TEXT NOT NULL DEFAULT 'queued'",
+    "error": "error TEXT NOT NULL DEFAULT ''",
+    "completed_at": "completed_at TEXT NOT NULL DEFAULT ''",
+    "claimed_at": "claimed_at TEXT NOT NULL DEFAULT ''",
+    "created_at": "created_at TEXT NOT NULL",
+    "result_json": "result_json TEXT NOT NULL DEFAULT '{}'",
+}
+
+
+def _replace_observer_command_queue_for_test(
+    connection: sqlite3.Connection,
+    *,
+    omit: str = "",
+    override: tuple[str, str] | None = None,
+) -> None:
+    columns = dict(_OBSERVER_COMMAND_DIRECT_TEST_COLUMN_SQL)
+    if omit:
+        columns.pop(omit)
+    if override:
+        columns[override[0]] = override[1]
+    connection.execute("DROP TABLE observer_command_queue")
+    connection.execute(
+        "CREATE TABLE observer_command_queue ("
+        + ", ".join(columns.values())
+        + ")"
+    )
+
+
 def _seed_file_backed_backlog_read_rows(
     connection: sqlite3.Connection,
     *,
@@ -28936,6 +28968,28 @@ def test_stable_backlog_read_schema_initialization_remains_handler_owned(
         ("wrong_trigger_owner", "trigger_insert_definition"),
         ("missing_seed", "backlog_generation_seed"),
         ("wrong_seed", "backlog_generation_seed"),
+        ("missing_command_table", "observer_command_queue"),
+        ("wrong_command_table_object", "observer_command_queue"),
+        (
+            "missing_command_column",
+            "observer_command_queue_column_result_json",
+        ),
+        (
+            "wrong_command_type",
+            "observer_command_queue_column_project_id_definition",
+        ),
+        (
+            "wrong_command_notnull",
+            "observer_command_queue_column_project_id_definition",
+        ),
+        (
+            "wrong_command_default",
+            "observer_command_queue_column_status_definition",
+        ),
+        (
+            "wrong_command_pk",
+            "observer_command_queue_column_command_id_definition",
+        ),
     ],
 )
 def test_ac_dev_backlog_read_schema_mismatch_is_typed_and_zero_write(
@@ -29014,6 +29068,39 @@ def test_ac_dev_backlog_read_schema_mismatch_is_typed_and_zero_write(
             "UPDATE dashboard_backlog_cache_generation SET generation=0 "
             "WHERE resource='backlog'"
         )
+    elif fault == "missing_command_table":
+        connection.execute("DROP TABLE observer_command_queue")
+    elif fault == "wrong_command_table_object":
+        connection.execute("DROP TABLE observer_command_queue")
+        connection.execute(
+            "CREATE VIEW observer_command_queue AS "
+            "SELECT 'cmd' AS command_id"
+        )
+    elif fault == "missing_command_column":
+        _replace_observer_command_queue_for_test(
+            connection,
+            omit="result_json",
+        )
+    elif fault == "wrong_command_type":
+        _replace_observer_command_queue_for_test(
+            connection,
+            override=("project_id", "project_id INTEGER NOT NULL"),
+        )
+    elif fault == "wrong_command_notnull":
+        _replace_observer_command_queue_for_test(
+            connection,
+            override=("project_id", "project_id TEXT"),
+        )
+    elif fault == "wrong_command_default":
+        _replace_observer_command_queue_for_test(
+            connection,
+            override=("status", "status TEXT NOT NULL DEFAULT 'ready'"),
+        )
+    elif fault == "wrong_command_pk":
+        _replace_observer_command_queue_for_test(
+            connection,
+            override=("command_id", "command_id TEXT"),
+        )
     else:
         raise AssertionError(f"unhandled test fault: {fault}")
     connection.commit()
@@ -29065,7 +29152,7 @@ def test_ac_dev_backlog_read_schema_mismatch_is_http_409_not_raw_500(
     tmp_path,
 ):
     connection = _file_backed_backlog_read_schema_conn(tmp_path)
-    connection.execute("DROP INDEX idx_backlog_bugs_dashboard_keyset")
+    connection.execute("DROP TABLE observer_command_queue")
     connection.commit()
     before_changes = connection.total_changes
     connection.set_authorizer(governance_db._dev_schema_authorizer)
@@ -29090,7 +29177,7 @@ def test_ac_dev_backlog_read_schema_mismatch_is_http_409_not_raw_500(
             "ac_dev_backlog_read_schema_incompatible"
         )
         assert captured["body"]["details"]["incompatible_components"] == [
-            "keyset_index"
+            "observer_command_queue"
         ]
         assert captured["body"]["details"]["writes_performed"] is False
         assert captured["body"]["details"]["ddl_attempted"] is False
@@ -29286,6 +29373,15 @@ def test_stable_nonempty_backlog_read_keeps_dynamic_recovery_overlay(
         ("drop_index", "keyset_index"),
         ("delete_seed", "backlog_generation_seed"),
         ("replace_trigger", "trigger_insert_definition"),
+        ("drop_command_table", "observer_command_queue"),
+        (
+            "replace_command_table",
+            "observer_command_queue_column_status_definition",
+        ),
+        (
+            "alter_command_table",
+            "observer_command_queue_column_result_json",
+        ),
     ],
 )
 def test_ac_dev_backlog_read_detects_separate_connection_schema_toctou(
@@ -29346,6 +29442,21 @@ def test_ac_dev_backlog_read_detects_separate_connection_schema_toctou(
                 writer.execute(
                     "CREATE TRIGGER trg_dashboard_backlog_cache_insert "
                     "AFTER INSERT ON backlog_bugs BEGIN SELECT 1; END"
+                )
+            elif drift == "drop_command_table":
+                writer.execute("DROP TABLE observer_command_queue")
+            elif drift == "replace_command_table":
+                _replace_observer_command_queue_for_test(
+                    writer,
+                    override=(
+                        "status",
+                        "status TEXT NOT NULL DEFAULT 'waiting'",
+                    ),
+                )
+            elif drift == "alter_command_table":
+                writer.execute(
+                    "ALTER TABLE observer_command_queue "
+                    "RENAME COLUMN result_json TO result_payload_json"
                 )
             else:
                 raise AssertionError(f"unhandled drift: {drift}")

@@ -803,10 +803,15 @@ AC repair work uses two independent runtime planes:
   then preserves the existing commit behavior. An optimized own-project read
   on dev instead performs a pure verification of those stable-owned objects:
   exact generation columns and primary key, exact index owner and normalized
-  SQL, exact trigger owner/event/body, and a valid seed. This path issues no
-  DDL, DML, commit, temporary object, migration, backfill, or journal-mode
-  operation; the normal pagination, authority, generation, cache, and response
-  budgets are unchanged. Verification runs before any cache/data read and again
+  SQL, exact trigger owner/event/body, a valid seed, and the canonical direct
+  projection subset of `observer_command_queue`. That subset is limited to the
+  exact type/null/default/primary-key constraints for `command_id`,
+  `project_id`, `payload_json`, `status`, `error`, `completed_at`, `claimed_at`,
+  `created_at`, and `result_json`; recovery-only columns and queue indexes are
+  outside this read contract. This path issues no DDL, DML, commit, temporary
+  object, migration, backfill, or journal-mode operation; the normal pagination,
+  authority, generation, cache, and response budgets are unchanged.
+  Verification runs before any cache/data read and again
   after page, cache, and projection materialization immediately before the
   response returns. The dev authority read requires the real valid seed and
   never substitutes generation `1` for a missing row. A concurrent table,
