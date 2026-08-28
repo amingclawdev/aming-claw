@@ -13089,15 +13089,17 @@ def _dev_external_discovery_fixture(monkeypatch, tmp_path):
 
 
 def _dev_external_stable_payload(path):
-    match = re.fullmatch(
-        (
-            r"/api/backlog/([^/?]+)\?view=compact&limit=250&include_closed=true"
-            r"(?:&q=([^&]+))?"
-        ),
-        path,
-    )
-    if match:
-        project_id, backlog_query = match.groups()
+    parsed = server.urlparse(path)
+    match = re.fullmatch(r"/api/backlog/([^/?]+)", parsed.path)
+    if match and parsed.query:
+        project_id = match.group(1)
+        query = server.parse_qs(parsed.query)
+        backlog_query = (query.get("q") or [""])[0]
+        cursor = (query.get("cursor") or [""])[0]
+        status = (query.get("status") or [""])[0]
+        priority = (query.get("priority") or [""])[0]
+        include_closed = (query.get("include_closed") or ["true"])[0] == "true"
+        limit = int((query.get("limit") or ["50"])[0])
         rows = [
             {
                 "bug_id": f"{project_id.upper()}-PUBLIC",
@@ -13128,25 +13130,31 @@ def _dev_external_stable_payload(path):
             rows = [row for row in rows if row["bug_id"] == backlog_query]
         return {
             "view": "compact",
-            "limit": 250,
+            "limit": limit,
+            "offset": 0,
+            "cursor": cursor,
             "q": backlog_query or "",
+            "include_closed": include_closed,
+            "count": len(rows),
+            "total_count": len(rows),
+            "filtered_count": len(rows),
+            "has_more": False,
+            "next_cursor": None,
+            "next_offset": None,
+            "truncated": False,
             "generation": 7,
             "authority_generation": "sha256:" + "2" * 64,
             "scope": {
-                "schema_version": (
-                    "backlog.indexed_history_scope.v1"
-                    if backlog_query
-                    else "backlog.hot_window_scope.v1"
-                ),
+                "schema_version": "backlog.indexed_history_scope.v1",
                 "project_id": project_id,
                 "view": "compact",
-                "status": "",
-                "priority": "",
+                "status": status,
+                "priority": priority,
+                "q": backlog_query or "",
+                "include_closed": include_closed,
                 "public_safe": True,
                 "bounded": True,
-                "pagination": (
-                    "sqlite_indexed_keyset" if backlog_query else "hot_window"
-                ),
+                "pagination": "sqlite_indexed_keyset",
             },
             "bugs": rows,
         }
@@ -13176,6 +13184,77 @@ def _dev_external_stable_payload(path):
             "pending_scope_reconcile": [{"private": "must not escape"}],
         }
     raise AssertionError(f"unexpected stable proxy path: {path}")
+
+
+def _dev_external_paginated_backlog_payload(
+    path,
+    *,
+    total_rows,
+    generation=7,
+    authority_generation="sha256:" + "2" * 64,
+    padding_bytes=0,
+    private_indexes=(),
+):
+    parsed = server.urlparse(path)
+    match = re.fullmatch(r"/api/backlog/([^/?]+)", parsed.path)
+    assert match, path
+    query = server.parse_qs(parsed.query)
+    assert "offset" not in query
+    project_id = match.group(1)
+    limit = int(query["limit"][0])
+    assert 1 <= limit <= 50
+    cursor = (query.get("cursor") or [""])[0]
+    start = int(cursor.split(".", 1)[1], 16) if cursor else 0
+    end = min(start + limit, total_rows)
+    has_more = end < total_rows
+    status = (query.get("status") or [""])[0]
+    priority = (query.get("priority") or [""])[0]
+    include_closed = query["include_closed"][0] == "true"
+    rows = [
+        {
+            "bug_id": f"{project_id.upper()}-ROW-{index:04d}",
+            "title": f"generic public row {index}",
+            "status": status if status not in {"", "ALL"} else "OPEN",
+            "priority": priority if priority not in {"", "ALL"} else "P1",
+            "created_at": f"2026-08-28T00:{index // 60:02d}:{index % 60:02d}Z",
+            "updated_at": f"2026-08-28T00:{index // 60:02d}:{index % 60:02d}Z",
+            "fixed_at": "",
+            "privacy_level": "private" if index in private_indexes else "public",
+            "public_safe": index not in private_indexes,
+        }
+        for index in range(start, end)
+    ]
+    return {
+        "view": "compact",
+        "limit": limit,
+        "offset": 0,
+        "cursor": cursor,
+        "q": "",
+        "include_closed": include_closed,
+        "count": len(rows),
+        "total_count": total_rows,
+        "filtered_count": total_rows - start,
+        "has_more": has_more,
+        "next_cursor": f"bk1.{end:04x}" if has_more else None,
+        "next_offset": len(rows) if has_more else None,
+        "truncated": has_more,
+        "generation": generation,
+        "authority_generation": authority_generation,
+        "scope": {
+            "schema_version": "backlog.indexed_history_scope.v1",
+            "project_id": project_id,
+            "view": "compact",
+            "status": status,
+            "priority": priority,
+            "q": "",
+            "include_closed": include_closed,
+            "public_safe": True,
+            "bounded": True,
+            "pagination": "sqlite_indexed_keyset",
+        },
+        "bugs": rows,
+        "padding": "x" * padding_bytes,
+    }
 
 
 def _dev_stable_health_payload(
@@ -13585,6 +13664,12 @@ def test_ac_dev_stable_proxy_bad_schema_private_and_transport_fail_closed(monkey
         "limit_float",
         "q_missing",
         "q_container",
+        "offset_bool",
+        "cursor_container",
+        "count_float",
+        "total_count_bool",
+        "has_more_int",
+        "include_closed_int",
         "scope_status_missing",
         "scope_priority_null",
         "scope_priority_container",
@@ -13607,6 +13692,18 @@ def test_ac_dev_stable_backlog_authority_rejects_cross_scope_and_missing_generat
         payload.pop("q")
     elif defect == "q_container":
         payload["q"] = []
+    elif defect == "offset_bool":
+        payload["offset"] = False
+    elif defect == "cursor_container":
+        payload["cursor"] = []
+    elif defect == "count_float":
+        payload["count"] = float(payload["count"])
+    elif defect == "total_count_bool":
+        payload["total_count"] = True
+    elif defect == "has_more_int":
+        payload["has_more"] = 0
+    elif defect == "include_closed_int":
+        payload["include_closed"] = 1
     elif defect == "scope_status_missing":
         payload["scope"].pop("status")
     elif defect == "scope_priority_null":
@@ -13616,6 +13713,292 @@ def test_ac_dev_stable_backlog_authority_rejects_cross_scope_and_missing_generat
     with pytest.raises(GovernanceError) as rejected:
         server._dev_external_validate_backlog_list("content-sys", payload)
     assert rejected.value.code == "ac_dev_stable_proxy_backlog_authority_rejected"
+
+
+def test_ac_dev_stable_backlog_legacy_filter_binding_is_default_true_only():
+    path = server._dev_external_stable_backlog_list_path(
+        "content-sys",
+        status="OPEN",
+    )
+    payload = copy.deepcopy(_dev_external_stable_payload(path))
+    payload.pop("include_closed")
+    payload["scope"].pop("q")
+    payload["scope"].pop("include_closed")
+
+    _rows, authority, _pagination = server._dev_external_validate_backlog_list(
+        "content-sys",
+        payload,
+        status="OPEN",
+    )
+    assert (
+        authority["filter_binding_schema"]
+        == "backlog.legacy_default_include_closed.v1"
+    )
+
+    with pytest.raises(GovernanceError) as unsupported:
+        server._dev_external_validate_backlog_list(
+            "content-sys",
+            payload,
+            status="OPEN",
+            include_closed=False,
+        )
+    assert (
+        unsupported.value.code
+        == "ac_dev_stable_proxy_backlog_pagination_unsupported"
+    )
+    assert unsupported.value.details["zero_write_rejection"] is True
+
+    partial = copy.deepcopy(payload)
+    partial["include_closed"] = True
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_validate_backlog_list(
+            "content-sys",
+            partial,
+            status="OPEN",
+        )
+    assert rejected.value.code == "ac_dev_stable_proxy_backlog_authority_rejected"
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_code"),
+    [
+        ({"limit": "0"}, "ac_dev_external_backlog_limit_invalid"),
+        ({"limit": "51"}, "ac_dev_external_backlog_limit_invalid"),
+        ({"limit": "01"}, "ac_dev_external_backlog_limit_invalid"),
+        ({"limit": True}, "ac_dev_external_backlog_query_rejected"),
+        ({"offset": "400"}, "ac_dev_external_backlog_offset_invalid"),
+        ({"offset": "-1"}, "ac_dev_external_backlog_offset_invalid"),
+        ({"status": " OPEN"}, "ac_dev_external_backlog_filter_invalid"),
+        ({"include_closed": "False"}, "ac_dev_external_backlog_filter_invalid"),
+        ({"unknown": "x"}, "ac_dev_external_backlog_query_rejected"),
+        (
+            {"priority": ["P0", "P1"]},
+            "ac_dev_external_backlog_query_conflict",
+        ),
+    ],
+)
+def test_ac_dev_external_backlog_query_is_exact_and_bounded(
+    monkeypatch,
+    query,
+    expected_code,
+):
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get",
+        lambda _path: pytest.fail("invalid query reached stable transport"),
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_backlog_list_projection("content-sys", query)
+    assert rejected.value.code == expected_code
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+
+
+def test_ac_dev_external_backlog_bridges_offset_with_bounded_keyset_pages(monkeypatch):
+    paths = []
+
+    def stable_get(path):
+        paths.append(path)
+        return _dev_external_paginated_backlog_payload(path, total_rows=70)
+
+    monkeypatch.setattr(server, "_dev_stable_external_public_get", stable_get)
+    result = server._dev_external_backlog_list_projection(
+        "generic-system",
+        {
+            "view": "compact",
+            "limit": "3",
+            "offset": "55",
+            "status": "OPEN",
+            "priority": "P1",
+            "include_closed": "false",
+        },
+    )
+
+    assert [row["bug_id"] for row in result["bugs"]] == [
+        "GENERIC-SYSTEM-ROW-0055",
+        "GENERIC-SYSTEM-ROW-0056",
+        "GENERIC-SYSTEM-ROW-0057",
+    ]
+    assert result["count"] == 3
+    assert result["limit"] == 3
+    assert result["offset"] == 55
+    assert result["has_more"] is True
+    assert result["truncated"] is True
+    assert result["next_offset"] == 58
+    assert result["filters"] == {
+        "status": "OPEN",
+        "priority": "P1",
+        "include_closed": False,
+    }
+    assert result["pagination"]["pages_read"] == 2
+    assert result["pagination"]["rows_scanned"] == 70
+    assert len(paths) == 2
+    parsed = [server.parse_qs(server.urlparse(path).query) for path in paths]
+    assert all("offset" not in query for query in parsed)
+    assert all(int(query["limit"][0]) <= 50 for query in parsed)
+    assert all(query["status"] == ["OPEN"] for query in parsed)
+    assert all(query["priority"] == ["P1"] for query in parsed)
+    assert all(query["include_closed"] == ["false"] for query in parsed)
+    assert "cursor" not in parsed[0]
+    assert parsed[1]["cursor"] == ["bk1.0032"]
+
+
+def test_ac_dev_external_backlog_honors_one_row_caller_limit(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get",
+        lambda path: _dev_external_paginated_backlog_payload(path, total_rows=3),
+    )
+    result = server._dev_external_backlog_list_projection(
+        "generic-system",
+        {"limit": "1"},
+    )
+    assert result["limit"] == 1
+    assert result["count"] == 1
+    assert len(result["bugs"]) == 1
+    assert result["has_more"] is True
+    assert result["next_offset"] == 1
+
+
+def test_ac_dev_external_backlog_generic_210_rows_has_no_name_branch(monkeypatch):
+    paths = []
+
+    def stable_get(path):
+        paths.append(path)
+        return _dev_external_paginated_backlog_payload(path, total_rows=210)
+
+    monkeypatch.setattr(server, "_dev_stable_external_public_get", stable_get)
+    result = server._dev_external_backlog_list_projection(
+        "generic-system",
+        {"limit": "50", "offset": "160", "include_closed": "true"},
+    )
+
+    assert result["count"] == 50
+    assert result["bugs"][0]["bug_id"] == "GENERIC-SYSTEM-ROW-0160"
+    assert result["bugs"][-1]["bug_id"] == "GENERIC-SYSTEM-ROW-0209"
+    assert result["has_more"] is False
+    assert result["next_offset"] is None
+    assert result["pagination"]["pages_read"] == 5
+    assert len(paths) == 5
+    assert all("generic-system" in path for path in paths)
+
+
+def test_ac_dev_external_backlog_aggregate_cap_stops_before_third_fetch(monkeypatch):
+    paths = []
+
+    def stable_get(path):
+        paths.append(path)
+        return _dev_external_paginated_backlog_payload(
+            path,
+            total_rows=120,
+            padding_bytes=140_000,
+        )
+
+    monkeypatch.setattr(server, "_dev_stable_external_public_get", stable_get)
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_backlog_list_projection(
+            "generic-system",
+            {"limit": "5", "offset": "55"},
+        )
+    assert rejected.value.code == "ac_dev_stable_proxy_aggregate_size_rejected"
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["budget"]["max_aggregate_bytes"] == 256 * 1024
+    assert rejected.value.details["budget"]["pages_observed"] == 2
+    assert len(paths) == 2
+
+
+def test_ac_dev_external_backlog_row_budget_exhaustion_is_explicit(monkeypatch):
+    paths = []
+    private_indexes = tuple(range(500))
+
+    def stable_get(path):
+        paths.append(path)
+        return _dev_external_paginated_backlog_payload(
+            path,
+            total_rows=500,
+            private_indexes=private_indexes,
+        )
+
+    monkeypatch.setattr(server, "_dev_stable_external_public_get", stable_get)
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_backlog_list_projection(
+            "generic-system",
+            {"limit": "1"},
+        )
+    assert rejected.value.code == "ac_dev_stable_proxy_backlog_budget_exhausted"
+    assert rejected.value.details["budget"]["pages_observed"] == 9
+    assert rejected.value.details["budget"]["rows_observed"] == 450
+    assert len(paths) == 9
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "generation",
+        "filter",
+        "scope_extra",
+        "row_filter",
+        "cursor",
+        "duplicate",
+    ],
+)
+def test_ac_dev_external_backlog_pages_fail_closed_on_drift(monkeypatch, drift):
+    calls = 0
+
+    def stable_get(path):
+        nonlocal calls
+        calls += 1
+        payload = _dev_external_paginated_backlog_payload(path, total_rows=70)
+        if calls == 2 and drift == "generation":
+            payload["generation"] = 8
+        elif calls == 2 and drift == "filter":
+            payload["scope"]["priority"] = "P2"
+        elif calls == 2 and drift == "scope_extra":
+            payload["scope"]["facets"] = ["changed-between-pages"]
+        elif calls == 2 and drift == "row_filter":
+            payload["bugs"][0]["status"] = "IN_PROGRESS"
+        elif calls == 1 and drift == "cursor":
+            payload["next_cursor"] = "bk1.0000"
+        elif calls == 2 and drift == "duplicate":
+            payload["bugs"][0]["bug_id"] = "GENERIC-SYSTEM-ROW-0000"
+        return payload
+
+    monkeypatch.setattr(server, "_dev_stable_external_public_get", stable_get)
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_backlog_list_projection(
+            "generic-system",
+            {"limit": "3", "offset": "55", "status": "OPEN"},
+        )
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.code in {
+        "ac_dev_stable_proxy_backlog_authority_rejected",
+        "ac_dev_stable_proxy_backlog_generation_drift",
+        "ac_dev_stable_proxy_backlog_filter_drift",
+        "ac_dev_stable_proxy_backlog_pagination_drift",
+    }
+
+
+def test_ac_dev_external_backlog_private_rows_do_not_fill_public_offset(monkeypatch):
+    private_indexes = tuple(range(50))
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get",
+        lambda path: _dev_external_paginated_backlog_payload(
+            path,
+            total_rows=70,
+            private_indexes=private_indexes,
+        ),
+    )
+    result = server._dev_external_backlog_list_projection(
+        "generic-system",
+        {"limit": "2", "offset": "1"},
+    )
+    assert [row["bug_id"] for row in result["bugs"]] == [
+        "GENERIC-SYSTEM-ROW-0051",
+        "GENERIC-SYSTEM-ROW-0052",
+    ]
+    assert result["pagination"]["pages_read"] == 2
 
 
 @pytest.mark.parametrize(
@@ -13872,7 +14255,16 @@ def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
         )
         assert item["bug"]["public_safe"] is True
         assert item["backlog_id"] == backlog_id
-        assert item["stable_read_authority"] == backlog["stable_read_authority"]
+        assert item["stable_read_authority"]["project_id"] == project_id
+        assert item["stable_read_authority"]["generation"] == 7
+        assert (
+            item["stable_read_authority"]["authority_generation"]
+            == backlog["stable_read_authority"]["authority_generation"]
+        )
+        assert (
+            item["stable_read_authority"]["scope_sha256"]
+            != backlog["stable_read_authority"]["scope_sha256"]
+        )
         assert "chain_trigger_json" not in item["bug"]
 
         graph = discover(
@@ -28104,9 +28496,11 @@ def test_backlog_list_server_search_supports_status_priority_and_pagination(conn
     assert first["scope"] == {
         "schema_version": "backlog.indexed_history_scope.v1",
         "project_id": PID,
-        "status": "OPEN",
-        "priority": "P1",
-        "view": "compact",
+            "status": "OPEN",
+            "priority": "P1",
+            "q": "historical governance lookup",
+            "include_closed": True,
+            "view": "compact",
         "public_safe": True,
         "bounded": True,
         "facets": [],
@@ -28179,6 +28573,51 @@ def test_backlog_hot_window_is_newest_first_bounded_and_generation_invalidated(c
     assert refreshed["read_cache"]["miss"] is True
     assert refreshed["generation"] == first["generation"] + 1
     assert refreshed["bugs"][0]["bug_id"] == "AC-HOT-010"
+
+
+def test_backlog_explicit_lower_limit_uses_keyset_instead_of_forcing_hot_250(conn):
+    server._backlog_read_cache_clear()
+    conn.executemany(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+        [
+            (
+                f"AC-LOW-LIMIT-{index:03d}",
+                f"Lower bounded row {index}",
+                f"2026-07-25T00:{index // 60:02d}:{index % 60:02d}Z",
+                f"2026-07-25T00:{index // 60:02d}:{index % 60:02d}Z",
+            )
+            for index in range(210)
+        ],
+    )
+    conn.commit()
+    query = {
+        "view": "compact",
+        "limit": "50",
+        "include_closed": "true",
+    }
+
+    first = server.handle_backlog_list(_ctx({"project_id": PID}, query=query))
+    second = server.handle_backlog_list(
+        _ctx(
+            {"project_id": PID},
+            query={**query, "cursor": first["next_cursor"]},
+        )
+    )
+
+    assert first["limit"] == 50
+    assert first["count"] == 50
+    assert first["hot_count"] == 0
+    assert first["source"] == "sqlite_indexed_keyset"
+    assert first["scope"]["pagination"] == "sqlite_indexed_keyset"
+    assert first["scope"]["q"] == ""
+    assert first["scope"]["include_closed"] is True
+    assert first["has_more"] is True
+    assert second["limit"] == 50
+    assert second["count"] == 50
+    assert second["cursor"] == first["next_cursor"]
+    assert second["source"] == "sqlite_indexed_keyset"
 
 
 def test_backlog_history_uses_stable_keyset_and_separate_cache(conn):

@@ -3376,7 +3376,7 @@ _DEV_EXTERNAL_ONBOARD_BODY_ALLOWLIST = frozenset(
 )
 _DEV_EXTERNAL_ONBOARD_QUERY_ALLOWLIST = _DEV_EXTERNAL_ONBOARD_BODY_ALLOWLIST
 _DEV_EXTERNAL_BACKLOG_LIST_QUERY_ALLOWLIST = frozenset(
-    {"view", "limit", "status", "priority", "include_closed"}
+    {"view", "limit", "offset", "status", "priority", "include_closed"}
 )
 
 
@@ -3693,7 +3693,18 @@ _DEV_STABLE_PROXY_TIMEOUT_SECONDS = 3.0
 _DEV_LEGACY_STABLE_HEALTH_COMMIT = (
     "a25838f15f949ac434cf78e03f20760e82ff81f0"
 )
-_DEV_STABLE_PROXY_BACKLOG_MAX_ROWS = 250
+_DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS = 50
+_DEV_STABLE_PROXY_BACKLOG_MAX_PAGES = 9
+_DEV_STABLE_PROXY_BACKLOG_MAX_ROWS = (
+    _DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS
+    * _DEV_STABLE_PROXY_BACKLOG_MAX_PAGES
+)
+_DEV_STABLE_PROXY_BACKLOG_MAX_OFFSET = (
+    _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS
+    - _DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS
+    - 1
+)
+_DEV_STABLE_PROXY_BACKLOG_AGGREGATE_BYTES = _DEV_STABLE_PROXY_RESPONSE_BYTES
 
 
 class _DevStableProxyNoRedirect(urllib.request.HTTPRedirectHandler):
@@ -4198,62 +4209,303 @@ def _dev_external_public_backlog_row(
     }
 
 
+def _dev_external_backlog_query_failure(
+    project_id: str,
+    *,
+    code: str,
+    detail: str,
+) -> GovernanceError:
+    return GovernanceError(
+        code,
+        "AC dev external backlog discovery rejected an unbounded selector",
+        400,
+        {
+            "schema_version": _DEV_EXTERNAL_DISCOVERY_SCHEMA_VERSION,
+            "project_id": project_id,
+            "detail": detail,
+            "read_only": True,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "managed_pass": False,
+            "pass_implied": False,
+        },
+    )
+
+
+def _dev_external_exact_query_scalar(
+    project_id: str,
+    query: Mapping[str, Any],
+    key: str,
+    default: str,
+) -> str:
+    raw = query.get(key, default)
+    if isinstance(raw, list):
+        if not raw or any(type(value) is not str for value in raw):
+            raise _dev_external_backlog_query_failure(
+                project_id,
+                code="ac_dev_external_backlog_query_rejected",
+                detail=f"{key} must contain one exact scalar value",
+            )
+        if any(value != raw[0] for value in raw[1:]):
+            raise _dev_external_backlog_query_failure(
+                project_id,
+                code="ac_dev_external_backlog_query_conflict",
+                detail=f"{key} repeated with conflicting values",
+            )
+        raw = raw[0]
+    if type(raw) is not str:
+        raise _dev_external_backlog_query_failure(
+            project_id,
+            code="ac_dev_external_backlog_query_rejected",
+            detail=f"{key} must be an exact query string",
+        )
+    return raw
+
+
+def _dev_external_parse_backlog_list_query(
+    project_id: str,
+    query: Mapping[str, Any],
+    *,
+    default_limit: int,
+) -> dict[str, Any]:
+    unknown = sorted(set(query) - _DEV_EXTERNAL_BACKLOG_LIST_QUERY_ALLOWLIST)
+    if unknown:
+        raise _dev_external_backlog_query_failure(
+            project_id,
+            code="ac_dev_external_backlog_query_rejected",
+            detail=f"unknown selectors: {', '.join(unknown)}",
+        )
+    view = _dev_external_exact_query_scalar(project_id, query, "view", "compact")
+    if view not in {"", "compact"}:
+        raise _dev_external_backlog_query_failure(
+            project_id,
+            code="ac_dev_external_backlog_query_rejected",
+            detail="view must be exactly compact",
+        )
+    raw_limit = _dev_external_exact_query_scalar(
+        project_id,
+        query,
+        "limit",
+        str(default_limit),
+    )
+    if not re.fullmatch(r"[1-9][0-9]*", raw_limit):
+        raise _dev_external_backlog_query_failure(
+            project_id,
+            code="ac_dev_external_backlog_limit_invalid",
+            detail="limit must be a canonical integer from 1 to 50",
+        )
+    limit = int(raw_limit)
+    if limit > _DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS:
+        raise _dev_external_backlog_query_failure(
+            project_id,
+            code="ac_dev_external_backlog_limit_invalid",
+            detail="limit must be a canonical integer from 1 to 50",
+        )
+    raw_offset = _dev_external_exact_query_scalar(
+        project_id,
+        query,
+        "offset",
+        "0",
+    )
+    if not re.fullmatch(r"0|[1-9][0-9]*", raw_offset):
+        raise _dev_external_backlog_query_failure(
+            project_id,
+            code="ac_dev_external_backlog_offset_invalid",
+            detail=(
+                "offset must be a canonical integer from 0 to "
+                f"{_DEV_STABLE_PROXY_BACKLOG_MAX_OFFSET}"
+            ),
+        )
+    offset = int(raw_offset)
+    if offset > _DEV_STABLE_PROXY_BACKLOG_MAX_OFFSET:
+        raise _dev_external_backlog_query_failure(
+            project_id,
+            code="ac_dev_external_backlog_offset_invalid",
+            detail=(
+                "offset must be a canonical integer from 0 to "
+                f"{_DEV_STABLE_PROXY_BACKLOG_MAX_OFFSET}"
+            ),
+        )
+    filters: dict[str, str] = {}
+    for key in ("status", "priority"):
+        value = _dev_external_exact_query_scalar(project_id, query, key, "")
+        if value and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", value):
+            raise _dev_external_backlog_query_failure(
+                project_id,
+                code="ac_dev_external_backlog_filter_invalid",
+                detail=f"{key} must be an exact bounded token",
+            )
+        filters[key] = value
+    raw_include_closed = _dev_external_exact_query_scalar(
+        project_id,
+        query,
+        "include_closed",
+        "true",
+    )
+    if raw_include_closed not in {"true", "false"}:
+        raise _dev_external_backlog_query_failure(
+            project_id,
+            code="ac_dev_external_backlog_filter_invalid",
+            detail="include_closed must be exactly true or false",
+        )
+    return {
+        "view": "compact",
+        "limit": limit,
+        "offset": offset,
+        "status": filters["status"],
+        "priority": filters["priority"],
+        "include_closed": raw_include_closed == "true",
+    }
+
+
 def _dev_external_stable_backlog_list_path(
     project_id: str,
     *,
+    limit: int | None = None,
+    cursor: str = "",
+    status: str = "",
+    priority: str = "",
+    include_closed: bool = True,
     backlog_id: str = "",
 ) -> str:
-    path = (
-        f"/api/backlog/{quote(project_id, safe='')}"
-        "?view=compact&limit=250&include_closed=true"
+    page_limit = int(
+        limit
+        if limit is not None
+        else 1
+        if backlog_id
+        else _DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS
     )
+    params: list[tuple[str, str]] = [
+        ("view", "compact"),
+        ("limit", str(page_limit)),
+        ("include_closed", "true" if include_closed else "false"),
+    ]
+    if status:
+        params.append(("status", status))
+    if priority:
+        params.append(("priority", priority))
     if backlog_id:
-        path += f"&q={quote(backlog_id, safe='')}"
-    return path
+        params.append(("q", backlog_id))
+    if cursor:
+        params.append(("cursor", cursor))
+    return f"/api/backlog/{quote(project_id, safe='')}?{urlencode(params)}"
 
 
 def _dev_external_validate_backlog_list(
     project_id: str,
     stable: Mapping[str, Any],
     *,
+    limit: int | None = None,
+    cursor: str = "",
+    status: str = "",
+    priority: str = "",
+    include_closed: bool = True,
     backlog_id: str = "",
-) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+) -> tuple[list[Mapping[str, Any]], dict[str, Any], dict[str, Any]]:
+    page_limit = int(
+        limit
+        if limit is not None
+        else 1
+        if backlog_id
+        else _DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS
+    )
     rows = stable.get("bugs")
     scope = stable.get("scope")
     generation = stable.get("generation")
     authority_generation = stable.get("authority_generation")
-    expected_scope_schema = (
-        "backlog.indexed_history_scope.v1"
-        if backlog_id
-        else "backlog.hot_window_scope.v1"
+    has_more = stable.get("has_more")
+    next_cursor = stable.get("next_cursor")
+    next_offset = stable.get("next_offset")
+    full_filter_binding = bool(
+        "include_closed" in stable
+        and isinstance(scope, Mapping)
+        and "q" in scope
+        and "include_closed" in scope
     )
-    expected_pagination = "sqlite_indexed_keyset" if backlog_id else "hot_window"
+    legacy_filter_binding = bool(
+        "include_closed" not in stable
+        and isinstance(scope, Mapping)
+        and "q" not in scope
+        and "include_closed" not in scope
+    )
+    if legacy_filter_binding and not include_closed:
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_backlog_pagination_unsupported",
+            (
+                "legacy stable backlog pages cannot prove the requested "
+                "include_closed=false filter"
+            ),
+            status=409,
+        )
+    filter_binding_valid = bool(
+        (
+            full_filter_binding
+            and _dev_exact_scalar_fields(
+                stable,
+                {"include_closed": include_closed},
+            )
+            and _dev_exact_scalar_fields(
+                scope,
+                {"q": backlog_id, "include_closed": include_closed},
+            )
+        )
+        or (legacy_filter_binding and include_closed)
+    )
     if not (
         _dev_exact_scalar_fields(
             stable,
             {
                 "view": "compact",
-                "limit": _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS,
+                "limit": page_limit,
+                "offset": 0,
+                "cursor": cursor,
                 "q": backlog_id,
             },
         )
         and type(rows) is list
-        and len(rows) <= _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS
+        and len(rows) <= page_limit
         and all(isinstance(row, Mapping) for row in rows)
+        and type(stable.get("count")) is int
+        and stable.get("count") == len(rows)
+        and type(stable.get("total_count")) is int
+        and stable.get("total_count") >= len(rows)
+        and type(stable.get("filtered_count")) is int
+        and stable.get("filtered_count") >= len(rows)
+        and type(has_more) is bool
+        and type(stable.get("truncated")) is bool
+        and stable.get("truncated") is has_more
+        and (
+            (
+                has_more is True
+                and bool(rows)
+                and type(next_cursor) is str
+                and len(next_cursor) <= 1024
+                and re.fullmatch(r"bk1\.[0-9a-f]+", next_cursor)
+                and type(next_offset) is int
+                and next_offset == len(rows)
+            )
+            or (
+                has_more is False
+                and next_cursor is None
+                and next_offset is None
+            )
+        )
         and type(scope) is dict
         and _dev_exact_scalar_fields(
             scope,
             {
-                "schema_version": expected_scope_schema,
+                "schema_version": "backlog.indexed_history_scope.v1",
                 "project_id": project_id,
                 "view": "compact",
-                "status": "",
-                "priority": "",
+                "status": status,
+                "priority": priority,
                 "public_safe": True,
                 "bounded": True,
-                "pagination": expected_pagination,
+                "pagination": "sqlite_indexed_keyset",
             },
         )
+        and filter_binding_valid
         and type(generation) is int
         and generation >= 1
         and type(authority_generation) is str
@@ -4269,7 +4521,47 @@ def _dev_external_validate_backlog_list(
         "project_id": project_id,
         "generation": generation,
         "authority_generation": authority_generation,
+        "scope_sha256": stable_sha256(dict(scope)),
+        "filter_binding_schema": (
+            "backlog.filter_binding.v1"
+            if full_filter_binding
+            else "backlog.legacy_default_include_closed.v1"
+        ),
+    }, {
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "next_offset": next_offset,
+        "count": len(rows),
     }
+
+
+def _dev_external_backlog_status_matches(status: str, requested: str) -> bool:
+    normalized = requested.upper()
+    actual = status.upper()
+    if not normalized or normalized == "ALL":
+        return True
+    return actual == normalized
+
+
+def _dev_external_backlog_budget_failure(
+    code: str,
+    detail: str,
+    *,
+    pages: int,
+    rows: int,
+    aggregate_bytes: int,
+) -> GovernanceError:
+    rejected = _dev_stable_proxy_failure(code, detail, status=409)
+    rejected.details["budget"] = {
+        "page_rows": _DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS,
+        "max_pages": _DEV_STABLE_PROXY_BACKLOG_MAX_PAGES,
+        "max_rows": _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS,
+        "max_aggregate_bytes": _DEV_STABLE_PROXY_BACKLOG_AGGREGATE_BYTES,
+        "pages_observed": pages,
+        "rows_observed": rows,
+        "aggregate_bytes_observed": aggregate_bytes,
+    }
+    return rejected
 
 
 def _dev_external_backlog_list_projection(
@@ -4278,50 +4570,164 @@ def _dev_external_backlog_list_projection(
     *,
     default_limit: int = 20,
 ) -> dict[str, Any]:
-    raw_limit = str(_first_query_value(query, "limit", str(default_limit)) or "")
-    try:
-        limit = max(1, min(int(raw_limit), 50))
-    except (TypeError, ValueError) as exc:
-        raise GovernanceError(
-            "ac_dev_external_backlog_limit_invalid",
-            "external backlog discovery limit must be an integer from 1 to 50",
-            400,
-        ) from exc
-    status_filter = str(_first_query_value(query, "status") or "").strip()
-    priority_filter = str(_first_query_value(query, "priority") or "").strip()
-    stable = _dev_stable_external_public_get(
-        _dev_external_stable_backlog_list_path(project_id)
+    requested = _dev_external_parse_backlog_list_query(
+        project_id,
+        query,
+        default_limit=default_limit,
     )
-    rows, authority = _dev_external_validate_backlog_list(project_id, stable)
-    public_rows = [
-        projected
-        for row in rows
+    target_public_rows = requested["offset"] + requested["limit"] + 1
+    pages = 0
+    scanned_rows = 0
+    aggregate_bytes = 0
+    cursor = ""
+    seen_cursors: set[str] = set()
+    seen_backlog_ids: set[str] = set()
+    authority: dict[str, Any] | None = None
+    public_rows: list[dict[str, Any]] = []
+    while True:
         if (
-            projected := _dev_external_public_backlog_row(
+            pages >= _DEV_STABLE_PROXY_BACKLOG_MAX_PAGES
+            or scanned_rows >= _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS
+        ):
+            raise _dev_external_backlog_budget_failure(
+                "ac_dev_stable_proxy_backlog_budget_exhausted",
+                "stable backlog keyset scan exhausted its explicit page/row budget",
+                pages=pages,
+                rows=scanned_rows,
+                aggregate_bytes=aggregate_bytes,
+            )
+        page_limit = min(
+            _DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS,
+            _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS - scanned_rows,
+        )
+        stable = _dev_stable_external_public_get(
+            _dev_external_stable_backlog_list_path(
+                project_id,
+                limit=page_limit,
+                cursor=cursor,
+                status=requested["status"],
+                priority=requested["priority"],
+                include_closed=requested["include_closed"],
+            )
+        )
+        page_bytes = len(
+            json.dumps(
+                stable,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        aggregate_bytes += page_bytes
+        if aggregate_bytes > _DEV_STABLE_PROXY_BACKLOG_AGGREGATE_BYTES:
+            raise _dev_external_backlog_budget_failure(
+                "ac_dev_stable_proxy_aggregate_size_rejected",
+                "stable backlog keyset scan exceeded its aggregate wire-envelope budget",
+                pages=pages + 1,
+                rows=scanned_rows,
+                aggregate_bytes=aggregate_bytes,
+            )
+        rows, page_authority, pagination = _dev_external_validate_backlog_list(
+            project_id,
+            stable,
+            limit=page_limit,
+            cursor=cursor,
+            status=requested["status"],
+            priority=requested["priority"],
+            include_closed=requested["include_closed"],
+        )
+        if authority is None:
+            authority = page_authority
+        elif page_authority != authority:
+            raise _dev_stable_proxy_failure(
+                "ac_dev_stable_proxy_backlog_generation_drift",
+                "stable backlog authority or filter scope changed across keyset pages",
+                status=409,
+            )
+        pages += 1
+        scanned_rows += len(rows)
+        for row in rows:
+            projected = _dev_external_public_backlog_row(
                 row,
                 require_explicit_public_safe=True,
             )
-        ) is not None
-        and (not status_filter or projected["status"].upper() == status_filter.upper())
-        and (
-            not priority_filter
-            or projected["priority"].upper() == priority_filter.upper()
-        )
-        and (
-            _query_bool(query, "include_closed", True)
-            or projected["status"].upper() not in _BACKLOG_CLOSED_STATUSES
-        )
-    ][:limit]
+            if projected is None:
+                continue
+            if not _dev_external_backlog_status_matches(
+                projected["status"],
+                requested["status"],
+            ) or (
+                requested["priority"].upper() not in {"", "ALL"}
+                and projected["priority"].upper()
+                != requested["priority"].upper()
+            ) or (
+                not requested["include_closed"]
+                and projected["status"].upper() in _BACKLOG_CLOSED_STATUSES
+            ):
+                raise _dev_stable_proxy_failure(
+                    "ac_dev_stable_proxy_backlog_filter_drift",
+                    "stable backlog page contained a public row outside the exact filter scope",
+                    status=409,
+                )
+            bug_id = projected["bug_id"]
+            if bug_id in seen_backlog_ids:
+                raise _dev_stable_proxy_failure(
+                    "ac_dev_stable_proxy_backlog_pagination_drift",
+                    "stable backlog keyset pages repeated a backlog identity",
+                    status=409,
+                )
+            seen_backlog_ids.add(bug_id)
+            public_rows.append(projected)
+        if len(public_rows) >= target_public_rows:
+            break
+        if pagination["has_more"] is False:
+            break
+        next_cursor = str(pagination["next_cursor"])
+        if next_cursor == cursor or next_cursor in seen_cursors:
+            raise _dev_stable_proxy_failure(
+                "ac_dev_stable_proxy_backlog_pagination_drift",
+                "stable backlog keyset cursor did not advance exactly once",
+                status=409,
+            )
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    start = requested["offset"]
+    stop = start + requested["limit"]
+    selected_rows = public_rows[start:stop]
+    has_more = len(public_rows) > stop
     return {
         "schema_version": "ac_dev_external_public_backlog.v1",
         "project_id": project_id,
-        "bugs": public_rows,
-        "count": len(public_rows),
-        "limit": limit,
+        "bugs": selected_rows,
+        "count": len(selected_rows),
+        "limit": requested["limit"],
+        "offset": requested["offset"],
+        "has_more": has_more,
+        "truncated": has_more,
+        "next_offset": (
+            requested["offset"] + len(selected_rows)
+            if has_more
+            else None
+        ),
+        "filters": {
+            "status": requested["status"],
+            "priority": requested["priority"],
+            "include_closed": requested["include_closed"],
+        },
+        "pagination": {
+            "strategy": "bounded_stable_keyset_bridge",
+            "pages_read": pages,
+            "rows_scanned": scanned_rows,
+            "aggregate_wire_envelope_bytes": aggregate_bytes,
+            "page_rows_max": _DEV_STABLE_PROXY_BACKLOG_PAGE_ROWS,
+            "page_count_max": _DEV_STABLE_PROXY_BACKLOG_MAX_PAGES,
+            "row_count_max": _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS,
+            "aggregate_wire_envelope_bytes_max": (
+                _DEV_STABLE_PROXY_BACKLOG_AGGREGATE_BYTES
+            ),
+        },
         "bounded": True,
         "public_safe": True,
         "read_only": True,
-        "stable_read_authority": authority,
+        "stable_read_authority": authority or {},
     }
 
 
@@ -4346,15 +4752,19 @@ def _dev_external_backlog_item_projection(
     before_list, stable_item, after_list = _dev_stable_external_public_get_many(
         [list_path, item_path, list_path]
     )
-    before_rows, before_authority = _dev_external_validate_backlog_list(
-        project_id,
-        before_list,
-        backlog_id=backlog_id,
+    before_rows, before_authority, _before_pagination = (
+        _dev_external_validate_backlog_list(
+            project_id,
+            before_list,
+            backlog_id=backlog_id,
+        )
     )
-    after_rows, after_authority = _dev_external_validate_backlog_list(
-        project_id,
-        after_list,
-        backlog_id=backlog_id,
+    after_rows, after_authority, _after_pagination = (
+        _dev_external_validate_backlog_list(
+            project_id,
+            after_list,
+            backlog_id=backlog_id,
+        )
     )
     if before_authority != after_authority:
         raise _dev_stable_proxy_failure(
@@ -205053,7 +205463,16 @@ def handle_backlog_list(ctx: RequestContext):
     query = ctx.query or {}
     optimized = any(
         _query_has_key(query, key)
-        for key in ("view", "limit", "offset", "q", "include_closed")
+        for key in (
+            "view",
+            "limit",
+            "offset",
+            "cursor",
+            "q",
+            "status",
+            "priority",
+            "include_closed",
+        )
     )
     view = _first_query_value(query, "view", "full").strip().lower() or "full"
     if view not in {"full", "compact"}:
@@ -205070,6 +205489,10 @@ def handle_backlog_list(ctx: RequestContext):
         and not search
         and not cursor_value
         and offset == 0
+        and (
+            not _query_has_key(query, "limit")
+            or raw_limit == _BACKLOG_HOT_WINDOW_LIMIT
+        )
         and include_closed
         and not _first_query_value(query, "status").strip()
         and not _first_query_value(query, "priority").strip()
@@ -205152,6 +205575,7 @@ def handle_backlog_list(ctx: RequestContext):
                 "limit": page_limit if limit is not None else None,
                 "offset": 0,
                 "cursor": cursor_value,
+                "include_closed": include_closed,
                 "has_more": has_more,
                 "next_cursor": oldest_cursor if has_more else None,
                 "next_offset": len(bugs) if has_more else None,
@@ -205175,6 +205599,8 @@ def handle_backlog_list(ctx: RequestContext):
                     "project_id": pid,
                     "status": _first_query_value(query, "status").strip(),
                     "priority": _first_query_value(query, "priority").strip(),
+                    "q": search,
+                    "include_closed": include_closed,
                     "view": view,
                     "public_safe": True,
                     "bounded": limit is not None,

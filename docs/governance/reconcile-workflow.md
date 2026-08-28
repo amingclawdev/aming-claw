@@ -843,6 +843,35 @@ AC repair work uses two independent runtime planes:
   stable Onboard, but reports discovery available only after its own stable
   health pre/post check; it never calls stable Onboard or any authority mint path.
   Every other non-AC surface remains a pre-handler zero-write rejection.
+- External compact backlog discovery accepts only exact bounded selectors:
+  canonical integer `limit=1..50`, canonical integer `offset=0..399`, bounded
+  `status`/`priority` tokens, and lowercase `include_closed=true|false`.
+  Unknown selectors and conflicting repeats fail before transport. The dev
+  projector never forwards a positive numeric offset to stable. It walks stable
+  keyset cursors with at most 50 rows per page, nine pages, 450 rows, and a
+  total wire-envelope budget no larger than the existing 256 KiB single-page
+  cap. Every page must preserve exact project, generation, authority
+  generation, filter scope, compact view, keyset pagination, cursor, and raw
+  JSON types. A cursor cycle, duplicate row, filter/generation drift, one-page
+  oversize, aggregate oversize, or exhausted scan budget is a typed zero-write
+  rejection; the proxy never silently omits rows. Successful projections report
+  truthful `count`, `limit`, `offset`, `has_more`, `truncated`, and `next_offset`.
+  The stable producer treats an explicit limit below the 250-row dashboard hot
+  window as an indexed keyset request, while an explicit 250-row request retains
+  existing hot-window cache semantics.
+- Producer/consumer compatibility is staged. The frozen `a25838f...` stable
+  producer still forces an unfiltered explicit lower limit into its 250-row hot
+  window and does not emit the successor `q`/`include_closed` scope bindings.
+  Candidate dev may accept a legacy filtered page only when its top-level `q`
+  and scope `status`/`priority` are exact and `include_closed` remains the
+  provable default `true`; a requested `include_closed=false` without the new
+  binding returns typed `ac_dev_stable_proxy_backlog_pagination_unsupported`
+  and remains HOLD. There is no supported runtime or environment override for
+  the literal stable origin `127.0.0.1:40000`, so source/integration QA must not
+  be reported as an isolated two-process canary. Complete unfiltered end-to-end
+  verification follows a separately authorized stable producer deployment or
+  promotion. All of these reads remain advisory discovery: no route, managed
+  PASS, deploy, graph activation, reconcile, or close authority is implied.
 - Dev may append repair backlog, timeline, ContractRuntime, candidate graph,
   and independent-QA evidence. It cannot activate/finalize current-full,
   rewrite stable version identity, run stable deployment endpoints, or join
