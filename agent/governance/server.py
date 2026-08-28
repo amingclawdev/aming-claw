@@ -3693,6 +3693,10 @@ _DEV_STABLE_PROXY_ORIGIN = "http://127.0.0.1:40000"
 _DEV_STABLE_PROXY_HEALTH_BYTES = 64 * 1024
 _DEV_STABLE_PROXY_RESPONSE_BYTES = 256 * 1024
 _DEV_STABLE_PROXY_TIMEOUT_SECONDS = 3.0
+_DEV_LEGACY_STABLE_HEALTH_COMMIT = (
+    "a25838f15f949ac434cf78e03f20760e82ff81f0"
+)
+_DEV_STABLE_PROXY_BACKLOG_MAX_ROWS = 250
 
 
 class _DevStableProxyNoRedirect(urllib.request.HTTPRedirectHandler):
@@ -3833,41 +3837,115 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
         "/api/health",
         max_bytes=_DEV_STABLE_PROXY_HEALTH_BYTES,
     )
-    identity = health.get("runtime_plane_identity")
-    identity = dict(identity) if isinstance(identity, Mapping) else {}
     expected_anchor = str(os.environ.get(_STABLE_ANCHOR_ENV) or "").strip().lower()
     loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
+    pid = health.get("pid")
+    required_tuple = {
+        "status": health.get("status"),
+        "service": health.get("service"),
+        "port": health.get("port"),
+        "runtime_loaded_version": loaded,
+        "runtime_stale": health.get("runtime_stale"),
+        "pid": pid,
+    }
+    legacy_a258 = bool(
+        expected_anchor == _DEV_LEGACY_STABLE_HEALTH_COMMIT
+        and loaded == _DEV_LEGACY_STABLE_HEALTH_COMMIT
+    )
+    raw_loaded_identity = health.get("loaded_runtime_identity")
+    loaded_identity_invalid = bool(
+        raw_loaded_identity is not None
+        and not isinstance(raw_loaded_identity, Mapping)
+    )
+    loaded_identity = (
+        dict(raw_loaded_identity)
+        if isinstance(raw_loaded_identity, Mapping)
+        else {}
+    )
+    raw_identity = health.get("runtime_plane_identity")
+    if raw_identity is not None and not isinstance(raw_identity, Mapping):
+        raw_identity = {"__invalid__": True}
+    identity = dict(raw_identity or {})
+    database_identity_present = "stable_database_identity" in identity
     stable_database_identity = identity.get("stable_database_identity")
     stable_database_identity = (
         dict(stable_database_identity)
         if isinstance(stable_database_identity, Mapping)
         else {}
     )
-    pid = health.get("pid")
-    identity_pid = identity.get("pid")
-    if not (
+    base_valid = bool(
         re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_anchor)
         and health.get("status") == "ok"
         and health.get("service") == "governance"
         and health.get("port") == AC_STABLE_SERVICE_PORT
-        and health.get("runtime_plane") == "stable"
         and health.get("runtime_stale") is False
         and loaded == expected_anchor
-        and identity.get("status") == "ready"
-        and identity.get("plane") == "stable"
-        and identity.get("branch") == AC_STABLE_BRANCH
-        and identity.get("port") == AC_STABLE_SERVICE_PORT
-        and identity.get("expected_port") == AC_STABLE_SERVICE_PORT
-        and identity.get("commit") == expected_anchor
-        and identity.get("stable_anchor_commit") == expected_anchor
         and isinstance(pid, int)
         and not isinstance(pid, bool)
         and pid > 0
-        and identity_pid == pid
-        and (
-            not stable_database_identity
-            or _ac_stable_database_identity_valid(stable_database_identity)
+    )
+    extended_expected = {
+        "status": "ready",
+        "plane": "stable",
+        "branch": AC_STABLE_BRANCH,
+        "port": AC_STABLE_SERVICE_PORT,
+        "expected_port": AC_STABLE_SERVICE_PORT,
+        "commit": expected_anchor,
+        "stable_anchor_commit": expected_anchor,
+        "pid": pid,
+    }
+    health_plane_valid = (
+        "runtime_plane" not in health or health.get("runtime_plane") == "stable"
+        if legacy_a258
+        else health.get("runtime_plane") == "stable"
+    )
+    identity_valid = all(
+        key not in identity or identity.get(key) == expected
+        for key, expected in extended_expected.items()
+    )
+    if not legacy_a258:
+        identity_valid = identity_valid and all(
+            key in identity for key in extended_expected
         )
+    loaded_identity_expected = {
+        "schema_version": "governance_loaded_runtime_identity.v1",
+        "loaded_commit": loaded,
+        "loaded_pid": pid,
+        "runtime_stale": False,
+    }
+    loaded_identity_valid = all(
+        key not in loaded_identity or loaded_identity.get(key) == expected
+        for key, expected in loaded_identity_expected.items()
+    )
+    if raw_loaded_identity is not None:
+        loaded_identity_valid = loaded_identity_valid and all(
+            key in loaded_identity for key in loaded_identity_expected
+        )
+    loaded_source_sha256 = str(
+        loaded_identity.get("loaded_source_sha256") or ""
+    ).strip().lower()
+    if loaded_source_sha256 and not re.fullmatch(
+        r"sha256:[0-9a-f]{64}",
+        loaded_source_sha256,
+    ):
+        loaded_identity_valid = False
+    database_identity_valid = bool(
+        stable_database_identity
+        and _ac_stable_database_identity_valid(stable_database_identity)
+    )
+    if legacy_a258:
+        database_identity_valid = (
+            not database_identity_present
+            or database_identity_valid
+        )
+    if not (
+        base_valid
+        and health_plane_valid
+        and "__invalid__" not in identity
+        and identity_valid
+        and not loaded_identity_invalid
+        and loaded_identity_valid
+        and database_identity_valid
     ):
         raise _dev_stable_proxy_failure(
             "ac_dev_stable_proxy_identity_rejected",
@@ -3875,18 +3953,40 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
             status=409,
         )
     return {
-        "loaded_commit": loaded,
-        "pid": pid,
+        "required_health_tuple": required_tuple,
+        "legacy_a258_health": legacy_a258,
+        "runtime_plane": (
+            health.get("runtime_plane") if "runtime_plane" in health else None
+        ),
+        "runtime_plane_identity": {
+            key: identity[key]
+            for key in (*extended_expected, "stable_database_identity")
+            if key in identity
+        },
+        "loaded_runtime_identity": {
+            key: loaded_identity[key]
+            for key in (*loaded_identity_expected, "loaded_source_sha256")
+            if key in loaded_identity
+        },
         "stable_database_identity": stable_database_identity,
     }
 
 
-def _dev_stable_external_public_get(path: str) -> dict[str, Any]:
+def _dev_stable_external_public_get_many(paths: Sequence[str]) -> list[dict[str, Any]]:
+    if not paths or len(paths) > 3:
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_path_rejected",
+            "stable proxy accepts one bounded read sequence of at most three paths",
+            status=400,
+        )
     before = _dev_stable_proxy_health_identity()
-    payload = _dev_stable_proxy_json(
-        path,
-        max_bytes=_DEV_STABLE_PROXY_RESPONSE_BYTES,
-    )
+    payloads = [
+        _dev_stable_proxy_json(
+            path,
+            max_bytes=_DEV_STABLE_PROXY_RESPONSE_BYTES,
+        )
+        for path in paths
+    ]
     after = _dev_stable_proxy_health_identity()
     if after != before:
         raise _dev_stable_proxy_failure(
@@ -3894,7 +3994,11 @@ def _dev_stable_external_public_get(path: str) -> dict[str, Any]:
             "stable identity changed across the bounded GET",
             status=409,
         )
-    return payload
+    return payloads
+
+
+def _dev_stable_external_public_get(path: str) -> dict[str, Any]:
+    return _dev_stable_external_public_get_many([path])[0]
 
 
 def _dev_external_public_backlog_row(
@@ -3963,6 +4067,70 @@ def _dev_external_public_backlog_row(
     }
 
 
+def _dev_external_stable_backlog_list_path(
+    project_id: str,
+    *,
+    backlog_id: str = "",
+) -> str:
+    path = (
+        f"/api/backlog/{quote(project_id, safe='')}"
+        "?view=compact&limit=250&include_closed=true"
+    )
+    if backlog_id:
+        path += f"&q={quote(backlog_id, safe='')}"
+    return path
+
+
+def _dev_external_validate_backlog_list(
+    project_id: str,
+    stable: Mapping[str, Any],
+    *,
+    backlog_id: str = "",
+) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+    rows = stable.get("bugs")
+    scope = stable.get("scope")
+    generation = stable.get("generation")
+    authority_generation = str(stable.get("authority_generation") or "")
+    expected_scope_schema = (
+        "backlog.indexed_history_scope.v1"
+        if backlog_id
+        else "backlog.hot_window_scope.v1"
+    )
+    expected_pagination = "sqlite_indexed_keyset" if backlog_id else "hot_window"
+    if not (
+        stable.get("view") == "compact"
+        and stable.get("limit") == _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS
+        and str(stable.get("q") or "") == backlog_id
+        and isinstance(rows, list)
+        and len(rows) <= _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS
+        and all(isinstance(row, Mapping) for row in rows)
+        and isinstance(scope, Mapping)
+        and scope.get("schema_version") == expected_scope_schema
+        and scope.get("project_id") == project_id
+        and scope.get("view") == "compact"
+        and str(scope.get("status") or "") == ""
+        and str(scope.get("priority") or "") == ""
+        and scope.get("public_safe") is True
+        and scope.get("bounded") is True
+        and scope.get("pagination") == expected_pagination
+        and isinstance(generation, int)
+        and not isinstance(generation, bool)
+        and generation >= 1
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", authority_generation)
+    ):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_backlog_authority_rejected",
+            "stable backlog list lacked an exact project/generation authority",
+            status=409,
+        )
+    return rows, {
+        "schema_version": "ac_dev_external_backlog_authority.v1",
+        "project_id": project_id,
+        "generation": generation,
+        "authority_generation": authority_generation,
+    }
+
+
 def _dev_external_backlog_list_projection(
     project_id: str,
     query: Mapping[str, Any],
@@ -3981,20 +4149,9 @@ def _dev_external_backlog_list_projection(
     status_filter = str(_first_query_value(query, "status") or "").strip()
     priority_filter = str(_first_query_value(query, "priority") or "").strip()
     stable = _dev_stable_external_public_get(
-        f"/api/backlog/{quote(project_id, safe='')}"
-        "?view=compact&limit=50&include_closed=true"
+        _dev_external_stable_backlog_list_path(project_id)
     )
-    rows = stable.get("bugs")
-    if stable.get("view") != "compact" or not isinstance(rows, list):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_stable_proxy_schema_rejected",
-            "stable backlog list did not return the bounded compact schema",
-        )
-    if len(rows) > 50 or not all(isinstance(row, Mapping) for row in rows):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_stable_proxy_schema_rejected",
-            "stable backlog list exceeded its row bound or contained a bad row",
-        )
+    rows, authority = _dev_external_validate_backlog_list(project_id, stable)
     public_rows = [
         projected
         for row in rows
@@ -4023,6 +4180,7 @@ def _dev_external_backlog_list_projection(
         "bounded": True,
         "public_safe": True,
         "read_only": True,
+        "stable_read_authority": authority,
     }
 
 
@@ -4036,16 +4194,81 @@ def _dev_external_backlog_item_projection(
             path=f"/api/backlog/{project_id}",
             detail="external backlog_id is not a safe exact path segment",
         )
-    stable = _dev_stable_external_public_get(
-        f"/api/backlog/{quote(project_id, safe='')}/{quote(backlog_id, safe='')}"
+    list_path = _dev_external_stable_backlog_list_path(
+        project_id,
+        backlog_id=backlog_id,
     )
-    if str(stable.get("bug_id") or "") != backlog_id:
+    item_path = (
+        f"/api/backlog/{quote(project_id, safe='')}/"
+        f"{quote(backlog_id, safe='')}"
+    )
+    before_list, stable_item, after_list = _dev_stable_external_public_get_many(
+        [list_path, item_path, list_path]
+    )
+    before_rows, before_authority = _dev_external_validate_backlog_list(
+        project_id,
+        before_list,
+        backlog_id=backlog_id,
+    )
+    after_rows, after_authority = _dev_external_validate_backlog_list(
+        project_id,
+        after_list,
+        backlog_id=backlog_id,
+    )
+    if before_authority != after_authority:
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_backlog_generation_drift",
+            "stable backlog generation changed across the item read",
+            status=409,
+        )
+    if str(stable_item.get("bug_id") or "") != backlog_id:
         raise _dev_stable_proxy_failure(
             "ac_dev_stable_proxy_schema_rejected",
             "stable backlog item identity did not match the request",
         )
-    projected = _dev_external_public_backlog_row(stable)
-    if projected is None:
+
+    def bound_public_row(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+        matches = [row for row in rows if str(row.get("bug_id") or "") == backlog_id]
+        if len(matches) != 1:
+            raise _dev_stable_proxy_failure(
+                "ac_dev_stable_proxy_backlog_binding_rejected",
+                "stable backlog item lacked one unique compact-list binding",
+                status=409,
+            )
+        return _dev_external_public_backlog_row(
+            matches[0],
+            require_explicit_public_safe=True,
+        )
+
+    before_projected = bound_public_row(before_rows)
+    after_projected = bound_public_row(after_rows)
+    item_policy = backlog_runtime.parse_json_object(
+        stable_item.get("bypass_policy_json", "{}")
+    )
+    item_policy = item_policy if isinstance(item_policy, Mapping) else {}
+    explicit_item_privacy = str(
+        stable_item.get("privacy_level")
+        if "privacy_level" in stable_item
+        else item_policy.get("privacy_level") or ""
+    ).strip().lower()
+    explicit_item_public_safe = (
+        stable_item.get("public_safe")
+        if "public_safe" in stable_item
+        else item_policy.get("public_safe")
+    )
+    if (
+        before_projected is None
+        or after_projected is None
+        or (
+            explicit_item_public_safe is not None
+            and explicit_item_public_safe is not True
+        )
+        or explicit_item_privacy == "private"
+        or (
+            explicit_item_privacy
+            and explicit_item_privacy != "public"
+        )
+    ):
         raise GovernanceError(
             "ac_dev_stable_proxy_private_backlog_rejected",
             "stable backlog item is not public-safe",
@@ -4057,13 +4280,28 @@ def _dev_external_backlog_item_projection(
                 "writes_performed": False,
             },
         )
+    # The exact a258 item endpoint predates top-level privacy fields.  Its
+    # classification is therefore supplied only by the explicit public-safe
+    # compact row above, never by the legacy item's default-public fallback.
+    item_projected = _dev_external_public_backlog_row(
+        {**dict(stable_item), "privacy_level": "public", "public_safe": True},
+        require_explicit_public_safe=True,
+    )
+    if item_projected != before_projected or after_projected != before_projected:
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_backlog_binding_rejected",
+            "stable backlog item did not match its generation-bound compact row",
+            status=409,
+        )
     return {
         "schema_version": "ac_dev_external_public_backlog_item.v1",
         "project_id": project_id,
-        "bug": projected,
+        "backlog_id": backlog_id,
+        "bug": before_projected,
         "bounded": True,
         "public_safe": True,
         "read_only": True,
+        "stable_read_authority": before_authority,
     }
 
 
@@ -4175,6 +4413,7 @@ def _handle_dev_external_read_only_discovery(
                 "external discovery route is not supported",
                 404,
             )
+        stable_before = _dev_stable_proxy_health_identity()
         backlog_id = _dev_external_requested_backlog_id(ctx)
         if backlog_id and not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._:-]{0,191}",
@@ -4200,7 +4439,7 @@ def _handle_dev_external_read_only_discovery(
             or _first_query_value(ctx.query, "requested_work_type")
             or ""
         ).strip()
-        return {
+        result = {
             **common,
             "schema_version": _DEV_EXTERNAL_DISCOVERY_SCHEMA_VERSION,
             "status": "read_only_discovery_only",
@@ -4233,6 +4472,15 @@ def _handle_dev_external_read_only_discovery(
                 ),
             },
         }
+        stable_after = _dev_stable_proxy_health_identity()
+        if stable_after != stable_before:
+            raise _dev_stable_proxy_failure(
+                "ac_dev_stable_proxy_identity_drift",
+                "stable identity changed across the local Onboard redirect",
+                status=409,
+            )
+        result["stable_health_verified"] = True
+        return result
     except GovernanceError:
         raise
     except (OSError, RuntimeError, TypeError, ValueError) as exc:

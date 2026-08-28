@@ -13081,40 +13081,74 @@ def _dev_external_discovery_fixture(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
-    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", "a" * 40)
+    monkeypatch.setenv(
+        "AMING_CLAW_STABLE_ANCHOR_COMMIT",
+        server._DEV_LEGACY_STABLE_HEALTH_COMMIT,
+    )
     return paths
 
 
 def _dev_external_stable_payload(path):
     match = re.fullmatch(
-        r"/api/backlog/([^/?]+)\?view=compact&limit=50&include_closed=true",
+        (
+            r"/api/backlog/([^/?]+)\?view=compact&limit=250&include_closed=true"
+            r"(?:&q=([^&]+))?"
+        ),
         path,
     )
     if match:
-        project_id = match.group(1)
+        project_id, backlog_query = match.groups()
+        rows = [
+            {
+                "bug_id": f"{project_id.upper()}-PUBLIC",
+                "title": f"{project_id} public row",
+                "status": "OPEN",
+                "priority": "P0",
+                "created_at": "2026-08-28T00:00:00Z",
+                "updated_at": "2026-08-28T00:00:01Z",
+                "fixed_at": "",
+                "privacy_level": "public",
+                "public_safe": True,
+                "details_md": "must not be reprojected",
+                "route_token_ref": "must-not-escape",
+            },
+            {
+                "bug_id": f"{project_id.upper()}-PRIVATE",
+                "title": "private row",
+                "status": "OPEN",
+                "priority": "P1",
+                "created_at": "",
+                "updated_at": "",
+                "fixed_at": "",
+                "privacy_level": "private",
+                "public_safe": False,
+            },
+        ]
+        if backlog_query:
+            rows = [row for row in rows if row["bug_id"] == backlog_query]
         return {
             "view": "compact",
-            "bugs": [
-                {
-                    "bug_id": f"{project_id.upper()}-PUBLIC",
-                    "title": f"{project_id} public row",
-                    "status": "OPEN",
-                    "priority": "P0",
-                    "created_at": "2026-08-28T00:00:00Z",
-                    "updated_at": "2026-08-28T00:00:01Z",
-                    "fixed_at": "",
-                    "public_safe": True,
-                    "details_md": "must not be reprojected",
-                    "route_token_ref": "must-not-escape",
-                },
-                {
-                    "bug_id": f"{project_id.upper()}-PRIVATE",
-                    "title": "private row",
-                    "status": "OPEN",
-                    "priority": "P1",
-                    "public_safe": False,
-                },
-            ],
+            "limit": 250,
+            "q": backlog_query or "",
+            "generation": 7,
+            "authority_generation": "sha256:" + "2" * 64,
+            "scope": {
+                "schema_version": (
+                    "backlog.indexed_history_scope.v1"
+                    if backlog_query
+                    else "backlog.hot_window_scope.v1"
+                ),
+                "project_id": project_id,
+                "view": "compact",
+                "status": "",
+                "priority": "",
+                "public_safe": True,
+                "bounded": True,
+                "pagination": (
+                    "sqlite_indexed_keyset" if backlog_query else "hot_window"
+                ),
+            },
+            "bugs": rows,
         }
     match = re.fullmatch(r"/api/backlog/([^/]+)/([^/?]+)", path)
     if match:
@@ -13144,16 +13178,30 @@ def _dev_external_stable_payload(path):
     raise AssertionError(f"unexpected stable proxy path: {path}")
 
 
-def _dev_stable_health_payload(anchor, *, pid=8100):
-    return {
+def _dev_stable_health_payload(
+    anchor=server._DEV_LEGACY_STABLE_HEALTH_COMMIT,
+    *,
+    pid=61297,
+    extended=False,
+    include_database_identity=True,
+):
+    payload = {
         "status": "ok",
         "service": "governance",
         "port": 40000,
         "pid": pid,
-        "runtime_plane": "stable",
         "runtime_loaded_version": anchor,
         "runtime_stale": False,
-        "runtime_plane_identity": {
+        "loaded_runtime_identity": {
+            "schema_version": "governance_loaded_runtime_identity.v1",
+            "loaded_commit": anchor,
+            "loaded_pid": pid,
+            "runtime_stale": False,
+            "loaded_source_sha256": "sha256:" + "5" * 64,
+        },
+    }
+    if extended:
+        identity = {
             "status": "ready",
             "plane": "stable",
             "branch": server.AC_STABLE_BRANCH,
@@ -13162,8 +13210,16 @@ def _dev_stable_health_payload(anchor, *, pid=8100):
             "pid": pid,
             "commit": anchor,
             "stable_anchor_commit": anchor,
-        },
-    }
+        }
+        if include_database_identity:
+            identity["stable_database_identity"] = {
+                "schema_version": "ac_stable_database_identity.v1",
+                "device": 1,
+                "inode": 2,
+                "stable_relative_path_sha256": "sha256:" + "3" * 64,
+            }
+        payload.update(runtime_plane="stable", runtime_plane_identity=identity)
+    return payload
 
 
 def _start_dev_proxy_http(monkeypatch, reply):
@@ -13204,7 +13260,7 @@ def _start_dev_proxy_http(monkeypatch, reply):
 
 @pytest.mark.parametrize("drift", [False, True])
 def test_ac_dev_stable_proxy_real_get_checks_identity_and_drift(monkeypatch, drift):
-    anchor = "a" * 40
+    anchor = server._DEV_LEGACY_STABLE_HEALTH_COMMIT
     monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", anchor)
     health_calls = 0
 
@@ -13214,7 +13270,7 @@ def test_ac_dev_stable_proxy_real_get_checks_identity_and_drift(monkeypatch, dri
             health_calls += 1
             payload = _dev_stable_health_payload(
                 anchor,
-                pid=8101 if drift and health_calls == 2 else 8100,
+                pid=61298 if drift and health_calls == 2 else 61297,
             )
         else:
             payload = _dev_external_stable_payload(path)
@@ -13244,6 +13300,87 @@ def test_ac_dev_stable_proxy_real_get_checks_identity_and_drift(monkeypatch, dri
     assert all(request["method"] == "GET" and request["body"] == b"" for request in requests)
     assert all("Authorization" not in request["headers"] for request in requests)
     assert all("X-Gov-Token" not in request["headers"] for request in requests)
+
+
+def test_ac_dev_stable_proxy_accepts_only_exact_a258_legacy_health(monkeypatch):
+    anchor = server._DEV_LEGACY_STABLE_HEALTH_COMMIT
+    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", anchor)
+    exact_git_show_health = _dev_stable_health_payload(anchor, pid=61297)
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_json",
+        lambda *_args, **_kwargs: exact_git_show_health,
+    )
+    accepted = server._dev_stable_proxy_health_identity()
+    assert accepted["legacy_a258_health"] is True
+    assert accepted["required_health_tuple"] == {
+        "status": "ok",
+        "service": "governance",
+        "port": 40000,
+        "runtime_loaded_version": anchor,
+        "runtime_stale": False,
+        "pid": 61297,
+    }
+
+    for missing in (
+        "status",
+        "service",
+        "port",
+        "runtime_loaded_version",
+        "runtime_stale",
+        "pid",
+    ):
+        malformed = dict(exact_git_show_health)
+        malformed.pop(missing)
+        monkeypatch.setattr(
+            server,
+            "_dev_stable_proxy_json",
+            lambda *_args, _payload=malformed, **_kwargs: _payload,
+        )
+        with pytest.raises(GovernanceError) as missing_field:
+            server._dev_stable_proxy_health_identity()
+        assert missing_field.value.code == "ac_dev_stable_proxy_identity_rejected"
+
+    legacy_with_bad_extension = {
+        **exact_git_show_health,
+        "runtime_plane": "dev",
+    }
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_json",
+        lambda *_args, **_kwargs: legacy_with_bad_extension,
+    )
+    with pytest.raises(GovernanceError) as bad_extension:
+        server._dev_stable_proxy_health_identity()
+    assert bad_extension.value.code == "ac_dev_stable_proxy_identity_rejected"
+
+    legacy_with_bad_loaded_identity = copy.deepcopy(exact_git_show_health)
+    legacy_with_bad_loaded_identity["loaded_runtime_identity"]["loaded_pid"] = 1
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_json",
+        lambda *_args, **_kwargs: legacy_with_bad_loaded_identity,
+    )
+    with pytest.raises(GovernanceError) as bad_loaded_identity:
+        server._dev_stable_proxy_health_identity()
+    assert bad_loaded_identity.value.code == "ac_dev_stable_proxy_identity_rejected"
+
+    successor = "b" * 40
+    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", successor)
+    successor_without_db = _dev_stable_health_payload(
+        successor,
+        pid=70001,
+        extended=True,
+        include_database_identity=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_json",
+        lambda *_args, **_kwargs: successor_without_db,
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_stable_proxy_health_identity()
+    assert rejected.value.code == "ac_dev_stable_proxy_identity_rejected"
 
 
 @pytest.mark.parametrize(
@@ -13289,18 +13426,12 @@ def test_ac_dev_stable_proxy_bad_schema_private_and_transport_fail_closed(monkey
     )
     with pytest.raises(GovernanceError) as bad_list:
         server._dev_external_backlog_list_projection("content-sys", {})
-    assert bad_list.value.code == "ac_dev_stable_proxy_schema_rejected"
+    assert bad_list.value.code == "ac_dev_stable_proxy_backlog_authority_rejected"
 
     monkeypatch.setattr(
         server,
-        "_dev_stable_external_public_get",
-        lambda _path: {
-            "bug_id": "CONTENT-SYS-PRIVATE",
-            "title": "private",
-            "status": "OPEN",
-            "priority": "P0",
-            "public_safe": False,
-        },
+        "_dev_stable_external_public_get_many",
+        lambda paths: [_dev_external_stable_payload(path) for path in paths],
     )
     with pytest.raises(GovernanceError) as private_item:
         server._dev_external_backlog_item_projection(
@@ -13320,16 +13451,118 @@ def test_ac_dev_stable_proxy_bad_schema_private_and_transport_fail_closed(monkey
     assert transport.value.code == "ac_dev_stable_proxy_transport_failed"
 
 
+@pytest.mark.parametrize(
+    "defect",
+    ["scope_project", "generation_missing", "authority_missing"],
+)
+def test_ac_dev_stable_backlog_authority_rejects_cross_scope_and_missing_generation(
+    defect,
+):
+    path = server._dev_external_stable_backlog_list_path("content-sys")
+    payload = copy.deepcopy(_dev_external_stable_payload(path))
+    if defect == "scope_project":
+        payload["scope"]["project_id"] = "drift-gym"
+    elif defect == "generation_missing":
+        payload.pop("generation")
+    else:
+        payload.pop("authority_generation")
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_validate_backlog_list("content-sys", payload)
+    assert rejected.value.code == "ac_dev_stable_proxy_backlog_authority_rejected"
+
+
+@pytest.mark.parametrize(
+    ("privacy", "expected_code"),
+    [
+        ("missing", "ac_dev_stable_proxy_schema_rejected"),
+        ("private", "ac_dev_stable_proxy_private_backlog_rejected"),
+    ],
+)
+def test_ac_dev_stable_item_requires_generation_bound_explicit_public_row(
+    monkeypatch,
+    privacy,
+    expected_code,
+):
+    project_id = "content-sys"
+    backlog_id = "CONTENT-SYS-PUBLIC"
+    list_path = server._dev_external_stable_backlog_list_path(
+        project_id,
+        backlog_id=backlog_id,
+    )
+    item_path = f"/api/backlog/{project_id}/{backlog_id}"
+    stable_list = copy.deepcopy(_dev_external_stable_payload(list_path))
+    public_row = next(row for row in stable_list["bugs"] if row["bug_id"] == backlog_id)
+    if privacy == "missing":
+        public_row.pop("public_safe")
+    else:
+        public_row["public_safe"] = False
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_many",
+        lambda _paths: [
+            copy.deepcopy(stable_list),
+            _dev_external_stable_payload(item_path),
+            copy.deepcopy(stable_list),
+        ],
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_backlog_item_projection(project_id, backlog_id)
+    assert rejected.value.code == expected_code
+
+
+def test_ac_dev_stable_item_rejects_generation_drift(monkeypatch):
+    project_id = "content-sys"
+    backlog_id = "CONTENT-SYS-PUBLIC"
+    list_path = server._dev_external_stable_backlog_list_path(
+        project_id,
+        backlog_id=backlog_id,
+    )
+    item_path = f"/api/backlog/{project_id}/{backlog_id}"
+    before = copy.deepcopy(_dev_external_stable_payload(list_path))
+    after = copy.deepcopy(before)
+    after["generation"] += 1
+    after["authority_generation"] = "sha256:" + "4" * 64
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_many",
+        lambda _paths: [before, _dev_external_stable_payload(item_path), after],
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_backlog_item_projection(project_id, backlog_id)
+    assert rejected.value.code == "ac_dev_stable_proxy_backlog_generation_drift"
+
+
 def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
     monkeypatch, tmp_path
 ):
     paths = _dev_external_discovery_fixture(monkeypatch, tmp_path)
     before = {project_id: path.read_bytes() for project_id, path in paths.items()}
     proxied_paths = []
+
+    def stable_get_many(request_paths):
+        proxied_paths.extend(request_paths)
+        return [_dev_external_stable_payload(path) for path in request_paths]
+
     monkeypatch.setattr(
         server,
-        "_dev_stable_external_public_get",
-        lambda path: proxied_paths.append(path) or _dev_external_stable_payload(path),
+        "_dev_stable_external_public_get_many",
+        stable_get_many,
+    )
+    stable_health_checks = []
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_health_identity",
+        lambda: stable_health_checks.append(True) or {
+            "required_health_tuple": {
+                "status": "ok",
+                "service": "governance",
+                "port": 40000,
+                "runtime_loaded_version": server._DEV_LEGACY_STABLE_HEALTH_COMMIT,
+                "runtime_stale": False,
+                "pid": 61297,
+            },
+            "legacy_a258_health": True,
+        },
     )
     tripwires = {
         "_ensure_backlog_read_schema": "backlog DDL",
@@ -13376,6 +13609,8 @@ def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
         assert backlog["count"] == 1
         assert "details_md" not in backlog["bugs"][0]
         assert "route_token_ref" not in backlog["bugs"][0]
+        assert backlog["stable_read_authority"]["project_id"] == project_id
+        assert backlog["stable_read_authority"]["generation"] == 7
 
         backlog_id = f"{project_id.upper()}-PUBLIC"
         item = discover(
@@ -13383,6 +13618,8 @@ def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
             {"project_id": project_id, "bug_id": backlog_id},
         )
         assert item["bug"]["public_safe"] is True
+        assert item["backlog_id"] == backlog_id
+        assert item["stable_read_authority"] == backlog["stable_read_authority"]
         assert "chain_trigger_json" not in item["bug"]
 
         graph = discover(
@@ -13439,9 +13676,48 @@ def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
     handler._handle("POST")
     assert captured["code"] == 200
     assert captured["body"]["status"] == "read_only_discovery_only"
+    assert captured["body"]["stable_health_verified"] is True
+    assert stable_health_checks
     assert not any("onboard-route-guide" in path for path in proxied_paths)
     for project_id, path in paths.items():
         assert path.read_bytes() == before[project_id]
+
+
+def test_ac_dev_external_onboard_requires_unchanged_stable_health(monkeypatch, tmp_path):
+    _dev_external_discovery_fixture(monkeypatch, tmp_path)
+    before = {"required_health_tuple": {"pid": 61297}}
+    after = {"required_health_tuple": {"pid": 61298}}
+    health = iter((before, after))
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_health_identity",
+        lambda: next(health),
+    )
+    monkeypatch.setattr(
+        server,
+        "_onboard_route_guide_service_response",
+        lambda *_args, **_kwargs: pytest.fail("dev called stable Onboard handler"),
+    )
+    body = {
+        "project_id": "content-sys",
+        "backlog_id": "CONTENT-SYS-PUBLIC",
+        "role": "observer",
+        "work_type": "direct_main",
+    }
+    route = server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/projects/content-sys/onboard-route-guide",
+        path_params={"project_id": "content-sys"},
+        body=body,
+        query={},
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._handle_dev_external_read_only_discovery(
+            _ctx({"project_id": "content-sys"}, method="POST", body=body),
+            route_kind=route,
+        )
+    assert rejected.value.code == "ac_dev_stable_proxy_identity_drift"
+    assert rejected.value.details["writes_performed"] is False
 
 
 @pytest.mark.parametrize(

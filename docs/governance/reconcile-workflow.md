@@ -813,13 +813,24 @@ AC repair work uses two independent runtime planes:
   non-regular storage, but the dev process has no external SQLite capability.
   Backlog list/item and active graph status use hard-coded loopback
   `127.0.0.1:40000` GETs owned by stable. The proxy sends no caller headers,
-  credentials, body, or query selectors; refuses redirects; bounds timeout and
-  response bytes; and validates exact stable plane/port/loaded-anchor/non-stale
-  identity both before and after each GET. Stable PID and database identity,
-  when present, must also remain equal. It then republishes only explicit
-  public-safe fields. Transport, HTTP, JSON, schema, size, privacy, or identity
+  credentials, body, or arbitrary query selectors; the item projector may
+  reuse its already-validated path backlog ID in a fixed bounded search. It
+  refuses redirects, bounds timeout and response bytes, and validates exact
+  stable plane/port/loaded-anchor/non-stale
+  identity both before and after each GET. The frozen `a25838f...` service is
+  the sole legacy exception: its real health schema omits plane and database
+  identity, so its exact loaded commit and positive PID are frozen on the
+  first probe and must be byte-equivalent on the second. A successor must
+  provide valid stable-plane and database identities. Backlog reads also bind
+  exact project, generation, and authority generation; item reads use one
+  health window around targeted-list-before, item, and targeted-list-after and
+  require one exact, explicitly public compact row in the returned bounded
+  page. A target outside that page fails closed rather than falling back to a
+  default-public classification. The proxy republishes only allowlisted public
+  fields. Transport, HTTP, JSON, schema, size, privacy, generation, or identity
   drift fails closed. External Onboard is a local typed redirect to fresh
-  stable Onboard and does not call stable Onboard or any authority mint path.
+  stable Onboard, but reports discovery available only after its own stable
+  health pre/post check; it never calls stable Onboard or any authority mint path.
   Every other non-AC surface remains a pre-handler zero-write rejection.
 - Dev may append repair backlog, timeline, ContractRuntime, candidate graph,
   and independent-QA evidence. It cannot activate/finalize current-full,
