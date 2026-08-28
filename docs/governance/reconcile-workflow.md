@@ -956,3 +956,133 @@ the check only as defense in depth.
 Public blocker diagnostics expose only the fixed claim source and canonical
 activation alias; recursive caller-controlled ancestor keys and values are
 never copied into responses or logs.
+
+### §16.2 D-Bound Preparation, Activation, and Recovery
+
+Backlog `AC-PROMOTION-ACTIVATION-ROLLBACK-RESTART-P0-20260827` is the first
+successor allowed to describe an executable stable promotion. Candidate D is
+one direct child of C (`1012ec422160738356678f721ea470d583fe2be6`). Onboard
+keeps two separate immutable authorities: `implementation_delta` covers the
+exact five-file C-to-D row fence, while `promotion_delta` covers the full
+a258-to-D binary diff, complete fence, byte count, per-file source hashes, and
+tree. Only the full promotion delta is consumed by stable promotion.
+
+The D state machine remains read-only. It requires, in order, the durable
+current Direct Main implementation line, a new canonical-stable route whose
+only action is `ac_stable_promotion_prepare`, exact-D independent QA bound to
+both deltas and branch service plus all three lanes, the rollback row FIXED at
+exact D, and a fresh D-only one-hour operator signoff. Missing, stale, foreign,
+expired, duplicated, or replayed authority produces a typed zero-write
+blocker. Generic activation aliases are intercepted before registry, database,
+active-epoch, or health discovery. Onboard never runs a command itself.
+
+QA is bound to an immutable `qa_candidate_intent_sha256`: exact D/tree and
+runtime sources, both deltas, database identity, and the canonical promotion
+route plus the current Direct Main implementation CEX/line/revision/binding.
+It deliberately excludes the mutable rollback-row status. After that same QA
+is durable, only a rollback row fixed at exact D may create the separate final
+activation intent. The final intent adds the rollback authority hash and is
+what the later signoff, manifest, read-only precheck, activation plan, and
+completion receipt bind. Changing or revoking the prepare route, superseding
+its ref, or advancing the implementation CEX/revision invalidates the complete
+custody receipt immediately before mutation without rewriting QA history.
+
+Once all gates are durable, Onboard may project
+`ac_stable_promotion_manifest.v2`. Preparation and activation are separate
+operator commands:
+
+```text
+scripts/merge-and-deploy.sh --prepare \
+  --promotion-manifest <manifest-v2.json> \
+  --activation-plan </absolute/path/outside/all-worktrees/plan.json>
+
+scripts/merge-and-deploy.sh --activate \
+  --activation-plan </absolute/path/outside/all-worktrees/plan.json>
+
+scripts/merge-and-deploy.sh --recover \
+  --activation-plan </absolute/path/outside/all-worktrees/plan.json>
+```
+
+`--dry-run` performs validation without creating the lock, journal, plan, or
+any other file and without changing source, database, or process state. The old
+one-shot invocation is retired. Preparation writes one
+canonical JSON plan with `O_EXCL`, mode `0600`, file and parent-directory
+`fsync`, and refuses an existing file, symlink, relative path, or any location
+inside stable or dev worktrees. The plan binds the manifest/precheck digests,
+D/tree, both deltas, verifier source, exact stable branch and a258 CAS, old PID
+birth/command/listener, both exact Git-derived runtime source hashes, canonical
+DB device/inode/stable-relative path hash with every parent non-symlink,
+current graph identity, the route/CEX custody receipt, hard-coded launch argv
+and four lane commands, full-index binary
+patch and reverse-patch hash, completion template, journal, and lock. Operator
+signoff must still be live when activation validates the plan.
+
+Activation requires exactly one worktree for the canonical stable branch and
+holds one exclusive mode-0600 lock. Operator/coordinator tokens and every
+environment key shaped like a secret, credential, password, or private key are
+removed from the candidate and rollback service environments. All fallible imports, source
+and database checks, graph verification, old process identity, and isolated
+lane tests run while exact a258 remains alive. Frozen a258 is authenticated by
+its exact loaded commit/source, canonical DB, PID birth/argv/listener, and
+clean anchor even though its legacy health has no plane identity; its restart
+argv remains the legacy `start --workspace ... --port 40000` form. D uses the
+strict stable-plane argv and health identity. Immediately before mutation the
+script reprojects the durable QA/rollback/signoff receipt byte-for-byte,
+appends `MUTATION_INTENT`, and repeats the complete source/process/DB/graph
+CAS. The first mutation is stopping that exact PID without force kill. After
+the stop, every non-process identity is checked again. The script then
+uses only `git merge --ff-only` to D, starts the hard-coded stable command, and
+requires exact candidate HEAD/tree/clean state, loaded/current source identity,
+PID/listener, stable port 40000, canonical DB, unchanged graph, and the four
+deterministic lanes a second time against the started stable candidate. Only
+then may the stable completion endpoint append the
+v2 receipt. The receipt binds the plan hash and previous append-only journal
+entry and remains exactly idempotent after a lost response; absent, duplicate,
+ambiguous, or conflicting receipts are fatal. A deterministic HTTP 4xx durable
+gate rejection before any accepted response rolls back. The client requires
+two byte-equivalent exact receipt projections whose promoted commit, positive
+timeline event, and receipt hash agree. Transport loss, timeout, malformed
+bytes, conflicting readback, or a journal failure after an exact receipt
+instead marks completion uncertain and
+never rolls back a deployment that might already be durable. If both exact
+completion retries lose their response, the script records
+`COMPLETION_AMBIGUOUS` and deliberately
+leaves the verified candidate running: it cannot roll back a deployment whose
+completion receipt may already be durable. A process restart with exact
+`CANDIDATE_HEALTHY` as its final journal state (for example, a crash before the
+completion call) may replay the identical completion body and finish
+idempotently; a deterministic rejection from this pre-submit state rolls back.
+`COMPLETION_SUBMITTING` always replays the exact body but never auto-rolls back
+on failure because the first response may have been lost. `COMPLETION_COMMITTED`
+is finalize-only and appends no second completion request. Once
+`COMPLETION_AMBIGUOUS` itself is durable, automatic replay is
+disabled pending operator receipt audit. Any other unjournaled candidate HEAD
+fails closed.
+
+Every journal row is canonical, mode 0600, append-only, fsynced, and chained
+to the previous row and plan hash. Duplicate terminal rows, a malformed chain,
+or `ROLLBACK_FATAL` prevents replay. SIGINT and SIGTERM use the same rollback
+path after the first mutation. Before the first mutation they cannot trigger a
+source or process rollback. `CANDIDATE_SPAWNED`, rollback-ref intent/restored,
+patch-reversed, and old-runtime-spawned/started substates durably retain exact
+PID birth/argv and source custody across a crash.
+
+Rollback is bounded and deterministic: stop only the exact verified candidate
+PID, compare-and-swap the stable ref from D back to a258, apply the prepared
+full-index patch in reverse with `git apply -R --index`, verify clean exact
+a258, restart the hard-coded old launch specification, and recheck PID,
+listener, port, DB, health, and graph. It never uses reset, checkout, rebase,
+force update, force kill, database copy, or graph activation. Failure of
+candidate stop, ref CAS, reverse patch, clean-anchor verification, old start,
+old health, or graph restoration appends `ROLLBACK_FATAL` and requires
+operator recovery; it cannot silently claim a successful rollback. An exact
+existing terminal receipt is a no-op replay, while an unjournaled already-
+promoted or unrelated HEAD is ambiguous and fails closed.
+
+Isolated acceptance uses a real temporary Git repository for the a258-to-D
+full-index reverse patch and the crash window where the ref is already at the
+anchor but index/worktree still contain the exact candidate preimage. It also
+uses a real subprocess on an ephemeral loopback port to exercise delayed bind,
+PID birth/argv continuity, source-bound health, spawned-before-bind cleanup,
+and a second process for exclusive-lock contention. These tests never address
+the canonical repository service or port 40000.

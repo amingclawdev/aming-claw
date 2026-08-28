@@ -11926,6 +11926,12 @@ def _insert_exact_qa_graph_query_trace(
             "schema_version": "qa_review_graph.root_identity.v1",
             "query_root": str(query_root),
             "query_root_head_commit": candidate_commit_sha,
+            "query_root_tree_sha": candidate_commit_sha,
+            "query_root_clean": True,
+            "query_root_untracked_files_checked": True,
+            "query_root_status_hash": _fake_sha(
+                f"exact-query-root-status:{query_root}"
+            ),
             "query_root_identity_hash": query_root_identity_hash,
             "query_root_is_linked_worktree": False,
             "canonical_project_root": str(query_root),
@@ -13779,6 +13785,520 @@ def test_stable_promotion_bootstrap_rejects_nonempty_predecessor(
         match="bootstrap promotion predecessor must be empty",
     ):
         server.handle_ac_stable_promotion_complete(ctx)
+
+
+def test_stable_promotion_v2_completion_receipt_binds_plan_journal_and_replays(
+    conn, monkeypatch
+):
+    candidate = "d" * 40
+    previous = server.AC_STABLE_ANCHOR_COMMIT
+    fence = sorted(server._AC_PROMOTION_ROLLBACK_FILE_FENCE)
+    diff_bytes = b"exact-v2-promotion-diff"
+    diff_hash = "sha256:" + hashlib.sha256(diff_bytes).hexdigest()
+    database_identity = _promotion_database_identity()
+    implementation = {
+        "base_commit": server._AC_PROMOTION_ROLLBACK_BASELINE_COMMIT,
+        "candidate_commit": candidate,
+        "file_fence": fence,
+        "file_fence_sha256": server.stable_sha256(fence),
+        "diff_sha256": "sha256:" + "1" * 64,
+        "diff_byte_length": 10,
+        "source_sha256": {path: "sha256:" + "2" * 64 for path in fence},
+    }
+    implementation["delta_hash"] = server.stable_sha256(implementation)
+    promotion = {
+        "base_commit": previous,
+        "candidate_commit": candidate,
+        "file_fence": fence,
+        "file_fence_sha256": server.stable_sha256(fence),
+        "diff_sha256": diff_hash,
+        "diff_byte_length": len(diff_bytes),
+        "source_sha256": {path: "sha256:" + "3" * 64 for path in fence},
+    }
+    promotion["delta_hash"] = server.stable_sha256(promotion)
+    deploy = {
+        "authorized": True,
+        "mode": "host_supervisor_activation_plan_v2",
+        "stable_port": server.AC_STABLE_SERVICE_PORT,
+    }
+    policy = {
+        "schema_version": "ac_stable_activation_policy.v2",
+        "prepare_required": True,
+        "activation_plan_required": True,
+        "automatic_activation": False,
+        "rollback_required_after_first_mutation": True,
+    }
+    rollback_hash = "sha256:" + "4" * 64
+    candidate_tree_sha = "e" * 40
+    stable_runtime_source_sha256 = "sha256:" + hashlib.sha256(
+        b"stable-server-source"
+    ).hexdigest()
+    candidate_runtime_source_sha256 = "sha256:" + hashlib.sha256(
+        b"candidate-server-source"
+    ).hexdigest()
+    qa_candidate_intent_sha256 = "sha256:" + "9" * 64
+    custody_authority = {
+        "schema_version": "ac_promotion_rollback_custody_authority.v1",
+        "authority_hash": "sha256:" + "a" * 64,
+    }
+    manifest = {
+        "schema_version": "ac_stable_promotion_manifest.v2",
+        "project_id": "aming-claw",
+        "backlog_id": server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+        "contract_execution_id": server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+        "stable_anchor_commit": previous,
+        "stable_branch": server.AC_STABLE_BRANCH,
+        "branch": server.AC_DEV_BRANCH,
+        "candidate_commit": candidate,
+        "candidate_tree_sha": candidate_tree_sha,
+        "stable_runtime_source_sha256": stable_runtime_source_sha256,
+        "candidate_runtime_source_sha256": candidate_runtime_source_sha256,
+        "implementation_delta": implementation,
+        "promotion_delta": promotion,
+        "qa_candidate_intent_sha256": qa_candidate_intent_sha256,
+        "rollback_authority_hash": rollback_hash,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+        "activation_policy": policy,
+        "custody_authority": custody_authority,
+        "promotion_intent_sha256": "",
+        "promotion_manifest_sha256": "sha256:" + "5" * 64,
+        "gates": {},
+        "prior_promotion": {"kind": "bootstrap", "stable_commit": previous},
+    }
+    intent = {
+        key: manifest[key]
+        for key in (
+            "schema_version", "project_id", "backlog_id",
+            "contract_execution_id", "stable_anchor_commit", "stable_branch",
+            "branch", "candidate_commit", "candidate_tree_sha",
+            "stable_runtime_source_sha256", "candidate_runtime_source_sha256",
+                "implementation_delta",
+                "promotion_delta", "qa_candidate_intent_sha256",
+                "rollback_authority_hash", "deploy",
+                "stable_database_identity", "activation_policy",
+                "custody_authority",
+        )
+    }
+    manifest["promotion_intent_sha256"] = server.stable_sha256(intent)
+    precheck = {
+        "previous_promotion_receipt_hash": "",
+        "prior_promotion_event_id": 0,
+    }
+    identity = {
+        "plane": "stable",
+        "status": "ready",
+        "commit": candidate,
+        "stable_anchor_commit": candidate,
+        "stable_database_identity": database_identity,
+    }
+    body = {
+        "schema_version": "ac_stable_promotion_completion.v2",
+        "project_id": "aming-claw",
+        "backlog_id": server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+        "contract_execution_id": server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+        "candidate_commit": candidate,
+        "candidate_tree_sha": candidate_tree_sha,
+        "stable_runtime_source_sha256": stable_runtime_source_sha256,
+        "candidate_runtime_source_sha256": candidate_runtime_source_sha256,
+        "previous_stable_commit": previous,
+        "previous_promotion_receipt_hash": "",
+        "promotion_intent_sha256": manifest["promotion_intent_sha256"],
+        "promotion_manifest_sha256": manifest["promotion_manifest_sha256"],
+        "precheck_receipt_hash": "sha256:" + "6" * 64,
+        "verifier_sha256": "sha256:" + hashlib.sha256(
+            (
+                Path(server.__file__).resolve().parents[2]
+                / "scripts"
+                / "merge-and-deploy.sh"
+            ).read_bytes()
+        ).hexdigest(),
+        "diff_sha256": diff_hash,
+        "file_fence": fence,
+        "implementation_delta": implementation,
+        "promotion_delta": promotion,
+        "qa_candidate_intent_sha256": qa_candidate_intent_sha256,
+        "rollback_authority_hash": rollback_hash,
+        "custody_authority": custody_authority,
+        "activation_plan_hash": "sha256:" + "7" * 64,
+        "activation_journal_previous_entry_hash": "sha256:" + "8" * 64,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+        "operator_approval_ref": "release-operator-head-queue-event:99",
+        "precheck_receipt": precheck,
+        "promotion_manifest": manifest,
+        "health_identity": {
+            "runtime_loaded_version": candidate,
+            "runtime_plane_identity": identity,
+            "runtime_stale": False,
+        },
+    }
+    monkeypatch.setattr(server, "_runtime_plane_identity", lambda: identity)
+    monkeypatch.setattr(
+        server,
+        "canonical_ac_database_identity",
+        lambda _conn=None: dict(database_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "_validate_ac_stable_promotion_durable_evidence",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def git_run(args, **_kwargs):
+        if args[1:3] == ["merge-base", "--is-ancestor"]:
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        if args[1:3] == ["diff", "--no-ext-diff"]:
+            return SimpleNamespace(returncode=0, stdout=diff_bytes, stderr=b"")
+        if args[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(returncode=0, stdout="\n".join(fence) + "\n", stderr="")
+        if args[1] == "rev-parse":
+            return SimpleNamespace(returncode=0, stdout=candidate_tree_sha + "\n", stderr="")
+        if args[1:3] == ["show", f"{previous}:agent/governance/server.py"]:
+            return SimpleNamespace(returncode=0, stdout=b"stable-server-source", stderr=b"")
+        if args[1:3] == ["show", f"{candidate}:agent/governance/server.py"]:
+            return SimpleNamespace(returncode=0, stdout=b"candidate-server-source", stderr=b"")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(server.subprocess, "run", git_run)
+    ctx = _ctx_with_role(
+        {"project_id": "aming-claw"}, "coordinator", method="POST", body=body
+    )
+    ctx.token = "coordinator-token-ref"
+    first = server.handle_ac_stable_promotion_complete(ctx)
+    monkeypatch.setattr(
+        server,
+        "_validate_ac_stable_promotion_durable_evidence",
+        lambda *_args, **_kwargs: pytest.fail(
+            "exact v2 receipt replay must precede gate revalidation"
+        ),
+    )
+    second = server.handle_ac_stable_promotion_complete(ctx)
+
+    assert first["idempotent"] is False
+    assert second["idempotent"] is True
+    assert second["promotion_receipt_hash"] == first["promotion_receipt_hash"]
+    event = task_timeline.list_events(
+        conn,
+        "aming-claw",
+        backlog_id=server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+    )[0]
+    assert event["payload"]["schema_version"] == (
+        "ac_stable_promotion_completion_receipt.v2"
+    )
+    assert event["payload"]["activation_plan_hash"] == body[
+        "activation_plan_hash"
+    ]
+    assert event["payload"]["activation_journal_previous_entry_hash"] == body[
+        "activation_journal_previous_entry_hash"
+    ]
+
+
+def test_stable_promotion_v2_durable_evidence_revalidates_exact_d_authorities(
+    conn, monkeypatch
+):
+    server._ensure_release_operator_head_queue_schema(conn)
+    candidate = "d" * 40
+    fence = sorted(server._AC_PROMOTION_ROLLBACK_FILE_FENCE)
+    database_identity = _promotion_database_identity()
+
+    def delta(base, marker):
+        value = {
+            "base_commit": base,
+            "candidate_commit": candidate,
+            "file_fence": fence,
+            "file_fence_sha256": server.stable_sha256(fence),
+            "diff_sha256": "sha256:" + marker * 64,
+            "diff_byte_length": 123,
+            "source_sha256": {
+                path: "sha256:" + marker * 64 for path in fence
+            },
+        }
+        value["delta_hash"] = server.stable_sha256(value)
+        return value
+
+    implementation = delta(server._AC_PROMOTION_ROLLBACK_BASELINE_COMMIT, "1")
+    promotion = delta(server.AC_STABLE_ANCHOR_COMMIT, "2")
+    deploy = {
+        "authorized": True,
+        "mode": "host_supervisor_activation_plan_v2",
+        "stable_port": server.AC_STABLE_SERVICE_PORT,
+    }
+    policy = {
+        "schema_version": "ac_stable_activation_policy.v2",
+        "prepare_required": True,
+        "activation_plan_required": True,
+        "automatic_activation": False,
+        "rollback_required_after_first_mutation": True,
+    }
+    rollback_hash = "sha256:" + "3" * 64
+    candidate_tree_sha = "e" * 40
+    stable_runtime_source_sha256 = "sha256:" + "7" * 64
+    candidate_runtime_source_sha256 = "sha256:" + "8" * 64
+    candidate_authority = {
+        "candidate_commit": candidate,
+        "candidate_parent_commit": server._AC_PROMOTION_ROLLBACK_BASELINE_COMMIT,
+        "candidate_tree_sha": candidate_tree_sha,
+        "stable_runtime_source_sha256": stable_runtime_source_sha256,
+        "candidate_runtime_source_sha256": candidate_runtime_source_sha256,
+        "implementation_delta": implementation,
+        "promotion_delta": promotion,
+        "stable_database_identity": database_identity,
+        "authority_hash": "sha256:" + "9" * 64,
+    }
+    implementation_authority = {
+        "contract_execution_id": (
+            server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID
+        ),
+        "contract_id": "operator_supervised_direct_main",
+        "implementation_route_ref": "rtok-implementation-d",
+        "binding_hash": "sha256:" + "a" * 64,
+        "implementation_line_hash": "sha256:" + "b" * 64,
+        "runtime_revision": 4,
+        "runtime_state_hash": "sha256:" + "c" * 64,
+    }
+    route_identity = {
+        "route_id": "route-promotion-d",
+        "route_context_hash": "sha256:" + "d" * 64,
+        "prompt_contract_id": "prompt-promotion-d",
+        "prompt_contract_hash": "sha256:" + "e" * 64,
+        "visible_injection_manifest_hash": "sha256:" + "f" * 64,
+        "route_token_ref": "rtok-promotion-d",
+    }
+    route_core = {
+        "schema_version": "ac_promotion_rollback_route_authority.v1",
+        "accepted": True,
+        "source": "canonical_stable_route_registry",
+        "required_endpoint": "http://127.0.0.1:40000",
+        "project_id": "aming-claw",
+        "backlog_id": server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+        "contract_execution_id": (
+            server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID
+        ),
+        "candidate_commit": candidate,
+        "route_token_ref": route_identity["route_token_ref"],
+        "route_identity": route_identity,
+        "evidence_refs_hash": "sha256:" + "1" * 64,
+        "writes_performed": False,
+    }
+    promotion_route = {
+        **route_core,
+        "authority_hash": server.stable_sha256(route_core),
+    }
+    custody = server._ac_promotion_rollback_custody_authority(
+        candidate=candidate_authority,
+        implementation=implementation_authority,
+        promotion_route=promotion_route,
+    )
+    qa_candidate_intent = server._ac_promotion_rollback_qa_candidate_intent(
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+        candidate=candidate_authority,
+        deploy=deploy,
+        activation_policy=policy,
+        custody_authority=custody,
+    )
+    qa_candidate_intent_hash = server.stable_sha256(qa_candidate_intent)
+    intent = {
+        "schema_version": "ac_stable_promotion_manifest.v2",
+        "project_id": "aming-claw",
+        "backlog_id": server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+        "contract_execution_id": server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "stable_branch": server.AC_STABLE_BRANCH,
+        "branch": server.AC_DEV_BRANCH,
+        "candidate_commit": candidate,
+        "candidate_tree_sha": candidate_tree_sha,
+        "stable_runtime_source_sha256": stable_runtime_source_sha256,
+        "candidate_runtime_source_sha256": candidate_runtime_source_sha256,
+        "implementation_delta": implementation,
+        "promotion_delta": promotion,
+        "qa_candidate_intent_sha256": qa_candidate_intent_hash,
+        "rollback_authority_hash": rollback_hash,
+        "deploy": deploy,
+        "stable_database_identity": database_identity,
+        "activation_policy": policy,
+        "custody_authority": custody,
+    }
+    intent_hash = server.stable_sha256(intent)
+    qa_id = 81
+    queue = conn.execute(
+        """INSERT INTO release_operator_head_queue_events(
+               project_id,action,backlog_id,actor,reason,before_json,
+               after_json,created_at
+           ) VALUES ('aming-claw','reorder','','operator-d','{}','{}','{}',?)""",
+        (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),),
+    )
+    conn.commit()
+    queue_id = int(queue.lastrowid)
+    signoff_row = dict(
+        conn.execute(
+            "SELECT * FROM release_operator_head_queue_events WHERE id=?",
+            (queue_id,),
+        ).fetchone()
+    )
+    signoff_hash = server.stable_sha256(
+        {
+            key: signoff_row.get(key)
+            for key in (
+                "id", "project_id", "action", "backlog_id", "actor",
+                "reason", "before_json", "after_json", "created_at",
+            )
+        }
+    )
+    operator_gate = {
+        "status": "approved",
+        "nonce": "4" * 32,
+        "operator_principal_id": "operator-d",
+        "expires_at": "2099-08-28T00:00:00Z",
+        "queue_event_id": queue_id,
+    }
+    qa_gate = {"timeline_event_id": qa_id, "status": "passed"}
+    signable = {
+        **intent,
+        "promotion_intent_sha256": intent_hash,
+        "prior_promotion": {
+            "kind": "bootstrap",
+            "stable_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        },
+        "gates": {
+            "qa_verdict": qa_gate,
+            "operator_signoff": {
+                key: operator_gate[key]
+                for key in (
+                    "status", "nonce", "operator_principal_id", "expires_at"
+                )
+            },
+        },
+    }
+    manifest_hash = server.stable_sha256(signable)
+    manifest = {
+        **intent,
+        "promotion_intent_sha256": intent_hash,
+        "promotion_manifest_sha256": manifest_hash,
+        "gates": {
+            "qa_verdict": qa_gate,
+            "operator_signoff": operator_gate,
+        },
+        "prior_promotion": signable["prior_promotion"],
+    }
+    qa_hash = "sha256:" + "5" * 64
+    precheck_core = {
+        "schema_version": "ac_stable_promotion_precheck_receipt.v2",
+        "verifier_version": "readonly_timeline_projector.v2",
+        "verifier_sha256": "sha256:" + "6" * 64,
+        "promotion_intent_sha256": intent_hash,
+        "promotion_manifest_sha256": manifest_hash,
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "candidate_commit": candidate,
+        "candidate_tree_sha": candidate_tree_sha,
+        "stable_runtime_source_sha256": stable_runtime_source_sha256,
+        "candidate_runtime_source_sha256": candidate_runtime_source_sha256,
+        "qa_candidate_intent_sha256": qa_candidate_intent_hash,
+        "implementation_delta_hash": implementation["delta_hash"],
+        "promotion_delta_hash": promotion["delta_hash"],
+        "rollback_authority_hash": rollback_hash,
+        "custody_authority": custody,
+        "stable_database_identity": database_identity,
+        "previous_promotion_receipt_hash": "",
+        "prior_promotion_event_id": 0,
+        "gate_event_ids": {
+            "qa_verdict": qa_id,
+            "operator_signoff": queue_id,
+        },
+        "operator_approval_ref": f"release-operator-head-queue-event:{queue_id}",
+        "gate_evidence_hashes": {
+            "qa_verdict": qa_hash,
+            "operator_signoff": signoff_hash,
+        },
+        "pass_synthesized": False,
+        "writes_performed": False,
+    }
+    precheck = {
+        **precheck_core,
+        "receipt_hash": server.stable_sha256(precheck_core),
+    }
+    body = {
+        "precheck_receipt": precheck,
+        "precheck_receipt_hash": precheck["receipt_hash"],
+        "promotion_manifest": manifest,
+        "promotion_manifest_sha256": manifest_hash,
+    }
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_row_authority",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "authority_hash": rollback_hash,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_implementation_record",
+        lambda *_args, **_kwargs: copy.deepcopy(implementation_authority),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_route_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(promotion_route),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_qa_projection",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "timeline_event_id": qa_id,
+            "event_hash": qa_hash,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_signoff_projection",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "queue_event_id": queue_id,
+            "manifest_hash": manifest_hash,
+            "operator_approval_ref": (
+                f"release-operator-head-queue-event:{queue_id}"
+            ),
+        },
+    )
+
+    server._validate_ac_stable_promotion_durable_evidence(
+        conn,
+        body=body,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+        contract_execution_id=server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+        candidate=candidate,
+        previous_stable=server.AC_STABLE_ANCHOR_COMMIT,
+        file_fence=fence,
+        diff_sha256=promotion["diff_sha256"],
+        verifier_sha256=precheck["verifier_sha256"],
+        promotion_intent_sha256=intent_hash,
+        deploy=deploy,
+        stable_database_identity=database_identity,
+        operator_approval_ref=precheck["operator_approval_ref"],
+    )
+    forged = copy.deepcopy(body)
+    forged["precheck_receipt"]["promotion_delta_hash"] = "sha256:" + "0" * 64
+    with pytest.raises(server.ValidationError, match="receipt digest"):
+        server._validate_ac_stable_promotion_durable_evidence(
+            conn,
+            body=forged,
+            project_id="aming-claw",
+            backlog_id=server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+            contract_execution_id=server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+            candidate=candidate,
+            previous_stable=server.AC_STABLE_ANCHOR_COMMIT,
+            file_fence=fence,
+            diff_sha256=promotion["diff_sha256"],
+            verifier_sha256=precheck["verifier_sha256"],
+            promotion_intent_sha256=intent_hash,
+            deploy=deploy,
+            stable_database_identity=database_identity,
+            operator_approval_ref=precheck["operator_approval_ref"],
+        )
 
 
 def test_stable_promotion_durable_precheck_rejects_forgery_and_signoff_replay(
@@ -197643,3 +198163,848 @@ def test_promotion_successor_route_resolver_uses_canonical_stable_storage_only(
         candidate=stale_candidate,
     )
     assert rejected == {}
+
+
+def _promotion_rollback_candidate_fixture() -> dict[str, Any]:
+    candidate_commit = "d" * 40
+    database_identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": 41,
+        "inode": 42,
+        "stable_relative_path_sha256": "sha256:" + "0" * 64,
+    }
+    implementation_files = sorted(server._AC_PROMOTION_ROLLBACK_FILE_FENCE)
+    implementation_delta = {
+        "base_commit": server._AC_PROMOTION_ROLLBACK_BASELINE_COMMIT,
+        "candidate_commit": candidate_commit,
+        "file_fence": implementation_files,
+        "file_fence_sha256": server.stable_sha256(implementation_files),
+        "diff_sha256": "sha256:" + "1" * 64,
+        "diff_byte_length": 123,
+        "source_sha256": {
+            path: "sha256:" + "2" * 64 for path in implementation_files
+        },
+    }
+    implementation_delta["delta_hash"] = server.stable_sha256(
+        implementation_delta
+    )
+    promotion_files = sorted(["agent/cli.py", *implementation_files])
+    promotion_delta = {
+        "base_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "candidate_commit": candidate_commit,
+        "file_fence": promotion_files,
+        "file_fence_sha256": server.stable_sha256(promotion_files),
+        "diff_sha256": "sha256:" + "3" * 64,
+        "diff_byte_length": 456,
+        "source_sha256": {
+            path: "sha256:" + "4" * 64 for path in promotion_files
+        },
+    }
+    promotion_delta["delta_hash"] = server.stable_sha256(promotion_delta)
+    authority = {
+        "schema_version": "ac_promotion_rollback_candidate_authority.v1",
+        "status": "candidate_projected",
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "baseline_commit": server._AC_PROMOTION_ROLLBACK_BASELINE_COMMIT,
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "candidate_commit": candidate_commit,
+        "candidate_parent_commit": server._AC_PROMOTION_ROLLBACK_BASELINE_COMMIT,
+        "candidate_tree_sha": "e" * 40,
+        "stable_runtime_source_sha256": "sha256:" + "6" * 64,
+        "candidate_runtime_source_sha256": "sha256:" + "7" * 64,
+        "implementation_delta": implementation_delta,
+        "promotion_delta": promotion_delta,
+        "file_fence": promotion_files,
+        "diff_sha256": promotion_delta["diff_sha256"],
+        "source_sha256": promotion_delta["source_sha256"],
+        "runtime_world_authority": {"world_hash": "sha256:" + "5" * 64},
+        "stable_database_identity": database_identity,
+        "writes_performed": False,
+    }
+    authority["authority_hash"] = server.stable_sha256(authority)
+    return authority
+
+
+def test_promotion_rollback_candidate_authority_uses_direct_d_and_dual_deltas(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "rollback-d-candidate"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=root, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+    (root / "agent" / "cli.py").parent.mkdir(parents=True)
+    (root / "agent" / "cli.py").write_text("stable\n", encoding="utf-8")
+    for relative in server._AC_PROMOTION_ROLLBACK_FILE_FENCE:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("stable\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "a258"], cwd=root, check=True)
+    anchor = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+    (root / "agent" / "cli.py").write_text("candidate-c\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "candidate-c"], cwd=root, check=True)
+    baseline = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+    for relative in server._AC_PROMOTION_ROLLBACK_FILE_FENCE:
+        (root / relative).write_text(f"candidate-d:{relative}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "candidate-d"], cwd=root, check=True)
+    candidate_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+    monkeypatch.setattr(server, "AC_STABLE_ANCHOR_COMMIT", anchor)
+    monkeypatch.setattr(server, "_AC_PROMOTION_ROLLBACK_BASELINE_COMMIT", baseline)
+    world = _fixed_ac_dev_direct_world(root, candidate_commit)
+    world["stable_anchor_commit"] = anchor
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(world),
+    )
+
+    authority = server._ac_promotion_rollback_candidate_authority()
+
+    assert authority["candidate_parent_commit"] == baseline
+    assert authority["implementation_delta"]["base_commit"] == baseline
+    assert authority["implementation_delta"]["file_fence"] == sorted(
+        server._AC_PROMOTION_ROLLBACK_FILE_FENCE
+    )
+    assert authority["promotion_delta"]["base_commit"] == anchor
+    assert authority["promotion_delta"]["file_fence"] == sorted(
+        ["agent/cli.py", *server._AC_PROMOTION_ROLLBACK_FILE_FENCE]
+    )
+    assert authority["implementation_delta"]["delta_hash"] != authority[
+        "promotion_delta"
+    ]["delta_hash"]
+
+
+def test_promotion_rollback_exact_prepare_is_not_activation_but_aliases_are_blocked():
+    exact_prepare = server._ac_promotion_successor_activation_preguard(
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+        request_body={"action": server._AC_PROMOTION_ROLLBACK_ROUTE_ACTION},
+    )
+    assert exact_prepare == {}
+
+    for body in (
+        {"action": "promote"},
+        {"operation": "restart"},
+        {"requested_action": "deploy"},
+        {"execute": True},
+    ):
+        blocked = server._ac_promotion_successor_activation_preguard(
+            project_id="aming-claw",
+            backlog_id=server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+            request_body=body,
+        )
+        assert blocked["promotion_rollback_state"] == "activation_rollback_blocked"
+        assert blocked["next_legal_action"]["code"] == (
+            "promotion_activation_requires_explicit_plan"
+        )
+        assert blocked["activation_authorized"] is False
+        assert blocked["deploy_ready"] is False
+
+
+def test_promotion_rollback_d_selectors_bind_exact_cex_tree_source_and_all_claims():
+    candidate = _promotion_rollback_candidate_fixture()
+    exact = {
+        "contract_execution_id": server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+        "task_id": server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+        "candidate_commit": candidate["candidate_commit"],
+        "candidate_tree_sha": candidate["candidate_tree_sha"],
+        "stable_runtime_source_sha256": candidate[
+            "stable_runtime_source_sha256"
+        ],
+        "candidate_runtime_source_sha256": candidate[
+            "candidate_runtime_source_sha256"
+        ],
+    }
+    assert server._ac_promotion_successor_request_mismatches(
+        exact,
+        {key: [value, value] for key, value in exact.items()},
+        candidate,
+        contract_execution_id=server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+    ) == []
+    for field in exact:
+        wrong = {key: value for key, value in exact.items()}
+        wrong[field] = [exact[field], "private-wrong-authority"]
+        mismatches = server._ac_promotion_successor_request_mismatches(
+            {},
+            wrong,
+            candidate,
+            contract_execution_id=server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+        )
+        assert mismatches == [field]
+    assert server._ac_promotion_successor_request_mismatches(
+        {"contract_execution_id": server._AC_PROMOTION_SUCCESSOR_CONTRACT_EXECUTION_ID},
+        {},
+        candidate,
+        contract_execution_id=server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+    ) == ["contract_execution_id"]
+
+
+@pytest.mark.parametrize(
+    ("route_ready", "qa_ready", "rollback_ready", "signoff_ready", "state"),
+    [
+        (False, False, False, False, "promotion_route_missing"),
+        (True, False, False, False, "route_ready_qa_missing"),
+        (True, True, False, False, "qa_ready_rollback_row_missing"),
+        (True, True, True, False, "qa_ready_signoff_missing"),
+        (True, True, True, True, "manifest_prepared"),
+    ],
+)
+def test_promotion_rollback_overlay_state_machine_is_zero_write_and_never_activates(
+    conn,
+    monkeypatch,
+    route_ready,
+    qa_ready,
+    rollback_ready,
+    signoff_ready,
+    state,
+):
+    candidate = _promotion_rollback_candidate_fixture()
+    route = {
+        "accepted": True,
+        "route_token_ref": "rtok-stable-rollback-prepare",
+        "authority_hash": "sha256:" + "6" * 64,
+        "route_identity": {
+            "route_id": "route-rollback-prepare",
+            "route_context_hash": "sha256:" + "a" * 64,
+            "prompt_contract_id": "prompt-rollback-prepare",
+            "prompt_contract_hash": "sha256:" + "b" * 64,
+            "visible_injection_manifest_hash": "sha256:" + "c" * 64,
+            "route_token_ref": "rtok-stable-rollback-prepare",
+        },
+    }
+    qa = {
+        "accepted": qa_ready,
+        "status": "passed" if qa_ready else "missing",
+        "timeline_event_id": 61,
+        "promotion_gate_results": {
+            "branch_service": {"status": "passed"},
+            "lanes": {
+                name: {"status": "passed"}
+                for name in ("direct_main", "mf_parallel", "mf_batch_parallel")
+            },
+        },
+    }
+    rollback = {
+        "accepted": rollback_ready,
+        "status": "FIXED" if rollback_ready else "OPEN",
+        "authority_hash": "sha256:" + "7" * 64,
+        "writes_performed": False,
+    }
+    signoff = {
+        "accepted": signoff_ready,
+        "status": "approved" if signoff_ready else "missing",
+        "queue_event_id": 71,
+        "operator_principal_id": "operator-rollback-d",
+        "nonce": "8" * 32,
+        "expires_at": "2099-08-28T00:00:00Z",
+        "manifest_hash": "sha256:" + "9" * 64,
+        "operator_approval_ref": "release-operator-head-queue-event:71",
+    }
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_candidate_authority",
+        lambda: copy.deepcopy(candidate),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_successor_stable_health",
+        lambda: _promotion_successor_health_fixture(candidate),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_implementation_record",
+        lambda *_args, **_kwargs: {
+            "contract_execution_id": server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID,
+            "contract_id": "operator_supervised_direct_main",
+            "implementation_route_ref": "rtok-d-implementation",
+            "binding_hash": "sha256:" + "a" * 64,
+            "implementation_line_hash": "sha256:" + "d" * 64,
+            "runtime_revision": 4,
+            "runtime_state_hash": "sha256:" + "e" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_route_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(route) if route_ready else {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_qa_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(qa),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_row_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(rollback),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_signoff_projection",
+        lambda *_args, **_kwargs: copy.deepcopy(signoff),
+    )
+    monkeypatch.setattr(Path, "read_bytes", lambda _self: b"verifier-v2")
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    body = {
+        "promotion_route_token_ref": route["route_token_ref"],
+        "candidate_commit": candidate["candidate_commit"],
+        "file_fence": candidate["file_fence"],
+        "diff_sha256": candidate["diff_sha256"],
+    }
+
+    result = server._ac_promotion_rollback_route_guide_overlay(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+        route_token_ref="rtok-d-implementation",
+        response_view="full",
+        request_body=body,
+    )
+
+    assert result["promotion_rollback_state"] == state
+    assert result["activation_authorized"] is False
+    assert result["deploy_ready"] is False
+    assert result["authorizes_write"] is False
+    assert result["writes_performed"] is False
+    if state == "manifest_prepared":
+        manifest = result["promotion_manifest_v2"]
+        assert manifest["schema_version"] == "ac_stable_promotion_manifest.v2"
+        assert manifest["implementation_delta"] == candidate["implementation_delta"]
+        assert manifest["promotion_delta"] == candidate["promotion_delta"]
+        assert manifest["activation_policy"]["automatic_activation"] is False
+        assert result["next_legal_action"]["code"] == (
+            "promotion_activation_plan_prepare_required"
+        )
+    assert tuple(conn.iterdump()) == before
+    assert conn.total_changes == before_changes
+
+
+def test_promotion_rollback_open_qa_fixed_signoff_transition_uses_immutable_qa_intent(
+    conn, tmp_path, monkeypatch
+):
+    candidate = _promotion_rollback_candidate_fixture()
+    backlog_id = server._AC_PROMOTION_ROLLBACK_BLOCKER_ID
+    cex = server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID
+    project_id = "aming-claw"
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    conn.execute(
+        "UPDATE backlog_bugs SET status='OPEN', fixed_at='', \"commit\"='' "
+        "WHERE bug_id=?",
+        (backlog_id,),
+    )
+    conn.commit()
+    implementation = {
+        "contract_execution_id": cex,
+        "contract_id": "operator_supervised_direct_main",
+        "implementation_route_ref": "rtok-implementation-d",
+        "binding_hash": "sha256:" + "1" * 64,
+        "implementation_line_hash": "sha256:" + "2" * 64,
+        "runtime_revision": 4,
+        "runtime_state_hash": "sha256:" + "3" * 64,
+    }
+    route_identity = {
+        "route_id": "route-promotion-d",
+        "route_context_hash": "sha256:" + "4" * 64,
+        "prompt_contract_id": "prompt-promotion-d",
+        "prompt_contract_hash": "sha256:" + "5" * 64,
+        "visible_injection_manifest_hash": "sha256:" + "6" * 64,
+        "route_token_ref": "rtok-promotion-d",
+    }
+    route_core = {
+        "schema_version": "ac_promotion_rollback_route_authority.v1",
+        "accepted": True,
+        "source": "canonical_stable_route_registry",
+        "required_endpoint": "http://127.0.0.1:40000",
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": cex,
+        "candidate_commit": candidate["candidate_commit"],
+        "route_token_ref": route_identity["route_token_ref"],
+        "route_identity": route_identity,
+        "evidence_refs_hash": "sha256:" + "7" * 64,
+        "writes_performed": False,
+    }
+    route = {**route_core, "authority_hash": server.stable_sha256(route_core)}
+    custody = server._ac_promotion_rollback_custody_authority(
+        candidate=candidate,
+        implementation=implementation,
+        promotion_route=route,
+    )
+    deploy = {
+        "authorized": True,
+        "mode": "host_supervisor_activation_plan_v2",
+        "stable_port": 40000,
+    }
+    activation_policy = {
+        "schema_version": "ac_stable_activation_policy.v2",
+        "prepare_required": True,
+        "activation_plan_required": True,
+        "automatic_activation": False,
+        "rollback_required_after_first_mutation": True,
+    }
+    qa_intent = server._ac_promotion_rollback_qa_candidate_intent(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        candidate=candidate,
+        deploy=deploy,
+        activation_policy=activation_policy,
+        custody_authority=custody,
+    )
+    qa_intent_hash = server.stable_sha256(qa_intent)
+
+    principal = "qa-promotion-transition"
+    session_id = "ses-qa-promotion-transition"
+    snapshot_id = "snapshot-qa-promotion-transition"
+    trace_id = "gqt-qa-promotion-transition"
+    scope_ref = server._qa_scope_binding_ref(
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=cex,
+        commit_sha=candidate["candidate_commit"],
+    )
+    session = server.role_service.register(
+        conn, principal, project_id, "qa", scope=[scope_ref]
+    )
+    session_id = session["session_id"]
+    _insert_exact_qa_graph_query_trace(
+        conn,
+        project_id=project_id,
+        trace_id=trace_id,
+        snapshot_id=snapshot_id,
+        candidate_commit_sha=candidate["candidate_commit"],
+        backlog_id=backlog_id,
+        task_id=cex,
+        target_project_root=str(tmp_path),
+        actor=principal,
+        qa_session_id=session_id,
+    )
+    proof = {
+        "schema_version": "qa_session_scope_proof.v1",
+        "source": "authenticated_qa_session",
+        "role": "qa",
+        "verified": True,
+        "observer_impersonation": False,
+        "db_verified_graph_trace": True,
+        "query_source": "qa",
+        "query_purpose": "independent_verification",
+        "evidence_status": "passed",
+        "authority_scope": "close_satisfying",
+        "close_satisfying": True,
+        "audit_only": False,
+        "passing_status_required_for_close": True,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": cex,
+        "commit_sha": candidate["candidate_commit"],
+        "principal_id": principal,
+        "qa_session_id": session_id,
+        "qa_scope_binding_ref": scope_ref,
+        "snapshot_id": snapshot_id,
+        "snapshot_commit_sha": candidate["candidate_commit"],
+        "graph_trace_ids": [trace_id],
+        "candidate_review_context": {
+            "candidate_commit_sha": candidate["candidate_commit"],
+            "comparison_base_commit_sha": server.AC_STABLE_ANCHOR_COMMIT,
+            "comparison_authority_required": True,
+            "candidate_diff_hash": candidate["promotion_delta"]["diff_sha256"],
+            "changed_files": candidate["promotion_delta"]["file_fence"],
+        },
+    }
+    authority = task_timeline.source_backed_qa_session_authority(proof)
+    report = "sha256:" + "8" * 64
+    results = {
+        "branch_service": {
+            "status": "passed",
+            "runtime_plane": "dev",
+            "port": 40008,
+            "bind_host": "127.0.0.1",
+            "test_id": "branch-service",
+            "report_sha256": report,
+        },
+        "lanes": {
+            lane: {
+                "status": "passed",
+                "test_id": f"lane-{lane}",
+                "report_sha256": report,
+            }
+            for lane in ("direct_main", "mf_parallel", "mf_batch_parallel")
+        },
+    }
+    qa_payload = {
+        "source_backed_contract_gate_authority": authority,
+        "contract_runtime_canonical_line": {
+            "stage_id": "qa",
+            "line_id": "qa_independent_verification",
+            "contract_execution_id": cex,
+            "runtime_guide_hash": "sha256:" + "9" * 64,
+        },
+        "implementation_delta_review_context": {
+            "candidate_commit_sha": candidate["candidate_commit"],
+            "comparison_base_commit_sha": server._AC_PROMOTION_ROLLBACK_BASELINE_COMMIT,
+            "candidate_diff_hash": candidate["implementation_delta"]["diff_sha256"],
+            "changed_files": candidate["implementation_delta"]["file_fence"],
+        },
+        "implementation_delta": candidate["implementation_delta"],
+        "promotion_delta": candidate["promotion_delta"],
+        "candidate_tree_sha": candidate["candidate_tree_sha"],
+        "stable_runtime_source_sha256": candidate["stable_runtime_source_sha256"],
+        "candidate_runtime_source_sha256": candidate["candidate_runtime_source_sha256"],
+        "qa_candidate_intent_sha256": qa_intent_hash,
+        "stable_database_identity": candidate["stable_database_identity"],
+    }
+    qa_event = task_timeline.record_event(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        task_id=cex,
+        event_type="qa.independent_verification",
+        phase="qa",
+        event_kind="independent_verification",
+        actor=principal,
+        status="passed",
+        payload=qa_payload,
+        verification={"promotion_gate_results": results},
+        commit_sha=candidate["candidate_commit"],
+        post_commit_hooks=False,
+    )
+    conn.commit()
+
+    qa_open = server._ac_promotion_rollback_qa_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        candidate=candidate,
+        qa_candidate_intent_sha256=qa_intent_hash,
+    )
+    assert qa_open["accepted"] is True
+    assert qa_open["timeline_event_id"] == qa_event["id"]
+    open_rollback = server._ac_promotion_rollback_row_authority(
+        conn, candidate=candidate
+    )
+    assert open_rollback["accepted"] is False
+
+    fixed_at = "2026-08-28T12:00:00Z"
+    conn.execute(
+        "UPDATE backlog_bugs SET status='FIXED', fixed_at=?, \"commit\"=? "
+        "WHERE bug_id=?",
+        (fixed_at, candidate["candidate_commit"], backlog_id),
+    )
+    conn.commit()
+    fixed_rollback = server._ac_promotion_rollback_row_authority(
+        conn, candidate=candidate
+    )
+    assert fixed_rollback["accepted"] is True
+    assert fixed_rollback["authority_hash"] != open_rollback["authority_hash"]
+    qa_fixed = server._ac_promotion_rollback_qa_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        candidate=candidate,
+        qa_candidate_intent_sha256=qa_intent_hash,
+    )
+    assert qa_fixed == qa_open
+
+    final_intent = {
+        "schema_version": "ac_stable_promotion_manifest.v2",
+        **{
+            key: qa_intent[key]
+            for key in (
+                "project_id", "backlog_id", "contract_execution_id",
+                "stable_anchor_commit", "stable_branch", "branch",
+                "candidate_commit", "candidate_tree_sha",
+                "stable_runtime_source_sha256",
+                "candidate_runtime_source_sha256", "implementation_delta",
+                "promotion_delta",
+            )
+        },
+        "qa_candidate_intent_sha256": qa_intent_hash,
+        "rollback_authority_hash": fixed_rollback["authority_hash"],
+        "deploy": deploy,
+        "stable_database_identity": candidate["stable_database_identity"],
+        "activation_policy": activation_policy,
+        "custody_authority": custody,
+    }
+    final_intent_hash = server.stable_sha256(final_intent)
+    verifier_hash = "sha256:" + "a" * 64
+    nonce = "b" * 32
+    created_at = datetime.now(timezone.utc).replace(microsecond=0)
+    expires_at = created_at + timedelta(minutes=30)
+    operator_gate = {
+        "status": "approved",
+        "nonce": nonce,
+        "operator_principal_id": "operator-promotion-transition",
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+    }
+    signable = {
+        **final_intent,
+        "promotion_intent_sha256": final_intent_hash,
+        "prior_promotion": {
+            "kind": "bootstrap",
+            "stable_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        },
+        "gates": {
+            "qa_verdict": {
+                "timeline_event_id": qa_fixed["timeline_event_id"],
+                "status": "passed",
+            },
+            "operator_signoff": operator_gate,
+        },
+    }
+    manifest_hash = server.stable_sha256(signable)
+    reason = {
+        "schema_version": "ac_stable_promotion_operator_signoff.v2",
+        "nonce": nonce,
+        "operator_principal_id": operator_gate["operator_principal_id"],
+        "expires_at": operator_gate["expires_at"],
+            "project_id": project_id,
+        "backlog_id": backlog_id,
+        "contract_execution_id": cex,
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "candidate_commit": candidate["candidate_commit"],
+        "candidate_tree_sha": candidate["candidate_tree_sha"],
+        "stable_runtime_source_sha256": candidate["stable_runtime_source_sha256"],
+        "candidate_runtime_source_sha256": candidate["candidate_runtime_source_sha256"],
+        "promotion_intent_sha256": final_intent_hash,
+        "qa_candidate_intent_sha256": qa_intent_hash,
+        "promotion_manifest_sha256": manifest_hash,
+        "verifier_sha256": verifier_hash,
+        "implementation_delta_hash": candidate["implementation_delta"]["delta_hash"],
+        "promotion_delta_hash": candidate["promotion_delta"]["delta_hash"],
+        "rollback_authority_hash": fixed_rollback["authority_hash"],
+        "custody_authority": custody,
+        "stable_database_identity": candidate["stable_database_identity"],
+    }
+    server._ensure_release_operator_head_queue_schema(conn)
+    cursor = conn.execute(
+        "INSERT INTO release_operator_head_queue_events("
+        "project_id,action,backlog_id,actor,reason,before_json,after_json,created_at"
+        ") VALUES (?, 'reorder', '', ?, ?, '{}', '{}', ?)",
+        (
+            project_id,
+            operator_gate["operator_principal_id"],
+            json.dumps(reason, sort_keys=True, separators=(",", ":")),
+            created_at.isoformat().replace("+00:00", "Z"),
+        ),
+    )
+    conn.commit()
+    signoff = server._ac_promotion_rollback_signoff_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        candidate=candidate,
+        qa=qa_fixed,
+        intent=final_intent,
+        promotion_intent_sha256=final_intent_hash,
+        verifier_sha256=verifier_hash,
+    )
+    assert signoff["accepted"] is True
+    assert signoff["queue_event_id"] == cursor.lastrowid
+    assert signoff["manifest_hash"] == manifest_hash
+    manifest = {
+        **final_intent,
+        "promotion_intent_sha256": final_intent_hash,
+        "promotion_manifest_sha256": manifest_hash,
+        "gates": {
+            "qa_verdict": {
+                "timeline_event_id": qa_fixed["timeline_event_id"],
+                "status": "passed",
+            },
+            "operator_signoff": {
+                **operator_gate,
+                "queue_event_id": int(cursor.lastrowid),
+            },
+        },
+        "prior_promotion": signable["prior_promotion"],
+    }
+    signoff_row = dict(
+        conn.execute(
+            "SELECT * FROM release_operator_head_queue_events WHERE id=?",
+            (int(cursor.lastrowid),),
+        ).fetchone()
+    )
+    signoff_row_hash = server.stable_sha256(
+        {
+            key: signoff_row.get(key)
+            for key in (
+                "id", "project_id", "action", "backlog_id", "actor",
+                "reason", "before_json", "after_json", "created_at",
+            )
+        }
+    )
+    precheck_core = {
+        "schema_version": "ac_stable_promotion_precheck_receipt.v2",
+        "verifier_version": "readonly_timeline_projector.v2",
+        "verifier_sha256": verifier_hash,
+        "promotion_intent_sha256": final_intent_hash,
+        "promotion_manifest_sha256": manifest_hash,
+        "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+        "candidate_commit": candidate["candidate_commit"],
+        "candidate_tree_sha": candidate["candidate_tree_sha"],
+        "stable_runtime_source_sha256": candidate[
+            "stable_runtime_source_sha256"
+        ],
+        "candidate_runtime_source_sha256": candidate[
+            "candidate_runtime_source_sha256"
+        ],
+        "qa_candidate_intent_sha256": qa_intent_hash,
+        "implementation_delta_hash": candidate["implementation_delta"][
+            "delta_hash"
+        ],
+        "promotion_delta_hash": candidate["promotion_delta"]["delta_hash"],
+        "rollback_authority_hash": fixed_rollback["authority_hash"],
+        "custody_authority": custody,
+        "stable_database_identity": candidate["stable_database_identity"],
+        "previous_promotion_receipt_hash": "",
+        "prior_promotion_event_id": 0,
+        "gate_event_ids": {
+            "qa_verdict": qa_fixed["timeline_event_id"],
+            "operator_signoff": int(cursor.lastrowid),
+        },
+        "operator_approval_ref": signoff["operator_approval_ref"],
+        "gate_evidence_hashes": {
+            "qa_verdict": qa_fixed["event_hash"],
+            "operator_signoff": signoff_row_hash,
+        },
+        "pass_synthesized": False,
+        "writes_performed": False,
+    }
+    precheck = {
+        **precheck_core,
+        "receipt_hash": server.stable_sha256(precheck_core),
+    }
+    body = {
+        "precheck_receipt": precheck,
+        "precheck_receipt_hash": precheck["receipt_hash"],
+        "promotion_manifest": manifest,
+        "promotion_manifest_sha256": manifest_hash,
+    }
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_implementation_record",
+        lambda *_args, **_kwargs: copy.deepcopy(implementation),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ac_promotion_rollback_route_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(route),
+    )
+    server._validate_ac_stable_promotion_durable_evidence(
+        conn,
+        body=body,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        contract_execution_id=cex,
+        candidate=candidate["candidate_commit"],
+        previous_stable=server.AC_STABLE_ANCHOR_COMMIT,
+        file_fence=candidate["promotion_delta"]["file_fence"],
+        diff_sha256=candidate["promotion_delta"]["diff_sha256"],
+        verifier_sha256=verifier_hash,
+        promotion_intent_sha256=final_intent_hash,
+        deploy=deploy,
+        stable_database_identity=candidate["stable_database_identity"],
+        operator_approval_ref=signoff["operator_approval_ref"],
+    )
+
+
+def test_promotion_rollback_route_rejects_missing_stale_and_overbroad_authority(
+    conn,
+    monkeypatch,
+):
+    candidate = _promotion_rollback_candidate_fixture()
+    evidence = server._ac_promotion_rollback_expected_evidence_refs(
+        backlog_id=server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+        candidate=candidate,
+    )
+
+    def route(**overrides):
+        value = {
+            "caller_role": "observer",
+            "allowed_actions": [server._AC_PROMOTION_ROLLBACK_ROUTE_ACTION],
+            "target_files": candidate["implementation_delta"]["file_fence"],
+            "owned_files": candidate["implementation_delta"]["file_fence"],
+            "evidence_refs": evidence,
+            "route_token_ref": "rtok-rollback-prepare",
+            "route_id": "route-rollback-prepare",
+            "route_context_hash": "sha256:" + "1" * 64,
+            "prompt_contract_id": "prompt-rollback-prepare",
+            "prompt_contract_hash": "sha256:" + "2" * 64,
+            "visible_injection_manifest_hash": "sha256:" + "3" * 64,
+        }
+        value.update(overrides)
+        return value
+
+    monkeypatch.setattr(
+        observer_route_context,
+        "resolve_route_token_ref",
+        lambda *_args, **_kwargs: route(),
+    )
+    accepted = server._ac_promotion_rollback_route_authority(
+        conn,
+        project_id="aming-claw",
+        backlog_id=server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+        route_token_ref="rtok-rollback-prepare",
+        candidate=candidate,
+    )
+    assert accepted["accepted"] is True
+    implementation = {
+        "contract_execution_id": (
+            server._AC_PROMOTION_ROLLBACK_CONTRACT_EXECUTION_ID
+        ),
+        "contract_id": "operator_supervised_direct_main",
+        "implementation_route_ref": "rtok-implementation-d",
+        "binding_hash": "sha256:" + "4" * 64,
+        "implementation_line_hash": "sha256:" + "5" * 64,
+        "runtime_revision": 4,
+        "runtime_state_hash": "sha256:" + "6" * 64,
+    }
+    custody = server._ac_promotion_rollback_custody_authority(
+        candidate=candidate,
+        implementation=implementation,
+        promotion_route=accepted,
+    )
+    assert custody["candidate_authority_hash"] == candidate["authority_hash"]
+    advanced = server._ac_promotion_rollback_custody_authority(
+        candidate=candidate,
+        implementation={**implementation, "runtime_revision": 5},
+        promotion_route=accepted,
+    )
+    assert advanced["authority_hash"] != custody["authority_hash"]
+
+    for overrides in (
+        {"evidence_refs": []},
+        {"evidence_refs": [*evidence[:-1], "candidate_commit:" + "0" * 40]},
+        {
+            "allowed_actions": [
+                server._AC_PROMOTION_ROLLBACK_ROUTE_ACTION,
+                "task_timeline.record_event",
+            ]
+        },
+        {"route_context_hash": ""},
+    ):
+        monkeypatch.setattr(
+            observer_route_context,
+            "resolve_route_token_ref",
+            lambda *_args, _overrides=overrides, **_kwargs: route(**_overrides),
+        )
+        assert server._ac_promotion_rollback_route_authority(
+            conn,
+            project_id="aming-claw",
+            backlog_id=server._AC_PROMOTION_ROLLBACK_BLOCKER_ID,
+            route_token_ref="rtok-rollback-prepare",
+            candidate=candidate,
+        ) == {}
