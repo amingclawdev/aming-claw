@@ -14052,6 +14052,81 @@ def test_ac_dev_external_backlog_honors_one_row_caller_limit(monkeypatch):
     assert result["next_offset"] == 1
 
 
+def test_ac_dev_external_backlog_exact_cl_page_uses_upstream_continuation(
+    monkeypatch,
+):
+    paths: list[str] = []
+
+    def stable_get(path, *, max_bytes):
+        paths.append(path)
+        assert "charting-loop" in path
+        payload = _dev_external_paginated_backlog_payload(
+            path,
+            total_rows=70,
+        )
+        assert len(payload["bugs"]) == 50
+        assert payload["has_more"] is True
+        assert max_bytes == 262_144
+        return _dev_sized_stable_payload(payload, wire_bytes=159_009)
+
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
+    )
+    result = server._dev_external_backlog_list_projection(
+        "charting-loop",
+        {"limit": "50", "status": "OPEN"},
+    )
+
+    assert result["count"] == 50
+    assert result["has_more"] is True
+    assert result["truncated"] is True
+    assert result["next_offset"] == 50
+    assert result["pagination"]["pages_read"] == 1
+    assert result["pagination"]["rows_scanned"] == 50
+    assert result["pagination"]["aggregate_transported_bytes"] == 159_009
+    assert len(paths) == 1
+    assert server.parse_qs(server.urlparse(paths[0]).query)["status"] == [
+        "OPEN"
+    ]
+
+
+def test_ac_dev_external_backlog_exact_terminal_page_has_no_continuation(
+    monkeypatch,
+):
+    paths: list[str] = []
+
+    def stable_get(path, *, max_bytes):
+        paths.append(path)
+        payload = _dev_external_paginated_backlog_payload(
+            path,
+            total_rows=50,
+        )
+        assert len(payload["bugs"]) == 50
+        assert payload["has_more"] is False
+        sized = _dev_sized_stable_payload(payload)
+        assert sized[1] <= max_bytes
+        return sized
+
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
+    )
+    result = server._dev_external_backlog_list_projection(
+        "generic-system",
+        {"limit": "50"},
+    )
+
+    assert result["count"] == 50
+    assert result["has_more"] is False
+    assert result["truncated"] is False
+    assert result["next_offset"] is None
+    assert result["pagination"]["pages_read"] == 1
+    assert len(paths) == 1
+
+
 @pytest.mark.parametrize(
     ("requested_status", "row_statuses"),
     [
@@ -14297,16 +14372,22 @@ def test_ac_dev_external_backlog_pages_fail_closed_on_drift(monkeypatch, drift):
 
 def test_ac_dev_external_backlog_private_rows_do_not_fill_public_offset(monkeypatch):
     private_indexes = tuple(range(50))
-    monkeypatch.setattr(
-        server,
-        "_dev_stable_external_public_get_with_size",
-        lambda path, **_kwargs: _dev_sized_stable_payload(
+    paths: list[str] = []
+
+    def stable_get(path, **_kwargs):
+        paths.append(path)
+        return _dev_sized_stable_payload(
             _dev_external_paginated_backlog_payload(
                 path,
                 total_rows=70,
                 private_indexes=private_indexes,
             )
-        ),
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        stable_get,
     )
     result = server._dev_external_backlog_list_projection(
         "generic-system",
@@ -14317,6 +14398,7 @@ def test_ac_dev_external_backlog_private_rows_do_not_fill_public_offset(monkeypa
         "GENERIC-SYSTEM-ROW-0052",
     ]
     assert result["pagination"]["pages_read"] == 2
+    assert len(paths) == 2
 
 
 @pytest.mark.parametrize(

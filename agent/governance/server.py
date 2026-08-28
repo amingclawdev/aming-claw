@@ -4647,7 +4647,7 @@ def _dev_external_backlog_list_projection(
         query,
         default_limit=default_limit,
     )
-    target_public_rows = requested["offset"] + requested["limit"] + 1
+    target_public_rows = requested["offset"] + requested["limit"]
     pages = 0
     scanned_rows = 0
     aggregate_bytes = 0
@@ -4655,6 +4655,7 @@ def _dev_external_backlog_list_projection(
     seen_cursors: set[str] = set()
     seen_backlog_ids: set[str] = set()
     authority: dict[str, Any] | None = None
+    last_pagination: dict[str, Any] | None = None
     public_rows: list[dict[str, Any]] = []
     while True:
         if (
@@ -4732,6 +4733,7 @@ def _dev_external_backlog_list_projection(
             priority=requested["priority"],
             include_closed=requested["include_closed"],
         )
+        last_pagination = pagination
         if authority is None:
             authority = page_authority
         elif page_authority != authority:
@@ -4774,23 +4776,31 @@ def _dev_external_backlog_list_projection(
                 )
             seen_backlog_ids.add(bug_id)
             public_rows.append(projected)
+        next_cursor = ""
+        if pagination["has_more"] is True:
+            next_cursor = str(pagination["next_cursor"])
+            if next_cursor == cursor or next_cursor in seen_cursors:
+                raise _dev_stable_proxy_failure(
+                    "ac_dev_stable_proxy_backlog_pagination_drift",
+                    "stable backlog keyset cursor did not advance exactly once",
+                    status=409,
+                )
         if len(public_rows) >= target_public_rows:
             break
         if pagination["has_more"] is False:
             break
-        next_cursor = str(pagination["next_cursor"])
-        if next_cursor == cursor or next_cursor in seen_cursors:
-            raise _dev_stable_proxy_failure(
-                "ac_dev_stable_proxy_backlog_pagination_drift",
-                "stable backlog keyset cursor did not advance exactly once",
-                status=409,
-            )
         seen_cursors.add(next_cursor)
         cursor = next_cursor
     start = requested["offset"]
     stop = start + requested["limit"]
     selected_rows = public_rows[start:stop]
-    has_more = len(public_rows) > stop
+    has_more = bool(
+        len(public_rows) > stop
+        or (
+            last_pagination is not None
+            and last_pagination["has_more"] is True
+        )
+    )
     return _dev_external_backlog_projection_envelope({
         "schema_version": "ac_dev_external_public_backlog.v1",
         "project_id": project_id,

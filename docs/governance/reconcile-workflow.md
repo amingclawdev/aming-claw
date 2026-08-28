@@ -901,6 +901,12 @@ AC repair work uses two independent runtime planes:
   oversize, aggregate oversize, or exhausted scan budget is a typed zero-write
   rejection; the proxy never silently omits rows. Successful projections report
   truthful `count`, `limit`, `offset`, `has_more`, `truncated`, and `next_offset`.
+  The bridge stops as soon as validated public rows satisfy exact
+  `offset + limit`; it does not fetch a speculative `+1` row or page. At an
+  exact full-page boundary, the last validated upstream `has_more` supplies the
+  continuation truth, while a terminal upstream page produces
+  `has_more=false`, `truncated=false`, and no `next_offset`. Another page is read
+  only when offset or privacy filtering leaves an actual public-row shortfall.
   The stable producer treats an explicit limit below the 250-row dashboard hot
   window as an indexed keyset request, while an explicit 250-row request retains
   existing hot-window cache semantics.
