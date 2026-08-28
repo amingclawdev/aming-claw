@@ -3379,7 +3379,7 @@ _DEV_EXTERNAL_BACKLOG_LIST_QUERY_ALLOWLIST = frozenset(
     {"view", "limit", "status", "priority", "include_closed"}
 )
 _DEV_EXTERNAL_COORDINATION_QUERY_ALLOWLIST = frozenset(
-    {"limit", "status", "priority", "include_closed"}
+    {"limit", "status", "q", "include_closed"}
 )
 _DEV_EXTERNAL_SCOPED_PROFILE = "private-scoped-coordination.v1"
 _DEV_EXTERNAL_COORDINATION_SCHEMA_VERSION = (
@@ -3571,11 +3571,11 @@ def _dev_external_discovery_request(
         unknown_query = sorted(
             set(query) - allowlist
         )
-        view = (
-            str(_first_query_value(query, "view") or "").strip().lower()
-            if route_kind == "backlog_list"
-            else ""
-        )
+        if route_kind == "coordination":
+            _dev_external_coordination_filters(query)
+            view = ""
+        else:
+            view = str(_first_query_value(query, "view") or "").strip().lower()
         if unknown_query or view not in {"", "compact"}:
             raise _dev_external_discovery_rejection(
                 code=(
@@ -3726,6 +3726,12 @@ def _dev_external_public_project(project_id: str) -> dict[str, Any]:
             field_profile=str(registered.get("field_profile") or ""),
             policy_schema_version=str(
                 registered.get("policy_schema_version") or ""
+            ),
+            policy_overlay_applied=bool(
+                registered.get("policy_overlay_sha256")
+            ),
+            policy_overlay_sha256=str(
+                registered.get("policy_overlay_sha256") or ""
             ),
         )
     return project
@@ -4314,7 +4320,6 @@ def _dev_external_coordination_backlog_row(
     bug_id = raw.get("bug_id")
     status = raw.get("status")
     priority = raw.get("priority")
-    title = raw.get("title")
     if not (
         type(bug_id) is str
         and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,191}", bug_id)
@@ -4322,8 +4327,6 @@ def _dev_external_coordination_backlog_row(
         and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", status)
         and type(priority) is str
         and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", priority)
-        and type(title) is str
-        and len(title) <= 16 * 1024
     ):
         raise _dev_stable_proxy_failure(
             "ac_dev_stable_proxy_schema_rejected",
@@ -4394,22 +4397,6 @@ def _dev_external_coordination_backlog_row(
             status=409,
         )
 
-    public_safe = raw.get("public_safe")
-    privacy_level = raw.get("privacy_level")
-    if not (
-        type(public_safe) is bool
-        and type(privacy_level) is str
-        and (
-            (public_safe is True and privacy_level == "public")
-            or (public_safe is False and privacy_level in {"private", "restricted"})
-        )
-    ):
-        raise _dev_stable_proxy_failure(
-            "ac_dev_external_coordination_classification_rejected",
-            "stable compact intent lacks an exact supported privacy classification",
-            status=409,
-        )
-
     refs = {
         **_dev_external_coordination_reference_pair(
             raw,
@@ -4440,19 +4427,8 @@ def _dev_external_coordination_backlog_row(
             "divergent": contract["divergent"],
         },
         "coordination_refs": refs,
-        "public_summary_available": public_safe,
+        "content_projection": "omitted_unverified_legacy_classification",
     }
-    if public_safe:
-        if any(ord(char) < 0x20 and char not in "\t\n\r" for char in title):
-            raise _dev_stable_proxy_failure(
-                "ac_dev_external_coordination_summary_rejected",
-                "stable compact intent public title contains control bytes",
-                status=409,
-            )
-        projected["public_summary"] = {
-            "title": _compact_preview(title, limit=240),
-            "classification": "explicit_public",
-        }
     return projected
 
 
@@ -4461,7 +4437,19 @@ def _dev_external_coordination_filters(
     *,
     default_limit: int = 20,
 ) -> tuple[int, str, str, bool]:
-    raw_limit = _first_query_value(query, "limit", str(default_limit))
+    def exact_scalar(field: str, default: str) -> str:
+        if field not in query:
+            return default
+        value = query[field]
+        if type(value) is not str:
+            raise GovernanceError(
+                "ac_dev_external_coordination_query_type_rejected",
+                f"coordination projection {field} must be one exact string",
+                400,
+            )
+        return value
+
+    raw_limit = exact_scalar("limit", str(default_limit))
     if type(raw_limit) is not str or not re.fullmatch(r"[1-9][0-9]?", raw_limit):
         raise GovernanceError(
             "ac_dev_external_coordination_limit_rejected",
@@ -4475,20 +4463,22 @@ def _dev_external_coordination_filters(
             "coordination projection limit must be an exact integer string from 1 to 50",
             400,
         )
-    filters = []
-    for field in ("status", "priority"):
-        raw = _first_query_value(query, field, "")
-        if type(raw) is not str or not re.fullmatch(
-            r"(?:|[A-Za-z0-9][A-Za-z0-9._:-]{0,63})", raw
-        ):
-            raise GovernanceError(
-                "ac_dev_external_coordination_filter_rejected",
-                f"coordination projection {field} filter is invalid",
-                400,
-            )
-        filters.append(raw)
-    raw_include_closed = _first_query_value(query, "include_closed", "true")
-    if type(raw_include_closed) is not str or raw_include_closed not in {
+    raw_status = exact_scalar("status", "")
+    if not re.fullmatch(r"(?:|[A-Za-z0-9][A-Za-z0-9._:-]{0,63})", raw_status):
+        raise GovernanceError(
+            "ac_dev_external_coordination_filter_rejected",
+            "coordination projection status filter is invalid",
+            400,
+        )
+    raw_q = exact_scalar("q", "")
+    if not re.fullmatch(r"(?:|[A-Za-z0-9][A-Za-z0-9._:-]{0,191})", raw_q):
+        raise GovernanceError(
+            "ac_dev_external_coordination_filter_rejected",
+            "coordination projection q filter is invalid",
+            400,
+        )
+    raw_include_closed = exact_scalar("include_closed", "true")
+    if raw_include_closed not in {
         "true",
         "false",
     }:
@@ -4497,7 +4487,7 @@ def _dev_external_coordination_filters(
             "coordination projection include_closed must be true or false",
             400,
         )
-    return limit, filters[0], filters[1], raw_include_closed == "true"
+    return limit, raw_status, raw_q, raw_include_closed == "true"
 
 
 def _dev_external_stable_backlog_list_path(
@@ -4632,10 +4622,24 @@ def _dev_external_scoped_backlog_list_from_stable(
     stable: Mapping[str, Any],
     query: Mapping[str, Any],
 ) -> dict[str, Any]:
-    limit, status_filter, priority_filter, include_closed = (
+    limit, status_filter, backlog_filter, include_closed = (
         _dev_external_coordination_filters(query)
     )
-    rows, authority = _dev_external_validate_backlog_list(project_id, stable)
+    rows, authority = _dev_external_validate_backlog_list(
+        project_id,
+        stable,
+        backlog_id=backlog_filter,
+    )
+    if backlog_filter and any(
+        type(row.get("bug_id")) is not str
+        or row.get("bug_id") != backlog_filter
+        for row in rows
+    ):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_backlog_authority_rejected",
+            "stable indexed backlog response crossed its exact q binding",
+            status=409,
+        )
     projected_rows = [
         _dev_external_coordination_backlog_row(row) for row in rows
     ]
@@ -4643,10 +4647,6 @@ def _dev_external_scoped_backlog_list_from_stable(
         row
         for row in projected_rows
         if (not status_filter or row["status"].upper() == status_filter.upper())
-        and (
-            not priority_filter
-            or row["priority"].upper() == priority_filter.upper()
-        )
         and (
             include_closed
             or row["status"].upper() not in _BACKLOG_CLOSED_STATUSES
@@ -4887,9 +4887,15 @@ def _dev_external_coordination_projection(
             path=f"/api/projects/{project_id}/coordination-projection",
             detail="coordination projection requires the private scoped profile",
         )
+    _limit, _status, backlog_filter, _include_closed = (
+        _dev_external_coordination_filters(query)
+    )
     stable_identity, payloads = _dev_stable_external_public_read_window(
         [
-            _dev_external_stable_backlog_list_path(project_id),
+            _dev_external_stable_backlog_list_path(
+                project_id,
+                backlog_id=backlog_filter,
+            ),
             f"/api/graph-governance/{quote(project_id, safe='')}/status",
         ]
     )
@@ -4929,7 +4935,6 @@ def _dev_external_coordination_projection(
             "graph_status",
             "intent_lifecycle_identifiers_status_counts",
             "route_decision_ids_with_hashes",
-            "explicitly_public_summary",
         ],
         "bounded": True,
         "read_only": True,
