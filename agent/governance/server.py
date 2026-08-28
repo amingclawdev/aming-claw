@@ -105765,6 +105765,28 @@ def _contract_runtime_fresh_repair_canonical_envelope_sources(
     return candidates if len(candidates) == 1 else ()
 
 
+def _contract_runtime_monotone_disposition_join(
+    dispositions: Sequence[Any],
+    *,
+    diagnostic_path: str,
+) -> str:
+    """Join closed authority dispositions without permitting demotion."""
+
+    precedence = {
+        "audited_non_authority": 0,
+        "recursive_container": 1,
+        "authority_leaf": 2,
+    }
+    normalized = tuple(dispositions)
+    if not normalized:
+        return ""
+    if any(type(value) is not str or value not in precedence for value in normalized):
+        _contract_runtime_raise_canonical_authority_registry_incomplete(
+            [diagnostic_path]
+        )
+    return max(normalized, key=precedence.__getitem__)
+
+
 def _contract_runtime_key_is_execution_authority_or_credential(
     key: Any,
     *,
@@ -105777,7 +105799,7 @@ def _contract_runtime_key_is_execution_authority_or_credential(
     context = validated_authority_context or (
         _contract_runtime_require_canonical_authority_registry_complete()
     )
-    canonical_dispositions = tuple(
+    source_dispositions = tuple(
         disposition
         for source_name in canonical_source_names
         if (
@@ -105786,15 +105808,30 @@ def _contract_runtime_key_is_execution_authority_or_credential(
             .get(key_name)
         )
     )
-    if canonical_dispositions:
-        return "authority_leaf" in canonical_dispositions
-    if canonical_source_names:
-        return False
-    disposition = context["global_compatibility_index"].get(key_name)
-    if disposition is None:
+    global_disposition = context["global_compatibility_index"].get(key_name)
+    if canonical_source_names and len(source_dispositions) != len(
+        canonical_source_names
+    ):
+        _contract_runtime_raise_canonical_authority_registry_incomplete(
+            [
+                f"{source_name}.{key_name}"
+                for source_name in canonical_source_names
+                if key_name
+                not in context["field_dispositions_by_source"].get(
+                    source_name, {}
+                )
+            ]
+        )
+    if global_disposition is None and not source_dispositions:
         # Arbitrary acceptance prose may contain application-specific keys.
         # Only the validated global index can classify an unscoped key.
         return False
+    disposition = _contract_runtime_monotone_disposition_join(
+        (*source_dispositions, global_disposition)
+        if global_disposition is not None
+        else source_dispositions,
+        diagnostic_path=f"global_compatibility_index.{key_name}",
+    )
     return disposition in {"authority_leaf", "recursive_container"}
 
 

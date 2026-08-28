@@ -124020,6 +124020,68 @@ def test_contract_runtime_authority_registry_compound_record_and_live_cannot_sel
     assert "registry.golden_ordered_hash" in error.value.details["diagnostic_paths"]
 
 
+_AUTHORITY_TEST_CONTEXT = (
+    server._contract_runtime_require_canonical_authority_registry_complete()
+)
+_AUTHORITY_DEMOTION_CASES = tuple(
+    (source_name, field_name, source_disposition, global_disposition)
+    for source_name, fields in (
+        _AUTHORITY_TEST_CONTEXT["field_dispositions_by_source"].items()
+    )
+    for field_name, source_disposition in fields.items()
+    if (
+        global_disposition := _AUTHORITY_TEST_CONTEXT[
+            "global_compatibility_index"
+        ][field_name]
+    )
+    != source_disposition
+)
+
+
+@pytest.mark.parametrize(
+    "source_name,field_name,source_disposition,global_disposition",
+    _AUTHORITY_DEMOTION_CASES,
+)
+def test_contract_runtime_authority_registry_all_source_contexts_are_non_demotable(
+    source_name, field_name, source_disposition, global_disposition
+):
+    assert len(_AUTHORITY_DEMOTION_CASES) >= 80
+    context = server._contract_runtime_require_canonical_authority_registry_complete()
+    joined = server._contract_runtime_monotone_disposition_join(
+        (source_disposition, global_disposition),
+        diagnostic_path=f"{source_name}.{field_name}",
+    )
+    assert joined == global_disposition
+    assert server._contract_runtime_key_is_execution_authority_or_credential(
+        field_name,
+        canonical_source_names=(source_name,),
+        validated_authority_context=context,
+    ) is (global_disposition in {"authority_leaf", "recursive_container"})
+
+
+def test_contract_runtime_authority_registry_monotone_join_algebra():
+    audited = "audited_non_authority"
+    recursive = "recursive_container"
+    authority = "authority_leaf"
+    for disposition in (audited, recursive, authority):
+        assert server._contract_runtime_monotone_disposition_join(
+            (disposition, disposition), diagnostic_path="algebra.idempotent"
+        ) == disposition
+    assert server._contract_runtime_monotone_disposition_join(
+        (audited, recursive), diagnostic_path="algebra.commutative"
+    ) == server._contract_runtime_monotone_disposition_join(
+        (recursive, audited), diagnostic_path="algebra.commutative"
+    )
+    assert server._contract_runtime_monotone_disposition_join(
+        (audited, recursive, authority), diagnostic_path="algebra.associative"
+    ) == authority
+    with pytest.raises(server.GovernanceError) as error:
+        server._contract_runtime_monotone_disposition_join(
+            (audited, "unknown"), diagnostic_path="algebra.unknown"
+        )
+    assert error.value.code == "contract_runtime_authority_registry_incomplete"
+
+
 @pytest.mark.parametrize(
     "work_type",
     [
