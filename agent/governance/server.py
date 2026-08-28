@@ -3849,14 +3849,14 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
         "/api/health",
         max_bytes=_DEV_STABLE_PROXY_HEALTH_BYTES,
     )
-    expected_anchor = str(os.environ.get(_STABLE_ANCHOR_ENV) or "").strip().lower()
-    loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
+    expected_anchor = os.environ.get(_STABLE_ANCHOR_ENV) or ""
+    loaded = health.get("runtime_loaded_version")
     pid = health.get("pid")
     required_tuple = {
         "status": health.get("status"),
         "service": health.get("service"),
         "port": health.get("port"),
-        "runtime_loaded_version": loaded,
+        "runtime_loaded_version": health.get("runtime_loaded_version"),
         "runtime_stale": health.get("runtime_stale"),
         "pid": pid,
     }
@@ -3902,13 +3902,17 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
     )
     base_valid = bool(
         re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_anchor)
-        and health.get("status") == "ok"
-        and health.get("service") == "governance"
-        and health.get("port") == AC_STABLE_SERVICE_PORT
-        and health.get("runtime_stale") is False
-        and loaded == expected_anchor
-        and isinstance(pid, int)
-        and not isinstance(pid, bool)
+        and _dev_exact_scalar_fields(
+            health,
+            {
+                "status": "ok",
+                "service": "governance",
+                "port": AC_STABLE_SERVICE_PORT,
+                "runtime_loaded_version": expected_anchor,
+                "runtime_stale": False,
+            },
+        )
+        and type(pid) is int
         and pid > 0
     )
 
@@ -4033,6 +4037,7 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
         )
     return {
         "required_health_tuple": required_tuple,
+        "required_health_tuple_sha256": stable_sha256(required_tuple),
         "legacy_a258_health": legacy_a258,
         "loaded_runtime_identity_sha256": (
             stable_sha256(loaded_identity) if loaded_identity_present else ""
@@ -4068,7 +4073,7 @@ def _dev_stable_external_public_get_many(paths: Sequence[str]) -> list[dict[str,
         for path in paths
     ]
     after = _dev_stable_proxy_health_identity()
-    if after != before:
+    if stable_sha256(after) != stable_sha256(before):
         raise _dev_stable_proxy_failure(
             "ac_dev_stable_proxy_identity_drift",
             "stable identity changed across the bounded GET",
@@ -4219,7 +4224,7 @@ def _dev_external_validate_backlog_list(
     rows = stable.get("bugs")
     scope = stable.get("scope")
     generation = stable.get("generation")
-    authority_generation = str(stable.get("authority_generation") or "")
+    authority_generation = stable.get("authority_generation")
     expected_scope_schema = (
         "backlog.indexed_history_scope.v1"
         if backlog_id
@@ -4227,24 +4232,34 @@ def _dev_external_validate_backlog_list(
     )
     expected_pagination = "sqlite_indexed_keyset" if backlog_id else "hot_window"
     if not (
-        stable.get("view") == "compact"
-        and stable.get("limit") == _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS
-        and str(stable.get("q") or "") == backlog_id
-        and isinstance(rows, list)
+        _dev_exact_scalar_fields(
+            stable,
+            {
+                "view": "compact",
+                "limit": _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS,
+                "q": backlog_id,
+            },
+        )
+        and type(rows) is list
         and len(rows) <= _DEV_STABLE_PROXY_BACKLOG_MAX_ROWS
         and all(isinstance(row, Mapping) for row in rows)
-        and isinstance(scope, Mapping)
-        and scope.get("schema_version") == expected_scope_schema
-        and scope.get("project_id") == project_id
-        and scope.get("view") == "compact"
-        and str(scope.get("status") or "") == ""
-        and str(scope.get("priority") or "") == ""
-        and scope.get("public_safe") is True
-        and scope.get("bounded") is True
-        and scope.get("pagination") == expected_pagination
-        and isinstance(generation, int)
-        and not isinstance(generation, bool)
+        and type(scope) is dict
+        and _dev_exact_scalar_fields(
+            scope,
+            {
+                "schema_version": expected_scope_schema,
+                "project_id": project_id,
+                "view": "compact",
+                "status": "",
+                "priority": "",
+                "public_safe": True,
+                "bounded": True,
+                "pagination": expected_pagination,
+            },
+        )
+        and type(generation) is int
         and generation >= 1
+        and type(authority_generation) is str
         and re.fullmatch(r"sha256:[0-9a-f]{64}", authority_generation)
     ):
         raise _dev_stable_proxy_failure(
@@ -4474,13 +4489,19 @@ def _dev_external_graph_status_projection(
     stable = _dev_stable_external_public_get(
         f"/api/graph-governance/{quote(project_id, safe='')}/status"
     )
-    if stable.get("ok") is not True or str(stable.get("project_id") or "") != project_id:
+    if not (
+        stable.get("ok") is True
+        and type(stable.get("project_id")) is str
+        and stable.get("project_id") == project_id
+        and type(stable.get("active_snapshot_id")) is str
+        and type(stable.get("graph_snapshot_commit")) is str
+    ):
         raise _dev_stable_proxy_failure(
             "ac_dev_stable_proxy_schema_rejected",
             "stable graph status identity did not match the request",
         )
-    active_snapshot_id = str(stable.get("active_snapshot_id") or "")
-    active_commit = str(stable.get("graph_snapshot_commit") or "")
+    active_snapshot_id = stable["active_snapshot_id"]
+    active_commit = stable["graph_snapshot_commit"]
     if bool(active_snapshot_id) != bool(active_commit):
         raise _dev_stable_proxy_failure(
             "ac_dev_stable_proxy_schema_rejected",
@@ -4636,7 +4657,7 @@ def _handle_dev_external_read_only_discovery(
             },
         }
         stable_after = _dev_stable_proxy_health_identity()
-        if stable_after != stable_before:
+        if stable_sha256(stable_after) != stable_sha256(stable_before):
             raise _dev_stable_proxy_failure(
                 "ac_dev_stable_proxy_identity_drift",
                 "stable identity changed across the local Onboard redirect",

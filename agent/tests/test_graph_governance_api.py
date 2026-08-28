@@ -13474,6 +13474,41 @@ def test_ac_dev_stable_proxy_freezes_complete_extended_identity(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("runtime_loaded_version", " a25838f15f949ac434cf78e03f20760e82ff81f0"),
+        ("runtime_loaded_version", "A25838F15F949AC434CF78E03F20760E82FF81F0"),
+        ("port", 40000.0),
+        ("port", True),
+        ("port", "40000"),
+        ("pid", 61297.0),
+        ("pid", True),
+        ("pid", "61297"),
+        ("status", " ok"),
+        ("service", "Governance"),
+        ("runtime_stale", 0),
+    ],
+)
+def test_ac_dev_stable_proxy_rejects_untyped_or_normalized_core_health(
+    monkeypatch,
+    field,
+    value,
+):
+    anchor = server._DEV_LEGACY_STABLE_HEALTH_COMMIT
+    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", anchor)
+    malformed = _dev_stable_health_payload(anchor, pid=61297)
+    malformed[field] = value
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_json",
+        lambda *_args, **_kwargs: malformed,
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_stable_proxy_health_identity()
+    assert rejected.value.code == "ac_dev_stable_proxy_identity_rejected"
+
+
+@pytest.mark.parametrize(
     ("mode", "expected_code"),
     [
         ("redirect", "ac_dev_stable_proxy_redirect_rejected"),
@@ -13543,7 +13578,17 @@ def test_ac_dev_stable_proxy_bad_schema_private_and_transport_fail_closed(monkey
 
 @pytest.mark.parametrize(
     "defect",
-    ["scope_project", "generation_missing", "authority_missing"],
+    [
+        "scope_project",
+        "generation_missing",
+        "authority_missing",
+        "limit_float",
+        "q_missing",
+        "q_container",
+        "scope_status_missing",
+        "scope_priority_null",
+        "scope_priority_container",
+    ],
 )
 def test_ac_dev_stable_backlog_authority_rejects_cross_scope_and_missing_generation(
     defect,
@@ -13554,8 +13599,20 @@ def test_ac_dev_stable_backlog_authority_rejects_cross_scope_and_missing_generat
         payload["scope"]["project_id"] = "drift-gym"
     elif defect == "generation_missing":
         payload.pop("generation")
-    else:
+    elif defect == "authority_missing":
         payload.pop("authority_generation")
+    elif defect == "limit_float":
+        payload["limit"] = 250.0
+    elif defect == "q_missing":
+        payload.pop("q")
+    elif defect == "q_container":
+        payload["q"] = []
+    elif defect == "scope_status_missing":
+        payload["scope"].pop("status")
+    elif defect == "scope_priority_null":
+        payload["scope"]["priority"] = None
+    else:
+        payload["scope"]["priority"] = {}
     with pytest.raises(GovernanceError) as rejected:
         server._dev_external_validate_backlog_list("content-sys", payload)
     assert rejected.value.code == "ac_dev_stable_proxy_backlog_authority_rejected"
@@ -13702,6 +13759,30 @@ def test_ac_dev_stable_item_projects_only_after_equal_raw_long_title(monkeypatch
     )
     result = server._dev_external_backlog_item_projection(project_id, backlog_id)
     assert result["bug"]["title"] == "\u957f" * 240 + "..."
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["project_id", "active_snapshot_id", "graph_snapshot_commit"],
+)
+@pytest.mark.parametrize("value", [7, True, None, [], {}])
+def test_ac_dev_graph_status_rejects_untyped_raw_identity(
+    monkeypatch,
+    field,
+    value,
+):
+    project_id = "content-sys"
+    path = f"/api/graph-governance/{project_id}/status"
+    payload = copy.deepcopy(_dev_external_stable_payload(path))
+    payload[field] = value
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get",
+        lambda _path: payload,
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_graph_status_projection(project_id)
+    assert rejected.value.code == "ac_dev_stable_proxy_schema_rejected"
 
 
 def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(

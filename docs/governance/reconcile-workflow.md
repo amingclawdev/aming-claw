@@ -823,12 +823,17 @@ AC repair work uses two independent runtime planes:
   first probe and must be byte-equivalent on the second. If that legacy health
   exposes a loaded-runtime or plane-identity extension, the complete known
   schema is required, unknown or partial keys fail closed, and the whole
-  identity is frozen across the read. A successor must provide valid
+  identity is frozen across the read. Core health values are exact raw JSON
+  types and values (including lowercase loaded commit, integer port/PID, and
+  boolean stale state), and pre/post comparison uses their canonical digest.
+  A successor must provide valid
   stable-plane and database identities. Backlog reads also bind
   exact project, generation, and authority generation; item reads use one
   health window around targeted-list-before, item, and targeted-list-after and
   require one exact, explicitly public compact row in the returned bounded
-  page. A target outside that page fails closed rather than falling back to a
+  page. Limit, query, scope filters, generation, and authority retain exact raw
+  types; graph project/snapshot/commit identities must also be raw strings.
+  A target outside that page fails closed rather than falling back to a
   default-public classification. Before any whitespace normalization or title
   truncation, the two list rows and item must have type-correct, exactly equal
   raw output-source scalars; only then is the bounded display projection built.
