@@ -104496,265 +104496,335 @@ class _ContractRuntimeCanonicalSourceRecord(NamedTuple):
     disposition: str
     container_type: str
     entry_schema_id: str
-    projection_policy: str
     field_partitions: tuple[tuple[str, str], ...]
 
 
-_CONTRACT_RUNTIME_CANONICAL_DISPOSITIONS = frozenset(
-    {"authority_leaf", "recursive_container", "audited_non_authority"}
-)
-_CONTRACT_RUNTIME_CANONICAL_CONTAINER_TYPES = frozenset(
-    {"frozenset", "list", "set", "tuple"}
-)
-_CONTRACT_RUNTIME_CANONICAL_ENTRY_SCHEMAS = frozenset(
-    {"scalar_string.v1", "nonempty_string_pair_set.v1"}
-)
-_CONTRACT_RUNTIME_CANONICAL_PROJECTION_POLICIES = frozenset(
-    {
-        "all_audited_non_authority.v1",
-        "all_recursive_container.v1",
-        "explicit_partition.v1",
-        "typed_authority_classifier.v1",
-    }
-)
-_CONTRACT_RUNTIME_CANONICAL_FIELD_DISPOSITIONS = frozenset(
-    {"authority_leaf", "recursive_container", "audited_non_authority"}
-)
-
-
-# Single closed authority source registry.  Every record binds its source name,
-# exact runtime container, entry schema, source disposition, and projection
-# policy in one immutable object.  No parallel disposition/shape/partition map
-# participates in discovery or classification.
+# The sole static authority input. Each live scalar field and its disposition is
+# frozen here; no classifier, alias set, denylist, or mutable enum participates.
 _CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS = (
-    *(
-        _ContractRuntimeCanonicalSourceRecord(
-            "canonical_source_record.v1",
-            source_name,
-            "authority_leaf",
-            container_type,
-            "scalar_string.v1",
-            "typed_authority_classifier.v1",
-            (),
-        )
-        for source_name, container_type in (
-            ("_CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS", "tuple"),
-            ("_CONTRACT_RUNTIME_EXECUTION_ID_FIELDS", "tuple"),
-            ("_CONTRACT_RUNTIME_LINE_WRITE_PROTOCOL_FIELDS", "tuple"),
-            ("_CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS", "tuple"),
-            ("_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS", "set"),
-            ("_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS", "set"),
-            ("_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS", "set"),
-            ("_DESKTOP_EXECUTION_TICKET_RESOLVE_FIELDS", "frozenset"),
-            ("_FINISH_GATE_PARENT_LINEAGE_REQUIRED_FIELDS", "tuple"),
-            ("_GUIDE_RAW_AUTH_BODY_FIELDS", "set"),
-            ("_INTEGRATION_EPOCH_RELEASE_RAW_CREDENTIAL_FIELDS", "tuple"),
-            ("_INTEGRATION_EPOCH_RELEASE_ROUTE_PROOF_FIELDS", "tuple"),
-            ("_MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS", "tuple"),
-            ("_MF_PARALLEL_LANE_INTENT_FIELDS", "frozenset"),
-            ("_MF_SUB_HOST_BRIDGE_REQUIRED_FIELDS", "tuple"),
-            ("_OBSERVER_HOTFIX_ATTEMPT_ALLOWED_FIELDS", "frozenset"),
-            ("_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS", "tuple"),
-            ("_PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_KEYS", "set"),
-            ("_QA_REVIEW_AUTHORITY_NAMES", "set"),
-            ("_ROUTE_ACTION_SCOPE_LINEAGE_KEYS", "tuple"),
-            ("_ROUTE_GATE_PAYLOAD_KEYS", "tuple"),
-            ("_ROUTE_REGISTRY_IDENTITY_FIELDS", "tuple"),
-            ("_RUNTIME_CONTEXT_GRAPH_TRACE_ID_KEYS", "set"),
-            ("_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS", "tuple"),
-            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_BASELINE_KEYS", "frozenset"),
-            ("_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS", "tuple"),
-            ("_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS", "tuple"),
-            ("_RUNTIME_CONTEXT_SERVER_IDENTITY_FIELDS", "tuple"),
-            ("_TIMELINE_BOUNDED_DISPATCH_RUNTIME_LINEAGE_FIELDS", "tuple"),
-            ("_TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS", "tuple"),
-            ("_TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS", "frozenset"),
-        )
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_CLOSE_AUTHORITY_IDENTITY_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('prompt_contract_hash', 'authority_leaf'), ('prompt_contract_id', 'authority_leaf'), ('route_context_hash', 'authority_leaf'), ('route_id', 'authority_leaf'), ('visible_injection_manifest_hash', 'authority_leaf')),
     ),
     _ContractRuntimeCanonicalSourceRecord(
-        "canonical_source_record.v1",
-        "_CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS",
-        "authority_leaf",
-        "set",
-        "scalar_string.v1",
-        "explicit_partition.v1",
-        (
-            ("actor_role", "audited_non_authority"),
-            ("backlog_id", "audited_non_authority"),
-            ("contract_execution_id", "authority_leaf"),
-            ("definition_hash", "authority_leaf"),
-            ("evidence_kind", "audited_non_authority"),
-            ("execution_state_revision", "authority_leaf"),
-            ("instruction_bundle_hash", "authority_leaf"),
-            ("line_id", "authority_leaf"),
-            ("line_instance_id", "authority_leaf"),
-            ("project_id", "audited_non_authority"),
-            ("runtime_guide_hash", "authority_leaf"),
-            ("stage_id", "authority_leaf"),
-        ),
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_EXECUTION_ID_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('active_contract_execution_id', 'authority_leaf'), ('contract_execution_id', 'authority_leaf'), ('successor_contract_execution_id', 'authority_leaf')),
     ),
     _ContractRuntimeCanonicalSourceRecord(
-        "canonical_source_record.v1",
-        "_ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS",
-        "authority_leaf",
-        "frozenset",
-        "scalar_string.v1",
-        "explicit_partition.v1",
-        tuple(
-            (field_name, "audited_non_authority")
-            for field_name in ("harness_type", "owned_files", "project_id", "role", "worker_role")
-        )
-        + tuple(
-            (field_name, "authority_leaf")
-            for field_name in (
-                "actual_cwd", "actual_git_root", "actual_host_worker_id", "agent_id",
-                "base_commit", "branch", "branch_head", "branch_ref",
-                "contract_execution_id", "fence_token", "filer_principal", "head_commit",
-                "host_session_id", "host_startup_id", "launch_text_hash", "merge_queue_id",
-                "now_iso", "observer_command_id", "parent_task_id", "prompt_contract_hash",
-                "prompt_contract_id", "read_receipt_event_id", "read_receipt_hash",
-                "route_context_hash", "route_id", "route_token_ref", "runtime_context_id",
-                "session_token", "session_token_ref", "session_token_surrogate", "startup_source",
-                "target_head_commit", "target_project_root", "task_id",
-                "visible_injection_manifest_hash", "worker_id", "worker_session_id",
-                "worker_slot_id", "worker_transcript_path", "worker_transcript_ref",
-            )
-        ),
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_LINE_WRITE_PROTOCOL_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('base_commit', 'authority_leaf'), ('execution_state_revision', 'authority_leaf'), ('lane_id', 'authority_leaf'), ('merge_queue_id', 'authority_leaf'), ('observer_command_id', 'authority_leaf'), ('parent_task_id', 'authority_leaf'), ('runtime_context_id', 'authority_leaf'), ('runtime_guide_hash', 'authority_leaf'), ('target_head_commit', 'authority_leaf'), ('task_id', 'authority_leaf'), ('worker_id', 'authority_leaf'), ('worker_role', 'audited_non_authority'), ('worker_slot_id', 'authority_leaf')),
     ),
     _ContractRuntimeCanonicalSourceRecord(
-        "canonical_source_record.v1",
-        "_PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS",
-        "authority_leaf",
-        "tuple",
-        "scalar_string.v1",
-        "explicit_partition.v1",
-        tuple(
-            (field_name, "audited_non_authority")
-            for field_name in ("acceptance_criteria", "backlog_id", "owned_files", "project_id", "target_files")
-        )
-        + tuple(
-            (field_name, "authority_leaf")
-            for field_name in (
-                "allocation_precheck", "base_commit", "branch_ref", "contract_execution_id",
-                "merge_queue_id", "route_identity", "target_head_commit", "target_project_root",
-                "task_id", "worker_id", "worker_slot_id", "workspace_root", "worktree_path",
-                "worktree_root",
-            )
-        ),
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_OBSERVER_MERGE_LANE_IDENTITY_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('lane_id', 'authority_leaf'), ('line_instance_id', 'authority_leaf'), ('parent_task_id', 'authority_leaf'), ('runtime_context_id', 'authority_leaf'), ('task_id', 'authority_leaf'), ('worker_id', 'authority_leaf'), ('worker_role', 'audited_non_authority'), ('worker_slot_id', 'authority_leaf')),
     ),
     _ContractRuntimeCanonicalSourceRecord(
-        "canonical_source_record.v1",
-        "_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS",
-        "authority_leaf",
-        "set",
-        "scalar_string.v1",
-        "explicit_partition.v1",
-        (
-            ("base_commit_sha", "authority_leaf"),
-            ("base_failure_identities", "audited_non_authority"),
-            ("base_reproduction", "recursive_container"),
-            ("candidate_commit_sha", "authority_leaf"),
-            ("candidate_failure_identities", "audited_non_authority"),
-            ("candidate_new_failures", "audited_non_authority"),
-            ("candidate_specific_issues", "audited_non_authority"),
-            ("candidate_suite_counts", "recursive_container"),
-            ("no_pass_claim", "audited_non_authority"),
-            ("overall_release_pass_claimed", "audited_non_authority"),
-            ("refs", "audited_non_authority"),
-            ("schema_version", "audited_non_authority"),
-        ),
-    ),
-    *(
-        _ContractRuntimeCanonicalSourceRecord(
-            "canonical_source_record.v1", source_name, "authority_leaf", "frozenset",
-            "scalar_string.v1", "explicit_partition.v1", field_partitions,
-        )
-        for source_name, field_partitions in (
-            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS", tuple(
-                (field_name, "audited_non_authority") for field_name in (
-                    "invalid_reason", "lease_expires_at", "renewal_default_ttl_seconds",
-                    "renewal_endpoint", "renewal_max_ttl_seconds", "renewal_supported",
-                    "schema_version", "status",
-                )
-            ) + tuple((field_name, "authority_leaf") for field_name in (
-                "authorization_valid", "canonical_no_lease", "clock_valid", "expired",
-                "expiry_valid", "has_lease", "lease_id", "lease_record_valid",
-                "lease_remaining_ttl_seconds", "now", "raw_session_token_exposed",
-                "raw_session_token_persisted", "session_token_ref",
-                "session_token_ref_available",
-            ))),
-            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS", tuple(
-                (field_name, "audited_non_authority") for field_name in (
-                    "applicable", "caller_claims_trusted", "eligible", "errors",
-                    "identity_mismatches", "mode", "schema_version", "server_derived",
-                )
-            ) + (("last_recovery_action", "authority_leaf"), ("replacement_generation", "authority_leaf"))),
-            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS", tuple(
-                (field_name, "audited_non_authority") for field_name in (
-                    "applicable", "caller_claims_trusted", "eligible", "errors",
-                    "identity_mismatches", "mode", "schema_version", "server_derived",
-                )
-            ) + tuple((field_name, "authority_leaf") for field_name in (
-                "actual_worker_write_baseline", "current_session_token_ref",
-                "expected_worker_write_baseline", "last_recovery_action",
-                "replacement_generation", "source_event_ref",
-            ))),
-        )
-    ),
-    *(
-        _ContractRuntimeCanonicalSourceRecord(
-            "canonical_source_record.v1", source_name, "recursive_container", container_type,
-            "scalar_string.v1", "all_recursive_container.v1", (),
-        )
-        for source_name, container_type in (
-            ("_CONTRACT_RUNTIME_CONTAINER_KEYS", "tuple"),
-            ("_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS", "set"),
-            ("_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_CONTAINERS", "tuple"),
-            ("_QA_REVIEW_AUTHORITY_CONTAINERS", "set"),
-            ("_SERVER_PROJECTED_TIMELINE_KEYS", "frozenset"),
-        )
-    ),
-    *(
-        _ContractRuntimeCanonicalSourceRecord(
-            "canonical_source_record.v1", source_name, "audited_non_authority", container_type,
-            "scalar_string.v1", "all_audited_non_authority.v1", (),
-        )
-        for source_name, container_type in (
-            ("_BACKLOG_TRIAGE_SUCCESSOR_JSON_FIELDS", "tuple"),
-            ("_BACKLOG_TRIAGE_SUCCESSOR_SCALAR_FIELDS", "tuple"),
-            ("_CONTRACT_CHAIN_RUNTIME_FRESHNESS_COMPARE_KEYS", "tuple"),
-            ("_CONTRACT_CHAIN_RUNTIME_FRESHNESS_CONTEXT_KEYS", "tuple"),
-            ("_CONTRACT_RUNTIME_QA_FAILURE_COUNT_FIELDS", "frozenset"),
-            ("_CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS", "frozenset"),
-            ("_CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS", "frozenset"),
-            ("_CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS", "tuple"),
-            ("_LEGACY_PRIMARY_ROUTE_CLAIM_KEYS", "tuple"),
-            ("_QA_EXTERNAL_NO_PASS_BASE_REPRODUCTION_REQUIRED_KEYS", "set"),
-            ("_QA_EXTERNAL_NO_PASS_CANDIDATE_COUNTS_REQUIRED_KEYS", "set"),
-            ("_RESUMED_SUCCESSOR_STATUS_FIELDS", "frozenset"),
-            ("_RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_COUNT_FIELDS", "tuple"),
-            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_PAYLOAD_KEYS", "frozenset"),
-            ("_RUNTIME_CONTEXT_LEGACY_REJOIN_PRE_LINEAGE_PAYLOAD_KEYS", "frozenset"),
-            ("_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_ACTIONABLE_KEYS", "tuple"),
-            ("_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_CONTRACT_STATE_KEYS", "tuple"),
-            ("_SEMANTIC_REVISION_FORBIDDEN_KEYS", "set"),
-            ("_TIMELINE_TOP_LEVEL_ROLE_FIELDS", "frozenset"),
-        )
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_QA_AUTHORITY_FIELDS', 'authority_leaf',
+        'set', 'scalar_string.v1',
+        (('active_snapshot_id', 'authority_leaf'), ('authority_hash', 'authority_leaf'), ('backlog_id', 'audited_non_authority'), ('base_commit', 'authority_leaf'), ('base_commit_sha', 'authority_leaf'), ('base_snapshot_id', 'authority_leaf'), ('candidate_changed_files', 'authority_leaf'), ('candidate_commit', 'authority_leaf'), ('candidate_commit_sha', 'authority_leaf'), ('candidate_diff_hash', 'authority_leaf'), ('candidate_overlay', 'authority_leaf'), ('candidate_overlay_hash', 'authority_leaf'), ('canonical_base_snapshot_id', 'authority_leaf'), ('canonical_head_commit', 'authority_leaf'), ('canonical_project_identity_hash', 'authority_leaf'), ('canonical_project_root', 'authority_leaf'), ('changed_files', 'authority_leaf'), ('changed_files_source', 'authority_leaf'), ('comparison_authority_required', 'audited_non_authority'), ('comparison_base_commit', 'authority_leaf'), ('comparison_base_commit_lineage_source', 'authority_leaf'), ('comparison_base_commit_sha', 'authority_leaf'), ('comparison_base_commit_source', 'authority_leaf'), ('contract_execution_id', 'authority_leaf'), ('db_verified', 'audited_non_authority'), ('diff_hash', 'authority_leaf'), ('graph_basis', 'authority_leaf'), ('graph_basis_decision', 'authority_leaf'), ('graph_basis_decision_hash', 'authority_leaf'), ('graph_query_trace_ids', 'authority_leaf'), ('graph_trace_ids', 'authority_leaf'), ('identity_mismatches', 'authority_leaf'), ('missing_trace_ids', 'authority_leaf'), ('parent_task_id', 'authority_leaf'), ('post_merge_provenance', 'authority_leaf'), ('producer', 'audited_non_authority'), ('project_id', 'audited_non_authority'), ('qa_principal', 'authority_leaf'), ('qa_scope_binding_ref', 'authority_leaf'), ('qa_session_id', 'authority_leaf'), ('query_purpose', 'audited_non_authority'), ('query_root', 'authority_leaf'), ('query_root_clean', 'audited_non_authority'), ('query_root_head_commit', 'authority_leaf'), ('query_root_identity_hash', 'authority_leaf'), ('query_root_status_hash', 'authority_leaf'), ('query_root_tree_sha', 'authority_leaf'), ('query_root_untracked_files_checked', 'audited_non_authority'), ('query_source', 'audited_non_authority'), ('repository_identity_hash', 'authority_leaf'), ('requested_trace_ids', 'authority_leaf'), ('root_identity', 'authority_leaf'), ('root_identity_hash', 'authority_leaf'), ('runtime_context_id', 'authority_leaf'), ('snapshot_commit', 'authority_leaf'), ('snapshot_commit_sha', 'authority_leaf'), ('snapshot_id', 'authority_leaf'), ('source', 'audited_non_authority'), ('source_details', 'audited_non_authority'), ('target_project_root', 'authority_leaf'), ('task_id', 'authority_leaf'), ('trace_id', 'authority_leaf'), ('trace_ids', 'authority_leaf'), ('trace_status', 'audited_non_authority'), ('verified_trace_ids', 'authority_leaf')),
     ),
     _ContractRuntimeCanonicalSourceRecord(
-        "canonical_source_record.v1", "_CURRENT_FULL_BUILD_KEYS",
-        "audited_non_authority", "set", "nonempty_string_pair_set.v1",
-        "all_audited_non_authority.v1", (),
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_QA_PROVENANCE_SECURITY_FIELDS', 'authority_leaf',
+        'set', 'scalar_string.v1',
+        (('actor_session_principal', 'authority_leaf'), ('authenticated_qa_binding', 'authority_leaf'), ('authorization_source', 'authority_leaf'), ('completion_status_gate', 'authority_leaf'), ('evidence_owner_actor', 'audited_non_authority'), ('evidence_owner_role', 'audited_non_authority'), ('evidence_owner_session', 'authority_leaf'), ('evidence_owner_session_ref', 'authority_leaf'), ('materialized_from', 'authority_leaf'), ('materialized_from_report', 'authority_leaf'), ('observer_impersonation', 'audited_non_authority'), ('parent_materialization_authorized', 'audited_non_authority'), ('qa_session_token_ref', 'authority_leaf'), ('submitter_principal', 'authority_leaf'), ('submitter_session', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_RECONCILE_AUTHORITY_FIELDS', 'authority_leaf',
+        'set', 'scalar_string.v1',
+        (('active_graph_commit', 'authority_leaf'), ('active_snapshot_commit', 'authority_leaf'), ('active_snapshot_id', 'authority_leaf'), ('active_snapshot_verified', 'audited_non_authority'), ('authority_hash', 'authority_leaf'), ('backlog_id', 'audited_non_authority'), ('canonical_head_commit', 'authority_leaf'), ('canonical_head_verified', 'audited_non_authority'), ('contract_execution_id', 'authority_leaf'), ('contract_runtime_dispatch_source_ref', 'authority_leaf'), ('current_full_reconcile', 'authority_leaf'), ('current_full_reconcile_marker', 'authority_leaf'), ('current_full_reconcile_provenance', 'authority_leaf'), ('db_verified', 'audited_non_authority'), ('dispatch_lineage_verified', 'audited_non_authority'), ('durable_order_verified', 'audited_non_authority'), ('graph_reconciled', 'authority_leaf'), ('identity_mismatches', 'authority_leaf'), ('live_verified', 'audited_non_authority'), ('merge_event_created_at', 'audited_non_authority'), ('merge_event_id', 'authority_leaf'), ('merge_projection_verified', 'audited_non_authority'), ('merge_queue_id', 'authority_leaf'), ('merge_queue_scope_verified', 'audited_non_authority'), ('merge_source_ref', 'authority_leaf'), ('merged_commit_sha', 'authority_leaf'), ('parent_task_id', 'authority_leaf'), ('parent_task_scope_verified', 'audited_non_authority'), ('project_id', 'audited_non_authority'), ('provenance_scope_verified', 'audited_non_authority'), ('provenance_verified', 'audited_non_authority'), ('qa_event_created_at', 'audited_non_authority'), ('qa_event_id', 'authority_leaf'), ('qa_source_ref', 'authority_leaf'), ('reconcile_event_created_at', 'audited_non_authority'), ('reconcile_event_id', 'authority_leaf'), ('reconcile_event_recorded', 'authority_leaf'), ('reconcile_runtime_context_id', 'authority_leaf'), ('reconcile_source_ref', 'authority_leaf'), ('reconcile_task_id', 'authority_leaf'), ('reconciled_commit_sha', 'authority_leaf'), ('record_verified', 'audited_non_authority'), ('runtime_context_id', 'authority_leaf'), ('runtime_context_scope_verified', 'audited_non_authority'), ('server_derived', 'audited_non_authority'), ('source', 'audited_non_authority'), ('strategy', 'audited_non_authority'), ('target_project_root', 'authority_leaf'), ('task_id', 'authority_leaf'), ('task_scope_verified', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_DESKTOP_EXECUTION_TICKET_RESOLVE_FIELDS', 'authority_leaf',
+        'frozenset', 'scalar_string.v1',
+        (('backlog_id', 'audited_non_authority'), ('contract_execution_id', 'authority_leaf'), ('expected_dispatch_identity_hash', 'authority_leaf'), ('expected_execution_state_hash', 'authority_leaf'), ('expected_execution_state_revision', 'authority_leaf'), ('observer_command_id', 'authority_leaf'), ('principal_id', 'authority_leaf'), ('profile_id', 'authority_leaf'), ('project_id', 'audited_non_authority'), ('role', 'audited_non_authority'), ('runtime_context_id', 'authority_leaf'), ('task_id', 'authority_leaf'), ('worker_id', 'authority_leaf'), ('worker_slot_id', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_FINISH_GATE_PARENT_LINEAGE_REQUIRED_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('allowed_actions', 'authority_leaf'), ('blocked_actions', 'authority_leaf'), ('prompt_contract_id', 'authority_leaf'), ('required_evidence', 'authority_leaf'), ('required_lanes', 'authority_leaf'), ('route_context_hash', 'authority_leaf'), ('route_id', 'authority_leaf'), ('selected_backlog_id', 'authority_leaf'), ('selected_project', 'authority_leaf'), ('visible_injection_manifest_hash', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_GUIDE_RAW_AUTH_BODY_FIELDS', 'authority_leaf',
+        'set', 'scalar_string.v1',
+        (('fence_token', 'authority_leaf'), ('qa_session_token', 'authority_leaf'), ('route_token', 'authority_leaf'), ('session_token', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_INTEGRATION_EPOCH_RELEASE_RAW_CREDENTIAL_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('gov_token', 'authority_leaf'), ('observer_session_token', 'authority_leaf'), ('route_token', 'authority_leaf'), ('route_token_waiver', 'authority_leaf'), ('route_waiver', 'authority_leaf'), ('session_token', 'authority_leaf'), ('x_gov_token', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_INTEGRATION_EPOCH_RELEASE_ROUTE_PROOF_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('backlog_id', 'audited_non_authority'), ('observer_route_token_ref', 'authority_leaf'), ('observer_session_id', 'authority_leaf'), ('route_token_ref', 'authority_leaf'), ('task_id', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_MF_BATCH_PARALLEL_CALLER_AUTHORITY_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('contract_chain_id', 'authority_leaf'), ('legacy_onboard_contract_waived', 'authority_leaf'), ('onboard_contract_facade', 'authority_leaf'), ('onboard_service', 'authority_leaf'), ('onboard_service_parent', 'authority_leaf'), ('onboard_service_waiver', 'authority_leaf'), ('parent_contract_execution_id', 'authority_leaf'), ('root_contract_execution_id', 'authority_leaf'), ('waive_onboard_contract', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_MF_PARALLEL_LANE_INTENT_FIELDS', 'authority_leaf',
+        'frozenset', 'scalar_string.v1',
+        (('owned_files', 'audited_non_authority'), ('task_id', 'authority_leaf'), ('worker_id', 'authority_leaf'), ('worker_slot_id', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_MF_SUB_HOST_BRIDGE_REQUIRED_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('fence_token', 'authority_leaf'), ('parent_task_id', 'authority_leaf'), ('runtime_context_id', 'authority_leaf'), ('session_token_ref', 'authority_leaf'), ('target_project_root', 'authority_leaf'), ('task_id', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_OBSERVER_HOTFIX_ATTEMPT_ALLOWED_FIELDS', 'authority_leaf',
+        'frozenset', 'scalar_string.v1',
+        (('actor', 'audited_non_authority'), ('backlog_id', 'audited_non_authority'), ('parent_contract_execution_id', 'authority_leaf'), ('predecessor_contract_execution_id', 'authority_leaf'), ('predecessor_execution_state_hash', 'authority_leaf'), ('predecessor_execution_state_revision', 'authority_leaf'), ('project_id', 'audited_non_authority'), ('reason', 'audited_non_authority'), ('route_token_ref', 'authority_leaf'), ('successor_attempt_id', 'authority_leaf'), ('task_id', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('prompt_contract_hash', 'authority_leaf'), ('prompt_contract_id', 'authority_leaf'), ('route_context_hash', 'authority_leaf'), ('route_id', 'authority_leaf'), ('route_token_ref', 'authority_leaf'), ('selected_backlog_id', 'authority_leaf'), ('selected_project', 'authority_leaf'), ('visible_injection_manifest_hash', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_PARENTLESS_DIRECT_MAIN_GRAPH_TRACE_KEYS', 'authority_leaf',
+        'set', 'scalar_string.v1',
+        (('graph_query_trace_id', 'authority_leaf'), ('graph_query_trace_ids', 'authority_leaf'), ('graph_trace_id', 'authority_leaf'), ('graph_trace_ids', 'authority_leaf'), ('verified_trace_ids', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_QA_REVIEW_AUTHORITY_NAMES', 'authority_leaf',
+        'set', 'scalar_string.v1',
+        (('active_snapshot_id', 'authority_leaf'), ('base_commit', 'authority_leaf'), ('base_commit_sha', 'authority_leaf'), ('base_snapshot_id', 'authority_leaf'), ('candidate_changed_files', 'authority_leaf'), ('candidate_commit', 'authority_leaf'), ('candidate_commit_sha', 'authority_leaf'), ('candidate_diff_hash', 'authority_leaf'), ('candidate_overlay', 'authority_leaf'), ('candidate_overlay_hash', 'authority_leaf'), ('canonical_base_snapshot_id', 'authority_leaf'), ('canonical_head_commit', 'authority_leaf'), ('canonical_project_identity_hash', 'authority_leaf'), ('canonical_project_root', 'authority_leaf'), ('changed_files', 'authority_leaf'), ('changed_files_source', 'authority_leaf'), ('comparison_base_commit', 'authority_leaf'), ('comparison_base_commit_lineage_source', 'authority_leaf'), ('comparison_base_commit_sha', 'authority_leaf'), ('comparison_base_commit_source', 'authority_leaf'), ('diff_hash', 'authority_leaf'), ('graph_basis', 'authority_leaf'), ('graph_basis_decision', 'authority_leaf'), ('graph_basis_decision_hash', 'authority_leaf'), ('query_root', 'authority_leaf'), ('query_root_clean', 'audited_non_authority'), ('query_root_head_commit', 'authority_leaf'), ('query_root_identity_hash', 'authority_leaf'), ('query_root_status_hash', 'authority_leaf'), ('query_root_tree_sha', 'authority_leaf'), ('query_root_untracked_files_checked', 'audited_non_authority'), ('repository_identity_hash', 'authority_leaf'), ('root_identity', 'authority_leaf'), ('root_identity_hash', 'authority_leaf'), ('snapshot_commit', 'authority_leaf'), ('snapshot_commit_sha', 'authority_leaf'), ('snapshot_id', 'authority_leaf'), ('target_project_root', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_ROUTE_ACTION_SCOPE_LINEAGE_KEYS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('action_scope_route_lineage', 'authority_leaf'), ('route_action_scope_lineage', 'authority_leaf'), ('route_token_action_scope_lineage', 'authority_leaf'), ('server_route_lineage', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_ROUTE_GATE_PAYLOAD_KEYS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('protected_route_waiver', 'authority_leaf'), ('route_token', 'authority_leaf'), ('route_token_ref', 'authority_leaf'), ('route_token_waiver', 'authority_leaf'), ('route_waiver', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_ROUTE_REGISTRY_IDENTITY_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('prompt_contract_hash', 'authority_leaf'), ('prompt_contract_id', 'authority_leaf'), ('route_context_hash', 'authority_leaf'), ('route_id', 'authority_leaf'), ('route_token_ref', 'authority_leaf'), ('visible_injection_manifest_hash', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_GRAPH_TRACE_ID_KEYS', 'authority_leaf',
+        'set', 'scalar_string.v1',
+        (('graph_query_trace_id', 'authority_leaf'), ('graph_query_trace_ids', 'authority_leaf'), ('graph_trace_id', 'authority_leaf'), ('graph_trace_ids', 'authority_leaf'), ('trace_ids', 'authority_leaf'), ('verified_trace_ids', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_IMPLEMENTATION_WRITER_BINDING_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('backlog_id', 'audited_non_authority'), ('definition_hash', 'authority_leaf'), ('evidence_kind', 'authority_leaf'), ('execution_state_revision', 'authority_leaf'), ('instruction_bundle_hash', 'authority_leaf'), ('line_id', 'authority_leaf'), ('line_instance_id', 'authority_leaf'), ('runtime_guide_hash', 'authority_leaf'), ('stage_id', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_LEGACY_REJOIN_BASELINE_KEYS', 'authority_leaf',
+        'frozenset', 'scalar_string.v1',
+        (('contract_execution_id', 'authority_leaf'), ('contract_runtime_completed_line_count', 'authority_leaf'), ('contract_runtime_completed_lines_hash', 'authority_leaf'), ('runtime_context_id', 'authority_leaf'), ('schema_version', 'audited_non_authority'), ('timeline_worker_write_count', 'authority_leaf'), ('timeline_worker_write_hash', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_REJOIN_CHECKPOINT_BASELINE_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('contract_execution_id', 'authority_leaf'), ('contract_runtime_completed_line_count', 'authority_leaf'), ('contract_runtime_completed_lines_hash', 'authority_leaf'), ('runtime_context_id', 'authority_leaf'), ('timeline_worker_write_count', 'authority_leaf'), ('timeline_worker_write_hash', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_ROUTE_IDENTITY_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('prompt_contract_hash', 'authority_leaf'), ('prompt_contract_id', 'authority_leaf'), ('route_context_hash', 'authority_leaf'), ('route_id', 'authority_leaf'), ('route_token_ref', 'authority_leaf'), ('visible_injection_manifest_hash', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_SERVER_IDENTITY_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('accepted', 'audited_non_authority'), ('action', 'audited_non_authority'), ('actionable', 'audited_non_authority'), ('agent_id', 'authority_leaf'), ('authority_decision_source', 'authority_leaf'), ('base_commit', 'authority_leaf'), ('branch_ref', 'authority_leaf'), ('canonical', 'audited_non_authority'), ('complete', 'audited_non_authority'), ('contract_execution_id', 'authority_leaf'), ('contract_revision_id', 'authority_leaf'), ('error', 'audited_non_authority'), ('execution_state_revision', 'authority_leaf'), ('generation', 'authority_leaf'), ('governance_project_id', 'authority_leaf'), ('merge_queue_id', 'authority_leaf'), ('message', 'audited_non_authority'), ('next_legal_action', 'authority_leaf'), ('ok', 'audited_non_authority'), ('parent_task_id', 'authority_leaf'), ('passed', 'audited_non_authority'), ('project_id', 'audited_non_authority'), ('project_root', 'authority_leaf'), ('projection_hash', 'authority_leaf'), ('projection_watermark', 'authority_leaf'), ('prompt_contract_hash', 'authority_leaf'), ('prompt_contract_id', 'authority_leaf'), ('reason', 'audited_non_authority'), ('repo_root', 'authority_leaf'), ('route_context_hash', 'authority_leaf'), ('route_id', 'authority_leaf'), ('route_token_ref', 'authority_leaf'), ('runtime_context_id', 'authority_leaf'), ('schema_version', 'audited_non_authority'), ('session_token_ref', 'authority_leaf'), ('snapshot_commit', 'authority_leaf'), ('snapshot_id', 'authority_leaf'), ('source_of_authority', 'authority_leaf'), ('status', 'audited_non_authority'), ('target_head_commit', 'authority_leaf'), ('target_project_id', 'authority_leaf'), ('target_project_root', 'authority_leaf'), ('task_id', 'authority_leaf'), ('terminal', 'audited_non_authority'), ('trace_id', 'authority_leaf'), ('visible_injection_manifest_hash', 'authority_leaf'), ('worker_id', 'authority_leaf'), ('worker_slot_id', 'authority_leaf'), ('worktree_path', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_TIMELINE_BOUNDED_DISPATCH_RUNTIME_LINEAGE_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('fence_token', 'authority_leaf'), ('parent_task_id', 'authority_leaf'), ('runtime_context_id', 'authority_leaf'), ('task_id', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_TIMELINE_BOUNDED_DISPATCH_RUNTIME_REQUIRED_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('base_commit', 'authority_leaf'), ('branch', 'authority_leaf'), ('merge_queue_id', 'authority_leaf'), ('prompt_contract_hash', 'authority_leaf'), ('route_id', 'authority_leaf'), ('target_head_commit', 'authority_leaf'), ('visible_injection_manifest_hash', 'authority_leaf'), ('worktree_path', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_TIMELINE_GATE_MATERIALIZED_QA_PRIVATE_EVENT_KEYS', 'authority_leaf',
+        'frozenset', 'scalar_string.v1',
+        (('artifact_refs_json', 'authority_leaf'), ('authorization_source', 'authority_leaf'), ('child_route_lineage', 'authority_leaf'), ('evidence_owner_actor', 'audited_non_authority'), ('evidence_owner_role', 'audited_non_authority'), ('evidence_owner_session', 'authority_leaf'), ('evidence_refs', 'authority_leaf'), ('graph_query_trace_ids', 'authority_leaf'), ('graph_trace_ids', 'authority_leaf'), ('materialized_from', 'authority_leaf'), ('materialized_from_report', 'authority_leaf'), ('observer_impersonation', 'audited_non_authority'), ('parent_materialization_authorized', 'audited_non_authority'), ('parent_route_lineage', 'authority_leaf'), ('payload_json', 'authority_leaf'), ('qa_evidence_provenance', 'authority_leaf'), ('qa_report_ref', 'authority_leaf'), ('qa_scope_binding_ref', 'authority_leaf'), ('qa_session_id', 'authority_leaf'), ('route_action_scope_lineage', 'authority_leaf'), ('route_action_scope_lineage_resolution', 'authority_leaf'), ('route_lineage', 'authority_leaf'), ('route_token_gate', 'authority_leaf'), ('route_token_ref', 'authority_leaf'), ('source_backed_contract_gate_authority', 'authority_leaf'), ('submitter_principal', 'authority_leaf'), ('submitter_session', 'authority_leaf'), ('verification_json', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_AUTHORITY_TOP_LEVEL_FIELDS', 'authority_leaf',
+        'set', 'scalar_string.v1',
+        (('actor_role', 'audited_non_authority'), ('backlog_id', 'audited_non_authority'), ('contract_execution_id', 'authority_leaf'), ('definition_hash', 'authority_leaf'), ('evidence_kind', 'audited_non_authority'), ('execution_state_revision', 'authority_leaf'), ('instruction_bundle_hash', 'authority_leaf'), ('line_id', 'authority_leaf'), ('line_instance_id', 'authority_leaf'), ('project_id', 'audited_non_authority'), ('runtime_guide_hash', 'authority_leaf'), ('stage_id', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_ONBOARD_RUNTIME_CONTEXT_STARTUP_COPY_SAFE_FIELDS', 'authority_leaf',
+        'frozenset', 'scalar_string.v1',
+        (('actual_cwd', 'authority_leaf'), ('actual_git_root', 'authority_leaf'), ('actual_host_worker_id', 'authority_leaf'), ('agent_id', 'authority_leaf'), ('base_commit', 'authority_leaf'), ('branch', 'authority_leaf'), ('branch_head', 'authority_leaf'), ('branch_ref', 'authority_leaf'), ('contract_execution_id', 'authority_leaf'), ('fence_token', 'authority_leaf'), ('filer_principal', 'authority_leaf'), ('harness_type', 'audited_non_authority'), ('head_commit', 'authority_leaf'), ('host_session_id', 'authority_leaf'), ('host_startup_id', 'authority_leaf'), ('launch_text_hash', 'authority_leaf'), ('merge_queue_id', 'authority_leaf'), ('now_iso', 'authority_leaf'), ('observer_command_id', 'authority_leaf'), ('owned_files', 'audited_non_authority'), ('parent_task_id', 'authority_leaf'), ('project_id', 'audited_non_authority'), ('prompt_contract_hash', 'authority_leaf'), ('prompt_contract_id', 'authority_leaf'), ('read_receipt_event_id', 'authority_leaf'), ('read_receipt_hash', 'authority_leaf'), ('role', 'audited_non_authority'), ('route_context_hash', 'authority_leaf'), ('route_id', 'authority_leaf'), ('route_token_ref', 'authority_leaf'), ('runtime_context_id', 'authority_leaf'), ('session_token', 'authority_leaf'), ('session_token_ref', 'authority_leaf'), ('session_token_surrogate', 'authority_leaf'), ('startup_source', 'authority_leaf'), ('target_head_commit', 'authority_leaf'), ('target_project_root', 'authority_leaf'), ('task_id', 'authority_leaf'), ('visible_injection_manifest_hash', 'authority_leaf'), ('worker_id', 'authority_leaf'), ('worker_role', 'audited_non_authority'), ('worker_session_id', 'authority_leaf'), ('worker_slot_id', 'authority_leaf'), ('worker_transcript_path', 'authority_leaf'), ('worker_transcript_ref', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_PARALLEL_BRANCH_ALLOCATION_PRECHECK_RECEIPT_BOUND_FIELDS', 'authority_leaf',
+        'tuple', 'scalar_string.v1',
+        (('acceptance_criteria', 'audited_non_authority'), ('allocation_precheck', 'authority_leaf'), ('backlog_id', 'audited_non_authority'), ('base_commit', 'authority_leaf'), ('branch_ref', 'authority_leaf'), ('contract_execution_id', 'authority_leaf'), ('merge_queue_id', 'authority_leaf'), ('owned_files', 'audited_non_authority'), ('project_id', 'audited_non_authority'), ('route_identity', 'authority_leaf'), ('target_files', 'audited_non_authority'), ('target_head_commit', 'authority_leaf'), ('target_project_root', 'authority_leaf'), ('task_id', 'authority_leaf'), ('worker_id', 'authority_leaf'), ('worker_slot_id', 'authority_leaf'), ('workspace_root', 'authority_leaf'), ('worktree_path', 'authority_leaf'), ('worktree_root', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_QA_EXTERNAL_NO_PASS_COMPARISON_LEDGER_REQUIRED_KEYS', 'authority_leaf',
+        'set', 'scalar_string.v1',
+        (('base_commit_sha', 'authority_leaf'), ('base_failure_identities', 'audited_non_authority'), ('base_reproduction', 'recursive_container'), ('candidate_commit_sha', 'authority_leaf'), ('candidate_failure_identities', 'audited_non_authority'), ('candidate_new_failures', 'audited_non_authority'), ('candidate_specific_issues', 'audited_non_authority'), ('candidate_suite_counts', 'recursive_container'), ('no_pass_claim', 'audited_non_authority'), ('overall_release_pass_claimed', 'audited_non_authority'), ('refs', 'audited_non_authority'), ('schema_version', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_LEGACY_REJOIN_LEASE_KEYS', 'authority_leaf',
+        'frozenset', 'scalar_string.v1',
+        (('authorization_valid', 'authority_leaf'), ('canonical_no_lease', 'authority_leaf'), ('clock_valid', 'authority_leaf'), ('expired', 'authority_leaf'), ('expiry_valid', 'authority_leaf'), ('has_lease', 'authority_leaf'), ('invalid_reason', 'audited_non_authority'), ('lease_expires_at', 'audited_non_authority'), ('lease_id', 'authority_leaf'), ('lease_record_valid', 'authority_leaf'), ('lease_remaining_ttl_seconds', 'authority_leaf'), ('now', 'authority_leaf'), ('raw_session_token_exposed', 'authority_leaf'), ('raw_session_token_persisted', 'authority_leaf'), ('renewal_default_ttl_seconds', 'audited_non_authority'), ('renewal_endpoint', 'audited_non_authority'), ('renewal_max_ttl_seconds', 'audited_non_authority'), ('renewal_supported', 'audited_non_authority'), ('schema_version', 'audited_non_authority'), ('session_token_ref', 'authority_leaf'), ('session_token_ref_available', 'authority_leaf'), ('status', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_LEGACY_REJOIN_NOT_APPLICABLE_AUTHORITY_KEYS', 'authority_leaf',
+        'frozenset', 'scalar_string.v1',
+        (('applicable', 'audited_non_authority'), ('caller_claims_trusted', 'audited_non_authority'), ('eligible', 'audited_non_authority'), ('errors', 'audited_non_authority'), ('identity_mismatches', 'audited_non_authority'), ('last_recovery_action', 'authority_leaf'), ('mode', 'audited_non_authority'), ('replacement_generation', 'authority_leaf'), ('schema_version', 'audited_non_authority'), ('server_derived', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_LEGACY_REJOIN_REPLACEMENT_AUTHORITY_KEYS', 'authority_leaf',
+        'frozenset', 'scalar_string.v1',
+        (('actual_worker_write_baseline', 'authority_leaf'), ('applicable', 'audited_non_authority'), ('caller_claims_trusted', 'audited_non_authority'), ('current_session_token_ref', 'authority_leaf'), ('eligible', 'audited_non_authority'), ('errors', 'audited_non_authority'), ('expected_worker_write_baseline', 'authority_leaf'), ('identity_mismatches', 'audited_non_authority'), ('last_recovery_action', 'authority_leaf'), ('mode', 'audited_non_authority'), ('replacement_generation', 'authority_leaf'), ('schema_version', 'audited_non_authority'), ('server_derived', 'audited_non_authority'), ('source_event_ref', 'authority_leaf')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_CONTAINER_KEYS', 'recursive_container',
+        'tuple', 'scalar_string.v1',
+        (('artifact_refs', 'recursive_container'), ('authority_projection', 'recursive_container'), ('backlog_contract_chain_current', 'recursive_container'), ('close_authority', 'recursive_container'), ('contract_chain_current', 'recursive_container'), ('contract_runtime', 'recursive_container'), ('contract_runtime_current_state', 'recursive_container'), ('current_state', 'recursive_container'), ('onboard_service_waiver', 'recursive_container'), ('payload', 'recursive_container'), ('route_token_gate', 'recursive_container'), ('selected_successor_contract', 'recursive_container'), ('source_backed_contract_gate_authority', 'recursive_container'), ('successor_contract', 'recursive_container'), ('successor_contract_binding', 'recursive_container'), ('verification', 'recursive_container')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_QA_AUTHORITY_CONTAINERS', 'recursive_container',
+        'set', 'scalar_string.v1',
+        (('candidate_review_context', 'recursive_container'), ('graph_context', 'recursive_container'), ('graph_review_context', 'recursive_container'), ('graph_trace_db_evidence', 'recursive_container'), ('graph_trace_evidence', 'recursive_container')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_PARALLEL_BRANCH_RUNTIME_CONTRACT_ROUTE_IDENTITY_CONTAINERS', 'recursive_container',
+        'tuple', 'scalar_string.v1',
+        (('canonical_route_identity', 'recursive_container'), ('contract_revision', 'recursive_container'), ('expected_binding', 'recursive_container'), ('payload', 'recursive_container'), ('revision', 'recursive_container'), ('route_gate', 'recursive_container'), ('route_identity', 'recursive_container'), ('route_token_gate', 'recursive_container'), ('runtime_contract_revision', 'recursive_container')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_QA_REVIEW_AUTHORITY_CONTAINERS', 'recursive_container',
+        'set', 'scalar_string.v1',
+        (('candidate_review_context', 'recursive_container'), ('graph_context', 'recursive_container'), ('graph_review_context', 'recursive_container'), ('graph_trace_db_evidence', 'recursive_container'), ('graph_trace_evidence', 'recursive_container')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_SERVER_PROJECTED_TIMELINE_KEYS', 'recursive_container',
+        'frozenset', 'scalar_string.v1',
+        (('action_scope_route_lineage', 'recursive_container'), ('contract_gate_decision', 'recursive_container'), ('meta_contract_gate', 'recursive_container'), ('observer_direct_pre_mutation_authority', 'recursive_container'), ('observer_failure_domain_authority', 'recursive_container'), ('route_action_scope_lineage', 'recursive_container'), ('route_token_action_scope_lineage', 'recursive_container'), ('server_route_lineage', 'recursive_container'), ('source_backed_contract_gate_authority', 'recursive_container')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_BACKLOG_TRIAGE_SUCCESSOR_JSON_FIELDS', 'audited_non_authority',
+        'tuple', 'scalar_string.v1',
+        (('acceptance_criteria', 'audited_non_authority'), ('chain_trigger_json', 'audited_non_authority'), ('provenance_paths', 'audited_non_authority'), ('required_docs', 'audited_non_authority'), ('target_files', 'audited_non_authority'), ('test_files', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_BACKLOG_TRIAGE_SUCCESSOR_SCALAR_FIELDS', 'audited_non_authority',
+        'tuple', 'scalar_string.v1',
+        (('chain_task_id', 'audited_non_authority'), ('commit', 'audited_non_authority'), ('details_md', 'audited_non_authority'), ('discovered_at', 'audited_non_authority'), ('fixed_at', 'audited_non_authority'), ('mf_type', 'audited_non_authority'), ('priority', 'audited_non_authority'), ('status', 'audited_non_authority'), ('title', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_CHAIN_RUNTIME_FRESHNESS_COMPARE_KEYS', 'audited_non_authority',
+        'tuple', 'scalar_string.v1',
+        (('action', 'audited_non_authority'), ('contract_execution_id', 'audited_non_authority'), ('evidence_kind', 'audited_non_authority'), ('execution_state_revision', 'audited_non_authority'), ('id', 'audited_non_authority'), ('line_id', 'audited_non_authority'), ('stage_id', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_CHAIN_RUNTIME_FRESHNESS_CONTEXT_KEYS', 'audited_non_authority',
+        'tuple', 'scalar_string.v1',
+        (('artifact_refs', 'audited_non_authority'), ('caller_graph_query_schema_trace_id', 'audited_non_authority'), ('changed_files', 'audited_non_authority'), ('commit_sha', 'audited_non_authority'), ('graph_query_trace_id', 'audited_non_authority'), ('graph_query_trace_ids', 'audited_non_authority'), ('graph_trace_id', 'audited_non_authority'), ('graph_trace_ids', 'audited_non_authority'), ('head_commit', 'audited_non_authority'), ('implementation_event_refs', 'audited_non_authority'), ('lane_id', 'audited_non_authority'), ('owned_files', 'audited_non_authority'), ('parent_task_id', 'audited_non_authority'), ('project_root', 'audited_non_authority'), ('prompt_contract_hash', 'audited_non_authority'), ('prompt_contract_id', 'audited_non_authority'), ('read_receipt_hash', 'audited_non_authority'), ('repo_root', 'audited_non_authority'), ('route_context_hash', 'audited_non_authority'), ('route_id', 'audited_non_authority'), ('route_identity', 'audited_non_authority'), ('runtime_context_id', 'audited_non_authority'), ('session_token_ref', 'audited_non_authority'), ('startup_event_id', 'audited_non_authority'), ('startup_event_ref', 'audited_non_authority'), ('target_files', 'audited_non_authority'), ('target_project_root', 'audited_non_authority'), ('task_id', 'audited_non_authority'), ('test_results', 'audited_non_authority'), ('trace_id', 'audited_non_authority'), ('verification', 'audited_non_authority'), ('visible_injection_manifest_hash', 'audited_non_authority'), ('worker_id', 'audited_non_authority'), ('worker_index', 'audited_non_authority'), ('worker_role', 'audited_non_authority'), ('worker_session_lifecycle_policy', 'audited_non_authority'), ('worker_slot_id', 'audited_non_authority'), ('write_authorization_policy', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_QA_FAILURE_COUNT_FIELDS', 'audited_non_authority',
+        'frozenset', 'scalar_string.v1',
+        (('error_count', 'audited_non_authority'), ('failed', 'audited_non_authority'), ('failed_count', 'audited_non_authority'), ('failure_count', 'audited_non_authority'), ('failures', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_QA_FAILURE_STATUS_FIELDS', 'audited_non_authority',
+        'frozenset', 'scalar_string.v1',
+        (('decision', 'audited_non_authority'), ('outcome', 'audited_non_authority'), ('qa_decision', 'audited_non_authority'), ('qa_status', 'audited_non_authority'), ('result', 'audited_non_authority'), ('status', 'audited_non_authority'), ('verdict', 'audited_non_authority'), ('verification_decision', 'audited_non_authority'), ('verification_status', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_QA_FAILURE_SUMMARY_FIELDS', 'audited_non_authority',
+        'frozenset', 'scalar_string.v1',
+        (('block_reason', 'audited_non_authority'), ('decision_summary', 'audited_non_authority'), ('failure_summary', 'audited_non_authority'), ('qa_result_summary', 'audited_non_authority'), ('qa_summary', 'audited_non_authority'), ('reason', 'audited_non_authority'), ('summary', 'audited_non_authority'), ('tests_summary', 'audited_non_authority'), ('verification_summary', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CONTRACT_RUNTIME_QA_REJECTION_RESPONSE_FIELDS', 'audited_non_authority',
+        'tuple', 'scalar_string.v1',
+        (('completed_line_mutated', 'audited_non_authority'), ('missing_proof_fields', 'audited_non_authority'), ('nested_passing_verdict_field', 'audited_non_authority'), ('nested_passing_verdict_value', 'audited_non_authority'), ('next_legal_action', 'audited_non_authority'), ('qa_pass_write_compiler_parity_prevented', 'audited_non_authority'), ('remediation', 'audited_non_authority'), ('silent_failing_normalization_prevented', 'audited_non_authority'), ('zero_contract_runtime_write', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_LEGACY_PRIMARY_ROUTE_CLAIM_KEYS', 'audited_non_authority',
+        'tuple', 'scalar_string.v1',
+        (('agent_facing_decision_source', 'audited_non_authority'), ('contract_decision_source', 'audited_non_authority'), ('decision_source', 'audited_non_authority'), ('next_move_source', 'audited_non_authority'), ('primary_route_source', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_QA_EXTERNAL_NO_PASS_BASE_REPRODUCTION_REQUIRED_KEYS', 'audited_non_authority',
+        'set', 'scalar_string.v1',
+        (('failure_identities', 'audited_non_authority'), ('reproduced', 'audited_non_authority'), ('total', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_QA_EXTERNAL_NO_PASS_CANDIDATE_COUNTS_REQUIRED_KEYS', 'audited_non_authority',
+        'set', 'scalar_string.v1',
+        (('baseline_known_non_green', 'audited_non_authority'), ('failed', 'audited_non_authority'), ('passed', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RESUMED_SUCCESSOR_STATUS_FIELDS', 'audited_non_authority',
+        'frozenset', 'scalar_string.v1',
+        (('decision', 'audited_non_authority'), ('outcome', 'audited_non_authority'), ('result', 'audited_non_authority'), ('status', 'audited_non_authority'), ('verdict', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_FINISH_ATTESTATION_NO_PASS_COUNT_FIELDS', 'audited_non_authority',
+        'tuple', 'scalar_string.v1',
+        (('baseline_failed', 'audited_non_authority'), ('baseline_passed', 'audited_non_authority'), ('candidate_new_failures', 'audited_non_authority'), ('focused_passed', 'audited_non_authority'), ('full_failed', 'audited_non_authority'), ('full_passed', 'audited_non_authority'), ('inherited_failed', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_LEGACY_REJOIN_PAYLOAD_KEYS', 'audited_non_authority',
+        'frozenset', 'scalar_string.v1',
+        (('action', 'audited_non_authority'), ('attempt', 'audited_non_authority'), ('backlog_id', 'audited_non_authority'), ('bounded_rejoin_kind', 'audited_non_authority'), ('bounded_replacement_generation', 'audited_non_authority'), ('bounded_replacement_rejoin', 'audited_non_authority'), ('bounded_replacement_rejoin_authority', 'audited_non_authority'), ('bounded_replacement_worker_write_baseline', 'audited_non_authority'), ('caller_role', 'audited_non_authority'), ('contract_runtime_failed_qa_revision', 'audited_non_authority'), ('contract_runtime_worker_sequence', 'audited_non_authority'), ('current_status', 'audited_non_authority'), ('delivery', 'audited_non_authority'), ('effective_read_receipt_ref', 'audited_non_authority'), ('effective_startup_ref', 'audited_non_authority'), ('expires_at', 'audited_non_authority'), ('failed_qa_running_revision_rejoin_authority', 'audited_non_authority'), ('fence_token_hash', 'audited_non_authority'), ('host_envelope_env_keys', 'audited_non_authority'), ('host_envelope_returned', 'audited_non_authority'), ('last_recovery_action', 'audited_non_authority'), ('meta_contract_gate', 'audited_non_authority'), ('ok', 'audited_non_authority'), ('operator_session_role', 'audited_non_authority'), ('parent_task_id', 'audited_non_authority'), ('post_qa_merge_conflict_rejoin_authority', 'audited_non_authority'), ('post_qa_merge_conflict_rejoin_diagnostics', 'audited_non_authority'), ('post_qa_rejoin_retarget_authority', 'audited_non_authority'), ('post_qa_rejoin_retarget_diagnostics', 'audited_non_authority'), ('post_qa_rejoin_retarget_result', 'audited_non_authority'), ('previous_route_identity', 'audited_non_authority'), ('previous_status', 'audited_non_authority'), ('principal_id', 'audited_non_authority'), ('project_id', 'audited_non_authority'), ('raw_fence_token_persisted_to_timeline', 'audited_non_authority'), ('raw_fence_token_returned_for_host_envelope', 'audited_non_authority'), ('raw_session_token_persisted', 'audited_non_authority'), ('read_receipt_event_ref', 'audited_non_authority'), ('reason', 'audited_non_authority'), ('reopen_for_failed_qa_revision', 'audited_non_authority'), ('reopen_for_post_qa_merge_conflict', 'audited_non_authority'), ('reopen_for_post_qa_target_retarget', 'audited_non_authority'), ('reopen_for_revision', 'audited_non_authority'), ('retry_round', 'audited_non_authority'), ('revision_rejoin_applied', 'audited_non_authority'), ('route_identity', 'audited_non_authority'), ('route_identity_rebound', 'audited_non_authority'), ('route_identity_source', 'audited_non_authority'), ('route_identity_verified', 'audited_non_authority'), ('route_lineage', 'audited_non_authority'), ('runtime_context_id', 'audited_non_authority'), ('schema_version', 'audited_non_authority'), ('session_token_lease', 'audited_non_authority'), ('session_token_persisted', 'audited_non_authority'), ('session_token_ref', 'audited_non_authority'), ('startup_event_ref', 'audited_non_authority'), ('status', 'audited_non_authority'), ('task_id', 'audited_non_authority'), ('timeline_reopen_for_revision', 'audited_non_authority'), ('ttl_seconds', 'audited_non_authority'), ('validated_missing_finish_rejoin_authority', 'audited_non_authority'), ('worker_evidence_synthesized', 'audited_non_authority'), ('worker_id', 'audited_non_authority'), ('worker_role', 'audited_non_authority'), ('worker_slot_id', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_LEGACY_REJOIN_PRE_LINEAGE_PAYLOAD_KEYS', 'audited_non_authority',
+        'frozenset', 'scalar_string.v1',
+        (('pre_lineage_auth_only_rejoin', 'audited_non_authority'), ('pre_lineage_rejoin_authority', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_ACTIONABLE_KEYS', 'audited_non_authority',
+        'tuple', 'scalar_string.v1',
+        (('actual_host_worker_id', 'audited_non_authority'), ('agent_id', 'audited_non_authority'), ('allocation_owner', 'audited_non_authority'), ('base_commit', 'audited_non_authority'), ('branch', 'audited_non_authority'), ('branch_ref', 'audited_non_authority'), ('copy_safe_route_token_scope', 'audited_non_authority'), ('endpoints', 'audited_non_authority'), ('fence_token_hash', 'audited_non_authority'), ('fence_token_ref', 'audited_non_authority'), ('finish_gate_facade_payload_skeleton', 'audited_non_authority'), ('finish_time_attestation_facade_payload_skeleton', 'audited_non_authority'), ('finish_time_worker_attestation_facade_payload_skeleton', 'audited_non_authority'), ('finish_time_worker_attestation_submission', 'audited_non_authority'), ('finish_time_worker_self_attestation_facade_payload_skeleton', 'audited_non_authority'), ('host_session_id', 'audited_non_authority'), ('host_startup_id', 'audited_non_authority'), ('implementation_evidence_facade_payload_skeleton', 'audited_non_authority'), ('merge_queue_id', 'audited_non_authority'), ('observer_allocation_owner', 'audited_non_authority'), ('parent_task_id', 'audited_non_authority'), ('project_id', 'audited_non_authority'), ('raw_fence_token_exposed', 'audited_non_authority'), ('raw_route_token_exposed', 'audited_non_authority'), ('raw_session_token_exposed', 'audited_non_authority'), ('read_receipt_facade_payload_skeleton', 'audited_non_authority'), ('route_identity', 'audited_non_authority'), ('route_token_ref', 'audited_non_authority'), ('runtime_context_id', 'audited_non_authority'), ('schema_version', 'audited_non_authority'), ('scope_insufficiency_request_facade_payload_skeleton', 'audited_non_authority'), ('session_token_initial_join_submission', 'audited_non_authority'), ('session_token_ref', 'audited_non_authority'), ('session_token_ref_available', 'audited_non_authority'), ('session_token_reissue_submission', 'audited_non_authority'), ('session_token_rejoin_eligibility', 'audited_non_authority'), ('session_token_rejoin_submission', 'audited_non_authority'), ('startup_facade_payload_skeleton', 'audited_non_authority'), ('target_head_commit', 'audited_non_authority'), ('target_project_root', 'audited_non_authority'), ('task_id', 'audited_non_authority'), ('worker_commit_facade_payload_skeleton', 'audited_non_authority'), ('worker_id', 'audited_non_authority'), ('worker_role', 'audited_non_authority'), ('worker_session_id', 'audited_non_authority'), ('worker_session_lifecycle_policy', 'audited_non_authority'), ('worker_slot_id', 'audited_non_authority'), ('write_authorization_policy', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_RUNTIME_CONTEXT_WORKER_GUIDE_COMPACT_CONTRACT_STATE_KEYS', 'audited_non_authority',
+        'tuple', 'scalar_string.v1',
+        (('backlog_id', 'audited_non_authority'), ('contract_execution_id', 'audited_non_authority'), ('contract_id', 'audited_non_authority'), ('contract_revision_id', 'audited_non_authority'), ('execution_state_revision', 'audited_non_authority'), ('execution_status', 'audited_non_authority'), ('next_legal_action', 'audited_non_authority'), ('project_id', 'audited_non_authority'), ('runtime_context_id', 'audited_non_authority'), ('schema_version', 'audited_non_authority'), ('status', 'audited_non_authority'), ('task_id', 'audited_non_authority'), ('terminal_disposition', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_SEMANTIC_REVISION_FORBIDDEN_KEYS', 'audited_non_authority',
+        'set', 'scalar_string.v1',
+        (('graph_enrich_config_candidates', 'audited_non_authority'), ('graph_enrich_config_ops', 'audited_non_authority'), ('graph_enrich_config_suggestions', 'audited_non_authority'), ('graph_structure_candidates', 'audited_non_authority'), ('graph_structure_ops', 'audited_non_authority'), ('graph_structure_suggestions', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_TIMELINE_TOP_LEVEL_ROLE_FIELDS', 'audited_non_authority',
+        'frozenset', 'scalar_string.v1',
+        (('actor_role', 'audited_non_authority'), ('caller_role', 'audited_non_authority'), ('lane_role', 'audited_non_authority'), ('role', 'audited_non_authority')),
+    ),
+    _ContractRuntimeCanonicalSourceRecord(
+        "canonical_source_record.v1", '_CURRENT_FULL_BUILD_KEYS', 'structured_non_authority',
+        'set', 'nonempty_string_pair_set.v1',
+        (),
     ),
 )
+
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES: tuple[str, ...] = ()
 _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_CONTAINER_SOURCE_NAMES: tuple[
     str, ...
 ] = ()
 _CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS = frozenset()
-_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset(
-    PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
-)
+_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = frozenset()
 
 
 def _contract_runtime_is_server_canonical_collection_source_name(
@@ -104770,6 +104840,9 @@ def _contract_runtime_is_server_canonical_collection_source_name(
             "_CONTRACT_RUNTIME_CANONICAL_AUTHORITY_CONTAINER_FIELDS",
             "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
             "_CONTRACT_RUNTIME_FRESH_REPAIR_CONTEXTUAL_SAFE_SEMANTIC_FIELDS",
+            "_CONTRACT_RUNTIME_FRESH_REPAIR_CANONICAL_ENVELOPE_REQUIRED_FIELDS",
+            "_RUNTIME_CONTEXT_PUBLIC_ERROR_ACTION_KEYS",
+            "_TIMELINE_WARM_CACHE_RESOURCE_KEYS",
         }
     )
 
@@ -104791,7 +104864,7 @@ def _contract_runtime_canonical_source_record_registry_meta_audit(
                 errors.append(f"{path}.record_type")
                 continue
             values = tuple(raw_record)
-            if not all(type(value) is str for value in values[:6]):
+            if not all(type(value) is str for value in values[:5]):
                 errors.append(f"{path}.scalar_types")
                 continue
             partitions = raw_record.field_partitions
@@ -104809,32 +104882,38 @@ def _contract_runtime_canonical_source_record_registry_meta_audit(
                 raw_record.source_name
             ):
                 errors.append(f"{path}.source_name")
-            if raw_record.disposition not in _CONTRACT_RUNTIME_CANONICAL_DISPOSITIONS:
+            if raw_record.disposition not in {
+                "authority_leaf",
+                "recursive_container",
+                "audited_non_authority",
+                "structured_non_authority",
+            }:
                 errors.append(f"{path}.disposition")
-            if raw_record.container_type not in _CONTRACT_RUNTIME_CANONICAL_CONTAINER_TYPES:
+            if raw_record.container_type not in {
+                "frozenset", "list", "set", "tuple"
+            }:
                 errors.append(f"{path}.container_type")
-            if raw_record.entry_schema_id not in _CONTRACT_RUNTIME_CANONICAL_ENTRY_SCHEMAS:
+            if raw_record.entry_schema_id not in {
+                "scalar_string.v1", "nonempty_string_pair_set.v1"
+            }:
                 errors.append(f"{path}.entry_schema_id")
-            if raw_record.projection_policy not in _CONTRACT_RUNTIME_CANONICAL_PROJECTION_POLICIES:
-                errors.append(f"{path}.projection_policy")
             partition_names = [name for name, _ in partitions]
             if len(partition_names) != len(set(partition_names)):
                 errors.append(f"{path}.duplicate_partition_field")
             if any(
-                disposition not in _CONTRACT_RUNTIME_CANONICAL_FIELD_DISPOSITIONS
+                disposition not in {
+                    "authority_leaf",
+                    "recursive_container",
+                    "audited_non_authority",
+                }
                 for _, disposition in partitions
             ):
                 errors.append(f"{path}.partition_disposition")
-            policy_contract = {
-                "all_audited_non_authority.v1": ("audited_non_authority", False),
-                "all_recursive_container.v1": ("recursive_container", False),
-                "explicit_partition.v1": ("authority_leaf", True),
-                "typed_authority_classifier.v1": ("authority_leaf", False),
-            }.get(raw_record.projection_policy)
-            if policy_contract is None or raw_record.disposition != policy_contract[0]:
-                errors.append(f"{path}.policy_disposition")
-            elif bool(partitions) is not policy_contract[1]:
-                errors.append(f"{path}.policy_partition_shape")
+            if raw_record.disposition == "structured_non_authority":
+                if partitions or raw_record.entry_schema_id != "nonempty_string_pair_set.v1":
+                    errors.append(f"{path}.structured_contract")
+            elif not partitions or raw_record.entry_schema_id != "scalar_string.v1":
+                errors.append(f"{path}.scalar_partition_contract")
             if (
                 raw_record.entry_schema_id == "nonempty_string_pair_set.v1"
                 and raw_record.container_type != "set"
@@ -104847,7 +104926,6 @@ def _contract_runtime_canonical_source_record_registry_meta_audit(
                     "disposition": raw_record.disposition,
                     "container_type": raw_record.container_type,
                     "entry_schema_id": raw_record.entry_schema_id,
-                    "projection_policy": raw_record.projection_policy,
                     "field_partitions": [list(pair) for pair in partitions],
                 }
             )
@@ -104926,15 +105004,11 @@ def _contract_runtime_server_canonical_field_dispositions(
     record = next((item for item in meta["records"] if item.source_name == source), None)
     if record is None:
         return ()
-    if record.projection_policy == "explicit_partition.v1":
-        return tuple(disposition for name, disposition in record.field_partitions if name == field)
-    if record.projection_policy == "typed_authority_classifier.v1":
-        return (("authority_leaf",) if parallel_branch_authority_field_is_nontransferable(field) else ("audited_non_authority",))
-    if record.projection_policy == "all_recursive_container.v1":
-        return ("recursive_container",)
-    if record.projection_policy == "all_audited_non_authority.v1":
-        return ("audited_non_authority",)
-    return ()
+    return tuple(
+        disposition
+        for name, disposition in record.field_partitions
+        if name == field
+    )
 
 
 def _contract_runtime_server_canonical_source_registry_audit(
@@ -104950,9 +105024,8 @@ def _contract_runtime_server_canonical_source_registry_audit(
     records = {record.source_name: record for record in meta["records"]}
     live_candidates = {
         name
-        for name, value in globals().items()
+        for name in globals()
         if _contract_runtime_is_server_canonical_collection_source_name(name)
-        and type(value) in (frozenset, list, set, tuple)
     }
     registered = set(records)
     unclassified = sorted(live_candidates - registered)
@@ -104980,12 +105053,14 @@ def _contract_runtime_server_canonical_source_registry_audit(
         for field_name in fields:
             path = f"{source_name}.{field_name}"
             field_memberships[path] = _contract_runtime_server_canonical_field_dispositions(source_name, field_name)
-        if record.projection_policy == "explicit_partition.v1":
-            live_fields = set(fields)
-            partition_fields = {name for name, _ in record.field_partitions}
-            stale_partitions.extend(
-                f"{source_name}.{name}" for name in sorted(partition_fields - live_fields)
-            )
+        live_fields = set(fields)
+        partition_fields = {name for name, _ in record.field_partitions}
+        stale_partitions.extend(
+            f"{source_name}.{name}" for name in sorted(partition_fields - live_fields)
+        )
+        stale_partitions.extend(
+            f"{source_name}.{name}" for name in sorted(live_fields - partition_fields)
+        )
     unclassified_fields = sorted(path for path, dispositions in field_memberships.items() if not dispositions)
     overlapping_fields = sorted(path for path, dispositions in field_memberships.items() if len(dispositions) != 1)
     field_memberships: dict[str, tuple[str, ...]] = {}
@@ -105009,7 +105084,13 @@ def _contract_runtime_server_canonical_source_registry_audit(
     semantic_payload = {
         "registry": meta["normalized_records"],
         "live_source_names": sorted(live_candidates),
+        "actual_scalar_fields": scalar_source_fields,
         "source_validation": source_validation,
+        "invalid_source_signatures": {
+            source_name: raw_signatures[source_name]
+            for source_name in sorted(invalid_shapes)
+            if source_name in raw_signatures
+        },
         "complete": not diagnostics,
     }
     return {
@@ -105020,6 +105101,7 @@ def _contract_runtime_server_canonical_source_registry_audit(
         "authority_leaf_source_names": sorted(name for name, record in records.items() if record.disposition == "authority_leaf"),
         "recursive_container_source_names": sorted(name for name, record in records.items() if record.disposition == "recursive_container"),
         "audited_non_authority_source_names": sorted(name for name, record in records.items() if record.disposition == "audited_non_authority"),
+        "structured_non_authority_source_names": sorted(name for name, record in records.items() if record.disposition == "structured_non_authority"),
         "unclassified_source_names": unclassified,
         "missing_registered_source_names": missing,
         "field_inventory_paths": sorted(field_memberships),
@@ -105163,12 +105245,9 @@ def _contract_runtime_refresh_canonical_authority_field_inventory(
         _contract_runtime_server_canonical_authority_container_sources()
     )
     derived = frozenset(
-        PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS
-        | {
-            field_name
-            for field_source in sources.values()
-            for field_name in field_source
-        }
+        field_name
+        for field_source in sources.values()
+        for field_name in field_source
     )
     _CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS = derived
     _CONTRACT_RUNTIME_SERVER_CANONICAL_AUTHORITY_SOURCE_NAMES = tuple(sources)

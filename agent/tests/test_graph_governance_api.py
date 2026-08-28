@@ -123671,6 +123671,17 @@ def test_contract_runtime_authority_registry_fresh_import_is_complete():
     assert audit["registered_source_names"] == audit["inventory_source_names"]
     assert "_CURRENT_FULL_BUILD_KEYS" in audit["registered_source_names"]
     assert audit["raw_source_signatures"]["_CURRENT_FULL_BUILD_KEYS"]["raw_type"] == "set"
+    assert audit["registry_schema_hash"] == (
+        "sha256:3b9b38a938c74af40c8000080dcf7bae93ea90ec39db4579f48a4f22f0275303"
+    )
+    assert len(server._CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS) == 63
+    for record in server._CONTRACT_RUNTIME_SERVER_CANONICAL_SOURCE_RECORDS:
+        raw = getattr(server, record.source_name)
+        if record.entry_schema_id == "scalar_string.v1":
+            assert set(raw) == {name for name, _ in record.field_partitions}
+        else:
+            assert record.disposition == "structured_non_authority"
+            assert record.field_partitions == ()
 
 
 def test_contract_runtime_authority_registry_build_key_content_is_semantically_stable(
@@ -123712,7 +123723,10 @@ def test_contract_runtime_authority_registry_rejects_build_key_shape(monkeypatch
     assert rejected["semantic_registry_hash"] != accepted_hash
 
 
-@pytest.mark.parametrize("future_value", [frozenset(), ("field",), {("x", "y")}, {("x",)}])
+@pytest.mark.parametrize(
+    "future_value",
+    [frozenset(), ("field",), {("x", "y")}, {("x",)}, {}, "bad", None, 7],
+)
 def test_contract_runtime_authority_registry_future_collection_never_disappears(
     monkeypatch, future_value
 ):
@@ -123755,7 +123769,6 @@ def test_contract_runtime_authority_registry_rejects_malformed_registry(
         {"disposition": "double_disposition"},
         {"container_type": "mapping"},
         {"entry_schema_id": "unknown.shape"},
-        {"projection_policy": "unknown.partition"},
         {"field_partitions": (("field", "unknown_category"),)},
     ],
 )
@@ -123784,6 +123797,75 @@ def test_contract_runtime_authority_registry_rejects_unused_record(monkeypatch):
     with pytest.raises(server.GovernanceError) as error:
         server._contract_runtime_require_canonical_authority_registry_complete()
     assert error.value.details["diagnostic_paths"] == [extra.source_name]
+
+
+def test_contract_runtime_authority_registry_static_projection_ignores_classifier_drift(
+    monkeypatch,
+):
+    before = server._contract_runtime_server_canonical_source_registry_audit()
+    monkeypatch.setattr(
+        server,
+        "parallel_branch_authority_field_is_nontransferable",
+        lambda _field: False,
+    )
+    monkeypatch.setattr(
+        server,
+        "PARALLEL_BRANCH_TYPED_NONTRANSFERABLE_AUTHORITY_FIELDS",
+        frozenset({"invented_external_authority"}),
+    )
+    after = server._contract_runtime_server_canonical_source_registry_audit()
+    assert after["complete"] is True
+    assert after["semantic_registry_hash"] == before["semantic_registry_hash"]
+    assert after["authority_leaf_field_paths"] == before["authority_leaf_field_paths"]
+
+
+@pytest.mark.parametrize("mutation", ["clear", "add", "rename"])
+def test_contract_runtime_authority_registry_rejects_live_scalar_field_drift(
+    monkeypatch, mutation
+):
+    source_name = "_CONTRACT_RUNTIME_EXECUTION_ID_FIELDS"
+    original = tuple(getattr(server, source_name))
+    mutated = {
+        "clear": (),
+        "add": (*original, "new_unclassified_authority"),
+        "rename": ("renamed_authority", *original[1:]),
+    }[mutation]
+    monkeypatch.setattr(
+        server,
+        source_name,
+        mutated,
+    )
+    with pytest.raises(server.GovernanceError) as error:
+        server._contract_runtime_require_canonical_authority_registry_complete()
+    assert error.value.code == "contract_runtime_authority_registry_incomplete"
+    assert any(path.startswith(source_name) for path in error.value.details["diagnostic_paths"])
+
+
+def test_contract_runtime_authority_registry_has_no_mutable_enum_authority_inputs():
+    for name in (
+        "_CONTRACT_RUNTIME_CANONICAL_DISPOSITIONS",
+        "_CONTRACT_RUNTIME_CANONICAL_CONTAINER_TYPES",
+        "_CONTRACT_RUNTIME_CANONICAL_ENTRY_SCHEMAS",
+        "_CONTRACT_RUNTIME_CANONICAL_PROJECTION_POLICIES",
+        "_CONTRACT_RUNTIME_CANONICAL_FIELD_DISPOSITIONS",
+    ):
+        assert not hasattr(server, name)
+
+
+def test_contract_runtime_authority_registry_rebuilds_derived_cache_from_projection(
+    monkeypatch,
+):
+    before = server._contract_runtime_server_canonical_source_registry_audit()
+    monkeypatch.setattr(
+        server,
+        "_CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS",
+        frozenset({"tampered_cache_field"}),
+    )
+    after_tamper = server._contract_runtime_server_canonical_source_registry_audit()
+    assert after_tamper["semantic_registry_hash"] == before["semantic_registry_hash"]
+    rebuilt = server._contract_runtime_refresh_canonical_authority_field_inventory()
+    assert "tampered_cache_field" not in rebuilt
+    assert rebuilt == server._CONTRACT_RUNTIME_CANONICAL_NONTRANSFERABLE_AUTHORITY_FIELDS
 
 
 @pytest.mark.parametrize(
