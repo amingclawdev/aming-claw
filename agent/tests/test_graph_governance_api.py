@@ -13192,24 +13192,53 @@ def _dev_stable_health_payload(
         "pid": pid,
         "runtime_loaded_version": anchor,
         "runtime_stale": False,
+        "runtime_loaded_source_sha256": "sha256:" + "5" * 64,
+        "runtime_loaded_at": "2026-08-27T13:11:43Z",
+        "runtime_stale_reasons": [],
+        "worktree_head_version": anchor[:8],
         "loaded_runtime_identity": {
             "schema_version": "governance_loaded_runtime_identity.v1",
             "loaded_commit": anchor,
+            "loaded_at": "2026-08-27T13:11:43Z",
             "loaded_pid": pid,
+            "loaded_source_path": "/srv/aming-claw/agent/governance/server.py",
             "runtime_stale": False,
+            "loaded_source_size": 8199570,
+            "loaded_source_mtime_ns": 1787834917047090843,
+            "worktree_head_version": anchor[:8],
+            "worktree_source_sha256": "sha256:" + "5" * 64,
+            "runtime_stale_reasons": [],
+            "identity_source": "frozen_at_import",
+            "commit_source": "git_head_at_import",
+            "worktree_head_version_source": "live_git_head_at_request_time",
+            "meaning": "frozen loaded runtime identity",
             "loaded_source_sha256": "sha256:" + "5" * 64,
         },
     }
     if extended:
         identity = {
+            "schema_version": "ac_runtime_plane_identity.v1",
             "status": "ready",
             "plane": "stable",
             "branch": server.AC_STABLE_BRANCH,
             "port": 40000,
             "expected_port": 40000,
             "pid": pid,
+            "bind_host": "0.0.0.0",
+            "worktree_root": "/srv/aming-claw",
             "commit": anchor,
             "stable_anchor_commit": anchor,
+            "expected_branch": server.AC_STABLE_BRANCH,
+            "identity_source": "git_worktree",
+            "worktree_dirty": False,
+            "worktree_dirty_files": [],
+            "project_allowlist": [],
+            "schema_policy": "managed",
+            "active_graph_activation_allowed": True,
+            "stable_deploy_allowed": True,
+            "background_workers_enabled": True,
+            "status": "ready",
+            "violations": [],
         }
         if include_database_identity:
             identity["stable_database_identity"] = {
@@ -13218,7 +13247,15 @@ def _dev_stable_health_payload(
                 "inode": 2,
                 "stable_relative_path_sha256": "sha256:" + "3" * 64,
             }
-        payload.update(runtime_plane="stable", runtime_plane_identity=identity)
+        payload.update(
+            bind_host=identity["bind_host"],
+            runtime_plane="stable",
+            runtime_plane_identity=identity,
+            worktree_root=identity["worktree_root"],
+            branch=identity["branch"],
+            runtime_commit=identity["commit"],
+            stable_anchor_commit=identity["stable_anchor_commit"],
+        )
     return payload
 
 
@@ -13365,6 +13402,41 @@ def test_ac_dev_stable_proxy_accepts_only_exact_a258_legacy_health(monkeypatch):
         server._dev_stable_proxy_health_identity()
     assert bad_loaded_identity.value.code == "ac_dev_stable_proxy_identity_rejected"
 
+    exact_extended = _dev_stable_health_payload(
+        anchor,
+        pid=61297,
+        extended=True,
+    )
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_json",
+        lambda *_args, **_kwargs: exact_extended,
+    )
+    assert server._dev_stable_proxy_health_identity()["legacy_a258_health"] is True
+
+    malformed_extensions = []
+    partial = copy.deepcopy(exact_extended)
+    partial["runtime_plane_identity"] = {"status": "ready"}
+    malformed_extensions.append(partial)
+    unknown_only = copy.deepcopy(exact_git_show_health)
+    unknown_only["runtime_plane_identity"] = {"unknown": "identity"}
+    malformed_extensions.append(unknown_only)
+    unknown_key = copy.deepcopy(exact_extended)
+    unknown_key["runtime_plane_identity"]["unknown"] = "identity"
+    malformed_extensions.append(unknown_key)
+    unknown_loaded_key = copy.deepcopy(exact_git_show_health)
+    unknown_loaded_key["loaded_runtime_identity"]["unknown"] = "identity"
+    malformed_extensions.append(unknown_loaded_key)
+    for malformed_extension in malformed_extensions:
+        monkeypatch.setattr(
+            server,
+            "_dev_stable_proxy_json",
+            lambda *_args, _payload=malformed_extension, **_kwargs: _payload,
+        )
+        with pytest.raises(GovernanceError) as malformed_identity:
+            server._dev_stable_proxy_health_identity()
+        assert malformed_identity.value.code == "ac_dev_stable_proxy_identity_rejected"
+
     successor = "b" * 40
     monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", successor)
     successor_without_db = _dev_stable_health_payload(
@@ -13381,6 +13453,24 @@ def test_ac_dev_stable_proxy_accepts_only_exact_a258_legacy_health(monkeypatch):
     with pytest.raises(GovernanceError) as rejected:
         server._dev_stable_proxy_health_identity()
     assert rejected.value.code == "ac_dev_stable_proxy_identity_rejected"
+
+
+def test_ac_dev_stable_proxy_freezes_complete_extended_identity(monkeypatch):
+    anchor = server._DEV_LEGACY_STABLE_HEALTH_COMMIT
+    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", anchor)
+    before = _dev_stable_health_payload(anchor, pid=61297, extended=True)
+    after = copy.deepcopy(before)
+    after["runtime_plane_identity"]["worktree_root"] = "/srv/other-stable"
+    after["worktree_root"] = "/srv/other-stable"
+    responses = iter([before, {"ok": True}, after])
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_json",
+        lambda *_args, **_kwargs: next(responses),
+    )
+    with pytest.raises(GovernanceError) as drift:
+        server._dev_stable_external_public_get("/api/test")
+    assert drift.value.code == "ac_dev_stable_proxy_identity_drift"
 
 
 @pytest.mark.parametrize(
@@ -13530,6 +13620,88 @@ def test_ac_dev_stable_item_rejects_generation_drift(monkeypatch):
     with pytest.raises(GovernanceError) as rejected:
         server._dev_external_backlog_item_projection(project_id, backlog_id)
     assert rejected.value.code == "ac_dev_stable_proxy_backlog_generation_drift"
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "long_title_suffix",
+        "whitespace",
+        "unicode",
+        "scalar_type",
+        "list_before_after",
+    ],
+)
+def test_ac_dev_stable_item_rejects_raw_binding_drift(monkeypatch, defect):
+    project_id = "content-sys"
+    backlog_id = "CONTENT-SYS-PUBLIC"
+    list_path = server._dev_external_stable_backlog_list_path(
+        project_id,
+        backlog_id=backlog_id,
+    )
+    item_path = f"/api/backlog/{project_id}/{backlog_id}"
+    before = copy.deepcopy(_dev_external_stable_payload(list_path))
+    after = copy.deepcopy(before)
+    item = copy.deepcopy(_dev_external_stable_payload(item_path))
+    row = before["bugs"][0]
+    after_row = after["bugs"][0]
+    if defect == "long_title_suffix":
+        row["title"] = "A" * 260 + "-list"
+        after_row["title"] = row["title"]
+        item["title"] = "A" * 260 + "-item"
+    elif defect == "whitespace":
+        row["title"] = "alpha beta"
+        after_row["title"] = row["title"]
+        item["title"] = " alpha   beta "
+    elif defect == "unicode":
+        row["title"] = "Caf\u00e9"
+        after_row["title"] = row["title"]
+        item["title"] = "Cafe\u0301"
+    elif defect == "scalar_type":
+        row["created_at"] = "7"
+        after_row["created_at"] = row["created_at"]
+        item["created_at"] = 7
+    else:
+        row["title"] = "alpha beta"
+        after_row["title"] = " alpha   beta "
+        item["title"] = row["title"]
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_many",
+        lambda _paths: [before, item, after],
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server._dev_external_backlog_item_projection(project_id, backlog_id)
+    assert rejected.value.code in {
+        "ac_dev_stable_proxy_backlog_binding_rejected",
+        "ac_dev_stable_proxy_schema_rejected",
+    }
+
+
+def test_ac_dev_stable_item_projects_only_after_equal_raw_long_title(monkeypatch):
+    project_id = "content-sys"
+    backlog_id = "CONTENT-SYS-PUBLIC"
+    list_path = server._dev_external_stable_backlog_list_path(
+        project_id,
+        backlog_id=backlog_id,
+    )
+    item_path = f"/api/backlog/{project_id}/{backlog_id}"
+    stable_list = copy.deepcopy(_dev_external_stable_payload(list_path))
+    stable_item = copy.deepcopy(_dev_external_stable_payload(item_path))
+    long_title = "\u957f" * 260
+    stable_list["bugs"][0]["title"] = long_title
+    stable_item["title"] = long_title
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_many",
+        lambda _paths: [
+            copy.deepcopy(stable_list),
+            stable_item,
+            copy.deepcopy(stable_list),
+        ],
+    )
+    result = server._dev_external_backlog_item_projection(project_id, backlog_id)
+    assert result["bug"]["title"] == "\u957f" * 240 + "..."
 
 
 def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(

@@ -3729,6 +3729,18 @@ def _dev_stable_proxy_failure(
     )
 
 
+def _dev_exact_scalar_fields(
+    value: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    return all(
+        key in value
+        and type(value[key]) is type(required)
+        and value[key] == required
+        for key, required in expected.items()
+    )
+
+
 def _dev_stable_proxy_json(
     path: str,
     *,
@@ -3852,21 +3864,36 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
         expected_anchor == _DEV_LEGACY_STABLE_HEALTH_COMMIT
         and loaded == _DEV_LEGACY_STABLE_HEALTH_COMMIT
     )
-    raw_loaded_identity = health.get("loaded_runtime_identity")
-    loaded_identity_invalid = bool(
-        raw_loaded_identity is not None
-        and not isinstance(raw_loaded_identity, Mapping)
+    loaded_identity_keys = frozenset(
+        "schema_version loaded_commit loaded_at loaded_pid loaded_source_path "
+        "loaded_source_sha256 loaded_source_size loaded_source_mtime_ns "
+        "worktree_head_version worktree_source_sha256 runtime_stale "
+        "runtime_stale_reasons identity_source commit_source "
+        "worktree_head_version_source meaning".split()
     )
+    loaded_alias_keys = frozenset(
+        "runtime_loaded_source_sha256 runtime_loaded_at runtime_stale_reasons "
+        "worktree_head_version".split()
+    )
+    plane_identity_keys = frozenset(
+        "schema_version plane port expected_port pid bind_host worktree_root branch "
+        "expected_branch identity_source commit worktree_dirty worktree_dirty_files "
+        "stable_anchor_commit stable_database_identity project_allowlist schema_policy "
+        "active_graph_activation_allowed stable_deploy_allowed "
+        "background_workers_enabled status violations".split()
+    )
+    plane_alias_keys = frozenset(
+        "bind_host runtime_plane runtime_plane_identity worktree_root branch "
+        "runtime_commit stable_anchor_commit".split()
+    )
+    raw_loaded_identity = health.get("loaded_runtime_identity")
     loaded_identity = (
         dict(raw_loaded_identity)
         if isinstance(raw_loaded_identity, Mapping)
         else {}
     )
     raw_identity = health.get("runtime_plane_identity")
-    if raw_identity is not None and not isinstance(raw_identity, Mapping):
-        raw_identity = {"__invalid__": True}
-    identity = dict(raw_identity or {})
-    database_identity_present = "stable_database_identity" in identity
+    identity = dict(raw_identity) if isinstance(raw_identity, Mapping) else {}
     stable_database_identity = identity.get("stable_database_identity")
     stable_database_identity = (
         dict(stable_database_identity)
@@ -3884,68 +3911,120 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
         and not isinstance(pid, bool)
         and pid > 0
     )
-    extended_expected = {
-        "status": "ready",
-        "plane": "stable",
-        "branch": AC_STABLE_BRANCH,
-        "port": AC_STABLE_SERVICE_PORT,
-        "expected_port": AC_STABLE_SERVICE_PORT,
-        "commit": expected_anchor,
-        "stable_anchor_commit": expected_anchor,
-        "pid": pid,
-    }
-    health_plane_valid = (
-        "runtime_plane" not in health or health.get("runtime_plane") == "stable"
-        if legacy_a258
-        else health.get("runtime_plane") == "stable"
+
+    loaded_alias_present = any(
+        key in health for key in loaded_alias_keys
     )
-    identity_valid = all(
-        key not in identity or identity.get(key) == expected
-        for key, expected in extended_expected.items()
-    )
-    if not legacy_a258:
-        identity_valid = identity_valid and all(
-            key in identity for key in extended_expected
-        )
-    loaded_identity_expected = {
+    loaded_identity_present = raw_loaded_identity is not None
+    loaded_expected = {
         "schema_version": "governance_loaded_runtime_identity.v1",
         "loaded_commit": loaded,
         "loaded_pid": pid,
         "runtime_stale": False,
+        "runtime_stale_reasons": [],
+        "identity_source": "frozen_at_import",
+        "worktree_head_version_source": "live_git_head_at_request_time",
     }
-    loaded_identity_valid = all(
-        key not in loaded_identity or loaded_identity.get(key) == expected
-        for key, expected in loaded_identity_expected.items()
-    )
-    if raw_loaded_identity is not None:
-        loaded_identity_valid = loaded_identity_valid and all(
-            key in loaded_identity for key in loaded_identity_expected
+    loaded_identity_valid = bool(
+        isinstance(raw_loaded_identity, Mapping)
+        and set(loaded_identity) == loaded_identity_keys
+        and _dev_exact_scalar_fields(loaded_identity, loaded_expected)
+        and all(
+            type(loaded_identity.get(key)) is str
+            and bool(loaded_identity.get(key))
+            for key in ("loaded_at", "loaded_source_path", "meaning")
         )
-    loaded_source_sha256 = str(
-        loaded_identity.get("loaded_source_sha256") or ""
-    ).strip().lower()
-    if loaded_source_sha256 and not re.fullmatch(
-        r"sha256:[0-9a-f]{64}",
-        loaded_source_sha256,
-    ):
-        loaded_identity_valid = False
-    database_identity_valid = bool(
-        stable_database_identity
+        and all(
+            type(loaded_identity.get(key)) is int
+            and loaded_identity.get(key) >= 0
+            for key in ("loaded_source_size", "loaded_source_mtime_ns")
+        )
+        and all(
+            re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(loaded_identity.get(key) or ""),
+            )
+            for key in ("loaded_source_sha256", "worktree_source_sha256")
+        )
+        and _git_object_identity_matches(
+            loaded_identity.get("worktree_head_version"),
+            loaded,
+        )
+        and loaded_identity.get("commit_source")
+        in {"git_head_at_import", "immutable_build_environment"}
+    )
+    if loaded_alias_present:
+        loaded_identity_valid = bool(
+            loaded_identity_valid
+            and all(key in health for key in loaded_alias_keys)
+            and health.get("runtime_loaded_source_sha256")
+            == loaded_identity.get("loaded_source_sha256")
+            and health.get("runtime_loaded_at") == loaded_identity.get("loaded_at")
+            and health.get("runtime_stale_reasons") == []
+            and health.get("worktree_head_version")
+            == loaded_identity.get("worktree_head_version")
+        )
+    elif loaded_identity_present:
+        # A full container without its public aliases is still a complete,
+        # frozen identity.  The aliases are optional as a group.
+        loaded_identity_valid = bool(loaded_identity_valid)
+    elif legacy_a258:
+        loaded_identity_valid = True
+
+    plane_alias_present = any(
+        key in health for key in plane_alias_keys
+    )
+    plane_expected = {
+        "schema_version": "ac_runtime_plane_identity.v1",
+        "plane": "stable",
+        "port": AC_STABLE_SERVICE_PORT,
+        "expected_port": AC_STABLE_SERVICE_PORT,
+        "pid": pid,
+        "bind_host": "0.0.0.0",
+        "branch": AC_STABLE_BRANCH,
+        "expected_branch": AC_STABLE_BRANCH,
+        "commit": expected_anchor,
+        "worktree_dirty": False,
+        "worktree_dirty_files": [],
+        "stable_anchor_commit": expected_anchor,
+        "project_allowlist": [],
+        "schema_policy": "managed",
+        "active_graph_activation_allowed": True,
+        "stable_deploy_allowed": True,
+        "background_workers_enabled": True,
+        "status": "ready",
+        "violations": [],
+    }
+    plane_identity_valid = bool(
+        isinstance(raw_identity, Mapping)
+        and set(identity) == plane_identity_keys
+        and _dev_exact_scalar_fields(identity, plane_expected)
+        and type(identity.get("worktree_root")) is str
+        and bool(identity.get("worktree_root"))
+        and identity.get("identity_source")
+        in {"git_worktree", "immutable_build_commit+promotion_branch_policy"}
         and _ac_stable_database_identity_valid(stable_database_identity)
     )
-    if legacy_a258:
-        database_identity_valid = (
-            not database_identity_present
-            or database_identity_valid
+    if plane_alias_present:
+        plane_identity_valid = bool(
+            plane_identity_valid
+            and all(key in health for key in plane_alias_keys)
+            and health.get("runtime_plane") == "stable"
+            and health.get("bind_host") == identity.get("bind_host")
+            and health.get("worktree_root") == identity.get("worktree_root")
+            and health.get("branch") == identity.get("branch")
+            and health.get("runtime_commit") == identity.get("commit")
+            and health.get("stable_anchor_commit")
+            == identity.get("stable_anchor_commit")
         )
+    elif not legacy_a258:
+        plane_identity_valid = False
+    else:
+        plane_identity_valid = True
     if not (
         base_valid
-        and health_plane_valid
-        and "__invalid__" not in identity
-        and identity_valid
-        and not loaded_identity_invalid
         and loaded_identity_valid
-        and database_identity_valid
+        and plane_identity_valid
     ):
         raise _dev_stable_proxy_failure(
             "ac_dev_stable_proxy_identity_rejected",
@@ -3955,20 +4034,21 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
     return {
         "required_health_tuple": required_tuple,
         "legacy_a258_health": legacy_a258,
-        "runtime_plane": (
-            health.get("runtime_plane") if "runtime_plane" in health else None
+        "loaded_runtime_identity_sha256": (
+            stable_sha256(loaded_identity) if loaded_identity_present else ""
         ),
-        "runtime_plane_identity": {
-            key: identity[key]
-            for key in (*extended_expected, "stable_database_identity")
-            if key in identity
-        },
-        "loaded_runtime_identity": {
-            key: loaded_identity[key]
-            for key in (*loaded_identity_expected, "loaded_source_sha256")
-            if key in loaded_identity
-        },
-        "stable_database_identity": stable_database_identity,
+        "runtime_plane_identity_sha256": (
+            stable_sha256(identity) if raw_identity is not None else ""
+        ),
+        "extended_health_identity_sha256": stable_sha256(
+            {
+                key: health[key]
+                for key in sorted(
+                    loaded_alias_keys | plane_alias_keys
+                )
+                if key in health and key != "runtime_plane_identity"
+            }
+        ),
     }
 
 
@@ -3999,6 +4079,55 @@ def _dev_stable_external_public_get_many(paths: Sequence[str]) -> list[dict[str,
 
 def _dev_stable_external_public_get(path: str) -> dict[str, Any]:
     return _dev_stable_external_public_get_many([path])[0]
+
+
+def _dev_external_raw_backlog_binding(
+    raw: Mapping[str, Any],
+    *,
+    require_public_classification: bool,
+) -> dict[str, Any]:
+    """Freeze output source scalars before any display normalization."""
+
+    output_fields = (
+        "bug_id",
+        "title",
+        "status",
+        "priority",
+        "created_at",
+        "updated_at",
+        "fixed_at",
+    )
+    if not all(
+        field in raw and type(raw.get(field)) is str
+        for field in output_fields
+    ):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable backlog binding fields must be exact JSON strings",
+        )
+    binding = {
+        field: raw[field] for field in output_fields
+    }
+    if require_public_classification:
+        if (
+            type(raw.get("public_safe")) is not bool
+            or type(raw.get("privacy_level")) is not str
+        ):
+            raise _dev_stable_proxy_failure(
+                "ac_dev_stable_proxy_schema_rejected",
+                "stable compact backlog row lacks a typed public classification",
+            )
+        if raw.get("public_safe") is not True or raw.get("privacy_level") != "public":
+            raise _dev_stable_proxy_failure(
+                "ac_dev_stable_proxy_private_backlog_rejected",
+                "stable compact backlog row is not explicitly public",
+                status=409,
+            )
+        binding.update(
+            public_safe=raw["public_safe"],
+            privacy_level=raw["privacy_level"],
+        )
+    return binding
 
 
 def _dev_external_public_backlog_row(
@@ -4221,51 +4350,77 @@ def _dev_external_backlog_item_projection(
             "stable backlog generation changed across the item read",
             status=409,
         )
-    if str(stable_item.get("bug_id") or "") != backlog_id:
+    if (
+        type(stable_item.get("bug_id")) is not str
+        or stable_item.get("bug_id") != backlog_id
+    ):
         raise _dev_stable_proxy_failure(
             "ac_dev_stable_proxy_schema_rejected",
             "stable backlog item identity did not match the request",
         )
 
-    def bound_public_row(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
-        matches = [row for row in rows if str(row.get("bug_id") or "") == backlog_id]
+    def bound_public_row(
+        rows: Sequence[Mapping[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        matches = [
+            row
+            for row in rows
+            if type(row.get("bug_id")) is str and row.get("bug_id") == backlog_id
+        ]
         if len(matches) != 1:
             raise _dev_stable_proxy_failure(
                 "ac_dev_stable_proxy_backlog_binding_rejected",
                 "stable backlog item lacked one unique compact-list binding",
                 status=409,
             )
-        return _dev_external_public_backlog_row(
-            matches[0],
-            require_explicit_public_safe=True,
+        raw_row = dict(matches[0])
+        raw_binding = _dev_external_raw_backlog_binding(
+            raw_row,
+            require_public_classification=True,
         )
+        return raw_row, raw_binding
 
-    before_projected = bound_public_row(before_rows)
-    after_projected = bound_public_row(after_rows)
+    before_raw, before_binding = bound_public_row(before_rows)
+    after_raw, after_binding = bound_public_row(after_rows)
+    item_binding = _dev_external_raw_backlog_binding(
+        stable_item,
+        require_public_classification=False,
+    )
+    list_output_binding = {
+        field: before_binding[field]
+        for field in before_binding
+        if field not in {"public_safe", "privacy_level"}
+    }
+    if (
+        before_binding != after_binding
+        or item_binding != list_output_binding
+    ):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_backlog_binding_rejected",
+            "stable backlog item raw fields changed or did not match its compact row",
+            status=409,
+        )
     item_policy = backlog_runtime.parse_json_object(
         stable_item.get("bypass_policy_json", "{}")
     )
     item_policy = item_policy if isinstance(item_policy, Mapping) else {}
-    explicit_item_privacy = str(
-        stable_item.get("privacy_level")
-        if "privacy_level" in stable_item
-        else item_policy.get("privacy_level") or ""
-    ).strip().lower()
     explicit_item_public_safe = (
         stable_item.get("public_safe")
         if "public_safe" in stable_item
         else item_policy.get("public_safe")
     )
+    explicit_item_privacy = (
+        stable_item.get("privacy_level")
+        if "privacy_level" in stable_item
+        else item_policy.get("privacy_level")
+    )
     if (
-        before_projected is None
-        or after_projected is None
-        or (
+        (
             explicit_item_public_safe is not None
             and explicit_item_public_safe is not True
         )
-        or explicit_item_privacy == "private"
         or (
-            explicit_item_privacy
+            explicit_item_privacy is not None
             and explicit_item_privacy != "public"
         )
     ):
@@ -4280,6 +4435,14 @@ def _dev_external_backlog_item_projection(
                 "writes_performed": False,
             },
         )
+    before_projected = _dev_external_public_backlog_row(
+        before_raw,
+        require_explicit_public_safe=True,
+    )
+    after_projected = _dev_external_public_backlog_row(
+        after_raw,
+        require_explicit_public_safe=True,
+    )
     # The exact a258 item endpoint predates top-level privacy fields.  Its
     # classification is therefore supplied only by the explicit public-safe
     # compact row above, never by the legacy item's default-public fallback.

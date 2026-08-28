@@ -820,14 +820,20 @@ AC repair work uses two independent runtime planes:
   identity both before and after each GET. The frozen `a25838f...` service is
   the sole legacy exception: its real health schema omits plane and database
   identity, so its exact loaded commit and positive PID are frozen on the
-  first probe and must be byte-equivalent on the second. A successor must
-  provide valid stable-plane and database identities. Backlog reads also bind
+  first probe and must be byte-equivalent on the second. If that legacy health
+  exposes a loaded-runtime or plane-identity extension, the complete known
+  schema is required, unknown or partial keys fail closed, and the whole
+  identity is frozen across the read. A successor must provide valid
+  stable-plane and database identities. Backlog reads also bind
   exact project, generation, and authority generation; item reads use one
   health window around targeted-list-before, item, and targeted-list-after and
   require one exact, explicitly public compact row in the returned bounded
   page. A target outside that page fails closed rather than falling back to a
-  default-public classification. The proxy republishes only allowlisted public
-  fields. Transport, HTTP, JSON, schema, size, privacy, generation, or identity
+  default-public classification. Before any whitespace normalization or title
+  truncation, the two list rows and item must have type-correct, exactly equal
+  raw output-source scalars; only then is the bounded display projection built.
+  The proxy republishes only allowlisted public fields. Transport, HTTP, JSON,
+  schema, size, privacy, generation, raw-binding, or identity
   drift fails closed. External Onboard is a local typed redirect to fresh
   stable Onboard, but reports discovery available only after its own stable
   health pre/post check; it never calls stable Onboard or any authority mint path.
