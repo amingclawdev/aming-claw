@@ -11690,6 +11690,73 @@ def _sqlite_schema_snapshot(connection: sqlite3.Connection) -> tuple[tuple, ...]
     )
 
 
+def _seed_file_backed_backlog_read_rows(
+    connection: sqlite3.Connection,
+    *,
+    row_count: int,
+    terminal_projection: bool,
+) -> str:
+    observer_session.ensure_schema(connection)
+    target_backlog_id = f"AC-DEV-READ-{row_count - 1:03d}"
+    connection.executemany(
+        """INSERT INTO backlog_bugs
+           (bug_id, title, status, priority, created_at, updated_at)
+           VALUES (?, ?, ?, 'P1', ?, ?)""",
+        [
+            (
+                f"AC-DEV-READ-{index:03d}",
+                f"AC dev read row {index}",
+                "FIXED"
+                if terminal_projection and index == row_count - 1
+                else "OPEN",
+                f"2026-08-28T17:00:{index:02d}Z",
+                f"2026-08-28T17:00:{index:02d}Z",
+            )
+            for index in range(row_count)
+        ],
+    )
+    terminal = {
+        "schema_version": "observer_command_terminal_projection.v1",
+        "source_of_truth": "Contract/Revision/Event",
+        "passed": True,
+        "canonical_contract_state": "closed",
+        "command_projection_status": "completed",
+        "divergence_reason": "source_backed_terminal_projection",
+        "canonical_route_identity": {"route_id": "route-dev-read"},
+        "superseded_route_identity": {},
+        "terminal_evidence_refs": [{"request_id": "req-dev-read"}],
+    }
+    result = (
+        {"ok": True, "terminal_contract_projection": terminal}
+        if terminal_projection
+        else {}
+    )
+    connection.execute(
+        """INSERT INTO observer_command_queue (
+               command_id, project_id, command_type, payload_json, status,
+               target_session_id, claimed_by_session_id, created_by, created_at,
+               notified_at, claimed_at, completed_at, result_json, error
+           ) VALUES (?, 'aming-claw', ?, ?, ?, '', '', 'observer', ?, ?, ?, ?, ?, '')""",
+        (
+            "cmd-dev-read-terminal" if terminal_projection else "cmd-stable-live",
+            observer_session.COMMAND_TYPE_EXECUTE_BACKLOG_ROW,
+            observer_session._json_dumps({"backlog_id": target_backlog_id}),
+            (
+                observer_session.COMMAND_STATUS_COMPLETED
+                if terminal_projection
+                else observer_session.COMMAND_STATUS_CLAIMED
+            ),
+            "2026-08-28T17:01:00Z",
+            "2026-08-28T17:01:01Z",
+            "2026-08-28T17:01:02Z",
+            "2026-08-28T17:01:03Z" if terminal_projection else "",
+            observer_session._json_dumps(result),
+        ),
+    )
+    connection.commit()
+    return target_backlog_id
+
+
 def _ctx(path_params: dict, *, method: str = "GET", query: dict | None = None, body: dict | None = None):
     return server.RequestContext(
         None,
@@ -29029,6 +29096,357 @@ def test_ac_dev_backlog_read_schema_mismatch_is_http_409_not_raw_500(
         assert captured["body"]["details"]["ddl_attempted"] is False
         assert "not authorized" not in json.dumps(captured["body"]).lower()
         assert connection.total_changes == before_changes
+    finally:
+        connection.set_authorizer(None)
+        connection.close()
+
+
+@pytest.mark.parametrize("limit", [1, 50])
+def test_ac_dev_nonempty_backlog_read_omits_only_live_recovery_without_writes(
+    monkeypatch,
+    tmp_path,
+    limit,
+):
+    connection = _file_backed_backlog_read_schema_conn(tmp_path)
+    target_backlog_id = _seed_file_backed_backlog_read_rows(
+        connection,
+        row_count=50,
+        terminal_projection=True,
+    )
+    database_path = Path(
+        connection.execute("PRAGMA database_list").fetchone()[2]
+    )
+    before_stat = database_path.stat()
+    before_file_digest = hashlib.sha256(database_path.read_bytes()).hexdigest()
+    before_data_version = connection.execute("PRAGMA data_version").fetchone()[0]
+    before_schema = _sqlite_schema_snapshot(connection)
+    before_schema_digest = server.stable_sha256(before_schema)
+    before_object_counts = tuple(
+        tuple(row)
+        for row in connection.execute(
+            "SELECT type, COUNT(*) FROM sqlite_master GROUP BY type ORDER BY type"
+        ).fetchall()
+    )
+    before_fixed_count = connection.execute(
+        "SELECT COUNT(*) FROM backlog_bugs WHERE status='FIXED'"
+    ).fetchone()[0]
+    before_changes = connection.total_changes
+    denied_actions: list[tuple[int, str | None]] = []
+
+    def tracked_dev_authorizer(action, arg1, arg2, database, source):
+        decision = governance_db._dev_schema_authorizer(
+            action,
+            arg1,
+            arg2,
+            database,
+            source,
+        )
+        if decision == sqlite3.SQLITE_DENY:
+            denied_actions.append((action, arg1))
+        return decision
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(connection),
+    )
+    monkeypatch.setattr(
+        observer_session,
+        "observer_command_consumer_recovery",
+        lambda *_args, **_kwargs: pytest.fail(
+            "dev read called the schema-owning live recovery overlay"
+        ),
+    )
+    server._backlog_read_cache_clear()
+    connection.set_authorizer(tracked_dev_authorizer)
+    try:
+        result = server.handle_backlog_list(
+            _ctx(
+                {"project_id": "aming-claw"},
+                query={
+                    "view": "compact",
+                    "limit": str(limit),
+                    "include_closed": "true",
+                },
+            )
+        )
+
+        assert result["count"] == limit
+        assert result["limit"] == limit
+        assert result["scope"]["observer_command_live_recovery"] == (
+            "optional_degraded_omitted_dev_verify_only"
+        )
+        target = next(
+            bug for bug in result["bugs"] if bug["bug_id"] == target_backlog_id
+        )
+        projection = target["observer_command_projection"]
+        assert projection["source_of_truth"] == "Contract/Revision/Event"
+        assert projection["command_projection_status"] == "completed"
+        assert projection["divergence_reason"] == (
+            "source_backed_terminal_projection"
+        )
+        assert "recovery" not in projection
+        assert connection.total_changes == before_changes
+        assert connection.in_transaction is False
+        assert denied_actions == []
+        after_schema = _sqlite_schema_snapshot(connection)
+        assert after_schema == before_schema
+        assert server.stable_sha256(after_schema) == before_schema_digest
+        assert tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT type, COUNT(*) FROM sqlite_master "
+                "GROUP BY type ORDER BY type"
+            ).fetchall()
+        ) == before_object_counts
+        assert connection.execute(
+            "SELECT COUNT(*) FROM backlog_bugs WHERE status='FIXED'"
+        ).fetchone()[0] == before_fixed_count
+        assert connection.execute("PRAGMA data_version").fetchone()[0] == (
+            before_data_version
+        )
+        after_stat = database_path.stat()
+        assert (
+            after_stat.st_dev,
+            after_stat.st_ino,
+            after_stat.st_size,
+            after_stat.st_mtime_ns,
+        ) == (
+            before_stat.st_dev,
+            before_stat.st_ino,
+            before_stat.st_size,
+            before_stat.st_mtime_ns,
+        )
+        assert hashlib.sha256(database_path.read_bytes()).hexdigest() == (
+            before_file_digest
+        )
+    finally:
+        connection.set_authorizer(None)
+        connection.close()
+
+
+def test_stable_nonempty_backlog_read_keeps_dynamic_recovery_overlay(
+    monkeypatch,
+    tmp_path,
+):
+    connection = _file_backed_backlog_read_schema_conn(tmp_path)
+    target_backlog_id = _seed_file_backed_backlog_read_rows(
+        connection,
+        row_count=1,
+        terminal_projection=False,
+    )
+    calls: list[str] = []
+
+    def live_recovery(_connection, *, project_id):
+        calls.append(project_id)
+        return {
+            "status": "blocked",
+            "classification": "claimed_execute_missing_startup",
+            "blocked_command_id": "cmd-stable-live",
+            "computed_status": "claimed",
+            "next_legal_action": {"action": "record_mf_subagent_startup"},
+        }
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(connection),
+    )
+    monkeypatch.setattr(
+        observer_session,
+        "observer_command_consumer_recovery",
+        live_recovery,
+    )
+    server._backlog_read_cache_clear()
+    try:
+        result = server.handle_backlog_list(
+            _ctx(
+                {"project_id": "aming-claw"},
+                query={"view": "compact", "limit": "1"},
+            )
+        )
+
+        assert calls == ["aming-claw"]
+        assert "observer_command_live_recovery" not in result["scope"]
+        target = next(
+            bug for bug in result["bugs"] if bug["bug_id"] == target_backlog_id
+        )
+        assert target["observer_command_projection"]["recovery"][
+            "classification"
+        ] == "claimed_execute_missing_startup"
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("drift", "expected_component"),
+    [
+        ("drop_index", "keyset_index"),
+        ("delete_seed", "backlog_generation_seed"),
+        ("replace_trigger", "trigger_insert_definition"),
+    ],
+)
+def test_ac_dev_backlog_read_detects_separate_connection_schema_toctou(
+    monkeypatch,
+    tmp_path,
+    drift,
+    expected_component,
+):
+    connection = _file_backed_backlog_read_schema_conn(tmp_path)
+    _seed_file_backed_backlog_read_rows(
+        connection,
+        row_count=2,
+        terminal_projection=True,
+    )
+    database_path = Path(
+        connection.execute("PRAGMA database_list").fetchone()[2]
+    )
+    before_changes = connection.total_changes
+    denied_actions: list[tuple[int, str | None]] = []
+
+    def tracked_dev_authorizer(action, arg1, arg2, database, source):
+        decision = governance_db._dev_schema_authorizer(
+            action,
+            arg1,
+            arg2,
+            database,
+            source,
+        )
+        if decision == sqlite3.SQLITE_DENY:
+            denied_actions.append((action, arg1))
+        return decision
+
+    original_authority = server._backlog_read_authority
+    mutation_performed = False
+
+    def drift_then_read_authority(
+        read_connection,
+        project_id,
+        *,
+        require_verified_seed=False,
+    ):
+        nonlocal mutation_performed
+        assert mutation_performed is False
+        mutation_performed = True
+        writer = sqlite3.connect(database_path)
+        try:
+            if drift == "drop_index":
+                writer.execute("DROP INDEX idx_backlog_bugs_dashboard_keyset")
+            elif drift == "delete_seed":
+                writer.execute(
+                    "DELETE FROM dashboard_backlog_cache_generation "
+                    "WHERE resource='backlog'"
+                )
+            elif drift == "replace_trigger":
+                writer.execute(
+                    "DROP TRIGGER trg_dashboard_backlog_cache_insert"
+                )
+                writer.execute(
+                    "CREATE TRIGGER trg_dashboard_backlog_cache_insert "
+                    "AFTER INSERT ON backlog_bugs BEGIN SELECT 1; END"
+                )
+            else:
+                raise AssertionError(f"unhandled drift: {drift}")
+            writer.commit()
+        finally:
+            writer.close()
+        return original_authority(
+            read_connection,
+            project_id,
+            require_verified_seed=require_verified_seed,
+        )
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(connection),
+    )
+    server._backlog_read_cache_clear()
+    connection.set_authorizer(tracked_dev_authorizer)
+    try:
+        control = server.handle_backlog_list(
+            _ctx(
+                {"project_id": "aming-claw"},
+                query={"view": "compact", "limit": "1"},
+            )
+        )
+        assert control["count"] == 1
+        assert control["read_cache"]["miss"] is True
+        assert connection.total_changes == before_changes
+        monkeypatch.setattr(
+            server,
+            "_backlog_read_authority",
+            drift_then_read_authority,
+        )
+        with pytest.raises(GovernanceError) as exc_info:
+            server.handle_backlog_list(
+                _ctx(
+                    {"project_id": "aming-claw"},
+                    query={"view": "compact", "limit": "1"},
+                )
+            )
+
+        assert mutation_performed is True
+        assert exc_info.value.code == "ac_dev_backlog_read_schema_incompatible"
+        assert exc_info.value.status == 409
+        assert expected_component in exc_info.value.details[
+            "incompatible_components"
+        ]
+        assert exc_info.value.details["writes_performed"] is False
+        assert connection.total_changes == before_changes
+        assert connection.in_transaction is False
+        assert denied_actions == []
+    finally:
+        connection.set_authorizer(None)
+        connection.close()
+
+
+def test_ac_dev_backlog_read_maps_intervening_sqlite_error_to_typed_409(
+    monkeypatch,
+    tmp_path,
+):
+    connection = _file_backed_backlog_read_schema_conn(tmp_path)
+    _seed_file_backed_backlog_read_rows(
+        connection,
+        row_count=1,
+        terminal_projection=True,
+    )
+    before_changes = connection.total_changes
+    connection.set_authorizer(governance_db._dev_schema_authorizer)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        server,
+        "get_connection",
+        lambda _project_id: _NoCloseConn(connection),
+    )
+    monkeypatch.setattr(
+        server,
+        "_attach_observer_command_projections",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.DatabaseError("simulated schema-change read failure")
+        ),
+    )
+    server._backlog_read_cache_clear()
+    try:
+        with pytest.raises(GovernanceError) as exc_info:
+            server.handle_backlog_list(
+                _ctx(
+                    {"project_id": "aming-claw"},
+                    query={"view": "compact", "limit": "1"},
+                )
+            )
+
+        assert exc_info.value.code == "ac_dev_backlog_read_schema_incompatible"
+        assert exc_info.value.status == 409
+        assert exc_info.value.details["incompatible_components"] == [
+            "schema_changed_during_read"
+        ]
+        assert exc_info.value.details["writes_performed"] is False
+        assert connection.total_changes == before_changes
+        assert connection.in_transaction is False
     finally:
         connection.set_authorizer(None)
         connection.close()

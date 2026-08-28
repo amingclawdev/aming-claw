@@ -806,10 +806,23 @@ AC repair work uses two independent runtime planes:
   SQL, exact trigger owner/event/body, and a valid seed. This path issues no
   DDL, DML, commit, temporary object, migration, backfill, or journal-mode
   operation; the normal pagination, authority, generation, cache, and response
-  budgets are unchanged. Any missing or drifted object fails before the read
-  with HTTP 409 `ac_dev_backlog_read_schema_incompatible`, bounded public-safe
-  component names, and explicit `writes_performed=false`. Dev does not repair
-  or lazily initialize this schema.
+  budgets are unchanged. Verification runs before any cache/data read and again
+  after page, cache, and projection materialization immediately before the
+  response returns. The dev authority read requires the real valid seed and
+  never substitutes generation `1` for a missing row. A concurrent table,
+  index, trigger, or seed change, or an intervening SQLite error, therefore
+  fails with HTTP 409 `ac_dev_backlog_read_schema_incompatible`, bounded
+  public-safe component names, and explicit `writes_performed=false`. Dev does
+  not repair or lazily initialize this schema.
+- Backlog projection in dev continues to read `observer_command_queue` and
+  preserves durable terminal `result_json` projections. It omits only the
+  optional live `observer_command_consumer_recovery` overlay because that
+  helper owns lazy schema initialization. Dev responses state this narrow
+  degradation under `scope.observer_command_live_recovery` with value
+  `optional_degraded_omitted_dev_verify_only`; absence of a live recovery
+  overlay is not evidence that no recovery is required.
+  Stable/generic responses keep the dynamic overlay and their existing response
+  shape, without the dev-only marker.
 - A separate discovery capability may read a non-AC project only when its
   exact normalized key is already initialized and active in `projects.json`,
   its governance policy says `public_safe=true`, and its project directory and

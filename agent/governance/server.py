@@ -205165,7 +205165,13 @@ def _observer_command_recovery_projection(recovery: Mapping[str, Any] | dict) ->
     }
 
 
-def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]) -> None:
+def _attach_observer_command_projections(
+    conn,
+    project_id: str,
+    bugs: list[dict],
+    *,
+    include_live_recovery_overlay: bool = True,
+) -> None:
     bug_ids = {str(bug.get("bug_id") or "").strip() for bug in bugs if bug.get("bug_id")}
     if not bug_ids:
         return
@@ -205189,15 +205195,18 @@ def _attach_observer_command_projections(conn, project_id: str, bugs: list[dict]
         if "no such table" in str(exc).lower():
             return
         raise
-    try:
-        recovery_projection = _observer_command_recovery_projection(
-            observer_session.observer_command_consumer_recovery(conn, project_id=project_id)
-        )
-    except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc).lower():
-            recovery_projection = {}
-        else:
-            raise
+    recovery_projection: dict[str, Any] = {}
+    if include_live_recovery_overlay:
+        try:
+            recovery_projection = _observer_command_recovery_projection(
+                observer_session.observer_command_consumer_recovery(
+                    conn,
+                    project_id=project_id,
+                )
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
     recovery_command_id = str(recovery_projection.get("blocked_command_id") or "")
     projections: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -205545,6 +205554,8 @@ def _ac_dev_verify_backlog_read_schema(conn: sqlite3.Connection) -> None:
 def _backlog_read_authority(
     conn: sqlite3.Connection,
     project_id: str,
+    *,
+    require_verified_seed: bool = False,
 ) -> tuple[int, str]:
     """Return project-local mutation generation plus dynamic authority digest."""
 
@@ -205555,8 +205566,20 @@ def _backlog_read_authority(
          WHERE resource = 'backlog'
         """
     ).fetchone()
-    generation = int(_row_get(row, "generation", 1) or 1)
-    generation_updated_at = str(_row_get(row, "updated_at", "") or "")
+    raw_generation = _row_get(row, "generation", None)
+    raw_generation_updated_at = _row_get(row, "updated_at", None)
+    if require_verified_seed and not (
+        row is not None
+        and type(raw_generation) is int
+        and raw_generation >= 1
+        and type(raw_generation_updated_at) is str
+        and bool(raw_generation_updated_at)
+    ):
+        raise _ac_dev_backlog_read_schema_incompatible(
+            ["backlog_generation_seed"]
+        )
+    generation = int(raw_generation or 1)
+    generation_updated_at = str(raw_generation_updated_at or "")
     try:
         database_rows = conn.execute("PRAGMA database_list").fetchall()
         database_path = next(
@@ -205751,15 +205774,21 @@ def handle_backlog_list(ctx: RequestContext):
             "historical backlog pages require next_cursor; offset pagination is not supported",
             400,
         )
+    dev_runtime = _runtime_plane() == "dev"
+    dev_verify_only = bool(optimized and dev_runtime)
     conn = get_connection(pid)
     try:
         if optimized:
-            if _runtime_plane() == "dev":
+            if dev_verify_only:
                 _ac_dev_verify_backlog_read_schema(conn)
             else:
                 _ensure_backlog_read_schema(conn)
         generation, authority_generation = (
-            _backlog_read_authority(conn, pid)
+            _backlog_read_authority(
+                conn,
+                pid,
+                require_verified_seed=dev_verify_only,
+            )
             if optimized
             else (0, "legacy-full")
         )
@@ -205807,7 +205836,12 @@ def handle_backlog_list(ctx: RequestContext):
                         "backlog": bug_id,
                     }
                 )
-            _attach_observer_command_projections(conn, pid, bugs)
+            _attach_observer_command_projections(
+                conn,
+                pid,
+                bugs,
+                include_live_recovery_overlay=not dev_runtime,
+            )
             total_count = int(
                 conn.execute(
                     "SELECT COUNT(*) AS count FROM backlog_bugs"
@@ -205817,6 +205851,40 @@ def handle_backlog_list(ctx: RequestContext):
             oldest_cursor = _backlog_stable_cursor(
                 page_rows[-1] if page_rows else None
             )
+            scope = {
+                "schema_version": (
+                    "backlog.hot_window_scope.v1"
+                    if canonical_hot_window
+                    else "backlog.indexed_history_scope.v1"
+                ),
+                "project_id": pid,
+                "status": _first_query_value(query, "status").strip(),
+                "priority": _first_query_value(query, "priority").strip(),
+                "q": search,
+                "include_closed": include_closed,
+                "view": view,
+                "public_safe": True,
+                "bounded": limit is not None,
+                "facets": (
+                    ["status", "priority"]
+                    if canonical_hot_window
+                    else []
+                ),
+                "recent_scope": (
+                    f"newest {_BACKLOG_HOT_WINDOW_LIMIT}"
+                    if canonical_hot_window
+                    else ""
+                ),
+                "pagination": (
+                    "hot_window"
+                    if canonical_hot_window
+                    else "sqlite_indexed_keyset"
+                ),
+            }
+            if dev_runtime:
+                scope["observer_command_live_recovery"] = (
+                    "optional_degraded_omitted_dev_verify_only"
+                )
             return {
                 "bugs": bugs,
                 "count": len(bugs),
@@ -205841,36 +205909,7 @@ def handle_backlog_list(ctx: RequestContext):
                 "history_available": has_more,
                 "generation": generation,
                 "authority_generation": authority_generation,
-                "scope": {
-                    "schema_version": (
-                        "backlog.hot_window_scope.v1"
-                        if canonical_hot_window
-                        else "backlog.indexed_history_scope.v1"
-                    ),
-                    "project_id": pid,
-                    "status": _first_query_value(query, "status").strip(),
-                    "priority": _first_query_value(query, "priority").strip(),
-                    "q": search,
-                    "include_closed": include_closed,
-                    "view": view,
-                    "public_safe": True,
-                    "bounded": limit is not None,
-                    "facets": (
-                        ["status", "priority"]
-                        if canonical_hot_window
-                        else []
-                    ),
-                    "recent_scope": (
-                        f"newest {_BACKLOG_HOT_WINDOW_LIMIT}"
-                        if canonical_hot_window
-                        else ""
-                    ),
-                    "pagination": (
-                        "hot_window"
-                        if canonical_hot_window
-                        else "sqlite_indexed_keyset"
-                    ),
-                },
+                "scope": scope,
                 "summary": _backlog_summary(conn),
             }
 
@@ -205919,7 +205958,15 @@ def handle_backlog_list(ctx: RequestContext):
                 else "sqlite_indexed_keyset"
             )
         result["read_cache"] = read_cache
+        if dev_verify_only:
+            _ac_dev_verify_backlog_read_schema(conn)
         return result
+    except sqlite3.Error:
+        if dev_verify_only:
+            raise _ac_dev_backlog_read_schema_incompatible(
+                ["schema_changed_during_read"]
+            ) from None
+        raise
     finally:
         conn.close()
 
