@@ -1231,158 +1231,26 @@ def registered_public_safe_external_project(project_id: str) -> dict:
     db_stat = _external_read_path_identity(db_path, kind="governance database")
     if db_path.parent.resolve(strict=True) != project_dir.resolve(strict=True):
         raise ValueError("registered governance database escaped project directory")
+    for suffix in ("-wal", "-shm", "-journal"):
+        companion = Path(str(db_path) + suffix)
+        try:
+            companion.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        _external_read_path_identity(
+            companion,
+            kind=f"SQLite companion {suffix}",
+        )
     return {
         "project_id": canonical,
         "name": str(entry.get("name") or canonical),
         "status": "active",
         "initialized": True,
         "public_safe": True,
-        "db_path": db_path,
         "db_device": int(db_stat.st_dev),
         "db_inode": int(db_stat.st_ino),
+        "storage_validated_without_database_open": True,
     }
-
-
-def _external_database_fingerprint(db_path: Path) -> tuple[tuple[str, bool, int, int, int, int], ...]:
-    result: list[tuple[str, bool, int, int, int, int]] = []
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        candidate = Path(str(db_path) + suffix)
-        try:
-            current = candidate.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            result.append((suffix or "database", False, 0, 0, 0, 0))
-            continue
-        result.append(
-            (
-                suffix or "database",
-                True,
-                int(current.st_dev),
-                int(current.st_ino),
-                int(current.st_size),
-                int(current.st_mtime_ns),
-            )
-        )
-    return tuple(result)
-
-
-_EXTERNAL_DENIED_WRITE_ACTIONS = frozenset(
-    code
-    for name in (
-        "SQLITE_INSERT",
-        "SQLITE_UPDATE",
-        "SQLITE_DELETE",
-        "SQLITE_ALTER_TABLE",
-        "SQLITE_ANALYZE",
-        "SQLITE_ATTACH",
-        "SQLITE_CREATE_INDEX",
-        "SQLITE_CREATE_TABLE",
-        "SQLITE_CREATE_TRIGGER",
-        "SQLITE_CREATE_VIEW",
-        "SQLITE_CREATE_VTABLE",
-        "SQLITE_DETACH",
-        "SQLITE_DROP_INDEX",
-        "SQLITE_DROP_TABLE",
-        "SQLITE_DROP_TRIGGER",
-        "SQLITE_DROP_VIEW",
-        "SQLITE_DROP_VTABLE",
-        "SQLITE_REINDEX",
-    )
-    if isinstance((code := getattr(sqlite3, name, None)), int)
-)
-
-
-def _external_read_authorizer(
-    action: int,
-    arg1: str | None,
-    arg2: str | None,
-    _database: str | None,
-    _source: str | None,
-) -> int:
-    if action in _EXTERNAL_DENIED_WRITE_ACTIONS:
-        return sqlite3.SQLITE_DENY
-    if action == getattr(sqlite3, "SQLITE_PRAGMA", -1) and arg2 not in (None, ""):
-        return sqlite3.SQLITE_DENY
-    return sqlite3.SQLITE_OK
-
-
-class ExternalReadOnlyConnection:
-    """Context-bound external reader with exact storage zero-change proof."""
-
-    def __init__(self, project_id: str, *, busy_timeout: int = 5000):
-        self.project = registered_public_safe_external_project(project_id)
-        self.db_path = Path(self.project["db_path"])
-        self.busy_timeout = int(busy_timeout)
-        self.before = _external_database_fingerprint(self.db_path)
-        self.conn: sqlite3.Connection | None = None
-
-    def __enter__(self) -> sqlite3.Connection:
-        # SQLite's ordinary read-only WAL open creates ``-wal``/``-shm`` when
-        # they are absent.  The dev plane must never be the process that does
-        # that.  WAL databases therefore require an already-live companion
-        # pair (normally owned by the stable service); otherwise discovery
-        # fails before sqlite3.connect.  We intentionally do not use
-        # ``immutable=1`` because it can ignore committed WAL content.
-        with self.db_path.open("rb") as database_file:
-            header = database_file.read(20)
-        wal_mode = len(header) >= 20 and header[18:20] == b"\x02\x02"
-        before_by_name = {item[0]: item for item in self.before}
-        if wal_mode and not (
-            before_by_name.get("-wal", ("", False))[1]
-            and before_by_name.get("-shm", ("", False))[1]
-        ):
-            raise RuntimeError(
-                "external WAL database lacks stable-owned WAL/SHM companions"
-            )
-        uri = self.db_path.absolute().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(
-            uri,
-            timeout=self.busy_timeout / 1000.0,
-            uri=True,
-        )
-        try:
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA query_only=ON")
-            conn.execute(f"PRAGMA busy_timeout={self.busy_timeout}")
-            database_file = str(conn.execute("PRAGMA database_list").fetchone()[2] or "")
-            if Path(database_file).resolve(strict=True) != self.db_path.absolute():
-                raise ValueError("external read-only database identity mismatch")
-            conn.set_authorizer(_external_read_authorizer)
-            if _external_database_fingerprint(self.db_path) != self.before:
-                raise RuntimeError("external database changed while opening read-only connection")
-        except Exception:
-            conn.close()
-            raise
-        self.conn = conn
-        return conn
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        close_error: Exception | None = None
-        if self.conn is not None:
-            try:
-                if self.conn.total_changes != 0:
-                    close_error = RuntimeError(
-                        "external read-only connection reported SQLite changes"
-                    )
-            finally:
-                self.conn.close()
-        after = _external_database_fingerprint(self.db_path)
-        if after != self.before and close_error is None:
-            close_error = RuntimeError(
-                "external database or SQLite companion metadata changed during read"
-            )
-        if close_error is not None and exc_type is None:
-            raise close_error
-        return False
-
-
-def external_read_only_connection(
-    project_id: str,
-    *,
-    busy_timeout: int = 5000,
-) -> ExternalReadOnlyConnection:
-    """Return the only connection allowed for non-AC reads on the dev plane."""
-
-    return ExternalReadOnlyConnection(project_id, busy_timeout=busy_timeout)
 
 
 def _resolve_project_dir(project_id: str) -> Path:

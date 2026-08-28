@@ -808,16 +808,19 @@ AC repair work uses two independent runtime planes:
   session authority and never implies managed PASS. Runtime/source/commit,
   route, task, CEX, QA-session, mismatched nested-project, and unknown
   selectors fail before a handler.
-- External discovery bypasses the normal backlog, graph, dashboard, queue, and
-  Onboard handlers. Its dedicated SQLite connection uses URI `mode=ro`,
-  `query_only=ON`, and a deny-write authorizer; it never calls schema setup,
-  migration, backfill, or journal-mode code. Database, WAL, SHM, and rollback
-  journal identity/size/mtime/existence must be identical before and after the
-  read and `total_changes` must remain zero. A WAL database without an already
-  existing stable-owned WAL/SHM pair fails before connect, because a normal
-  read-only SQLite open would otherwise create those sidecars; `immutable=1`
-  is forbidden because it could omit committed WAL content. Every other
-  non-AC surface remains a pre-handler zero-write rejection.
+- External discovery never opens a non-AC `governance.db`, WAL, SHM, or rollback
+  journal. Registration validates those existing paths and rejects symlink or
+  non-regular storage, but the dev process has no external SQLite capability.
+  Backlog list/item and active graph status use hard-coded loopback
+  `127.0.0.1:40000` GETs owned by stable. The proxy sends no caller headers,
+  credentials, body, or query selectors; refuses redirects; bounds timeout and
+  response bytes; and validates exact stable plane/port/loaded-anchor/non-stale
+  identity both before and after each GET. Stable PID and database identity,
+  when present, must also remain equal. It then republishes only explicit
+  public-safe fields. Transport, HTTP, JSON, schema, size, privacy, or identity
+  drift fails closed. External Onboard is a local typed redirect to fresh
+  stable Onboard and does not call stable Onboard or any authority mint path.
+  Every other non-AC surface remains a pre-handler zero-write rejection.
 - Dev may append repair backlog, timeline, ContractRuntime, candidate graph,
   and independent-QA evidence. It cannot activate/finalize current-full,
   rewrite stable version identity, run stable deployment endpoints, or join

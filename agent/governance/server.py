@@ -21,6 +21,7 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+import http.client
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from threading import BoundedSemaphore, Event, RLock, local
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
@@ -53,7 +54,6 @@ from .db import (
     validate_project_id,
     validate_project_id_syntax,
     registered_public_safe_external_project,
-    external_read_only_connection,
     verify_existing_schema_capabilities,
 )
 from . import role_service
@@ -3683,26 +3683,280 @@ def _dev_external_public_project(project_id: str) -> dict[str, Any]:
     registered = registered_public_safe_external_project(project_id)
     return {
         "project_id": str(registered.get("project_id") or ""),
-        "name": str(registered.get("name") or project_id),
         "status": "active",
         "initialized": True,
         "public_safe": True,
     }
 
 
-def _dev_external_public_backlog_row(row: sqlite3.Row) -> dict[str, Any] | None:
-    raw = dict(row)
-    privacy_level, public_safe = _backlog_compact_bug_privacy(raw)
+_DEV_STABLE_PROXY_ORIGIN = "http://127.0.0.1:40000"
+_DEV_STABLE_PROXY_HEALTH_BYTES = 64 * 1024
+_DEV_STABLE_PROXY_RESPONSE_BYTES = 256 * 1024
+_DEV_STABLE_PROXY_TIMEOUT_SECONDS = 3.0
+
+
+class _DevStableProxyNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _dev_stable_proxy_failure(
+    code: str,
+    detail: str,
+    *,
+    status: int = 502,
+) -> GovernanceError:
+    return GovernanceError(
+        code,
+        "AC dev external discovery could not verify the stable read authority",
+        status,
+        {
+            "schema_version": _DEV_EXTERNAL_DISCOVERY_SCHEMA_VERSION,
+            "runtime_plane": "dev",
+            "stable_service_port": AC_STABLE_SERVICE_PORT,
+            "detail": detail,
+            "read_only": True,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "managed_pass": False,
+            "pass_implied": False,
+        },
+    )
+
+
+def _dev_stable_proxy_json(
+    path: str,
+    *,
+    max_bytes: int,
+) -> dict[str, Any]:
+    """GET one exact stable loopback path without credentials or redirects."""
+
+    if (
+        not path.startswith("/api/")
+        or "//" in path
+        or "#" in path
+        or any(ord(char) < 0x20 for char in path)
+    ):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_path_rejected",
+            "stable proxy path failed the exact local-path contract",
+            status=400,
+        )
+    url = _DEV_STABLE_PROXY_ORIGIN + path
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _DevStableProxyNoRedirect(),
+    )
+    try:
+        with opener.open(
+            request,
+            timeout=_DEV_STABLE_PROXY_TIMEOUT_SECONDS,
+        ) as response:
+            status = int(response.getcode())
+            final_url = str(response.geturl() or "")
+            if status != 200:
+                raise _dev_stable_proxy_failure(
+                    "ac_dev_stable_proxy_status_rejected",
+                    "stable GET did not return HTTP 200",
+                )
+            if final_url != url:
+                raise _dev_stable_proxy_failure(
+                    "ac_dev_stable_proxy_redirect_rejected",
+                    "stable GET changed origin or path",
+                )
+            content_type = str(response.headers.get("Content-Type") or "")
+            if content_type.split(";", 1)[0].strip().lower() != "application/json":
+                raise _dev_stable_proxy_failure(
+                    "ac_dev_stable_proxy_content_type_rejected",
+                    "stable GET did not return application/json",
+                )
+            content_length = str(response.headers.get("Content-Length") or "").strip()
+            if content_length:
+                try:
+                    declared_length = int(content_length)
+                except ValueError as exc:
+                    raise _dev_stable_proxy_failure(
+                        "ac_dev_stable_proxy_size_rejected",
+                        "stable GET returned an invalid Content-Length",
+                    ) from exc
+                if declared_length < 0 or declared_length > max_bytes:
+                    raise _dev_stable_proxy_failure(
+                        "ac_dev_stable_proxy_size_rejected",
+                        "stable GET exceeded the bounded response size",
+                    )
+            payload_bytes = response.read(max_bytes + 1)
+    except GovernanceError:
+        raise
+    except urllib.error.HTTPError as exc:
+        code = (
+            "ac_dev_stable_proxy_redirect_rejected"
+            if 300 <= int(exc.code or 0) < 400
+            else "ac_dev_stable_proxy_status_rejected"
+        )
+        raise _dev_stable_proxy_failure(
+            code,
+            "stable GET was rejected before a bounded response was accepted",
+        ) from exc
+    except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_transport_failed",
+            "stable loopback transport failed",
+        ) from exc
+    if not payload_bytes or len(payload_bytes) > max_bytes:
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_size_rejected",
+            "stable GET returned an empty or oversized response",
+        )
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_json_rejected",
+            "stable GET returned invalid JSON",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable GET response must be a JSON object",
+        )
+    return payload
+
+
+def _dev_stable_proxy_health_identity() -> dict[str, Any]:
+    health = _dev_stable_proxy_json(
+        "/api/health",
+        max_bytes=_DEV_STABLE_PROXY_HEALTH_BYTES,
+    )
+    identity = health.get("runtime_plane_identity")
+    identity = dict(identity) if isinstance(identity, Mapping) else {}
+    expected_anchor = str(os.environ.get(_STABLE_ANCHOR_ENV) or "").strip().lower()
+    loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
+    stable_database_identity = identity.get("stable_database_identity")
+    stable_database_identity = (
+        dict(stable_database_identity)
+        if isinstance(stable_database_identity, Mapping)
+        else {}
+    )
+    pid = health.get("pid")
+    identity_pid = identity.get("pid")
+    if not (
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_anchor)
+        and health.get("status") == "ok"
+        and health.get("service") == "governance"
+        and health.get("port") == AC_STABLE_SERVICE_PORT
+        and health.get("runtime_plane") == "stable"
+        and health.get("runtime_stale") is False
+        and loaded == expected_anchor
+        and identity.get("status") == "ready"
+        and identity.get("plane") == "stable"
+        and identity.get("branch") == AC_STABLE_BRANCH
+        and identity.get("port") == AC_STABLE_SERVICE_PORT
+        and identity.get("expected_port") == AC_STABLE_SERVICE_PORT
+        and identity.get("commit") == expected_anchor
+        and identity.get("stable_anchor_commit") == expected_anchor
+        and isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 0
+        and identity_pid == pid
+        and (
+            not stable_database_identity
+            or _ac_stable_database_identity_valid(stable_database_identity)
+        )
+    ):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_identity_rejected",
+            "stable health did not match the exact loaded stable anchor",
+            status=409,
+        )
+    return {
+        "loaded_commit": loaded,
+        "pid": pid,
+        "stable_database_identity": stable_database_identity,
+    }
+
+
+def _dev_stable_external_public_get(path: str) -> dict[str, Any]:
+    before = _dev_stable_proxy_health_identity()
+    payload = _dev_stable_proxy_json(
+        path,
+        max_bytes=_DEV_STABLE_PROXY_RESPONSE_BYTES,
+    )
+    after = _dev_stable_proxy_health_identity()
+    if after != before:
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_identity_drift",
+            "stable identity changed across the bounded GET",
+            status=409,
+        )
+    return payload
+
+
+def _dev_external_public_backlog_row(
+    raw: Mapping[str, Any],
+    *,
+    require_explicit_public_safe: bool = False,
+) -> dict[str, Any] | None:
+    if not all(
+        isinstance(raw.get(field), str)
+        for field in ("bug_id", "title", "status", "priority")
+    ):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable backlog row is missing its public compact identity",
+        )
+    bug_id = str(raw.get("bug_id") or "")
+    status = str(raw.get("status") or "")
+    priority = str(raw.get("priority") or "")
+    timestamps = [
+        str(raw.get(field) or "")
+        for field in ("created_at", "updated_at", "fixed_at")
+    ]
+    if not (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,191}", bug_id)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", status)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", priority)
+        and all(
+            len(value) <= 64
+            and not any(ord(char) < 0x20 for char in value)
+            for value in timestamps
+        )
+    ):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable backlog row contains an invalid bounded public field",
+        )
+    # Stable compact responses already carry the authoritative public-safe
+    # projection.  Preserve an explicit false instead of falling through to
+    # the legacy raw-row default (which predates that top-level field).
+    if require_explicit_public_safe and not isinstance(raw.get("public_safe"), bool):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable compact backlog row omitted its public-safe classification",
+        )
+    if "public_safe" in raw and raw.get("public_safe") is not True:
+        return None
+    privacy_level, public_safe = _backlog_compact_bug_privacy(dict(raw))
     if not public_safe:
         return None
+    if privacy_level != "public":
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_privacy_rejected",
+            "stable backlog row has an unsupported privacy classification",
+        )
     return {
-        "bug_id": str(raw.get("bug_id") or ""),
+        "bug_id": bug_id,
         "title": _compact_preview(raw.get("title"), limit=240),
-        "status": str(raw.get("status") or ""),
-        "priority": str(raw.get("priority") or ""),
-        "created_at": str(raw.get("created_at") or ""),
-        "updated_at": str(raw.get("updated_at") or ""),
-        "fixed_at": str(raw.get("fixed_at") or ""),
+        "status": status,
+        "priority": priority,
+        "created_at": timestamps[0],
+        "updated_at": timestamps[1],
+        "fixed_at": timestamps[2],
         "privacy_level": privacy_level,
         "public_safe": True,
         "compact": True,
@@ -3710,7 +3964,6 @@ def _dev_external_public_backlog_row(row: sqlite3.Row) -> dict[str, Any] | None:
 
 
 def _dev_external_backlog_list_projection(
-    conn: sqlite3.Connection,
     project_id: str,
     query: Mapping[str, Any],
     *,
@@ -3725,29 +3978,41 @@ def _dev_external_backlog_list_projection(
             "external backlog discovery limit must be an integer from 1 to 50",
             400,
         ) from exc
-    sql = "SELECT * FROM backlog_bugs WHERE 1=1"
-    params: list[Any] = []
     status_filter = str(_first_query_value(query, "status") or "").strip()
     priority_filter = str(_first_query_value(query, "priority") or "").strip()
-    if status_filter:
-        sql += " AND UPPER(status) = UPPER(?)"
-        params.append(status_filter)
-    if priority_filter:
-        sql += " AND UPPER(priority) = UPPER(?)"
-        params.append(priority_filter)
-    if not _query_bool(query, "include_closed", True):
-        placeholders = ",".join("?" for _ in _BACKLOG_CLOSED_STATUSES)
-        sql += f" AND UPPER(status) NOT IN ({placeholders})"
-        params.extend(_BACKLOG_CLOSED_STATUSES)
-    sql += " ORDER BY updated_at DESC, created_at DESC, bug_id DESC LIMIT ?"
-    # Fetch a bounded over-window so private rows do not crowd out all public
-    # rows while never turning discovery into an unbounded scan.
-    params.append(min(200, limit * 4))
-    rows = conn.execute(sql, params).fetchall()
+    stable = _dev_stable_external_public_get(
+        f"/api/backlog/{quote(project_id, safe='')}"
+        "?view=compact&limit=50&include_closed=true"
+    )
+    rows = stable.get("bugs")
+    if stable.get("view") != "compact" or not isinstance(rows, list):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable backlog list did not return the bounded compact schema",
+        )
+    if len(rows) > 50 or not all(isinstance(row, Mapping) for row in rows):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable backlog list exceeded its row bound or contained a bad row",
+        )
     public_rows = [
         projected
         for row in rows
-        if (projected := _dev_external_public_backlog_row(row)) is not None
+        if (
+            projected := _dev_external_public_backlog_row(
+                row,
+                require_explicit_public_safe=True,
+            )
+        ) is not None
+        and (not status_filter or projected["status"].upper() == status_filter.upper())
+        and (
+            not priority_filter
+            or projected["priority"].upper() == priority_filter.upper()
+        )
+        and (
+            _query_bool(query, "include_closed", True)
+            or projected["status"].upper() not in _BACKLOG_CLOSED_STATUSES
+        )
     ][:limit]
     return {
         "schema_version": "ac_dev_external_public_backlog.v1",
@@ -3762,20 +4027,29 @@ def _dev_external_backlog_list_projection(
 
 
 def _dev_external_backlog_item_projection(
-    conn: sqlite3.Connection,
     project_id: str,
     backlog_id: str,
 ) -> dict[str, Any]:
-    row = conn.execute(
-        "SELECT * FROM backlog_bugs WHERE bug_id = ?",
-        (backlog_id,),
-    ).fetchone()
-    projected = _dev_external_public_backlog_row(row) if row is not None else None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,191}", backlog_id):
+        raise _dev_external_discovery_rejection(
+            code="ac_dev_external_backlog_identity_rejected",
+            path=f"/api/backlog/{project_id}",
+            detail="external backlog_id is not a safe exact path segment",
+        )
+    stable = _dev_stable_external_public_get(
+        f"/api/backlog/{quote(project_id, safe='')}/{quote(backlog_id, safe='')}"
+    )
+    if str(stable.get("bug_id") or "") != backlog_id:
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable backlog item identity did not match the request",
+        )
+    projected = _dev_external_public_backlog_row(stable)
     if projected is None:
         raise GovernanceError(
-            "not_found",
-            "public-safe backlog item not found",
-            404,
+            "ac_dev_stable_proxy_private_backlog_rejected",
+            "stable backlog item is not public-safe",
+            409,
             {
                 "project_id": project_id,
                 "backlog_id": backlog_id,
@@ -3794,38 +4068,40 @@ def _dev_external_backlog_item_projection(
 
 
 def _dev_external_graph_status_projection(
-    conn: sqlite3.Connection,
     project_id: str,
 ) -> dict[str, Any]:
-    row = conn.execute(
-        """
-        SELECT r.snapshot_id,
-               r.commit_sha,
-               r.updated_at AS ref_updated_at,
-               s.status AS snapshot_status,
-               s.snapshot_kind,
-               s.created_at AS snapshot_created_at
-          FROM graph_snapshot_refs AS r
-          LEFT JOIN graph_snapshots AS s
-            ON s.project_id = r.project_id
-           AND s.snapshot_id = r.snapshot_id
-         WHERE r.project_id = ? AND r.ref_name = 'active'
-         LIMIT 1
-        """,
-        (project_id,),
-    ).fetchone()
+    stable = _dev_stable_external_public_get(
+        f"/api/graph-governance/{quote(project_id, safe='')}/status"
+    )
+    if stable.get("ok") is not True or str(stable.get("project_id") or "") != project_id:
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable graph status identity did not match the request",
+        )
+    active_snapshot_id = str(stable.get("active_snapshot_id") or "")
+    active_commit = str(stable.get("graph_snapshot_commit") or "")
+    if bool(active_snapshot_id) != bool(active_commit):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable graph status returned a partial active snapshot identity",
+        )
+    if active_snapshot_id and not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", active_snapshot_id):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable graph snapshot identity is malformed",
+        )
+    if active_commit and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", active_commit):
+        raise _dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_schema_rejected",
+            "stable graph commit identity is malformed",
+        )
     return {
         "schema_version": "ac_dev_external_public_graph_status.v1",
         "project_id": project_id,
-        "graph_available": row is not None,
-        "active_snapshot_id": str(row["snapshot_id"] or "") if row else "",
-        "active_commit": str(row["commit_sha"] or "") if row else "",
-        "snapshot_status": str(row["snapshot_status"] or "") if row else "",
-        "snapshot_kind": str(row["snapshot_kind"] or "") if row else "",
-        "ref_updated_at": str(row["ref_updated_at"] or "") if row else "",
-        "snapshot_created_at": (
-            str(row["snapshot_created_at"] or "") if row else ""
-        ),
+        "graph_available": bool(active_snapshot_id),
+        "active_snapshot_id": active_snapshot_id,
+        "active_commit": active_commit,
+        "active_ref": "active" if active_snapshot_id else "",
         "public_safe": True,
         "read_only": True,
     }
@@ -3863,118 +4139,103 @@ def _handle_dev_external_read_only_discovery(
         ctx.path_params.get("project_id", ""),
         require_exact=True,
     )
-    project = _dev_external_public_project(project_id)
     try:
-        with external_read_only_connection(project_id) as conn:
-            if route_kind == "backlog_list":
-                result = _dev_external_backlog_list_projection(
-                    conn,
+        project = _dev_external_public_project(project_id)
+        common = {
+            "ok": True,
+            "project": project,
+            "writes_performed": False,
+            "managed_pass": False,
+            "pass_implied": False,
+        }
+        if route_kind == "backlog_list":
+            return {
+                **common,
+                **_dev_external_backlog_list_projection(
                     project_id,
                     ctx.query,
-                )
-                return {
-                    "ok": True,
-                    **result,
-                    "project": project,
-                    "writes_performed": False,
-                    "managed_pass": False,
-                    "pass_implied": False,
-                }
-            if route_kind == "backlog_item":
-                result = _dev_external_backlog_item_projection(
-                    conn,
+                ),
+            }
+        if route_kind == "backlog_item":
+            return {
+                **common,
+                **_dev_external_backlog_item_projection(
                     project_id,
                     str(ctx.path_params.get("bug_id") or ""),
-                )
-                return {
-                    "ok": True,
-                    **result,
-                    "project": project,
-                    "writes_performed": False,
-                    "managed_pass": False,
-                    "pass_implied": False,
-                }
-            graph = _dev_external_graph_status_projection(conn, project_id)
-            if route_kind == "graph_status":
-                return {
-                    "ok": True,
-                    **graph,
-                    "project": project,
-                    "writes_performed": False,
-                    "managed_pass": False,
-                    "pass_implied": False,
-                }
-            if route_kind != "onboard":
-                raise GovernanceError(
-                    "ac_dev_external_discovery_route_invalid",
-                    "external discovery route is not supported",
-                    404,
-                )
-            backlog_id = _dev_external_requested_backlog_id(ctx)
-            backlog = (
-                _dev_external_backlog_item_projection(
-                    conn,
-                    project_id,
-                    backlog_id,
-                )
-                if backlog_id
-                else _dev_external_backlog_list_projection(
-                    conn,
-                    project_id,
-                    {},
-                    default_limit=10,
-                )
-            )
-            body = ctx.body if isinstance(ctx.body, Mapping) else {}
-            role = str(
-                body.get("role")
-                or body.get("actor_role")
-                or _first_query_value(ctx.query, "role")
-                or _first_query_value(ctx.query, "actor_role")
-                or ""
-            ).strip()
-            work_type = str(
-                body.get("work_type")
-                or body.get("requested_work_type")
-                or _first_query_value(ctx.query, "work_type")
-                or _first_query_value(ctx.query, "requested_work_type")
-                or ""
-            ).strip()
-            return {
-                "ok": True,
-                "schema_version": _DEV_EXTERNAL_DISCOVERY_SCHEMA_VERSION,
-                "status": "read_only_discovery_only",
-                "discovery_available": True,
-                "runtime_plane": "dev",
-                "project_id": project_id,
-                "role": role,
-                "work_type": work_type,
-                "project": project,
-                "backlog": backlog,
-                "graph": graph,
-                "route_authority_accepted": False,
-                "read_only": True,
-                "writes_performed": False,
-                "mutation_allowed": False,
-                "cex_minted": False,
-                "route_minted": False,
-                "contract_runtime_materialized": False,
-                "managed_pass": False,
-                "pass_implied": False,
-                "next_legal_action": {
-                    "action": "call_stable_onboard_route_guide",
-                    "service_port": AC_STABLE_SERVICE_PORT,
-                    "method": ctx.method,
-                    "endpoint": f"/api/projects/{project_id}/onboard-route-guide",
-                    "reason": (
-                        "the AC dev plane exposes discovery only; stable authority "
-                        "must mint any route or ContractRuntime execution"
-                    ),
-                },
+                ),
             }
+        if route_kind == "graph_status":
+            return {
+                **common,
+                **_dev_external_graph_status_projection(project_id),
+            }
+        if route_kind != "onboard":
+            raise GovernanceError(
+                "ac_dev_external_discovery_route_invalid",
+                "external discovery route is not supported",
+                404,
+            )
+        backlog_id = _dev_external_requested_backlog_id(ctx)
+        if backlog_id and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,191}",
+            backlog_id,
+        ):
+            raise _dev_external_discovery_rejection(
+                code="ac_dev_external_backlog_identity_rejected",
+                path=f"/api/projects/{project_id}/onboard-route-guide",
+                detail="external backlog_id is not a safe bounded identity",
+            )
+        body = ctx.body if isinstance(ctx.body, Mapping) else {}
+        role = str(
+            body.get("role")
+            or body.get("actor_role")
+            or _first_query_value(ctx.query, "role")
+            or _first_query_value(ctx.query, "actor_role")
+            or ""
+        ).strip()
+        work_type = str(
+            body.get("work_type")
+            or body.get("requested_work_type")
+            or _first_query_value(ctx.query, "work_type")
+            or _first_query_value(ctx.query, "requested_work_type")
+            or ""
+        ).strip()
+        return {
+            **common,
+            "schema_version": _DEV_EXTERNAL_DISCOVERY_SCHEMA_VERSION,
+            "status": "read_only_discovery_only",
+            "discovery_available": True,
+            "runtime_plane": "dev",
+            "project_id": project_id,
+            "backlog_id": backlog_id,
+            "role": role,
+            "work_type": work_type,
+            "route_authority": False,
+            "route_authority_accepted": False,
+            "read_only": True,
+            "mutation_allowed": False,
+            "cex_minted": False,
+            "route_minted": False,
+            "contract_runtime_materialized": False,
+            "timeline_written": False,
+            "graph_mutated": False,
+            "close_authority_minted": False,
+            "session_minted": False,
+            "qa_authority_minted": False,
+            "next_legal_action": {
+                "action": "call_stable_onboard_route_guide",
+                "service_port": AC_STABLE_SERVICE_PORT,
+                "method": ctx.method,
+                "endpoint": f"/api/projects/{project_id}/onboard-route-guide",
+                "reason": (
+                    "the AC dev plane exposes discovery only; stable authority "
+                    "must mint any route or ContractRuntime execution"
+                ),
+            },
+        }
     except GovernanceError:
         raise
-    except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise GovernanceError(
             "ac_dev_external_read_only_proof_failed",
             "external read-only discovery could not prove zero-change access",
