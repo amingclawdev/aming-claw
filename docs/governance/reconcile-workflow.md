@@ -802,8 +802,10 @@ AC repair work uses two independent runtime planes:
   `resource=backlog` seed, and the insert/update/delete generation triggers,
   then preserves the existing commit behavior. An optimized own-project read
   on dev instead performs a pure verification of those stable-owned objects:
-  exact generation columns and primary key, exact index owner and normalized
-  SQL, exact trigger owner/event/body, a valid seed, and the canonical direct
+  exactly the three generation columns and primary key using SQLite
+  `table_xinfo` (each must have `hidden=0`, so generated or hidden additions
+  fail closed), exact index owner and normalized SQL, exact trigger
+  owner/event/body, a valid seed, and the canonical direct
   projection subset of `observer_command_queue`. That subset is limited to the
   exact type/null/default/primary-key constraints for `command_id`,
   `project_id`, `payload_json`, `status`, `error`, `completed_at`, `claimed_at`,

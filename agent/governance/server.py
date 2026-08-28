@@ -205375,8 +205375,8 @@ _BACKLOG_READ_SCHEMA_TABLE_DEFINITION = (
     (("generation", "INTEGER", 1, "1", 0), "generation INTEGER NOT NULL DEFAULT 1"),
     (("updated_at", "TEXT", 1, "''", 0), "updated_at TEXT NOT NULL DEFAULT ''"),
 )
-_BACKLOG_READ_SCHEMA_TABLE_COLUMNS = tuple(
-    metadata for metadata, _sql in _BACKLOG_READ_SCHEMA_TABLE_DEFINITION
+_BACKLOG_READ_SCHEMA_TABLE_XINFO = tuple(
+    (*metadata, 0) for metadata, _sql in _BACKLOG_READ_SCHEMA_TABLE_DEFINITION
 )
 # Exact direct-read subset bound from observer_session.SCHEMA_SQL's canonical
 # observer_command_queue definition. Recovery-only columns and indexes are not
@@ -205496,12 +205496,13 @@ def _ac_dev_verify_backlog_read_schema(conn: sqlite3.Connection) -> None:
                     int(row[3]),
                     None if row[4] is None else str(row[4]),
                     int(row[5]),
+                    int(row[6]),
                 )
                 for row in conn.execute(
-                    'PRAGMA table_info("dashboard_backlog_cache_generation")'
+                    'PRAGMA table_xinfo("dashboard_backlog_cache_generation")'
                 ).fetchall()
             )
-            if columns != _BACKLOG_READ_SCHEMA_TABLE_COLUMNS:
+            if columns != _BACKLOG_READ_SCHEMA_TABLE_XINFO:
                 problems.append("generation_table_columns")
 
         command_table = conn.execute(

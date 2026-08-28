@@ -28955,6 +28955,7 @@ def test_stable_backlog_read_schema_initialization_remains_handler_owned(
         ("missing_table", "generation_table"),
         ("wrong_table_object", "generation_table"),
         ("wrong_columns", "generation_table_columns"),
+        ("generated_column", "generation_table_columns"),
         ("missing_index", "keyset_index"),
         ("wrong_index_definition", "keyset_index_definition"),
         ("wrong_index_owner", "keyset_index_definition"),
@@ -29012,6 +29013,11 @@ def test_ac_dev_backlog_read_schema_mismatch_is_typed_and_zero_write(
         connection.execute(
             "CREATE TABLE dashboard_backlog_cache_generation "
             "(resource TEXT PRIMARY KEY, generation TEXT, updated_at TEXT)"
+        )
+    elif fault == "generated_column":
+        connection.execute(
+            "ALTER TABLE dashboard_backlog_cache_generation "
+            "ADD COLUMN shadow INTEGER GENERATED ALWAYS AS (generation+1) VIRTUAL"
         )
     elif fault == "missing_index":
         connection.execute("DROP INDEX idx_backlog_bugs_dashboard_keyset")
@@ -29371,6 +29377,7 @@ def test_stable_nonempty_backlog_read_keeps_dynamic_recovery_overlay(
     ("drift", "expected_component"),
     [
         ("drop_index", "keyset_index"),
+        ("add_generated_column", "generation_table_columns"),
         ("delete_seed", "backlog_generation_seed"),
         ("replace_trigger", "trigger_insert_definition"),
         ("drop_command_table", "observer_command_queue"),
@@ -29430,6 +29437,12 @@ def test_ac_dev_backlog_read_detects_separate_connection_schema_toctou(
         try:
             if drift == "drop_index":
                 writer.execute("DROP INDEX idx_backlog_bugs_dashboard_keyset")
+            elif drift == "add_generated_column":
+                writer.execute(
+                    "ALTER TABLE dashboard_backlog_cache_generation "
+                    "ADD COLUMN shadow INTEGER "
+                    "GENERATED ALWAYS AS (generation+1) VIRTUAL"
+                )
             elif drift == "delete_seed":
                 writer.execute(
                     "DELETE FROM dashboard_backlog_cache_generation "
