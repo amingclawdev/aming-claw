@@ -123445,6 +123445,7 @@ def _resolve_contract_runtime_observer_proof(
     action: str,
     backlog_id: str = "",
     contract_execution_id: str = "",
+    record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     observer_session_id = _contract_runtime_ref_value(
         ctx, "observer_session_id", "observer_session_ref"
@@ -123464,12 +123465,16 @@ def _resolve_contract_runtime_observer_proof(
             },
         )
 
-    session = observer_session.get_session(
-        conn,
-        project_id=project_id,
-        session_id=observer_session_id,
-    )
-    if not session or str(session.get("computed_status") or "") != "active":
+    requested = _normalized_contract_runtime_action(action)
+    dev_bypass = bool(requested == "contract_runtime_bypass_line"
+        and _runtime_plane() == "dev" and isinstance(record, Mapping)
+        and record.get("contract_id") == "operator_supervised_direct_main")
+    session = (_ac_dev_read_only_observer_session_authority(
+        conn, project_id=project_id, session_id=observer_session_id)
+        if dev_bypass else observer_session.get_session(
+            conn, project_id=project_id, session_id=observer_session_id))
+    if (not session or str(session.get("computed_status") or "") != "active"
+            or (dev_bypass and str(session.get("state") or "") != "active")):
         raise PermissionDeniedError(
             "coordinator",
             action,
@@ -123564,8 +123569,29 @@ def _resolve_contract_runtime_observer_proof(
         _normalized_contract_runtime_action(item)
         for item in (resolved.get("allowed_actions") or [])
     }
-    requested = _normalized_contract_runtime_action(action)
-    if requested not in allowed and "contract_runtime_facade" not in allowed:
+    derived = bool(
+        dev_bypass and _contract_runtime_dev_direct_line_bypass_derived_authority(
+            ctx,
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            route_token_ref=route_token_ref,
+            record=record,
+        )
+    )
+    if dev_bypass and not derived:
+        raise PermissionDeniedError(
+            "coordinator",
+            action,
+            {
+                "required_role": "observer",
+                "proof_error": "dev_direct_line_bypass_authority_mismatch",
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            },
+        )
+    if requested not in allowed and "contract_runtime_facade" not in allowed and not derived:
         raise PermissionDeniedError(
             "coordinator",
             action,
@@ -123598,6 +123624,93 @@ def _resolve_contract_runtime_observer_proof(
         "route_token_ref": route_token_ref,
         "route_identity": route_identity,
     }
+
+
+def _contract_runtime_dev_direct_line_bypass_derived_authority(
+    ctx: RequestContext, conn, *, project_id: str, backlog_id: str,
+    contract_execution_id: str, route_token_ref: str,
+    record: Mapping[str, Any] | None,
+) -> bool:
+    if _runtime_plane() != "dev" or not isinstance(record, Mapping):
+        return False
+    body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    route_refs = {
+        str(body.get(key) or "").strip()
+        for key in ("observer_route_token_ref", "route_token_ref")
+        if str(body.get(key) or "").strip()
+    }
+    if len(route_refs) > 1:
+        return False
+    if any(key in body for key in {
+        *_dev_source_root_keys,
+        "target_ref", "branch", "branch_ref", "requested_branch_ref", "runtime_port",
+        "port", "target_head_commit", "head_commit", "candidate_commit_sha",
+        "requested_commit", "commit_sha", "base_commit", "namespace",
+        "namespace_hash", "physical_namespace", "storage_contract_id",
+        "runtime_plane", "runtime_world_authority", "world_hash", "authority_hash",
+    }):
+        return False
+    world = _operator_supervised_direct_main_dev_world_authority()
+    if not (
+        str(record.get("project_id") or "") == project_id
+        and str(record.get("backlog_id") or "") == backlog_id
+        and record.get("contract_execution_id") == contract_execution_id
+        and record.get("contract_id") == "operator_supervised_direct_main"
+        and str(record.get("revision") or "")
+        in _OPERATOR_SUPERVISED_DIRECT_MAIN_STRICT_REVISIONS
+        and _operator_supervised_direct_main_record_matches_dev_world(record, world)
+    ):
+        return False
+    task_id = str(body.get("task_id") or "").strip()
+    if task_id and task_id != contract_execution_id:
+        return False
+    root_route = _contract_runtime_parentless_direct_main_root_route_action_authority(
+        conn, project_id=project_id, route_token_ref=route_token_ref
+    )
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    stored_route = metadata.get("operator_supervised_direct_main_route_authority", {})
+    if not (
+        root_route.get("accepted") is True
+        and isinstance(stored_route, Mapping)
+        and stored_route.get("accepted") is True
+        and str(stored_route.get("project_id") or "") == project_id
+        and str(stored_route.get("backlog_id") or "") == backlog_id
+        and stored_route.get("contract_execution_id") == contract_execution_id
+        and str(stored_route.get("route_token_ref") or "") == route_token_ref
+    ):
+        return False
+    current = _contract_runtime(conn).current_record(
+        contract_execution_id, actor_role="observer"
+    )
+    for line in reversed(current.get("completed_lines") or []):
+        payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+        if (line.get("evidence_kind") == "contract_line_bypass"
+                and payload.get("bypass_identity") == body.get("bypass_identity")):
+            return bool(line.get("stage_id") == body.get("stage_id")
+                and line.get("line_id") == body.get("line_id")
+                and payload.get("execution_state_revision")
+                == body.get("execution_state_revision"))
+    guide = _contract_runtime_guide_for_response(current, actor_role="observer")
+    bypass = (
+        guide.get("line_bypass_guidance")
+        if isinstance(guide.get("line_bypass_guidance"), Mapping)
+        else {}
+    )
+    binding = (
+        bypass.get("current_line_binding")
+        if isinstance(bypass.get("current_line_binding"), Mapping)
+        else {}
+    )
+    return bool(
+        bypass.get("authorization", {}).get("reader_role_authorized") is True
+        and binding.get("line_id")
+        and str(body.get("stage_id") or "") == str(binding.get("stage_id") or "")
+        and str(body.get("line_id") or "") == str(binding.get("line_id") or "")
+        and body.get("execution_state_revision")
+        == int(binding.get("execution_state_revision") or 0)
+        and str(body.get("runtime_guide_hash") or "")
+        == str(binding.get("runtime_guide_hash") or "")
+    )
 
 
 def _contract_runtime_bind_observer_dispatch_transport_proof(
@@ -125052,6 +125165,27 @@ def _contract_runtime_effective_actor_role(
     contract_execution_id: str = "",
     record: Mapping[str, Any] | None = None,
 ) -> str:
+    if (action == "contract_runtime_bypass_line" and _runtime_plane() == "dev"
+            and isinstance(record, Mapping)
+            and record.get("contract_id") == "operator_supervised_direct_main"):
+        proof = _resolve_contract_runtime_observer_proof(
+            ctx,
+            conn,
+            project_id=ctx.get_project_id(),
+            action=action,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            record=record,
+        )
+        if not proof:
+            raise PermissionDeniedError("coordinator", action, {
+                "required_role": "observer",
+                "proof_error": "dev_direct_line_bypass_proof_required",
+                "zero_contract_runtime_write": True,
+                "zero_timeline_write": True,
+            })
+        ctx._contract_runtime_observer_proof = dict(proof)
+        return "observer"
     session = ctx.require_auth(conn)
     role = str(session.get("role") or "").strip()
     project_id = ctx.get_project_id()
@@ -125147,6 +125281,7 @@ def _contract_runtime_effective_actor_role(
         action=action,
         backlog_id=backlog_id,
         contract_execution_id=contract_execution_id,
+        record=record,
     )
     if proof:
         ctx._contract_runtime_observer_proof = dict(proof)
@@ -146728,33 +146863,41 @@ def _operator_supervised_direct_main_record_matches_dev_world(
         if isinstance(binding.get("runtime_world_authority"), Mapping)
         else {}
     )
+    identity_fields = (
+        "schema_version", "accepted", "server_derived", "caller_claims_trusted",
+        "runtime_plane", "runtime_port", "bind_host", "target_project_root",
+        "worktree_path", "branch", "target_ref", "stable_anchor_commit",
+        "stable_database_identity", "runtime_stale", "violations",
+        "namespace_hash", "storage_contract_id",
+    )
     if not (
-        record_world.get("namespace_hash")
-        == world_authority.get("namespace_hash")
-        and record_world.get("storage_contract_id")
-        == world_authority.get("storage_contract_id")
-        and record_world.get("target_project_root")
-        == world_authority.get("target_project_root")
-        and record_world.get("branch") == world_authority.get("branch")
-        and record_world.get("stable_anchor_commit")
-        == world_authority.get("stable_anchor_commit")
-        and record_world.get("stable_database_identity")
-        == world_authority.get("stable_database_identity")
+        world_authority.get("accepted") is True
+        and world_authority.get("runtime_plane") == "dev"
+        and world_authority.get("runtime_port") == AC_DEV_SERVICE_PORT
+        and world_authority.get("bind_host") == AC_DEV_BIND_HOST
+        and world_authority.get("runtime_stale") is False
+        and not world_authority.get("violations")
+        and all(record_world.get(key) == world_authority.get(key)
+                for key in identity_fields)
     ):
         return False
-    initial_head = str(
-        record_world.get("target_head_commit") or ""
-    ).strip().lower()
-    current_head = str(
-        world_authority.get("target_head_commit") or ""
-    ).strip().lower()
-    if initial_head == current_head:
+    current_commits = {
+        str(world_authority.get(key) or "").strip().lower()
+        for key in ("target_head_commit", "loaded_runtime_commit")
+    }
+    record_commits = {
+        str(record_world.get(key) or "").strip().lower()
+        for key in ("target_head_commit", "loaded_runtime_commit")
+    }
+    root = Path(str(world_authority.get("target_project_root") or ""))
+    if (len(current_commits) != 1 or len(record_commits) != 1
+            or not all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
+                       for commit in current_commits | record_commits)):
+        return False
+    if record_commits == current_commits:
         return True
-    return _git_commit_is_ancestor(
-        Path(str(world_authority.get("target_project_root") or "")),
-        initial_head,
-        current_head,
-    )
+    return all(_git_commit_is_ancestor(root, commit, next(iter(current_commits)))
+               for commit in record_commits)
 
 
 def _operator_supervised_direct_main_strict_records(
@@ -216988,6 +217131,56 @@ def handle_project_contract_runtime_line_write(ctx: RequestContext):
     )
 
 
+def _contract_runtime_proxy_dev_direct_line_bypass(
+    project_id: str, execution_id: str, body: Mapping[str, Any]
+) -> dict[str, Any]:
+    allowed = {
+        "bypass_identity", "stage_id", "line_id", "execution_state_revision",
+        "runtime_guide_hash", "diagnostic_backlog_id", "diagnostic_priority",
+        "classification", "reason", "decision", "evidence_refs",
+        "graph_trace_ids", "task_id", "phase", "observer_route_token_ref",
+        "route_token_ref", "observer_session_id",
+    }
+    rejected = sorted(set(body) - allowed)
+    if rejected:
+        raise GovernanceError("ac_dev_line_bypass_selector_rejected",
+            "dev Direct line bypass accepts only copy-safe line authority",
+            400, {"rejected_fields": rejected, "zero_write_rejection": True,
+                  "writes_performed": False})
+    path = (
+        f"/api/projects/{quote(project_id, safe='')}"
+        f"/contract-runtime/{quote(execution_id, safe='')}/line-bypasses"
+    )
+    url = f"http://127.0.0.1:{AC_DEV_SERVICE_PORT}{path}"
+    request = urllib.request.Request(url, data=json.dumps(dict(body)).encode(),
+        method="POST", headers={"Content-Type": "application/json",
+                                "Accept": "application/json"})
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _DevStableProxyNoRedirect()
+    )
+    try:
+        response = opener.open(request, timeout=10)
+    except urllib.error.HTTPError as exc:
+        response = exc
+    except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+        raise GovernanceError("ac_dev_line_bypass_proxy_failed",
+            "exact 40008 bypass is unavailable", 502,
+            {"outcome_unknown": True, "safe_retry": False}) from exc
+    with response:
+        raw = response.read(_DEV_STABLE_PROXY_RESPONSE_BYTES + 1)
+        final_url = str(response.geturl() or "")
+    try:
+        payload = json.loads(raw.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    if (final_url != url or len(raw) > _DEV_STABLE_PROXY_RESPONSE_BYTES
+            or not isinstance(payload, dict)):
+        raise GovernanceError("ac_dev_line_bypass_proxy_response_rejected",
+            "exact 40008 bypass returned an invalid bounded response", 502,
+            {"outcome_unknown": True, "safe_retry": False})
+    return payload
+
+
 @route("POST", "/api/projects/{project_id}/contract-runtime/{contract_execution_id}/line-bypasses")
 def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
     """Waive one line, rooting or inheriting one no-PASS diagnostic generation."""
@@ -217006,6 +217199,13 @@ def handle_project_contract_runtime_line_bypass(ctx: RequestContext):
 
     with DBContext(project_id) as conn:
         runtime = _contract_runtime(conn)
+        physical_dev = runtime.store.get_dev_direct_main_physical(execution_id)
+        if physical_dev is not None and _runtime_plane() != "dev":
+            if str(physical_dev.get("project_id") or "") != project_id:
+                raise ValidationError("physical dev Direct project scope mismatch")
+            return _contract_runtime_proxy_dev_direct_line_bypass(
+                project_id, execution_id, body
+            )
         record = runtime.store.get(execution_id)
         actor_role = _contract_runtime_effective_actor_role(
             ctx,

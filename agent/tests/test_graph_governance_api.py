@@ -9250,7 +9250,10 @@ def test_worker_commit_line_bypass_forwards_server_derived_no_pass_continuation(
     captured: dict[str, Any] = {}
 
     class FakeRuntime:
-        store = SimpleNamespace(get=lambda _execution_id: case["record"])
+        store = SimpleNamespace(
+            get=lambda _execution_id: case["record"],
+            get_dev_direct_main_physical=lambda _execution_id: None,
+        )
 
         def bypass_current_line(self, _execution_id, body, **_kwargs):
             captured.update(body)
@@ -10547,7 +10550,8 @@ def test_line_bypass_does_not_preflight_the_same_guide_twice(conn, monkeypatch):
                 "project_id": PID,
                 "backlog_id": "AC-BYPASS-SELF-DEADLOCK",
                 "contract_execution_id": "cex-bypass-self-deadlock",
-            }
+            },
+            get_dev_direct_main_physical=lambda _execution_id: None,
         )
 
         def current_guide(self, *_args, **_kwargs):
@@ -202604,3 +202608,734 @@ def test_promotion_rollback_route_rejects_missing_stale_and_overbroad_authority(
             route_token_ref="rtok-rollback-prepare",
             candidate=candidate,
         ) == {}
+
+
+def _prepare_ac_dev_cross_plane_line_bypass(
+    conn, monkeypatch, tmp_path, *, backlog_id: str
+):
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn, monkeypatch, tmp_path, backlog_id=backlog_id
+    )
+    project_id = prepared["project_id"]
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": project_id}, method="POST", body=prepared["issue_body"])
+    )
+    session_id = _insert_ac_dev_active_observer_session(
+        conn, project_id=project_id, session_id=f"obs-{backlog_id.lower()}"
+    )
+    execution_id = prepared["task_id"]
+    record = server._contract_runtime(conn).current_record(
+        execution_id, actor_role="observer"
+    )
+    guide = server._contract_runtime_guide_for_response(
+        record, actor_role="observer"
+    )
+    body = copy.deepcopy(
+        guide["line_bypass_guidance"]["create_new_copy_safe_body"]
+    )
+    body.update(
+        {
+            "classification": "cross_plane_runtime_blocker",
+            "reason": "the exact dev line is blocked by shared-plane authority",
+            "decision": "waive this line without PASS and keep the diagnostic open",
+            "evidence_refs": [f"backlog:{backlog_id}", "request:req-cross-plane"],
+            "task_id": execution_id,
+            "observer_session_id": session_id,
+            "observer_route_token_ref": issued["route_token_ref"],
+        }
+    )
+    return {
+        **prepared,
+        "project_id": project_id,
+        "execution_id": execution_id,
+        "route_token_ref": issued["route_token_ref"],
+        "session_id": session_id,
+        "body": body,
+    }
+
+
+def _advance_ac_dev_cross_plane_world(conn, case):
+    old_commit = _init_test_git_repo(case["root"], filename="runtime.py")
+    current_commit = _commit_test_git_files(
+        case["root"], ["repair.py"], message="repair loaded runtime"
+    )
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get_dev_direct_main_physical(case["execution_id"])
+    old_world = _fixed_ac_dev_direct_world(case["root"], old_commit)
+    record["metadata"][
+        "operator_supervised_direct_main_runtime_binding"
+    ]["runtime_world_authority"] = old_world
+    runtime.store.update(
+        case["execution_id"],
+        record,
+        expected_revision=record["execution_state_revision"],
+    )
+    conn.commit()
+    current = runtime.current_record(case["execution_id"], actor_role="observer")
+    guide = server._contract_runtime_guide_for_response(
+        current, actor_role="observer"
+    )
+    body = copy.deepcopy(
+        guide["line_bypass_guidance"]["create_new_copy_safe_body"]
+    )
+    for key in (
+        "classification", "reason", "decision", "evidence_refs", "task_id",
+        "observer_session_id", "observer_route_token_ref",
+    ):
+        body[key] = copy.deepcopy(case["body"][key])
+    return {
+        **case,
+        "body": body,
+        "old_commit": old_commit,
+        "current_commit": current_commit,
+        "old_world": old_world,
+        "current_world": _fixed_ac_dev_direct_world(
+            case["root"], current_commit
+        ),
+    }
+
+
+def test_dev_verify_only_canonical_direct_without_world_keeps_canonical_storage(
+    conn, monkeypatch
+):
+    store = SQLiteContractExecutionStore(conn)
+    monkeypatch.setattr(contract_runtime, "dev_runtime_verify_only", lambda: True)
+    execution_id = "cex-dev-verify-only-canonical-direct"
+    record = {
+        "project_id": PID,
+        "backlog_id": "AC-DEV-VERIFY-ONLY-CANONICAL-DIRECT",
+        "contract_execution_id": execution_id,
+        "contract_id": "operator_supervised_direct_main",
+        "version": "v1",
+        "revision": "rev3",
+        "root_contract_execution_id": execution_id,
+        "contract_chain_id": "cchain-dev-verify-only-canonical-direct",
+        "execution_state_revision": 1,
+        "completed_lines": [],
+        "metadata": {},
+    }
+    assert contract_runtime._contract_runtime_storage_contract_id(record) == (
+        "operator_supervised_direct_main"
+    )
+    with pytest.raises(ContractRuntimeError):
+        contract_runtime._direct_main_dev_physical_storage_identity(record)
+    store.create(record)
+    assert store.get(execution_id) == record
+    assert store.list_by_backlog(
+        project_id=PID, backlog_id=record["backlog_id"]
+    ) == [record]
+
+
+def test_ac_dev_cross_plane_line_bypass_accepts_real_ancestor_runtime_upgrade(
+    conn, monkeypatch, tmp_path
+):
+    case = _advance_ac_dev_cross_plane_world(
+        conn,
+        _prepare_ac_dev_cross_plane_line_bypass(
+            conn, monkeypatch, tmp_path,
+            backlog_id="AC-DEV-CROSS-PLANE-ANCESTOR-RUNTIME-UPGRADE",
+        ),
+    )
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(case["current_world"]),
+    )
+    assert server._git_commit_is_ancestor(
+        case["root"], case["old_commit"], case["current_commit"]
+    )
+    accepted = server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {"project_id": case["project_id"],
+             "contract_execution_id": case["execution_id"]},
+            method="POST", body=case["body"],
+        )
+    )
+    assert accepted["ok"] is True
+    assert accepted["written_line"]["status"] == "waived"
+    assert accepted["written_line"]["payload"]["no_pass_generation"][
+        "authoritative_pass_synthesized"
+    ] is False
+
+
+def test_ac_dev_cross_plane_rejects_mixed_stored_target_and_loaded_commits(
+    conn, monkeypatch, tmp_path
+):
+    case = _advance_ac_dev_cross_plane_world(
+        conn,
+        _prepare_ac_dev_cross_plane_line_bypass(
+            conn, monkeypatch, tmp_path,
+            backlog_id="AC-DEV-CROSS-PLANE-MIXED-STORED-COMMITS",
+        ),
+    )
+    core = {
+        key: copy.deepcopy(value)
+        for key, value in case["current_world"].items()
+        if key not in {"world_hash", "storage_contract_id", "authority_hash"}
+    }
+    core["loaded_runtime_commit"] = case["old_commit"]
+    mixed_world = {
+        **core,
+        "world_hash": server.stable_sha256(core),
+        "storage_contract_id": server.direct_main_dev_storage_contract_id(
+            core["namespace_hash"]
+        ),
+    }
+    mixed_world["authority_hash"] = server.stable_sha256(mixed_world)
+    runtime = server._contract_runtime(conn)
+    record = runtime.store.get_dev_direct_main_physical(case["execution_id"])
+    record["metadata"][
+        "operator_supervised_direct_main_runtime_binding"
+    ]["runtime_world_authority"] = mixed_world
+    runtime.store.update(
+        case["execution_id"], record,
+        expected_revision=record["execution_state_revision"],
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(case["current_world"]),
+    )
+    assert not server._operator_supervised_direct_main_record_matches_dev_world(
+        record, case["current_world"]
+    )
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    with pytest.raises(server.PermissionDeniedError):
+        server.handle_project_contract_runtime_line_bypass(
+            _ctx(
+                {"project_id": case["project_id"],
+                 "contract_execution_id": case["execution_id"]},
+                method="POST", body=case["body"],
+            )
+        )
+    assert tuple(conn.iterdump()) == before
+    assert conn.total_changes == before_changes
+
+
+def test_ac_dev_cross_plane_ancestor_upgrade_rejects_every_identity_drift(
+    conn, monkeypatch, tmp_path
+):
+    case = _advance_ac_dev_cross_plane_world(
+        conn,
+        _prepare_ac_dev_cross_plane_line_bypass(
+            conn, monkeypatch, tmp_path,
+            backlog_id="AC-DEV-CROSS-PLANE-ANCESTOR-IDENTITY-DRIFT",
+        ),
+    )
+
+    def reject(world):
+        monkeypatch.setattr(
+            server, "_operator_supervised_direct_main_dev_world_authority",
+            lambda: copy.deepcopy(world),
+        )
+        before = tuple(conn.iterdump())
+        with pytest.raises((server.PermissionDeniedError, GovernanceError)):
+            server.handle_project_contract_runtime_line_bypass(
+                _ctx(
+                    {"project_id": case["project_id"],
+                     "contract_execution_id": case["execution_id"]},
+                    method="POST", body=case["body"],
+                )
+            )
+        assert tuple(conn.iterdump()) == before
+
+    wrong_values = {
+        "schema_version": "wrong-world-schema",
+        "accepted": False,
+        "server_derived": False,
+        "caller_claims_trusted": True,
+        "runtime_plane": "stable",
+        "runtime_port": 40000,
+        "bind_host": "0.0.0.0",
+        "target_project_root": str(tmp_path / "wrong-root"),
+        "worktree_path": str(tmp_path / "wrong-worktree"),
+        "branch": "codex/wrong-dev",
+        "target_ref": "refs/heads/codex/wrong-dev",
+        "stable_anchor_commit": "0" * 40,
+        "stable_database_identity": {
+            **case["current_world"]["stable_database_identity"], "inode": 999,
+        },
+        "runtime_stale": True,
+        "violations": ["identity_drift"],
+        "namespace_hash": "sha256:" + "0" * 64,
+        "storage_contract_id": "operator-supervised-direct-main.dev." + "0" * 64,
+    }
+    for field, value in wrong_values.items():
+        reject({**copy.deepcopy(case["current_world"]), field: value})
+    reject({
+        **copy.deepcopy(case["current_world"]),
+        "loaded_runtime_commit": case["old_commit"],
+    })
+
+    subprocess.run(
+        ["git", "switch", "--orphan", "divergent"], cwd=case["root"],
+        check=True, capture_output=True, text=True,
+    )
+    (case["root"] / "divergent.py").write_text("divergent\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "-A"], cwd=case["root"], check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "divergent runtime"], cwd=case["root"],
+        check=True, capture_output=True, text=True,
+    )
+    divergent = batch_jobs.git_commit(case["root"])
+    assert not server._git_commit_is_ancestor(
+        case["root"], case["old_commit"], divergent
+    )
+    reject(_fixed_ac_dev_direct_world(case["root"], divergent))
+
+
+def test_ac_dev_cross_plane_line_bypass_is_atomic_no_pass_and_idempotent(
+    conn, monkeypatch, tmp_path
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-CROSS-PLANE-LINE-BYPASS-ATOMIC",
+    )
+    ctx = lambda body: _ctx(
+        {"project_id": case["project_id"], "contract_execution_id": case["execution_id"]},
+        method="POST", body=body,
+    )
+    before = conn.total_changes
+    accepted = server.handle_project_contract_runtime_line_bypass(
+        ctx(case["body"])
+    )
+    assert accepted["ok"] is True
+    assert accepted["idempotent"] is False
+    assert accepted["actor_role"] == "observer"
+    assert accepted["written_line"]["status"] == "waived"
+    assert accepted["written_line"]["no_pass_claim"] is True
+    generation = accepted["written_line"]["payload"]["no_pass_generation"]
+    assert generation["authoritative_pass_synthesized"] is False
+    assert accepted["diagnostic_status"] == "OPEN"
+    assert len(accepted["timeline_events"]) == 2
+    assert conn.total_changes > before
+    changes_after_first = conn.total_changes
+    replay = server.handle_project_contract_runtime_line_bypass(
+        ctx(case["body"])
+    )
+    assert replay["ok"] is True
+    assert replay["idempotent"] is True
+    assert replay["timeline_events"] == []
+    assert conn.total_changes == changes_after_first
+
+
+def test_ac_dev_cross_plane_bypass_verify_only_session_read_is_whitelisted(
+    conn, monkeypatch, tmp_path
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-CROSS-PLANE-VERIFY-ONLY-SESSION-WHITELIST",
+    )
+    allowed_columns = {"session_id", "project_id", "status", "last_seen_at"}
+    session_reads: set[str] = set()
+    denied_schema_actions: list[int] = []
+
+    def authorizer(action, arg1, arg2, *args):
+        if action in governance_db._DEV_DENIED_SCHEMA_ACTIONS:
+            denied_schema_actions.append(action)
+        if action == sqlite3.SQLITE_READ and arg1 == "observer_sessions":
+            session_reads.add(str(arg2 or ""))
+            if arg2 not in allowed_columns:
+                return sqlite3.SQLITE_DENY
+        return governance_db._dev_schema_authorizer(action, arg1, arg2, *args)
+
+    ctx = _ctx(
+        {"project_id": case["project_id"],
+         "contract_execution_id": case["execution_id"]},
+        method="POST", body=case["body"],
+    )
+    conn.set_authorizer(authorizer)
+    try:
+        accepted = server.handle_project_contract_runtime_line_bypass(ctx)
+        changes_after_first = conn.total_changes
+        replay = server.handle_project_contract_runtime_line_bypass(ctx)
+    finally:
+        conn.set_authorizer(None)
+
+    assert accepted["ok"] is True
+    assert accepted["written_line"]["status"] == "waived"
+    assert accepted["written_line"]["payload"]["no_pass_generation"][
+        "authoritative_pass_synthesized"
+    ] is False
+    assert replay["idempotent"] is True
+    assert conn.total_changes == changes_after_first
+    assert session_reads == allowed_columns
+    assert denied_schema_actions == []
+
+
+@pytest.mark.parametrize(
+    "session_case",
+    [
+        "missing", "malformed_status", "malformed_last_seen", "idle", "stale",
+        "closed", "revoked", "wrong_project",
+    ],
+)
+def test_ac_dev_cross_plane_bypass_nonactive_session_is_zero_write(
+    conn, monkeypatch, tmp_path, session_case
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id=f"AC-DEV-CROSS-PLANE-SESSION-{session_case.upper()}",
+    )
+    session_id = case["session_id"]
+    if session_case == "missing":
+        conn.execute("DELETE FROM observer_sessions WHERE session_id=?", (session_id,))
+    elif session_case == "malformed_status":
+        conn.execute(
+            "UPDATE observer_sessions SET status='malformed' WHERE session_id=?",
+            (session_id,),
+        )
+    elif session_case == "malformed_last_seen":
+        conn.execute(
+            "UPDATE observer_sessions SET last_seen_at='not-a-time' WHERE session_id=?",
+            (session_id,),
+        )
+    elif session_case == "idle":
+        idle_at = datetime.now(timezone.utc) - timedelta(
+            seconds=observer_session.IDLE_AFTER_SEC + 1
+        )
+        conn.execute(
+            "UPDATE observer_sessions SET last_seen_at=? WHERE session_id=?",
+            (idle_at.strftime("%Y-%m-%dT%H:%M:%SZ"), session_id),
+        )
+    elif session_case == "stale":
+        conn.execute(
+            "UPDATE observer_sessions SET last_seen_at='2000-01-01T00:00:00Z' "
+            "WHERE session_id=?",
+            (session_id,),
+        )
+    elif session_case == "wrong_project":
+        conn.execute(
+            "UPDATE observer_sessions SET project_id='other-project' WHERE session_id=?",
+            (session_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE observer_sessions SET status=? WHERE session_id=?",
+            (session_case, session_id),
+        )
+    conn.commit()
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    with pytest.raises(server.PermissionDeniedError):
+        server.handle_project_contract_runtime_line_bypass(
+            _ctx(
+                {"project_id": case["project_id"],
+                 "contract_execution_id": case["execution_id"]},
+                method="POST", body=case["body"],
+            )
+        )
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+def test_cross_plane_session_adapter_is_confined_to_dev_direct_bypass(
+    conn, monkeypatch, tmp_path
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-CROSS-PLANE-SESSION-ADAPTER-CONFINEMENT",
+    )
+    record = server._contract_runtime(conn).current_record(
+        case["execution_id"], actor_role="observer"
+    )
+    calls = []
+    monkeypatch.setattr(
+        server, "_ac_dev_read_only_observer_session_authority",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+
+    def invoke(action, selected_record):
+        try:
+            server._resolve_contract_runtime_observer_proof(
+                _ctx(
+                    {"project_id": case["project_id"],
+                     "contract_execution_id": case["execution_id"]},
+                    method="POST", body=case["body"],
+                ),
+                conn,
+                project_id=case["project_id"],
+                action=action,
+                backlog_id=record["backlog_id"],
+                contract_execution_id=case["execution_id"],
+                record=selected_record,
+            )
+        except (GovernanceError, server.PermissionDeniedError):
+            pass
+
+    before = tuple(conn.iterdump())
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    invoke("contract_runtime_bypass_line", record)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    invoke("contract_runtime_bypass_line", {**record, "contract_id": "mf_parallel.v2"})
+    invoke("contract_runtime_write_line", record)
+    assert calls == []
+    assert tuple(conn.iterdump()) == before
+
+
+def test_ac_dev_cross_plane_bypass_session_schema_fault_is_typed_zero_write(
+    conn, monkeypatch, tmp_path
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-CROSS-PLANE-SESSION-SCHEMA-FAULT",
+    )
+    conn.execute("DROP INDEX idx_observer_sessions_last_seen")
+    conn.commit()
+    before = tuple(conn.iterdump())
+    before_changes = conn.total_changes
+    with pytest.raises(governance_db.DevRuntimeSchemaVerificationError) as rejected:
+        server.handle_project_contract_runtime_line_bypass(
+            _ctx(
+                {"project_id": case["project_id"],
+                 "contract_execution_id": case["execution_id"]},
+                method="POST", body=case["body"],
+            )
+        )
+    assert rejected.value.code == "ac_dev_verify_only_schema_incompatible"
+    assert rejected.value.details["writes_performed"] is False
+    assert conn.total_changes == before_changes
+    assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("line_id", "wrong-line"),
+        ("stage_id", "wrong-stage"),
+        ("execution_state_revision", 999),
+        ("runtime_guide_hash", "sha256:" + "0" * 64),
+        ("task_id", "cex-wrong-task"),
+        ("route_token_ref", "rtok-conflicting-alias"),
+        ("runtime_port", 40008),
+        ("namespace_hash", "sha256:" + "1" * 64),
+    ],
+)
+def test_ac_dev_cross_plane_line_bypass_wrong_binding_is_zero_write(
+    conn, monkeypatch, tmp_path, field, value
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id=f"AC-DEV-CROSS-PLANE-WRONG-{field.upper()}",
+    )
+    before_dump = tuple(conn.iterdump())
+    with pytest.raises(server.PermissionDeniedError):
+        server.handle_project_contract_runtime_line_bypass(
+            _ctx(
+                {"project_id": case["project_id"], "contract_execution_id": case["execution_id"]},
+                method="POST", body={**case["body"], field: value},
+            )
+        )
+    assert tuple(conn.iterdump()) == before_dump
+
+
+def test_ac_dev_cross_plane_line_bypass_wrong_session_route_world_are_zero_write(
+    conn, monkeypatch, tmp_path
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-CROSS-PLANE-WRONG-AUTHORITY",
+    )
+
+    def reject(body):
+        before = tuple(conn.iterdump())
+        with pytest.raises(server.PermissionDeniedError):
+            server.handle_project_contract_runtime_line_bypass(
+                _ctx(
+                    {"project_id": case["project_id"], "contract_execution_id": case["execution_id"]},
+                    method="POST", body=body,
+                )
+            )
+        assert tuple(conn.iterdump()) == before
+
+    reject({**case["body"], "observer_session_id": "obs-wrong"})
+    reject({**case["body"], "observer_route_token_ref": "rtok-wrong"})
+    before = tuple(conn.iterdump())
+    with pytest.raises(ContractRuntimeError):
+        server.handle_project_contract_runtime_line_bypass(
+            _ctx(
+                {"project_id": case["project_id"],
+                 "contract_execution_id": "cex-direct-main-wrong"},
+                method="POST", body=case["body"],
+            )
+        )
+    assert tuple(conn.iterdump()) == before
+    route_project_id = server.direct_main_dev_storage_project_id(
+        case["project_id"], case["world"]["namespace_hash"]
+    )
+    conn.execute(
+        "UPDATE observer_route_token_refs SET expires_at='2000-01-01T00:00:00Z' "
+        "WHERE project_id=? AND route_token_ref=?",
+        (route_project_id, case["route_token_ref"]),
+    )
+    conn.commit()
+    reject(case["body"])
+    conn.execute(
+        "UPDATE observer_route_token_refs SET expires_at='2999-01-01T00:00:00Z' "
+        "WHERE project_id=? AND route_token_ref=?",
+        (route_project_id, case["route_token_ref"]),
+    )
+    conn.commit()
+    wrong_world = _fixed_ac_dev_direct_world(case["root"], "7" * 40)
+    monkeypatch.setattr(
+        server, "_operator_supervised_direct_main_dev_world_authority",
+        lambda: copy.deepcopy(wrong_world),
+    )
+    reject(case["body"])
+
+
+def test_ac_dev_bypass_copy_safe_preauth_does_not_open_generic_crud(
+    conn, monkeypatch, tmp_path
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-DEV-BYPASS-PREAUTH-NOT-GENERIC-CRUD",
+    )
+    before = tuple(conn.iterdump())
+    with pytest.raises((AuthError, PermissionDeniedError)):
+        server.handle_project_contract_runtime_line_write(
+            _ctx(
+                {"project_id": case["project_id"],
+                 "contract_execution_id": case["execution_id"]},
+                method="POST",
+                body={
+                    **case["body"],
+                    "evidence_kind": "implementation",
+                    "status": "passed",
+                },
+            )
+        )
+    assert tuple(conn.iterdump()) == before
+
+
+def test_ac_stable_cross_plane_proxy_requires_prevalidated_physical_row(
+    conn, monkeypatch, tmp_path
+):
+    case = _prepare_ac_dev_cross_plane_line_bypass(
+        conn, monkeypatch, tmp_path,
+        backlog_id="AC-STABLE-CROSS-PLANE-PHYSICAL-PREVALIDATED",
+    )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "generic")
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_contract_runtime_proxy_dev_direct_line_bypass",
+        lambda project_id, execution_id, body: calls.append(
+            (project_id, execution_id, dict(body))
+        ) or {"ok": True, "decision": {"no_pass_claim": True}},
+    )
+    response = server.handle_project_contract_runtime_line_bypass(
+        _ctx(
+            {"project_id": case["project_id"], "contract_execution_id": case["execution_id"]},
+            method="POST", body=case["body"],
+        )
+    )
+    assert response["ok"] is True
+    assert calls == [(case["project_id"], case["execution_id"], case["body"])]
+
+    conn.execute(
+        "UPDATE contract_runtime_executions SET contract_id=? "
+        "WHERE contract_execution_id=?",
+        (
+            server.direct_main_dev_storage_contract_id("sha256:" + "9" * 64),
+            case["execution_id"],
+        ),
+    )
+    conn.commit()
+    before = tuple(conn.iterdump())
+    with pytest.raises(
+        ContractRuntimeError,
+        match="physical namespace does not match record authority",
+    ):
+        server.handle_project_contract_runtime_line_bypass(
+            _ctx(
+                {"project_id": case["project_id"], "contract_execution_id": case["execution_id"]},
+                method="POST", body=case["body"],
+            )
+        )
+    assert tuple(conn.iterdump()) == before
+
+
+def test_ac_cross_plane_proxy_is_single_hop_bounded_and_credential_free(
+    monkeypatch
+):
+    calls = []
+
+    class Response:
+        def __init__(self, request):
+            self.request = request
+
+        def read(self, _limit):
+            return json.dumps(
+                {"ok": True, "decision": {"no_pass_claim": True}}
+            ).encode()
+
+        def geturl(self):
+            return self.request.full_url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class Opener:
+        def open(self, request, timeout):
+            calls.append((request, timeout))
+            return Response(request)
+
+    monkeypatch.setattr(
+        server.urllib.request, "build_opener", lambda *_args: Opener()
+    )
+    body = {
+        "bypass_identity": "bypass:cex-direct-main-exact:1",
+        "stage_id": "route_gate",
+        "line_id": "observer_bind_direct_scope",
+        "execution_state_revision": 1,
+        "runtime_guide_hash": "sha256:" + "1" * 64,
+        "classification": "system_logic",
+        "reason": "exact shared-plane blocker",
+        "decision": "waive without PASS",
+        "observer_session_id": "obs-exact",
+        "observer_route_token_ref": "rtok-exact",
+    }
+    response = server._contract_runtime_proxy_dev_direct_line_bypass(
+        "aming-claw", "cex-direct-main-exact", body
+    )
+    assert response["decision"]["no_pass_claim"] is True
+    assert len(calls) == 1
+    request, timeout = calls[0]
+    assert request.full_url == (
+        "http://127.0.0.1:40008/api/projects/aming-claw/contract-runtime/"
+        "cex-direct-main-exact/line-bypasses"
+    )
+    assert timeout == 10
+    assert request.get_header("Authorization") is None
+    assert json.loads(request.data) == body
+    with pytest.raises(GovernanceError) as rejected:
+        server._contract_runtime_proxy_dev_direct_line_bypass(
+            "aming-claw", "cex-direct-main-exact",
+            {**body, "namespace_hash": "sha256:" + "2" * 64},
+        )
+    assert rejected.value.code == "ac_dev_line_bypass_selector_rejected"
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert len(calls) == 1
+
+    class FailedOpener:
+        def open(self, *_args, **_kwargs):
+            raise server.urllib.error.URLError("post-send outcome unknown")
+
+    monkeypatch.setattr(
+        server.urllib.request, "build_opener", lambda *_args: FailedOpener()
+    )
+    with pytest.raises(GovernanceError) as uncertain:
+        server._contract_runtime_proxy_dev_direct_line_bypass(
+            "aming-claw", "cex-direct-main-exact", body
+        )
+    assert uncertain.value.details == {
+        "outcome_unknown": True,
+        "safe_retry": False,
+    }

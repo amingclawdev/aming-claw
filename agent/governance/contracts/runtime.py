@@ -489,6 +489,21 @@ def _contract_runtime_storage_contract_id(record: Mapping[str, Any]) -> str:
         and canonical == _DIRECT_MAIN_CANONICAL_CONTRACT_ID
     ):
         return canonical
+    metadata = record.get("metadata")
+    binding = metadata.get(_DIRECT_MAIN_RUNTIME_BINDING_KEY) if isinstance(metadata, Mapping) else None
+    authority = binding.get("runtime_world_authority") if isinstance(binding, Mapping) else None
+    if not isinstance(authority, Mapping) or not authority:
+        return canonical
+    return _direct_main_dev_physical_storage_identity(record)[2]
+
+
+def _direct_main_dev_physical_storage_identity(
+    record: Mapping[str, Any],
+) -> tuple[str, str, str]:
+    """Return the record-owned dev tuple without caller namespace input."""
+    canonical = str(record.get("contract_id") or "").strip()
+    if canonical != _DIRECT_MAIN_CANONICAL_CONTRACT_ID:
+        raise ContractRuntimeError("record is not a dev Direct execution")
     metadata = (
         record.get("metadata")
         if isinstance(record.get("metadata"), Mapping)
@@ -508,7 +523,7 @@ def _contract_runtime_storage_contract_id(record: Mapping[str, Any]) -> str:
     world_hash = str(authority.get("world_hash") or "").strip()
     namespace_hash = str(authority.get("namespace_hash") or "").strip()
     if not authority:
-        return canonical
+        raise ContractRuntimeError("dev Direct physical authority is required")
     expected_world_hash = stable_sha256(
         {
             key: value
@@ -533,7 +548,14 @@ def _contract_runtime_storage_contract_id(record: Mapping[str, Any]) -> str:
     storage_contract_id = direct_main_dev_storage_contract_id(namespace_hash)
     if str(authority.get("storage_contract_id") or "") != storage_contract_id:
         raise ContractRuntimeError("dev Direct storage namespace is not world-bound")
-    return storage_contract_id
+    return (
+        direct_main_dev_storage_project_id(
+            str(record.get("project_id") or "").strip(),
+            namespace_hash,
+        ),
+        str(record.get("backlog_id") or "").strip(),
+        storage_contract_id,
+    )
 
 
 def _contract_runtime_storage_project_id(record: Mapping[str, Any]) -> str:
@@ -845,6 +867,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
             physical_backlog_id=physical_backlog_id,
             physical_contract_id=physical_contract_id,
         )
+        return record
+
+    def get_dev_direct_main_physical(
+        self,
+        contract_execution_id: str,
+    ) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT project_id, backlog_id, contract_id, record_json "
+            "FROM contract_runtime_executions WHERE contract_execution_id = ?",
+            (contract_execution_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        physical = tuple(str(value or "") for value in row[:3])
+        if not physical[2].startswith(_DIRECT_MAIN_DEV_STORAGE_PREFIX):
+            return None
+        raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[3]
+        record = _decode_record(raw)
+        expected = _direct_main_dev_physical_storage_identity(record)
+        if physical != expected:
+            raise ContractRuntimeError(
+                "contract runtime physical namespace does not match record authority"
+            )
+        if record.get("contract_execution_id") != contract_execution_id:
+            raise ContractRuntimeError(
+                "contract runtime execution id does not match physical row"
+            )
         return record
 
     def update(
