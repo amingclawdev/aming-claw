@@ -409,42 +409,7 @@ def _runtime_bind_host() -> str:
     return AC_DEV_BIND_HOST if _runtime_plane() == "dev" else "0.0.0.0"
 
 
-def _current_stable_runtime_commit() -> str:
-    """Read the exact non-stale stable commit; accept legacy health only at a258."""
-
-    try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{AC_STABLE_SERVICE_PORT}/api/health",
-            timeout=3,
-        ) as response:
-            health = json.load(response)
-    except Exception:
-        return ""
-    loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
-    if not (
-        health.get("status") == "ok"
-        and health.get("service") == "governance"
-        and health.get("port") == AC_STABLE_SERVICE_PORT
-        and health.get("runtime_stale") is False
-        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", loaded)
-    ):
-        return ""
-    identity = health.get("runtime_plane_identity")
-    if isinstance(identity, Mapping) and identity:
-        if not (
-            health.get("runtime_plane") == "stable"
-            and identity.get("status") == "ready"
-            and identity.get("branch") == AC_STABLE_BRANCH
-            and identity.get("commit") == loaded
-            and identity.get("stable_anchor_commit") == loaded
-        ):
-            return ""
-    elif loaded != AC_STABLE_ANCHOR_COMMIT:
-        return ""
-    return loaded
-
-
-def _current_stable_runtime_database_identity() -> dict[str, Any]:
+def _stable_runtime_health() -> dict[str, Any]:
     try:
         with urllib.request.urlopen(
             f"http://127.0.0.1:{AC_STABLE_SERVICE_PORT}/api/health",
@@ -453,11 +418,230 @@ def _current_stable_runtime_database_identity() -> dict[str, Any]:
             health = json.load(response)
     except Exception:
         return {}
-    plane_identity = health.get("runtime_plane_identity")
-    database_identity = (
-        plane_identity.get("stable_database_identity")
-        if isinstance(plane_identity, Mapping)
-        else None
+    return dict(health) if isinstance(health, Mapping) else {}
+
+
+def _stable_runtime_graph_status() -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:40000/api/graph-governance/aming-claw/status",
+            timeout=3,
+        ) as response:
+            status = json.load(response)
+    except Exception:
+        return {}
+    return dict(status) if isinstance(status, Mapping) else {}
+
+
+def _verified_generic_stable_health_identity(
+    health: Mapping[str, Any],
+) -> dict[str, Any]:
+    loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
+    identity = health.get("runtime_plane_identity")
+    loaded_identity = health.get("loaded_runtime_identity")
+    if not (
+        health.get("status") == "ok"
+        and health.get("service") == "governance"
+        and health.get("port") == AC_STABLE_SERVICE_PORT
+        and health.get("runtime_plane") == "generic"
+        and health.get("runtime_stale") is False
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", loaded)
+        and type(health.get("pid")) is int
+        and int(health.get("pid") or 0) > 0
+        and isinstance(identity, Mapping)
+        and identity.get("schema_version") == "ac_runtime_plane_identity.v1"
+        and identity.get("status") == "ready"
+        and identity.get("plane") == "generic"
+        and identity.get("bind_host") == "0.0.0.0"
+        and identity.get("port") == AC_STABLE_SERVICE_PORT
+        and identity.get("expected_port") == AC_STABLE_SERVICE_PORT
+        and identity.get("pid") == health.get("pid")
+        and identity.get("branch") == AC_STABLE_BRANCH
+        and identity.get("expected_branch") == AC_STABLE_BRANCH
+        and identity.get("commit") == loaded
+        and identity.get("worktree_dirty") is False
+        and identity.get("worktree_dirty_files") == []
+        and isinstance(loaded_identity, Mapping)
+        and loaded_identity.get("schema_version") == LOADED_RUNTIME_IDENTITY_SCHEMA
+        and loaded_identity.get("loaded_commit") == loaded
+        and loaded_identity.get("loaded_pid") == health.get("pid")
+        and _git_object_identity_matches(
+            loaded_identity.get("worktree_head_version"), loaded
+        )
+        and loaded_identity.get("runtime_stale") is False
+        and loaded_identity.get("runtime_stale_reasons") == []
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(loaded_identity.get("loaded_source_sha256") or ""),
+        )
+        and loaded_identity.get("loaded_source_sha256")
+        == loaded_identity.get("worktree_source_sha256")
+    ):
+        return {}
+    return {
+        "commit": loaded,
+        "pid": int(health["pid"]),
+        "worktree_root": str(identity.get("worktree_root") or ""),
+        "database_identity": (
+            dict(identity.get("stable_database_identity"))
+            if isinstance(identity.get("stable_database_identity"), Mapping)
+            else {}
+        ),
+    }
+
+
+def _verified_generic_stable_graph_identity(
+    graph_status: Mapping[str, Any],
+    *,
+    loaded_commit: str,
+) -> dict[str, Any]:
+    current_state = (
+        graph_status.get("current_state")
+        if isinstance(graph_status.get("current_state"), Mapping)
+        else {}
+    )
+    graph_stale = (
+        current_state.get("graph_stale")
+        if isinstance(current_state.get("graph_stale"), Mapping)
+        else {}
+    )
+    snapshot_id = str(graph_status.get("active_snapshot_id") or "").strip()
+    graph_commit = str(graph_status.get("graph_snapshot_commit") or "").strip().lower()
+    materialized_commit = str(
+        graph_status.get("materialized_graph_baseline_commit") or ""
+    ).strip().lower()
+    if not (
+        graph_status.get("ok") is True
+        and graph_status.get("project_id") == "aming-claw"
+        and snapshot_id
+        and graph_commit == loaded_commit
+        and materialized_commit == loaded_commit
+        and graph_stale.get("is_stale") is False
+        and graph_stale.get("head_commit") == loaded_commit
+        and graph_stale.get("active_graph_commit") == loaded_commit
+    ):
+        return {}
+    return {
+        "active_snapshot_id": snapshot_id,
+        "graph_snapshot_commit": graph_commit,
+        "materialized_graph_baseline_commit": materialized_commit,
+    }
+
+
+def _verified_generic_stable_authority(
+    health: Mapping[str, Any],
+) -> dict[str, Any]:
+    base = _verified_generic_stable_health_identity(health)
+    if not base or _branch_service_port_open("127.0.0.1", AC_DEV_SERVICE_PORT):
+        return {}
+    try:
+        expected_root = Path(base["worktree_root"]).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return {}
+    try:
+        proc = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=expected_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    roots: list[Path] = []
+    if proc.returncode == 0:
+        for block in proc.stdout.strip().split("\n\n"):
+            values = dict(
+                line.split(" ", 1) if " " in line else (line, "")
+                for line in block.splitlines()
+            )
+            if (
+                values.get("branch") == "refs/heads/" + AC_STABLE_BRANCH
+                and values.get("worktree")
+            ):
+                try:
+                    roots.append(Path(values["worktree"]).resolve(strict=True))
+                except (OSError, RuntimeError, ValueError):
+                    return {}
+    if len(roots) != 1 or roots[0] != expected_root:
+        return {}
+    if (
+        _branch_service_git_output(expected_root, ["branch", "--show-current"])
+        != AC_STABLE_BRANCH
+        or _branch_service_git_output(expected_root, ["rev-parse", "HEAD"]).lower()
+        != base["commit"]
+        or _branch_service_git_output(expected_root, ["status", "--porcelain"])
+    ):
+        return {}
+    graph = _verified_generic_stable_graph_identity(
+        _stable_runtime_graph_status(),
+        loaded_commit=base["commit"],
+    )
+    if not graph:
+        return {}
+    return {
+        **base,
+        "mode": "verified_generic",
+        "health": dict(health),
+        "graph": graph,
+        "stable_branch_root": str(expected_root),
+    }
+
+
+def _current_stable_runtime_authority() -> dict[str, Any]:
+    """Read stable, legacy a258, or fully verified generic 40000 authority."""
+
+    health = _stable_runtime_health()
+    loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
+    if not (
+        health.get("status") == "ok"
+        and health.get("service") == "governance"
+        and health.get("port") == AC_STABLE_SERVICE_PORT
+        and health.get("runtime_stale") is False
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", loaded)
+    ):
+        return {}
+    identity = health.get("runtime_plane_identity")
+    if isinstance(identity, Mapping) and identity:
+        if health.get("runtime_plane") == "generic":
+            return _verified_generic_stable_authority(health)
+        if not (
+            health.get("runtime_plane") == "stable"
+            and identity.get("status") == "ready"
+            and identity.get("branch") == AC_STABLE_BRANCH
+            and identity.get("commit") == loaded
+            and identity.get("stable_anchor_commit") == loaded
+        ):
+            return {}
+        return {
+            "commit": loaded,
+            "mode": "explicit_stable",
+            "health": dict(health),
+            "database_identity": (
+                dict(identity.get("stable_database_identity"))
+                if isinstance(identity.get("stable_database_identity"), Mapping)
+                else {}
+            ),
+        }
+    if loaded == AC_STABLE_ANCHOR_COMMIT:
+        return {
+            "commit": loaded,
+            "mode": "legacy_a258",
+            "health": dict(health),
+            "database_identity": {},
+        }
+    return {}
+
+
+def _current_stable_runtime_commit() -> str:
+    authority = _current_stable_runtime_authority()
+    return str(authority.get("commit") or "")
+
+
+def _current_stable_runtime_database_identity() -> dict[str, Any]:
+    database_identity = _current_stable_runtime_authority().get(
+        "database_identity"
     )
     return (
         dict(database_identity)
@@ -621,13 +805,18 @@ def _validate_runtime_plane_startup() -> dict[str, Any]:
         raise GovernanceSingletonError(
             "ac_dev_canonical_stable_database_identity_mismatch"
         )
-    current_stable_commit = _current_stable_runtime_commit()
+    stable_authority = _current_stable_runtime_authority()
+    current_stable_commit = str(
+        stable_authority.get("commit") or _current_stable_runtime_commit()
+    )
     if not current_stable_commit:
         raise GovernanceSingletonError("ac_dev_current_stable_identity_unavailable")
     if identity["stable_anchor_commit"] != current_stable_commit:
         raise GovernanceSingletonError("ac_dev_stable_anchor_not_current")
-    current_stable_database_identity = (
-        _current_stable_runtime_database_identity()
+    current_stable_database_identity = dict(
+        stable_authority.get("database_identity")
+        or _current_stable_runtime_database_identity()
+        or {}
     )
     if current_stable_database_identity:
         if (
@@ -637,7 +826,10 @@ def _validate_runtime_plane_startup() -> dict[str, Any]:
             raise GovernanceSingletonError(
                 "ac_dev_stable_database_identity_not_current"
             )
-    elif current_stable_commit != AC_STABLE_ANCHOR_COMMIT:
+    elif not (
+        current_stable_commit == AC_STABLE_ANCHOR_COMMIT
+        or stable_authority.get("mode") == "verified_generic"
+    ):
         raise GovernanceSingletonError(
             "ac_dev_current_stable_database_identity_unavailable"
         )
@@ -203294,7 +203486,10 @@ def handle_branch_service_validate(ctx: RequestContext):
             },
         )
     stable_anchor = str(body.get("stable_anchor_commit") or "").strip().lower()
-    current_stable_commit = _current_stable_runtime_commit()
+    stable_runtime_authority = _current_stable_runtime_authority()
+    current_stable_commit = str(
+        stable_runtime_authority.get("commit") or _current_stable_runtime_commit()
+    )
     if not current_stable_commit:
         raise ValidationError(
             "branch-service requires an exact non-stale stable service",
@@ -203438,7 +203633,11 @@ def handle_branch_service_validate(ctx: RequestContext):
             AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
         ).hexdigest(),
     }
-    live_database_identity = _current_stable_runtime_database_identity()
+    live_database_identity = dict(
+        stable_runtime_authority.get("database_identity")
+        or _current_stable_runtime_database_identity()
+        or {}
+    )
     if (
         not _ac_stable_database_identity_valid(supplied_database_identity)
         or dict(supplied_database_identity) != actual_database_identity
@@ -203447,7 +203646,11 @@ def handle_branch_service_validate(ctx: RequestContext):
             live_database_identity
             and live_database_identity != actual_database_identity
         )
-        or (not live_database_identity and stable_anchor != AC_STABLE_ANCHOR_COMMIT)
+        or (
+            not live_database_identity
+            and stable_anchor != AC_STABLE_ANCHOR_COMMIT
+            and stable_runtime_authority.get("mode") != "verified_generic"
+        )
     ):
         raise ValidationError(
             "branch-service stable database identity mismatch",

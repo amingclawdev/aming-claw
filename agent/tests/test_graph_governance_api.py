@@ -15151,6 +15151,192 @@ def test_stable_runtime_requires_exact_port_branch_commit_and_anchor(monkeypatch
     assert identity["stable_anchor_commit"] == commit
 
 
+def _generic_stable_health_fixture(root: Path, commit: str) -> dict[str, Any]:
+    source_hash = "sha256:" + "1" * 64
+    return {
+        "status": "ok",
+        "service": "governance",
+        "port": server.AC_STABLE_SERVICE_PORT,
+        "pid": 4242,
+        "runtime_loaded_version": commit,
+        "runtime_stale": False,
+        "runtime_plane": "generic",
+        "runtime_plane_identity": {
+            "schema_version": "ac_runtime_plane_identity.v1",
+            "status": "ready",
+            "plane": "generic",
+            "bind_host": "0.0.0.0",
+            "port": server.AC_STABLE_SERVICE_PORT,
+            "expected_port": server.AC_STABLE_SERVICE_PORT,
+            "pid": 4242,
+            "worktree_root": str(root),
+            "branch": server.AC_STABLE_BRANCH,
+            "expected_branch": server.AC_STABLE_BRANCH,
+            "commit": commit,
+            "worktree_dirty": False,
+            "worktree_dirty_files": [],
+        },
+        "loaded_runtime_identity": {
+            "schema_version": "governance_loaded_runtime_identity.v1",
+            "loaded_commit": commit,
+            "loaded_pid": 4242,
+            "worktree_head_version": commit[:12],
+            "runtime_stale": False,
+            "runtime_stale_reasons": [],
+            "loaded_source_sha256": source_hash,
+            "worktree_source_sha256": source_hash,
+        },
+    }
+
+
+def _generic_stable_graph_fixture(commit: str) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "project_id": "aming-claw",
+        "active_snapshot_id": "full-verified-generic",
+        "graph_snapshot_commit": commit,
+        "materialized_graph_baseline_commit": commit,
+        "current_state": {
+            "graph_stale": {
+                "is_stale": False,
+                "head_commit": commit,
+                "active_graph_commit": commit,
+            }
+        },
+    }
+
+
+def test_verified_generic_stable_authority_requires_unique_clean_graph_exact_root(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "stable"
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "-qb", server.AC_STABLE_BRANCH], cwd=root, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=root, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"], cwd=root, check=True
+    )
+    (root / "README.md").write_text("stable\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "stable"], cwd=root, check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    health = _generic_stable_health_fixture(root.resolve(), commit)
+    monkeypatch.setattr(server, "_branch_service_port_open", lambda *_args: False)
+    monkeypatch.setattr(
+        server,
+        "_stable_runtime_graph_status",
+        lambda: _generic_stable_graph_fixture(commit),
+    )
+
+    authority = server._verified_generic_stable_authority(health)
+
+    assert authority["mode"] == "verified_generic"
+    assert authority["commit"] == commit
+    assert authority["stable_branch_root"] == str(root.resolve())
+    monkeypatch.setattr(server, "_branch_service_port_open", lambda *_args: True)
+    assert server._verified_generic_stable_authority(health) == {}
+    other_root = tmp_path / "not-the-registered-stable-root"
+    other_root.mkdir()
+    wrong_root_health = copy.deepcopy(health)
+    wrong_root_health["runtime_plane_identity"]["worktree_root"] = str(other_root)
+    monkeypatch.setattr(server, "_branch_service_port_open", lambda *_args: False)
+    assert server._verified_generic_stable_authority(wrong_root_health) == {}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "stale",
+        "dirty",
+        "source",
+        "branch",
+        "commit",
+        "port",
+        "pid",
+        "loaded_pid",
+        "loaded_schema",
+        "worktree_head",
+        "plane_schema",
+        "bind_host",
+        "expected_branch",
+    ],
+)
+def test_verified_generic_stable_health_fails_closed(mutation, tmp_path):
+    commit = "c" * 40
+    health = _generic_stable_health_fixture(tmp_path, commit)
+    if mutation == "stale":
+        health["runtime_stale"] = True
+    elif mutation == "dirty":
+        health["runtime_plane_identity"]["worktree_dirty"] = True
+        health["runtime_plane_identity"]["worktree_dirty_files"] = ["M file"]
+    elif mutation == "source":
+        health["loaded_runtime_identity"]["worktree_source_sha256"] = (
+            "sha256:" + "2" * 64
+        )
+    elif mutation == "branch":
+        health["runtime_plane_identity"]["branch"] = server.AC_DEV_BRANCH
+    elif mutation == "commit":
+        health["runtime_plane_identity"]["commit"] = "d" * 40
+    elif mutation == "port":
+        health["runtime_plane_identity"]["expected_port"] = (
+            server.AC_DEV_SERVICE_PORT
+        )
+    elif mutation == "pid":
+        health["runtime_plane_identity"]["pid"] = 9999
+    elif mutation == "loaded_pid":
+        health["loaded_runtime_identity"]["loaded_pid"] = 9999
+    elif mutation == "loaded_schema":
+        health["loaded_runtime_identity"]["schema_version"] = "legacy"
+    elif mutation == "worktree_head":
+        health["loaded_runtime_identity"]["worktree_head_version"] = "d" * 40
+    elif mutation == "plane_schema":
+        health["runtime_plane_identity"]["schema_version"] = "legacy"
+    elif mutation == "bind_host":
+        health["runtime_plane_identity"]["bind_host"] = "127.0.0.1"
+    else:
+        health["runtime_plane_identity"]["expected_branch"] = server.AC_DEV_BRANCH
+
+    assert server._verified_generic_stable_health_identity(health) == {}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["snapshot", "commit", "baseline", "stale", "head", "active"],
+)
+def test_verified_generic_stable_graph_fails_closed(mutation):
+    commit = "c" * 40
+    graph = _generic_stable_graph_fixture(commit)
+    if mutation == "snapshot":
+        graph["active_snapshot_id"] = ""
+    elif mutation == "commit":
+        graph["graph_snapshot_commit"] = "d" * 40
+    elif mutation == "baseline":
+        graph["materialized_graph_baseline_commit"] = "d" * 40
+    elif mutation == "stale":
+        graph["current_state"]["graph_stale"]["is_stale"] = True
+    elif mutation == "head":
+        graph["current_state"]["graph_stale"]["head_commit"] = "d" * 40
+    else:
+        graph["current_state"]["graph_stale"]["active_graph_commit"] = "d" * 40
+
+    assert (
+        server._verified_generic_stable_graph_identity(
+            graph, loaded_commit=commit
+        )
+        == {}
+    )
+
+
 def test_dev_runtime_tracks_current_stable_after_bootstrap(monkeypatch, tmp_path):
     stable = "c" * 40
     candidate = "d" * 40
@@ -16816,8 +17002,12 @@ def test_branch_service_validate_refuses_any_port_except_40008(
     monkeypatch.setattr(server, "_branch_service_git_output", git_output)
     monkeypatch.setattr(
         server,
-        "_current_stable_runtime_commit",
-        lambda: server.AC_STABLE_ANCHOR_COMMIT,
+        "_current_stable_runtime_authority",
+        lambda: {
+            "commit": server.AC_STABLE_ANCHOR_COMMIT,
+            "mode": "verified_generic",
+            "database_identity": {},
+        },
     )
     monkeypatch.setattr(
         server.subprocess,
@@ -16885,8 +17075,12 @@ def test_branch_service_launches_guarded_module_with_dev_env(
     )
     monkeypatch.setattr(
         server,
-        "_current_stable_runtime_commit",
-        lambda: server.AC_STABLE_ANCHOR_COMMIT,
+        "_current_stable_runtime_authority",
+        lambda: {
+            "commit": server.AC_STABLE_ANCHOR_COMMIT,
+            "mode": "verified_generic",
+            "database_identity": {},
+        },
     )
     monkeypatch.setattr(server, "_branch_service_port_open", lambda *_: False)
     monkeypatch.setattr(
@@ -16948,6 +17142,29 @@ def test_branch_service_launches_guarded_module_with_dev_env(
                     "shared_volume_path": str(alternate),
                     "stable_database_identity": database_identity,
                     "runtime_workspace": str(tmp_path / "runtime-alternate"),
+                },
+            )
+        )
+    assert launched == {}
+
+    with pytest.raises(
+        ValidationError,
+        match="stable database identity mismatch",
+    ):
+        server.handle_branch_service_validate(
+            _ctx(
+                {},
+                method="POST",
+                body={
+                    "worktree_path": str(worktree),
+                    "port": 40008,
+                    "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+                    "shared_volume_path": str(shared),
+                    "stable_database_identity": {
+                        **database_identity,
+                        "inode": database_identity["inode"] + 1,
+                    },
+                    "runtime_workspace": str(tmp_path / "runtime-bad-db"),
                 },
             )
         )

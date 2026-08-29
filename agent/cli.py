@@ -273,15 +273,20 @@ def _canonical_stable_database_binding(
         "inode": int(metadata.st_ino),
         "stable_relative_path_sha256": relative_hash,
     }
-    health = _probe_governance(AC_STABLE_SERVICE_PORT) or {}
+    authority = _current_stable_runtime_authority()
+    if authority.get("commit") != stable_anchor_commit:
+        raise click.ClickException(
+            "Stable service authority changed while binding its database."
+        )
+    health = authority.get("health") or {}
     plane_identity = health.get("runtime_plane_identity")
     health_database_identity = (
         plane_identity.get("stable_database_identity")
         if isinstance(plane_identity, Mapping)
         else None
     )
-    if health_database_identity is None:
-        if stable_anchor_commit != AC_STABLE_ANCHOR_COMMIT:
+    if health_database_identity in (None, {}):
+        if authority.get("mode") not in {"legacy_a258", "verified_generic"}:
             raise click.ClickException(
                 "Stable service does not expose its database identity."
             )
@@ -295,24 +300,214 @@ def _canonical_stable_database_binding(
     }
 
 
-def _current_stable_anchor_commit() -> str:
-    """Resolve the exact currently loaded stable commit, never a stale default."""
+def _exact_sha256(value: Any) -> bool:
+    return bool(re.fullmatch(r"sha256:[0-9a-f]{64}", str(value or "")))
 
-    health = _probe_governance(AC_STABLE_SERVICE_PORT)
-    loaded = str((health or {}).get("runtime_loaded_version") or "").strip().lower()
+
+def _git_commit_identity_matches(left: Any, right: Any) -> bool:
+    left_value = str(left or "").strip().lower()
+    right_value = str(right or "").strip().lower()
+    return bool(
+        re.fullmatch(r"[0-9a-f]{7,64}", left_value)
+        and re.fullmatch(r"[0-9a-f]{7,64}", right_value)
+        and (
+            left_value == right_value
+            or left_value.startswith(right_value)
+            or right_value.startswith(left_value)
+        )
+    )
+
+
+def _verified_generic_health_identity(
+    health: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the immutable part of the temporary generic stable authority."""
+
+    loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
+    identity = health.get("runtime_plane_identity")
+    loaded_identity = health.get("loaded_runtime_identity")
     if not (
-        health
-        and health.get("status") == "ok"
+        health.get("status") == "ok"
+        and health.get("service") == "governance"
+        and health.get("port") == AC_STABLE_SERVICE_PORT
+        and health.get("runtime_plane") == "generic"
+        and health.get("runtime_stale") is False
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", loaded)
+        and type(health.get("pid")) is int
+        and int(health.get("pid") or 0) > 0
+        and isinstance(identity, Mapping)
+        and identity.get("schema_version") == "ac_runtime_plane_identity.v1"
+        and identity.get("status") == "ready"
+        and identity.get("plane") == "generic"
+        and identity.get("bind_host") == "0.0.0.0"
+        and identity.get("port") == AC_STABLE_SERVICE_PORT
+        and identity.get("expected_port") == AC_STABLE_SERVICE_PORT
+        and identity.get("pid") == health.get("pid")
+        and identity.get("branch") == AC_STABLE_BRANCH
+        and identity.get("expected_branch") == AC_STABLE_BRANCH
+        and identity.get("commit") == loaded
+        and identity.get("worktree_dirty") is False
+        and identity.get("worktree_dirty_files") == []
+        and isinstance(loaded_identity, Mapping)
+        and loaded_identity.get("schema_version")
+        == "governance_loaded_runtime_identity.v1"
+        and loaded_identity.get("loaded_commit") == loaded
+        and loaded_identity.get("loaded_pid") == health.get("pid")
+        and _git_commit_identity_matches(
+            loaded_identity.get("worktree_head_version"), loaded
+        )
+        and loaded_identity.get("runtime_stale") is False
+        and loaded_identity.get("runtime_stale_reasons") == []
+        and _exact_sha256(loaded_identity.get("loaded_source_sha256"))
+        and loaded_identity.get("loaded_source_sha256")
+        == loaded_identity.get("worktree_source_sha256")
+    ):
+        return {}
+    return {
+        "commit": loaded,
+        "pid": int(health["pid"]),
+        "worktree_root": str(identity.get("worktree_root") or ""),
+        "database_identity": (
+            dict(identity.get("stable_database_identity"))
+            if isinstance(identity.get("stable_database_identity"), Mapping)
+            else {}
+        ),
+    }
+
+
+def _verified_generic_graph_identity(
+    graph_status: Mapping[str, Any],
+    *,
+    loaded_commit: str,
+) -> dict[str, Any]:
+    current_state = (
+        graph_status.get("current_state")
+        if isinstance(graph_status.get("current_state"), Mapping)
+        else {}
+    )
+    graph_stale = (
+        current_state.get("graph_stale")
+        if isinstance(current_state.get("graph_stale"), Mapping)
+        else {}
+    )
+    snapshot_id = str(graph_status.get("active_snapshot_id") or "").strip()
+    graph_commit = str(graph_status.get("graph_snapshot_commit") or "").strip().lower()
+    materialized_commit = str(
+        graph_status.get("materialized_graph_baseline_commit") or ""
+    ).strip().lower()
+    if not (
+        graph_status.get("ok") is True
+        and graph_status.get("project_id") == "aming-claw"
+        and snapshot_id
+        and graph_commit == loaded_commit
+        and materialized_commit == loaded_commit
+        and graph_stale.get("is_stale") is False
+        and graph_stale.get("head_commit") == loaded_commit
+        and graph_stale.get("active_graph_commit") == loaded_commit
+    ):
+        return {}
+    return {
+        "active_snapshot_id": snapshot_id,
+        "graph_snapshot_commit": graph_commit,
+        "materialized_graph_baseline_commit": materialized_commit,
+    }
+
+
+def _verified_generic_stable_authority(
+    health: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Accept generic 40000 only when source, Git, graph, and port agree."""
+
+    base = _verified_generic_health_identity(health)
+    if not base or _port_is_open(AC_DEV_SERVICE_PORT):
+        return {}
+    try:
+        expected_root = Path(base["worktree_root"]).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return {}
+    try:
+        proc = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=expected_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    roots: list[Path] = []
+    if proc.returncode == 0:
+        for block in proc.stdout.strip().split("\n\n"):
+            values = dict(
+                line.split(" ", 1) if " " in line else (line, "")
+                for line in block.splitlines()
+            )
+            if (
+                values.get("branch") == "refs/heads/" + AC_STABLE_BRANCH
+                and values.get("worktree")
+            ):
+                try:
+                    roots.append(Path(values["worktree"]).resolve(strict=True))
+                except (OSError, RuntimeError, ValueError):
+                    return {}
+    if len(roots) != 1 or roots[0] != expected_root:
+        return {}
+
+    def git_output(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=expected_root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    if (
+        git_output("branch", "--show-current") != AC_STABLE_BRANCH
+        or git_output("rev-parse", "HEAD").lower() != base["commit"]
+        or git_output("status", "--porcelain")
+    ):
+        return {}
+    graph_status = _probe_governance_path(
+        AC_STABLE_SERVICE_PORT,
+        "/api/graph-governance/aming-claw/status",
+    )
+    graph = _verified_generic_graph_identity(
+        graph_status or {},
+        loaded_commit=base["commit"],
+    )
+    if not graph:
+        return {}
+    return {
+        **base,
+        "mode": "verified_generic",
+        "health": dict(health),
+        "graph": graph,
+        "stable_branch_root": str(expected_root),
+    }
+
+
+def _current_stable_runtime_authority() -> dict[str, Any]:
+    health = _probe_governance(AC_STABLE_SERVICE_PORT) or {}
+    loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
+    if not (
+        health.get("status") == "ok"
         and health.get("service") == "governance"
         and health.get("port") == AC_STABLE_SERVICE_PORT
         and health.get("runtime_stale") is False
         and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", loaded)
     ):
-        raise click.ClickException(
-            "AC dev runtime requires an exact non-stale stable service on port 40000."
-        )
+        return {}
     identity = health.get("runtime_plane_identity")
     if isinstance(identity, Mapping) and identity:
+        if health.get("runtime_plane") == "generic":
+            return _verified_generic_stable_authority(health)
         if not (
             health.get("runtime_plane") == "stable"
             and identity.get("status") == "ready"
@@ -320,12 +515,23 @@ def _current_stable_anchor_commit() -> str:
             and identity.get("commit") == loaded
             and identity.get("stable_anchor_commit") == loaded
         ):
-            raise click.ClickException("Stable service identity is not release-ready.")
-    elif loaded != AC_STABLE_ANCHOR_COMMIT:
-        # a258 predates plane identity fields. It is the only legacy stable
-        # runtime accepted for the one-time bootstrap promotion.
-        raise click.ClickException("Legacy stable health is valid only at the bootstrap anchor.")
-    return loaded
+            return {}
+        return {"commit": loaded, "mode": "explicit_stable", "health": dict(health)}
+    if loaded == AC_STABLE_ANCHOR_COMMIT:
+        return {"commit": loaded, "mode": "legacy_a258", "health": dict(health)}
+    return {}
+
+
+def _current_stable_anchor_commit() -> str:
+    """Resolve the exact currently loaded stable commit, never a stale default."""
+
+    authority = _current_stable_runtime_authority()
+    if not authority:
+        raise click.ClickException(
+            "AC dev runtime requires exact stable or verified-generic authority "
+            "on port 40000."
+        )
+    return str(authority["commit"])
 
 
 def _run_dev_governance() -> None:
@@ -518,6 +724,23 @@ def _probe_governance(port: int, *, timeout: float = 2.0) -> Optional[dict]:
     url = f"http://127.0.0.1:{port}/api/health"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - localhost probe
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _probe_governance_path(
+    port: int,
+    path: str,
+    *,
+    timeout: float = 2.0,
+) -> Optional[dict]:
+    if not path.startswith("/"):
+        return None
+    url = f"http://127.0.0.1:{port}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
             payload = json.loads(resp.read().decode("utf-8"))
     except (OSError, urllib.error.URLError, json.JSONDecodeError):
         return None

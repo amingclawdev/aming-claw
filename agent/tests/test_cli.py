@@ -2991,6 +2991,280 @@ class TestCliMf:
 
 
 class TestACDevRuntimeCli:
+    @staticmethod
+    def _generic_stable_health(cli, *, commit, root, **overrides):
+        source_hash = "sha256:" + "1" * 64
+        health = {
+            "status": "ok",
+            "service": "governance",
+            "port": cli.AC_STABLE_SERVICE_PORT,
+            "pid": 12345,
+            "runtime_loaded_version": commit,
+            "runtime_stale": False,
+            "runtime_plane": "generic",
+            "runtime_plane_identity": {
+                "schema_version": "ac_runtime_plane_identity.v1",
+                "status": "ready",
+                "plane": "generic",
+                "bind_host": "0.0.0.0",
+                "port": cli.AC_STABLE_SERVICE_PORT,
+                "expected_port": cli.AC_STABLE_SERVICE_PORT,
+                "pid": 12345,
+                "worktree_root": str(root),
+                "branch": cli.AC_STABLE_BRANCH,
+                "expected_branch": cli.AC_STABLE_BRANCH,
+                "commit": commit,
+                "worktree_dirty": False,
+                "worktree_dirty_files": [],
+            },
+            "loaded_runtime_identity": {
+                "schema_version": "governance_loaded_runtime_identity.v1",
+                "loaded_commit": commit,
+                "loaded_pid": 12345,
+                "worktree_head_version": commit[:12],
+                "runtime_stale": False,
+                "runtime_stale_reasons": [],
+                "loaded_source_sha256": source_hash,
+                "worktree_source_sha256": source_hash,
+            },
+        }
+        health.update(overrides)
+        return health
+
+    @staticmethod
+    def _generic_graph(commit, **overrides):
+        graph = {
+            "ok": True,
+            "project_id": "aming-claw",
+            "active_snapshot_id": "full-generic-stable",
+            "graph_snapshot_commit": commit,
+            "materialized_graph_baseline_commit": commit,
+            "current_state": {
+                "graph_stale": {
+                    "is_stale": False,
+                    "head_commit": commit,
+                    "active_graph_commit": commit,
+                }
+            },
+        }
+        graph.update(overrides)
+        return graph
+
+    def test_verified_generic_anchor_requires_exact_source_git_graph_and_free_dev_port(
+        self, monkeypatch, tmp_path
+    ):
+        import agent.cli as cli
+
+        stable = tmp_path / "stable"
+        stable.mkdir()
+        subprocess.run(
+            ["git", "init", "-qb", cli.AC_STABLE_BRANCH],
+            cwd=stable,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=stable,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=stable,
+            check=True,
+        )
+        (stable / "README.md").write_text("stable\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=stable, check=True)
+        subprocess.run(["git", "commit", "-qm", "stable"], cwd=stable, check=True)
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=stable,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        health = self._generic_stable_health(
+            cli, commit=commit, root=stable.resolve()
+        )
+        monkeypatch.setattr(cli, "_port_is_open", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(
+            cli,
+            "_probe_governance_path",
+            lambda *_args, **_kwargs: self._generic_graph(commit),
+        )
+
+        authority = cli._verified_generic_stable_authority(health)
+
+        assert authority["mode"] == "verified_generic"
+        assert authority["commit"] == commit
+        assert authority["graph"]["graph_snapshot_commit"] == commit
+
+        monkeypatch.setattr(cli, "_port_is_open", lambda *_args, **_kwargs: True)
+        assert cli._verified_generic_stable_authority(health) == {}
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "runtime_stale",
+            "dirty",
+            "source_hash",
+            "branch",
+            "commit",
+            "port",
+            "pid",
+            "loaded_pid",
+            "loaded_schema",
+            "worktree_head",
+            "plane_schema",
+            "bind_host",
+            "expected_branch",
+        ],
+    )
+    def test_verified_generic_health_fails_closed_on_identity_drift(
+        self, tmp_path, mutation
+    ):
+        import agent.cli as cli
+
+        commit = "c" * 40
+        health = self._generic_stable_health(
+            cli, commit=commit, root=tmp_path
+        )
+        if mutation == "runtime_stale":
+            health["runtime_stale"] = True
+        elif mutation == "dirty":
+            health["runtime_plane_identity"]["worktree_dirty"] = True
+            health["runtime_plane_identity"]["worktree_dirty_files"] = ["M file"]
+        elif mutation == "source_hash":
+            health["loaded_runtime_identity"]["worktree_source_sha256"] = (
+                "sha256:" + "2" * 64
+            )
+        elif mutation == "branch":
+            health["runtime_plane_identity"]["branch"] = "codex/ac-dev"
+        elif mutation == "commit":
+            health["runtime_plane_identity"]["commit"] = "d" * 40
+        elif mutation == "port":
+            health["runtime_plane_identity"]["expected_port"] = (
+                cli.AC_DEV_SERVICE_PORT
+            )
+        elif mutation == "pid":
+            health["runtime_plane_identity"]["pid"] = 999
+        elif mutation == "loaded_pid":
+            health["loaded_runtime_identity"]["loaded_pid"] = 999
+        elif mutation == "loaded_schema":
+            health["loaded_runtime_identity"]["schema_version"] = "legacy"
+        elif mutation == "worktree_head":
+            health["loaded_runtime_identity"]["worktree_head_version"] = "d" * 40
+        elif mutation == "plane_schema":
+            health["runtime_plane_identity"]["schema_version"] = "legacy"
+        elif mutation == "bind_host":
+            health["runtime_plane_identity"]["bind_host"] = "127.0.0.1"
+        else:
+            health["runtime_plane_identity"]["expected_branch"] = "codex/ac-dev"
+
+        assert cli._verified_generic_health_identity(health) == {}
+
+    @pytest.mark.parametrize(
+        "mutation",
+        ["snapshot", "commit", "baseline", "stale", "head", "active"],
+    )
+    def test_verified_generic_graph_fails_closed_on_graph_drift(self, mutation):
+        import agent.cli as cli
+
+        commit = "c" * 40
+        graph = self._generic_graph(commit)
+        if mutation == "snapshot":
+            graph["active_snapshot_id"] = ""
+        elif mutation == "commit":
+            graph["graph_snapshot_commit"] = "d" * 40
+        elif mutation == "baseline":
+            graph["materialized_graph_baseline_commit"] = "d" * 40
+        elif mutation == "stale":
+            graph["current_state"]["graph_stale"]["is_stale"] = True
+        elif mutation == "head":
+            graph["current_state"]["graph_stale"]["head_commit"] = "d" * 40
+        else:
+            graph["current_state"]["graph_stale"]["active_graph_commit"] = (
+                "d" * 40
+            )
+
+        assert (
+            cli._verified_generic_graph_identity(graph, loaded_commit=commit) == {}
+        )
+
+    def test_generic_database_binding_allows_absent_health_identity_but_rejects_mismatch(
+        self, monkeypatch, tmp_path
+    ):
+        import agent.cli as cli
+
+        source = tmp_path / "ac-dev"
+        source.mkdir()
+        stable = tmp_path / "stable"
+        database = (
+            stable
+            / cli.AC_DATABASE_STABLE_RELATIVE_PATH
+        )
+        database.parent.mkdir(parents=True)
+        database.touch()
+        stable_commit = "c" * 40
+        monkeypatch.setattr(
+            cli,
+            "_source_git_identity",
+            lambda: {
+                "root": str(source),
+                "branch": cli.AC_DEV_BRANCH,
+                "commit": "d" * 40,
+                "dirty": "",
+            },
+        )
+        monkeypatch.setattr(
+            cli.subprocess,
+            "run",
+            lambda *_args, **_kwargs: types.SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"worktree {stable}\n"
+                    f"branch refs/heads/{cli.AC_STABLE_BRANCH}\n"
+                ),
+                stderr="",
+            ),
+        )
+        monkeypatch.setattr(
+            cli,
+            "_current_stable_runtime_authority",
+            lambda: {
+                "commit": stable_commit,
+                "mode": "verified_generic",
+                "health": {"runtime_plane_identity": {}},
+            },
+        )
+
+        binding = cli._canonical_stable_database_binding(
+            str(stable / "shared-volume"),
+            stable_anchor_commit=stable_commit,
+        )
+        assert binding["stable_database_identity"]["inode"] == database.stat().st_ino
+
+        monkeypatch.setattr(
+            cli,
+            "_current_stable_runtime_authority",
+            lambda: {
+                "commit": stable_commit,
+                "mode": "verified_generic",
+                "health": {
+                    "runtime_plane_identity": {
+                        "stable_database_identity": {
+                            **binding["stable_database_identity"],
+                            "inode": binding["stable_database_identity"]["inode"] + 1,
+                        }
+                    }
+                },
+            },
+        )
+        with pytest.raises(cli.click.ClickException, match="differs"):
+            cli._canonical_stable_database_binding(
+                str(stable / "shared-volume"),
+                stable_anchor_commit=stable_commit,
+            )
+
     def test_dev_anchor_tracks_exact_current_stable_health(self, monkeypatch):
         import agent.cli as cli
 
