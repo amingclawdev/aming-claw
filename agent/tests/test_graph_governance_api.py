@@ -17208,20 +17208,44 @@ def test_branch_service_exact_dev_health_rejects_each_identity_mutation(
     )
 
 
+def test_branch_service_detached_log_keeps_real_child_alive_after_parent_close(
+    tmp_path,
+):
+    log_path, parent_handle = server._branch_service_detached_log(tmp_path)
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=parent_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        parent_handle.close()
+        time.sleep(0.05)
+        assert parent_handle.closed is True
+        assert child.poll() is None
+        assert log_path == tmp_path / "branch-service.log"
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
 @pytest.mark.parametrize(
-    ("health_pid", "keep_running", "expected_ok"),
+    ("health_pid", "keep_running", "expected_ok", "expected_stop"),
     [
-        pytest.param(43210, False, True, id="spawned-pid-matches"),
+        pytest.param(43210, False, True, True, id="bounded-pipe-stops"),
+        pytest.param(43210, True, True, False, id="detached-child-keeps-running"),
         pytest.param(
             99999,
             True,
             False,
+            True,
             id="health-pid-mismatch-stops-even-when-kept-running",
         ),
     ],
 )
 def test_branch_service_launches_guarded_module_with_dev_env(
-    tmp_path, monkeypatch, health_pid, keep_running, expected_ok
+    tmp_path, monkeypatch, health_pid, keep_running, expected_ok, expected_stop
 ):
     worktree = tmp_path / "ac-dev"
     worktree.mkdir()
@@ -17276,10 +17300,11 @@ def test_branch_service_launches_guarded_module_with_dev_env(
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
     launched = {}
+    process = SimpleNamespace(pid=43210, alive=True)
 
     def fake_popen(command, **kwargs):
         launched.update({"command": command, **kwargs})
-        return SimpleNamespace(pid=43210)
+        return process
 
     monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(
@@ -17300,6 +17325,7 @@ def test_branch_service_launches_guarded_module_with_dev_env(
 
     def stop_process(proc):
         stopped.append(proc.pid)
+        proc.alive = False
         return {"stopped": True, "pid": proc.pid}
 
     monkeypatch.setattr(server, "_branch_service_stop_process", stop_process)
@@ -17368,8 +17394,11 @@ def test_branch_service_launches_guarded_module_with_dev_env(
     assert result["ok"] is expected_ok
     assert result["process_pid"] == 43210
     assert result["pid"] == health_pid
-    assert stopped == [43210]
-    assert result["stop_result"] == {"stopped": True, "pid": 43210}
+    assert stopped == ([43210] if expected_stop else [])
+    assert result["stop_result"] == (
+        {"stopped": True, "pid": 43210} if expected_stop else {}
+    )
+    assert process.alive is not expected_stop
     assert result["isolation_status"] == (
         "isolated" if expected_ok else "health_probe_failed"
     )
@@ -17382,6 +17411,26 @@ def test_branch_service_launches_guarded_module_with_dev_env(
     assert launched["env"]["GOVERNANCE_PORT"] == "40008"
     assert launched["env"]["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] == "deny"
     assert "start_governance.py" not in launched["command"]
+    if keep_running:
+        assert launched["stdin"] is subprocess.DEVNULL
+        assert launched["stderr"] is subprocess.STDOUT
+        assert launched["start_new_session"] is True
+        assert launched["stdout"].closed is True
+        assert result["process_log"] == {
+            "mode": "detached_append",
+            "path": str(tmp_path / "runtime" / "branch-service.log"),
+            "relative_path": "branch-service.log",
+            "path_scope": "runtime_workspace",
+            "content_exposed": False,
+            "public_safe_metadata_only": True,
+            "parent_handle_closed": True,
+        }
+    else:
+        assert launched["stdout"] is subprocess.PIPE
+        assert launched["stderr"] is subprocess.PIPE
+        assert "start_new_session" not in launched
+        assert result["process_log"]["mode"] == "captured_pipe"
+        assert result["process_log"]["parent_handle_closed"] is False
 
 
 def _graph(node_id: str = "L7.1") -> dict:

@@ -27,7 +27,7 @@ from threading import BoundedSemaphore, Event, RLock, local
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterable, Iterator, Mapping, NamedTuple, NoReturn, Sequence
+from typing import Any, Iterable, Iterator, Mapping, NamedTuple, NoReturn, Sequence, TextIO
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -203419,6 +203419,22 @@ def _branch_service_stop_process(proc: subprocess.Popen) -> dict[str, Any]:
         }
 
 
+def _branch_service_detached_log(
+    runtime_workspace: Path,
+) -> tuple[Path, TextIO]:
+    log_path = runtime_workspace / "branch-service.log"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(log_path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        return log_path, os.fdopen(fd, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def _branch_service_exact_dev_health_matches(
     health: Mapping[str, Any],
     *,
@@ -203760,16 +203776,35 @@ def handle_branch_service_validate(ctx: RequestContext):
     # start_governance.py performs a legacy chain-history backfill before the
     # server's dev-plane preflight. Launch the guarded module directly.
     command = [python_bin, "-m", "agent.governance.server"]
+    detached_log_path: Path | None = None
+    detached_log_handle: TextIO | None = None
     try:
+        popen_output: dict[str, Any]
+        if keep_running:
+            detached_log_path, detached_log_handle = _branch_service_detached_log(
+                runtime_workspace
+            )
+            popen_output = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": detached_log_handle,
+                "stderr": subprocess.STDOUT,
+                "start_new_session": True,
+            }
+        else:
+            popen_output = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+            }
         proc = subprocess.Popen(
             command,
             cwd=worktree,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             text=True,
+            **popen_output,
         )
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        if detached_log_handle is not None:
+            detached_log_handle.close()
         return {
             "ok": False,
             "schema_version": "branch_service_validation.v2",
@@ -203780,6 +203815,9 @@ def handle_branch_service_validate(ctx: RequestContext):
             "worktree_path": str(worktree),
             "cwd": str(worktree),
             "command": command,
+            "process_log_path": (
+                str(detached_log_path) if detached_log_path is not None else ""
+            ),
             "env": {
                 "GOVERNANCE_PORT": str(requested_port),
                 "AMING_CLAW_HOME": str(runtime_workspace),
@@ -203790,33 +203828,59 @@ def handle_branch_service_validate(ctx: RequestContext):
             },
             "isolation_status": "start_failed",
         }
-    probe = _branch_service_poll_health(host, requested_port, timeout_sec=timeout_sec)
-    health = probe.get("health") if isinstance(probe.get("health"), Mapping) else {}
-    actual_port = health.get("port") if type(health.get("port")) is int else 0
-    health_pid = health.get("pid") if type(health.get("pid")) is int else 0
-    plane_identity = (
-        health.get("runtime_plane_identity")
-        if isinstance(health.get("runtime_plane_identity"), Mapping)
-        else {}
-    )
-    isolation_ok = bool(
-        probe.get("ok")
-        and requested_port == AC_DEV_SERVICE_PORT
-        and _branch_service_exact_dev_health_matches(
-            health,
-            process_pid=proc.pid,
-            runtime_commit=runtime_commit,
-            worktree_root=str(worktree),
-            stable_anchor_commit=stable_anchor,
-            stable_database_identity=actual_database_identity,
+    try:
+        probe = _branch_service_poll_health(
+            host, requested_port, timeout_sec=timeout_sec
         )
-    )
+        health = (
+            probe.get("health")
+            if isinstance(probe.get("health"), Mapping)
+            else {}
+        )
+        actual_port = health.get("port") if type(health.get("port")) is int else 0
+        health_pid = health.get("pid") if type(health.get("pid")) is int else 0
+        plane_identity = (
+            health.get("runtime_plane_identity")
+            if isinstance(health.get("runtime_plane_identity"), Mapping)
+            else {}
+        )
+        isolation_ok = bool(
+            probe.get("ok")
+            and requested_port == AC_DEV_SERVICE_PORT
+            and _branch_service_exact_dev_health_matches(
+                health,
+                process_pid=proc.pid,
+                runtime_commit=runtime_commit,
+                worktree_root=str(worktree),
+                stable_anchor_commit=stable_anchor,
+                stable_database_identity=actual_database_identity,
+            )
+        )
 
-    stop_result: dict[str, Any] = {}
-    if not keep_running:
-        stop_result = _branch_service_stop_process(proc)
-    elif not isolation_ok:
-        stop_result = _branch_service_stop_process(proc)
+    except Exception:
+        _branch_service_stop_process(proc)
+        raise
+    else:
+        stop_result: dict[str, Any] = {}
+        if not keep_running or not isolation_ok:
+            stop_result = _branch_service_stop_process(proc)
+    finally:
+        if detached_log_handle is not None:
+            detached_log_handle.close()
+
+    process_log_evidence = {
+        "mode": "detached_append" if keep_running else "captured_pipe",
+        "path": str(detached_log_path) if detached_log_path is not None else "",
+        "relative_path": (
+            detached_log_path.name if detached_log_path is not None else ""
+        ),
+        "path_scope": "runtime_workspace" if keep_running else "parent_pipe",
+        "content_exposed": False,
+        "public_safe_metadata_only": True,
+        "parent_handle_closed": bool(
+            detached_log_handle is not None and detached_log_handle.closed
+        ),
+    }
 
     return {
         "ok": bool(isolation_ok),
@@ -203864,6 +203928,7 @@ def handle_branch_service_validate(ctx: RequestContext):
         },
         "command": command,
         "keep_running": keep_running,
+        "process_log": process_log_evidence,
         "stop_result": stop_result,
         "isolation_status": "isolated" if isolation_ok else "health_probe_failed",
         "probe": {k: v for k, v in probe.items() if k != "health"},
