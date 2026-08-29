@@ -27,7 +27,7 @@ from threading import BoundedSemaphore, Event, RLock, local
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterable, Iterator, Mapping, NamedTuple, NoReturn, Sequence, TextIO
+from typing import Any, Iterable, Iterator, Mapping, NamedTuple, NoReturn, Sequence
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -203419,20 +203419,35 @@ def _branch_service_stop_process(proc: subprocess.Popen) -> dict[str, Any]:
         }
 
 
-def _branch_service_detached_log(
-    runtime_workspace: Path,
-) -> tuple[Path, TextIO]:
-    log_path = runtime_workspace / "branch-service.log"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(log_path, flags, 0o600)
+def _branch_service_stop_no_orphan(proc: subprocess.Popen) -> dict[str, Any]:
     try:
-        os.fchmod(fd, 0o600)
-        return log_path, os.fdopen(fd, "a", encoding="utf-8", buffering=1)
-    except Exception:
-        os.close(fd)
-        raise
+        return _branch_service_stop_process(proc)
+    except BaseException as cleanup_error:
+        result: dict[str, Any] = {
+            "stopped": False,
+            "graceful_cleanup_failed": True,
+            "graceful_cleanup_error_type": type(cleanup_error).__name__,
+        }
+        try:
+            alive = proc.poll() is None
+        except BaseException:
+            alive = True
+        if alive:
+            try:
+                proc.kill()
+                result["killed"] = True
+            except BaseException:
+                result["killed"] = False
+            try:
+                proc.wait(timeout=5)
+                result["waited"] = True
+            except BaseException:
+                result["waited"] = False
+        try:
+            result["stopped"] = proc.poll() is not None
+        except BaseException:
+            result["stopped"] = False
+        return result
 
 
 def _branch_service_exact_dev_health_matches(
@@ -203776,18 +203791,13 @@ def handle_branch_service_validate(ctx: RequestContext):
     # start_governance.py performs a legacy chain-history backfill before the
     # server's dev-plane preflight. Launch the guarded module directly.
     command = [python_bin, "-m", "agent.governance.server"]
-    detached_log_path: Path | None = None
-    detached_log_handle: TextIO | None = None
     try:
         popen_output: dict[str, Any]
         if keep_running:
-            detached_log_path, detached_log_handle = _branch_service_detached_log(
-                runtime_workspace
-            )
             popen_output = {
                 "stdin": subprocess.DEVNULL,
-                "stdout": detached_log_handle,
-                "stderr": subprocess.STDOUT,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
                 "start_new_session": True,
             }
         else:
@@ -203803,8 +203813,6 @@ def handle_branch_service_validate(ctx: RequestContext):
             **popen_output,
         )
     except (OSError, ValueError) as exc:
-        if detached_log_handle is not None:
-            detached_log_handle.close()
         return {
             "ok": False,
             "schema_version": "branch_service_validation.v2",
@@ -203815,9 +203823,6 @@ def handle_branch_service_validate(ctx: RequestContext):
             "worktree_path": str(worktree),
             "cwd": str(worktree),
             "command": command,
-            "process_log_path": (
-                str(detached_log_path) if detached_log_path is not None else ""
-            ),
             "env": {
                 "GOVERNANCE_PORT": str(requested_port),
                 "AMING_CLAW_HOME": str(runtime_workspace),
@@ -203857,29 +203862,20 @@ def handle_branch_service_validate(ctx: RequestContext):
             )
         )
 
-    except Exception:
-        _branch_service_stop_process(proc)
+    except BaseException:
+        _branch_service_stop_no_orphan(proc)
         raise
     else:
         stop_result: dict[str, Any] = {}
         if not keep_running or not isolation_ok:
-            stop_result = _branch_service_stop_process(proc)
-    finally:
-        if detached_log_handle is not None:
-            detached_log_handle.close()
+            stop_result = _branch_service_stop_no_orphan(proc)
 
     process_log_evidence = {
-        "mode": "detached_append" if keep_running else "captured_pipe",
-        "path": str(detached_log_path) if detached_log_path is not None else "",
-        "relative_path": (
-            detached_log_path.name if detached_log_path is not None else ""
-        ),
-        "path_scope": "runtime_workspace" if keep_running else "parent_pipe",
+        "mode": "detached_devnull" if keep_running else "captured_pipe",
         "content_exposed": False,
+        "path_exposed": False,
         "public_safe_metadata_only": True,
-        "parent_handle_closed": bool(
-            detached_log_handle is not None and detached_log_handle.closed
-        ),
+        "parent_stream_dependency": not keep_running,
     }
 
     return {

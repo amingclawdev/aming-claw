@@ -17208,44 +17208,77 @@ def test_branch_service_exact_dev_health_rejects_each_identity_mutation(
     )
 
 
-def test_branch_service_detached_log_keeps_real_child_alive_after_parent_close(
-    tmp_path,
-):
-    log_path, parent_handle = server._branch_service_detached_log(tmp_path)
+def test_branch_service_detached_devnull_keeps_real_child_alive():
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
         stdin=subprocess.DEVNULL,
-        stdout=parent_handle,
-        stderr=subprocess.STDOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
     try:
-        parent_handle.close()
         time.sleep(0.05)
-        assert parent_handle.closed is True
         assert child.poll() is None
-        assert log_path == tmp_path / "branch-service.log"
     finally:
         child.terminate()
         child.wait(timeout=5)
 
 
 @pytest.mark.parametrize(
-    ("health_pid", "keep_running", "expected_ok", "expected_stop"),
+    (
+        "health_pid",
+        "keep_running",
+        "expected_ok",
+        "expected_stop",
+        "artifact_kind",
+        "failure_stage",
+    ),
     [
-        pytest.param(43210, False, True, True, id="bounded-pipe-stops"),
-        pytest.param(43210, True, True, False, id="detached-child-keeps-running"),
+        pytest.param(43210, False, True, True, "", "", id="bounded-pipe-stops"),
+        pytest.param(
+            43210, True, True, False, "symlink", "", id="detached-symlink-untouched"
+        ),
+        pytest.param(
+            43210, True, True, False, "hardlink", "", id="detached-hardlink-untouched"
+        ),
         pytest.param(
             99999,
             True,
             False,
             True,
+            "",
+            "",
             id="health-pid-mismatch-stops-even-when-kept-running",
+        ),
+        pytest.param(
+            43210,
+            True,
+            None,
+            True,
+            "",
+            "poll_keyboard_interrupt",
+            id="poll-keyboard-interrupt-stops-child",
+        ),
+        pytest.param(
+            43210,
+            True,
+            None,
+            True,
+            "",
+            "identity_system_exit_cleanup_failure",
+            id="identity-system-exit-cleanup-failure-kills-child",
         ),
     ],
 )
 def test_branch_service_launches_guarded_module_with_dev_env(
-    tmp_path, monkeypatch, health_pid, keep_running, expected_ok, expected_stop
+    tmp_path,
+    monkeypatch,
+    health_pid,
+    keep_running,
+    expected_ok,
+    expected_stop,
+    artifact_kind,
+    failure_stage,
 ):
     worktree = tmp_path / "ac-dev"
     worktree.mkdir()
@@ -17300,17 +17333,37 @@ def test_branch_service_launches_guarded_module_with_dev_env(
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
     launched = {}
-    process = SimpleNamespace(pid=43210, alive=True)
+
+    class Process:
+        pid = 43210
+        alive = True
+        killed = False
+        waited = False
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def kill(self):
+            self.killed = True
+            self.alive = False
+
+        def wait(self, *, timeout):
+            assert timeout == 5
+            self.waited = True
+            self.alive = False
+            return -9
+
+    process = Process()
 
     def fake_popen(command, **kwargs):
         launched.update({"command": command, **kwargs})
         return process
 
     monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(
-        server,
-        "_branch_service_poll_health",
-        lambda *args, **kwargs: {
+    def poll_health(*_args, **_kwargs):
+        if failure_stage == "poll_keyboard_interrupt":
+            raise KeyboardInterrupt("poll sentinel")
+        return {
             "ok": True,
             "url": "http://127.0.0.1:40008/api/health",
             "health": _exact_branch_service_dev_health(
@@ -17319,12 +17372,23 @@ def test_branch_service_launches_guarded_module_with_dev_env(
                 pid=health_pid,
                 database_identity=database_identity,
             ),
-        },
-    )
+        }
+
+    monkeypatch.setattr(server, "_branch_service_poll_health", poll_health)
+    if failure_stage == "identity_system_exit_cleanup_failure":
+        monkeypatch.setattr(
+            server,
+            "_branch_service_exact_dev_health_matches",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                SystemExit("identity sentinel")
+            ),
+        )
     stopped = []
 
     def stop_process(proc):
         stopped.append(proc.pid)
+        if failure_stage == "identity_system_exit_cleanup_failure":
+            raise RuntimeError("cleanup sentinel")
         proc.alive = False
         return {"stopped": True, "pid": proc.pid}
 
@@ -17372,24 +17436,60 @@ def test_branch_service_launches_guarded_module_with_dev_env(
                     "runtime_workspace": str(tmp_path / "runtime-bad-db"),
                 },
             )
-        )
+    )
     assert launched == {}
 
-    result = server.handle_branch_service_validate(
-        _ctx(
-            {},
-            method="POST",
-                body={
-                    "worktree_path": str(worktree),
-                    "port": 40008,
-                    "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
-                    "shared_volume_path": str(shared),
-                    "stable_database_identity": database_identity,
-                    "runtime_workspace": str(tmp_path / "runtime"),
-                    "keep_running": keep_running,
-            },
+    runtime_workspace = tmp_path / "runtime"
+    external_target = tmp_path / "external-target.log"
+    external_before = None
+    if artifact_kind:
+        runtime_workspace.mkdir()
+        external_target.write_bytes(b"external sentinel\n")
+        external_target.chmod(0o640)
+        log_artifact = runtime_workspace / "branch-service.log"
+        if artifact_kind == "symlink":
+            log_artifact.symlink_to(external_target)
+        else:
+            os.link(external_target, log_artifact)
+        external_before = (
+            external_target.read_bytes(),
+            external_target.stat().st_mode & 0o777,
         )
+
+    request = _ctx(
+        {},
+        method="POST",
+        body={
+            "worktree_path": str(worktree),
+            "port": 40008,
+            "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
+            "shared_volume_path": str(shared),
+            "stable_database_identity": database_identity,
+            "runtime_workspace": str(runtime_workspace),
+            "keep_running": keep_running,
+        },
     )
+    if failure_stage:
+        expected_exception = (
+            KeyboardInterrupt
+            if failure_stage == "poll_keyboard_interrupt"
+            else SystemExit
+        )
+        expected_message = (
+            "poll sentinel"
+            if failure_stage == "poll_keyboard_interrupt"
+            else "identity sentinel"
+        )
+        with pytest.raises(expected_exception, match=expected_message):
+            server.handle_branch_service_validate(request)
+        assert stopped == [43210]
+        assert process.alive is False
+        if failure_stage == "identity_system_exit_cleanup_failure":
+            assert process.killed is True
+            assert process.waited is True
+        return
+
+    result = server.handle_branch_service_validate(request)
 
     assert result["ok"] is expected_ok
     assert result["process_pid"] == 43210
@@ -17413,24 +17513,25 @@ def test_branch_service_launches_guarded_module_with_dev_env(
     assert "start_governance.py" not in launched["command"]
     if keep_running:
         assert launched["stdin"] is subprocess.DEVNULL
-        assert launched["stderr"] is subprocess.STDOUT
+        assert launched["stdout"] is subprocess.DEVNULL
+        assert launched["stderr"] is subprocess.DEVNULL
         assert launched["start_new_session"] is True
-        assert launched["stdout"].closed is True
         assert result["process_log"] == {
-            "mode": "detached_append",
-            "path": str(tmp_path / "runtime" / "branch-service.log"),
-            "relative_path": "branch-service.log",
-            "path_scope": "runtime_workspace",
+            "mode": "detached_devnull",
             "content_exposed": False,
+            "path_exposed": False,
             "public_safe_metadata_only": True,
-            "parent_handle_closed": True,
+            "parent_stream_dependency": False,
         }
+        if external_before is not None:
+            assert external_target.read_bytes() == external_before[0]
+            assert external_target.stat().st_mode & 0o777 == external_before[1]
     else:
         assert launched["stdout"] is subprocess.PIPE
         assert launched["stderr"] is subprocess.PIPE
         assert "start_new_session" not in launched
         assert result["process_log"]["mode"] == "captured_pipe"
-        assert result["process_log"]["parent_handle_closed"] is False
+        assert result["process_log"]["parent_stream_dependency"] is True
 
 
 def _graph(node_id: str = "L7.1") -> dict:
