@@ -3750,3 +3750,116 @@ class TestACDevRuntimeCli:
                 str(alternate),
                 stable_anchor_commit=cli.AC_STABLE_ANCHOR_COMMIT,
             )
+
+
+def test_branch_service_orphan_handoff_cli_is_two_phase_and_copy_safe(
+    tmp_path,
+    monkeypatch,
+):
+    import agent.cli as cli
+
+    orphan = tmp_path / "orphan"
+    successor = tmp_path / "successor"
+    runtime = tmp_path / "runtime"
+    orphan.mkdir()
+    successor.mkdir()
+    runtime.mkdir()
+    receipt = {
+        "schema_version": "ac_dev_orphan_adopt_stop_handoff_inspection.v1",
+        "inspection_receipt_sha256": "sha256:" + "1" * 64,
+    }
+    calls = []
+
+    def fake_local(payload):
+        calls.append(payload)
+        return 200, {
+            "ok": True,
+            "action": payload["action"],
+            "inspection": receipt,
+            "pass_synthesized": False,
+        }
+
+    monkeypatch.setattr(
+        cli, "_local_branch_service_adopt_stop_handoff", fake_local
+    )
+    inspect_result = CliRunner().invoke(
+        main,
+        [
+            "branch-service",
+            "adopt-stop-handoff",
+            "--orphan-worktree",
+            str(orphan),
+            "--successor-worktree",
+            str(successor),
+            "--orphan-pid",
+            "43210",
+        ],
+    )
+    assert inspect_result.exit_code == 0, inspect_result.output
+    assert calls[-1] == {
+        "action": "inspect",
+        "orphan_worktree_path": str(orphan.resolve()),
+        "successor_worktree_path": str(successor.resolve()),
+        "orphan_pid": 43210,
+        "allow_kill": False,
+        "term_timeout_sec": 5.0,
+        "kill_timeout_sec": 5.0,
+        "replacement_timeout_sec": 30.0,
+    }
+
+    receipt_path = tmp_path / "inspection.json"
+    receipt_path.write_text(
+        json.dumps({"ok": True, "inspection": receipt}), encoding="utf-8"
+    )
+    execute_result = CliRunner().invoke(
+        main,
+        [
+            "branch-service",
+            "adopt-stop-handoff",
+            "--orphan-worktree",
+            str(orphan),
+            "--successor-worktree",
+            str(successor),
+            "--orphan-pid",
+            "43210",
+            "--inspection-receipt",
+            str(receipt_path),
+            "--runtime-workspace",
+            str(runtime),
+            "--allow-kill",
+        ],
+    )
+    assert execute_result.exit_code == 0, execute_result.output
+    assert calls[-1]["action"] == "execute"
+    assert calls[-1]["inspection_receipt"] == receipt
+    assert calls[-1]["inspection_receipt_sha256"] == (
+        "sha256:" + "1" * 64
+    )
+    assert calls[-1]["allow_kill"] is True
+    assert calls[-1]["runtime_workspace"] == str(runtime.resolve())
+    assert "raw_token" not in execute_result.output
+
+
+def test_branch_service_orphan_handoff_cli_never_authorizes_kill_at_inspection(
+    tmp_path,
+):
+    orphan = tmp_path / "orphan"
+    successor = tmp_path / "successor"
+    orphan.mkdir()
+    successor.mkdir()
+    result = CliRunner().invoke(
+        main,
+        [
+            "branch-service",
+            "adopt-stop-handoff",
+            "--orphan-worktree",
+            str(orphan),
+            "--successor-worktree",
+            str(successor),
+            "--orphan-pid",
+            "43210",
+            "--allow-kill",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "only with an explicit inspection receipt" in result.output

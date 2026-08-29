@@ -1224,6 +1224,34 @@ def _local_branch_service_validate(payload: Mapping[str, Any]) -> tuple[int, dic
     return 200, dict(result)
 
 
+def _local_branch_service_adopt_stop_handoff(
+    payload: Mapping[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """Run exact orphan recovery in the local candidate supervisor."""
+
+    from agent.governance.server import (
+        RequestContext,
+        handle_branch_service_adopt_stop_handoff,
+    )
+
+    ctx = RequestContext(
+        handler=None,
+        method="POST",
+        path_params={},
+        query={},
+        body=dict(payload),
+        request_id=f"local-branch-orphan-handoff-{os.getpid()}",
+        token="",
+        idem_key="",
+    )
+    result = handle_branch_service_adopt_stop_handoff(ctx)
+    if isinstance(result, tuple):
+        if isinstance(result[0], int):
+            return int(result[0]), dict(result[1])
+        return int(result[1]), dict(result[0])
+    return 200, dict(result)
+
+
 @branch_service.command("validate")
 @click.option(
     "--worktree",
@@ -1313,6 +1341,108 @@ def branch_service_validate(
     if status >= 400 or not result.get("ok"):
         raise click.ClickException(
             str(result.get("error") or result.get("detail") or "branch service validation failed")
+        )
+
+
+@branch_service.command("adopt-stop-handoff")
+@click.option(
+    "--orphan-worktree",
+    "orphan_worktree_path",
+    required=True,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=str),
+    help="Dirty AC dev worktree whose exact process is being adopted.",
+)
+@click.option(
+    "--successor-worktree",
+    "successor_worktree_path",
+    required=True,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=str),
+    help="Clean descendant worktree that will receive codex/ac-dev.",
+)
+@click.option("--orphan-pid", required=True, type=int, help="Exact live orphan PID.")
+@click.option(
+    "--inspection-receipt",
+    default=None,
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=str),
+    help="Prior JSON inspection receipt; supplying it selects execute mode.",
+)
+@click.option(
+    "--runtime-workspace",
+    default="",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=str),
+    help="Isolated runtime root for the clean same-port replacement.",
+)
+@click.option(
+    "--allow-kill",
+    is_flag=True,
+    help="Explicitly authorize SIGKILL only after exact post-TERM revalidation.",
+)
+@click.option("--term-timeout-sec", default=5.0, type=float, show_default=True)
+@click.option("--kill-timeout-sec", default=5.0, type=float, show_default=True)
+@click.option("--replacement-timeout-sec", default=30.0, type=float, show_default=True)
+def branch_service_adopt_stop_handoff(
+    orphan_worktree_path,
+    successor_worktree_path,
+    orphan_pid,
+    inspection_receipt,
+    runtime_workspace,
+    allow_kill,
+    term_timeout_sec,
+    kill_timeout_sec,
+    replacement_timeout_sec,
+):
+    """Inspect, then explicitly execute, an exact AC dev orphan handoff."""
+
+    payload: dict[str, Any] = {
+        "action": "execute" if inspection_receipt else "inspect",
+        "orphan_worktree_path": str(
+            Path(orphan_worktree_path).expanduser().resolve()
+        ),
+        "successor_worktree_path": str(
+            Path(successor_worktree_path).expanduser().resolve()
+        ),
+        "orphan_pid": int(orphan_pid),
+        "allow_kill": bool(allow_kill),
+        "term_timeout_sec": float(term_timeout_sec),
+        "kill_timeout_sec": float(kill_timeout_sec),
+        "replacement_timeout_sec": float(replacement_timeout_sec),
+    }
+    if inspection_receipt:
+        receipt_path = Path(inspection_receipt).expanduser()
+        try:
+            metadata = receipt_path.stat(follow_symlinks=False)
+            if receipt_path.is_symlink() or metadata.st_size > 256 * 1024:
+                raise ValueError("inspection receipt must be a bounded regular file")
+            parsed = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise click.ClickException("Inspection receipt is unreadable or invalid.") from exc
+        if not isinstance(parsed, Mapping):
+            raise click.ClickException("Inspection receipt must be a JSON object.")
+        parsed_receipt = (
+            parsed.get("inspection")
+            if isinstance(parsed.get("inspection"), Mapping)
+            else parsed
+        )
+        payload["inspection_receipt"] = dict(parsed_receipt)
+        payload["inspection_receipt_sha256"] = str(
+            parsed_receipt.get("inspection_receipt_sha256") or ""
+        )
+        if not runtime_workspace:
+            raise click.ClickException(
+                "Execute mode requires --runtime-workspace for the replacement."
+            )
+        payload["runtime_workspace"] = str(
+            Path(runtime_workspace).expanduser().resolve()
+        )
+    elif allow_kill:
+        raise click.ClickException(
+            "--allow-kill is accepted only with an explicit inspection receipt."
+        )
+    status, result = _local_branch_service_adopt_stop_handoff(payload)
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
+    if status >= 400 or not result.get("ok"):
+        raise click.ClickException(
+            str(result.get("error") or "branch-service orphan handoff failed")
         )
 
 

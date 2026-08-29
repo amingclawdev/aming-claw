@@ -203339,3 +203339,1002 @@ def test_ac_cross_plane_proxy_is_single_hop_bounded_and_credential_free(
         "outcome_unknown": True,
         "safe_retry": False,
     }
+
+
+def _orphan_handoff_git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _orphan_handoff_fixture(tmp_path: Path) -> dict[str, Any]:
+    repository = tmp_path / "orphan-handoff-repository"
+    repository.mkdir()
+    _orphan_handoff_git(repository, "init", "-b", "main")
+    _orphan_handoff_git(repository, "config", "user.name", "AC Test")
+    _orphan_handoff_git(repository, "config", "user.email", "ac@example.test")
+    (repository / "agent" / "governance").mkdir(parents=True)
+    (repository / "agent" / "governance" / "server.py").write_text(
+        "# governed server fixture\n", encoding="utf-8"
+    )
+    (repository / "start_governance.py").write_text("# fixture\n", encoding="utf-8")
+    (repository / "tracked.txt").write_text("base\n", encoding="utf-8")
+    _orphan_handoff_git(repository, "add", ".")
+    _orphan_handoff_git(repository, "commit", "-m", "base")
+    base = _orphan_handoff_git(repository, "rev-parse", "HEAD")
+    orphan = tmp_path / "dirty-dev"
+    successor = tmp_path / "clean-successor"
+    _orphan_handoff_git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        server.AC_DEV_BRANCH,
+        str(orphan),
+        base,
+    )
+    _orphan_handoff_git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "codex/orphan-handoff-worker",
+        str(successor),
+        base,
+    )
+    (successor / "tracked.txt").write_text("base\nsuccessor\n", encoding="utf-8")
+    _orphan_handoff_git(successor, "add", "tracked.txt")
+    _orphan_handoff_git(successor, "commit", "-m", "successor")
+    candidate = _orphan_handoff_git(successor, "rev-parse", "HEAD")
+    (orphan / "tracked.txt").write_bytes(b"base\n\x00dirty-residue\n")
+    (orphan / "start_governance.py").write_text(
+        "# fixture\n# second dirty line\n", encoding="utf-8"
+    )
+    orphan_state = server._branch_service_worktree_state(orphan.resolve())
+    successor_state = server._branch_service_worktree_state(successor.resolve())
+    return {
+        "repository": repository.resolve(),
+        "orphan": orphan.resolve(),
+        "successor": successor.resolve(),
+        "base": base,
+        "candidate": candidate,
+        "source_branch": "codex/orphan-handoff-worker",
+        "orphan_state": orphan_state,
+        "successor_state": successor_state,
+    }
+
+
+def _orphan_database_identity() -> dict[str, Any]:
+    return {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": 11,
+        "inode": 22,
+        "stable_relative_path_sha256": "sha256:" + "8" * 64,
+    }
+
+
+def _orphan_health(
+    case: Mapping[str, Any],
+    *,
+    pid: int = 43210,
+    source_sha256: str = "sha256:" + "7" * 64,
+) -> dict[str, Any]:
+    state = case["orphan_state"]
+    stable = "f" * 40
+    database = _orphan_database_identity()
+    return {
+        "status": "ok",
+        "service": "governance",
+        "port": server.AC_DEV_SERVICE_PORT,
+        "pid": pid,
+        "runtime_plane": "dev",
+        "bind_host": server.AC_DEV_BIND_HOST,
+        "runtime_loaded_version": case["base"],
+        "runtime_loaded_source_sha256": source_sha256,
+        "runtime_stale": True,
+        "runtime_stale_reasons": ["loaded_source_file_changed"],
+        "worktree_root": str(case["orphan"]),
+        "branch": server.AC_DEV_BRANCH,
+        "runtime_commit": case["base"],
+        "stable_anchor_commit": stable,
+        "loaded_runtime_identity": {
+            "schema_version": server.LOADED_RUNTIME_IDENTITY_SCHEMA,
+            "loaded_commit": case["base"],
+            "loaded_pid": pid,
+            "loaded_source_path": str(
+                case["orphan"] / "agent" / "governance" / "server.py"
+            ),
+            "loaded_source_sha256": source_sha256,
+            "loaded_source_size": (
+                case["orphan"] / "agent" / "governance" / "server.py"
+            ).stat().st_size,
+            "worktree_source_sha256": "sha256:" + "6" * 64,
+            "worktree_head_version": case["base"][:12],
+            "runtime_stale": True,
+            "runtime_stale_reasons": ["loaded_source_file_changed"],
+        },
+        "runtime_plane_identity": {
+            "schema_version": "ac_runtime_plane_identity.v1",
+            "plane": "dev",
+            "port": server.AC_DEV_SERVICE_PORT,
+            "expected_port": server.AC_DEV_SERVICE_PORT,
+            "pid": pid,
+            "bind_host": server.AC_DEV_BIND_HOST,
+            "worktree_root": str(case["orphan"]),
+            "branch": server.AC_DEV_BRANCH,
+            "expected_branch": server.AC_DEV_BRANCH,
+            "commit": case["base"],
+            "worktree_dirty": True,
+            "worktree_dirty_files": list(state["porcelain_lines"]),
+            "stable_anchor_commit": stable,
+            "stable_database_identity": database,
+            "project_allowlist": ["aming-claw"],
+            "schema_policy": "verify_only_no_auto_migration",
+            "active_graph_activation_allowed": False,
+            "stable_deploy_allowed": False,
+            "background_workers_enabled": False,
+            "status": "invalid",
+            "violations": ["dev_worktree_dirty"],
+        },
+    }
+
+
+def test_git_identity_and_runtime_plane_preserve_porcelain_xy_columns(
+    tmp_path,
+    monkeypatch,
+):
+    commit = "a" * 40
+    porcelain = " M agent/a.py\n D agent/b.py"
+
+    def run(args, **_kwargs):
+        output = {
+            ("rev-parse", "--show-toplevel"): f"{tmp_path}\n",
+            ("branch", "--show-current"): f"{server.AC_DEV_BRANCH}\n",
+            ("rev-parse", "HEAD"): f"{commit}\n",
+            ("status", "--porcelain"): porcelain + "\n",
+        }[tuple(args[1:])]
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", run)
+    git_identity = server._git_identity(tmp_path)
+    assert git_identity["dirty"] == porcelain
+    monkeypatch.setattr(server, "_git_identity", lambda _root: git_identity)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "generic")
+    monkeypatch.setattr(server, "_immutable_build_commit", lambda: "")
+    plane = server._runtime_plane_identity()
+    assert plane["worktree_dirty_files"] == [
+        " M agent/a.py",
+        " D agent/b.py",
+    ]
+
+
+def test_exact_dirty_orphan_health_accepts_only_known_legacy_first_line_shape(
+    tmp_path,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    health = _orphan_health(case)
+    disk_lines = list(case["orphan_state"]["porcelain_lines"])
+    assert len(disk_lines) >= 2
+    legacy_lines = [disk_lines[0][1:], *disk_lines[1:]]
+    health["runtime_plane_identity"]["worktree_dirty_files"] = legacy_lines
+    arguments = {
+        "orphan_pid": 43210,
+        "worktree_state": case["orphan_state"],
+        "loaded_commit": case["base"],
+        "loaded_source_sha256": "sha256:" + "7" * 64,
+        "loaded_source_size": health["loaded_runtime_identity"][
+            "loaded_source_size"
+        ],
+        "stable_anchor_commit": "f" * 40,
+        "stable_database_identity": _orphan_database_identity(),
+    }
+    assert server._branch_service_exact_orphan_health_matches(
+        health, **arguments
+    )
+
+    mutated_lines = [
+        [legacy_lines[0], disk_lines[1][1:]],
+        ["D" + legacy_lines[0][1:], *disk_lines[1:]],
+        [legacy_lines[0] + "-different-path", *disk_lines[1:]],
+        [disk_lines[1], legacy_lines[0]],
+        [*legacy_lines, " M agent/extra.py"],
+        legacy_lines[:-1],
+    ]
+    for mutation in mutated_lines:
+        candidate = copy.deepcopy(health)
+        candidate["runtime_plane_identity"]["worktree_dirty_files"] = mutation
+        assert not server._branch_service_exact_orphan_health_matches(
+            candidate, **arguments
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "wrong", "relative", "symlink", "other_worktree"],
+)
+def test_exact_dirty_orphan_health_binds_loaded_source_to_physical_module(
+    tmp_path,
+    mutation,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    health = _orphan_health(case)
+    loaded = health["loaded_runtime_identity"]
+    exact_source = case["orphan"] / "agent" / "governance" / "server.py"
+    if mutation == "missing":
+        loaded.pop("loaded_source_path")
+    elif mutation == "wrong":
+        wrong = tmp_path / "wrong-server.py"
+        wrong.write_bytes(exact_source.read_bytes())
+        loaded["loaded_source_path"] = str(wrong)
+    elif mutation == "relative":
+        loaded["loaded_source_path"] = "agent/governance/server.py"
+    elif mutation == "symlink":
+        link = tmp_path / "server-link.py"
+        link.symlink_to(exact_source)
+        loaded["loaded_source_path"] = str(link)
+    elif mutation == "other_worktree":
+        loaded["loaded_source_path"] = str(
+            case["successor"] / "agent" / "governance" / "server.py"
+        )
+    assert not server._branch_service_exact_orphan_health_matches(
+        health,
+        orphan_pid=43210,
+        worktree_state=case["orphan_state"],
+        loaded_commit=case["base"],
+        loaded_source_sha256="sha256:" + "7" * 64,
+        loaded_source_size=(
+            case["orphan"] / "agent" / "governance" / "server.py"
+        ).stat().st_size,
+        stable_anchor_commit="f" * 40,
+        stable_database_identity=_orphan_database_identity(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "replacement"),
+    [
+        ("health", "pid", 99999),
+        ("health", "port", 40009),
+        ("health", "runtime_plane", "stable"),
+        ("health", "bind_host", "0.0.0.0"),
+        ("health", "runtime_loaded_source_sha256", "sha256:" + "9" * 64),
+        ("loaded_runtime_identity", "loaded_pid", 99999),
+        ("loaded_runtime_identity", "loaded_source_sha256", "sha256:" + "9" * 64),
+        ("loaded_runtime_identity", "loaded_source_size", 0),
+        ("runtime_plane_identity", "worktree_root", "/wrong/root"),
+        ("runtime_plane_identity", "branch", "codex/wrong"),
+        ("runtime_plane_identity", "project_allowlist", ["other"]),
+        ("runtime_plane_identity", "schema_policy", "managed"),
+        ("runtime_plane_identity", "active_graph_activation_allowed", True),
+    ],
+)
+def test_exact_dirty_orphan_health_rejects_each_critical_identity_mutation(
+    tmp_path,
+    target,
+    field,
+    replacement,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    health = _orphan_health(case)
+    mutated = copy.deepcopy(health)
+    mutated_target = mutated if target == "health" else mutated[target]
+    mutated_target[field] = replacement
+    assert not server._branch_service_exact_orphan_health_matches(
+        mutated,
+        orphan_pid=43210,
+        worktree_state=case["orphan_state"],
+        loaded_commit=case["base"],
+        loaded_source_sha256="sha256:" + "7" * 64,
+        loaded_source_size=health["loaded_runtime_identity"][
+            "loaded_source_size"
+        ],
+        stable_anchor_commit="f" * 40,
+        stable_database_identity=_orphan_database_identity(),
+    )
+
+
+def test_exact_dirty_orphan_health_accepts_frozen_loaded_bytes_not_dirty_source(
+    tmp_path,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    health = _orphan_health(case)
+    assert server._branch_service_exact_orphan_health_matches(
+        health,
+        orphan_pid=43210,
+        worktree_state=case["orphan_state"],
+        loaded_commit=case["base"],
+        loaded_source_sha256="sha256:" + "7" * 64,
+        loaded_source_size=health["loaded_runtime_identity"][
+            "loaded_source_size"
+        ],
+        stable_anchor_commit="f" * 40,
+        stable_database_identity=_orphan_database_identity(),
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "process_start_identity",
+        "command_sha256",
+        "cwd_ref",
+        "listener_identity_sha256",
+        "listener_port",
+    ],
+)
+def test_orphan_stop_refuses_identity_drift_without_signal(monkeypatch, field):
+    expected = {
+        "schema_version": "ac_dev_orphan_os_identity.v1",
+        "pid": 43210,
+        "process_start_identity": "sha256:" + "1" * 64,
+        "command_sha256": "sha256:" + "2" * 64,
+        "cwd_ref": "path-sha256:" + "3" * 64,
+        "listener_identity_sha256": "sha256:" + "4" * 64,
+        "listener_port": server.AC_DEV_SERVICE_PORT,
+        "listener_bind_host": server.AC_DEV_BIND_HOST,
+        "identity_sha256": "sha256:" + "5" * 64,
+    }
+    actual = dict(expected)
+    actual[field] = (
+        server.AC_DEV_SERVICE_PORT + 1
+        if field == "listener_port"
+        else "sha256:" + "9" * 64
+    )
+    monkeypatch.setattr(
+        server, "_branch_service_process_os_identity", lambda *_args: actual
+    )
+    signals = []
+    monkeypatch.setattr(
+        server,
+        "_branch_service_send_signal",
+        lambda *args: signals.append(args),
+    )
+    with pytest.raises(ValidationError, match="drifted before TERM"):
+        server._branch_service_stop_exact_orphan(
+            orphan_pid=43210,
+            expected_os_identity=expected,
+            allow_kill=True,
+            term_timeout_sec=0.05,
+            kill_timeout_sec=0.05,
+        )
+    assert signals == []
+
+
+def test_orphan_stop_uses_term_then_exact_revalidated_kill(monkeypatch):
+    expected = {
+        "schema_version": "ac_dev_orphan_os_identity.v1",
+        "pid": 43210,
+        "process_start_identity": "sha256:" + "1" * 64,
+        "command_sha256": "sha256:" + "2" * 64,
+        "cwd_ref": "path-sha256:" + "3" * 64,
+        "listener_identity_sha256": "sha256:" + "4" * 64,
+        "listener_port": server.AC_DEV_SERVICE_PORT,
+        "listener_bind_host": server.AC_DEV_BIND_HOST,
+        "identity_sha256": "sha256:" + "5" * 64,
+    }
+    monkeypatch.setattr(
+        server, "_branch_service_process_os_identity", lambda *_args: expected
+    )
+    waits = iter(["timeout", "exited"])
+    monkeypatch.setattr(
+        server,
+        "_branch_service_wait_for_exact_pid_exit",
+        lambda *_args, **_kwargs: next(waits),
+    )
+    signals = []
+    monkeypatch.setattr(
+        server,
+        "_branch_service_send_signal",
+        lambda pid, signum: signals.append((pid, signum)),
+    )
+    result = server._branch_service_stop_exact_orphan(
+        orphan_pid=43210,
+        expected_os_identity=expected,
+        allow_kill=True,
+        term_timeout_sec=0.05,
+        kill_timeout_sec=0.05,
+    )
+    assert result["stopped"] is True
+    assert result["termination"] == "kill"
+    assert signals == [
+        (43210, signal.SIGTERM),
+        (43210, signal.SIGKILL),
+    ]
+
+
+def test_orphan_stop_timeout_never_kills_without_explicit_authority(monkeypatch):
+    expected = {
+        "schema_version": "ac_dev_orphan_os_identity.v1",
+        "pid": 43210,
+        "process_start_identity": "sha256:" + "1" * 64,
+        "command_sha256": "sha256:" + "2" * 64,
+        "cwd_ref": "path-sha256:" + "3" * 64,
+        "listener_identity_sha256": "sha256:" + "4" * 64,
+        "listener_port": server.AC_DEV_SERVICE_PORT,
+        "listener_bind_host": server.AC_DEV_BIND_HOST,
+        "identity_sha256": "sha256:" + "5" * 64,
+    }
+    monkeypatch.setattr(
+        server, "_branch_service_process_os_identity", lambda *_args: expected
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_wait_for_exact_pid_exit",
+        lambda *_args, **_kwargs: "timeout",
+    )
+    signals = []
+    monkeypatch.setattr(
+        server,
+        "_branch_service_send_signal",
+        lambda pid, signum: signals.append((pid, signum)),
+    )
+    result = server._branch_service_stop_exact_orphan(
+        orphan_pid=43210,
+        expected_os_identity=expected,
+        allow_kill=False,
+        term_timeout_sec=0.05,
+        kill_timeout_sec=0.05,
+    )
+    assert result["stopped"] is False
+    assert result["termination"] == "term_timeout_kill_not_authorized"
+    assert signals == [(43210, signal.SIGTERM)]
+
+
+def test_orphan_stop_refuses_kill_when_post_term_identity_drifts(monkeypatch):
+    expected = {
+        "schema_version": "ac_dev_orphan_os_identity.v1",
+        "pid": 43210,
+        "process_start_identity": "sha256:" + "1" * 64,
+        "command_sha256": "sha256:" + "2" * 64,
+        "cwd_ref": "path-sha256:" + "3" * 64,
+        "listener_identity_sha256": "sha256:" + "4" * 64,
+        "listener_port": server.AC_DEV_SERVICE_PORT,
+        "listener_bind_host": server.AC_DEV_BIND_HOST,
+        "identity_sha256": "sha256:" + "5" * 64,
+    }
+    drifted = dict(expected)
+    drifted["process_start_identity"] = "sha256:" + "9" * 64
+    identities = iter([expected, drifted])
+    monkeypatch.setattr(
+        server,
+        "_branch_service_process_os_identity",
+        lambda *_args: next(identities),
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_wait_for_exact_pid_exit",
+        lambda *_args, **_kwargs: "timeout",
+    )
+    signals = []
+    monkeypatch.setattr(
+        server,
+        "_branch_service_send_signal",
+        lambda pid, signum: signals.append((pid, signum)),
+    )
+    result = server._branch_service_stop_exact_orphan(
+        orphan_pid=43210,
+        expected_os_identity=expected,
+        allow_kill=True,
+        term_timeout_sec=0.05,
+        kill_timeout_sec=0.05,
+    )
+    assert result["stopped"] is False
+    assert result["termination"] == "kill_identity_revalidation_failed"
+    assert signals == [(43210, signal.SIGTERM)]
+
+
+def test_orphan_signal_wait_targets_only_an_isolated_temp_process():
+    process = _sleeping_process()
+    try:
+        assert process.stdout is not None
+        assert int(process.stdout.readline().strip()) == process.pid
+        start_identity = server._branch_service_precise_process_start_identity(
+            process.pid
+        )
+        assert start_identity.startswith("sha256:")
+        server._branch_service_send_signal(process.pid, signal.SIGTERM)
+        assert (
+            server._branch_service_wait_for_exact_pid_exit(
+                process.pid,
+                process_start_identity=start_identity,
+                timeout_sec=2.0,
+            )
+            == "exited"
+        )
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
+def test_dirty_branch_handoff_preserves_bytes_and_is_resume_idempotent(
+    tmp_path,
+    monkeypatch,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    before_bytes = (case["orphan"] / "tracked.txt").read_bytes()
+    before = server._branch_service_worktree_state(case["orphan"])
+    monkeypatch.setattr(
+        server,
+        "_branch_service_assert_recovery_stable_authority",
+        lambda expected, **_kwargs: {"authority_sha256": expected},
+    )
+    first = server._branch_service_apply_branch_handoff(
+        orphan_root=case["orphan"],
+        successor_root=case["successor"],
+        orphan_commit=case["base"],
+        successor_commit=case["candidate"],
+        successor_source_branch=case["source_branch"],
+        orphan_diff_sha256=before["binary_diff_sha256"],
+        stable_authority_sha256="sha256:" + "5" * 64,
+    )
+    assert first["mutations"] == [
+        "detach_dirty_orphan",
+        "advance_ac_dev_ref",
+        "attach_ac_dev_to_successor",
+    ]
+    assert (case["orphan"] / "tracked.txt").read_bytes() == before_bytes
+    after = server._branch_service_worktree_state(case["orphan"])
+    assert after["branch"] == ""
+    assert after["porcelain_sha256"] == before["porcelain_sha256"]
+    assert after["binary_diff_sha256"] == before["binary_diff_sha256"]
+    assert _orphan_handoff_git(case["successor"], "branch", "--show-current") == (
+        server.AC_DEV_BRANCH
+    )
+    assert _orphan_handoff_git(
+        case["successor"], "rev-parse", f"refs/heads/{case['source_branch']}"
+    ) == case["candidate"]
+    second = server._branch_service_apply_branch_handoff(
+        orphan_root=case["orphan"],
+        successor_root=case["successor"],
+        orphan_commit=case["base"],
+        successor_commit=case["candidate"],
+        successor_source_branch=case["source_branch"],
+        orphan_diff_sha256=before["binary_diff_sha256"],
+        stable_authority_sha256="sha256:" + "5" * 64,
+    )
+    assert second["idempotent"] is True
+    assert second["mutations"] == []
+
+
+@pytest.mark.parametrize(
+    ("partial_stage", "expected_mutations"),
+    [
+        (
+            "orphan_detached",
+            ["advance_ac_dev_ref", "attach_ac_dev_to_successor"],
+        ),
+        ("ref_updated", ["attach_ac_dev_to_successor"]),
+    ],
+)
+def test_dirty_branch_handoff_resumes_after_each_partial_git_stage(
+    tmp_path,
+    monkeypatch,
+    partial_stage,
+    expected_mutations,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    before_bytes = (case["orphan"] / "tracked.txt").read_bytes()
+    before = server._branch_service_worktree_state(case["orphan"])
+    _orphan_handoff_git(
+        case["orphan"],
+        "switch",
+        "--detach",
+        "--no-guess",
+        case["base"],
+    )
+    if partial_stage == "ref_updated":
+        _orphan_handoff_git(
+            case["successor"],
+            "update-ref",
+            f"refs/heads/{server.AC_DEV_BRANCH}",
+            case["candidate"],
+            case["base"],
+        )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_assert_recovery_stable_authority",
+        lambda expected, **_kwargs: {"authority_sha256": expected},
+    )
+    result = server._branch_service_apply_branch_handoff(
+        orphan_root=case["orphan"],
+        successor_root=case["successor"],
+        orphan_commit=case["base"],
+        successor_commit=case["candidate"],
+        successor_source_branch=case["source_branch"],
+        orphan_diff_sha256=before["binary_diff_sha256"],
+        stable_authority_sha256="sha256:" + "5" * 64,
+    )
+    assert result["mutations"] == expected_mutations
+    assert (case["orphan"] / "tracked.txt").read_bytes() == before_bytes
+    after = server._branch_service_worktree_state(case["orphan"])
+    assert after["porcelain_sha256"] == before["porcelain_sha256"]
+    assert after["binary_diff_sha256"] == before["binary_diff_sha256"]
+    assert server._branch_service_worktree_state(case["successor"])["branch"] == (
+        server.AC_DEV_BRANCH
+    )
+
+
+def test_dirty_branch_handoff_stable_authority_drift_is_zero_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    before_bytes = (case["orphan"] / "tracked.txt").read_bytes()
+    before = server._branch_service_worktree_state(case["orphan"])
+
+    def reject_drift(*_args, **_kwargs):
+        raise ValidationError(
+            "branch-service stable authority drifted during recovery",
+            {"writes_performed": False, "signals_sent": False},
+        )
+
+    monkeypatch.setattr(
+        server,
+        "_branch_service_assert_recovery_stable_authority",
+        reject_drift,
+    )
+    with pytest.raises(ValidationError, match="stable authority drifted"):
+        server._branch_service_apply_branch_handoff(
+            orphan_root=case["orphan"],
+            successor_root=case["successor"],
+            orphan_commit=case["base"],
+            successor_commit=case["candidate"],
+            successor_source_branch=case["source_branch"],
+            orphan_diff_sha256=before["binary_diff_sha256"],
+            stable_authority_sha256="sha256:" + "5" * 64,
+        )
+    after = server._branch_service_worktree_state(case["orphan"])
+    assert after["branch"] == server.AC_DEV_BRANCH
+    assert after["porcelain_sha256"] == before["porcelain_sha256"]
+    assert after["binary_diff_sha256"] == before["binary_diff_sha256"]
+    assert (case["orphan"] / "tracked.txt").read_bytes() == before_bytes
+    assert server._branch_service_worktree_state(case["successor"])["branch"] == (
+        case["source_branch"]
+    )
+
+
+def test_dirty_branch_handoff_refuses_unclean_successor_before_mutation(
+    tmp_path,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    before = server._branch_service_worktree_state(case["orphan"])
+    (case["successor"] / "tracked.txt").write_text(
+        "base\nsuccessor\nuncommitted\n", encoding="utf-8"
+    )
+    with pytest.raises(ValidationError, match="handoff state drifted") as rejected:
+        server._branch_service_apply_branch_handoff(
+            orphan_root=case["orphan"],
+            successor_root=case["successor"],
+            orphan_commit=case["base"],
+            successor_commit=case["candidate"],
+            successor_source_branch=case["source_branch"],
+            orphan_diff_sha256=before["binary_diff_sha256"],
+            stable_authority_sha256="sha256:" + "5" * 64,
+        )
+    assert rejected.value.details["writes_performed"] is False
+    after = server._branch_service_worktree_state(case["orphan"])
+    assert after["branch"] == server.AC_DEV_BRANCH
+    assert after["binary_diff_sha256"] == before["binary_diff_sha256"]
+
+
+def _install_orphan_inspection_fakes(
+    monkeypatch,
+    tmp_path: Path,
+    case: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    pid = 43210
+    health = _orphan_health(case, pid=pid)
+    public_os = {
+        "schema_version": "ac_dev_orphan_os_identity.v1",
+        "pid": pid,
+        "process_start_identity": "sha256:" + "1" * 64,
+        "command_sha256": "sha256:" + "2" * 64,
+        "cwd_ref": server._branch_service_path_ref(case["orphan"]),
+        "listener_identity_sha256": "sha256:" + "3" * 64,
+        "listener_port": server.AC_DEV_SERVICE_PORT,
+        "listener_bind_host": server.AC_DEV_BIND_HOST,
+    }
+    public_os["identity_sha256"] = server._branch_service_json_sha256(public_os)
+    os_identity = {
+        **public_os,
+        "_cwd": case["orphan"],
+        "_argv": [sys.executable, "-m", "agent.governance.server"],
+    }
+    stable_canonical = {
+        "schema_version": "ac_stable_generic_recovery_authority.v1",
+        "commit": "f" * 40,
+        "pid": 79466,
+        "loaded_source_sha256": "sha256:" + "4" * 64,
+        "active_snapshot_id": "full-stable",
+        "graph_snapshot_commit": "f" * 40,
+        "materialized_graph_baseline_commit": "f" * 40,
+    }
+    stable = {
+        **stable_canonical,
+        "authority_sha256": server._branch_service_json_sha256(stable_canonical),
+    }
+    shared = tmp_path / "stable-shared"
+    shared.mkdir()
+    database = _orphan_database_identity()
+    monkeypatch.setattr(
+        server,
+        "_branch_service_process_os_identity",
+        lambda *_args: dict(os_identity),
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_poll_health",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "url": "http://127.0.0.1:40008/api/health",
+            "health": copy.deepcopy(health),
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_recovery_stable_authority",
+        lambda: dict(stable),
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_stable_database_binding",
+        lambda _root: (shared.resolve(), dict(database)),
+    )
+    body = {
+        "action": "inspect",
+        "orphan_worktree_path": str(case["orphan"]),
+        "successor_worktree_path": str(case["successor"]),
+        "orphan_pid": pid,
+    }
+    return body, health, os_identity
+
+
+def test_orphan_handoff_inspection_accepts_exact_legacy_first_porcelain_line(
+    tmp_path,
+    monkeypatch,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    body, health, _os_identity = _install_orphan_inspection_fakes(
+        monkeypatch, tmp_path, case
+    )
+    dirty_files = health["runtime_plane_identity"]["worktree_dirty_files"]
+    assert dirty_files[0].startswith(" M ")
+    dirty_files[0] = dirty_files[0][1:]
+    result = server.handle_branch_service_adopt_stop_handoff(
+        _ctx({}, method="POST", body=body)
+    )
+    assert result["ok"] is True
+    assert result["action"] == "inspect"
+    assert result["inspection"]["writes_performed"] is False
+    assert result["inspection"]["signals_sent"] is False
+    assert result["inspection"]["orphan_worktree"]["binary_diff_sha256"] == (
+        case["orphan_state"]["binary_diff_sha256"]
+    )
+    assert result["inspection"]["orphan_worktree"][
+        "full_index_binary_diff_sha256"
+    ] == case["orphan_state"]["full_index_binary_diff_sha256"]
+    assert result["inspection"]["orphan_worktree"]["changed_files_sha256"] == (
+        case["orphan_state"]["changed_files_sha256"]
+    )
+
+
+def test_orphan_handoff_inspection_is_zero_write_and_path_bounded(
+    tmp_path,
+    monkeypatch,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    body, _health, _os_identity = _install_orphan_inspection_fakes(
+        monkeypatch, tmp_path, case
+    )
+    before_orphan = tuple(
+        server._branch_service_worktree_state(case["orphan"])[key]
+        for key in ("branch", "commit", "porcelain_sha256", "binary_diff_sha256")
+    )
+    result = server.handle_branch_service_adopt_stop_handoff(
+        _ctx({}, method="POST", body=body)
+    )
+    assert result["ok"] is True
+    assert result["action"] == "inspect"
+    inspection = result["inspection"]
+    assert inspection["writes_performed"] is False
+    assert inspection["signals_sent"] is False
+    assert inspection["pass_synthesized"] is False
+    assert inspection["orphan_worktree"]["binary_diff_sha256"] == (
+        case["orphan_state"]["binary_diff_sha256"]
+    )
+    assert inspection["handoff"] == {
+        "from_branch": server.AC_DEV_BRANCH,
+        "from_commit": case["base"],
+        "successor_source_branch": case["source_branch"],
+        "to_commit": case["candidate"],
+        "same_common_git_dir": True,
+        "descendant": True,
+        "reserved_dev_port": server.AC_DEV_SERVICE_PORT,
+    }
+    serialized = json.dumps(result, sort_keys=True)
+    assert str(case["orphan"]) not in serialized
+    assert str(case["successor"]) not in serialized
+    assert "tracked.txt" not in serialized
+    after_orphan = tuple(
+        server._branch_service_worktree_state(case["orphan"])[key]
+        for key in ("branch", "commit", "porcelain_sha256", "binary_diff_sha256")
+    )
+    assert after_orphan == before_orphan
+
+
+def test_orphan_handoff_execute_replaces_same_port_without_stable_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    case = _orphan_handoff_fixture(tmp_path)
+    body, health, _os_identity = _install_orphan_inspection_fakes(
+        monkeypatch, tmp_path, case
+    )
+    inspected = server.handle_branch_service_adopt_stop_handoff(
+        _ctx({}, method="POST", body=body)
+    )["inspection"]
+    monkeypatch.setattr(
+        server,
+        "_branch_service_precise_process_start_identity",
+        lambda _pid: inspected["orphan_os_identity"]["process_start_identity"],
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_stop_exact_orphan",
+        lambda **_kwargs: {
+            "stopped": True,
+            "termination": "term",
+            "signals_sent": ["SIGTERM"],
+            "process_start_identity": inspected["orphan_os_identity"][
+                "process_start_identity"
+            ],
+            "kill_authorized": False,
+        },
+    )
+    probes = iter(
+        [
+            {
+                "ok": True,
+                "url": "http://127.0.0.1:40008/api/health",
+                "health": health,
+            },
+            {"ok": False, "url": "http://127.0.0.1:40008/api/health"},
+        ]
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_poll_health",
+        lambda *_args, **_kwargs: next(probes),
+    )
+    monkeypatch.setattr(
+        server, "_branch_service_port_open", lambda *_args: False
+    )
+    monkeypatch.setattr(
+        server,
+        "_branch_service_successor_health_matches",
+        lambda *_args, **_kwargs: False,
+    )
+    launched = []
+
+    def validate_successor(ctx):
+        launched.append(dict(ctx.body))
+        return {
+            "ok": True,
+            "pid": 54321,
+            "runtime_commit": case["candidate"],
+        }
+
+    monkeypatch.setattr(server, "handle_branch_service_validate", validate_successor)
+    runtime = tmp_path / "replacement-runtime"
+    runtime.mkdir()
+    execute = {
+        "action": "execute",
+        "orphan_worktree_path": str(case["orphan"]),
+        "successor_worktree_path": str(case["successor"]),
+        "orphan_pid": 43210,
+        "inspection_receipt": inspected,
+        "inspection_receipt_sha256": inspected["inspection_receipt_sha256"],
+        "runtime_workspace": str(runtime),
+        "allow_kill": False,
+    }
+    result = server.handle_branch_service_adopt_stop_handoff(
+        _ctx({}, method="POST", body=execute)
+    )
+    assert result["ok"] is True
+    assert result["replacement"] == {
+        "ok": True,
+        "idempotent": False,
+        "pid": 54321,
+        "runtime_commit": case["candidate"],
+    }
+    assert result["stable_unchanged"] is True
+    assert result["active_graph_unchanged"] is True
+    assert result["stable_database_identity_unchanged"] is True
+    assert result["dirty_bytes_preserved"] is True
+    assert result["pass_synthesized"] is False
+    assert launched[0]["port"] == server.AC_DEV_SERVICE_PORT
+    assert launched[0]["keep_running"] is True
+    assert launched[0]["worktree_path"] == str(case["successor"])
+    assert launched[0]["stable_anchor_commit"] == "f" * 40
+    assert server._branch_service_worktree_state(case["orphan"])["branch"] == ""
+    assert server._branch_service_worktree_state(case["successor"])["branch"] == (
+        server.AC_DEV_BRANCH
+    )
+
+
+def test_verified_generic_recovery_authority_allows_only_explicit_occupied_dev_port(
+    tmp_path,
+    monkeypatch,
+):
+    stable_root = tmp_path / "stable-root"
+    stable_root.mkdir()
+    commit = "f" * 40
+    monkeypatch.setattr(
+        server,
+        "_verified_generic_stable_health_identity",
+        lambda _health: {
+            "commit": commit,
+            "pid": 79466,
+            "worktree_root": str(stable_root),
+            "database_identity": {},
+        },
+    )
+    monkeypatch.setattr(
+        server, "_branch_service_port_open", lambda *_args: True
+    )
+    real_run = server.subprocess.run
+
+    def run(args, **kwargs):
+        if args[:3] == ["git", "worktree", "list"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"worktree {stable_root}\n"
+                    f"HEAD {commit}\n"
+                    f"branch refs/heads/{server.AC_STABLE_BRANCH}\n"
+                ),
+                stderr="",
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", run)
+
+    def git_output(_root, args):
+        return {
+            ("branch", "--show-current"): server.AC_STABLE_BRANCH,
+            ("rev-parse", "HEAD"): commit,
+            ("status", "--porcelain"): "",
+        }.get(tuple(args), "")
+
+    monkeypatch.setattr(server, "_branch_service_git_output", git_output)
+    monkeypatch.setattr(
+        server,
+        "_stable_runtime_graph_status",
+        lambda: {
+            "ok": True,
+            "project_id": "aming-claw",
+            "active_snapshot_id": "full-stable",
+            "graph_snapshot_commit": commit,
+            "materialized_graph_baseline_commit": commit,
+            "current_state": {
+                "graph_stale": {
+                    "is_stale": False,
+                    "head_commit": commit,
+                    "active_graph_commit": commit,
+                }
+            },
+        },
+    )
+    assert server._verified_generic_stable_authority({}) == {}
+    recovered = server._verified_generic_stable_authority(
+        {}, allow_occupied_dev_port=True
+    )
+    assert recovered["mode"] == "verified_generic"
+    assert recovered["commit"] == commit
+    assert recovered["graph"]["active_snapshot_id"] == "full-stable"

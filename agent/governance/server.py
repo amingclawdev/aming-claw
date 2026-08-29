@@ -137,6 +137,7 @@ from agent.mcp.schema_contract import (
 import os
 import errno
 import fcntl
+import shlex
 import shutil
 import signal
 import socket
@@ -528,9 +529,14 @@ def _verified_generic_stable_graph_identity(
 
 def _verified_generic_stable_authority(
     health: Mapping[str, Any],
+    *,
+    allow_occupied_dev_port: bool = False,
 ) -> dict[str, Any]:
     base = _verified_generic_stable_health_identity(health)
-    if not base or _branch_service_port_open("127.0.0.1", AC_DEV_SERVICE_PORT):
+    if not base or (
+        not allow_occupied_dev_port
+        and _branch_service_port_open("127.0.0.1", AC_DEV_SERVICE_PORT)
+    ):
         return {}
     try:
         expected_root = Path(base["worktree_root"]).resolve(strict=True)
@@ -661,7 +667,10 @@ def _git_identity(root: Path) -> dict[str, str]:
             )
         except (OSError, subprocess.SubprocessError):
             return ""
-        return proc.stdout.strip() if proc.returncode == 0 else ""
+        # Porcelain v1 uses both XY columns; a leading ASCII space is semantic
+        # (for example, `` M`` means unstaged while ``M `` means staged).
+        # Remove only Git's record terminator, never status-column whitespace.
+        return proc.stdout.rstrip("\r\n") if proc.returncode == 0 else ""
 
     return {
         "worktree_root": run("rev-parse", "--show-toplevel") or str(root),
@@ -203500,6 +203509,843 @@ def _branch_service_stable_database_binding(
     return shared, identity
 
 
+def _branch_service_json_sha256(value: Mapping[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            dict(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _branch_service_path_ref(path: Path) -> str:
+    return "path-sha256:" + hashlib.sha256(
+        str(path).encode("utf-8")
+    ).hexdigest()
+
+
+def _branch_service_git_bytes(
+    worktree: Path,
+    args: Sequence[str],
+    *,
+    timeout: float = 10.0,
+) -> bytes:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=worktree,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValidationError(
+            "branch-service Git identity command failed",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        ) from exc
+    if proc.returncode != 0:
+        raise ValidationError(
+            "branch-service Git identity command was rejected",
+            {
+                "git_action": str(args[0] if args else "unknown"),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    return bytes(proc.stdout)
+
+
+def _branch_service_worktree_state(worktree: Path) -> dict[str, Any]:
+    """Return exact Git/diff state without exposing unbounded file bytes."""
+
+    try:
+        root = Path(
+            _branch_service_git_bytes(
+                worktree, ["rev-parse", "--show-toplevel"]
+            ).decode("utf-8").strip()
+        ).resolve(strict=True)
+        common_raw = _branch_service_git_bytes(
+            worktree, ["rev-parse", "--git-common-dir"]
+        ).decode("utf-8").strip()
+        common = Path(common_raw)
+        if not common.is_absolute():
+            common = worktree / common
+        common = common.resolve(strict=True)
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError) as exc:
+        raise ValidationError(
+            "branch-service physical Git identity is unavailable",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        ) from exc
+    if root != worktree.resolve(strict=True) or common.name != ".git":
+        raise ValidationError(
+            "branch-service physical Git identity mismatch",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    commit = _branch_service_git_bytes(
+        worktree, ["rev-parse", "HEAD"]
+    ).decode("ascii").strip().lower()
+    branch = _branch_service_git_bytes(
+        worktree, ["branch", "--show-current"]
+    ).decode("utf-8").strip()
+    status = _branch_service_git_bytes(
+        worktree,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    status_lines = status.decode("utf-8", errors="surrogateescape").splitlines()
+    if any(line.startswith(("?? ", "!! ")) for line in status_lines):
+        raise ValidationError(
+            "branch-service handoff does not support untracked or ignored bytes",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    binary_diff = _branch_service_git_bytes(
+        worktree,
+        ["diff", "HEAD", "--no-ext-diff", "--no-textconv", "--binary", "--", "."],
+    )
+    full_index_diff = _branch_service_git_bytes(
+        worktree,
+        [
+            "diff",
+            "HEAD",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "--",
+            ".",
+        ],
+    )
+    changed_raw = _branch_service_git_bytes(
+        worktree,
+        ["diff", "HEAD", "--name-only", "-z", "--", "."],
+    )
+    changed_files = [
+        item.decode("utf-8", errors="surrogateescape")
+        for item in changed_raw.split(b"\0")
+        if item
+    ]
+    return {
+        "root": root,
+        "root_ref": _branch_service_path_ref(root),
+        "common_git_dir": common,
+        "common_git_dir_ref": _branch_service_path_ref(common),
+        "branch": branch,
+        "commit": commit,
+        "dirty": bool(status),
+        "porcelain_lines": status_lines,
+        "porcelain_entry_count": len(status_lines),
+        "porcelain_sha256": "sha256:" + hashlib.sha256(status).hexdigest(),
+        # Preserve the historical `git diff --binary` digest used to freeze the
+        # existing dev residue, and retain a second full-index digest for audit.
+        "binary_diff_sha256": "sha256:"
+        + hashlib.sha256(binary_diff).hexdigest(),
+        "full_index_binary_diff_sha256": "sha256:"
+        + hashlib.sha256(full_index_diff).hexdigest(),
+        "binary_diff_size": len(binary_diff),
+        "changed_files": changed_files,
+        "changed_file_count": len(changed_files),
+        "changed_files_sha256": "sha256:"
+        + hashlib.sha256(changed_raw).hexdigest(),
+    }
+
+
+def _branch_service_public_worktree_state(
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        key: state.get(key)
+        for key in (
+            "root_ref",
+            "common_git_dir_ref",
+            "branch",
+            "commit",
+            "dirty",
+            "porcelain_entry_count",
+            "porcelain_sha256",
+            "binary_diff_sha256",
+            "full_index_binary_diff_sha256",
+            "binary_diff_size",
+            "changed_file_count",
+            "changed_files_sha256",
+        )
+    }
+
+
+def _branch_service_process_command(pid: int) -> tuple[list[str], str]:
+    proc_cmdline = Path(f"/proc/{int(pid)}/cmdline")
+    if proc_cmdline.is_file():
+        try:
+            argv = [
+                item.decode("utf-8", errors="surrogateescape")
+                for item in proc_cmdline.read_bytes().split(b"\0")
+                if item
+            ]
+        except OSError:
+            argv = []
+    else:
+        try:
+            result = subprocess.run(
+                ["ps", "-ww", "-o", "command=", "-p", str(int(pid))],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            argv = (
+                shlex.split(result.stdout.strip())
+                if result.returncode == 0 and result.stdout.strip()
+                else []
+            )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            argv = []
+    if len(argv) != 3 or argv[1:] != ["-m", "agent.governance.server"]:
+        return [], ""
+    try:
+        executable = str(Path(argv[0]).expanduser().resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return [], ""
+    normalized = [executable, *argv[1:]]
+    digest = "sha256:" + hashlib.sha256(
+        "\0".join(normalized).encode("utf-8", errors="surrogateescape")
+    ).hexdigest()
+    return normalized, digest
+
+
+def _branch_service_precise_process_start_identity(pid: int) -> str:
+    """Return a PID-reuse-resistant start identity from the host kernel."""
+
+    pid = int(pid)
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if proc_stat.is_file():
+        try:
+            raw = proc_stat.read_text(encoding="utf-8")
+            close_paren = raw.rfind(")")
+            # Fields after comm begin at Linux proc field 3. Start time is 22.
+            fields = raw[close_paren + 2 :].split()
+            start_ticks = fields[19]
+            if close_paren <= 0 or not start_ticks.isdigit():
+                return ""
+        except (OSError, IndexError, UnicodeError, ValueError):
+            return ""
+        exact = f"linux-proc-start.v1\0{pid}\0{start_ticks}".encode("ascii")
+        return "sha256:" + hashlib.sha256(exact).hexdigest()
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+            import ctypes.util
+
+            class _ProcBSDInfo(ctypes.Structure):
+                _fields_ = [
+                    ("pbi_flags", ctypes.c_uint32),
+                    ("pbi_status", ctypes.c_uint32),
+                    ("pbi_xstatus", ctypes.c_uint32),
+                    ("pbi_pid", ctypes.c_uint32),
+                    ("pbi_ppid", ctypes.c_uint32),
+                    ("pbi_uid", ctypes.c_uint32),
+                    ("pbi_gid", ctypes.c_uint32),
+                    ("pbi_ruid", ctypes.c_uint32),
+                    ("pbi_rgid", ctypes.c_uint32),
+                    ("pbi_svuid", ctypes.c_uint32),
+                    ("pbi_svgid", ctypes.c_uint32),
+                    ("rfu_1", ctypes.c_uint32),
+                    ("pbi_comm", ctypes.c_char * 16),
+                    ("pbi_name", ctypes.c_char * 32),
+                    ("pbi_nfiles", ctypes.c_uint32),
+                    ("pbi_pgid", ctypes.c_uint32),
+                    ("pbi_pjobc", ctypes.c_uint32),
+                    ("e_tdev", ctypes.c_uint32),
+                    ("e_tpgid", ctypes.c_uint32),
+                    ("pbi_nice", ctypes.c_int32),
+                    ("pbi_start_tvsec", ctypes.c_uint64),
+                    ("pbi_start_tvusec", ctypes.c_uint64),
+                ]
+
+            library_name = ctypes.util.find_library("proc")
+            if not library_name:
+                return ""
+            library = ctypes.CDLL(library_name)
+            proc_pidinfo = library.proc_pidinfo
+            proc_pidinfo.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            proc_pidinfo.restype = ctypes.c_int
+            info = _ProcBSDInfo()
+            size = ctypes.sizeof(info)
+            returned = proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+            if (
+                returned != size
+                or int(info.pbi_pid) != pid
+                or int(info.pbi_start_tvsec) <= 0
+            ):
+                return ""
+            exact = (
+                f"darwin-proc-start.v1\0{pid}\0{int(info.pbi_start_tvsec)}"
+                f"\0{int(info.pbi_start_tvusec)}"
+            ).encode("ascii")
+            return "sha256:" + hashlib.sha256(exact).hexdigest()
+        except (AttributeError, OSError, TypeError, ValueError):
+            return ""
+    # Unsupported hosts fail closed rather than falling back to second-granular
+    # `ps lstart`, which cannot defend against rapid PID reuse.
+    return ""
+
+
+def _branch_service_process_cwd(pid: int) -> Path | None:
+    proc_cwd = Path(f"/proc/{int(pid)}/cwd")
+    if proc_cwd.exists():
+        try:
+            return proc_cwd.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return None
+    try:
+        result = subprocess.run(
+            ["lsof", "-a", "-p", str(int(pid)), "-d", "cwd", "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    names = [line[1:] for line in result.stdout.splitlines() if line.startswith("n")]
+    if result.returncode != 0 or len(names) != 1:
+        return None
+    try:
+        return Path(names[0]).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _branch_service_listener_identity(pid: int, port: int) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            [
+                "lsof",
+                "-nP",
+                "-a",
+                "-p",
+                str(int(pid)),
+                f"-iTCP:{int(port)}",
+                "-sTCP:LISTEN",
+                "-Fpfn",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    pids = [line[1:] for line in result.stdout.splitlines() if line.startswith("p")]
+    fds = [line[1:] for line in result.stdout.splitlines() if line.startswith("f")]
+    names = [line[1:] for line in result.stdout.splitlines() if line.startswith("n")]
+    endpoint = f"{AC_DEV_BIND_HOST}:{int(port)}"
+    if (
+        result.returncode != 0
+        or set(pids) != {str(int(pid))}
+        or len(fds) != 1
+        or names != [endpoint]
+    ):
+        return {}
+    canonical = {"pid": int(pid), "fd": fds[0], "endpoint": endpoint}
+    return {
+        **canonical,
+        "identity_sha256": _branch_service_json_sha256(canonical),
+    }
+
+
+def _branch_service_process_os_identity(pid: int, port: int) -> dict[str, Any]:
+    start_identity = _branch_service_precise_process_start_identity(int(pid))
+    argv, command_sha256 = _branch_service_process_command(int(pid))
+    cwd = _branch_service_process_cwd(int(pid))
+    listener = _branch_service_listener_identity(int(pid), int(port))
+    if not (
+        start_identity
+        and argv
+        and command_sha256
+        and cwd is not None
+        and listener
+    ):
+        return {}
+    public = {
+        "schema_version": "ac_dev_orphan_os_identity.v1",
+        "pid": int(pid),
+        "process_start_identity": start_identity,
+        "command_sha256": command_sha256,
+        "cwd_ref": _branch_service_path_ref(cwd),
+        "listener_identity_sha256": listener["identity_sha256"],
+        "listener_port": int(port),
+        "listener_bind_host": AC_DEV_BIND_HOST,
+    }
+    return {
+        **public,
+        "identity_sha256": _branch_service_json_sha256(public),
+        "_cwd": cwd,
+        "_argv": argv,
+    }
+
+
+def _branch_service_recovery_stable_authority() -> dict[str, Any]:
+    """Verify 40000 while intentionally allowing the exact dev port occupant."""
+
+    health = _stable_runtime_health()
+    if health.get("runtime_plane") != "generic":
+        return {}
+    authority = _verified_generic_stable_authority(
+        health,
+        allow_occupied_dev_port=True,
+    )
+    if authority.get("mode") != "verified_generic":
+        return {}
+    loaded_identity = health.get("loaded_runtime_identity")
+    graph = authority.get("graph")
+    if not isinstance(loaded_identity, Mapping) or not isinstance(graph, Mapping):
+        return {}
+    canonical = {
+        "schema_version": "ac_stable_generic_recovery_authority.v1",
+        "commit": str(authority.get("commit") or ""),
+        "pid": int(authority.get("pid") or 0),
+        "loaded_source_sha256": str(
+            loaded_identity.get("loaded_source_sha256") or ""
+        ),
+        "active_snapshot_id": str(graph.get("active_snapshot_id") or ""),
+        "graph_snapshot_commit": str(graph.get("graph_snapshot_commit") or ""),
+        "materialized_graph_baseline_commit": str(
+            graph.get("materialized_graph_baseline_commit") or ""
+        ),
+    }
+    return {
+        **canonical,
+        "authority_sha256": _branch_service_json_sha256(canonical),
+    }
+
+
+def _branch_service_porcelain_health_matches(
+    health_lines: Any,
+    disk_lines: Sequence[str],
+) -> bool:
+    """Match exact porcelain, plus the one frozen legacy first-line defect.
+
+    The old runtime used ``str.strip()`` on the complete porcelain stream.  It
+    could therefore remove exactly the first line's leading unstaged status
+    column.  No other status, path, order, cardinality, or line may differ.
+    """
+
+    expected = list(disk_lines)
+    if not (
+        isinstance(health_lines, list)
+        and all(isinstance(line, str) for line in health_lines)
+        and all(isinstance(line, str) for line in expected)
+    ):
+        return False
+    if health_lines == expected:
+        return True
+    if len(health_lines) != len(expected) or not expected:
+        return False
+    first = expected[0]
+    return bool(
+        len(first) >= 4
+        and first[0] == " "
+        and first[1] in "MADRCU"
+        and first[2] == " "
+        and health_lines[0] == first[1:]
+        and health_lines[1:] == expected[1:]
+    )
+
+
+def _branch_service_exact_dirty_worktree_state_valid(
+    state: Mapping[str, Any],
+) -> bool:
+    porcelain = state.get("porcelain_lines")
+    changed_files = state.get("changed_files")
+    return bool(
+        state.get("dirty") is True
+        and isinstance(porcelain, list)
+        and bool(porcelain)
+        and all(isinstance(line, str) and len(line) >= 4 for line in porcelain)
+        and state.get("porcelain_entry_count") == len(porcelain)
+        and isinstance(changed_files, list)
+        and bool(changed_files)
+        and all(isinstance(path, str) and bool(path) for path in changed_files)
+        and state.get("changed_file_count") == len(changed_files)
+        and type(state.get("binary_diff_size")) is int
+        and state.get("binary_diff_size") > 0
+        and all(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", str(state.get(key) or ""))
+            for key in (
+                "porcelain_sha256",
+                "binary_diff_sha256",
+                "full_index_binary_diff_sha256",
+                "changed_files_sha256",
+            )
+        )
+    )
+
+
+def _branch_service_loaded_source_path_matches(
+    loaded: Mapping[str, Any],
+    worktree_state: Mapping[str, Any],
+) -> bool:
+    """Bind loaded source to the exact non-symlink orphan server module."""
+
+    root = worktree_state.get("root")
+    raw_path = loaded.get("loaded_source_path")
+    if not isinstance(root, Path) or not isinstance(raw_path, str) or not raw_path:
+        return False
+    expected = root / "agent" / "governance" / "server.py"
+    supplied = Path(raw_path)
+    try:
+        return bool(
+            supplied.is_absolute()
+            and supplied == expected
+            and not supplied.is_symlink()
+            and supplied.is_file()
+            and supplied.resolve(strict=True) == expected
+            and expected.resolve(strict=True) == expected
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _branch_service_exact_orphan_health_matches(
+    health: Mapping[str, Any],
+    *,
+    orphan_pid: int,
+    worktree_state: Mapping[str, Any],
+    loaded_commit: str,
+    loaded_source_sha256: str,
+    loaded_source_size: int,
+    stable_anchor_commit: str,
+    stable_database_identity: Mapping[str, Any],
+) -> bool:
+    loaded = health.get("loaded_runtime_identity")
+    plane = health.get("runtime_plane_identity")
+    if not isinstance(loaded, Mapping) or not isinstance(plane, Mapping):
+        return False
+    stale = health.get("runtime_stale")
+    stale_reasons = health.get("runtime_stale_reasons")
+    return bool(
+        orphan_pid > 0
+        and orphan_pid != SERVER_PID
+        and health.get("status") == "ok"
+        and health.get("service") == "governance"
+        and health.get("port") == AC_DEV_SERVICE_PORT
+        and health.get("pid") == orphan_pid
+        and health.get("runtime_plane") == "dev"
+        and health.get("bind_host") == AC_DEV_BIND_HOST
+        and health.get("runtime_loaded_version") == loaded_commit
+        and health.get("runtime_loaded_source_sha256") == loaded_source_sha256
+        and type(stale) is bool
+        and isinstance(stale_reasons, list)
+        and health.get("worktree_root") == str(worktree_state.get("root"))
+        and health.get("branch") == AC_DEV_BRANCH
+        and health.get("runtime_commit") == loaded_commit
+        and health.get("stable_anchor_commit") == stable_anchor_commit
+        and loaded.get("schema_version") == LOADED_RUNTIME_IDENTITY_SCHEMA
+        and loaded.get("loaded_commit") == loaded_commit
+        and loaded.get("loaded_pid") == orphan_pid
+        and _branch_service_loaded_source_path_matches(loaded, worktree_state)
+        and loaded.get("loaded_source_sha256") == loaded_source_sha256
+        and type(loaded_source_size) is int
+        and loaded_source_size > 0
+        and loaded.get("loaded_source_size") == loaded_source_size
+        and loaded.get("runtime_stale") is stale
+        and loaded.get("runtime_stale_reasons") == stale_reasons
+        and _git_object_identity_matches(
+            loaded.get("worktree_head_version"), loaded_commit
+        )
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(loaded.get("worktree_source_sha256") or ""),
+        )
+        and plane.get("schema_version") == "ac_runtime_plane_identity.v1"
+        and plane.get("plane") == "dev"
+        and plane.get("port") == AC_DEV_SERVICE_PORT
+        and plane.get("expected_port") == AC_DEV_SERVICE_PORT
+        and plane.get("pid") == orphan_pid
+        and plane.get("bind_host") == AC_DEV_BIND_HOST
+        and plane.get("worktree_root") == str(worktree_state.get("root"))
+        and plane.get("branch") == AC_DEV_BRANCH
+        and plane.get("expected_branch") == AC_DEV_BRANCH
+        and plane.get("commit") == loaded_commit
+        and plane.get("worktree_dirty") is True
+        and _branch_service_porcelain_health_matches(
+            plane.get("worktree_dirty_files"),
+            list(worktree_state.get("porcelain_lines") or []),
+        )
+        and plane.get("stable_anchor_commit") == stable_anchor_commit
+        and plane.get("stable_database_identity")
+        == dict(stable_database_identity)
+        and plane.get("project_allowlist") == ["aming-claw"]
+        and plane.get("schema_policy") == "verify_only_no_auto_migration"
+        and plane.get("active_graph_activation_allowed") is False
+        and plane.get("stable_deploy_allowed") is False
+        and plane.get("background_workers_enabled") is False
+        and plane.get("status") == "invalid"
+        and plane.get("violations") == ["dev_worktree_dirty"]
+        and _branch_service_exact_dirty_worktree_state_valid(worktree_state)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", loaded_source_sha256)
+        and _ac_stable_database_identity_valid(stable_database_identity)
+    )
+
+
+def _branch_service_orphan_inspection(
+    body: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Freeze a copy-safe, zero-write receipt for the exact recovery target."""
+
+    try:
+        orphan_pid = int(body.get("orphan_pid") or 0)
+    except (TypeError, ValueError):
+        orphan_pid = 0
+    if orphan_pid <= 0 or orphan_pid == SERVER_PID:
+        raise ValidationError(
+            "branch-service orphan_pid is invalid",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    try:
+        orphan_root = Path(str(body.get("orphan_worktree_path") or "")).expanduser().resolve(
+            strict=True
+        )
+        successor_root = Path(
+            str(body.get("successor_worktree_path") or "")
+        ).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValidationError(
+            "branch-service handoff worktree identity is unavailable",
+            {"zero_write_rejection": True, "writes_performed": False},
+        ) from exc
+    if orphan_root == successor_root:
+        raise ValidationError(
+            "branch-service handoff requires two distinct worktrees",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    orphan = _branch_service_worktree_state(orphan_root)
+    successor = _branch_service_worktree_state(successor_root)
+    supplied_orphan_commit = str(body.get("orphan_commit") or "").strip().lower()
+    supplied_successor_commit = str(body.get("successor_commit") or "").strip().lower()
+    successor_branch = str(body.get("successor_branch") or "").strip()
+    expected_diff = str(body.get("orphan_binary_diff_sha256") or "").strip()
+    expected_loaded_source = str(
+        body.get("orphan_loaded_source_sha256") or ""
+    ).strip()
+    expected_loaded_source_size = body.get("orphan_loaded_source_size")
+    expected_start = str(body.get("orphan_process_start_identity") or "").strip()
+    expected_command = str(body.get("orphan_command_sha256") or "").strip()
+    expected_listener = str(
+        body.get("orphan_listener_identity_sha256") or ""
+    ).strip()
+    if not (
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", supplied_orphan_commit)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", supplied_successor_commit)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", expected_diff)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", expected_loaded_source)
+        and type(expected_loaded_source_size) is int
+        and expected_loaded_source_size > 0
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", expected_start)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", expected_command)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", expected_listener)
+    ):
+        raise ValidationError(
+            "branch-service handoff requires exact commit/diff/process identities",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    if not (
+        orphan.get("branch") == AC_DEV_BRANCH
+        and orphan.get("commit") == supplied_orphan_commit
+        and orphan.get("dirty") is True
+        and orphan.get("binary_diff_sha256") == expected_diff
+        and successor_branch.startswith("codex/")
+        and successor_branch != AC_DEV_BRANCH
+        and successor.get("branch") == successor_branch
+        and successor.get("commit") == supplied_successor_commit
+        and successor.get("dirty") is False
+        and successor.get("common_git_dir") == orphan.get("common_git_dir")
+    ):
+        raise ValidationError(
+            "branch-service dirty/successor Git identity mismatch",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    ancestry = subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            supplied_orphan_commit,
+            supplied_successor_commit,
+        ],
+        cwd=successor_root,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    branch_ref = _branch_service_git_bytes(
+        successor_root, ["rev-parse", f"refs/heads/{AC_DEV_BRANCH}"]
+    ).decode("ascii").strip().lower()
+    successor_ref = _branch_service_git_bytes(
+        successor_root, ["rev-parse", f"refs/heads/{successor_branch}"]
+    ).decode("ascii").strip().lower()
+    if (
+        ancestry.returncode != 0
+        or branch_ref != supplied_orphan_commit
+        or successor_ref != supplied_successor_commit
+    ):
+        raise ValidationError(
+            "branch-service handoff branch ancestry/ref mismatch",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    worktrees = _branch_service_git_bytes(
+        successor_root, ["worktree", "list", "--porcelain"]
+    ).decode("utf-8")
+    dev_roots: list[Path] = []
+    for block in worktrees.strip().split("\n\n"):
+        values = dict(
+            line.split(" ", 1) if " " in line else (line, "")
+            for line in block.splitlines()
+        )
+        if values.get("branch") == f"refs/heads/{AC_DEV_BRANCH}" and values.get(
+            "worktree"
+        ):
+            dev_roots.append(Path(values["worktree"]).resolve(strict=True))
+    if dev_roots != [orphan_root]:
+        raise ValidationError(
+            "branch-service handoff requires one exact AC dev branch owner",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    stable = _branch_service_recovery_stable_authority()
+    stable_anchor = str(body.get("stable_anchor_commit") or "").strip().lower()
+    if not stable or stable.get("commit") != stable_anchor:
+        raise ValidationError(
+            "branch-service verified stable generic authority mismatch",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    shared, database_identity = _branch_service_stable_database_binding(orphan_root)
+    supplied_database_identity = body.get("stable_database_identity")
+    if (
+        not _ac_stable_database_identity_valid(supplied_database_identity)
+        or dict(supplied_database_identity) != database_identity
+    ):
+        raise ValidationError(
+            "branch-service recovery stable database identity mismatch",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    probe = _branch_service_poll_health(
+        AC_DEV_BIND_HOST,
+        AC_DEV_SERVICE_PORT,
+        timeout_sec=2.0,
+    )
+    health = probe.get("health") if isinstance(probe.get("health"), Mapping) else {}
+    os_identity = _branch_service_process_os_identity(
+        orphan_pid, AC_DEV_SERVICE_PORT
+    )
+    if not (
+        probe.get("ok") is True
+        and os_identity
+        and os_identity.get("_cwd") == orphan_root
+        and os_identity.get("process_start_identity") == expected_start
+        and os_identity.get("command_sha256") == expected_command
+        and os_identity.get("listener_identity_sha256") == expected_listener
+        and _branch_service_exact_orphan_health_matches(
+            health,
+            orphan_pid=orphan_pid,
+            worktree_state=orphan,
+            loaded_commit=supplied_orphan_commit,
+            loaded_source_sha256=expected_loaded_source,
+            loaded_source_size=expected_loaded_source_size,
+            stable_anchor_commit=stable_anchor,
+            stable_database_identity=database_identity,
+        )
+    ):
+        raise ValidationError(
+            "branch-service exact orphan identity mismatch",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "signals_sent": False,
+            },
+        )
+    health_identity = {
+        "schema_version": "ac_dev_orphan_health_identity.v1",
+        "pid": orphan_pid,
+        "service": "governance",
+        "runtime_plane": "dev",
+        "port": AC_DEV_SERVICE_PORT,
+        "bind_host": AC_DEV_BIND_HOST,
+        "loaded_commit": supplied_orphan_commit,
+        "loaded_source_sha256": expected_loaded_source,
+        "loaded_source_size": expected_loaded_source_size,
+        "loaded_source_path_ref": _branch_service_path_ref(
+            orphan_root / "agent" / "governance" / "server.py"
+        ),
+        "runtime_stale": bool(health.get("runtime_stale")),
+        "runtime_stale_reasons": list(health.get("runtime_stale_reasons") or []),
+    }
+    public_os_identity = {
+        key: value
+        for key, value in os_identity.items()
+        if not key.startswith("_")
+    }
+    receipt = {
+        "schema_version": "ac_dev_orphan_adopt_stop_handoff_inspection.v1",
+        "project_id": "aming-claw",
+        "stable_authority": stable,
+        "stable_database_identity": database_identity,
+        "orphan_worktree": _branch_service_public_worktree_state(orphan),
+        "successor_worktree": _branch_service_public_worktree_state(successor),
+        "orphan_os_identity": public_os_identity,
+        "orphan_health_identity": health_identity,
+        "orphan_health_identity_sha256": _branch_service_json_sha256(
+            health_identity
+        ),
+        "handoff": {
+            "from_branch": AC_DEV_BRANCH,
+            "from_commit": supplied_orphan_commit,
+            "successor_source_branch": successor_branch,
+            "to_commit": supplied_successor_commit,
+            "same_common_git_dir": True,
+            "descendant": True,
+            "reserved_dev_port": AC_DEV_SERVICE_PORT,
+        },
+        "shared_volume_ref": _branch_service_path_ref(shared),
+        "writes_performed": False,
+        "signals_sent": False,
+        "pass_synthesized": False,
+        "inspected_at": _utc_now(),
+    }
+    receipt["inspection_receipt_sha256"] = _branch_service_json_sha256(
+        {key: value for key, value in receipt.items() if key != "inspected_at"}
+    )
+    internal = {
+        "orphan_root": orphan_root,
+        "successor_root": successor_root,
+        "orphan": orphan,
+        "successor": successor,
+        "stable": stable,
+        "shared": shared,
+        "database_identity": database_identity,
+        "os_identity": os_identity,
+        "health": health,
+    }
+    return receipt, internal
+
+
 def _branch_service_tail(text: str | None, limit: int = 2000) -> str:
     return (text or "")[-limit:]
 
@@ -203591,6 +204437,368 @@ def _branch_service_stop_no_orphan(proc: subprocess.Popen) -> dict[str, Any]:
         except BaseException:
             result["stopped"] = False
         return result
+
+
+def _branch_service_send_signal(pid: int, signum: int) -> None:
+    os.kill(int(pid), int(signum))
+
+
+def _branch_service_wait_for_exact_pid_exit(
+    pid: int,
+    *,
+    process_start_identity: str,
+    timeout_sec: float,
+) -> str:
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        current = _branch_service_precise_process_start_identity(int(pid))
+        if not current:
+            return "exited"
+        try:
+            state_probe = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(int(pid))],
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=False,
+            )
+            process_state = (
+                state_probe.stdout.strip()
+                if state_probe.returncode == 0
+                else ""
+            )
+        except (OSError, subprocess.SubprocessError):
+            process_state = ""
+        if process_state.startswith("Z"):
+            return "exited"
+        if current != process_start_identity:
+            return "pid_reused"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "timeout"
+        time.sleep(min(0.05, remaining))
+
+
+def _branch_service_public_os_identity(
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in identity.items()
+        if not str(key).startswith("_")
+    }
+
+
+def _branch_service_stop_exact_orphan(
+    *,
+    orphan_pid: int,
+    expected_os_identity: Mapping[str, Any],
+    allow_kill: bool,
+    term_timeout_sec: float,
+    kill_timeout_sec: float,
+) -> dict[str, Any]:
+    """Signal only the exact inspected process; never target by name or port."""
+
+    current = _branch_service_process_os_identity(
+        orphan_pid, AC_DEV_SERVICE_PORT
+    )
+    if not current or _branch_service_public_os_identity(current) != dict(
+        expected_os_identity
+    ):
+        raise ValidationError(
+            "branch-service orphan process identity drifted before TERM",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "signals_sent": False,
+            },
+        )
+    start_identity = str(current.get("process_start_identity") or "")
+    _branch_service_send_signal(orphan_pid, signal.SIGTERM)
+    signals = ["SIGTERM"]
+    term_result = _branch_service_wait_for_exact_pid_exit(
+        orphan_pid,
+        process_start_identity=start_identity,
+        timeout_sec=term_timeout_sec,
+    )
+    if term_result == "exited":
+        return {
+            "stopped": True,
+            "termination": "term",
+            "signals_sent": signals,
+            "process_start_identity": start_identity,
+            "kill_authorized": bool(allow_kill),
+        }
+    if term_result == "pid_reused":
+        return {
+            "stopped": False,
+            "termination": "pid_reused_after_term",
+            "signals_sent": signals,
+            "process_start_identity": start_identity,
+            "kill_authorized": bool(allow_kill),
+            "safe_to_handoff": False,
+        }
+    if not allow_kill:
+        return {
+            "stopped": False,
+            "termination": "term_timeout_kill_not_authorized",
+            "signals_sent": signals,
+            "process_start_identity": start_identity,
+            "kill_authorized": False,
+            "safe_to_handoff": False,
+        }
+    kill_identity = _branch_service_process_os_identity(
+        orphan_pid, AC_DEV_SERVICE_PORT
+    )
+    if not kill_identity or _branch_service_public_os_identity(
+        kill_identity
+    ) != dict(expected_os_identity):
+        return {
+            "stopped": False,
+            "termination": "kill_identity_revalidation_failed",
+            "signals_sent": signals,
+            "process_start_identity": start_identity,
+            "kill_authorized": True,
+            "safe_to_handoff": False,
+        }
+    _branch_service_send_signal(orphan_pid, signal.SIGKILL)
+    signals.append("SIGKILL")
+    kill_result = _branch_service_wait_for_exact_pid_exit(
+        orphan_pid,
+        process_start_identity=start_identity,
+        timeout_sec=kill_timeout_sec,
+    )
+    return {
+        "stopped": kill_result == "exited",
+        "termination": (
+            "kill" if kill_result == "exited" else f"kill_{kill_result}"
+        ),
+        "signals_sent": signals,
+        "process_start_identity": start_identity,
+        "kill_authorized": True,
+        "safe_to_handoff": kill_result == "exited",
+    }
+
+
+def _branch_service_run_git_mutation(
+    worktree: Path,
+    args: Sequence[str],
+) -> None:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValidationError(
+            "branch-service handoff Git mutation failed",
+            {"writes_performed": True, "pass_synthesized": False},
+        ) from exc
+    if proc.returncode != 0:
+        raise ValidationError(
+            "branch-service handoff Git mutation was rejected",
+            {
+                "git_action": str(args[0] if args else "unknown"),
+                "writes_performed": True,
+                "pass_synthesized": False,
+            },
+        )
+
+
+def _branch_service_assert_recovery_stable_authority(
+    expected_sha256: str,
+    *,
+    writes_performed: bool = False,
+    signals_sent: bool = False,
+) -> dict[str, Any]:
+    authority = _branch_service_recovery_stable_authority()
+    if not authority or authority.get("authority_sha256") != expected_sha256:
+        raise ValidationError(
+            "branch-service stable authority drifted during recovery",
+            {
+                "writes_performed": bool(writes_performed),
+                "signals_sent": bool(signals_sent),
+                "pass_synthesized": False,
+            },
+        )
+    return authority
+
+
+def _branch_service_handoff_stage(
+    *,
+    orphan: Mapping[str, Any],
+    successor: Mapping[str, Any],
+    orphan_commit: str,
+    successor_commit: str,
+    successor_source_branch: str,
+) -> str:
+    branch_ref = _branch_service_git_bytes(
+        Path(successor["root"]),
+        ["rev-parse", f"refs/heads/{AC_DEV_BRANCH}"],
+    ).decode("ascii").strip().lower()
+    states = {
+        (AC_DEV_BRANCH, successor_source_branch, orphan_commit): "initial",
+        ("", successor_source_branch, orphan_commit): "orphan_detached",
+        ("", successor_source_branch, successor_commit): "ref_updated",
+        ("", AC_DEV_BRANCH, successor_commit): "complete",
+    }
+    return states.get(
+        (
+            str(orphan.get("branch") or ""),
+            str(successor.get("branch") or ""),
+            branch_ref,
+        ),
+        "invalid",
+    )
+
+
+def _branch_service_handoff_relationship_valid(
+    *,
+    orphan: Mapping[str, Any],
+    successor: Mapping[str, Any],
+    orphan_commit: str,
+    successor_commit: str,
+    successor_source_branch: str,
+) -> bool:
+    """Re-derive the trusted single-repository successor relationship."""
+
+    if not (
+        successor_source_branch.startswith("codex/")
+        and successor_source_branch != AC_DEV_BRANCH
+        and orphan.get("common_git_dir") == successor.get("common_git_dir")
+        and orphan.get("commit") == orphan_commit
+        and successor.get("commit") == successor_commit
+        and successor.get("dirty") is False
+    ):
+        return False
+    try:
+        source_ref = _branch_service_git_bytes(
+            Path(successor["root"]),
+            ["rev-parse", f"refs/heads/{successor_source_branch}"],
+        ).decode("ascii").strip().lower()
+        ancestry = subprocess.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                orphan_commit,
+                successor_commit,
+            ],
+            cwd=Path(successor["root"]),
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (KeyError, OSError, UnicodeDecodeError, subprocess.SubprocessError):
+        return False
+    return bool(source_ref == successor_commit and ancestry.returncode == 0)
+
+
+def _branch_service_apply_branch_handoff(
+    *,
+    orphan_root: Path,
+    successor_root: Path,
+    orphan_commit: str,
+    successor_commit: str,
+    successor_source_branch: str,
+    orphan_diff_sha256: str,
+    stable_authority_sha256: str,
+) -> dict[str, Any]:
+    """Resume-safe detach/update-ref/switch without touching dirty bytes."""
+
+    mutations: list[str] = []
+    while True:
+        orphan = _branch_service_worktree_state(orphan_root)
+        successor = _branch_service_worktree_state(successor_root)
+        if not (
+            orphan.get("commit") == orphan_commit
+            and orphan.get("dirty") is True
+            and orphan.get("binary_diff_sha256") == orphan_diff_sha256
+            and successor.get("commit") == successor_commit
+            and successor.get("dirty") is False
+            and successor.get("common_git_dir") == orphan.get("common_git_dir")
+            and _branch_service_handoff_relationship_valid(
+                orphan=orphan,
+                successor=successor,
+                orphan_commit=orphan_commit,
+                successor_commit=successor_commit,
+                successor_source_branch=successor_source_branch,
+            )
+        ):
+            raise ValidationError(
+                "branch-service handoff state drifted",
+                {
+                    "writes_performed": bool(mutations),
+                    "pass_synthesized": False,
+                },
+            )
+        stage = _branch_service_handoff_stage(
+            orphan=orphan,
+            successor=successor,
+            orphan_commit=orphan_commit,
+            successor_commit=successor_commit,
+            successor_source_branch=successor_source_branch,
+        )
+        if stage == "complete":
+            return {
+                "completed": True,
+                "idempotent": not mutations,
+                "mutations": mutations,
+                "orphan": _branch_service_public_worktree_state(orphan),
+                "successor": _branch_service_public_worktree_state(successor),
+                "dirty_bytes_preserved": True,
+                "binary_diff_preserved": True,
+            }
+        if stage == "invalid":
+            raise ValidationError(
+                "branch-service handoff stage is not recoverable",
+                {
+                    "writes_performed": bool(mutations),
+                    "pass_synthesized": False,
+                },
+            )
+        _branch_service_assert_recovery_stable_authority(
+            stable_authority_sha256,
+            writes_performed=bool(mutations),
+        )
+        if stage == "initial":
+            _branch_service_run_git_mutation(
+                orphan_root,
+                ["switch", "--detach", "--no-guess", orphan_commit],
+            )
+            mutations.append("detach_dirty_orphan")
+        elif stage == "orphan_detached":
+            _branch_service_run_git_mutation(
+                successor_root,
+                [
+                    "update-ref",
+                    f"refs/heads/{AC_DEV_BRANCH}",
+                    successor_commit,
+                    orphan_commit,
+                ],
+            )
+            mutations.append("advance_ac_dev_ref")
+        elif stage == "ref_updated":
+            _branch_service_run_git_mutation(
+                successor_root,
+                ["switch", AC_DEV_BRANCH],
+            )
+            mutations.append("attach_ac_dev_to_successor")
+
+
+def _branch_service_inspection_receipt_hash(
+    receipt: Mapping[str, Any],
+) -> str:
+    canonical = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"inspected_at", "inspection_receipt_sha256"}
+    }
+    return _branch_service_json_sha256(canonical)
 
 
 def _branch_service_exact_dev_health_matches(
@@ -204072,6 +205280,597 @@ def handle_branch_service_validate(ctx: RequestContext):
         "isolation_status": "isolated" if isolation_ok else "health_probe_failed",
         "probe": {k: v for k, v in probe.items() if k != "health"},
     }
+
+
+def _branch_service_fill_orphan_inspection_defaults(
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive only the first, zero-write inspection's exact identity fields."""
+
+    filled = dict(body)
+    try:
+        orphan_pid = int(filled.get("orphan_pid") or 0)
+        orphan_root = Path(
+            str(filled.get("orphan_worktree_path") or "")
+        ).expanduser().resolve(strict=True)
+        successor_root = Path(
+            str(filled.get("successor_worktree_path") or "")
+        ).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValidationError(
+            "branch-service inspection target identity is unavailable",
+            {"zero_write_rejection": True, "writes_performed": False},
+        ) from exc
+    orphan = _branch_service_worktree_state(orphan_root)
+    successor = _branch_service_worktree_state(successor_root)
+    os_identity = _branch_service_process_os_identity(
+        orphan_pid, AC_DEV_SERVICE_PORT
+    )
+    probe = _branch_service_poll_health(
+        AC_DEV_BIND_HOST, AC_DEV_SERVICE_PORT, timeout_sec=2.0
+    )
+    health = probe.get("health") if isinstance(probe.get("health"), Mapping) else {}
+    loaded = health.get("loaded_runtime_identity")
+    if not os_identity or not probe.get("ok") or not isinstance(loaded, Mapping):
+        raise ValidationError(
+            "branch-service inspection cannot derive an exact live orphan",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "signals_sent": False,
+            },
+        )
+    stable = _branch_service_recovery_stable_authority()
+    if not stable:
+        raise ValidationError(
+            "branch-service inspection requires verified generic stable authority",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    _shared, database_identity = _branch_service_stable_database_binding(
+        orphan_root
+    )
+    defaults = {
+        "orphan_commit": orphan.get("commit"),
+        "successor_commit": successor.get("commit"),
+        "successor_branch": successor.get("branch"),
+        "orphan_binary_diff_sha256": orphan.get("binary_diff_sha256"),
+        "orphan_loaded_source_sha256": loaded.get("loaded_source_sha256"),
+        "orphan_loaded_source_size": loaded.get("loaded_source_size"),
+        "orphan_process_start_identity": os_identity.get(
+            "process_start_identity"
+        ),
+        "orphan_command_sha256": os_identity.get("command_sha256"),
+        "orphan_listener_identity_sha256": os_identity.get(
+            "listener_identity_sha256"
+        ),
+        "stable_anchor_commit": stable.get("commit"),
+        "stable_database_identity": database_identity,
+    }
+    for key, value in defaults.items():
+        if filled.get(key) not in (None, "", {}):
+            if filled.get(key) != value:
+                raise ValidationError(
+                    "branch-service caller-supplied inspection identity mismatch",
+                    {
+                        "field": key,
+                        "zero_write_rejection": True,
+                        "writes_performed": False,
+                        "signals_sent": False,
+                    },
+                )
+        else:
+            filled[key] = value
+    return filled
+
+
+def _branch_service_body_from_inspection_receipt(
+    body: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    handoff = receipt.get("handoff")
+    orphan_worktree = receipt.get("orphan_worktree")
+    successor_worktree = receipt.get("successor_worktree")
+    orphan_os = receipt.get("orphan_os_identity")
+    orphan_health = receipt.get("orphan_health_identity")
+    stable = receipt.get("stable_authority")
+    database_identity = receipt.get("stable_database_identity")
+    if not all(
+        isinstance(item, Mapping)
+        for item in (
+            handoff,
+            orphan_worktree,
+            successor_worktree,
+            orphan_os,
+            orphan_health,
+            stable,
+            database_identity,
+        )
+    ):
+        raise ValidationError(
+            "branch-service inspection receipt is incomplete",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    rebuilt = dict(body)
+    rebuilt.update(
+        {
+            "orphan_pid": orphan_os.get("pid"),
+            "orphan_commit": handoff.get("from_commit"),
+            "successor_commit": handoff.get("to_commit"),
+            "successor_branch": handoff.get("successor_source_branch"),
+            "orphan_binary_diff_sha256": orphan_worktree.get(
+                "binary_diff_sha256"
+            ),
+            "orphan_loaded_source_sha256": orphan_health.get(
+                "loaded_source_sha256"
+            ),
+            "orphan_loaded_source_size": orphan_health.get(
+                "loaded_source_size"
+            ),
+            "orphan_process_start_identity": orphan_os.get(
+                "process_start_identity"
+            ),
+            "orphan_command_sha256": orphan_os.get("command_sha256"),
+            "orphan_listener_identity_sha256": orphan_os.get(
+                "listener_identity_sha256"
+            ),
+            "stable_anchor_commit": stable.get("commit"),
+            "stable_database_identity": dict(database_identity),
+        }
+    )
+    return rebuilt
+
+
+def _branch_service_successor_health_matches(
+    health: Mapping[str, Any],
+    *,
+    successor_root: Path,
+    successor_commit: str,
+    stable_anchor_commit: str,
+    database_identity: Mapping[str, Any],
+) -> bool:
+    pid = health.get("pid") if type(health.get("pid")) is int else 0
+    if pid <= 0:
+        return False
+    if not _branch_service_exact_dev_health_matches(
+        health,
+        process_pid=pid,
+        runtime_commit=successor_commit,
+        worktree_root=str(successor_root),
+        stable_anchor_commit=stable_anchor_commit,
+        stable_database_identity=database_identity,
+    ):
+        return False
+    os_identity = _branch_service_process_os_identity(pid, AC_DEV_SERVICE_PORT)
+    return bool(os_identity and os_identity.get("_cwd") == successor_root)
+
+
+@route("POST", "/api/branch-service/adopt-stop-handoff")
+def handle_branch_service_adopt_stop_handoff(ctx: RequestContext):
+    """Inspect or execute exact orphan stop + recoverable branch handoff.
+
+    This is deliberately local-supervisor-only.  The frozen stable generic
+    service is still the authority, but it never receives a raw path or a
+    process-control request over HTTP.
+    """
+
+    if ctx.handler is not None:
+        return 410, {
+            "ok": False,
+            "error": "branch_service_process_control_http_retired",
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "signals_sent": False,
+            "pass_synthesized": False,
+        }
+    raw_body = ctx.body if isinstance(ctx.body, Mapping) else {}
+    action = str(raw_body.get("action") or "inspect").strip().lower()
+    if action == "inspect":
+        inspection_body = _branch_service_fill_orphan_inspection_defaults(
+            raw_body
+        )
+        receipt, _internal = _branch_service_orphan_inspection(inspection_body)
+        return {
+            "ok": True,
+            "action": "inspect",
+            "inspection": receipt,
+            "writes_performed": False,
+            "signals_sent": False,
+            "pass_synthesized": False,
+        }
+    if action != "execute":
+        raise ValidationError(
+            "branch-service recovery action must be inspect or execute",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    supplied_receipt = raw_body.get("inspection_receipt")
+    if not isinstance(supplied_receipt, Mapping):
+        raise ValidationError(
+            "branch-service execute requires the full inspection receipt",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    supplied_receipt = dict(supplied_receipt)
+    supplied_hash = str(
+        raw_body.get("inspection_receipt_sha256")
+        or supplied_receipt.get("inspection_receipt_sha256")
+        or ""
+    )
+    if not (
+        supplied_receipt.get("schema_version")
+        == "ac_dev_orphan_adopt_stop_handoff_inspection.v1"
+        and supplied_hash
+        == supplied_receipt.get("inspection_receipt_sha256")
+        == _branch_service_inspection_receipt_hash(supplied_receipt)
+    ):
+        raise ValidationError(
+            "branch-service inspection receipt hash mismatch",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    try:
+        requested_orphan_pid = int(raw_body.get("orphan_pid") or 0)
+        inspected_orphan_pid = int(
+            supplied_receipt["orphan_os_identity"].get("pid") or 0
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidationError(
+            "branch-service execute orphan PID binding is malformed",
+            {"zero_write_rejection": True, "writes_performed": False},
+        ) from exc
+    if requested_orphan_pid != inspected_orphan_pid or requested_orphan_pid <= 0:
+        raise ValidationError(
+            "branch-service execute orphan PID differs from inspection",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "signals_sent": False,
+            },
+        )
+    body = _branch_service_body_from_inspection_receipt(
+        raw_body, supplied_receipt
+    )
+    try:
+        orphan_root = Path(
+            str(body.get("orphan_worktree_path") or "")
+        ).expanduser().resolve(strict=True)
+        successor_root = Path(
+            str(body.get("successor_worktree_path") or "")
+        ).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValidationError(
+            "branch-service execute worktree identity is unavailable",
+            {"zero_write_rejection": True, "writes_performed": False},
+        ) from exc
+    orphan_receipt = supplied_receipt["orphan_worktree"]
+    successor_receipt = supplied_receipt["successor_worktree"]
+    if not (
+        _branch_service_path_ref(orphan_root)
+        == orphan_receipt.get("root_ref")
+        and _branch_service_path_ref(successor_root)
+        == successor_receipt.get("root_ref")
+    ):
+        raise ValidationError(
+            "branch-service execute worktree refs do not match inspection",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    stable_hash = str(
+        supplied_receipt["stable_authority"].get("authority_sha256") or ""
+    )
+    current_stable = _branch_service_assert_recovery_stable_authority(stable_hash)
+    _shared, current_database_identity = _branch_service_stable_database_binding(
+        orphan_root
+    )
+    if not (
+        dict(supplied_receipt["stable_authority"]) == current_stable
+        and dict(supplied_receipt["stable_database_identity"])
+        == current_database_identity
+    ):
+        raise ValidationError(
+            "branch-service execute stable authority receipt drifted",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "signals_sent": False,
+            },
+        )
+    orphan = _branch_service_worktree_state(orphan_root)
+    successor = _branch_service_worktree_state(successor_root)
+    orphan_commit = str(body["orphan_commit"])
+    successor_commit = str(body["successor_commit"])
+    successor_source_branch = str(body["successor_branch"])
+    orphan_diff_sha256 = str(body["orphan_binary_diff_sha256"])
+    if not (
+        orphan.get("commit") == orphan_commit
+        and orphan.get("dirty") is True
+        and orphan.get("binary_diff_sha256") == orphan_diff_sha256
+        and orphan.get("porcelain_sha256")
+        == supplied_receipt["orphan_worktree"].get("porcelain_sha256")
+        and orphan.get("full_index_binary_diff_sha256")
+        == supplied_receipt["orphan_worktree"].get(
+            "full_index_binary_diff_sha256"
+        )
+        and orphan.get("changed_file_count")
+        == supplied_receipt["orphan_worktree"].get("changed_file_count")
+        and orphan.get("changed_files_sha256")
+        == supplied_receipt["orphan_worktree"].get("changed_files_sha256")
+        and successor.get("commit") == successor_commit
+        and successor.get("dirty") is False
+        and orphan.get("common_git_dir_ref")
+        == supplied_receipt["orphan_worktree"].get("common_git_dir_ref")
+        == successor.get("common_git_dir_ref")
+        and _branch_service_handoff_relationship_valid(
+            orphan=orphan,
+            successor=successor,
+            orphan_commit=orphan_commit,
+            successor_commit=successor_commit,
+            successor_source_branch=successor_source_branch,
+        )
+    ):
+        raise ValidationError(
+            "branch-service execute disk state drifted from inspection",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    stage = _branch_service_handoff_stage(
+        orphan=orphan,
+        successor=successor,
+        orphan_commit=orphan_commit,
+        successor_commit=successor_commit,
+        successor_source_branch=successor_source_branch,
+    )
+    if stage == "invalid":
+        raise ValidationError(
+            "branch-service execute handoff stage is invalid",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    original_start = str(body.get("orphan_process_start_identity") or "")
+    current_start = _branch_service_precise_process_start_identity(
+        int(body["orphan_pid"])
+    )
+    stop_result: dict[str, Any]
+    if stage == "initial" and current_start == original_start:
+        fresh_receipt, _fresh_internal = _branch_service_orphan_inspection(body)
+        if fresh_receipt.get("inspection_receipt_sha256") != supplied_hash:
+            raise ValidationError(
+                "branch-service live orphan drifted from inspection",
+                {
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "signals_sent": False,
+                },
+            )
+        stop_result = _branch_service_stop_exact_orphan(
+            orphan_pid=int(body["orphan_pid"]),
+            expected_os_identity=supplied_receipt["orphan_os_identity"],
+            allow_kill=_truthy_flag(body.get("allow_kill")),
+            term_timeout_sec=_clamped_float(
+                body.get("term_timeout_sec"),
+                default=5.0,
+                minimum=0.05,
+                maximum=30.0,
+            ),
+            kill_timeout_sec=_clamped_float(
+                body.get("kill_timeout_sec"),
+                default=5.0,
+                minimum=0.05,
+                maximum=30.0,
+            ),
+        )
+        if not stop_result.get("stopped"):
+            return {
+                "ok": False,
+                "action": "execute",
+                "schema_version": "ac_dev_orphan_adopt_stop_handoff.v1",
+                "error": str(stop_result.get("termination") or "stop_failed"),
+                "inspection_receipt_sha256": supplied_hash,
+                "stop": stop_result,
+                "handoff_performed": False,
+                "replacement_started": False,
+                "pass_synthesized": False,
+            }
+    elif current_start == original_start:
+        raise ValidationError(
+            "branch-service orphan remained live after a partial handoff",
+            {
+                "zero_write_rejection": True,
+                "writes_performed": False,
+                "signals_sent": False,
+            },
+        )
+    else:
+        stop_result = {
+            "stopped": True,
+            "termination": "previously_stopped",
+            "signals_sent": [],
+            "process_start_identity": original_start,
+            "kill_authorized": _truthy_flag(body.get("allow_kill")),
+            "idempotent": True,
+        }
+    if _branch_service_port_open(AC_DEV_BIND_HOST, AC_DEV_SERVICE_PORT):
+        probe = _branch_service_poll_health(
+            AC_DEV_BIND_HOST, AC_DEV_SERVICE_PORT, timeout_sec=2.0
+        )
+        health = (
+            probe.get("health")
+            if isinstance(probe.get("health"), Mapping)
+            else {}
+        )
+        if not (
+            stage == "complete"
+            and _branch_service_successor_health_matches(
+                health,
+                successor_root=successor_root,
+                successor_commit=successor_commit,
+                stable_anchor_commit=str(body["stable_anchor_commit"]),
+                database_identity=body["stable_database_identity"],
+            )
+        ):
+            raise ValidationError(
+                "branch-service dev port is occupied by an unapproved process",
+                {
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                    "signals_sent": False,
+                },
+            )
+    _branch_service_assert_recovery_stable_authority(
+        stable_hash,
+        signals_sent=bool(stop_result.get("signals_sent")),
+    )
+    handoff_result = _branch_service_apply_branch_handoff(
+        orphan_root=orphan_root,
+        successor_root=successor_root,
+        orphan_commit=orphan_commit,
+        successor_commit=successor_commit,
+        successor_source_branch=successor_source_branch,
+        orphan_diff_sha256=orphan_diff_sha256,
+        stable_authority_sha256=stable_hash,
+    )
+    _branch_service_assert_recovery_stable_authority(
+        stable_hash,
+        writes_performed=bool(handoff_result.get("mutations")),
+        signals_sent=bool(stop_result.get("signals_sent")),
+    )
+    probe = _branch_service_poll_health(
+        AC_DEV_BIND_HOST, AC_DEV_SERVICE_PORT, timeout_sec=1.0
+    )
+    running_health = (
+        probe.get("health") if isinstance(probe.get("health"), Mapping) else {}
+    )
+    replacement_idempotent = _branch_service_successor_health_matches(
+        running_health,
+        successor_root=successor_root,
+        successor_commit=successor_commit,
+        stable_anchor_commit=str(body["stable_anchor_commit"]),
+        database_identity=body["stable_database_identity"],
+    )
+    replacement: dict[str, Any]
+    if replacement_idempotent:
+        replacement = {
+            "ok": True,
+            "idempotent": True,
+            "pid": int(running_health["pid"]),
+            "runtime_commit": successor_commit,
+        }
+    else:
+        if _branch_service_port_open(AC_DEV_BIND_HOST, AC_DEV_SERVICE_PORT):
+            raise ValidationError(
+                "branch-service same-port replacement identity mismatch",
+                {
+                    "writes_performed": bool(handoff_result.get("mutations")),
+                    "pass_synthesized": False,
+                },
+            )
+        runtime_workspace_raw = str(body.get("runtime_workspace") or "").strip()
+        if not runtime_workspace_raw:
+            raise ValidationError(
+                "branch-service execute requires an isolated runtime_workspace",
+                {
+                    "writes_performed": bool(handoff_result.get("mutations")),
+                    "pass_synthesized": False,
+                },
+            )
+        validate_ctx = RequestContext(
+            handler=None,
+            method="POST",
+            path_params={},
+            query={},
+            body={
+                "worktree_path": str(successor_root),
+                "port": AC_DEV_SERVICE_PORT,
+                "timeout_sec": _clamped_float(
+                    body.get("replacement_timeout_sec"),
+                    default=30.0,
+                    minimum=2.0,
+                    maximum=120.0,
+                ),
+                "keep_running": True,
+                "stable_anchor_commit": str(body["stable_anchor_commit"]),
+                "shared_volume_path": str(
+                    _branch_service_stable_database_binding(successor_root)[0]
+                ),
+                "stable_database_identity": dict(
+                    body["stable_database_identity"]
+                ),
+                "runtime_workspace": runtime_workspace_raw,
+                "python": sys.executable,
+            },
+            request_id=f"local-orphan-replacement-{os.getpid()}",
+            token="",
+            idem_key="",
+        )
+        raw_replacement = handle_branch_service_validate(validate_ctx)
+        if isinstance(raw_replacement, tuple):
+            raw_replacement = raw_replacement[1]
+        if not isinstance(raw_replacement, Mapping) or not raw_replacement.get("ok"):
+            return {
+                "ok": False,
+                "action": "execute",
+                "schema_version": "ac_dev_orphan_adopt_stop_handoff.v1",
+                "error": "same_port_replacement_failed",
+                "inspection_receipt_sha256": supplied_hash,
+                "stop": stop_result,
+                "handoff": handoff_result,
+                "replacement_started": False,
+                "pass_synthesized": False,
+            }
+        replacement = {
+            "ok": True,
+            "idempotent": False,
+            "pid": int(raw_replacement.get("pid") or 0),
+            "runtime_commit": str(raw_replacement.get("runtime_commit") or ""),
+        }
+    final_stable = _branch_service_assert_recovery_stable_authority(
+        stable_hash,
+        writes_performed=bool(handoff_result.get("mutations")),
+        signals_sent=bool(stop_result.get("signals_sent")),
+    )
+    final_orphan = _branch_service_worktree_state(orphan_root)
+    final_successor = _branch_service_worktree_state(successor_root)
+    if not (
+        final_orphan.get("branch") == ""
+        and final_orphan.get("commit") == orphan_commit
+        and final_orphan.get("binary_diff_sha256") == orphan_diff_sha256
+        and final_orphan.get("porcelain_sha256")
+        == supplied_receipt["orphan_worktree"].get("porcelain_sha256")
+        and final_orphan.get("full_index_binary_diff_sha256")
+        == supplied_receipt["orphan_worktree"].get(
+            "full_index_binary_diff_sha256"
+        )
+        and final_orphan.get("changed_files_sha256")
+        == supplied_receipt["orphan_worktree"].get("changed_files_sha256")
+        and final_successor.get("branch") == AC_DEV_BRANCH
+        and final_successor.get("commit") == successor_commit
+        and final_successor.get("dirty") is False
+        and final_stable.get("authority_sha256") == stable_hash
+    ):
+        raise ValidationError(
+            "branch-service final recovery invariants failed",
+            {
+                "writes_performed": True,
+                "pass_synthesized": False,
+            },
+        )
+    receipt_body = {
+        "schema_version": "ac_dev_orphan_adopt_stop_handoff.v1",
+        "project_id": "aming-claw",
+        "inspection_receipt_sha256": supplied_hash,
+        "stable_authority_sha256": stable_hash,
+        "stable_database_identity": dict(body["stable_database_identity"]),
+        "stop": stop_result,
+        "handoff": handoff_result,
+        "replacement": replacement,
+        "orphan_worktree": _branch_service_public_worktree_state(final_orphan),
+        "successor_worktree": _branch_service_public_worktree_state(
+            final_successor
+        ),
+        "stable_unchanged": True,
+        "active_graph_unchanged": True,
+        "stable_database_identity_unchanged": True,
+        "dirty_bytes_preserved": True,
+        "pass_synthesized": False,
+    }
+    receipt_body["recovery_receipt_sha256"] = _branch_service_json_sha256(
+        receipt_body
+    )
+    return {"ok": True, "action": "execute", **receipt_body}
 
 
 @route("GET", "/api/version-check/{project_id}")
