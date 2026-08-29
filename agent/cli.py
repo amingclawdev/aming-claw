@@ -32,6 +32,7 @@ import webbrowser
 import socket
 import subprocess
 import tempfile
+import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -56,6 +57,8 @@ AC_STABLE_ANCHOR_COMMIT = "a25838f15f949ac434cf78e03f20760e82ff81f0"
 AC_DATABASE_STABLE_RELATIVE_PATH = (
     "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
 )
+_GOVERNANCE_PROBE_HEALTH_BYTES = 64 * 1024
+_GOVERNANCE_PROBE_GRAPH_BYTES = 256 * 1024
 
 # Governance keeps bounded SQLite state open for each registered project. 4096
 # leaves release-scale descriptor headroom while remaining below ordinary POSIX
@@ -720,14 +723,75 @@ def _require_source_checkout_matches_loaded_package(workspace: str = "") -> None
     )
 
 
-def _probe_governance(port: int, *, timeout: float = 2.0) -> Optional[dict]:
-    url = f"http://127.0.0.1:{port}/api/health"
+class _GovernanceProbeNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _strict_local_governance_json_probe(
+    port: int,
+    path: str,
+    *,
+    timeout: float,
+    max_bytes: int,
+) -> Optional[dict]:
+    if (
+        type(port) is not int
+        or not 1 <= port <= 65535
+        or not path.startswith("/api/")
+        or "//" in path
+        or "#" in path
+        or any(ord(char) < 0x20 for char in path)
+        or max_bytes < 1
+    ):
+        return None
+    url = f"http://127.0.0.1:{port}{path}"
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _GovernanceProbeNoRedirect(),
+    )
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - localhost probe
-            payload = json.loads(resp.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        with opener.open(request, timeout=timeout) as response:
+            if int(response.getcode()) != 200 or str(response.geturl() or "") != url:
+                return None
+            content_type = str(response.headers.get("Content-Type") or "")
+            if content_type.split(";", 1)[0].strip().lower() != "application/json":
+                return None
+            content_length = str(response.headers.get("Content-Length") or "").strip()
+            if content_length:
+                declared_length = int(content_length)
+                if declared_length < 0 or declared_length > max_bytes:
+                    return None
+            payload_bytes = response.read(max_bytes + 1)
+    except (
+        OSError,
+        ValueError,
+        UnicodeError,
+        urllib.error.URLError,
+        http.client.HTTPException,
+    ):
+        return None
+    if not payload_bytes or len(payload_bytes) > max_bytes:
+        return None
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _probe_governance(port: int, *, timeout: float = 2.0) -> Optional[dict]:
+    return _strict_local_governance_json_probe(
+        port,
+        "/api/health",
+        timeout=timeout,
+        max_bytes=_GOVERNANCE_PROBE_HEALTH_BYTES,
+    )
 
 
 def _probe_governance_path(
@@ -736,15 +800,12 @@ def _probe_governance_path(
     *,
     timeout: float = 2.0,
 ) -> Optional[dict]:
-    if not path.startswith("/"):
-        return None
-    url = f"http://127.0.0.1:{port}{path}"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
-            payload = json.loads(resp.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
+    return _strict_local_governance_json_probe(
+        port,
+        path,
+        timeout=timeout,
+        max_bytes=_GOVERNANCE_PROBE_GRAPH_BYTES,
+    )
 
 
 def _http_json(method: str, url: str, payload: dict | None = None, *, timeout: float = 30.0) -> tuple[int, dict]:

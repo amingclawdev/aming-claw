@@ -13772,6 +13772,54 @@ def test_ac_dev_stable_proxy_can_return_exact_received_payload_size(monkeypatch)
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize(
+    ("probe_name", "expected_path", "expected_limit"),
+    [
+        (
+            "_stable_runtime_health",
+            "/api/health",
+            server._DEV_STABLE_PROXY_HEALTH_BYTES,
+        ),
+        (
+            "_stable_runtime_graph_status",
+            "/api/graph-governance/aming-claw/status",
+            server._DEV_STABLE_PROXY_RESPONSE_BYTES,
+        ),
+    ],
+)
+def test_stable_runtime_authority_probe_reuses_strict_transport(
+    monkeypatch, probe_name, expected_path, expected_limit
+):
+    calls = []
+
+    def strict_probe(path, *, max_bytes):
+        calls.append((path, max_bytes))
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "_dev_stable_proxy_json", strict_probe)
+
+    assert getattr(server, probe_name)() == {"ok": True}
+    assert calls == [(expected_path, expected_limit)]
+
+
+@pytest.mark.parametrize(
+    "probe_name",
+    ["_stable_runtime_health", "_stable_runtime_graph_status"],
+)
+def test_stable_runtime_authority_probe_transport_failure_is_empty(
+    monkeypatch, probe_name
+):
+    def rejected_probe(*_args, **_kwargs):
+        raise server._dev_stable_proxy_failure(
+            "ac_dev_stable_proxy_transport_failed",
+            "test transport failure",
+        )
+
+    monkeypatch.setattr(server, "_dev_stable_proxy_json", rejected_probe)
+
+    assert getattr(server, probe_name)() == {}
+
+
 def test_ac_dev_sized_stable_read_preserves_health_window_on_size_rejection(
     monkeypatch,
 ):
@@ -17033,8 +17081,147 @@ def test_branch_service_validate_refuses_any_port_except_40008(
     assert result["zero_write_rejection"] is True
 
 
+def _exact_branch_service_dev_health(
+    *, worktree: Path, commit: str, pid: int, database_identity: Mapping[str, Any]
+) -> dict[str, Any]:
+    source_hash = "sha256:" + ("1" * 64)
+    stable_anchor = server.AC_STABLE_ANCHOR_COMMIT
+    return {
+        "status": "ok",
+        "service": "governance",
+        "port": server.AC_DEV_SERVICE_PORT,
+        "pid": pid,
+        "runtime_plane": "dev",
+        "bind_host": server.AC_DEV_BIND_HOST,
+        "runtime_loaded_version": commit,
+        "runtime_loaded_source_sha256": source_hash,
+        "runtime_stale": False,
+        "runtime_stale_reasons": [],
+        "worktree_root": str(worktree.resolve()),
+        "branch": server.AC_DEV_BRANCH,
+        "runtime_commit": commit,
+        "stable_anchor_commit": stable_anchor,
+        "loaded_runtime_identity": {
+            "schema_version": server.LOADED_RUNTIME_IDENTITY_SCHEMA,
+            "loaded_commit": commit,
+            "loaded_pid": pid,
+            "worktree_head_version": commit[:12],
+            "runtime_stale": False,
+            "runtime_stale_reasons": [],
+            "loaded_source_sha256": source_hash,
+            "worktree_source_sha256": source_hash,
+        },
+        "runtime_plane_identity": {
+            "schema_version": "ac_runtime_plane_identity.v1",
+            "plane": "dev",
+            "port": server.AC_DEV_SERVICE_PORT,
+            "expected_port": server.AC_DEV_SERVICE_PORT,
+            "pid": pid,
+            "bind_host": server.AC_DEV_BIND_HOST,
+            "worktree_root": str(worktree.resolve()),
+            "branch": server.AC_DEV_BRANCH,
+            "expected_branch": server.AC_DEV_BRANCH,
+            "commit": commit,
+            "worktree_dirty": False,
+            "worktree_dirty_files": [],
+            "stable_anchor_commit": stable_anchor,
+            "stable_database_identity": dict(database_identity),
+            "project_allowlist": ["aming-claw"],
+            "schema_policy": "verify_only_no_auto_migration",
+            "active_graph_activation_allowed": False,
+            "stable_deploy_allowed": False,
+            "background_workers_enabled": False,
+            "status": "ready",
+            "violations": [],
+        },
+    }
+
+
+_BRANCH_SERVICE_HEALTH_FIELDS = (
+    "status service port pid runtime_plane bind_host runtime_loaded_version "
+    "runtime_loaded_source_sha256 runtime_stale runtime_stale_reasons "
+    "worktree_root branch runtime_commit stable_anchor_commit"
+).split()
+_BRANCH_SERVICE_LOADED_FIELDS = (
+    "schema_version loaded_commit loaded_pid worktree_head_version runtime_stale "
+    "runtime_stale_reasons loaded_source_sha256 worktree_source_sha256"
+).split()
+_BRANCH_SERVICE_PLANE_FIELDS = (
+    "schema_version plane port expected_port pid bind_host worktree_root branch "
+    "expected_branch commit worktree_dirty worktree_dirty_files "
+    "stable_anchor_commit stable_database_identity project_allowlist schema_policy "
+    "active_graph_activation_allowed stable_deploy_allowed "
+    "background_workers_enabled status violations"
+).split()
+_BRANCH_SERVICE_IDENTITY_MUTATION_PATHS = (
+    [(field,) for field in _BRANCH_SERVICE_HEALTH_FIELDS]
+    + [
+        ("loaded_runtime_identity", field)
+        for field in _BRANCH_SERVICE_LOADED_FIELDS
+    ]
+    + [
+        ("runtime_plane_identity", field)
+        for field in _BRANCH_SERVICE_PLANE_FIELDS
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "path",
+    _BRANCH_SERVICE_IDENTITY_MUTATION_PATHS,
+    ids=lambda path: "-".join(path),
+)
+def test_branch_service_exact_dev_health_rejects_each_identity_mutation(
+    tmp_path, path
+):
+    commit = "b" * 40
+    database_identity = _promotion_database_identity()
+    health = _exact_branch_service_dev_health(
+        worktree=tmp_path,
+        commit=commit,
+        pid=43210,
+        database_identity=database_identity,
+    )
+    target = health
+    for key in path[:-1]:
+        target = target[key]
+    current = target[path[-1]]
+    if type(current) is bool:
+        replacement = not current
+    elif type(current) is int:
+        replacement = current + 1
+    elif isinstance(current, str):
+        replacement = current + "-mismatch"
+    elif isinstance(current, list):
+        replacement = [*current, "mismatch"]
+    else:
+        replacement = {}
+    target[path[-1]] = replacement
+
+    assert not server._branch_service_exact_dev_health_matches(
+        health,
+        process_pid=43210,
+        runtime_commit=commit,
+        worktree_root=str(tmp_path.resolve()),
+        stable_anchor_commit=server.AC_STABLE_ANCHOR_COMMIT,
+        stable_database_identity=database_identity,
+    )
+
+
+@pytest.mark.parametrize(
+    ("health_pid", "keep_running", "expected_ok"),
+    [
+        pytest.param(43210, False, True, id="spawned-pid-matches"),
+        pytest.param(
+            99999,
+            True,
+            False,
+            id="health-pid-mismatch-stops-even-when-kept-running",
+        ),
+    ],
+)
 def test_branch_service_launches_guarded_module_with_dev_env(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, health_pid, keep_running, expected_ok
 ):
     worktree = tmp_path / "ac-dev"
     worktree.mkdir()
@@ -17101,29 +17288,21 @@ def test_branch_service_launches_guarded_module_with_dev_env(
         lambda *args, **kwargs: {
             "ok": True,
             "url": "http://127.0.0.1:40008/api/health",
-            "health": {
-                "status": "ok",
-                "port": 40008,
-                "pid": 43210,
-                "runtime_plane": "dev",
-                "bind_host": server.AC_DEV_BIND_HOST,
-                "runtime_plane_identity": {
-                    "bind_host": server.AC_DEV_BIND_HOST,
-                    "worktree_root": str(worktree.resolve()),
-                    "branch": server.AC_DEV_BRANCH,
-                    "commit": candidate,
-                    "stable_anchor_commit": server.AC_STABLE_ANCHOR_COMMIT,
-                    "stable_database_identity": database_identity,
-                    "status": "ready",
-                },
-            },
+            "health": _exact_branch_service_dev_health(
+                worktree=worktree,
+                commit=candidate,
+                pid=health_pid,
+                database_identity=database_identity,
+            ),
         },
     )
-    monkeypatch.setattr(
-        server,
-        "_branch_service_stop_process",
-        lambda proc: {"stopped": True, "pid": proc.pid},
-    )
+    stopped = []
+
+    def stop_process(proc):
+        stopped.append(proc.pid)
+        return {"stopped": True, "pid": proc.pid}
+
+    monkeypatch.setattr(server, "_branch_service_stop_process", stop_process)
 
     alternate = tmp_path / "alternate-shared"
     alternate.mkdir()
@@ -17181,11 +17360,19 @@ def test_branch_service_launches_guarded_module_with_dev_env(
                     "shared_volume_path": str(shared),
                     "stable_database_identity": database_identity,
                     "runtime_workspace": str(tmp_path / "runtime"),
+                    "keep_running": keep_running,
             },
         )
     )
 
-    assert result["ok"] is True
+    assert result["ok"] is expected_ok
+    assert result["process_pid"] == 43210
+    assert result["pid"] == health_pid
+    assert stopped == [43210]
+    assert result["stop_result"] == {"stopped": True, "pid": 43210}
+    assert result["isolation_status"] == (
+        "isolated" if expected_ok else "health_probe_failed"
+    )
     assert launched["command"] == [
         sys.executable,
         "-m",

@@ -26,6 +26,131 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not HAS_CLICK, reason="click not installed")
 
 
+class _GovernanceProbeResponse:
+    def __init__(self, *, url, body, headers=None, status=200, expected_limit=None):
+        self.url = url
+        self.body = body
+        self.headers = headers or {"Content-Type": "application/json"}
+        self.status = status
+        self.expected_limit = expected_limit
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def getcode(self):
+        return self.status
+
+    def geturl(self):
+        return self.url
+
+    def read(self, limit):
+        if self.expected_limit is not None:
+            assert limit == self.expected_limit
+        return self.body[:limit]
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "redirect",
+        "oversize_declared",
+        "oversize_body",
+        "non_json",
+        "non_200",
+    ],
+)
+def test_governance_probe_transport_fails_closed(monkeypatch, mode):
+    import agent.cli as cli
+
+    max_bytes = 16
+    url = "http://127.0.0.1:40000/api/health"
+    headers = {"Content-Type": "application/json"}
+    body = b'{"ok":true}'
+    status = 200
+    final_url = url
+    if mode == "redirect":
+        final_url = "http://127.0.0.1:40000/api/other"
+    elif mode == "oversize_declared":
+        headers["Content-Length"] = str(max_bytes + 1)
+    elif mode == "oversize_body":
+        body = b"{" + (b" " * max_bytes)
+    elif mode == "non_json":
+        headers["Content-Type"] = "text/plain"
+    elif mode == "non_200":
+        status = 503
+
+    captured = {}
+    response = _GovernanceProbeResponse(
+        url=final_url,
+        body=body,
+        headers=headers,
+        status=status,
+        expected_limit=max_bytes + 1,
+    )
+
+    def build_opener(*handlers):
+        captured["handlers"] = handlers
+        return types.SimpleNamespace(
+            open=lambda request, *, timeout: (
+                captured.update(request=request, timeout=timeout) or response
+            )
+        )
+
+    monkeypatch.setattr(cli.urllib.request, "build_opener", build_opener)
+
+    assert (
+        cli._strict_local_governance_json_probe(
+            40000,
+            "/api/health",
+            timeout=0.25,
+            max_bytes=max_bytes,
+        )
+        is None
+    )
+    assert captured["request"].full_url == url
+    assert captured["timeout"] == 0.25
+    proxy = next(
+        handler
+        for handler in captured["handlers"]
+        if isinstance(handler, cli.urllib.request.ProxyHandler)
+    )
+    assert proxy.proxies == {}
+    assert any(
+        isinstance(handler, cli._GovernanceProbeNoRedirect)
+        for handler in captured["handlers"]
+    )
+
+
+def test_governance_probe_transport_accepts_only_exact_bounded_json(monkeypatch):
+    import agent.cli as cli
+
+    encoded = b'{"status":"ok"}'
+    url = "http://127.0.0.1:40000/api/health"
+
+    response = _GovernanceProbeResponse(
+        url=url,
+        body=encoded,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Length": str(len(encoded)),
+        },
+        expected_limit=cli._GOVERNANCE_PROBE_HEALTH_BYTES + 1,
+    )
+
+    monkeypatch.setattr(
+        cli.urllib.request,
+        "build_opener",
+        lambda *_handlers: types.SimpleNamespace(
+            open=lambda *_args, **_kwargs: response
+        ),
+    )
+
+    assert cli._probe_governance(40000) == {"status": "ok"}
+
+
 def test_observer_run_dry_run_emits_route_bound_invocation():
     runner = CliRunner()
 

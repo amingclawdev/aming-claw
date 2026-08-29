@@ -411,24 +411,22 @@ def _runtime_bind_host() -> str:
 
 def _stable_runtime_health() -> dict[str, Any]:
     try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{AC_STABLE_SERVICE_PORT}/api/health",
-            timeout=3,
-        ) as response:
-            health = json.load(response)
-    except Exception:
+        health = _dev_stable_proxy_json(
+            "/api/health",
+            max_bytes=_DEV_STABLE_PROXY_HEALTH_BYTES,
+        )
+    except GovernanceError:
         return {}
     return dict(health) if isinstance(health, Mapping) else {}
 
 
 def _stable_runtime_graph_status() -> dict[str, Any]:
     try:
-        with urllib.request.urlopen(
-            "http://127.0.0.1:40000/api/graph-governance/aming-claw/status",
-            timeout=3,
-        ) as response:
-            status = json.load(response)
-    except Exception:
+        status = _dev_stable_proxy_json(
+            "/api/graph-governance/aming-claw/status",
+            max_bytes=_DEV_STABLE_PROXY_RESPONSE_BYTES,
+        )
+    except GovernanceError:
         return {}
     return dict(status) if isinstance(status, Mapping) else {}
 
@@ -203421,6 +203419,83 @@ def _branch_service_stop_process(proc: subprocess.Popen) -> dict[str, Any]:
         }
 
 
+def _branch_service_exact_dev_health_matches(
+    health: Mapping[str, Any],
+    *,
+    process_pid: int,
+    runtime_commit: str,
+    worktree_root: str,
+    stable_anchor_commit: str,
+    stable_database_identity: Mapping[str, Any],
+) -> bool:
+    loaded_identity = health.get("loaded_runtime_identity")
+    plane_identity = health.get("runtime_plane_identity")
+    if not isinstance(loaded_identity, Mapping) or not isinstance(
+        plane_identity, Mapping
+    ):
+        return False
+    source_hash = str(loaded_identity.get("loaded_source_sha256") or "")
+    health_expected = {
+        "status": "ok",
+        "service": "governance",
+        "port": AC_DEV_SERVICE_PORT,
+        "pid": process_pid,
+        "runtime_plane": "dev",
+        "bind_host": AC_DEV_BIND_HOST,
+        "runtime_loaded_version": runtime_commit,
+        "runtime_loaded_source_sha256": source_hash,
+        "runtime_stale": False,
+        "runtime_stale_reasons": [],
+        "worktree_root": worktree_root,
+        "branch": AC_DEV_BRANCH,
+        "runtime_commit": runtime_commit,
+        "stable_anchor_commit": stable_anchor_commit,
+    }
+    loaded_expected = {
+        "schema_version": LOADED_RUNTIME_IDENTITY_SCHEMA,
+        "loaded_commit": runtime_commit,
+        "loaded_pid": process_pid,
+        "runtime_stale": False,
+        "runtime_stale_reasons": [],
+    }
+    plane_expected = {
+        "schema_version": "ac_runtime_plane_identity.v1",
+        "plane": "dev",
+        "port": AC_DEV_SERVICE_PORT,
+        "expected_port": AC_DEV_SERVICE_PORT,
+        "pid": process_pid,
+        "bind_host": AC_DEV_BIND_HOST,
+        "worktree_root": worktree_root,
+        "branch": AC_DEV_BRANCH,
+        "expected_branch": AC_DEV_BRANCH,
+        "commit": runtime_commit,
+        "worktree_dirty": False,
+        "worktree_dirty_files": [],
+        "stable_anchor_commit": stable_anchor_commit,
+        "stable_database_identity": dict(stable_database_identity),
+        "project_allowlist": ["aming-claw"],
+        "schema_policy": "verify_only_no_auto_migration",
+        "active_graph_activation_allowed": False,
+        "stable_deploy_allowed": False,
+        "background_workers_enabled": False,
+        "status": "ready",
+        "violations": [],
+    }
+    return bool(
+        process_pid > 0
+        and process_pid != SERVER_PID
+        and _dev_exact_scalar_fields(health, health_expected)
+        and _dev_exact_scalar_fields(loaded_identity, loaded_expected)
+        and _dev_exact_scalar_fields(plane_identity, plane_expected)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", source_hash)
+        and loaded_identity.get("worktree_source_sha256") == source_hash
+        and _git_object_identity_matches(
+            loaded_identity.get("worktree_head_version"), runtime_commit
+        )
+        and _ac_stable_database_identity_valid(stable_database_identity)
+    )
+
+
 @route("POST", "/api/branch-service/validate")
 def handle_branch_service_validate(ctx: RequestContext):
     """Start and probe the bounded AC dev plane from the local CLI only."""
@@ -203717,8 +203792,8 @@ def handle_branch_service_validate(ctx: RequestContext):
         }
     probe = _branch_service_poll_health(host, requested_port, timeout_sec=timeout_sec)
     health = probe.get("health") if isinstance(probe.get("health"), Mapping) else {}
-    actual_port = int(health.get("port") or 0) if health else 0
-    health_pid = int(health.get("pid") or 0) if health else 0
+    actual_port = health.get("port") if type(health.get("port")) is int else 0
+    health_pid = health.get("pid") if type(health.get("pid")) is int else 0
     plane_identity = (
         health.get("runtime_plane_identity")
         if isinstance(health.get("runtime_plane_identity"), Mapping)
@@ -203726,20 +203801,15 @@ def handle_branch_service_validate(ctx: RequestContext):
     )
     isolation_ok = bool(
         probe.get("ok")
-        and actual_port == requested_port
         and requested_port == AC_DEV_SERVICE_PORT
-        and health_pid
-        and health_pid != SERVER_PID
-        and str(health.get("runtime_plane") or "") == "dev"
-        and str(health.get("bind_host") or "") == AC_DEV_BIND_HOST
-        and str(plane_identity.get("bind_host") or "") == AC_DEV_BIND_HOST
-        and str(plane_identity.get("worktree_root") or "") == str(worktree)
-        and str(plane_identity.get("branch") or "") == AC_DEV_BRANCH
-        and str(plane_identity.get("commit") or "") == runtime_commit
-        and str(plane_identity.get("stable_anchor_commit") or "") == stable_anchor
-        and plane_identity.get("stable_database_identity")
-        == actual_database_identity
-        and str(plane_identity.get("status") or "") == "ready"
+        and _branch_service_exact_dev_health_matches(
+            health,
+            process_pid=proc.pid,
+            runtime_commit=runtime_commit,
+            worktree_root=str(worktree),
+            stable_anchor_commit=stable_anchor,
+            stable_database_identity=actual_database_identity,
+        )
     )
 
     stop_result: dict[str, Any] = {}
