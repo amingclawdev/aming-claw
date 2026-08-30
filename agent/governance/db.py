@@ -1176,6 +1176,8 @@ def _dev_storage_root(*, create: bool = False) -> Path:
         )
     supplied = Path(raw).expanduser().absolute()
     # Compare before any mkdir/open; a symlink/traversal is an invalid claim.
+    if supplied.is_symlink():
+        raise ValueError("AC dev storage root cannot be a symlink")
     if supplied != expected:
         raise ValueError("AC dev storage root must equal canonical resolver output")
     return _absolute_non_symlink_root(expected, create=create)

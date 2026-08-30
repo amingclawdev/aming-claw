@@ -17,6 +17,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from governance.db import SCHEMA_VERSION
 
 
+def _canonical_dev_world(tmp_path: Path) -> tuple[Path, Path]:
+    """Create the real persistent-temp stable/dev sibling layout used by AC."""
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    stable = Path(tmp_path).resolve() / "stable-shared-volume"
+    stable.mkdir(parents=True, exist_ok=True)
+    root = resolve_ac_dev_storage_root(stable)
+    os.environ["AMING_CLAW_SHARED_VOLUME"] = str(stable)
+    os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] = str(root)
+    return root, stable
+
+
 class TestDB(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -53,6 +64,7 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
         os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
         os.environ.pop("AMING_CLAW_RUNTIME_PLANE", None)
         os.environ.pop("AMING_CLAW_DEV_STORAGE_ROOT", None)
+        self.dev_storage_root, self.stable_shared_volume = _canonical_dev_world(Path(self.tmp.name))
 
     def tearDown(self):
         for key in (
@@ -61,6 +73,7 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
             "AMING_CLAW_DB_MIGRATION_POLICY",
             "AMING_CLAW_ALLOWED_PROJECT_IDS",
             "AMING_CLAW_DEV_STORAGE_ROOT",
+            "AMING_CLAW_SHARED_VOLUME",
         ):
             os.environ.pop(key, None)
         self.tmp.cleanup()
@@ -68,7 +81,7 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
     def _bootstrap_dev_db(self):
         from governance import db
 
-        storage_root = Path(self.tmp.name).resolve() / "dev-world"
+        storage_root = self.dev_storage_root
         receipt = db.bootstrap_dev_governance_store(
             storage_root,
             source_identity={
@@ -279,7 +292,7 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
     def test_dev_requires_existing_database_and_never_creates_it(self):
         from governance.db import get_connection
 
-        storage_root = Path(self.tmp.name).resolve() / "missing-dev-world"
+        storage_root = self.dev_storage_root
         root = storage_root / "governance" / "aming-claw"
         root.mkdir(parents=True)
         os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] = str(storage_root)
@@ -433,7 +446,7 @@ def test_ac_dev_world_bootstrap_is_source_only_and_physically_disjoint(tmp_path,
         "commit": "a" * 40,
         "source_sha256": "sha256:" + "b" * 64,
     }
-    storage_root = tmp_path / "dev-world"
+    storage_root, _ = _canonical_dev_world(tmp_path)
     receipt = db.bootstrap_dev_governance_store(
         storage_root,
         source_identity=source,
@@ -478,6 +491,7 @@ def test_ac_dev_world_bootstrap_is_source_only_and_physically_disjoint(tmp_path,
 def test_ac_dev_storage_rejects_alias_foreign_and_symlink_roots(tmp_path, monkeypatch):
     from agent.governance import db
 
+    _canonical_dev_world(tmp_path)
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "missing"))
     for project_id in ("aming_claw", "amingClaw", "other-project", "*", ""):
@@ -564,10 +578,10 @@ def test_v27_bootstrap_rejects_nonfresh_or_preloaded_world(
         "source_sha256": "sha256:" + "e" * 64,
     }
     process = {"pid": os.getpid(), "start_identity": "v27-bootstrap"}
-    storage_root = tmp_path / "dev-world"
+    storage_root, _ = _canonical_dev_world(tmp_path)
 
     if defect == "existing-empty-root":
-        storage_root.mkdir()
+        storage_root.mkdir(parents=True)
     else:
         first = db.bootstrap_dev_governance_store(
             storage_root,
@@ -707,7 +721,7 @@ def test_ac_dev_source_tip_cas_upgrade_is_descendant_and_genesis_immutable(tmp_p
     from agent.governance import db
 
     root, commit_a = _dev_source_repo(tmp_path)
-    storage_root = tmp_path / "dev-world"
+    storage_root, _ = _canonical_dev_world(tmp_path)
     source_a = {
         "root": str(root.resolve()),
         "branch": "codex/ac-dev",
@@ -779,7 +793,7 @@ def test_ac_dev_source_upgrade_rejects_non_descendant_root_branch_db_and_process
     from agent.governance import db
 
     root, commit_a = _dev_source_repo(tmp_path)
-    storage_root = tmp_path / "dev-world"
+    storage_root, _ = _canonical_dev_world(tmp_path)
     source_a = {
         "root": str(root.resolve()),
         "branch": "codex/ac-dev",
@@ -858,7 +872,7 @@ def test_ac_dev_cutover_preflight_activation_idempotency_and_rollback(tmp_path):
         "source_sha256": "sha256:" + "e" * 64,
     }
     process = {"pid": 404, "start_identity": "cutover-operator"}
-    storage_root = tmp_path / "dev-world"
+    storage_root, _ = _canonical_dev_world(tmp_path)
     dev = db.bootstrap_dev_governance_store(
         storage_root,
         source_identity=source,
@@ -951,7 +965,7 @@ def test_ac_dev_cutover_allows_live_legacy_growth_between_preflight_and_activati
         "source_sha256": "sha256:" + "e" * 64,
     }
     process = {"pid": 406, "start_identity": "cutover-live-growth"}
-    storage_root = tmp_path / "dev-world"
+    storage_root, _ = _canonical_dev_world(tmp_path)
     dev = db.bootstrap_dev_governance_store(
         storage_root,
         source_identity=source,
@@ -1023,7 +1037,7 @@ def test_ac_dev_cutover_rejects_legacy_path_identity_replacement(
         "source_sha256": "sha256:" + "e" * 64,
     }
     process = {"pid": 407, "start_identity": "cutover-path-identity"}
-    storage_root = tmp_path / "dev-world"
+    storage_root, _ = _canonical_dev_world(tmp_path)
     dev = db.bootstrap_dev_governance_store(
         storage_root,
         source_identity=source,
@@ -1081,7 +1095,7 @@ def test_ac_dev_cutover_failure_leaves_old_live_and_new_inactive(tmp_path):
         "source_sha256": "sha256:" + "f" * 64,
     }
     process = {"pid": 505, "start_identity": "cutover-operator"}
-    storage_root = tmp_path / "dev-world"
+    storage_root, _ = _canonical_dev_world(tmp_path)
     dev = db.bootstrap_dev_governance_store(storage_root, source_identity=source, process_identity=process)
     legacy = tmp_path / "legacy.db"
     with legacy.open("wb") as handle:
