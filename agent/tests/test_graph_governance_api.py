@@ -204180,6 +204180,70 @@ def test_stable_world_rejects_ac_canonical_and_aliases_before_effect(monkeypatch
     assert rejected.value.details["runtime_plane"] == "stable"
 
 
+@pytest.mark.parametrize("plane", ["stable", "generic"])
+@pytest.mark.parametrize("alias", ["aming-claw", "aming_claw", "amingClaw"])
+def test_v27_stable_and_generic_http_reject_ac_before_request_context(
+    monkeypatch, plane, alias
+):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: plane)
+    before = server.RequestContext
+    with pytest.raises(server.ValidationError) as rejected:
+        server._guard_runtime_world_request(
+            method="POST",
+            path=f"/api/backlog/{alias}/ROW",
+            path_params={"project_id": alias},
+            body={"project_id": alias},
+            query={},
+            token="",
+        )
+    assert server.RequestContext is before
+    assert rejected.value.details["project_domain_enforced_pre_database"] is True
+    assert rejected.value.details["writes_performed"] is False
+
+
+def test_v27_dev_projectless_mutation_is_zero_write_rejected(monkeypatch):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    with pytest.raises(server.ValidationError) as rejected:
+        server._guard_runtime_world_request(
+            method="POST",
+            path="/api/task/notify",
+            path_params={},
+            body={"task_id": "task-without-project"},
+            query={},
+            token="opaque-ref-is-not-a-project",
+        )
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["mutation_performed"] is False
+
+
+def test_v27_server_holds_writer_lease_before_validation_and_releases_on_error(
+    monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "dev-world"))
+    monkeypatch.setattr(
+        server,
+        "acquire_dev_runtime_writer_lease",
+        lambda root: calls.append(("acquire", root)),
+    )
+    monkeypatch.setattr(
+        server,
+        "release_dev_runtime_writer_lease",
+        lambda root: calls.append(("release", root)),
+    )
+
+    def reject_validation():
+        calls.append(("validate", ""))
+        raise RuntimeError("bounded startup rejection")
+
+    monkeypatch.setattr(server, "_validate_runtime_plane_startup", reject_validation)
+    with pytest.raises(RuntimeError, match="bounded startup rejection"):
+        server.main()
+
+    assert [event for event, _value in calls] == ["acquire", "validate", "release"]
+
+
 def test_dev_world_accepts_exact_ac_only_and_never_uses_stable_proxy(monkeypatch):
     monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
     monkeypatch.setattr(

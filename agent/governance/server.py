@@ -46,13 +46,14 @@ from .db import (
     canonical_ac_database_identity,
     DevRuntimeSchemaVerificationError,
     get_connection,
+    acquire_dev_runtime_writer_lease,
+    release_dev_runtime_writer_lease,
     DBContext,
     independent_connection,
     sqlite_write_lock,
     validate_project_id,
     validate_project_id_syntax,
     registered_public_safe_external_project,
-    validate_dev_world_cutover_activation,
     verify_existing_schema_capabilities,
     _dev_runtime_root,
 )
@@ -834,24 +835,6 @@ def _validate_runtime_plane_startup() -> dict[str, Any]:
     source_sha256 = str(loaded.get("loaded_source_sha256") or "").strip().lower()
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_sha256):
         raise GovernanceSingletonError("ac_dev_loaded_source_identity_invalid")
-    try:
-        cutover = validate_dev_world_cutover_activation(
-            storage_root=os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT", ""),
-            expected_dev_database_identity=database_identity,
-            source_identity={
-                "root": str(identity["worktree_root"]),
-                "branch": str(identity["branch"]),
-                "commit": str(identity["commit"]),
-                "source_sha256": source_sha256,
-            },
-        )
-    except Exception as exc:
-        raise GovernanceSingletonError("ac_dev_cutover_activation_invalid") from exc
-    expected_cutover = os.environ.get(
-        "AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH", ""
-    ).strip()
-    if expected_cutover and cutover.get("preflight_hash") != expected_cutover:
-        raise GovernanceSingletonError("ac_dev_cutover_activation_hash_mismatch")
     try:
         stable_ref = _branch_service_git_output(
             root,
@@ -3514,6 +3497,12 @@ def _guard_runtime_world_request(
             code="runtime_world_project_identity_ambiguous",
             path=path,
             detail="request contains conflicting project identities",
+        )
+    if method in {"POST", "DELETE"} and not normalized_claims:
+        raise _runtime_world_zero_write_rejection(
+            code="runtime_world_project_identity_missing",
+            path=path,
+            detail="mutation requires an explicit source-backed project identity",
         )
     if plane == "dev":
         for source, raw, canonical in normalized_claims:
@@ -221393,12 +221382,22 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stderr,
     )
-    _validate_runtime_plane_startup()
-    lease = _establish_governance_manager_generation()
+    dev_storage_root = ""
+    if _runtime_plane() == "dev":
+        dev_storage_root = os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT", "").strip()
+        if not dev_storage_root:
+            raise GovernanceSingletonError("ac_dev_storage_root_required")
+        acquire_dev_runtime_writer_lease(dev_storage_root)
     try:
-        _run_governance_service()
+        _validate_runtime_plane_startup()
+        lease = _establish_governance_manager_generation()
+        try:
+            _run_governance_service()
+        finally:
+            _release_governance_manager_generation(lease)
     finally:
-        _release_governance_manager_generation(lease)
+        if dev_storage_root:
+            release_dev_runtime_writer_lease(dev_storage_root)
 
 
 if __name__ == "__main__":

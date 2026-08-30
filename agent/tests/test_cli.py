@@ -3500,10 +3500,9 @@ class TestACDevRuntimeCli:
         monkeypatch.setattr(
             cli,
             "_require_dev_cutover_activation",
-            lambda *_args, **_kwargs: {
-                "preflight_hash": "sha256:" + "d" * 64,
-                "active": True,
-            },
+            lambda *_args, **_kwargs: pytest.fail(
+                "operator marker must not authorize dev startup"
+            ),
         )
         monkeypatch.setattr(
             cli.subprocess,
@@ -3539,9 +3538,7 @@ class TestACDevRuntimeCli:
         assert os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] == str(
             dev_storage_root.resolve()
         )
-        assert os.environ["AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH"] == (
-            "sha256:" + "d" * 64
-        )
+        assert "AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH" not in os.environ
         assert "SHARED_VOLUME_PATH" not in os.environ
         for key in (
             "AMING_CLAW_RUNTIME_PLANE",
@@ -3844,3 +3841,16 @@ def test_branch_service_orphan_handoff_cli_never_authorizes_kill_at_inspection(
     )
     assert result.exit_code != 0
     assert "Shared-database orphan handoff is retired" in result.output
+
+
+def test_v27_dev_startup_does_not_use_cutover_marker_as_authority():
+    import inspect
+
+    import agent.cli as cli
+    from agent.governance import server
+
+    start_source = inspect.getsource(cli.start.callback)
+    startup_source = inspect.getsource(server._validate_runtime_plane_startup)
+    assert "_require_dev_cutover_activation(" not in start_source
+    assert "validate_dev_world_cutover_activation(" not in startup_source
+    assert "AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH" not in start_source

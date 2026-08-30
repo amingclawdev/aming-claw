@@ -501,6 +501,116 @@ def test_ac_dev_storage_rejects_alias_foreign_and_symlink_roots(tmp_path, monkey
         )
 
 
+@pytest.mark.parametrize("plane", ["stable", "generic"])
+@pytest.mark.parametrize("project_id", ["aming-claw", "aming_claw", "amingClaw"])
+def test_v27_central_resolver_rejects_ac_before_mkdir(
+    tmp_path, monkeypatch, plane, project_id
+):
+    from agent.governance import db
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", plane)
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(shared))
+    forbidden = shared / "codex-tasks" / "state" / "governance"
+
+    with pytest.raises(ValueError, match="stable|generic|AC project"):
+        db._project_db_path(project_id)
+    assert not forbidden.exists()
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["existing-empty-root", "unknown-table", "wal", "shared-root", "hardlink-copy"],
+)
+def test_v27_bootstrap_rejects_nonfresh_or_preloaded_world(
+    tmp_path, monkeypatch, defect
+):
+    from agent.governance import db
+
+    source_root, commit = _dev_source_repo(tmp_path)
+    source = {
+        "root": str(source_root.resolve()),
+        "branch": "codex/ac-dev",
+        "commit": commit,
+        "source_sha256": "sha256:" + "e" * 64,
+    }
+    process = {"pid": os.getpid(), "start_identity": "v27-bootstrap"}
+    storage_root = tmp_path / "dev-world"
+
+    if defect == "existing-empty-root":
+        storage_root.mkdir()
+    else:
+        first = db.bootstrap_dev_governance_store(
+            storage_root,
+            source_identity=source,
+            process_identity=process,
+        )
+        database = Path(first["database_path"])
+        if defect == "unknown-table":
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE injected_state (value TEXT)")
+                connection.execute("INSERT INTO injected_state VALUES ('copied')")
+                connection.commit()
+        elif defect == "wal":
+            Path(str(database) + "-wal").write_bytes(b"reused")
+        elif defect == "shared-root":
+            monkeypatch.setenv("SHARED_VOLUME_PATH", str(storage_root))
+        else:
+            copied_root = tmp_path / "dev-world-copy"
+            copied_database = copied_root / db.AC_DATABASE_DEV_RELATIVE_PATH
+            copied_database.parent.mkdir(parents=True)
+            os.link(database, copied_database)
+            storage_root = copied_root
+
+    with pytest.raises(
+        (RuntimeError, ValueError), match="fresh|unknown|WAL|shared|storage"
+    ):
+        db.bootstrap_dev_governance_store(
+            storage_root,
+            source_identity=source,
+            process_identity=process,
+        )
+
+
+def test_v27_writer_lease_blocks_second_process_before_database_open(tmp_path):
+    from agent.governance import db
+
+    source_root, commit = _dev_source_repo(tmp_path)
+    source = {
+        "root": str(source_root.resolve()),
+        "branch": "codex/ac-dev",
+        "commit": commit,
+        "source_sha256": "sha256:" + "f" * 64,
+    }
+    storage_root = tmp_path / "dev-world"
+    first = db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity=source,
+        process_identity={"pid": os.getpid(), "start_identity": "v27-owner"},
+    )
+    database = Path(first["database_path"])
+    before = (database.stat().st_dev, database.stat().st_ino, database.stat().st_mtime_ns)
+    code = (
+        "import os,sys; "
+        "os.environ['AMING_CLAW_RUNTIME_PLANE']='dev'; "
+        "os.environ['AMING_CLAW_DEV_STORAGE_ROOT']=sys.argv[1]; "
+        "from agent.governance import server; server.main()"
+    )
+    contender = subprocess.run(
+        [sys.executable, "-c", code, str(storage_root)],
+        cwd=Path(db.__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert contender.returncode != 0
+    assert "writer" in (contender.stderr + contender.stdout).lower()
+    assert (database.stat().st_dev, database.stat().st_ino, database.stat().st_mtime_ns) == before
+
+
 def _dev_source_repo(tmp_path: Path) -> tuple[Path, str]:
     root = tmp_path / "source"
     root.mkdir()

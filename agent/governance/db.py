@@ -46,7 +46,7 @@ AC_LEGACY_ARCHIVE_SIZE_BYTES = 178_625_794_048
 AC_DEV_CUTOVER_SCHEMA = "ac_dev_world_cutover.v1"
 
 _SQLITE_WRITE_LOCK = threading.RLock()
-_DEV_DATABASE_WRITER_LEASES: dict[str, object] = {}
+_DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
 _DEV_DATABASE_WRITER_LEASES_LOCK = threading.RLock()
 
 _DEV_DENIED_SCHEMA_ACTIONS = frozenset(
@@ -1284,6 +1284,159 @@ def _exclusive_writer_file_lease(database: Path):
     return handle
 
 
+def _writer_process_start_identity() -> str:
+    """Derive the current writer's OS start identity without caller input."""
+
+    result = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(os.getpid())],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    started = result.stdout if result.returncode == 0 else ""
+    if not started.strip():
+        raise RuntimeError("AC dev writer process start identity is unavailable")
+    return "sha256:" + hashlib.sha256(
+        f"{os.getpid()}\0".encode("utf-8") + started.encode("utf-8")
+    ).hexdigest()
+
+
+def acquire_dev_runtime_writer_lease(storage_root: Path | str) -> dict[str, object]:
+    """Hold the dedicated dev database's OS writer fence for this process."""
+
+    root = _absolute_non_symlink_root(Path(storage_root), create=False)
+    root_metadata = root.stat(follow_symlinks=False)
+    database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+    if database.parent.is_symlink() or database.parent.resolve(strict=True) != database.parent:
+        raise ValueError("AC dev governance directory identity mismatch")
+    key = str(database)
+    owner_start = _writer_process_start_identity()
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        existing = _DEV_DATABASE_WRITER_LEASES.get(key)
+        if existing:
+            if (
+                int(existing.get("owner_pid") or 0) != os.getpid()
+                or existing.get("owner_start_identity") != owner_start
+                or existing.get("storage_device") != int(root_metadata.st_dev)
+                or existing.get("storage_inode") != int(root_metadata.st_ino)
+                or getattr(existing.get("handle"), "closed", True)
+            ):
+                raise RuntimeError("AC dev governance writer lease owner mismatch")
+            return {name: value for name, value in existing.items() if name != "handle"}
+        handle = _exclusive_writer_file_lease(database)
+        receipt: dict[str, object] = {
+            "schema_version": "ac_dev_runtime_writer_lease.v1",
+            "world_id": AC_DEV_WORLD_ID,
+            "project_id": AC_PROJECT_ID,
+            "runtime_plane": DEV_RUNTIME_PLANE,
+            "storage_root": str(root),
+            "storage_device": int(root_metadata.st_dev),
+            "storage_inode": int(root_metadata.st_ino),
+            "database_path": key,
+            "lease_path": str(Path(str(database) + ".writer.lock")),
+            "owner_pid": os.getpid(),
+            "owner_start_identity": owner_start,
+            "handle": handle,
+        }
+        _DEV_DATABASE_WRITER_LEASES[key] = receipt
+        return {name: value for name, value in receipt.items() if name != "handle"}
+
+
+def release_dev_runtime_writer_lease(storage_root: Path | str) -> None:
+    """Release this process's dedicated dev writer fence during shutdown."""
+
+    root = Path(storage_root).expanduser().absolute()
+    key = str((root / AC_DATABASE_DEV_RELATIVE_PATH).absolute())
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        receipt = _DEV_DATABASE_WRITER_LEASES.pop(key, None)
+        if not receipt:
+            return
+        handle = receipt.get("handle")
+        if handle is not None and not getattr(handle, "closed", True):
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+
+def _bind_dev_writer_lease_database_identity(database: Path) -> None:
+    metadata = database.stat(follow_symlinks=False)
+    if database.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("AC dev governance database is not a canonical regular file")
+    key = str(database.absolute())
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        receipt = _DEV_DATABASE_WRITER_LEASES.get(key)
+        if not receipt:
+            raise RuntimeError("AC dev governance writer lease is not held")
+        expected = (receipt.get("database_device"), receipt.get("database_inode"))
+        actual = (int(metadata.st_dev), int(metadata.st_ino))
+        if expected != (None, None) and expected != actual:
+            raise ValueError("AC dev governance database changed under writer lease")
+        receipt["database_device"], receipt["database_inode"] = actual
+
+
+def _source_schema_table_contract() -> tuple[set[str], set[str], set[tuple[str, str, str]]]:
+    """Return required tables and the exact baseline sqlite_master inventory."""
+
+    with closing(sqlite3.connect(":memory:")) as memory:
+        memory.row_factory = sqlite3.Row
+        _configure_connection(memory, busy_timeout=10000)
+        _ensure_schema(memory)
+        required = {
+            str(row[0])
+            for row in memory.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        objects = {
+            (str(row[0]), str(row[1]), str(row[2]))
+            for row in memory.execute(
+                "SELECT type, name, tbl_name FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'trigger', 'view')"
+            )
+        }
+    return required, required | set(_DEV_SCHEMA_PRIMARY_KEYS), objects
+
+
+def _source_schema_inventory_hash(conn: sqlite3.Connection, required: set[str]) -> str:
+    placeholders = ",".join("?" for _ in required)
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master "
+        f"WHERE tbl_name IN ({placeholders}) ORDER BY type, name, tbl_name",
+        tuple(sorted(required)),
+    ).fetchall()
+    return "sha256:" + hashlib.sha256(
+        json.dumps([tuple(row) for row in rows], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
+    required, allowed, source_objects = _source_schema_table_contract()
+    actual = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    unknown = sorted(actual - allowed)
+    missing = sorted(required - actual)
+    actual_objects = {
+        (str(row[0]), str(row[1]), str(row[2]))
+        for row in conn.execute(
+            "SELECT type, name, tbl_name FROM sqlite_master "
+            "WHERE type IN ('table', 'index', 'trigger', 'view')"
+        )
+    }
+    optional = allowed - required
+    unknown_objects = sorted(
+        item
+        for item in actual_objects - source_objects
+        if not (item[0] in {"table", "index"} and item[2] in optional)
+    )
+    if unknown or missing or unknown_objects:
+        raise ValueError(
+            "AC dev source schema inventory mismatch: "
+            f"unknown={unknown}, missing={missing}, unknown_objects={unknown_objects}"
+        )
+
+
 def bootstrap_dev_governance_store(
     storage_root: Path | str,
     *,
@@ -1304,6 +1457,12 @@ def bootstrap_dev_governance_store(
     root_input = Path(storage_root).expanduser().absolute()
     if root_input.is_symlink():
         raise ValueError("AC dev storage root cannot be a symlink")
+    root_existed = root_input.exists()
+    shared_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
+    if shared_raw:
+        shared = Path(shared_raw).expanduser().absolute()
+        if root_input == shared or root_input in shared.parents or shared in root_input.parents:
+            raise ValueError("AC dev storage root must be disjoint from shared storage")
     root = _absolute_non_symlink_root(root_input, create=not root_input.exists())
     source = {
         "root": str(source_identity.get("root") or "").strip(),
@@ -1327,9 +1486,20 @@ def bootstrap_dev_governance_store(
     ):
         raise ValueError("AC dev source/process bootstrap identity is incomplete")
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    if root_existed and not database.exists():
+        raise ValueError("AC dev fresh bootstrap requires an absent dedicated root")
     database.parent.mkdir(parents=True, exist_ok=True)
     if database.parent.is_symlink() or database.parent.resolve(strict=True) != database.parent:
         raise ValueError("AC dev governance directory cannot be a symlink")
+    companions = [
+        candidate
+        for suffix in ("-wal", "-shm", "-journal")
+        if (candidate := Path(str(database) + suffix)).exists()
+    ]
+    if companions:
+        raise ValueError("AC dev bootstrap rejects reused WAL/SHM/journal state")
+    lease_created = str(database.absolute()) not in _DEV_DATABASE_WRITER_LEASES
+    acquire_dev_runtime_writer_lease(root)
     genesis = {
         "schema_version": AC_WORLD_GENESIS_SCHEMA,
         "world_id": AC_DEV_WORLD_ID,
@@ -1348,12 +1518,40 @@ def bootstrap_dev_governance_store(
     created = not database.exists()
     if database.is_symlink():
         raise ValueError("AC dev governance database cannot be a symlink")
-    conn = sqlite3.connect(str(database), timeout=30)
+    conn: sqlite3.Connection | None = None
     try:
+        conn = sqlite3.connect(str(database), timeout=30)
         conn.row_factory = sqlite3.Row
         if created:
             _configure_connection(conn, busy_timeout=10000)
             _ensure_schema(conn)
+            _verify_dev_world_schema_inventory(conn)
+            required_tables, _allowed_tables, _source_objects = _source_schema_table_contract()
+            for table in sorted(
+                name
+                for name in required_tables
+                if name not in {"schema_meta", "sqlite_sequence"}
+                and not name.startswith("memories_fts")
+            ):
+                if int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]):
+                    raise ValueError("AC dev fresh bootstrap found preloaded business rows")
+            physical = database.stat(follow_symlinks=False)
+            root_physical = root.stat(follow_symlinks=False)
+            genesis["storage_root_identity"] = {
+                "path": str(root),
+                "device": int(root_physical.st_dev),
+                "inode": int(root_physical.st_ino),
+            }
+            genesis["database_identity"] = {
+                "device": int(physical.st_dev),
+                "inode": int(physical.st_ino),
+                "relative_path_sha256": "sha256:"
+                + hashlib.sha256(AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")).hexdigest(),
+            }
+            genesis["source_schema_sha256"] = _source_schema_inventory_hash(
+                conn, required_tables
+            )
+            genesis_sha256 = _world_genesis_hash(genesis)
             conn.executemany(
                 "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
                 (
@@ -1378,6 +1576,7 @@ def bootstrap_dev_governance_store(
             conn.commit()
         else:
             _verify_existing_schema(conn)
+            _verify_dev_world_schema_inventory(conn)
             meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
             try:
                 stored_genesis = json.loads(
@@ -1397,6 +1596,23 @@ def bootstrap_dev_governance_store(
                 and stored_hash == _world_genesis_hash(stored_genesis)
             ):
                 raise ValueError("existing AC dev world genesis is invalid")
+            stored_database = dict(stored_genesis.get("database_identity") or {})
+            stored_root = dict(stored_genesis.get("storage_root_identity") or {})
+            current_root = root.stat(follow_symlinks=False)
+            current_database = database.stat(follow_symlinks=False)
+            if (
+                stored_database.get("device") != int(current_database.st_dev)
+                or stored_database.get("inode") != int(current_database.st_ino)
+                or stored_root.get("path") != str(root)
+                or stored_root.get("device") != int(current_root.st_dev)
+                or stored_root.get("inode") != int(current_root.st_ino)
+            ):
+                raise ValueError("existing AC dev world storage/database identity changed")
+            required_tables, _allowed_tables, _source_objects = _source_schema_table_contract()
+            if stored_genesis.get("source_schema_sha256") != _source_schema_inventory_hash(
+                conn, required_tables
+            ):
+                raise ValueError("existing AC dev source schema contract changed")
             genesis = dict(stored_genesis)
             genesis_sha256 = stored_hash
             try:
@@ -1459,7 +1675,6 @@ def bootstrap_dev_governance_store(
                 ):
                     raise ValueError("AC dev source upgrade process identity mismatch")
                 _verify_dev_source_upgrade(source_tip_identity, source)
-                lease = _exclusive_writer_file_lease(database)
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     locked_meta = dict(
@@ -1505,16 +1720,14 @@ def bootstrap_dev_governance_store(
                 except Exception:
                     conn.rollback()
                     raise
-                finally:
-                    fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
-                    lease.close()
                 source_tip_identity = dict(source)
                 source_tip_sha256 = _world_source_tip_hash(source_tip_identity)
                 source_tip_revision += 1
                 current_process_identity = dict(process)
                 source_upgraded = True
     except Exception:
-        conn.close()
+        if conn is not None:
+            conn.close()
         if created:
             for suffix in ("", "-wal", "-shm", "-journal"):
                 candidate = Path(str(database) + suffix)
@@ -1522,12 +1735,16 @@ def bootstrap_dev_governance_store(
                     candidate.unlink()
                 except FileNotFoundError:
                     pass
+        if lease_created:
+            release_dev_runtime_writer_lease(root)
         raise
     finally:
         try:
-            conn.close()
+            if conn is not None:
+                conn.close()
         except Exception:
             pass
+    _bind_dev_writer_lease_database_identity(database)
     metadata = database.stat(follow_symlinks=False)
     identity = {
         "schema_version": "ac_governance_database_identity.v2",
@@ -1847,10 +2064,19 @@ def _inspect_dev_world_cutover(
     ):
         raise ValueError("AC dev cutover requires port 40008 inactive")
 
+    lease = None
     with _DEV_DATABASE_WRITER_LEASES_LOCK:
-        if str(new_database.resolve(strict=True)) in _DEV_DATABASE_WRITER_LEASES:
-            raise RuntimeError("AC dev cutover found an in-process database writer")
-    lease = _exclusive_writer_file_lease(new_database)
+        writer = _DEV_DATABASE_WRITER_LEASES.get(str(new_database.resolve(strict=True)))
+        if writer:
+            if (
+                int(writer.get("owner_pid") or 0) != os.getpid()
+                or writer.get("owner_start_identity") != _writer_process_start_identity()
+                or (writer.get("database_device"), writer.get("database_inode"))
+                != (int(new_stat["device"]), int(new_stat["inode"]))
+            ):
+                raise RuntimeError("AC dev cutover found a foreign in-process writer")
+        else:
+            lease = _exclusive_writer_file_lease(new_database)
     try:
         return {
             "schema_version": AC_DEV_CUTOVER_SCHEMA,
@@ -1867,8 +2093,9 @@ def _inspect_dev_world_cutover(
             "facts_copied": 0,
         }
     finally:
-        fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
-        lease.close()
+        if lease is not None:
+            fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+            lease.close()
 
 
 def preflight_dev_world_cutover(
@@ -2147,10 +2374,10 @@ def assert_runtime_world_project_identity(
             raise ValueError(
                 "AC dev world accepts exact project_id=" + AC_PROJECT_ID
             )
-    elif plane == "stable" and canonical == AC_PROJECT_ID:
-        raise ValueError("stable world cannot persist AC project state")
+    elif plane in {"stable", "generic"} and canonical == AC_PROJECT_ID:
+        raise ValueError(f"{plane} world cannot persist AC project state")
 
-    if plane in {DEV_RUNTIME_PLANE, "stable"}:
+    if plane in {DEV_RUNTIME_PLANE, "stable", "generic"}:
         for label, value in dict(referenced_project_ids or {}).items():
             if value in (None, ""):
                 continue
@@ -2179,6 +2406,9 @@ def validate_project_id(project_id: str) -> str:
             "AC dev runtime project allowlist requires exact project_id="
             + AC_PROJECT_ID
         )
+    plane = os.environ.get(RUNTIME_PLANE_ENV, "").strip().lower()
+    if plane in {"stable", "generic"} and normalized == AC_PROJECT_ID:
+        raise ValueError(f"{plane} runtime rejects the AC project domain")
     return normalized
 
 
@@ -2408,17 +2638,16 @@ def _connect_existing(db_path: Path, *, timeout: float) -> sqlite3.Connection:
         raise ValueError("AC dev runtime governance database escaped its canonical path")
     with _DEV_DATABASE_WRITER_LEASES_LOCK:
         lease_key = str(resolved)
-        if lease_key not in _DEV_DATABASE_WRITER_LEASES:
-            lease_path = Path(str(absolute) + ".writer.lock")
-            lease_handle = open(lease_path, "a+", encoding="utf-8")
-            try:
-                fcntl.flock(lease_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except (BlockingIOError, OSError) as exc:
-                lease_handle.close()
-                raise RuntimeError(
-                    "AC dev governance database already has a different writer"
-                ) from exc
-            _DEV_DATABASE_WRITER_LEASES[lease_key] = lease_handle
+        receipt = _DEV_DATABASE_WRITER_LEASES.get(lease_key)
+        if not receipt or getattr(receipt.get("handle"), "closed", True):
+            raise RuntimeError("AC dev governance database writer lease is not held")
+        if (
+            int(receipt.get("owner_pid") or 0) != os.getpid()
+            or receipt.get("owner_start_identity") != _writer_process_start_identity()
+            or (receipt.get("database_device"), receipt.get("database_inode"))
+            != (int(before.st_dev), int(before.st_ino))
+        ):
+            raise RuntimeError("AC dev governance database writer lease binding mismatch")
     uri = absolute.as_uri() + "?mode=rw"
     conn = sqlite3.connect(uri, timeout=timeout, uri=True)
     database_file = str(conn.execute("PRAGMA database_list").fetchone()[2] or "")

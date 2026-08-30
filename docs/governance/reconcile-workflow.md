@@ -29,18 +29,17 @@ namespaces in one database:
   continues to serve non-AC projects.
 - Dev port `40008` accepts only the exact canonical `aming-claw` spelling. It
   uses a dedicated, non-symlink storage root and a fresh source-created genesis.
+  First creation requires an absent root; restart verifies the complete
+  source-declared SQLite table inventory, physical database identity and
+  genesis instead of importing or migrating another world. Unknown tables,
+  preloaded state, SQLite companions and shared-root overlap fail closed.
   Its database, WAL/SHM, graph, sessions, routes, CEX, ContractRuntime Facts,
   timeline, backlog and queues are physically disjoint from stable storage.
-- The legacy AC database is a live stable transition store until stable has a
-  typed, zero-write AC rejection and all AC clients have drained or rerouted.
-  Its historically observed `178625794048`-byte size is audit context, not an
-  immutable cutover identity. Preflight binds its canonical path, device and
-  inode while treating size, mtime/ctime and a same-file content digest as
-  volatile observations. Legitimate stable writes between preflight and
-  activation therefore do not change activation authority. Each observation
-  still uses one `O_NOFOLLOW` regular-file descriptor and rejects path/inode or
-  within-observation TOCTOU changes. Only after client drain may the stable
-  store be archived. No governance row or Fact is copied into dev.
+- The legacy AC database remains stable-owned transition data. Historical
+  size, content observations, process census, health output, watermarks and
+  operator checkpoint/marker files are audit receipts only; none authorizes a
+  dev startup or a ContractRuntime action. No governance row or Fact is copied
+  into dev.
 - ContractRuntime source definitions and state semantics are identical in both
   worlds. Dev has no alternate grant cache, authority state machine, PASS
   synthesis, cross-world receipt or compatibility proxy.
@@ -51,16 +50,19 @@ namespaces in one database:
 
 Bootstrap is restart-safe: reopening the same dev storage must reproduce the
 same source-bound genesis and database device/inode while recording the current
-process separately. Before activation, the operator verifies exact source
-commit/tree, storage path/device/inode, listener/PID, WAL/SHM ownership, and a
-single writer per physical database. Any mismatch stops before cutover; rollback
-means stopping the unactivated dev process and retaining/removing only its
-disposable dedicated root. It never modifies stable storage.
+source tip separately. Before opening or initializing the database, the dev
+server acquires one OS writer lease bound to world, canonical project, storage
+root, database path/device/inode and OS process birth. It holds that lease for
+the process lifetime; a second server fails before database open. Startup
+authority is the source boundary, physical genesis and live writer lease—not a
+cutover checkpoint. Rollback means stopping the unactivated dev process and
+retaining/removing only its disposable dedicated root. It never modifies stable
+storage.
 
-Live cutover remains blocked until stable's project boundary demonstrates a
-typed, pre-effect, zero-write rejection for canonical AC and its aliases, and
-AC clients have drained or rerouted to dev. The source-only preflight and
-activation helpers do not waive or reorder those prerequisites.
+Operator preflight, activation-marker and rollback helpers are non-authorizing
+choreography diagnostics. They cannot make the server start, waive stable's
+typed pre-effect AC rejection, or reorder client drain/reroute. Source promotion
+transports Git bytes only and never transports runtime state.
 
 Because evidence cannot cross worlds, a pre-cutover AC row cannot be closed by
 fresh dev Facts. It remains honestly OPEN/WAIVED and a fresh dev-world successor

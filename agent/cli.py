@@ -1188,7 +1188,6 @@ def start(
     _require_source_checkout_matches_loaded_package(workspace)
     health = None
     database_binding = None
-    cutover_activation = None
     dev_identity = None
     if runtime_plane == "dev":
         if port != AC_DEV_SERVICE_PORT:
@@ -1233,11 +1232,6 @@ def start(
                 raise click.ClickException(
                     "Port 40008 is occupied by governance with a mismatched AC dev runtime identity."
                 )
-            cutover_activation = _require_dev_cutover_activation(
-                str(selected_dev_storage),
-                source_identity=dev_identity,
-                database_identity=reported_database_identity,
-            )
             dashboard = _dashboard_url(f"http://localhost:{port}")
             version = health.get("version") or health.get("runtime_version") or "unknown"
             click.echo(f"Governance already running on port {port} (version {version}).")
@@ -1254,11 +1248,6 @@ def start(
             source_identity=dev_identity,
         )
         dev_storage_root = str(database_binding["dev_storage_root"])
-        cutover_activation = _require_dev_cutover_activation(
-            dev_storage_root,
-            source_identity=dev_identity,
-            database_identity=database_binding["dev_database_identity"],
-        )
         stable_identity = None
     elif runtime_plane == "stable":
         stable_identity = _stable_start_identity_precheck(
@@ -1325,9 +1314,6 @@ def start(
         os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] = "dev-world-only"
         os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] = "deny"
         os.environ[AC_DEV_STORAGE_ROOT_ENV] = str(dev_storage)
-        os.environ["AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH"] = str(
-            (cutover_activation or {}).get("preflight_hash") or ""
-        )
         os.environ.pop("SHARED_VOLUME_PATH", None)
     elif runtime_plane == "stable":
         runtime_root = Path(workspace).resolve() if workspace else _default_runtime_workspace()
@@ -1341,7 +1327,7 @@ def start(
             os.environ.setdefault("SHARED_VOLUME_PATH", str(runtime_root / "shared-volume"))
     else:
         runtime_root = Path(workspace).resolve() if workspace else _default_runtime_workspace()
-        os.environ.pop("AMING_CLAW_RUNTIME_PLANE", None)
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "generic"
         os.environ.pop("AMING_CLAW_STABLE_ANCHOR_COMMIT", None)
         if shared_volume_path:
             os.environ["SHARED_VOLUME_PATH"] = str(
