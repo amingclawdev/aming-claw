@@ -784,6 +784,16 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _bound_identity(self) -> dict:
+        identity = getattr(self.server, "manager_identity", None)
+        if not isinstance(identity, dict):
+            raise RuntimeError("manager sidecar has no immutable launch identity")
+        active = urlparse(_governance_url())
+        bound = urlparse(identity["governance_url"])
+        if active.port != bound.port or active.hostname not in {"127.0.0.1", "localhost"}:
+            raise RuntimeError("manager sidecar governance environment crossed its launch plane")
+        return identity
+
     def do_POST(self):
         """Route POST requests."""
         path = urlparse(self.path).path.rstrip("/")
@@ -899,7 +909,13 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         """POST /api/manager/respawn-executor — write manager_signal.json."""
         body = self._read_json_body()
         try:
-            state_dir = _project_root() / "shared-volume" / "codex-tasks" / "state"
+            identity = self._bound_identity()
+            root = Path(identity["storage_root"])
+            state_dir = (
+                root / "runtime"
+                if identity["plane"] == "dev"
+                else root / "codex-tasks" / "state"
+            )
             state_dir.mkdir(parents=True, exist_ok=True)
             sig = {
                 "action": "restart",
@@ -926,6 +942,12 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         Response (JSON):
           {"ok": true/false, "detail": "...", "pid": <int or null>}
         """
+        try:
+            self._bound_identity()
+        except RuntimeError as exc:
+            self._send_json({"ok": False, "detail": str(exc), "error_code": "CROSS_PLANE_MANAGER"}, 409)
+            return
+
         # Mutual-exclusion guard — refuse to redeploy service_manager
         if target in _FORBIDDEN_TARGETS:
             self._send_json(
@@ -1181,7 +1203,9 @@ def create_server(
 ) -> ThreadingHTTPServer:
     """Create a sidecar bound to one project-plane custody identity."""
     if not storage_root:
-        storage_root = os.getenv("SHARED_VOLUME_PATH", str(_project_root() / "shared-volume"))
+        # Test/helper construction is stable by default. Production launchers
+        # must pass their explicit storage root through run_server().
+        storage_root = str(_project_root() / "shared-volume")
     identity = plane_bound_manager_identity(project_id, governance_url, storage_root)
     if int(port) not in {0, int(identity["sidecar_port"])}:
         raise ValueError("manager sidecar port does not match its project-plane identity")
