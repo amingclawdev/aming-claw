@@ -103,6 +103,8 @@ def test_actual_stdio_mcp_constructor_is_exactly_world_bound(monkeypatch, tmp_pa
         max_workers=0,
     )
     assert instance.gov_url == "http://127.0.0.1:40008"
+
+
     assert instance.dispatcher._api.__self__ is instance
     assert instance._http(
         "POST",
@@ -155,3 +157,17 @@ def test_actual_stdio_mcp_constructor_is_exactly_world_bound(monkeypatch, tmp_pa
         },
     ) == {"ok": True}
     assert calls[0][1].startswith("http://127.0.0.1:40000/")
+
+
+@pytest.mark.parametrize("project_id", ["", " aming-claw", "aming-claw ", "amingClaw", "aming_claw"])
+def test_mcp_plane_identity_rejects_raw_noncanonical_project_ids(project_id):
+    with pytest.raises(ValueError):
+        stdio_mcp_server._canonical_governance_url(project_id, "")
+    with pytest.raises(ValueError):
+        stdio_mcp_server.AmingClawMCP(
+            project_id=project_id,
+            governance_url="",
+            workspace="/must-not-be-created",
+            redis_url="redis://127.0.0.1:40079/0",
+            max_workers=0,
+        )

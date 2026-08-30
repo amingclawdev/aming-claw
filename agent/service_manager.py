@@ -97,12 +97,11 @@ def _default_project_id() -> str:
     return os.getenv("EXECUTOR_PROJECT_ID", os.getenv("PROJECT_ID", "aming-claw"))
 
 
-def _world_bound_governance_url(project_id: str, requested_url: str = "", *, allow_test_url: bool = False) -> str:
+def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str:
     """Bind one manager/executor generation to exactly one governance world."""
 
     plane = resolve_runtime_plane(project_id)
-    equivalent = requested_url.rstrip("/").replace("localhost", "127.0.0.1") == plane.governance_url
-    if requested_url and not equivalent and not allow_test_url:
+    if requested_url and requested_url != plane.governance_url:
         raise ValueError("ServiceManager governance URL crosses the project runtime plane")
     return plane.governance_url
 
@@ -120,7 +119,7 @@ def _plane_bound_manager_identity(
     A manager is never a host-global service: the project, governance listener,
     storage root, and sidecar port form one custody boundary.
     """
-    project = str(project_id or "").strip()
+    project = project_id
     url = _world_bound_governance_url(project, governance_url)
     if project == "aming-claw":
         raw_root = str(storage_root or os.getenv("AMING_CLAW_DEV_STORAGE_ROOT", "")).strip()
@@ -157,19 +156,21 @@ def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) 
     ]
 
 
-def _shared_log_dir(project_id: str = "") -> Path:
-    selected_project = str(project_id or _default_project_id()).strip()
-    if selected_project == "aming-claw":
+def _shared_log_dir(project_id: Optional[str] = None) -> Path:
+    selected_project = _default_project_id() if project_id is None else project_id
+    plane = resolve_runtime_plane(selected_project)
+    if plane.name == "dev":
         from agent.governance.db import _dev_runtime_root
 
         return _dev_runtime_root(create=True) / "logs"
     return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "logs"
 
 
-def _signal_file_path(project_id: str = "") -> Path:
+def _signal_file_path(project_id: Optional[str] = None) -> Path:
     """Path to the manager restart signal file (manager_signal.json)."""
-    selected_project = str(project_id or _default_project_id()).strip()
-    if selected_project == "aming-claw":
+    selected_project = _default_project_id() if project_id is None else project_id
+    plane = resolve_runtime_plane(selected_project)
+    if plane.name == "dev":
         from agent.governance.db import _dev_runtime_root
 
         return _dev_runtime_root(create=True) / "manager_signal.json"
@@ -203,13 +204,12 @@ class ServiceManager:
         poll_interval: float = _POLL_INTERVAL,
         workspace: Optional[str] = None,
     ) -> None:
-        self.project_id = project_id or _default_project_id()
+        self.project_id = project_id if project_id is not None else _default_project_id()
         self.governance_url = _world_bound_governance_url(
             self.project_id,
             governance_url
             if governance_url is not None
             else os.getenv("GOVERNANCE_URL", ""),
-            allow_test_url=executor_cmd is not None and self.project_id != "aming-claw",
         )
         self.manager_identity: Optional[dict] = None
         self.sidecar_port: Optional[int] = None

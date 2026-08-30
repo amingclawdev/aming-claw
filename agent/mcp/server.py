@@ -296,16 +296,11 @@ _STABLE_GOVERNANCE_URL = "http://127.0.0.1:40000"
 
 
 def _canonical_governance_url(project_id: str, requested_url: str) -> str:
-    project = str(project_id or "").strip()
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", project):
-        raise ValueError("MCP project identity must be an exact canonical key")
+    project = project_id
+    plane = resolve_runtime_plane(project)
     requested = str(requested_url or "").strip()
     if not requested:
-        return (
-            _AC_DEV_GOVERNANCE_URL
-            if project == _AC_PROJECT_ID
-            else _STABLE_GOVERNANCE_URL
-        )
+        return plane.governance_url
     parsed = urllib.parse.urlsplit(requested)
     if (
         parsed.scheme != "http"
@@ -321,12 +316,12 @@ def _canonical_governance_url(project_id: str, requested_url: str) -> str:
     if project == _AC_PROJECT_ID:
         if port != 40008:
             raise ValueError("canonical AC MCP is bound exclusively to dev port 40008")
-        return _AC_DEV_GOVERNANCE_URL
+        return plane.governance_url
     if port == 40008:
         raise ValueError("dev port 40008 accepts exact project aming-claw only")
     if port != 40000:
         raise ValueError("non-AC MCP projects are bound to stable port 40000")
-    return _STABLE_GOVERNANCE_URL
+    return plane.governance_url
 
 
 def _mcp_project_claims(value: Any) -> list[str]:
@@ -363,7 +358,7 @@ class AmingClawMCP:
                  redis_url: str, manager_url: str = "",
                  max_workers: int = 0, autostart_executor: bool = False,
                  enable_events: bool = False):
-        self.project_id = str(project_id or "").strip()
+        self.project_id = project_id
         self.gov_url = _canonical_governance_url(
             self.project_id,
             governance_url,

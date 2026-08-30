@@ -55,7 +55,7 @@ class TestStartStop(unittest.TestCase):
     def setUp(self):
         self.mgr = ServiceManager(
             project_id="test-proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo", "hello"],
         )
 
@@ -137,7 +137,7 @@ class TestStatus(unittest.TestCase):
     def _make_mgr(self, active=0, queued=0):
         mgr = ServiceManager(
             project_id="test-proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo"],
         )
         mgr._get_task_counts = MagicMock(return_value=(active, queued))
@@ -209,7 +209,7 @@ class TestReload(unittest.TestCase):
         """
         mgr = ServiceManager(
             project_id="test-proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo"],
             reload_timeout=10,
             poll_interval=0.05,
@@ -260,7 +260,7 @@ class TestReload(unittest.TestCase):
 
         mgr = ServiceManager(
             project_id="test-proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo"],
             reload_timeout=1,       # very short timeout
             poll_interval=0.05,
@@ -334,7 +334,7 @@ class TestGetTaskCounts(unittest.TestCase):
     def _mgr(self):
         return ServiceManager(
             project_id="proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo"],
         )
 
@@ -405,7 +405,7 @@ class TestHostDefaults(unittest.TestCase):
         import service_manager as sm
         cmd = sm._default_executor_cmd(
             "aming-claw",
-            "http://localhost:40000",
+            "http://127.0.0.1:40000",
             "C:/workspace/aming_claw",
         )
         self.assertEqual(
@@ -416,7 +416,7 @@ class TestHostDefaults(unittest.TestCase):
                 "--project",
                 "aming-claw",
                 "--url",
-                "http://localhost:40000",
+                "http://127.0.0.1:40000",
                 "--workspace",
                 "C:/workspace/aming_claw",
             ],
@@ -426,7 +426,7 @@ class TestHostDefaults(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "GOVERNANCE_URL": "http://localhost:40000",
+                "GOVERNANCE_URL": "http://127.0.0.1:40000",
                 "PROJECT_ID": "runtime-project",
                 "CODEX_WORKSPACE": "C:/runtime/workspace",
             },
@@ -468,7 +468,7 @@ class TestCheckRestartSignal(unittest.TestCase):
 
         self.mgr = ServiceManager(
             project_id="test-proj",
-            governance_url="http://localhost:40006",
+            governance_url="http://127.0.0.1:40000",
             executor_cmd=["echo", "hello"],
         )
 
@@ -654,6 +654,16 @@ def test_ac_service_manager_is_world_bound_to_dev_40008(monkeypatch, tmp_path):
         _world_bound_governance_url("aming_claw", "http://127.0.0.1:40008")
     with pytest.raises(ValueError):
         _world_bound_governance_url("content-sys", "http://127.0.0.1:40008")
+
+
+@pytest.mark.parametrize("project_id", ["", " aming-claw", "aming-claw ", "amingClaw", "aming_claw"])
+def test_manager_plane_identity_rejects_raw_noncanonical_project_ids(project_id):
+    with pytest.raises(ValueError):
+        _world_bound_governance_url(project_id, "")
+    with pytest.raises(ValueError):
+        _plane_bound_manager_identity(project_id, "")
+    with pytest.raises(ValueError):
+        ServiceManager(project_id=project_id, executor_cmd=["must-not-spawn"])
 
 
 def test_manager_identity_keeps_ac_dev_sidecar_and_storage_disjoint(monkeypatch, tmp_path):
