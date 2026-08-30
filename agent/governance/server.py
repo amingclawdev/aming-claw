@@ -2512,15 +2512,40 @@ def _acquire_pid_lock(
 
 
 def _governance_generation_project_ids() -> list[str]:
-    from .db import _governance_root
+    """Return only the project histories owned by this runtime plane.
 
-    project_ids = {"aming-claw"}
+    This is deliberately a *pre-connection* filter.  Manager-generation
+    certification is a server-owned startup operation, but it must not turn
+    that fact into a general way to open a project database belonging to the
+    other plane.  In particular, the stable plane may see the AC directory in
+    its shared governance root; it must exclude that canonical project and
+    every spelling which normalizes to it before ``get_connection`` is called.
+    The dev plane owns exactly the isolated canonical AC database.
+    """
+
+    from .db import _governance_root, validate_project_id_syntax
+
+    if _runtime_plane() == "dev":
+        # Do not enumerate shared or legacy storage from the AC-only dev
+        # plane.  The local manager certificate remains process-local below.
+        return [AC_PROJECT_ID]
+
+    project_ids = {AC_PROJECT_ID}
     root = _governance_root()
     if root.exists():
         for project_dir in root.iterdir():
             if project_dir.is_dir() and (project_dir / "governance.db").exists():
                 project_ids.add(project_dir.name)
-    return sorted(project_ids)
+
+    owned_project_ids: list[str] = []
+    for project_id in project_ids:
+        # Keep the historical fail-closed behavior for malformed on-disk
+        # project keys: only the known AC aliases are excluded deliberately.
+        canonical = validate_project_id_syntax(project_id)
+        if canonical == AC_PROJECT_ID:
+            continue
+        owned_project_ids.append(project_id)
+    return sorted(set(owned_project_ids))
 
 
 def _certify_governance_manager_generation(

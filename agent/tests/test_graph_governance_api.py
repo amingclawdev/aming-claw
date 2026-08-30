@@ -4327,6 +4327,64 @@ def test_server_certification_recovers_all_projects_after_partial_fault(
     assert result["project-b"]["observed_prior_generation_id"] == "generation-1"
 
 
+def test_manager_generation_scope_filters_ac_aliases_before_any_connection(
+    tmp_path, monkeypatch
+):
+    """Stable startup certifies only stable-owned histories, before DB open."""
+
+    governance_root = tmp_path / "governance"
+    for project_id in ("aming-claw", "amingClaw", "aming_claw", "public-project"):
+        project_dir = governance_root / project_id
+        project_dir.mkdir(parents=True)
+        (project_dir / "governance.db").touch()
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    monkeypatch.setattr(governance_db, "_governance_root", lambda: governance_root)
+
+    projects = server._governance_generation_project_ids()
+
+    assert projects == ["public-project"]
+
+    opened: list[str] = []
+
+    def connection_for(project_id: str):
+        opened.append(project_id)
+        assert project_id == "public-project"
+        connection = sqlite3.connect(tmp_path / "public.sqlite")
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    monkeypatch.setattr(server, "get_connection", connection_for)
+    server._certify_governance_manager_generation(
+        _FakeGenerationLease(_lease_receipt("generation-plane-scope", 5301)),
+        project_ids=projects,
+    )
+    assert opened == ["public-project"]
+
+
+def test_manager_generation_scope_is_ac_only_in_dev_and_has_no_cross_plane_bypass(
+    monkeypatch,
+):
+    """The source-owned startup scope cannot certify a forged foreign project."""
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    assert server._governance_generation_project_ids() == ["aming-claw"]
+
+    opened: list[str] = []
+
+    def reject_foreign(project_id: str):
+        opened.append(project_id)
+        raise ValueError("AC dev runtime project allowlist requires exact project_id=aming-claw")
+
+    monkeypatch.setattr(server, "get_connection", reject_foreign)
+    with pytest.raises(ValueError, match="allowlist"):
+        server._certify_governance_manager_generation(
+            _FakeGenerationLease(_lease_receipt("generation-cross-plane", 5302)),
+            project_ids=["public-project"],
+        )
+    assert opened == ["public-project"]
+
+
 def test_server_certification_completes_metric_identity_migration_before_publish(
     tmp_path,
     monkeypatch,
