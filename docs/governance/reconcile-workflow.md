@@ -31,8 +31,16 @@ namespaces in one database:
   uses a dedicated, non-symlink storage root and a fresh source-created genesis.
   Its database, WAL/SHM, graph, sessions, routes, CEX, ContractRuntime Facts,
   timeline, backlog and queues are physically disjoint from stable storage.
-- The legacy AC database whose recorded archive size is `178625794048` bytes is
-  immutable archive identity. No governance row or Fact is copied into dev.
+- The legacy AC database is a live stable transition store until stable has a
+  typed, zero-write AC rejection and all AC clients have drained or rerouted.
+  Its historically observed `178625794048`-byte size is audit context, not an
+  immutable cutover identity. Preflight binds its canonical path, device and
+  inode while treating size, mtime/ctime and a same-file content digest as
+  volatile observations. Legitimate stable writes between preflight and
+  activation therefore do not change activation authority. Each observation
+  still uses one `O_NOFOLLOW` regular-file descriptor and rejects path/inode or
+  within-observation TOCTOU changes. Only after client drain may the stable
+  store be archived. No governance row or Fact is copied into dev.
 - ContractRuntime source definitions and state semantics are identical in both
   worlds. Dev has no alternate grant cache, authority state machine, PASS
   synthesis, cross-world receipt or compatibility proxy.
@@ -48,6 +56,11 @@ commit/tree, storage path/device/inode, listener/PID, WAL/SHM ownership, and a
 single writer per physical database. Any mismatch stops before cutover; rollback
 means stopping the unactivated dev process and retaining/removing only its
 disposable dedicated root. It never modifies stable storage.
+
+Live cutover remains blocked until stable's project boundary demonstrates a
+typed, pre-effect, zero-write rejection for canonical AC and its aliases, and
+AC clients have drained or rerouted to dev. The source-only preflight and
+activation helpers do not waive or reorder those prerequisites.
 
 Because evidence cannot cross worlds, a pre-cutover AC row cannot be closed by
 fresh dev Facts. It remains honestly OPEN/WAIVED and a fresh dev-world successor

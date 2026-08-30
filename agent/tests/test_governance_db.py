@@ -712,10 +712,11 @@ def test_ac_dev_cutover_preflight_activation_idempotency_and_rollback(tmp_path):
         source_identity=source,
         process_identity=process,
     )
+    legacy_size = 2 * 1024 * 1024
     legacy = tmp_path / "legacy" / "governance.db"
     legacy.parent.mkdir()
     with legacy.open("wb") as handle:
-        handle.truncate(db.AC_LEGACY_ARCHIVE_SIZE_BYTES)
+        handle.truncate(legacy_size)
 
     def listener_probe(port):
         if port == 40000:
@@ -743,7 +744,7 @@ def test_ac_dev_cutover_preflight_activation_idempotency_and_rollback(tmp_path):
         listener_probe=listener_probe,
     )
     assert preflight["status"] == "ready"
-    assert preflight["legacy_database_identity"]["size"] == db.AC_LEGACY_ARCHIVE_SIZE_BYTES
+    assert preflight["legacy_database_identity"]["size"] == legacy_size
     assert preflight["new_database_identity"] == dev["database_identity"]
     assert Path(preflight["checkpoint_path"]).is_file()
     legacy_before = legacy.stat()
@@ -781,6 +782,140 @@ def test_ac_dev_cutover_preflight_activation_idempotency_and_rollback(tmp_path):
             expected_dev_database_identity=dev["database_identity"],
             source_identity=source,
         )
+
+
+def test_ac_dev_cutover_allows_live_legacy_growth_between_preflight_and_activation(
+    tmp_path,
+):
+    """The still-live stable store may grow without changing physical identity."""
+
+    from agent.governance import db
+
+    root, commit = _dev_source_repo(tmp_path)
+    source = {
+        "root": str(root.resolve()),
+        "branch": "codex/ac-dev",
+        "commit": commit,
+        "source_sha256": "sha256:" + "e" * 64,
+    }
+    process = {"pid": 406, "start_identity": "cutover-live-growth"}
+    storage_root = tmp_path / "dev-world"
+    dev = db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity=source,
+        process_identity=process,
+    )
+    legacy = tmp_path / "legacy" / "governance.db"
+    legacy.parent.mkdir()
+    with legacy.open("wb") as handle:
+        handle.truncate(db.AC_LEGACY_ARCHIVE_SIZE_BYTES)
+
+    def listener_probe(port):
+        if port == 40000:
+            return {
+                "port": 40000,
+                "listening": True,
+                "pid": 700,
+                "process_start_identity": "stable-700",
+                "source_commit": "f" * 40,
+            }
+        return {
+            "port": 40008,
+            "listening": False,
+            "pid": 0,
+            "process_start_identity": "",
+            "source_commit": "",
+        }
+
+    preflight = db.preflight_dev_world_cutover(
+        legacy_database_path=legacy,
+        storage_root=storage_root,
+        source_identity=source,
+        process_identity=process,
+        expected_dev_database_identity=dev["database_identity"],
+        listener_probe=listener_probe,
+    )
+    initial = legacy.stat()
+    with legacy.open("ab") as handle:
+        handle.write(b"stable-live-growth")
+        handle.flush()
+        os.fsync(handle.fileno())
+    grown = legacy.stat()
+    assert (grown.st_dev, grown.st_ino) == (initial.st_dev, initial.st_ino)
+    assert grown.st_size > initial.st_size
+
+    activated = db.activate_dev_world_cutover(
+        storage_root=storage_root,
+        preflight_hash=preflight["preflight_hash"],
+        listener_probe=listener_probe,
+    )
+
+    assert activated["status"] == "active"
+    assert activated["legacy_database_identity"]["device"] == grown.st_dev
+    assert activated["legacy_database_identity"]["inode"] == grown.st_ino
+
+
+@pytest.mark.parametrize("replacement_kind", ["inode", "symlink"])
+def test_ac_dev_cutover_rejects_legacy_path_identity_replacement(
+    tmp_path, replacement_kind
+):
+    """Live growth is allowed, but the canonical physical file may not change."""
+
+    from agent.governance import db
+
+    root, commit = _dev_source_repo(tmp_path)
+    source = {
+        "root": str(root.resolve()),
+        "branch": "codex/ac-dev",
+        "commit": commit,
+        "source_sha256": "sha256:" + "e" * 64,
+    }
+    process = {"pid": 407, "start_identity": "cutover-path-identity"}
+    storage_root = tmp_path / "dev-world"
+    dev = db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity=source,
+        process_identity=process,
+    )
+    legacy_size = 2 * 1024 * 1024
+    legacy = tmp_path / "legacy" / "governance.db"
+    legacy.parent.mkdir()
+    with legacy.open("wb") as handle:
+        handle.truncate(legacy_size)
+
+    def listener_probe(port):
+        return {
+            "port": port,
+            "listening": port == 40000,
+            "pid": 700 if port == 40000 else 0,
+            "process_start_identity": "stable-700" if port == 40000 else "",
+            "source_commit": "f" * 40 if port == 40000 else "",
+        }
+
+    preflight = db.preflight_dev_world_cutover(
+        legacy_database_path=legacy,
+        storage_root=storage_root,
+        source_identity=source,
+        process_identity=process,
+        expected_dev_database_identity=dev["database_identity"],
+        listener_probe=listener_probe,
+    )
+    replacement = tmp_path / "replacement.db"
+    with replacement.open("wb") as handle:
+        handle.truncate(legacy_size)
+    if replacement_kind == "inode":
+        os.replace(replacement, legacy)
+    else:
+        legacy.unlink()
+        legacy.symlink_to(replacement)
+
+    with pytest.raises(ValueError, match="symlink|identity changed"):
+        db.activate_dev_world_cutover(
+            storage_root=storage_root,
+            preflight_hash=preflight["preflight_hash"],
+            listener_probe=listener_probe,
+        )
+    assert not (storage_root / "cutover" / "active.json").exists()
 
 
 def test_ac_dev_cutover_failure_leaves_old_live_and_new_inactive(tmp_path):
@@ -865,8 +1000,8 @@ def test_ac_dev_archive_content_proof_is_fd_derived_and_detects_toctou(
         )
 
 
-def test_ac_dev_archive_cached_digest_is_compare_only(tmp_path):
-    """QA4 Y1: matching stat fields cannot authorize a forged digest."""
+def test_ac_dev_archive_cached_observation_is_not_activation_authority(tmp_path):
+    """Volatile cached observations cannot replace physical file identity."""
 
     from agent.governance import db
 
@@ -880,14 +1015,29 @@ def test_ac_dev_archive_cached_digest_is_compare_only(tmp_path):
         expected_size=db.AC_LEGACY_ARCHIVE_SIZE_BYTES,
         content_digest=True,
     )
-    forged = {
+    stale_observation = {
         **actual,
+        "size": actual["size"] + 1,
+        "mtime_ns": actual["mtime_ns"] + 1,
+        "ctime_ns": actual["ctime_ns"] + 1,
         "content_digest": "sha256-sparse-v1:" + "0" * 64,
     }
-    with pytest.raises(ValueError, match="cached content digest mismatch"):
+    observed = db._cutover_database_stat(
+        legacy,
+        content_digest=True,
+        cached_identity=stale_observation,
+    )
+    assert observed["content_digest"] == actual["content_digest"]
+    assert db._cutover_hash({"legacy_database_identity": actual}) == db._cutover_hash(
+        {"legacy_database_identity": stale_observation}
+    )
+    assert db._cutover_hash({"legacy_database_identity": actual}) != db._cutover_hash(
+        {"legacy_database_identity": {**actual, "inode": actual["inode"] + 1}}
+    )
+
+    with pytest.raises(ValueError, match="identity changed"):
         db._cutover_database_stat(
             legacy,
-            expected_size=db.AC_LEGACY_ARCHIVE_SIZE_BYTES,
             content_digest=True,
-            cached_identity=forged,
+            cached_identity={**actual, "inode": actual["inode"] + 1},
         )

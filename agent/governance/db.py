@@ -1556,9 +1556,21 @@ def bootstrap_dev_governance_store(
 
 
 def _cutover_hash(payload: Mapping[str, object]) -> str:
+    authority = dict(payload)
+    legacy = authority.get("legacy_database_identity")
+    if isinstance(legacy, Mapping):
+        # The stable database is still live while clients drain.  Its size,
+        # ownership timestamps, and content digest are bounded observations,
+        # not cross-phase activation authority.  Only the canonical physical
+        # file identity is stable across preflight and activation.
+        authority["legacy_database_identity"] = {
+            key: legacy[key]
+            for key in ("path", "device", "inode")
+            if key in legacy
+        }
     return "sha256:" + hashlib.sha256(
         json.dumps(
-            dict(payload),
+            authority,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -1723,21 +1735,14 @@ def _cutover_database_stat(
         }
         if content_digest:
             cached = dict(cached_identity or {})
-            stat_keys = (
-                "path", "device", "inode", "size", "uid", "mtime_ns", "ctime_ns",
-            )
-            if cached and any(cached.get(key) != identity[key] for key in stat_keys):
-                raise ValueError("legacy AC archive identity changed")
-            cached_digest = str(cached.get("content_digest") or "")
-            if cached and not re.fullmatch(
-                r"sha256-sparse-v1:[0-9a-f]{64}", cached_digest
+            authority_keys = ("path", "device", "inode")
+            if cached and any(
+                cached.get(key) != identity[key] for key in authority_keys
             ):
-                raise ValueError("legacy AC archive cached content digest is invalid")
+                raise ValueError("legacy AC archive identity changed")
             actual_digest = _fd_sparse_content_digest(
                 descriptor, size=int(before.st_size)
             )
-            if cached_digest and cached_digest != actual_digest:
-                raise ValueError("legacy AC archive cached content digest mismatch")
             identity["content_digest"] = actual_digest
         after = os.fstat(descriptor)
         path_after = os.stat(absolute, follow_symlinks=False)
@@ -1783,7 +1788,6 @@ def _inspect_dev_world_cutover(
 
     legacy = _cutover_database_stat(
         Path(legacy_database_path),
-        expected_size=AC_LEGACY_ARCHIVE_SIZE_BYTES,
         content_digest=True,
         cached_identity=expected_legacy_database_identity,
     )
@@ -1899,8 +1903,20 @@ def preflight_dev_world_cutover(
         "checkpoint_path": str(checkpoint),
     }
     if checkpoint.exists():
-        if _read_cutover_json(checkpoint) != payload:
+        existing = _read_cutover_json(checkpoint)
+        existing_core = {
+            key: value
+            for key, value in existing.items()
+            if key not in {"status", "preflight_hash", "checkpoint_path"}
+        }
+        if (
+            existing.get("status") != "ready"
+            or existing.get("preflight_hash") != preflight_hash
+            or existing.get("checkpoint_path") != str(checkpoint)
+            or _cutover_hash(existing_core) != preflight_hash
+        ):
             raise ValueError("AC dev cutover checkpoint collision")
+        return existing
     else:
         _atomic_cutover_json(checkpoint, payload)
     return payload
