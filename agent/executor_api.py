@@ -20,7 +20,7 @@ from datetime import datetime, timezone as _tz
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-from agent.runtime_plane import resolve_runtime_plane
+from agent.runtime_plane import bind_workspace_identity, resolve_runtime_plane
 
 log = logging.getLogger(__name__)
 
@@ -154,6 +154,21 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
     def _tasks_root(self) -> Path:
         return Path(self._executor_identity()["storage_root"]) / "codex-tasks"
 
+    def _workspace_identity(self):
+        identity = getattr(self.server, "executor_identity", None)
+        workspace = identity.get("workspace") if isinstance(identity, dict) else None
+        if workspace is None:
+            raise RuntimeError("executor file routes require explicit workspace identity")
+        return workspace
+
+    def _require_body_project(self, body: dict) -> bool:
+        """Reject every mutating request not addressed to this exact process."""
+        expected = self._executor_identity()["project_id"]
+        if not isinstance(body, dict) or body.get("project_id") != expected:
+            self._json_response(400, {"error": "project_id must exactly match executor identity"})
+            return False
+        return True
+
     def log_message(self, format, *args):
         log.info("API %s", format % args)
 
@@ -251,6 +266,10 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         body = self._read_body()
+        # A bound executor is not a multiplexer.  Check this before selecting a
+        # handler so even a rejected request cannot create files or subprocesses.
+        if not self._require_body_project(body):
+            return
 
         # ── Intervention (L18.3) ──
 
@@ -788,14 +807,14 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         Called by orchestrator after governance DB insert to ensure the pending
         file is created by the executor process (correct SHARED_VOLUME_PATH).
         """
-        from utils import tasks_root, save_json, utc_iso
+        from utils import save_json, utc_iso
 
         task_id = body.get("task_id", "")
         if not task_id:
             from utils import new_task_id
             task_id = new_task_id()
 
-        root = tasks_root()
+        root = self._tasks_root()
         pending_file = root / "pending" / f"{task_id}.json"
         results_file = root / "results" / f"{task_id}.json"
         processing_file = root / "processing" / f"{task_id}.json"
@@ -1343,12 +1362,25 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         if not path:
             return False, "", "empty path"
 
-        # Get worktree root for this task
-        worktree_root = _active_worktree_roots.get(task_id, "")
-        if not worktree_root:
-            # Fallback: use main workspace (for coordinator tasks without worktree)
-            worktree_root = os.getenv("CODEX_WORKSPACE",
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        # Get only an explicitly registered worktree inside the immutable root.
+        worktree = _active_worktree_roots.get(task_id)
+        if worktree is None:
+            return False, "", "task has no validated worktree root"
+        workspace = self._workspace_identity()
+        root = pathlib.Path(workspace.root)
+        target_root = pathlib.Path(worktree.root)
+        if not target_root.is_absolute() or target_root.is_symlink():
+            return False, "", "task worktree root is invalid"
+        try:
+            current = target_root.stat(follow_symlinks=False)
+            if current.st_dev != worktree.device or current.st_ino != worktree.inode:
+                return False, "", "task worktree identity changed"
+            target_root = target_root.resolve(strict=True)
+        except OSError:
+            return False, "", "task worktree root is unavailable"
+        if not target_root.is_relative_to(root):
+            return False, "", "task worktree escapes bound workspace"
+        worktree_root = str(target_root)
 
         # Resolve to absolute path within worktree
         if not os.path.isabs(path):
@@ -1362,7 +1394,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
         # Must be within worktree root
         worktree_resolved = str(pathlib.Path(worktree_root).resolve())
-        if not resolved.startswith(worktree_resolved):
+        if not pathlib.Path(resolved).is_relative_to(pathlib.Path(worktree_resolved)):
             return False, "", f"path {resolved} is outside worktree {worktree_resolved}"
 
         # Block sensitive paths
@@ -1491,8 +1523,10 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         import subprocess
         task_id = body.get("task_id", "")
         test_cmd = body.get("command", "python -m pytest -q")
-        worktree = _active_worktree_roots.get(task_id, "")
-        cwd = worktree or os.getenv("CODEX_WORKSPACE", os.getcwd())
+        ok, cwd, err = self._validate_file_path(".", task_id)
+        if not ok:
+            self._json_response(403, {"error": f"task worktree rejected: {err}"})
+            return
 
         # Whitelist test commands
         allowed_prefixes = ["python -m pytest", "python -m unittest", "npm test", "npm run test"]
@@ -1520,8 +1554,10 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         task_id = body.get("task_id", "")
         lint_cmd = body.get("command", "python -m py_compile")
         target = body.get("target", "")
-        worktree = _active_worktree_roots.get(task_id, "")
-        cwd = worktree or os.getenv("CODEX_WORKSPACE", os.getcwd())
+        ok, cwd, err = self._validate_file_path(".", task_id)
+        if not ok:
+            self._json_response(403, {"error": f"task worktree rejected: {err}"})
+            return
 
         allowed_prefixes = ["python -m py_compile", "python -m flake8", "npx eslint"]
         if not any(lint_cmd.startswith(p) for p in allowed_prefixes):
@@ -1546,12 +1582,16 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
 
 # Active worktree roots per task (set by Executor when creating dev sessions)
-_active_worktree_roots: dict[str, str] = {}
+_active_worktree_roots: dict[str, object] = {}
 
 
-def register_worktree(task_id: str, worktree_root: str) -> None:
-    """Register a worktree root for a task (called by Executor)."""
-    _active_worktree_roots[task_id] = worktree_root
+def register_worktree(task_id: str, worktree_root: str, workspace_root: str) -> None:
+    """Register one prevalidated task worktree beneath one explicit workspace."""
+    workspace = bind_workspace_identity(workspace_root)
+    worktree = bind_workspace_identity(worktree_root)
+    if not Path(worktree.root).is_relative_to(Path(workspace.root)):
+        raise ValueError("task worktree escapes bound workspace")
+    _active_worktree_roots[task_id] = worktree
 
 
 def unregister_worktree(task_id: str) -> None:
@@ -1559,17 +1599,19 @@ def unregister_worktree(task_id: str) -> None:
     _active_worktree_roots.pop(task_id, None)
 
 
-def start_api_server(project_id: str):
+def start_api_server(project_id: str, workspace_root: str = ""):
     """Start the Executor API server in a background thread."""
     plane = resolve_runtime_plane(project_id)
     from agent.manager_http_server import _canonical_storage_root, plane_bound_manager_identity
     root = _canonical_storage_root(plane.name)
     identity = plane_bound_manager_identity(project_id, plane.governance_url, str(root))
+    workspace = bind_workspace_identity(workspace_root) if workspace_root else None
     port = urlparse(plane.executor_url).port
     if PORT and PORT != port:
         raise ValueError("EXECUTOR_API_PORT crosses the project runtime plane")
     server = HTTPServer(("0.0.0.0", port), ExecutorAPIHandler)
     server.executor_identity = identity
+    server.executor_identity["workspace"] = workspace
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     log.info("Executor API server started on port %d", port)

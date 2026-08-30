@@ -46,6 +46,8 @@ if _proj_root not in sys.path:
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
+from agent.runtime_plane import bind_workspace_identity, resolve_runtime_plane
+
 log = logging.getLogger("executor_worker")
 
 # --- Configuration ---
@@ -55,7 +57,7 @@ log = logging.getLogger("executor_worker")
 GOVERNANCE_URL = os.getenv("GOVERNANCE_URL", "")
 POLL_INTERVAL = int(os.getenv("EXECUTOR_POLL_INTERVAL", "10"))
 WORKER_ID = os.getenv("EXECUTOR_WORKER_ID", f"executor-{os.getpid()}")
-WORKSPACE = os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[1]))
+WORKSPACE = ""
 
 # R2: MAX_CONCURRENT_WORKERS — configurable via env var, default 2, clamped to [1, 5]
 MAX_CONCURRENT_WORKERS = min(5, max(1, int(os.getenv("MAX_CONCURRENT_WORKERS", "2"))))
@@ -71,24 +73,10 @@ EXECUTOR_SESSION_TOKEN_ENV = "AMING_EXECUTOR_SESSION_TOKEN"
 
 
 def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str:
-    raw = str(project_id or "").strip()
-    canonical = re.sub(r"-+", "-", re.sub(r"[\s_]+", "-", raw)).lower().strip("-")
-    if canonical == "aming-claw" and raw != "aming-claw":
-        raise ValueError("AC executor project id must be exact aming-claw")
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", canonical):
-        raise ValueError("executor project id is invalid")
-    selected = str(requested_url or "").rstrip("/")
-    if canonical == "aming-claw":
-        expected = os.getenv(
-            "AC_DEV_GOVERNANCE_URL", "http://127.0.0.1:40008"
-        ).rstrip("/")
-        if selected and selected not in {expected, "http://localhost:40008"}:
-            raise ValueError("AC executor is bound exclusively to dev port 40008")
-        return expected
-    selected = selected or "http://127.0.0.1:40000"
-    if selected.endswith(":40008"):
-        raise ValueError("port 40008 is reserved to exact project aming-claw")
-    return selected
+    plane = resolve_runtime_plane(project_id)
+    if requested_url and requested_url != plane.governance_url:
+        raise ValueError("executor governance URL crosses the project runtime plane")
+    return plane.governance_url
 
 
 def _world_bound_log_root(project_id: str, workspace: str) -> Path:
@@ -96,7 +84,9 @@ def _world_bound_log_root(project_id: str, workspace: str) -> Path:
         from agent.governance.db import _dev_runtime_root
 
         return _dev_runtime_root(create=True) / "logs"
-    return Path(workspace or ".") / "shared-volume" / "codex-tasks" / "logs"
+    if not workspace:
+        raise ValueError("executor requires an explicit workspace")
+    return Path(workspace) / "shared-volume" / "codex-tasks" / "logs"
 
 
 def _world_bound_pid_path(project_id: str) -> Path:
@@ -415,11 +405,13 @@ class ExecutorWorker:
     def __init__(self, project_id: str, governance_url: str = GOVERNANCE_URL,
                  worker_id: str = WORKER_ID, workspace: str = WORKSPACE,
                  session_token: Optional[str] = None):
-        self.project_id = project_id
+        plane = resolve_runtime_plane(project_id)
+        self.workspace_identity = bind_workspace_identity(workspace)
+        self.project_id = plane.project_id
         self.base_url = _world_bound_governance_url(project_id, governance_url)
         self.worker_id = worker_id
-        self.workspace = workspace
-        self.log_root = _world_bound_log_root(project_id, workspace)
+        self.workspace = self.workspace_identity.root
+        self.log_root = _world_bound_log_root(self.project_id, self.workspace)
         self._session_token = str(
             os.getenv(EXECUTOR_SESSION_TOKEN_ENV, "")
             if session_token is None
@@ -1853,7 +1845,7 @@ class ExecutorWorker:
             if target_files:
                 parts.append(f"\n## Target Files Preview")
                 for tf in target_files[:3]:
-                    tf_path = os.path.join(self.workspace or ".", tf)
+                    tf_path = os.path.join(self.workspace, tf)
                     try:
                         with open(tf_path, "r", encoding="utf-8", errors="replace") as f:
                             lines = f.readlines()
@@ -3371,13 +3363,13 @@ class WorkerPool:
 
 def main():
     parser = argparse.ArgumentParser(description="Executor Worker - polls governance for tasks")
-    parser.add_argument("--project", "-p", default=os.getenv("PROJECT_ID", "aming-claw"),
+    parser.add_argument("--project", "-p", required=True,
                         help="Project ID to poll tasks from")
     parser.add_argument("--url", default=GOVERNANCE_URL,
                         help="Governance API URL")
     parser.add_argument("--worker-id", default=WORKER_ID,
                         help="Worker identifier")
-    parser.add_argument("--workspace", default=WORKSPACE,
+    parser.add_argument("--workspace", required=True,
                         help="Working directory for task execution")
     parser.add_argument("--once", action="store_true",
                         help="Execute one task and exit (no loop)")

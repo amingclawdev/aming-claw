@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -10,9 +11,9 @@ from executor_worker import ExecutorWorker
 def _worker():
     return ExecutorWorker(
         project_id="proj",
-        governance_url="http://localhost:40000",
+        governance_url="http://127.0.0.1:40000",
         worker_id="executor-test",
-        workspace="C:/repo",
+        workspace=str(Path(__file__).resolve().parents[2]),
     )
 
 

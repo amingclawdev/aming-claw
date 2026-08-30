@@ -435,7 +435,7 @@ class TestHostDefaults(unittest.TestCase):
             mgr = ServiceManager()
         self.assertEqual(mgr.project_id, "runtime-project")
         self.assertEqual(mgr.governance_url, "http://127.0.0.1:40000")
-        self.assertEqual(mgr.workspace, "C:/runtime/workspace")
+        self.assertEqual(mgr.workspace, "")
         self.assertEqual(
             mgr._executor_cmd,
             [
@@ -446,7 +446,7 @@ class TestHostDefaults(unittest.TestCase):
                 "--url",
                 "http://127.0.0.1:40000",
                 "--workspace",
-                "C:/runtime/workspace",
+                "",
             ],
         )
 
@@ -723,6 +723,7 @@ def test_managed_service_manager_verifies_and_passes_session_token_only_by_env(
     manager = ServiceManager(
         project_id="aming-claw",
         governance_url="http://127.0.0.1:40008",
+        workspace=str(tmp_path),
     )
     assert manager.start() is True
     call = popen.call_args
@@ -745,7 +746,7 @@ def test_managed_service_manager_rejects_missing_invalid_or_wrong_project_token(
     monkeypatch.setattr(sm.subprocess, "Popen", popen)
 
     monkeypatch.delenv("AMING_EXECUTOR_SESSION_TOKEN", raising=False)
-    missing = ServiceManager(project_id="aming-claw")
+    missing = ServiceManager(project_id="aming-claw", workspace=str(tmp_path))
     with pytest.raises(RuntimeError, match="session credential"):
         missing.start()
     popen.assert_not_called()
@@ -759,7 +760,7 @@ def test_managed_service_manager_rejects_missing_invalid_or_wrong_project_token(
         response.raise_for_status.return_value = None
         response.json.return_value = payload
         monkeypatch.setattr(sm.requests, "get", MagicMock(return_value=response))
-        manager = ServiceManager(project_id="aming-claw")
+        manager = ServiceManager(project_id="aming-claw", workspace=str(tmp_path))
         with pytest.raises(RuntimeError, match="session credential"):
             manager.start()
     popen.assert_not_called()

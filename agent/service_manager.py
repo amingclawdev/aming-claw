@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
-from agent.runtime_plane import resolve_runtime_plane
+from agent.runtime_plane import bind_workspace_identity, resolve_runtime_plane
 
 # B48 FIX B (observer-hotfix 2026-04-23): Ensure the project root is on
 # sys.path so `from agent.manager_http_server import run_server` works when
@@ -107,7 +107,7 @@ def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str
 
 
 def _default_workspace() -> str:
-    return os.getenv("CODEX_WORKSPACE", str(_repo_root()))
+    return ""
 
 
 def _plane_bound_manager_identity(
@@ -202,7 +202,8 @@ class ServiceManager:
         self.sidecar_port: Optional[int] = None
         self.reload_timeout = reload_timeout
         self.poll_interval = poll_interval
-        self.workspace = workspace or _default_workspace()
+        self.workspace_identity = bind_workspace_identity(workspace) if workspace else None
+        self.workspace = self.workspace_identity.root if self.workspace_identity else ""
 
         self._managed_executor = executor_cmd is None
         self._executor_cmd: list = executor_cmd or _default_executor_cmd(
@@ -739,6 +740,8 @@ class ServiceManager:
     def _spawn_executor_process(self) -> subprocess.Popen:
         """Spawn the executor and redirect output to a persistent host log file."""
         identity = self._bound_manager_identity()
+        if self._managed_executor and self.workspace_identity is None:
+            raise ValueError("managed executor requires an explicit workspace root")
         child_env = os.environ.copy()
         for key in ("GOVERNANCE_URL", "EXECUTOR_PROJECT_ID", "PROJECT_ID",
                     "SHARED_VOLUME_PATH", "EXECUTOR_API_PORT", "MANAGER_URL"):
@@ -894,9 +897,8 @@ def main() -> None:
         help="Governance base URL (use nginx entrypoint, e.g. http://localhost:40000)",
     )
     parser.add_argument(
-        "--workspace",
-        default=_default_workspace(),
-        help="Host workspace passed to executor_worker",
+        "--workspace-root", "--workspace", dest="workspace", default="",
+        help="Existing absolute workspace root passed to executor_worker",
     )
     parser.add_argument(
         "--status-only",
@@ -908,6 +910,7 @@ def main() -> None:
     # Bind the full plane/storage authority before creating any log directory,
     # handler, status probe, thread, or subprocess.
     identity = _plane_bound_manager_identity(args.project, args.governance_url)
+    workspace_identity = bind_workspace_identity(args.workspace) if args.workspace else None
     _load_env_file()
     for key, expected in {
         "PROJECT_ID": identity["project_id"],
@@ -926,6 +929,8 @@ def main() -> None:
         workspace=args.workspace,
     )
     manager.manager_identity = identity
+    manager.workspace_identity = workspace_identity
+    manager.workspace = workspace_identity.root if workspace_identity else ""
     manager.sidecar_port = int(identity["sidecar_port"])
 
     # B48 FIX A (observer-hotfix 2026-04-23): Add RotatingFileHandler so SM logs
@@ -963,7 +968,6 @@ def main() -> None:
         return
 
     os.environ.setdefault("GOVERNANCE_URL", args.governance_url)
-    os.environ.setdefault("CODEX_WORKSPACE", args.workspace)
     _install_signal_handlers(manager.stop)
 
     # R4: Start sidecar HTTP server before executor

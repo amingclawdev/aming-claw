@@ -2,6 +2,7 @@
 
 import json
 import threading
+import urllib.error
 import urllib.request
 from http.server import HTTPServer
 from unittest.mock import MagicMock, patch
@@ -63,7 +64,10 @@ def test_real_handler_status_and_cancel_use_bound_root_despite_hostile_env(
         base = f"http://{server.server_address[0]}:{server.server_address[1]}"
         with urllib.request.urlopen(f"{base}/status") as response:
             status = json.loads(response.read())
-        request = urllib.request.Request(f"{base}/task/task-1/cancel", data=b"{}", method="POST")
+        request = urllib.request.Request(
+            f"{base}/task/task-1/cancel",
+            data=json.dumps({"project_id": project_id}).encode(), method="POST",
+        )
         with urllib.request.urlopen(request) as response:
             cancelled = json.loads(response.read())
     finally:
@@ -71,3 +75,32 @@ def test_real_handler_status_and_cancel_use_bound_root_despite_hostile_env(
     assert status["pending_tasks"] == 1
     assert cancelled["cancelled"] is True
     assert not (pending / "task-1.json").exists()
+
+
+def test_mutating_request_requires_exact_bound_project_before_handler(monkeypatch, tmp_path):
+    from agent import manager_http_server
+    root = tmp_path / "shared-volume"
+    root.mkdir()
+    monkeypatch.setattr(manager_http_server, "_project_root", lambda: tmp_path)
+    identity = manager_http_server.plane_bound_manager_identity(
+        "proj", "http://127.0.0.1:40000", str(root),
+    )
+    pending = root / "codex-tasks" / "pending"
+    pending.mkdir(parents=True)
+    task = pending / "task-1.json"
+    task.write_text("{}")
+    server = HTTPServer(("127.0.0.1", 0), executor_api.ExecutorAPIHandler)
+    server.executor_identity = identity
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://{server.server_address[0]}:{server.server_address[1]}"
+        request = urllib.request.Request(
+            f"{base}/task/task-1/cancel", data=b'{"project_id":"aming-claw"}', method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            urllib.request.urlopen(request)
+        assert failure.value.code == 400
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+    assert task.exists()
