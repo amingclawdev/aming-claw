@@ -336,97 +336,19 @@ def _canonical_stable_database_binding(
     *,
     stable_anchor_commit: str,
 ) -> dict[str, Any]:
-    """Bind a dev runtime to the stable branch's physical governance DB."""
-
-    source_root = Path(str(_source_git_identity().get("root") or "")).resolve(
-        strict=True
-    )
-    proc = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"],
-        cwd=source_root,
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise click.ClickException("Stable worktree identity is unavailable.")
-    expected_branch = "refs/heads/" + AC_STABLE_BRANCH
-    roots = []
-    for block in proc.stdout.strip().split("\n\n"):
-        values = dict(
-            line.split(" ", 1) if " " in line else (line, "")
-            for line in block.splitlines()
-        )
-        if values.get("branch") == expected_branch and values.get("worktree"):
-            roots.append(Path(values["worktree"]).resolve(strict=True))
-    if len(roots) != 1:
-        raise click.ClickException("Exact stable branch worktree is unavailable.")
-    stable_root = roots[0]
-    canonical_shared = (stable_root / "shared-volume").absolute()
-    requested = Path(str(requested_shared_volume or "")).expanduser().absolute()
+    """CLI error adapter for the sole DB-layer stable binding predicate."""
+    from agent.governance.db import verified_stable_database_binding
     try:
-        if (
-            not requested_shared_volume
-            or requested.is_symlink()
-            or canonical_shared.is_symlink()
-            or requested.resolve(strict=True) != canonical_shared.resolve(strict=True)
-            or canonical_shared.resolve(strict=True) != canonical_shared
-        ):
-            raise click.ClickException(
-                "AC dev runtime requires the exact stable-worktree shared volume."
-            )
-        db_path = canonical_shared / Path(
-            AC_DATABASE_STABLE_RELATIVE_PATH
-        ).relative_to("shared-volume")
-        metadata = db_path.stat(follow_symlinks=False)
-        if (
-            db_path.is_symlink()
-            or not db_path.is_file()
-            or db_path.resolve(strict=True) != db_path
-        ):
-            raise click.ClickException(
-                "AC dev runtime canonical stable database identity is invalid."
-            )
+        binding = verified_stable_database_binding(
+            requested_shared_volume, stable_anchor_commit=stable_anchor_commit
+        )
     except (OSError, RuntimeError, ValueError) as exc:
-        if isinstance(exc, click.ClickException):
-            raise
         raise click.ClickException(
             "AC dev runtime canonical stable database identity is unavailable."
         ) from exc
-    relative_hash = "sha256:" + hashlib.sha256(
-        AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
-    ).hexdigest()
-    database_identity = {
-        "schema_version": "ac_stable_database_identity.v1",
-        "device": int(metadata.st_dev),
-        "inode": int(metadata.st_ino),
-        "stable_relative_path_sha256": relative_hash,
-    }
-    authority = _current_stable_runtime_authority()
-    if authority.get("commit") != stable_anchor_commit:
-        raise click.ClickException(
-            "Stable service authority changed while binding its database."
-        )
-    health = authority.get("health") or {}
-    plane_identity = health.get("runtime_plane_identity")
-    health_database_identity = (
-        plane_identity.get("stable_database_identity")
-        if isinstance(plane_identity, Mapping)
-        else None
-    )
-    if health_database_identity in (None, {}):
-        if authority.get("mode") not in {"legacy_a258", "verified_generic"}:
-            raise click.ClickException(
-                "Stable service does not expose its database identity."
-            )
-    elif health_database_identity != database_identity:
-        raise click.ClickException(
-            "Stable service database identity differs from the stable worktree."
-        )
     return {
-        "shared_volume_path": str(canonical_shared),
-        "stable_database_identity": database_identity,
+        "shared_volume_path": str(binding["shared_volume_path"]),
+        "stable_database_identity": dict(binding["stable_database_identity"]),
     }
 
 
@@ -1222,8 +1144,10 @@ def start(
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor_commit):
             raise click.ClickException("AC dev runtime requires an exact local stable source anchor.")
         from agent.runtime_plane import resolve_ac_dev_storage_root
-        from agent.governance.db import _verified_stable_binding
-        stable_shared = Path(str(_verified_stable_binding()["shared_volume_path"]))
+        from agent.governance.db import verified_stable_database_binding
+        stable_shared = Path(str(verified_stable_database_binding(
+            stable_anchor_commit=stable_anchor_commit
+        )["shared_volume_path"]))
         selected_dev_storage = resolve_ac_dev_storage_root(stable_shared)
         if dev_storage_root and Path(dev_storage_root).expanduser().absolute() != selected_dev_storage:
             raise click.ClickException("AC dev storage root must equal the canonical stable-volume sibling.")

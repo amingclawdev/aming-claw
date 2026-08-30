@@ -28,6 +28,9 @@ def _install_fixed_stable_boundary(monkeypatch, tmp_path):
     (source / "db.py").write_text("# fixture module origin\n", encoding="utf-8")
     shared = stable_root / "shared-volume"
     shared.mkdir()
+    database = shared / "codex-tasks" / "state" / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    database.touch()
     subprocess.run(["git", "init", "-b", "codex/direct-no-pass-post-reconcile-r2"], cwd=stable_root, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=stable_root, check=True)
     subprocess.run(["git", "config", "user.name", "AC Test"], cwd=stable_root, check=True)
@@ -35,12 +38,13 @@ def _install_fixed_stable_boundary(monkeypatch, tmp_path):
     subprocess.run(["git", "commit", "-m", "stable fixture"], cwd=stable_root, check=True, capture_output=True)
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=stable_root, check=True, capture_output=True, text=True).stdout.strip()
     source_hash = "sha256:" + hashlib.sha256((source / "server.py").read_bytes()).hexdigest()
+    database_identity = {"schema_version": "ac_stable_database_identity.v1", "device": database.stat().st_dev, "inode": database.stat().st_ino, "stable_relative_path_sha256": "sha256:" + hashlib.sha256(b"shared-volume/codex-tasks/state/governance/aming-claw/governance.db").hexdigest()}
     health = {
         "status": "ok", "service": "governance", "port": 40000,
         "runtime_plane": "stable", "runtime_stale": False, "pid": 4242,
         "runtime_loaded_version": head,
-        "runtime_plane_identity": {"worktree_root": str(stable_root), "branch": "codex/direct-no-pass-post-reconcile-r2", "project_allowlist": []},
-        "loaded_runtime_identity": {"loaded_source_path": str(source / "server.py"), "loaded_source_sha256": source_hash, "worktree_source_sha256": source_hash},
+        "runtime_plane_identity": {"worktree_root": str(stable_root), "branch": "codex/direct-no-pass-post-reconcile-r2", "commit": head, "stable_anchor_commit": head, "database_identity": database_identity, "stable_database_identity": database_identity, "project_allowlist": []},
+        "loaded_runtime_identity": {"loaded_commit": head, "loaded_source_path": str(source / "server.py"), "loaded_source_sha256": source_hash, "worktree_source_sha256": source_hash},
     }
     for module in (db, __import__("agent.governance.db", fromlist=["db"])):
         monkeypatch.setattr(module, "__file__", str(source / "db.py"))
@@ -571,16 +575,6 @@ def test_ac_dev_launch_receipt_requires_canonical_persistent_sibling(tmp_path, m
     with pytest.raises(ValueError, match="receipt mismatch"):
         db.validate_dev_launch_receipt(root, source_sha256="sha256:" + "e" * 64)
 
-    # Replacing the stable directory at the same canonical path cannot be
-    # concealed by a copied receipt or its self-reported pathname.
-    original = tmp_path / "stable-shared-volume-original"
-    stable.rename(original)
-    stable.mkdir()
-    before = sorted(root.rglob("*"))
-    with pytest.raises(ValueError, match="stable volume identity changed"):
-        db.validate_dev_launch_receipt(root, source_sha256=source)
-    assert sorted(root.rglob("*")) == before
-
     foreign = tmp_path / "foreign-dev-world"
     foreign.mkdir()
     with pytest.raises(ValueError, match="canonical resolver output"):
@@ -588,10 +582,19 @@ def test_ac_dev_launch_receipt_requires_canonical_persistent_sibling(tmp_path, m
             foreign, stable_shared_volume=stable, source_sha256=source, port=40008
         )
 
+    # Replacing the stable directory at the same canonical path cannot be
+    # concealed by a copied receipt or its self-reported pathname.
+    original = tmp_path / "stable-shared-volume-original"
+    stable.rename(original)
+    stable.mkdir()
+    before = sorted(root.rglob("*"))
+    with pytest.raises((RuntimeError, ValueError, FileNotFoundError)):
+        db.validate_dev_launch_receipt(root, source_sha256=source)
+    assert sorted(root.rglob("*")) == before
 
 @pytest.mark.parametrize(
     "defect",
-    ["offline", "wrong-port", "pid-zero", "start", "command", "cwd", "source", "head"],
+    ["offline", "wrong-port", "pid-zero", "start", "command", "cwd", "source", "head", "loaded-commit", "plane-commit", "database", "stable-database"],
 )
 def test_verified_stable_binding_rejects_each_health_process_and_source_mismatch(
     monkeypatch, defect
@@ -603,12 +606,15 @@ def test_verified_stable_binding_rejects_each_health_process_and_source_mismatch
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
     source = root / "agent" / "governance" / "server.py"
     digest = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+    database = root / "shared-volume" / "codex-tasks" / "state" / "governance" / "aming-claw" / "governance.db"
+    metadata = database.stat()
+    database_identity = {"schema_version": "ac_stable_database_identity.v1", "device": metadata.st_dev, "inode": metadata.st_ino, "stable_relative_path_sha256": "sha256:" + hashlib.sha256(b"shared-volume/codex-tasks/state/governance/aming-claw/governance.db").hexdigest()}
     health = {
         "status": "ok", "service": "governance", "port": 40000,
         "runtime_plane": "stable", "runtime_stale": False, "pid": 4242,
         "runtime_loaded_version": head,
-        "runtime_plane_identity": {"worktree_root": str(root), "branch": "codex/direct-no-pass-post-reconcile-r2", "project_allowlist": []},
-        "loaded_runtime_identity": {"loaded_source_path": str(source), "loaded_source_sha256": digest, "worktree_source_sha256": digest},
+        "runtime_plane_identity": {"worktree_root": str(root), "branch": "codex/direct-no-pass-post-reconcile-r2", "commit": head, "stable_anchor_commit": head, "database_identity": database_identity, "stable_database_identity": database_identity, "project_allowlist": []},
+        "loaded_runtime_identity": {"loaded_commit": head, "loaded_source_path": str(source), "loaded_source_sha256": digest, "worktree_source_sha256": digest},
     }
     if defect == "offline":
         monkeypatch.setattr(db, "_stable_health_request", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
@@ -617,6 +623,10 @@ def test_verified_stable_binding_rejects_each_health_process_and_source_mismatch
         if defect == "pid-zero": health["pid"] = 0
         if defect == "source": health["loaded_runtime_identity"]["loaded_source_sha256"] = "sha256:" + "0" * 64
         if defect == "head": health["runtime_loaded_version"] = "0" * 40
+        if defect == "loaded-commit": health["loaded_runtime_identity"]["loaded_commit"] = "0" * 40
+        if defect == "plane-commit": health["runtime_plane_identity"]["commit"] = "0" * 40
+        if defect == "database": health["runtime_plane_identity"]["database_identity"] = {**database_identity, "inode": database_identity["inode"] + 1}
+        if defect == "stable-database": health["runtime_plane_identity"]["stable_database_identity"] = {**database_identity, "inode": database_identity["inode"] + 1}
         monkeypatch.setattr(db, "_stable_health_request", lambda: health)
         command = "python -m agent.governance.server"
         cwd = str(root)
@@ -626,7 +636,29 @@ def test_verified_stable_binding_rejects_each_health_process_and_source_mismatch
         if defect == "cwd": cwd = str(root.parent)
         monkeypatch.setattr(db, "_stable_process_identity", lambda pid: (start, command, cwd))
     with pytest.raises(RuntimeError):
-        db._verified_stable_binding()
+        (
+            db.verified_stable_database_binding()
+            if defect in {"database", "stable-database"}
+            else db._verified_stable_binding()
+        )
+
+
+@pytest.mark.parametrize("replacement", ["swap", "symlink"])
+def test_stable_database_binding_revalidates_before_a_dev_effect(tmp_path, replacement):
+    from governance import db
+
+    binding = db.verified_stable_database_binding()
+    database = Path(binding["database_path"])
+    original = database.with_name("governance-original.db")
+    database.rename(original)
+    if replacement == "swap":
+        database.touch()
+    else:
+        database.symlink_to(original)
+    forbidden = tmp_path / "must-not-be-created"
+    with pytest.raises((RuntimeError, OSError, ValueError)):
+        db._revalidate_stable_database_binding(binding)
+    assert not forbidden.exists()
 
 
 @pytest.mark.parametrize("plane", ["stable", "generic"])

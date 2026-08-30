@@ -23,6 +23,9 @@ def _install_fixed_stable_boundary(root):
     (source / "db.py").write_text("# fixture module origin\n", encoding="utf-8")
     shared = stable_root / "shared-volume"
     shared.mkdir(exist_ok=True)
+    database = shared / "codex-tasks" / "state" / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    database.touch()
     subprocess.run(["git", "init", "-b", "codex/direct-no-pass-post-reconcile-r2"], cwd=stable_root, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=stable_root, check=True)
     subprocess.run(["git", "config", "user.name", "AC Test"], cwd=stable_root, check=True)
@@ -31,8 +34,9 @@ def _install_fixed_stable_boundary(root):
         subprocess.run(["git", "commit", "-m", "stable fixture"], cwd=stable_root, check=True, capture_output=True)
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=stable_root, check=True, capture_output=True, text=True).stdout.strip()
     digest = "sha256:" + hashlib.sha256((source / "server.py").read_bytes()).hexdigest()
+    identity = {"schema_version": "ac_stable_database_identity.v1", "device": database.stat().st_dev, "inode": database.stat().st_ino, "stable_relative_path_sha256": "sha256:" + hashlib.sha256(b"shared-volume/codex-tasks/state/governance/aming-claw/governance.db").hexdigest()}
     db.__file__ = str(source / "db.py")
-    db._stable_health_request = lambda: {"status": "ok", "service": "governance", "port": 40000, "runtime_plane": "stable", "runtime_stale": False, "pid": 4242, "runtime_loaded_version": head, "runtime_plane_identity": {"worktree_root": str(stable_root), "branch": "codex/direct-no-pass-post-reconcile-r2", "project_allowlist": []}, "loaded_runtime_identity": {"loaded_source_path": str(source / "server.py"), "loaded_source_sha256": digest, "worktree_source_sha256": digest}}
+    db._stable_health_request = lambda: {"status": "ok", "service": "governance", "port": 40000, "runtime_plane": "stable", "runtime_stale": False, "pid": 4242, "runtime_loaded_version": head, "runtime_plane_identity": {"worktree_root": str(stable_root), "branch": "codex/direct-no-pass-post-reconcile-r2", "commit": head, "stable_anchor_commit": head, "database_identity": identity, "stable_database_identity": identity, "project_allowlist": []}, "loaded_runtime_identity": {"loaded_commit": head, "loaded_source_path": str(source / "server.py"), "loaded_source_sha256": digest, "worktree_source_sha256": digest}}
     db._stable_process_identity = lambda pid: ("fixture-start", "python -m agent.governance.server", str(stable_root))
     return shared
 

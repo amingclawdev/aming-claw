@@ -135,6 +135,9 @@ def _verified_stable_binding() -> dict[str, object]:
         health.get("runtime_loaded_version") == head
         and identity.get("worktree_root") == str(stable_root)
         and identity.get("branch") == "codex/direct-no-pass-post-reconcile-r2"
+        and identity.get("commit") == head
+        and identity.get("stable_anchor_commit") == head
+        and loaded.get("loaded_commit") == head
         and loaded.get("loaded_source_path") == str(source_path)
         and loaded.get("loaded_source_sha256") == source_hash
         and loaded.get("worktree_source_sha256") == source_hash
@@ -145,6 +148,80 @@ def _verified_stable_binding() -> dict[str, object]:
     if not shared.is_dir() or shared.is_symlink() or shared.resolve(strict=True) != shared:
         raise RuntimeError("AC stable authority shared volume is invalid")
     return {"shared_volume_path": str(shared), "health": dict(health), "stable_head": head}
+
+
+def verified_stable_database_binding(
+    requested_shared_volume: str | None = None,
+    *,
+    stable_anchor_commit: str | None = None,
+) -> dict[str, object]:
+    """Return the one verified stable DB binding, with TOCTOU revalidation data."""
+    binding = _verified_stable_binding()
+    shared = _absolute_non_symlink_root(
+        Path(str(binding["shared_volume_path"])), create=False
+    )
+    if requested_shared_volume is not None:
+        requested = _absolute_non_symlink_root(
+            Path(requested_shared_volume), create=False
+        )
+        if requested != shared:
+            raise RuntimeError("AC dev runtime requires the exact stable-worktree shared volume")
+    head = str(binding["stable_head"])
+    if stable_anchor_commit is not None and str(stable_anchor_commit).lower() != head:
+        raise RuntimeError("stable service authority changed while binding its database")
+    database = (shared / Path(AC_DATABASE_STABLE_RELATIVE_PATH).relative_to("shared-volume")).absolute()
+    before = database.stat(follow_symlinks=False)
+    if (
+        database.is_symlink()
+        or not stat.S_ISREG(before.st_mode)
+        or database.resolve(strict=True) != database
+    ):
+        raise RuntimeError("AC dev runtime canonical stable database identity is invalid")
+    identity = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": int(before.st_dev),
+        "inode": int(before.st_ino),
+        "stable_relative_path_sha256": "sha256:" + hashlib.sha256(
+            AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+        ).hexdigest(),
+    }
+    health_identity = dict(binding["health"].get("runtime_plane_identity") or {})
+    if (
+        health_identity.get("database_identity") != identity
+        or health_identity.get("stable_database_identity") != identity
+    ):
+        raise RuntimeError("stable service database identity differs from the stable worktree")
+    after = database.stat(follow_symlinks=False)
+    if (
+        database.is_symlink()
+        or not stat.S_ISREG(after.st_mode)
+        or (int(after.st_dev), int(after.st_ino)) != (int(before.st_dev), int(before.st_ino))
+    ):
+        raise RuntimeError("stable database identity changed while binding")
+    return {
+        **binding,
+        "shared_volume_path": str(shared),
+        "database_path": str(database),
+        "stable_database_identity": identity,
+    }
+
+
+def _revalidate_stable_database_binding(binding: Mapping[str, object]) -> None:
+    """Fail before a dev root, receipt, or DB effect if the stable DB was swapped."""
+    database = Path(str(binding.get("database_path") or ""))
+    expected = binding.get("stable_database_identity")
+    if not database or not isinstance(expected, Mapping):
+        raise RuntimeError("stable database binding is incomplete")
+    metadata = database.stat(follow_symlinks=False)
+    actual = {
+        "schema_version": "ac_stable_database_identity.v1",
+        "device": int(metadata.st_dev), "inode": int(metadata.st_ino),
+        "stable_relative_path_sha256": "sha256:" + hashlib.sha256(
+            AC_DATABASE_STABLE_RELATIVE_PATH.encode("utf-8")
+        ).hexdigest(),
+    }
+    if database.is_symlink() or not stat.S_ISREG(metadata.st_mode) or actual != dict(expected):
+        raise RuntimeError("stable database identity changed before dev effect")
 
 _DEV_DENIED_SCHEMA_ACTIONS = frozenset(
     code
@@ -1264,7 +1341,8 @@ def _dev_storage_root(*, create: bool = False) -> Path:
         raise RuntimeError(
             "AC dev runtime requires an explicit AMING_CLAW_DEV_STORAGE_ROOT"
         )
-    binding = _verified_stable_binding()
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
     stable = _absolute_non_symlink_root(Path(str(binding["shared_volume_path"])), create=False)
     stable_raw = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
     if not stable_raw or _absolute_non_symlink_root(Path(stable_raw), create=False) != stable:
@@ -1292,7 +1370,8 @@ def write_dev_launch_receipt(
     """Persist the source-backed foreground launch admission before server exec."""
     root = _absolute_non_symlink_root(Path(storage_root), create=False)
     stable = _absolute_non_symlink_root(Path(stable_shared_volume), create=False)
-    binding = _verified_stable_binding()
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
     current_stable = str(binding.get("shared_volume_path") or "")
     if not current_stable or _absolute_non_symlink_root(Path(current_stable), create=False) != stable:
         raise ValueError("AC dev launch receipt stable volume is not current canonical authority")
@@ -1352,7 +1431,8 @@ def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str)
         "storage_inode": int(root_stat.st_ino), "source_sha256": source_sha256}
     if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in required.items()):
         raise ValueError("AC dev launch receipt mismatch")
-    binding = _verified_stable_binding()
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
     stable = _absolute_non_symlink_root(Path(str(binding.get("shared_volume_path") or "")), create=False)
     if receipt.get("stable_shared_volume") != str(stable):
         raise ValueError("AC dev launch receipt stable volume claim mismatch")
