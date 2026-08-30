@@ -192,22 +192,56 @@ def _dev_running_identity_matches(
     dev_database_identity: Mapping[str, Any],
 ) -> bool:
     identity = health.get("runtime_plane_identity")
-    if not isinstance(identity, Mapping):
+    loaded_identity = health.get("loaded_runtime_identity")
+    if not isinstance(identity, Mapping) or not isinstance(loaded_identity, Mapping):
         return False
     return bool(
         health.get("runtime_plane") == "dev"
         and health.get("port") == AC_DEV_SERVICE_PORT
         and health.get("bind_host") == "127.0.0.1"
+        and type(health.get("pid")) is int
+        and int(health.get("pid") or 0) > 0
         and health.get("runtime_loaded_version") == expected.get("commit")
         and health.get("runtime_stale") is False
+        and identity.get("schema_version") == "ac_runtime_plane_identity.v1"
         and identity.get("status") == "ready"
+        and identity.get("plane") == "dev"
         and identity.get("bind_host") == "127.0.0.1"
+        and identity.get("port") == AC_DEV_SERVICE_PORT
+        and identity.get("expected_port") == AC_DEV_SERVICE_PORT
+        and identity.get("pid") == health.get("pid")
         and identity.get("worktree_root") == expected.get("root")
         and identity.get("branch") == AC_DEV_BRANCH
+        and identity.get("expected_branch") == AC_DEV_BRANCH
         and identity.get("commit") == expected.get("commit")
+        and identity.get("worktree_dirty") is False
+        and identity.get("worktree_dirty_files") == []
         and identity.get("stable_anchor_commit") == stable_anchor_commit
+        and dev_database_identity.get("schema_version")
+        == "ac_governance_database_identity.v2"
+        and dev_database_identity.get("world_id") == "ac-dev"
+        and dev_database_identity.get("project_id") == "aming-claw"
+        and type(dev_database_identity.get("device")) is int
+        and int(dev_database_identity.get("device") or 0) > 0
+        and type(dev_database_identity.get("inode")) is int
+        and int(dev_database_identity.get("inode") or 0) > 0
+        and _exact_sha256(dev_database_identity.get("relative_path_sha256"))
+        and _exact_sha256(dev_database_identity.get("genesis_sha256"))
         and identity.get("database_identity") == dict(dev_database_identity)
         and identity.get("world_id") == "ac-dev"
+        and loaded_identity.get("schema_version")
+        == "governance_loaded_runtime_identity.v1"
+        and loaded_identity.get("loaded_commit") == expected.get("commit")
+        and loaded_identity.get("loaded_pid") == health.get("pid")
+        and _git_commit_identity_matches(
+            loaded_identity.get("worktree_head_version"), expected.get("commit")
+        )
+        and loaded_identity.get("runtime_stale") is False
+        and loaded_identity.get("runtime_stale_reasons") == []
+        and loaded_identity.get("loaded_source_sha256")
+        == expected.get("source_sha256")
+        and loaded_identity.get("worktree_source_sha256")
+        == expected.get("source_sha256")
     )
 
 
@@ -1152,6 +1186,10 @@ def start(
 ):
     """Start governance in the foreground without spawning plugin-owned workers."""
     _require_source_checkout_matches_loaded_package(workspace)
+    health = None
+    database_binding = None
+    cutover_activation = None
+    dev_identity = None
     if runtime_plane == "dev":
         if port != AC_DEV_SERVICE_PORT:
             raise click.ClickException(
@@ -1174,6 +1212,43 @@ def start(
             if dev_storage_root
             else runtime_root / "world"
         )
+        # Listener ownership is the first dev-world admission decision.  A
+        # running or foreign process must be rejected before bootstrap, source
+        # CAS, activation validation, or any dedicated-root filesystem write.
+        health = _probe_governance(port)
+        if health and health.get("status") == "ok" and health.get("service") == "governance":
+            runtime_identity = health.get("runtime_plane_identity")
+            reported_database_identity = (
+                dict(runtime_identity.get("database_identity"))
+                if isinstance(runtime_identity, Mapping)
+                and isinstance(runtime_identity.get("database_identity"), Mapping)
+                else {}
+            )
+            if not _dev_running_identity_matches(
+                health,
+                dev_identity,
+                stable_anchor_commit=stable_anchor_commit,
+                dev_database_identity=reported_database_identity,
+            ):
+                raise click.ClickException(
+                    "Port 40008 is occupied by governance with a mismatched AC dev runtime identity."
+                )
+            cutover_activation = _require_dev_cutover_activation(
+                str(selected_dev_storage),
+                source_identity=dev_identity,
+                database_identity=reported_database_identity,
+            )
+            dashboard = _dashboard_url(f"http://localhost:{port}")
+            version = health.get("version") or health.get("runtime_version") or "unknown"
+            click.echo(f"Governance already running on port {port} (version {version}).")
+            click.echo(f"Dashboard: {dashboard}")
+            return
+        if _port_is_open(port):
+            owner = _port_owner_hint(port)
+            raise click.ClickException(
+                f"Port {port} is already in use{owner}, but /api/health is not Aming Claw governance. "
+                "Stop that process or choose a different --port."
+            )
         database_binding = _canonical_dev_database_binding(
             str(selected_dev_storage),
             source_identity=dev_identity,
@@ -1193,23 +1268,10 @@ def start(
         stable_anchor_commit = stable_identity["commit"]
     else:
         stable_identity = None
-        dev_identity = None
-        database_binding = None
-    health = _probe_governance(port)
+    if runtime_plane != "dev":
+        health = _probe_governance(port)
     if health and health.get("status") == "ok" and health.get("service") == "governance":
-        if runtime_plane == "dev":
-            if not _dev_running_identity_matches(
-                health,
-                dev_identity or {},
-                stable_anchor_commit=stable_anchor_commit,
-                dev_database_identity=(database_binding or {}).get(
-                    "dev_database_identity", {}
-                ),
-            ):
-                raise click.ClickException(
-                    "Port 40008 is occupied by governance with a mismatched AC dev runtime identity."
-                )
-        elif runtime_plane == "stable" and not _stable_running_identity_matches(
+        if runtime_plane == "stable" and not _stable_running_identity_matches(
             health, stable_identity or {}
         ):
             raise click.ClickException(
@@ -1221,7 +1283,7 @@ def start(
         click.echo(f"Governance already running on port {port} (version {version}).")
         click.echo(f"Dashboard: {dashboard}")
         return
-    if _port_is_open(port):
+    if runtime_plane != "dev" and _port_is_open(port):
         owner = _port_owner_hint(port)
         raise click.ClickException(
             f"Port {port} is already in use{owner}, but /api/health is not Aming Claw governance. "

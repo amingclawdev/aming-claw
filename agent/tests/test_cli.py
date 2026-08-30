@@ -3586,11 +3586,19 @@ class TestACDevRuntimeCli:
             "source_sha256": "sha256:" + "c" * 64,
         }
         runtime_identity = {
+            "schema_version": "ac_runtime_plane_identity.v1",
             "status": "ready",
+            "plane": "dev",
             "bind_host": "127.0.0.1",
+            "port": cli.AC_DEV_SERVICE_PORT,
+            "expected_port": cli.AC_DEV_SERVICE_PORT,
+            "pid": 12345,
             "worktree_root": str(candidate_root.resolve()),
             "branch": cli.AC_DEV_BRANCH,
+            "expected_branch": cli.AC_DEV_BRANCH,
             "commit": candidate,
+            "worktree_dirty": False,
+            "worktree_dirty_files": [],
             "stable_anchor_commit": stable,
         }
         database_identity = {
@@ -3611,9 +3619,20 @@ class TestACDevRuntimeCli:
             "port": cli.AC_DEV_SERVICE_PORT,
             "runtime_plane": "dev",
             "bind_host": "127.0.0.1",
+            "pid": 12345,
             "runtime_loaded_version": candidate,
             "runtime_stale": False,
             "runtime_plane_identity": runtime_identity,
+            "loaded_runtime_identity": {
+                "schema_version": "governance_loaded_runtime_identity.v1",
+                "loaded_commit": candidate,
+                "loaded_pid": 12345,
+                "worktree_head_version": candidate[:12],
+                "runtime_stale": False,
+                "runtime_stale_reasons": [],
+                "loaded_source_sha256": source_identity["source_sha256"],
+                "worktree_source_sha256": source_identity["source_sha256"],
+            },
         }
         health.update(health_override)
         monkeypatch.setattr(
@@ -3621,27 +3640,86 @@ class TestACDevRuntimeCli:
         )
         monkeypatch.setattr(cli, "_source_git_identity", lambda: source_identity)
         monkeypatch.setattr(cli, "_local_stable_source_anchor", lambda: stable)
-        monkeypatch.setattr(
-            cli,
-            "_canonical_dev_database_binding",
-            lambda *_args, **_kwargs: {
-                "dev_storage_root": str((tmp_path / "dev-world").resolve()),
-                "database_path": str(tmp_path / "dev-world" / "governance.db"),
-                "dev_database_identity": database_identity,
-                "genesis_sha256": "sha256:" + "2" * 64,
-                "source_only": True,
-                "rows_copied": 0,
-            },
-        )
+        side_effects = []
+
+        def forbidden_storage(*_args, **_kwargs):
+            side_effects.append("storage")
+            raise AssertionError("occupied port must reject before storage")
+
+        def forbidden_activation(*_args, **_kwargs):
+            side_effects.append("activation")
+            raise AssertionError("mismatched runtime must reject before activation")
+
+        monkeypatch.setattr(cli, "_canonical_dev_database_binding", forbidden_storage)
+        monkeypatch.setattr(cli, "_require_dev_cutover_activation", forbidden_activation)
         monkeypatch.setattr(cli, "_probe_governance", lambda _port: health)
+        dev_root = tmp_path / "dev-world"
 
         result = CliRunner().invoke(
             main,
-            ["start", "--runtime-plane", "dev", "--port", "40008"],
+            [
+                "start", "--runtime-plane", "dev", "--port", "40008",
+                "--dev-storage-root", str(dev_root),
+            ],
         )
 
         assert result.exit_code != 0
         assert "mismatched AC dev runtime identity" in result.output
+        assert side_effects == []
+        assert not dev_root.exists()
+
+    def test_dev_start_rejects_non_governance_listener_before_storage(
+        self, monkeypatch, tmp_path
+    ):
+        import agent.cli as cli
+
+        candidate_root = tmp_path / "ac-dev"
+        candidate_root.mkdir()
+        source_identity = {
+            "root": str(candidate_root.resolve()),
+            "branch": cli.AC_DEV_BRANCH,
+            "commit": "b" * 40,
+            "dirty": "",
+            "source_sha256": "sha256:" + "c" * 64,
+        }
+        side_effects = []
+
+        def forbidden(name):
+            def reject(*_args, **_kwargs):
+                side_effects.append(name)
+                raise AssertionError("occupied foreign port must be pre-side-effect")
+
+            return reject
+
+        monkeypatch.setattr(
+            cli, "_require_source_checkout_matches_loaded_package", lambda _workspace: None
+        )
+        monkeypatch.setattr(cli, "_source_git_identity", lambda: source_identity)
+        monkeypatch.setattr(cli, "_local_stable_source_anchor", lambda: "a" * 40)
+        monkeypatch.setattr(cli, "_probe_governance", lambda _port: None)
+        monkeypatch.setattr(cli, "_port_is_open", lambda _port: True)
+        monkeypatch.setattr(cli, "_port_owner_hint", lambda _port: " PID=4321")
+        monkeypatch.setattr(
+            cli, "_canonical_dev_database_binding", forbidden("storage")
+        )
+        monkeypatch.setattr(
+            cli, "_require_dev_cutover_activation", forbidden("activation")
+        )
+        dev_root = tmp_path / "dev-world"
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "start", "--runtime-plane", "dev", "--port", "40008",
+                "--dev-storage-root", str(dev_root),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "not Aming Claw governance" in result.output
+        assert "PID=4321" in result.output
+        assert side_effects == []
+        assert not dev_root.exists()
 
     def test_branch_service_validate_defaults_to_40008_and_binds_anchor(
         self, monkeypatch, tmp_path
