@@ -337,6 +337,8 @@ def test_reconcile_dev_worktree_uses_target_branch_base(tmp_path):
 
     def _run(cmd, **kwargs):
         run_calls.append((cmd, kwargs.get("cwd")))
+        if cmd[:3] == ["git", "worktree", "add"]:
+            Path(cmd[-2]).mkdir(parents=True, exist_ok=True)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     with mock.patch("subprocess.run", side_effect=_run), mock.patch("os.makedirs"):
