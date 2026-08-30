@@ -3,6 +3,8 @@ import sys
 import tempfile
 import unittest
 import subprocess
+import hashlib
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 agent_dir = os.path.join(os.path.dirname(__file__), "..")
@@ -13,10 +15,22 @@ from executor_worker import ExecutorWorker
 
 def _ac_worker(workspace):
     workspace = os.path.realpath(workspace)
-    storage = os.path.realpath(os.path.join(workspace, "dev-storage"))
-    os.makedirs(storage, exist_ok=True)
-    with patch.dict(os.environ, {"AMING_CLAW_DEV_STORAGE_ROOT": storage}):
-        return ExecutorWorker("aming-claw", governance_url="http://127.0.0.1:40008", workspace=workspace)
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    from agent.governance.db import write_dev_launch_receipt
+
+    # The worker's Git worktree is never its data world.  Bind a persistent
+    # temp stable volume and its resolver-derived sibling instead.
+    persistent_root = Path(workspace).resolve().parent
+    stable = persistent_root / "stable-shared-volume"
+    stable.mkdir(exist_ok=True)
+    storage = resolve_ac_dev_storage_root(stable)
+    storage.mkdir(parents=True, exist_ok=True)
+    server_source = Path(agent_dir) / "governance" / "server.py"
+    source_hash = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
+    os.environ["AMING_CLAW_SHARED_VOLUME"] = str(stable)
+    os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] = str(storage)
+    write_dev_launch_receipt(storage, stable_shared_volume=stable, source_sha256=source_hash, port=40008)
+    return ExecutorWorker("aming-claw", governance_url="http://127.0.0.1:40008", workspace=workspace)
 
 
 def _git(cmd, cwd):

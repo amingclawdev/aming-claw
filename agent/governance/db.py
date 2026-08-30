@@ -1207,13 +1207,17 @@ def write_dev_launch_receipt(
         raise ValueError("AC dev launch receipt root must be canonical resolver output")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(source_sha256 or "")):
         raise ValueError("AC dev launch receipt source hash is invalid")
-    root_stat, parent_stat = root.stat(follow_symlinks=False), stable.parent.stat(follow_symlinks=False)
+    root_stat = root.stat(follow_symlinks=False)
+    stable_stat = stable.stat(follow_symlinks=False)
+    parent_stat = stable.parent.stat(follow_symlinks=False)
     receipt = {
         "schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA,
         "world_id": AC_DEV_WORLD_ID, "project_id": AC_PROJECT_ID,
         "runtime_plane": DEV_RUNTIME_PLANE, "port": 40008, "background": False,
         "storage_root": str(root), "storage_device": int(root_stat.st_dev), "storage_inode": int(root_stat.st_ino),
         "stable_shared_volume": str(stable),
+        "stable_shared_volume_device": int(stable_stat.st_dev),
+        "stable_shared_volume_inode": int(stable_stat.st_ino),
         "stable_parent_device": int(parent_stat.st_dev), "stable_parent_inode": int(parent_stat.st_ino),
         "source_sha256": str(source_sha256),
     }
@@ -1221,6 +1225,10 @@ def write_dev_launch_receipt(
     if path.exists() and path.is_symlink():
         raise ValueError("AC dev launch receipt cannot be a symlink")
     temporary = root / (AC_DEV_LAUNCH_RECEIPT_NAME + ".tmp")
+    # The authority is live filesystem identity, not this receipt's path claim.
+    stable_after = stable.stat(follow_symlinks=False)
+    if (int(stable_after.st_dev), int(stable_after.st_ino)) != (int(stable_stat.st_dev), int(stable_stat.st_ino)):
+        raise ValueError("AC dev launch receipt stable volume changed during creation")
     temporary.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     os.replace(temporary, path)
     return receipt
@@ -1252,6 +1260,12 @@ def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str)
     stable = _absolute_non_symlink_root(Path(stable_raw), create=False)
     if receipt.get("stable_shared_volume") != str(stable):
         raise ValueError("AC dev launch receipt stable volume claim mismatch")
+    stable_stat = stable.stat(follow_symlinks=False)
+    if (
+        receipt.get("stable_shared_volume_device") != int(stable_stat.st_dev)
+        or receipt.get("stable_shared_volume_inode") != int(stable_stat.st_ino)
+    ):
+        raise ValueError("AC dev launch receipt stable volume identity changed")
     parent_stat = stable.parent.stat(follow_symlinks=False)
     if receipt.get("stable_parent_device") != int(parent_stat.st_dev) or receipt.get("stable_parent_inode") != int(parent_stat.st_ino):
         raise ValueError("AC dev launch receipt stable parent identity changed")

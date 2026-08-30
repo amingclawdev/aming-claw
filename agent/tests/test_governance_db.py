@@ -535,6 +535,16 @@ def test_ac_dev_launch_receipt_requires_canonical_persistent_sibling(tmp_path, m
     with pytest.raises(ValueError, match="receipt mismatch"):
         db.validate_dev_launch_receipt(root, source_sha256="sha256:" + "e" * 64)
 
+    # Replacing the stable directory at the same canonical path cannot be
+    # concealed by a copied receipt or its self-reported pathname.
+    original = tmp_path / "stable-shared-volume-original"
+    stable.rename(original)
+    stable.mkdir()
+    before = sorted(root.rglob("*"))
+    with pytest.raises(ValueError, match="stable volume identity changed"):
+        db.validate_dev_launch_receipt(root, source_sha256=source)
+    assert sorted(root.rglob("*")) == before
+
     foreign = tmp_path / "foreign-dev-world"
     foreign.mkdir()
     with pytest.raises(ValueError, match="canonical resolver output"):
