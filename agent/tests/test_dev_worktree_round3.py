@@ -13,6 +13,30 @@ sys.path.insert(0, agent_dir)
 from executor_worker import ExecutorWorker
 
 
+def _install_fixed_stable_boundary(root):
+    """Use real temporary Git worktree state with fixed private boundaries."""
+    from agent.governance import db
+    stable_root = (Path(root) / "stable-runtime").resolve()
+    source = stable_root / "agent" / "governance"
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "server.py").write_text("# stable fixture\n", encoding="utf-8")
+    (source / "db.py").write_text("# fixture module origin\n", encoding="utf-8")
+    shared = stable_root / "shared-volume"
+    shared.mkdir(exist_ok=True)
+    subprocess.run(["git", "init", "-b", "codex/direct-no-pass-post-reconcile-r2"], cwd=stable_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=stable_root, check=True)
+    subprocess.run(["git", "config", "user.name", "AC Test"], cwd=stable_root, check=True)
+    subprocess.run(["git", "add", "."], cwd=stable_root, check=True)
+    if subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=stable_root, capture_output=True).returncode:
+        subprocess.run(["git", "commit", "-m", "stable fixture"], cwd=stable_root, check=True, capture_output=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=stable_root, check=True, capture_output=True, text=True).stdout.strip()
+    digest = "sha256:" + hashlib.sha256((source / "server.py").read_bytes()).hexdigest()
+    db.__file__ = str(source / "db.py")
+    db._stable_health_request = lambda: {"status": "ok", "service": "governance", "port": 40000, "runtime_plane": "stable", "runtime_stale": False, "pid": 4242, "runtime_loaded_version": head, "runtime_plane_identity": {"worktree_root": str(stable_root), "branch": "codex/direct-no-pass-post-reconcile-r2", "project_allowlist": []}, "loaded_runtime_identity": {"loaded_source_path": str(source / "server.py"), "loaded_source_sha256": digest, "worktree_source_sha256": digest}}
+    db._stable_process_identity = lambda pid: ("fixture-start", "python -m agent.governance.server", str(stable_root))
+    return shared
+
+
 def _ac_worker(workspace):
     workspace = os.path.realpath(workspace)
     from agent.runtime_plane import resolve_ac_dev_storage_root
@@ -21,8 +45,7 @@ def _ac_worker(workspace):
     # The worker's Git worktree is never its data world.  Bind a persistent
     # temp stable volume and its resolver-derived sibling instead.
     persistent_root = Path(workspace).resolve().parent
-    stable = persistent_root / "stable-shared-volume"
-    stable.mkdir(exist_ok=True)
+    stable = _install_fixed_stable_boundary(persistent_root)
     storage = resolve_ac_dev_storage_root(stable)
     storage.mkdir(parents=True, exist_ok=True)
     server_source = Path(agent_dir) / "governance" / "server.py"
@@ -54,6 +77,18 @@ def _repo_with_worktree(tmpdir, name="worker"):
 
 
 class TestDevWorktreeRound3(unittest.TestCase):
+    def setUp(self):
+        from agent.governance import db
+        self._db_boundary = (db.__file__, db._stable_health_request, db._stable_process_identity)
+
+    def tearDown(self):
+        # The fixed boundary is private to each worker test; never leak a
+        # synthetic storage claim into deploy/CLI tests that run afterward.
+        os.environ.pop("AMING_CLAW_SHARED_VOLUME", None)
+        os.environ.pop("AMING_CLAW_DEV_STORAGE_ROOT", None)
+        from agent.governance import db
+        db.__file__, db._stable_health_request, db._stable_process_identity = self._db_boundary
+
     def test_dev_session_uses_worktree_workspace(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo, worktree = _repo_with_worktree(tmpdir)

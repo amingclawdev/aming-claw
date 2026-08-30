@@ -53,34 +53,60 @@ AC_DEV_LAUNCH_RECEIPT_NAME = "launch-receipt.json"
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
 _DEV_DATABASE_WRITER_LEASES_LOCK = threading.RLock()
-_TEST_STABLE_BINDING_PROBE = None
+def _stable_health_request() -> dict[str, object]:
+    """Fixed read-only localhost stable health boundary."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:40000/api/health", timeout=2) as response:
+            payload = json.loads(response.read(65536).decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError("AC stable authority is unavailable") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("AC stable authority health is invalid")
+    return payload
 
 
-def _set_test_stable_binding_probe(probe):
-    """Test-only in-process seam; never read from environment or requests."""
-    global _TEST_STABLE_BINDING_PROBE
-    _TEST_STABLE_BINDING_PROBE = probe
+def _stable_process_identity(pid: int) -> tuple[str, str, str]:
+    """Read start, argv and cwd from the OS; a PID alone is never authority."""
+    if not isinstance(pid, int) or pid <= 0:
+        raise RuntimeError("AC stable authority PID is invalid")
+    start = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=2, check=False).stdout.strip()
+    command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=2, check=False).stdout.strip()
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        # macOS does not expose procfs.  ``lsof`` is the OS-owned equivalent
+        # for a process's current directory; do not weaken this to a PID-only
+        # check when procfs is absent.
+        try:
+            lsof = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            cwd = next(
+                (line[1:] for line in lsof.stdout.splitlines() if line.startswith("n")),
+                "",
+            )
+        except (OSError, subprocess.SubprocessError):
+            cwd = ""
+    if not start or not command or not cwd:
+        raise RuntimeError("AC stable authority process identity is unavailable")
+    return start, command, cwd
 
 
 def _verified_stable_binding() -> dict[str, object]:
     """Read-only fixed-40000 + unique stable-worktree authority for AC dev."""
-    probe = _TEST_STABLE_BINDING_PROBE
-    if probe is not None:
-        health = probe()
-        if isinstance(health, Mapping) and health.get("shared_volume_path"):
-            return dict(health)
-    else:
-        try:
-            with urllib.request.urlopen("http://127.0.0.1:40000/api/health", timeout=2) as response:
-                health = json.loads(response.read(65536).decode("utf-8"))
-        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-            raise RuntimeError("AC stable authority is unavailable") from exc
+    health = _stable_health_request()
     if not isinstance(health, Mapping) or not (
         health.get("status") == "ok" and health.get("service") == "governance"
         and health.get("port") == 40000 and health.get("runtime_plane") == "stable"
-        and health.get("runtime_stale") is False and isinstance(health.get("pid"), int)
+        and health.get("runtime_stale") is False
+        and isinstance(health.get("pid"), int) and health["pid"] > 0
     ):
         raise RuntimeError("AC stable authority health is invalid")
+    _start, command, cwd = _stable_process_identity(int(health["pid"]))
     root = Path(__file__).resolve().parents[2]
     result = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=5, check=False)
     roots = []
@@ -91,6 +117,15 @@ def _verified_stable_binding() -> dict[str, object]:
     if len(roots) != 1:
         raise RuntimeError("AC stable authority worktree is unavailable")
     stable_root = roots[0]
+    server_command = "agent.governance.server" in command or (
+        "-m agent.cli" in command and " start " in f" {command} "
+    )
+    if (
+        not _start
+        or Path(cwd).resolve(strict=True) != stable_root
+        or not server_command
+    ):
+        raise RuntimeError("AC stable authority process binding is invalid")
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=stable_root, capture_output=True, text=True, timeout=5, check=False).stdout.strip().lower()
     source_path = stable_root / "agent" / "governance" / "server.py"
     source_hash = "sha256:" + hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -1222,6 +1257,13 @@ def _absolute_non_symlink_root(path: Path, *, create: bool) -> Path:
 
 def _dev_storage_root(*, create: bool = False) -> Path:
     """Resolve the only AC dev world; raw env values are assertions, not authority."""
+    # Reject the missing required dev claim before contacting any authority or
+    # resolving a potentially hostile sibling path.  This is zero-mutation.
+    raw = os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
+    if not raw:
+        raise RuntimeError(
+            "AC dev runtime requires an explicit AMING_CLAW_DEV_STORAGE_ROOT"
+        )
     binding = _verified_stable_binding()
     stable = _absolute_non_symlink_root(Path(str(binding["shared_volume_path"])), create=False)
     stable_raw = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
@@ -1229,11 +1271,6 @@ def _dev_storage_root(*, create: bool = False) -> Path:
         raise RuntimeError("AC dev stable shared-volume claim mismatches verified authority")
     from agent.runtime_plane import resolve_ac_dev_storage_root
     expected = resolve_ac_dev_storage_root(stable)
-    raw = os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
-    if not raw:
-        raise RuntimeError(
-            "AC dev runtime requires an explicit AMING_CLAW_DEV_STORAGE_ROOT"
-        )
     supplied = Path(raw).expanduser().absolute()
     # Compare before any mkdir/open; a symlink/traversal is an invalid claim.
     if supplied.is_symlink():

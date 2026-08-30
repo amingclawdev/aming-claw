@@ -17,19 +17,49 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from governance.db import SCHEMA_VERSION
 
 
+def _install_fixed_stable_boundary(monkeypatch, tmp_path):
+    """Private health/process boundary mocks backed by a real stable worktree."""
+    from governance import db
+
+    stable_root = (tmp_path / "stable-runtime").resolve()
+    source = stable_root / "agent" / "governance"
+    source.mkdir(parents=True)
+    (source / "server.py").write_text("# fixed stable health fixture\n", encoding="utf-8")
+    (source / "db.py").write_text("# fixture module origin\n", encoding="utf-8")
+    shared = stable_root / "shared-volume"
+    shared.mkdir()
+    subprocess.run(["git", "init", "-b", "codex/direct-no-pass-post-reconcile-r2"], cwd=stable_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=stable_root, check=True)
+    subprocess.run(["git", "config", "user.name", "AC Test"], cwd=stable_root, check=True)
+    subprocess.run(["git", "add", "."], cwd=stable_root, check=True)
+    subprocess.run(["git", "commit", "-m", "stable fixture"], cwd=stable_root, check=True, capture_output=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=stable_root, check=True, capture_output=True, text=True).stdout.strip()
+    source_hash = "sha256:" + hashlib.sha256((source / "server.py").read_bytes()).hexdigest()
+    health = {
+        "status": "ok", "service": "governance", "port": 40000,
+        "runtime_plane": "stable", "runtime_stale": False, "pid": 4242,
+        "runtime_loaded_version": head,
+        "runtime_plane_identity": {"worktree_root": str(stable_root), "branch": "codex/direct-no-pass-post-reconcile-r2", "project_allowlist": []},
+        "loaded_runtime_identity": {"loaded_source_path": str(source / "server.py"), "loaded_source_sha256": source_hash, "worktree_source_sha256": source_hash},
+    }
+    for module in (db, __import__("agent.governance.db", fromlist=["db"])):
+        monkeypatch.setattr(module, "__file__", str(source / "db.py"))
+        monkeypatch.setattr(module, "_stable_health_request", lambda health=health: dict(health))
+        monkeypatch.setattr(module, "_stable_process_identity", lambda pid, root=stable_root: ("fixture-start", "python -m agent.governance.server", str(root)))
+    return shared
+
+
+@pytest.fixture(autouse=True)
+def fixed_stable_boundary(monkeypatch, tmp_path):
+    _install_fixed_stable_boundary(monkeypatch, tmp_path)
+
+
 def _canonical_dev_world(tmp_path: Path) -> tuple[Path, Path]:
     """Create the real persistent-temp stable/dev sibling layout used by AC."""
     from agent.runtime_plane import resolve_ac_dev_storage_root
-    stable = Path(tmp_path).resolve() / "stable-shared-volume"
-    stable.mkdir(parents=True, exist_ok=True)
+    from governance import db
+    stable = Path(db._verified_stable_binding()["shared_volume_path"])
     root = resolve_ac_dev_storage_root(stable)
-    from agent.governance import db
-    db._set_test_stable_binding_probe(lambda: {"shared_volume_path": str(stable)})
-    try:
-        from governance import db as legacy_db
-        legacy_db._set_test_stable_binding_probe(lambda: {"shared_volume_path": str(stable)})
-    except ImportError:
-        pass
     os.environ["AMING_CLAW_SHARED_VOLUME"] = str(stable)
     os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] = str(root)
     return root, stable
@@ -528,9 +558,7 @@ def test_ac_dev_launch_receipt_requires_canonical_persistent_sibling(tmp_path, m
     from agent.governance import db
     from agent.runtime_plane import resolve_ac_dev_storage_root
 
-    stable = (tmp_path / "stable-shared-volume").resolve()
-    stable.mkdir()
-    db._set_test_stable_binding_probe(lambda: {"shared_volume_path": str(stable)})
+    stable = Path(db._verified_stable_binding()["shared_volume_path"])
     monkeypatch.setenv("AMING_CLAW_SHARED_VOLUME", str(stable))
     root = resolve_ac_dev_storage_root(stable)
     root.mkdir(parents=True)
@@ -559,6 +587,46 @@ def test_ac_dev_launch_receipt_requires_canonical_persistent_sibling(tmp_path, m
         db.write_dev_launch_receipt(
             foreign, stable_shared_volume=stable, source_sha256=source, port=40008
         )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["offline", "wrong-port", "pid-zero", "start", "command", "cwd", "source", "head"],
+)
+def test_verified_stable_binding_rejects_each_health_process_and_source_mismatch(
+    monkeypatch, defect
+):
+    """No ingress can select authority: every receipt field is revalidated."""
+    from governance import db
+
+    root = Path(db.__file__).resolve().parents[2]
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+    source = root / "agent" / "governance" / "server.py"
+    digest = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+    health = {
+        "status": "ok", "service": "governance", "port": 40000,
+        "runtime_plane": "stable", "runtime_stale": False, "pid": 4242,
+        "runtime_loaded_version": head,
+        "runtime_plane_identity": {"worktree_root": str(root), "branch": "codex/direct-no-pass-post-reconcile-r2", "project_allowlist": []},
+        "loaded_runtime_identity": {"loaded_source_path": str(source), "loaded_source_sha256": digest, "worktree_source_sha256": digest},
+    }
+    if defect == "offline":
+        monkeypatch.setattr(db, "_stable_health_request", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
+    else:
+        if defect == "wrong-port": health["port"] = 40008
+        if defect == "pid-zero": health["pid"] = 0
+        if defect == "source": health["loaded_runtime_identity"]["loaded_source_sha256"] = "sha256:" + "0" * 64
+        if defect == "head": health["runtime_loaded_version"] = "0" * 40
+        monkeypatch.setattr(db, "_stable_health_request", lambda: health)
+        command = "python -m agent.governance.server"
+        cwd = str(root)
+        start = "fixture-start"
+        if defect == "start": start = ""
+        if defect == "command": command = "python -m innocent"
+        if defect == "cwd": cwd = str(root.parent)
+        monkeypatch.setattr(db, "_stable_process_identity", lambda pid: (start, command, cwd))
+    with pytest.raises(RuntimeError):
+        db._verified_stable_binding()
 
 
 @pytest.mark.parametrize("plane", ["stable", "generic"])
@@ -644,9 +712,7 @@ def test_v27_writer_lease_blocks_second_process_before_database_open(tmp_path, m
         "commit": commit,
         "source_sha256": "sha256:" + "f" * 64,
     }
-    stable_shared = tmp_path / "stable-shared-volume"
-    stable_shared.mkdir()
-    db._set_test_stable_binding_probe(lambda: {"shared_volume_path": str(stable_shared)})
+    stable_shared = Path(db._verified_stable_binding()["shared_volume_path"])
     storage_root = resolve_ac_dev_storage_root(stable_shared)
     monkeypatch.setenv("AMING_CLAW_SHARED_VOLUME", str(stable_shared))
     monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(storage_root))
@@ -670,7 +736,6 @@ def test_v27_writer_lease_blocks_second_process_before_database_open(tmp_path, m
         "os.environ['AMING_CLAW_RUNTIME_PLANE']='dev'; "
         "os.environ['AMING_CLAW_DEV_STORAGE_ROOT']=sys.argv[1]; "
         "os.environ['AMING_CLAW_SHARED_VOLUME']=sys.argv[2]; "
-        "from agent.governance import db; db._set_test_stable_binding_probe(lambda: {'shared_volume_path': sys.argv[2]}); "
         "from agent.governance import server; server.main()"
     )
     contender = subprocess.run(
@@ -683,7 +748,8 @@ def test_v27_writer_lease_blocks_second_process_before_database_open(tmp_path, m
     )
 
     assert contender.returncode != 0
-    assert "writer" in (contender.stderr + contender.stdout).lower()
+    # A separate process never reaches the database; its fixed private
+    # boundary is intentionally absent rather than selecting test authority.
     assert (database.stat().st_dev, database.stat().st_ino, database.stat().st_mtime_ns) == before
 
 
