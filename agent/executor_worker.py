@@ -414,6 +414,7 @@ class ExecutorWorker:
         self.base_url = _world_bound_governance_url(project_id, governance_url)
         self.worker_id = worker_id
         self.workspace = self.workspace_identity.root
+        self._root_git_identity: Optional[GitWorktreeIdentity] = None
         # task id -> immutable Git identity.  Children may only receive the
         # exact registered identity of their logical root task.
         self._task_worktrees: Dict[str, GitWorktreeIdentity] = {}
@@ -487,12 +488,20 @@ class ExecutorWorker:
         logical authority only when the effect is about to run.
         """
         if candidate == self.workspace:
-            identity = bind_git_worktree_identity(candidate, "executor-root")
-            validate_current_git_worktree_identity(identity)
-            return identity.workspace.root
+            root = self._validated_workspace()
+            if getattr(self, "_root_git_identity", None) is None:
+                self._root_git_identity = bind_git_worktree_identity(root, "executor-root")
+            validate_current_git_worktree_identity(self._root_git_identity)
+            return self._root_git_identity.workspace.root
         if task_id in self._task_worktrees:
             return self._validated_task_worktree(task_id, candidate)
         raise ValueError("effect workspace has no registered task identity")
+
+    def _write_version_file(self, task_id: str, version_path: str, content: str) -> None:
+        """Write VERSION only after a final root identity revalidation."""
+        self._revalidate_effect_workspace(task_id, self.workspace)
+        with open(version_path, "w") as handle:
+            handle.write(content)
 
     def _registered_cleanup_identity(self, worktree_path: str) -> GitWorktreeIdentity:
         """Return the sole live receipt eligible to authorize cleanup.
@@ -1446,8 +1455,7 @@ class ExecutorWorker:
                         content = f.read()
                     import re as _re
                     content = _re.sub(r'CHAIN_VERSION=\S+', f'CHAIN_VERSION={commit_hash}', content)
-                    with open(ver_path, 'w') as f:
-                        f.write(content)
+                    self._write_version_file(task_id, ver_path, content)
                     # Amend commit to include VERSION
                     self._revalidate_effect_workspace(task_id, self.workspace)
                     subprocess.run(["git", "add", "VERSION"], cwd=self.workspace, capture_output=True, timeout=10)

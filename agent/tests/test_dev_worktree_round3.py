@@ -216,6 +216,33 @@ class TestDevWorktreeRound3(unittest.TestCase):
                 _git(["branch", "--list", "test/worker"], repo).stdout.strip(), "test/worker"
             )
 
+    def test_version_write_rejects_identity_drift_after_read_without_mutation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo, _ = _repo_with_worktree(tmpdir)
+            worker = _ac_worker(repo)
+            repo = worker.workspace
+            version = os.path.join(repo, "VERSION")
+            with open(version, "w", encoding="utf-8") as handle:
+                handle.write("CHAIN_VERSION=old\n")
+            # This models the earlier read-side validation in merge handling.
+            self.assertEqual(worker._revalidate_effect_workspace("merge", repo), repo)
+            observed = open(version, encoding="utf-8").read()
+
+            moved = os.path.join(os.path.dirname(repo), "replaced-repo")
+            os.rename(repo, moved)
+            os.makedirs(repo)
+            _git(["init"], repo)
+            replacement = os.path.join(repo, "VERSION")
+            with open(replacement, "w", encoding="utf-8") as handle:
+                handle.write("CHAIN_VERSION=replacement\n")
+
+            with self.assertRaisesRegex(ValueError, "workspace identity changed"):
+                worker._write_version_file("merge", replacement, observed.replace("old", "new"))
+
+            self.assertEqual(
+                open(replacement, encoding="utf-8").read(), "CHAIN_VERSION=replacement\n"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
