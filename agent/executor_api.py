@@ -1357,54 +1357,13 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
           2. realpath is within worktree_root (not main workspace)
           3. Not in .git, system dirs, or sensitive paths
         """
-        import pathlib
-
         if not path:
             return False, "", "empty path"
 
-        # Get only an explicitly registered worktree inside the immutable root.
-        worktree = _active_worktree_roots.get(task_id)
-        if worktree is None:
-            return False, "", "task has no validated worktree root"
-        workspace = self._workspace_identity()
-        root = pathlib.Path(workspace.root)
-        target_root = pathlib.Path(worktree.root)
-        if not target_root.is_absolute() or target_root.is_symlink():
-            return False, "", "task worktree root is invalid"
-        try:
-            current = target_root.stat(follow_symlinks=False)
-            if current.st_dev != worktree.device or current.st_ino != worktree.inode:
-                return False, "", "task worktree identity changed"
-            target_root = target_root.resolve(strict=True)
-        except OSError:
-            return False, "", "task worktree root is unavailable"
-        if not target_root.is_relative_to(root):
-            return False, "", "task worktree escapes bound workspace"
-        worktree_root = str(target_root)
-
-        # Resolve to absolute path within worktree
-        if not os.path.isabs(path):
-            path = os.path.join(worktree_root, path)
-
-        # Resolve symlinks and normalize
-        try:
-            resolved = str(pathlib.Path(path).resolve())
-        except Exception as e:
-            return False, "", f"path resolution failed: {e}"
-
-        # Must be within worktree root
-        worktree_resolved = str(pathlib.Path(worktree_root).resolve())
-        if not pathlib.Path(resolved).is_relative_to(pathlib.Path(worktree_resolved)):
-            return False, "", f"path {resolved} is outside worktree {worktree_resolved}"
-
-        # Block sensitive paths
-        rel = os.path.relpath(resolved, worktree_resolved)
-        blocked = [".git", ".env", "node_modules", "__pycache__"]
-        for b in blocked:
-            if rel == b or rel.startswith(b + os.sep):
-                return False, "", f"blocked path: {rel}"
-
-        return True, resolved, ""
+        # There is no in-process worker→API custody handoff.  A global registry
+        # would fabricate one across processes, so all file/worktree routes fail
+        # closed until a real local binding exists.
+        return False, "", "no validated local task worktree identity"
 
     def _handle_file_write(self, body: dict):
         """POST /file/write — Write entire file (new or overwrite).
@@ -1579,24 +1538,6 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             })
         except Exception as e:
             self._json_response(500, {"error": str(e)})
-
-
-# Active worktree roots per task (set by Executor when creating dev sessions)
-_active_worktree_roots: dict[str, object] = {}
-
-
-def register_worktree(task_id: str, worktree_root: str, workspace_root: str) -> None:
-    """Register one prevalidated task worktree beneath one explicit workspace."""
-    workspace = bind_workspace_identity(workspace_root)
-    worktree = bind_workspace_identity(worktree_root)
-    if not Path(worktree.root).is_relative_to(Path(workspace.root)):
-        raise ValueError("task worktree escapes bound workspace")
-    _active_worktree_roots[task_id] = worktree
-
-
-def unregister_worktree(task_id: str) -> None:
-    """Unregister worktree when task completes."""
-    _active_worktree_roots.pop(task_id, None)
 
 
 def start_api_server(project_id: str, workspace_root: str = ""):

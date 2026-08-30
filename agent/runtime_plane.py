@@ -31,10 +31,18 @@ def bind_workspace_identity(workspace_root: str) -> WorkspaceIdentity:
     if not candidate.is_absolute() or not candidate.exists() or candidate.is_symlink() or not candidate.is_dir():
         raise ValueError("workspace root must be an existing absolute non-symlink directory")
     resolved = candidate.resolve(strict=True)
-    if resolved != candidate:
-        raise ValueError("workspace root escaped its canonical path")
-    stat = candidate.stat(follow_symlinks=False)
-    return WorkspaceIdentity(str(candidate), stat.st_dev, stat.st_ino)
+    stat = resolved.stat(follow_symlinks=False)
+    return WorkspaceIdentity(str(resolved), stat.st_dev, stat.st_ino)
+
+
+def validate_current_workspace_identity(identity: WorkspaceIdentity) -> WorkspaceIdentity:
+    """Fail closed if an already-bound workspace changed before an effect."""
+    if not isinstance(identity, WorkspaceIdentity):
+        raise ValueError("workspace identity is required")
+    current = bind_workspace_identity(identity.root)
+    if (current.device, current.inode) != (identity.device, identity.inode):
+        raise ValueError("workspace identity changed")
+    return identity
 
 
 def resolve_runtime_plane(project_id: str) -> RuntimePlane:

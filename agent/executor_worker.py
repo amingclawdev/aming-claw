@@ -46,7 +46,10 @@ if _proj_root not in sys.path:
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
-from agent.runtime_plane import bind_workspace_identity, resolve_runtime_plane
+from agent.runtime_plane import (
+    WorkspaceIdentity, bind_workspace_identity, resolve_runtime_plane,
+    validate_current_workspace_identity,
+)
 
 log = logging.getLogger("executor_worker")
 
@@ -411,6 +414,7 @@ class ExecutorWorker:
         self.base_url = _world_bound_governance_url(project_id, governance_url)
         self.worker_id = worker_id
         self.workspace = self.workspace_identity.root
+        self._task_worktrees: Dict[str, WorkspaceIdentity] = {}
         self.log_root = _world_bound_log_root(self.project_id, self.workspace)
         self._session_token = str(
             os.getenv(EXECUTOR_SESSION_TOKEN_ENV, "")
@@ -424,6 +428,26 @@ class ExecutorWorker:
         self._consecutive_empty_polls = 0  # tracks consecutive polls with no task
         self._start_time = time.monotonic()
         self.last_claimed_at = time.monotonic()  # R5: tracked by ServiceManager watchdog
+
+    def _validated_workspace(self) -> str:
+        return validate_current_workspace_identity(self.workspace_identity).root
+
+    def _register_task_worktree(self, task_id: str, worktree_path: str) -> str:
+        worktree = bind_workspace_identity(worktree_path)
+        root = Path(self._validated_workspace())
+        if not Path(worktree.root).is_relative_to(root):
+            raise ValueError("task worktree escapes executor workspace")
+        self._task_worktrees[task_id] = worktree
+        return worktree.root
+
+    def _validated_task_worktree(self, task_id: str, candidate: str) -> str:
+        worktree = self._task_worktrees.get(task_id)
+        if worktree is None or candidate != worktree.root:
+            raise ValueError("task has no bound worktree identity")
+        validate_current_workspace_identity(worktree)
+        if not Path(worktree.root).is_relative_to(Path(self._validated_workspace())):
+            raise ValueError("task worktree escapes executor workspace")
+        return worktree.root
 
     def _api(self, method: str, path: str, data: dict = None, timeout: Optional[int] = None) -> dict:
         """Call governance API. Short timeouts to avoid MCP IO deadlock."""
@@ -580,7 +604,7 @@ class ExecutorWorker:
 
         worktree_path = None
         branch_name = None
-        execution_workspace = self.workspace
+        execution_workspace = self._validated_workspace()
         try:
             attempt_num = int(task.get("attempt_num") or metadata.get("attempt_num") or 1)
         except Exception:
@@ -594,7 +618,7 @@ class ExecutorWorker:
                 attempt_num=attempt_num,
             )
             if worktree_path:
-                execution_workspace = worktree_path
+                execution_workspace = self._validated_task_worktree(task_id, worktree_path)
                 _timing(f"worktree: created {worktree_path}")
             else:
                 reason = "worktree creation returned (None, None)"
@@ -607,8 +631,8 @@ class ExecutorWorker:
         elif task_type in ("test", "qa"):
             inherited_worktree = metadata.get("_worktree", "")
             inherited_branch = metadata.get("_branch", "")
-            if inherited_worktree and os.path.isdir(inherited_worktree):
-                execution_workspace = inherited_worktree
+            if inherited_worktree:
+                execution_workspace = self._validated_task_worktree(task_id, inherited_worktree)
                 worktree_path = inherited_worktree
                 branch_name = inherited_branch
                 _timing(f"worktree: reusing {inherited_worktree}")
@@ -869,10 +893,10 @@ class ExecutorWorker:
         import shlex
 
         # Determine execution workspace (inherit worktree from dev stage)
-        execution_workspace = self.workspace
+        execution_workspace = self._validated_workspace()
         inherited_worktree = metadata.get("_worktree", "")
-        if inherited_worktree and os.path.isdir(inherited_worktree):
-            execution_workspace = inherited_worktree
+        if inherited_worktree:
+            execution_workspace = self._validated_task_worktree(task_id, inherited_worktree)
 
         if _is_reconcile_cluster_without_tests(metadata):
             return {
@@ -2464,7 +2488,8 @@ class ExecutorWorker:
             )
             if proc.returncode != 0:
                 return None, None
-            return worktree_dir, branch_name
+            # The identity is captured only after git has materialized the path.
+            return self._register_task_worktree(task_id, worktree_dir), branch_name
         except Exception:
             return None, None
 
@@ -2489,6 +2514,10 @@ class ExecutorWorker:
                 )
         except Exception:
             pass
+        finally:
+            for task_id, identity in list(self._task_worktrees.items()):
+                if identity.root == worktree_path:
+                    self._task_worktrees.pop(task_id, None)
 
     def _create_integration_worktree(self, task_id: str, base_ref: str = "HEAD"):
         """Create a clean integration worktree used only for merge verification."""
