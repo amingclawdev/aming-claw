@@ -9,6 +9,7 @@ Covers AC1-AC5 from the PRD:
 """
 
 import json
+from pathlib import Path
 import subprocess
 import types
 from unittest import mock
@@ -20,7 +21,7 @@ import pytest
 # Helper: build a minimal ExecutorWorker-like object with _execute_merge
 # ---------------------------------------------------------------------------
 
-def _make_worker(workspace="/tmp/ws", base_url="http://localhost:40000", project_id="test"):
+def _make_worker(workspace=None, base_url="http://localhost:40000", project_id="test"):
     """Return a lightweight stub that has _execute_merge bound."""
     # Import the real module to get _execute_merge's code
     import importlib
@@ -46,8 +47,15 @@ def _make_worker(workspace="/tmp/ws", base_url="http://localhost:40000", project
 
     spec.loader.exec_module(mod)
 
+    workspace = workspace or str(Path(__file__).resolve().parents[2])
     worker = object.__new__(mod.ExecutorWorker)
-    worker.workspace = workspace
+    from agent.runtime_plane import bind_workspace_identity
+    worker.workspace_identity = bind_workspace_identity(str(Path(workspace).resolve()))
+    worker.workspace = worker.workspace_identity.root
+    worker._task_worktrees = {}
+    worker._validated_workspace = mod.ExecutorWorker._validated_workspace.__get__(worker)
+    worker._register_task_worktree = mod.ExecutorWorker._register_task_worktree.__get__(worker)
+    worker._validated_task_worktree = mod.ExecutorWorker._validated_task_worktree.__get__(worker)
     worker.base_url = base_url
     worker.project_id = project_id
     worker._report_progress = lambda tid, data: None
@@ -341,7 +349,7 @@ def test_reconcile_dev_worktree_uses_target_branch_base(tmp_path):
             Path(cmd[-2]).mkdir(parents=True, exist_ok=True)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    with mock.patch("subprocess.run", side_effect=_run), mock.patch("os.makedirs"):
+    with mock.patch("subprocess.run", side_effect=_run):
         worktree_path, branch = worker._create_worktree(
             "task-dev-8",
             base_ref="reconcile/p-test-session",

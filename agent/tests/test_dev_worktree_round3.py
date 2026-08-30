@@ -10,10 +10,19 @@ sys.path.insert(0, agent_dir)
 from executor_worker import ExecutorWorker
 
 
+def _ac_worker(workspace):
+    workspace = os.path.realpath(workspace)
+    storage = os.path.realpath(os.path.join(workspace, "dev-storage"))
+    os.makedirs(storage, exist_ok=True)
+    with patch.dict(os.environ, {"AMING_CLAW_DEV_STORAGE_ROOT": storage}):
+        return ExecutorWorker("aming-claw", governance_url="http://127.0.0.1:40008", workspace=workspace)
+
+
 class TestDevWorktreeRound3(unittest.TestCase):
     def test_dev_session_uses_worktree_workspace(self):
         with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory(dir=repo) as worktree:
-            worker = ExecutorWorker("aming-claw", governance_url="http://127.0.0.1:40008", workspace=repo)
+            worker = _ac_worker(repo)
+            worktree = os.path.realpath(worktree)
             worker._register_task_worktree("task-dev-1", worktree)
             fake_session = MagicMock(pid=123, status="completed", stderr="", session_id="sess-1")
             fake_session.stdout = '{"schema_version":"v1","summary":"ok","changed_files":[]}'
@@ -41,7 +50,7 @@ class TestDevWorktreeRound3(unittest.TestCase):
 
     def test_git_changed_files_uses_supplied_cwd(self):
         with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory(dir=repo) as worktree:
-            worker = ExecutorWorker("aming-claw", governance_url="http://127.0.0.1:40008", workspace=repo)
+            worker = _ac_worker(repo)
             proc1 = MagicMock(returncode=0, stdout="agent/foo.py\n")
             proc2 = MagicMock(returncode=0, stdout="")
             proc3 = MagicMock(returncode=0, stdout="")
@@ -53,47 +62,56 @@ class TestDevWorktreeRound3(unittest.TestCase):
 
     def test_git_changed_files_includes_untracked_new_files(self):
         """B27: untracked new files (git ls-files --others) must appear in changed_files."""
-        worker = ExecutorWorker("aming-claw", governance_url="http://localhost:40000", workspace="C:/repo/main")
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory(dir=repo) as worktree:
+            worker = _ac_worker(repo)
 
-        proc1 = MagicMock(returncode=0, stdout="agent/existing.py\n")  # modified tracked
-        proc2 = MagicMock(returncode=0, stdout="agent/staged_new.py\n")  # staged new
-        proc3 = MagicMock(returncode=0, stdout="agent/untracked_new.py\n")  # untracked new
+            proc1 = MagicMock(returncode=0, stdout="agent/existing.py\n")  # modified tracked
+            proc2 = MagicMock(returncode=0, stdout="agent/staged_new.py\n")  # staged new
+            proc3 = MagicMock(returncode=0, stdout="agent/untracked_new.py\n")  # untracked new
 
-        with patch("subprocess.run", side_effect=[proc1, proc2, proc3]):
-            files = worker._get_git_changed_files(cwd="C:/repo/worktree")
+            with patch("subprocess.run", side_effect=[proc1, proc2, proc3]):
+                files = worker._get_git_changed_files(cwd=worktree)
 
-        self.assertIn("agent/existing.py", files)
-        self.assertIn("agent/staged_new.py", files)
-        self.assertIn("agent/untracked_new.py", files)
-        self.assertEqual(len(files), 3)
+            self.assertIn("agent/existing.py", files)
+            self.assertIn("agent/staged_new.py", files)
+            self.assertIn("agent/untracked_new.py", files)
+            self.assertEqual(len(files), 3)
 
     def test_create_worktree_uses_attempt_scoped_path_for_retry(self):
         with tempfile.TemporaryDirectory() as repo:
-            worker = ExecutorWorker("aming-claw", governance_url="http://localhost:40000", workspace=repo)
+            worker = _ac_worker(repo)
             ok = MagicMock(returncode=0, stdout="", stderr="")
 
-            with patch("subprocess.run", side_effect=[ok, ok]) as mock_run:
+            def _run(cmd, **kwargs):
+                if cmd[:3] == ["git", "worktree", "add"]:
+                    os.makedirs(cmd[-2], exist_ok=True)
+                return ok
+            with patch("subprocess.run", side_effect=_run) as mock_run:
                 worktree_path, branch_name = worker._create_worktree("task-abc", attempt_num=2)
 
             self.assertEqual(branch_name, "dev/task-abc-attempt-2")
             self.assertEqual(
                 worktree_path,
-                os.path.join(repo, ".worktrees", "dev-task-abc-attempt-2"),
+                os.path.realpath(os.path.join(repo, ".worktrees", "dev-task-abc-attempt-2")),
             )
             add_cmd = mock_run.call_args_list[1].args[0]
             self.assertEqual(add_cmd[:5], ["git", "worktree", "add", "-b", "dev/task-abc-attempt-2"])
-            self.assertEqual(add_cmd[5], worktree_path)
+            self.assertEqual(os.path.realpath(add_cmd[5]), worktree_path)
 
     def test_create_worktree_keeps_first_attempt_names(self):
         with tempfile.TemporaryDirectory() as repo:
-            worker = ExecutorWorker("aming-claw", governance_url="http://localhost:40000", workspace=repo)
+            worker = _ac_worker(repo)
             ok = MagicMock(returncode=0, stdout="", stderr="")
 
-            with patch("subprocess.run", side_effect=[ok, ok]):
+            def _run(cmd, **kwargs):
+                if cmd[:3] == ["git", "worktree", "add"]:
+                    os.makedirs(cmd[-2], exist_ok=True)
+                return ok
+            with patch("subprocess.run", side_effect=_run):
                 worktree_path, branch_name = worker._create_worktree("task-abc", attempt_num=1)
 
             self.assertEqual(branch_name, "dev/task-abc")
-            self.assertEqual(worktree_path, os.path.join(repo, ".worktrees", "dev-task-abc"))
+            self.assertEqual(worktree_path, os.path.realpath(os.path.join(repo, ".worktrees", "dev-task-abc")))
 
 
 if __name__ == "__main__":
