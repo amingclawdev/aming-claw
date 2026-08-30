@@ -80,6 +80,20 @@ def test_unknown_target_returns_404():
     assert body["error_code"] == "UNKNOWN_TARGET"
 
 
+def test_bound_handler_ignores_conflicting_ambient_plane_env(monkeypatch):
+    monkeypatch.setenv("GOVERNANCE_URL", "http://127.0.0.1:40008")
+    monkeypatch.setenv("PROJECT_ID", "aming-claw")
+    monkeypatch.setenv("EXECUTOR_PROJECT_ID", "aming-claw")
+    with _running_manager() as base:
+        status, body = _post_json(
+            base,
+            "/api/manager/redeploy/foobar",
+            {"chain_version": "abc1234"},
+        )
+    assert status == 404
+    assert body["error_code"] == "UNKNOWN_TARGET"
+
+
 def test_executor_target_returns_404():
     with _running_manager() as base:
         status, body = _post_json(
@@ -163,6 +177,29 @@ def test_sidecar_create_server_preserves_exact_ac_and_stable_planes(tmp_path):
         stable.server_close()
 
 
+@pytest.mark.parametrize(
+    ("project_id", "governance_url"),
+    [("proj", "http://127.0.0.1:40000"), ("aming-claw", "http://127.0.0.1:40008")],
+)
+def test_chain_version_write_uses_bound_project_and_url_despite_ambient_env(
+    monkeypatch, tmp_path, project_id, governance_url,
+):
+    identity = manager_http_server.plane_bound_manager_identity(
+        project_id, governance_url, str(tmp_path / "bound-root"),
+    )
+    monkeypatch.setenv("GOVERNANCE_URL", "http://127.0.0.1:40000")
+    monkeypatch.setenv("PROJECT_ID", "ambient-project")
+    monkeypatch.setenv("EXECUTOR_PROJECT_ID", "ambient-project")
+    response = MagicMock(status=200)
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+    with patch("urllib.request.urlopen", return_value=response) as urlopen:
+        assert manager_http_server._write_chain_version(identity, "abc1234") is True
+    assert urlopen.call_args.args[0].full_url == (
+        f"{governance_url}/api/version-update/{project_id}"
+    )
+
+
 def test_respawn_executor_writes_restart_signal(tmp_path):
     with patch.object(manager_http_server, "_project_root", return_value=tmp_path), \
             _running_manager() as base:
@@ -180,6 +217,9 @@ def test_respawn_executor_writes_restart_signal(tmp_path):
     assert payload["action"] == "restart"
     assert payload["requested_action"] == "respawn_executor"
     assert payload["chain_version"] == "abc1234"
+    assert payload["project_id"] == "proj"
+    assert payload["governance_url"] == "http://127.0.0.1:40000"
+    assert payload["executor_url"] == "http://127.0.0.1:40100"
 
 
 def test_successful_redeploy_writes_chain_version_once():
@@ -201,7 +241,8 @@ def test_successful_redeploy_writes_chain_version_once():
     assert body["ok"] is True
     assert body["pid"] == 99999
     assert body["chain_version"] == "abc1234"
-    mock_write.assert_called_once_with("abc1234")
+    assert mock_write.call_args.args[0]["project_id"] == "proj"
+    assert mock_write.call_args.args[1] == "abc1234"
 
 
 def test_failed_spawn_does_not_write_chain_version():
