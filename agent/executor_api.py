@@ -18,6 +18,7 @@ import time
 import uuid as _uuid
 from datetime import datetime, timezone as _tz
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 from agent.runtime_plane import resolve_runtime_plane
 
@@ -320,9 +321,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         import socket
         from pathlib import Path
 
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         pending = len(list((tasks_root / "pending").glob("*.json"))) if (tasks_root / "pending").exists() else 0
         processing = len(list((tasks_root / "processing").glob("*.json"))) if (tasks_root / "processing").exists() else 0
@@ -348,12 +347,12 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_tasks(self, qs):
         """GET /tasks — List tasks from governance."""
-        project_id = qs.get("project_id", [os.getenv("PROJECT_ID", "")])[0]
+        project_id = self._executor_identity()["project_id"]
         status = qs.get("status", [""])[0]
         limit = int(qs.get("limit", ["20"])[0])
 
         token = os.getenv("GOV_COORDINATOR_TOKEN", "")
-        gov_url = resolve_runtime_plane(project_id).governance_url
+        gov_url = self._executor_identity()["governance_url"]
 
         try:
             import requests
@@ -367,10 +366,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_task_detail(self, task_id):
         """GET /task/{id} — Single task detail."""
-        from pathlib import Path
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         # Search in all stages
         for stage in ["pending", "processing", "results"]:
@@ -387,10 +383,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_trace(self, trace_id):
         """GET /trace/{id} — Full trace chain from filesystem (processing + results)."""
-        from pathlib import Path
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         for stage in ["processing", "results"]:
             stage_dir = tasks_root / stage
@@ -417,10 +410,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_traces(self, qs):
         """GET /traces — List trace summaries from filesystem (processing + results)."""
-        from pathlib import Path
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         project_id_filter = qs.get("project_id", [None])[0]
         limit = min(int(qs.get("limit", ["20"])[0]), 100)
@@ -465,10 +455,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_task_cancel(self, task_id):
         """POST /task/{id}/cancel — Cancel a task."""
-        from pathlib import Path
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         # Remove from pending
         pending = tasks_root / "pending" / f"{task_id}.json"
@@ -494,9 +481,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         """POST /task/{id}/retry — Retry a failed task."""
         from pathlib import Path
         import shutil
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         # Move from results back to pending
         for stage in ["results", "processing"]:
@@ -520,9 +505,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         from pathlib import Path
         import shutil
         max_age_min = int(body.get("max_age_min", 10))
-        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_dir = self._tasks_root()
         processing_dir = tasks_dir / "processing"
         dead_letter_dir = tasks_dir / "dead_letter"
         dead_letter_dir.mkdir(parents=True, exist_ok=True)
@@ -562,9 +545,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         import shutil
         reason = body.get("reason", "")
         operator = body.get("operator", "observer")
-        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_dir = self._tasks_root()
 
         killed_session = None
         if _ai_manager:
@@ -618,9 +599,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             return
 
         fix_id = f"fix-{bug_id}-{_uuid.uuid4().hex[:8]}"
-        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_dir = self._tasks_root()
 
         cancelled_tasks = []
         for stage in ["pending", "processing"]:
@@ -670,10 +649,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_observer_manual_fix_complete(self, fix_id, body):
         """POST /observer/manual-fix/{fix_id}/complete — Record manual fix completion."""
-        from pathlib import Path
-        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_dir = self._tasks_root()
         fix_path = tasks_dir / "observer_fixes" / f"{fix_id}.json"
 
         if not fix_path.exists():
@@ -943,9 +919,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             return
 
         # Probe filesystem stage
-        tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-        ) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         fs_stage = None
         for stage in ("pending", "processing", "results"):
@@ -1011,9 +985,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         if status.get("active") and status.get("session"):
             task_id = status["session"].get("task_id", "")
             if task_id:
-                tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-                    os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-                ) / "codex-tasks"
+                tasks_root = self._tasks_root()
                 for stage in ("pending", "processing", "results"):
                     fp = tasks_root / stage / f"{task_id}.json"
                     if fp.exists():
@@ -1038,9 +1010,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         report = ObserverManager.get_report(task_id)
         if report is None:
             # Try to generate from filesystem data on demand
-            tasks_root = Path(os.getenv("SHARED_VOLUME_PATH",
-                os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
-            ) / "codex-tasks"
+            tasks_root = self._tasks_root()
             task_data = None
             for stage in ("pending", "processing", "results", "archive"):
                 fp = tasks_root / stage / f"{task_id}.json"
@@ -1280,10 +1250,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         """
         from pathlib import Path
 
-        tasks_root = Path(os.getenv(
-            "SHARED_VOLUME_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "shared-volume"),
-        )) / "codex-tasks"
+        tasks_root = self._tasks_root()
 
         total = 0
         first_pass_count = 0          # retry_count == 0
@@ -1586,11 +1553,24 @@ def unregister_worktree(task_id: str) -> None:
 def start_api_server(project_id: str):
     """Start the Executor API server in a background thread."""
     plane = resolve_runtime_plane(project_id)
+    from agent.manager_http_server import _canonical_storage_root, plane_bound_manager_identity
+    root = _canonical_storage_root(plane.name)
+    identity = plane_bound_manager_identity(project_id, plane.governance_url, str(root))
     port = urlparse(plane.executor_url).port
     if PORT and PORT != port:
         raise ValueError("EXECUTOR_API_PORT crosses the project runtime plane")
     server = HTTPServer(("0.0.0.0", port), ExecutorAPIHandler)
+    server.executor_identity = identity
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     log.info("Executor API server started on port %d", port)
     return server
+    def _executor_identity(self) -> dict:
+        identity = getattr(self.server, "executor_identity", None)
+        if not isinstance(identity, dict):
+            raise RuntimeError("executor API has no immutable launch identity")
+        return identity
+
+    def _tasks_root(self) -> Path:
+        root = Path(self._executor_identity()["storage_root"])
+        return root / "codex-tasks"
