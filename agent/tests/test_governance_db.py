@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import sqlite3
 import json
+import hashlib
 import subprocess
 from pathlib import Path
 from unittest import mock
@@ -501,15 +502,17 @@ def test_ac_dev_storage_rejects_alias_foreign_and_symlink_roots(tmp_path, monkey
         )
 
 
-def test_ac_dev_launch_receipt_requires_canonical_persistent_sibling(tmp_path):
+def test_ac_dev_launch_receipt_requires_canonical_persistent_sibling(tmp_path, monkeypatch):
     """A direct server may only consume the one resolver-derived dev world."""
     from agent.governance import db
     from agent.runtime_plane import resolve_ac_dev_storage_root
 
     stable = (tmp_path / "stable-shared-volume").resolve()
     stable.mkdir()
+    monkeypatch.setenv("AMING_CLAW_SHARED_VOLUME", str(stable))
     root = resolve_ac_dev_storage_root(stable)
     root.mkdir(parents=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(root))
     source = "sha256:" + "d" * 64
     receipt = db.write_dev_launch_receipt(
         root, stable_shared_volume=stable, source_sha256=source, port=40008
@@ -598,8 +601,9 @@ def test_v27_bootstrap_rejects_nonfresh_or_preloaded_world(
         )
 
 
-def test_v27_writer_lease_blocks_second_process_before_database_open(tmp_path):
+def test_v27_writer_lease_blocks_second_process_before_database_open(tmp_path, monkeypatch):
     from agent.governance import db
+    from agent.runtime_plane import resolve_ac_dev_storage_root
 
     source_root, commit = _dev_source_repo(tmp_path)
     source = {
@@ -608,22 +612,35 @@ def test_v27_writer_lease_blocks_second_process_before_database_open(tmp_path):
         "commit": commit,
         "source_sha256": "sha256:" + "f" * 64,
     }
-    storage_root = tmp_path / "dev-world"
+    stable_shared = tmp_path / "stable-shared-volume"
+    stable_shared.mkdir()
+    storage_root = resolve_ac_dev_storage_root(stable_shared)
+    monkeypatch.setenv("AMING_CLAW_SHARED_VOLUME", str(stable_shared))
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(storage_root))
     first = db.bootstrap_dev_governance_store(
         storage_root,
         source_identity=source,
         process_identity={"pid": os.getpid(), "start_identity": "v27-owner"},
     )
     database = Path(first["database_path"])
+    server_source = Path(db.__file__).with_name("server.py")
+    source_sha256 = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
+    db.write_dev_launch_receipt(
+        storage_root,
+        stable_shared_volume=stable_shared,
+        source_sha256=source_sha256,
+        port=40008,
+    )
     before = (database.stat().st_dev, database.stat().st_ino, database.stat().st_mtime_ns)
     code = (
         "import os,sys; "
         "os.environ['AMING_CLAW_RUNTIME_PLANE']='dev'; "
         "os.environ['AMING_CLAW_DEV_STORAGE_ROOT']=sys.argv[1]; "
+        "os.environ['AMING_CLAW_SHARED_VOLUME']=sys.argv[2]; "
         "from agent.governance import server; server.main()"
     )
     contender = subprocess.run(
-        [sys.executable, "-c", code, str(storage_root)],
+        [sys.executable, "-c", code, str(storage_root), str(stable_shared)],
         cwd=Path(db.__file__).resolve().parents[2],
         capture_output=True,
         text=True,

@@ -34,6 +34,7 @@ AC_PROJECT_ID = "aming-claw"
 DEV_RUNTIME_PLANE = "dev"
 RUNTIME_PLANE_ENV = "AMING_CLAW_RUNTIME_PLANE"
 AC_DEV_STORAGE_ROOT_ENV = "AMING_CLAW_DEV_STORAGE_ROOT"
+AC_STABLE_SHARED_VOLUME_ENV = "AMING_CLAW_SHARED_VOLUME"
 AC_DEV_WORLD_ID = "ac-dev"
 AC_STABLE_WORLD_ID = "ac-stable"
 AC_WORLD_GENESIS_SCHEMA = "ac_governance_world_genesis.v1"
@@ -1161,12 +1162,23 @@ def _absolute_non_symlink_root(path: Path, *, create: bool) -> Path:
 
 
 def _dev_storage_root(*, create: bool = False) -> Path:
+    """Resolve the only AC dev world; raw env values are assertions, not authority."""
+    stable_raw = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
+    if not stable_raw:
+        raise RuntimeError("AC dev runtime requires canonical AMING_CLAW_SHARED_VOLUME")
+    stable = _absolute_non_symlink_root(Path(stable_raw), create=False)
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    expected = resolve_ac_dev_storage_root(stable)
     raw = os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
     if not raw:
         raise RuntimeError(
             "AC dev runtime requires an explicit AMING_CLAW_DEV_STORAGE_ROOT"
         )
-    return _absolute_non_symlink_root(Path(raw), create=create)
+    supplied = Path(raw).expanduser().absolute()
+    # Compare before any mkdir/open; a symlink/traversal is an invalid claim.
+    if supplied != expected:
+        raise ValueError("AC dev storage root must equal canonical resolver output")
+    return _absolute_non_symlink_root(expected, create=create)
 
 
 def dev_launch_receipt_path(storage_root: Path | str) -> Path:
@@ -1181,6 +1193,9 @@ def write_dev_launch_receipt(
     """Persist the source-backed foreground launch admission before server exec."""
     root = _absolute_non_symlink_root(Path(storage_root), create=False)
     stable = _absolute_non_symlink_root(Path(stable_shared_volume), create=False)
+    current_stable = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
+    if not current_stable or _absolute_non_symlink_root(Path(current_stable), create=False) != stable:
+        raise ValueError("AC dev launch receipt stable volume is not current canonical authority")
     if project_id != AC_PROJECT_ID or port != 40008:
         raise ValueError("AC dev launch receipt requires exact project and port")
     if root == stable or stable in root.parents or root in stable.parents:
@@ -1211,7 +1226,10 @@ def write_dev_launch_receipt(
 
 def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str) -> dict[str, object]:
     """Fail closed before a dev server opens SQLite or takes the writer lease."""
-    root = _absolute_non_symlink_root(Path(storage_root), create=False)
+    root = _dev_storage_root(create=False)
+    supplied = Path(storage_root).expanduser().absolute()
+    if supplied != root:
+        raise ValueError("AC dev launch receipt storage root mismatch")
     path = root / AC_DEV_LAUNCH_RECEIPT_NAME
     if not path.is_file() or path.is_symlink() or path.resolve(strict=True) != path:
         raise ValueError("AC dev launch receipt is missing or invalid")
@@ -1226,9 +1244,12 @@ def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str)
         "storage_inode": int(root_stat.st_ino), "source_sha256": source_sha256}
     if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in required.items()):
         raise ValueError("AC dev launch receipt mismatch")
-    stable = Path(str(receipt.get("stable_shared_volume") or ""))
-    if not stable.is_absolute() or stable.is_symlink() or not stable.is_dir() or stable.resolve(strict=True) != stable:
-        raise ValueError("AC dev launch receipt stable identity invalid")
+    stable_raw = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
+    if not stable_raw:
+        raise ValueError("AC dev launch receipt stable authority unavailable")
+    stable = _absolute_non_symlink_root(Path(stable_raw), create=False)
+    if receipt.get("stable_shared_volume") != str(stable):
+        raise ValueError("AC dev launch receipt stable volume claim mismatch")
     parent_stat = stable.parent.stat(follow_symlinks=False)
     if receipt.get("stable_parent_device") != int(parent_stat.st_dev) or receipt.get("stable_parent_inode") != int(parent_stat.st_ino):
         raise ValueError("AC dev launch receipt stable parent identity changed")
@@ -1528,15 +1549,18 @@ def bootstrap_dev_governance_store(
     """
 
     root_input = Path(storage_root).expanduser().absolute()
-    if root_input.is_symlink():
-        raise ValueError("AC dev storage root cannot be a symlink")
+    # Bootstrap is an ingress too: reject a caller-selected world before it
+    # can create a directory or initialize SQLite.
+    env_raw = os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
+    if not env_raw or Path(env_raw).expanduser().absolute() != root_input:
+        raise ValueError("AC dev bootstrap storage root env mismatch")
     root_existed = root_input.exists()
     shared_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
     if shared_raw:
         shared = Path(shared_raw).expanduser().absolute()
         if root_input == shared or root_input in shared.parents or shared in root_input.parents:
             raise ValueError("AC dev storage root must be disjoint from shared storage")
-    root = _absolute_non_symlink_root(root_input, create=not root_input.exists())
+    root = _dev_storage_root(create=not root_existed)
     source = {
         "root": str(source_identity.get("root") or "").strip(),
         "branch": str(source_identity.get("branch") or "").strip(),

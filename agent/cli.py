@@ -1258,6 +1258,10 @@ def start(
                 f"Port {port} is already in use{owner}, but /api/health is not Aming Claw governance. "
                 "Stop that process or choose a different --port."
             )
+        # DB ingress independently re-derives this stable-volume sibling and
+        # treats the dev-root env only as an equality assertion.
+        os.environ["AMING_CLAW_SHARED_VOLUME"] = str(stable_shared)
+        os.environ[AC_DEV_STORAGE_ROOT_ENV] = str(selected_dev_storage)
         database_binding = _canonical_dev_database_binding(
             str(selected_dev_storage),
             source_identity=dev_identity,
