@@ -23,7 +23,11 @@ from agent import manager_http_server as manager_http_server  # noqa: E402
 
 @contextmanager
 def _running_manager():
-    server = manager_http_server.create_server("127.0.0.1", 0)
+    server = manager_http_server.create_server(
+        "127.0.0.1", 0, project_id="proj",
+        governance_url="http://127.0.0.1:40000",
+        storage_root=str(manager_http_server._project_root() / "shared-volume"),
+    )
     host, port = server.server_address
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -100,6 +104,63 @@ def test_sidecar_rejects_cross_plane_port_and_reports_bound_identity(tmp_path):
             "127.0.0.1", 40101, project_id="aming-claw",
             governance_url="http://127.0.0.1:40008", storage_root=str(tmp_path / "dev"),
         )
+
+
+@pytest.mark.parametrize("project_id", [None, "", " aming-claw", "aming-claw ", "amingClaw", "aming_claw"])
+def test_sidecar_rejects_noncanonical_identity_before_server_construction(
+    project_id, tmp_path,
+):
+    with patch.object(manager_http_server, "ThreadingHTTPServer") as server:
+        with pytest.raises(ValueError):
+            manager_http_server.plane_bound_manager_identity(
+                project_id, "http://127.0.0.1:40008", str(tmp_path / "dev"),
+            )
+        with pytest.raises(ValueError):
+            manager_http_server.create_server(
+                "127.0.0.1", 0, project_id=project_id,
+                governance_url="http://127.0.0.1:40008",
+                storage_root=str(tmp_path / "dev"),
+            )
+    server.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("project_id", "governance_url", "storage_root"),
+    [
+        ("aming-claw", "http://127.0.0.1:40000", "/tmp/dev"),
+        ("proj", "http://127.0.0.1:40008", "/tmp/stable"),
+        ("proj", "http://localhost:40000", "/tmp/stable"),
+        ("proj", "http://127.0.0.1:40000", " "),
+        ("proj", "http://127.0.0.1:40000", ""),
+    ],
+)
+def test_sidecar_rejects_contradictory_custody_before_server_construction(
+    project_id, governance_url, storage_root,
+):
+    with patch.object(manager_http_server, "ThreadingHTTPServer") as server:
+        with pytest.raises(ValueError):
+            manager_http_server.create_server(
+                "127.0.0.1", 0, project_id=project_id,
+                governance_url=governance_url, storage_root=storage_root,
+            )
+    server.assert_not_called()
+
+
+def test_sidecar_create_server_preserves_exact_ac_and_stable_planes(tmp_path):
+    ac = manager_http_server.create_server(
+        "127.0.0.1", 0, project_id="aming-claw",
+        governance_url="http://127.0.0.1:40008", storage_root=str(tmp_path / "dev"),
+    )
+    stable = manager_http_server.create_server(
+        "127.0.0.1", 0, project_id="proj",
+        governance_url="http://127.0.0.1:40000", storage_root=str(tmp_path / "stable"),
+    )
+    try:
+        assert (ac.manager_identity["plane"], ac.manager_identity["sidecar_port"]) == ("dev", 40109)
+        assert (stable.manager_identity["plane"], stable.manager_identity["sidecar_port"]) == ("stable", 40101)
+    finally:
+        ac.server_close()
+        stable.server_close()
 
 
 def test_respawn_executor_writes_restart_signal(tmp_path):

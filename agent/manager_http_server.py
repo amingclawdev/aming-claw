@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from agent.runtime_plane import resolve_runtime_plane
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -113,25 +115,18 @@ def plane_bound_manager_identity(
     project_id: str, governance_url: str, storage_root: str,
 ) -> dict:
     """Validate the immutable custody boundary for one manager sidecar."""
-    project = str(project_id or "").strip()
-    url = str(governance_url or "").rstrip("/")
-    root = Path(str(storage_root or "")).expanduser().absolute()
-    if not project or not url or not str(storage_root or "").strip():
+    plane = resolve_runtime_plane(project_id)
+    if not isinstance(governance_url, str) or governance_url != plane.governance_url:
+        raise ValueError("manager sidecar governance URL crosses the project runtime plane")
+    if not isinstance(storage_root, str) or not storage_root or storage_root != storage_root.strip():
         raise ValueError("manager sidecar requires explicit project, governance URL, and storage root")
-    parsed = urlparse(url)
-    if parsed.hostname not in {"127.0.0.1", "localhost"}:
-        raise ValueError("manager sidecar governance URL must be loopback")
-    if project == "aming-claw":
-        if url not in {"http://127.0.0.1:40008", "http://localhost:40008"}:
-            raise ValueError("AC manager sidecar is bound to dev governance port 40008")
+    root = Path(storage_root).expanduser().absolute()
+    if plane.name == "dev":
         if root.is_symlink():
             raise ValueError("AC manager sidecar storage root cannot be a symlink")
-        return {"project_id": project, "plane": "dev", "governance_url": url,
-                "storage_root": str(root), "sidecar_port": AC_DEV_MANAGER_HTTP_PORT}
-    if parsed.port != 40000:
-        raise ValueError("stable manager sidecar is bound to governance port 40000")
-    return {"project_id": project, "plane": "stable", "governance_url": url,
-            "storage_root": str(root), "sidecar_port": MANAGER_HTTP_PORT}
+    return {"project_id": plane.project_id, "plane": plane.name,
+            "governance_url": plane.governance_url, "storage_root": str(root),
+            "sidecar_port": urlparse(plane.manager_url).port}
 
 
 def _profile_auth_controller():
@@ -1197,15 +1192,11 @@ def create_server(
     host: str = MANAGER_HTTP_HOST,
     port: int = MANAGER_HTTP_PORT,
     *,
-    project_id: str = "proj",
-    governance_url: str = "http://127.0.0.1:40000",
-    storage_root: str = "",
+    project_id: str,
+    governance_url: str,
+    storage_root: str,
 ) -> ThreadingHTTPServer:
     """Create a sidecar bound to one project-plane custody identity."""
-    if not storage_root:
-        # Test/helper construction is stable by default. Production launchers
-        # must pass their explicit storage root through run_server().
-        storage_root = str(_project_root() / "shared-volume")
     identity = plane_bound_manager_identity(project_id, governance_url, storage_root)
     if int(port) not in {0, int(identity["sidecar_port"])}:
         raise ValueError("manager sidecar port does not match its project-plane identity")

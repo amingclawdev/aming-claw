@@ -63,7 +63,11 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Start a test HTTP server on a random port."""
-        cls.server = create_server("127.0.0.1", 0)  # port 0 = random available
+        cls.server = create_server(
+            "127.0.0.1", 0, project_id="proj",
+            governance_url="http://127.0.0.1:40000",
+            storage_root="/tmp/manager-redeploy-test",
+        )  # port 0 = random available
         cls.server_address = cls.server.server_address
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
@@ -667,7 +671,11 @@ class TestRedeployEndpointRuntimeCheckout(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.server = create_server("127.0.0.1", 0)
+        cls.server = create_server(
+            "127.0.0.1", 0, project_id="proj",
+            governance_url="http://127.0.0.1:40000",
+            storage_root="/tmp/manager-redeploy-test",
+        )
         cls.server_address = cls.server.server_address
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
@@ -785,7 +793,11 @@ class TestRedeployResponseCarriesProbeDerivedStatus(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.server = create_server("127.0.0.1", 0)
+        cls.server = create_server(
+            "127.0.0.1", 0, project_id="proj",
+            governance_url="http://127.0.0.1:40000",
+            storage_root="/tmp/manager-redeploy-test",
+        )
         cls.server_address = cls.server.server_address
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
