@@ -33,7 +33,14 @@ _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
-from .errors import GovernanceError, PermissionDeniedError, ValidationError
+from .errors import (
+    AuthError,
+    GovernanceError,
+    PermissionDeniedError,
+    TokenExpiredError,
+    TokenInvalidError,
+    ValidationError,
+)
 from .dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
 import logging
 import sqlite3
@@ -3421,6 +3428,147 @@ def _runtime_world_zero_write_rejection(
     )
 
 
+_SOURCE_BACKED_UNAUTHENTICATED_BOOTSTRAP_PATHS = frozenset(
+    {
+        "/api/init",
+        "/api/project/bootstrap",
+        "/api/local/choose-directory",
+        "/api/projects/register",
+    }
+)
+
+
+def _mutation_auth_project_id(
+    *,
+    path_params: Mapping[str, Any],
+    body: Mapping[str, Any],
+    query: Mapping[str, Any] | None,
+) -> str:
+    """Select the handler-owned project without conflating target projects."""
+
+    sources = (path_params, body, query or {})
+    for source in sources:
+        raw = source.get("governance_project_id")
+        if raw:
+            return validate_project_id_syntax(str(raw).strip())
+    for source in sources:
+        raw = source.get("project_id")
+        if raw:
+            return validate_project_id_syntax(str(raw).strip())
+    return ""
+
+
+def _read_source_backed_session(
+    conn: sqlite3.Connection,
+    token: str,
+) -> dict[str, Any]:
+    """Authenticate against SQLite truth without mutating expired sessions.
+
+    ``role_service.authenticate`` preserves an old convenience behavior that
+    marks an expired row while authenticating.  A rejected mutation must be a
+    physical zero-write, so the HTTP pre-effect guard uses the same sessions
+    table and token hash in a strictly read-only query.
+    """
+
+    credential = str(token or "").strip()
+    if not credential:
+        raise AuthError("X-Gov-Token header required")
+    row = conn.execute(
+        "SELECT * FROM sessions WHERE token_hash = ?",
+        (hashlib.sha256(credential.encode("utf-8")).hexdigest(),),
+    ).fetchone()
+    if row is None:
+        raise TokenInvalidError()
+    session = dict(row)
+    if str(session.get("status") or "") != "active":
+        raise TokenExpiredError()
+    expires_at = str(session.get("expires_at") or "")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not expires_at or expires_at < now:
+        raise TokenExpiredError()
+    try:
+        scope = json.loads(session.get("scope_json") or "[]")
+    except (TypeError, ValueError):
+        scope = []
+    session["scope"] = scope if isinstance(scope, list) else []
+    return session
+
+
+def _require_task_mutation_capability(
+    session: Mapping[str, Any],
+    *,
+    action: str,
+) -> None:
+    role = str(session.get("role") or "").strip().lower()
+    scope = {
+        str(value).strip()
+        for value in (session.get("scope") or [])
+        if str(value).strip()
+    }
+    if action == "notify":
+        if role not in {"observer", "coordinator"}:
+            raise PermissionDeniedError(role or "unknown", "task:notify")
+        return
+    if action in {"claim", "progress", "complete", "recover"}:
+        if role != "dev" or "task:worker" not in scope:
+            raise PermissionDeniedError(role or "unknown", f"task:{action}")
+
+
+def _authenticate_and_authorize_runtime_world_mutation(
+    *,
+    method: str,
+    path: str,
+    path_params: Mapping[str, Any],
+    body: Mapping[str, Any],
+    query: Mapping[str, Any] | None,
+    token: str,
+    close_connection: bool = True,
+) -> dict[str, Any] | None:
+    """Central pre-handler authentication for every mutating HTTP request."""
+
+    if method not in {"POST", "DELETE"}:
+        return None
+    credential = str(token or "").strip()
+    if path in _SOURCE_BACKED_UNAUTHENTICATED_BOOTSTRAP_PATHS and not credential:
+        return None
+    project_id = _mutation_auth_project_id(
+        path_params=path_params,
+        body=body,
+        query=query,
+    )
+    if not project_id:
+        raise _runtime_world_zero_write_rejection(
+            code="unscoped_mutation_forbidden",
+            path=path,
+            detail="projectless mutation has no source-backed bootstrap authority",
+        )
+    conn = independent_connection(project_id)
+    try:
+        session = _read_source_backed_session(conn, credential)
+        if str(session.get("project_id") or "").strip() != project_id:
+            raise PermissionDeniedError(
+                str(session.get("role") or "unknown"),
+                "runtime_world_project",
+                {
+                    "expected_project_id": project_id,
+                    "session_project_id": str(session.get("project_id") or ""),
+                    "zero_write_rejection": True,
+                    "writes_performed": False,
+                },
+            )
+        match = re.fullmatch(
+            r"/api/task/[^/]+/(claim|progress|complete|notify|recover)",
+            path,
+        )
+        if match:
+            _require_task_mutation_capability(session, action=match.group(1))
+            session = {**session, "authorized_action": f"task:{match.group(1)}"}
+        return session
+    finally:
+        if close_connection:
+            conn.close()
+
+
 def _guard_runtime_world_request(
     *,
     method: str,
@@ -3502,13 +3650,19 @@ def _guard_runtime_world_request(
 
     if method not in {"POST", "DELETE"}:
         return None
-    if not str(token or "").strip():
+    if (
+        not str(token or "").strip()
+        and path not in _SOURCE_BACKED_UNAUTHENTICATED_BOOTSTRAP_PATHS
+    ):
         raise _runtime_world_zero_write_rejection(
             code="anonymous_mutation_forbidden",
             path=path,
             detail="anonymous wildcard authority is read-only",
         )
-    if not normalized_claims:
+    if (
+        not normalized_claims
+        and path not in _SOURCE_BACKED_UNAUTHENTICATED_BOOTSTRAP_PATHS
+    ):
         raise _runtime_world_zero_write_rejection(
             code="unscoped_mutation_forbidden",
             path=path,
@@ -5672,6 +5826,16 @@ class GovernanceHandler(BaseHTTPRequestHandler):
                 query=request_query,
                 token=self.headers.get("X-Gov-Token", ""),
             )
+            authenticated_session = (
+                _authenticate_and_authorize_runtime_world_mutation(
+                    method=method,
+                    path=urlparse(self.path).path,
+                    path_params=path_params,
+                    body=request_body,
+                    query=request_query,
+                    token=self.headers.get("X-Gov-Token", ""),
+                )
+            )
             ctx = RequestContext(
                 handler=self,
                 method=method,
@@ -5682,6 +5846,7 @@ class GovernanceHandler(BaseHTTPRequestHandler):
                 token=self.headers.get("X-Gov-Token", ""),
                 idem_key=self.headers.get("Idempotency-Key", ""),
             )
+            ctx._session = authenticated_session
             result = handler(ctx)
             # Streaming handlers (SSE) write headers + body directly via
             # self.wfile and return the STREAMED_RESPONSE sentinel; skip the
@@ -5802,27 +5967,9 @@ class RequestContext:
         return project_service._normalize_project_id(raw) if raw else raw
 
     def require_auth(self, conn) -> dict:
-        """Authenticate and return session. Caches result.
-
-        Token-free mode: when no token is provided, returns a default
-        coordinator session so all APIs work without authentication.
-        Tokens still work if provided (for backward compatibility).
-        """
+        """Authenticate and return the centrally validated session."""
         if self._session is None:
-            if not self.token:
-                # Anonymous access — full coordinator permissions
-                project_id = self.get_project_id()
-                self._session = {
-                    "session_id": "anonymous",
-                    "principal_id": "anonymous",
-                    "project_id": project_id,
-                    "role": "coordinator",
-                    "scope": [],
-                    "token": "",
-                    "permissions": ["*"],
-                }
-            else:
-                self._session = role_service.authenticate(conn, self.token)
+            self._session = _read_source_backed_session(conn, self.token)
         return self._session
 
 
@@ -109127,6 +109274,7 @@ def _require_executor_session(
             "executor_active_session",
             {"zero_write_rejection": True, "writes_performed": False},
         )
+    _require_task_mutation_capability(session, action="claim")
     return session
 
 
@@ -201954,6 +202102,8 @@ def handle_task_notify(ctx: RequestContext):
     project_id = ctx.get_project_id()
     from . import task_registry
     with DBContext(project_id) as conn:
+        session = ctx.require_auth(conn)
+        _require_task_mutation_capability(session, action="notify")
         return task_registry.mark_notified(conn, ctx.body.get("task_id", ""))
 
 
@@ -201963,6 +202113,7 @@ def handle_task_recover(ctx: RequestContext):
     project_id = ctx.get_project_id()
     from . import task_registry
     with DBContext(project_id) as conn:
+        _require_executor_session(ctx, conn, project_id)
         return task_registry.recover_stale_tasks(conn, project_id)
 
 

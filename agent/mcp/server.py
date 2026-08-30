@@ -24,6 +24,7 @@ import sys
 import threading
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -288,6 +289,72 @@ def _notification(method: str, params: dict) -> None:
 # MCP Server
 # ---------------------------------------------------------------------------
 
+_AC_PROJECT_ID = "aming-claw"
+_AC_DEV_GOVERNANCE_URL = "http://127.0.0.1:40008"
+_STABLE_GOVERNANCE_URL = "http://127.0.0.1:40000"
+
+
+def _canonical_governance_url(project_id: str, requested_url: str) -> str:
+    project = str(project_id or "").strip()
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", project):
+        raise ValueError("MCP project identity must be an exact canonical key")
+    requested = str(requested_url or "").strip()
+    if not requested:
+        return (
+            _AC_DEV_GOVERNANCE_URL
+            if project == _AC_PROJECT_ID
+            else _STABLE_GOVERNANCE_URL
+        )
+    parsed = urllib.parse.urlsplit(requested)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost"}
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError("MCP governance URL must be one exact local world listener")
+    port = parsed.port
+    if project == _AC_PROJECT_ID:
+        if port != 40008:
+            raise ValueError("canonical AC MCP is bound exclusively to dev port 40008")
+        return _AC_DEV_GOVERNANCE_URL
+    if port == 40008:
+        raise ValueError("dev port 40008 accepts exact project aming-claw only")
+    if port != 40000:
+        raise ValueError("non-AC MCP projects are bound to stable port 40000")
+    return _STABLE_GOVERNANCE_URL
+
+
+def _mcp_project_claims(value: Any) -> list[str]:
+    claims: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "project_id" or str(key).endswith("_project_id"):
+                claims.append(str(item or "").strip())
+            claims.extend(_mcp_project_claims(item))
+    elif isinstance(value, list):
+        for item in value:
+            claims.extend(_mcp_project_claims(item))
+    return claims
+
+
+def _mcp_path_project_claims(path: str) -> list[str]:
+    parsed = urllib.parse.urlsplit(str(path or ""))
+    patterns = (
+        r"^/api/backlog/([^/]+)",
+        r"^/api/task/([^/]+)",
+        r"^/api/(?:graph-governance|wf|reconcile|context|ai-output)/([^/]+)",
+        r"^/api/projects/([^/]+)",
+    )
+    return [
+        urllib.parse.unquote(match.group(1))
+        for pattern in patterns
+        if (match := re.match(pattern, parsed.path))
+    ]
+
 class AmingClawMCP:
     """MCP Server main class."""
 
@@ -295,8 +362,11 @@ class AmingClawMCP:
                  redis_url: str, manager_url: str = "http://127.0.0.1:40101",
                  max_workers: int = 0, autostart_executor: bool = False,
                  enable_events: bool = False):
-        self.project_id = project_id
-        self.gov_url = governance_url.rstrip("/")
+        self.project_id = str(project_id or "").strip()
+        self.gov_url = _canonical_governance_url(
+            self.project_id,
+            governance_url,
+        )
         self.manager_url = manager_url.rstrip("/")
         self._workspace = workspace
         self._autostart_executor = autostart_executor
@@ -307,8 +377,8 @@ class AmingClawMCP:
         self.worker_pool = None
         if max_workers > 0:
             self.worker_pool = WorkerPool(
-                governance_url=governance_url,
-                project_id=project_id,
+                governance_url=self.gov_url,
+                project_id=self.project_id,
                 workspace=workspace,
                 max_workers=max_workers,
                 on_event=self._on_worker_event,
@@ -329,12 +399,12 @@ class AmingClawMCP:
         if self._autostart_executor:
             from service_manager import ServiceManager
             self.service_mgr = ServiceManager(
-                project_id=project_id,
-                governance_url=governance_url,
+                project_id=self.project_id,
+                governance_url=self.gov_url,
                 executor_cmd=[
                     sys.executable, str(Path(__file__).resolve().parents[1] / "executor_worker.py"),
-                    "--project", project_id,
-                    "--url", governance_url,
+                    "--project", self.project_id,
+                    "--url", self.gov_url,
                     "--workspace", workspace,
                 ],
             )
@@ -761,6 +831,35 @@ class AmingClawMCP:
     # -----------------------------------------------------------------------
 
     def _http(self, method: str, path: str, data: dict = None) -> dict:
+        claims = _mcp_path_project_claims(path) + _mcp_project_claims(data or {})
+        normalized = {claim for claim in claims if claim}
+        invalid_claim = any(
+            not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", claim)
+            for claim in normalized
+        )
+        if self.project_id == _AC_PROJECT_ID:
+            world_mismatch = any(
+                claim != _AC_PROJECT_ID for claim in normalized
+            )
+        else:
+            # Stable transports supported role-bound cross-project graph
+            # operations; it must reject AC, but must not collapse governance
+            # and target project identities into one value.
+            world_mismatch = any(
+                claim == _AC_PROJECT_ID for claim in normalized
+            )
+        if invalid_claim or world_mismatch:
+            return {
+                "error": "mcp_world_project_scope_mismatch",
+                "writes_performed": False,
+                "mutation_performed": False,
+            }
+        if method in {"POST", "DELETE"} and not normalized:
+            return {
+                "error": "mcp_unscoped_mutation_forbidden",
+                "writes_performed": False,
+                "mutation_performed": False,
+            }
         url = f"{self.gov_url}{path}"
         return self._request_json(method, url, data, timeout=15)
 
@@ -920,7 +1019,7 @@ class AmingClawMCP:
 def main():
     parser = argparse.ArgumentParser(description="Aming Claw MCP Server")
     parser.add_argument("--project", default="aming-claw", help="Project ID")
-    parser.add_argument("--governance-url", default=os.getenv("GOVERNANCE_URL", "http://localhost:40000"))
+    parser.add_argument("--governance-url", default=None)
     parser.add_argument("--manager-url", default=os.getenv("MANAGER_URL", "http://127.0.0.1:40101"))
     parser.add_argument("--workspace", default=os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[2])))
     parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:40079/0"))
@@ -948,7 +1047,11 @@ def main():
 
     server = AmingClawMCP(
         project_id=args.project,
-        governance_url=args.governance_url,
+        governance_url=(
+            args.governance_url
+            if args.governance_url is not None
+            else os.getenv("GOVERNANCE_URL", "")
+        ),
         workspace=args.workspace,
         redis_url=args.redis_url,
         manager_url=args.manager_url,

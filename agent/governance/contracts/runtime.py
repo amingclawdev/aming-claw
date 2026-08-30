@@ -62,7 +62,7 @@ _MF_PARALLEL_ATOMIC_DISPATCH_LINE = (
 )
 
 _DIRECT_MAIN_CANONICAL_CONTRACT_ID = "operator_supervised_direct_main"
-_DIRECT_MAIN_DEV_STORAGE_PREFIX = (
+_DIRECT_MAIN_LEGACY_STORAGE_PREFIX = (
     "operator_supervised_direct_main.dev_world."
 )
 _DIRECT_MAIN_DEV_PROJECT_PREFIX = "__ac_dev_world__."
@@ -838,8 +838,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
         if row is None:
             return None
         physical = tuple(str(value or "") for value in row[:3])
-        if not physical[2].startswith(_DIRECT_MAIN_DEV_STORAGE_PREFIX):
-            return None
+        if physical[2] != _DIRECT_MAIN_CANONICAL_CONTRACT_ID:
+            # Historical rows created before dev acquired a physically
+            # dedicated database used a synthetic contract namespace.  They
+            # remain readable for pinned audit only; current writes never
+            # recreate that namespace.
+            if not physical[2].startswith(_DIRECT_MAIN_LEGACY_STORAGE_PREFIX):
+                return None
+            raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[3]
+            record = _decode_record(raw)
+            if (
+                record.get("contract_execution_id") != contract_execution_id
+                or physical[1] != str(record.get("backlog_id") or "")
+                or not physical[0].startswith(_DIRECT_MAIN_DEV_PROJECT_PREFIX)
+            ):
+                raise ContractRuntimeError(
+                    "legacy dev Direct physical namespace is inconsistent"
+                )
+            return record
         raw = row["record_json"] if isinstance(row, sqlite3.Row) else row[3]
         record = _decode_record(raw)
         expected = _direct_main_dev_physical_storage_identity(record)

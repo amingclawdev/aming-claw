@@ -1316,8 +1316,22 @@ def dev_cutover():
     required=True,
     type=click.Path(exists=True, dir_okay=False, path_type=str),
 )
+@click.option(
+    "--legacy-digest-receipt",
+    required=False,
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    help=(
+        "Content-addressed identity receipt for a dense legacy archive whose "
+        "allocated bytes exceed the bounded preflight hashing budget."
+    ),
+)
 @click.option("--stable-anchor-commit", required=True)
-def dev_cutover_preflight(dev_storage_root, legacy_database, stable_anchor_commit):
+def dev_cutover_preflight(
+    dev_storage_root,
+    legacy_database,
+    legacy_digest_receipt,
+    stable_anchor_commit,
+):
     """Write a read-only, restart-safe cutover checkpoint; start nothing."""
 
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor_commit):
@@ -1339,6 +1353,7 @@ def dev_cutover_preflight(dev_storage_root, legacy_database, stable_anchor_commi
                 "start_identity": f"pid:{os.getpid()}:dev-cutover-preflight",
             },
             expected_dev_database_identity=binding["dev_database_identity"],
+            legacy_digest_receipt_path=legacy_digest_receipt,
         )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc

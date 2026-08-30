@@ -204300,7 +204300,9 @@ def test_stable_world_keeps_non_ac_project_behavior_with_authenticated_scope(mon
     ) is None
 
 
-def test_stable_world_preserves_supported_mf_sub_cross_project_graph_preflight(monkeypatch):
+def test_stable_world_preserves_supported_mf_sub_cross_project_graph_preflight(
+    conn, monkeypatch
+):
     """D1: transport domain checks must not collapse role-aware bindings."""
 
     monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
@@ -204319,6 +204321,30 @@ def test_stable_world_preserves_supported_mf_sub_cross_project_graph_preflight(m
         query={},
         token="source-backed-session-token",
     ) is None
+    from agent.governance import role_service
+
+    mf_sub = role_service.register(
+        conn,
+        "cross-project-worker",
+        "charting-loop",
+        "mf_sub",
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        server,
+        "independent_connection",
+        lambda _project_id, busy_timeout=5000: conn,
+    )
+    authenticated = server._authenticate_and_authorize_runtime_world_mutation(
+        method="POST",
+        path="/api/graph-governance/content-sys/query",
+        path_params={"project_id": "content-sys"},
+        body=body,
+        query={},
+        token=mf_sub["token"],
+        close_connection=False,
+    )
+    assert authenticated["project_id"] == "charting-loop"
 
     class ReadOnlyGovernanceConnection:
         closed = False
@@ -204539,3 +204565,86 @@ def test_executor_session_auth_guards_real_claim_progress_complete_zero_write(
         (task["task_id"],),
     ).fetchone()
     assert tuple(row) == ("executor-worker", "succeeded")
+
+
+def test_central_mutation_auth_binds_worker_role_action_and_zero_write_rejections(
+    conn,
+    monkeypatch,
+):
+    """QA2 A/B: central auth precedes every task mutation and binds actions."""
+
+    from agent.governance import role_service
+
+    project_id = "worker-project"
+    worker = role_service.register(
+        conn, "executor-worker", project_id, "dev", scope=["task:worker"]
+    )
+    qa = role_service.register(conn, "qa-reviewer", project_id, "qa")
+    coordinator = role_service.register(
+        conn, "operator", project_id, "coordinator"
+    )
+    expired = role_service.register(
+        conn, "expired-worker", project_id, "dev", scope=["task:worker"]
+    )
+    conn.execute(
+        "UPDATE sessions SET expires_at='2000-01-01T00:00:00Z' "
+        "WHERE session_id=?",
+        (expired["session_id"],),
+    )
+    revoked = role_service.register(
+        conn, "revoked-worker", project_id, "dev", scope=["task:worker"]
+    )
+    role_service.deregister(conn, revoked["session_id"])
+    replayed = role_service.register(
+        conn, "replayed-worker", project_id, "dev", scope=["task:worker"]
+    )
+    refreshed = role_service.register(
+        conn, "replayed-worker", project_id, "dev", scope=["task:worker"]
+    )
+    assert refreshed["token"] != replayed["token"]
+    conn.commit()
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+    monkeypatch.setattr(
+        server,
+        "independent_connection",
+        lambda _project_id, busy_timeout=5000: conn,
+    )
+
+    def authorize(path, token):
+        return server._authenticate_and_authorize_runtime_world_mutation(
+            method="POST",
+            path=path,
+            path_params={"project_id": project_id},
+            body={"project_id": project_id},
+            query={},
+            token=token,
+            close_connection=False,
+        )
+
+    for action in ("claim", "progress", "complete", "recover"):
+        before = tuple(conn.iterdump())
+        with pytest.raises((AuthError, PermissionDeniedError, ValidationError)):
+            authorize(f"/api/task/{project_id}/{action}", qa["token"])
+        assert tuple(conn.iterdump()) == before
+        accepted = authorize(f"/api/task/{project_id}/{action}", worker["token"])
+        assert accepted["principal_id"] == "executor-worker"
+        assert accepted["authorized_action"] == f"task:{action}"
+
+    before = tuple(conn.iterdump())
+    with pytest.raises((AuthError, PermissionDeniedError, ValidationError)):
+        authorize(f"/api/task/{project_id}/notify", qa["token"])
+    assert tuple(conn.iterdump()) == before
+    assert authorize(
+        f"/api/task/{project_id}/notify", coordinator["token"]
+    )["authorized_action"] == "task:notify"
+
+    for token in (
+        "gov-invalid-token",
+        expired["token"],
+        revoked["token"],
+        replayed["token"],
+    ):
+        before = tuple(conn.iterdump())
+        with pytest.raises((AuthError, PermissionDeniedError, ValidationError)):
+            authorize(f"/api/task/{project_id}/claim", token)
+        assert tuple(conn.iterdump()) == before

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent.governance import mcp_server
+from agent.mcp import server as stdio_mcp_server
 
 
 def test_contract_runtime_bypass_mcp_exposes_only_opaque_cross_plane_authority(
@@ -87,3 +88,73 @@ def test_governance_mcp_rejects_cross_project_request(monkeypatch):
     )
     assert result["error"] == "mcp_world_project_scope_mismatch"
     assert result["writes_performed"] is False
+
+
+def test_actual_stdio_mcp_constructor_is_exactly_world_bound(monkeypatch, tmp_path):
+    monkeypatch.delenv("GOVERNANCE_URL", raising=False)
+    instance = stdio_mcp_server.AmingClawMCP(
+        project_id="aming-claw",
+        governance_url="",
+        workspace=str(tmp_path),
+        redis_url="redis://127.0.0.1:40079/0",
+        max_workers=0,
+    )
+    assert instance.gov_url == "http://127.0.0.1:40008"
+    assert instance.dispatcher._api.__self__ is instance
+    assert instance._http(
+        "POST",
+        "/api/task/content-sys/claim",
+        {"project_id": "content-sys"},
+    ) == {
+        "error": "mcp_world_project_scope_mismatch",
+        "writes_performed": False,
+        "mutation_performed": False,
+    }
+    assert instance._http("POST", "/api/project/bootstrap", {}) == {
+        "error": "mcp_unscoped_mutation_forbidden",
+        "writes_performed": False,
+        "mutation_performed": False,
+    }
+
+    with pytest.raises(ValueError, match="40008"):
+        stdio_mcp_server.AmingClawMCP(
+            project_id="aming-claw",
+            governance_url="http://127.0.0.1:40000",
+            workspace=str(tmp_path),
+            redis_url="redis://127.0.0.1:40079/0",
+            max_workers=0,
+        )
+    for project_id in ("aming_claw", "content-sys", ""):
+        with pytest.raises(ValueError):
+            stdio_mcp_server.AmingClawMCP(
+                project_id=project_id,
+                governance_url="http://127.0.0.1:40008",
+                workspace=str(tmp_path),
+                redis_url="redis://127.0.0.1:40079/0",
+                max_workers=0,
+            )
+
+    stable = stdio_mcp_server.AmingClawMCP(
+        project_id="charting-loop",
+        governance_url="http://localhost:40000",
+        workspace=str(tmp_path),
+        redis_url="redis://127.0.0.1:40079/0",
+        max_workers=0,
+    )
+    calls = []
+    monkeypatch.setattr(
+        stable,
+        "_request_json",
+        lambda method, url, data, timeout: calls.append(
+            (method, url, data, timeout)
+        ) or {"ok": True},
+    )
+    assert stable._http(
+        "POST",
+        "/api/graph-governance/content-sys/query",
+        {
+            "governance_project_id": "charting-loop",
+            "target_project_id": "content-sys",
+        },
+    ) == {"ok": True}
+    assert calls[0][1].startswith("http://127.0.0.1:40000/")
