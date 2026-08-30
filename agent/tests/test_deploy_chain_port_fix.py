@@ -93,7 +93,7 @@ def test_ac_restart_requires_dev_storage_before_writing(monkeypatch):
     import agent.deploy_chain as deploy
 
     monkeypatch.delenv("AMING_CLAW_DEV_STORAGE_ROOT", raising=False)
-    with pytest.raises(ValueError, match="dev storage"):
+    with pytest.raises(RuntimeError, match="explicit AMING_CLAW_DEV_STORAGE_ROOT"):
         deploy.restart_executor("aming-claw")
 
 

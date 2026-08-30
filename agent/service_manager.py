@@ -884,8 +884,6 @@ def _install_signal_handlers(stop_fn: Callable[[], None]) -> None:
 def main() -> None:
     import argparse
 
-    _load_env_file()
-
     parser = argparse.ArgumentParser(
         description="Host-side ServiceManager that supervises agent.executor_worker",
     )
@@ -910,6 +908,18 @@ def main() -> None:
     # Bind the full plane/storage authority before creating any log directory,
     # handler, status probe, thread, or subprocess.
     identity = _plane_bound_manager_identity(args.project, args.governance_url)
+    _load_env_file()
+    for key, expected in {
+        "PROJECT_ID": identity["project_id"],
+        "EXECUTOR_PROJECT_ID": identity["project_id"],
+        "GOVERNANCE_URL": identity["governance_url"],
+        "MANAGER_URL": identity["manager_url"],
+        "EXECUTOR_API_PORT": str(urlparse(identity["executor_url"]).port),
+        "SHARED_VOLUME_PATH": identity["storage_root"],
+    }.items():
+        configured = os.getenv(key)
+        if configured and configured != expected:
+            raise ValueError(f"ServiceManager environment {key} crosses bound runtime identity")
     manager = ServiceManager(
         project_id=args.project,
         governance_url=args.governance_url,

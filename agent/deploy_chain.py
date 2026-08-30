@@ -161,17 +161,20 @@ def restart_executor(project_id: str) -> bool:
 
     Returns True on success, False if an exception occurred.
     """
-    _plane_bound_endpoints(project_id)
-    if project_id == "aming-claw":
-        dev_root = os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT", "")
-        if not dev_root:
-            raise ValueError("AC executor restart requires explicit dev storage root")
-        signal_path = Path(dev_root).absolute() / "runtime" / "manager_signal.json"
-    else:
-        signal_path = _state_dir() / "manager_signal.json"
+    from agent.manager_http_server import _canonical_storage_root, plane_bound_manager_identity
+
+    plane = resolve_runtime_plane(project_id)
+    root = _canonical_storage_root(plane.name)
+    identity = plane_bound_manager_identity(
+        project_id, plane.governance_url, str(root),
+    )
+    signal_path = (
+        Path(identity["storage_root"]) / "manager_signal.json"
+        if identity["plane"] == "dev"
+        else Path(identity["storage_root"]) / "codex-tasks" / "state" / "manager_signal.json"
+    )
     try:
-        if project_id == "aming-claw":
-            signal_path.parent.mkdir(parents=True, exist_ok=True)
+        signal_path.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
             "action": "restart",
             "requested_at": utc_iso(),
