@@ -863,3 +863,31 @@ def test_ac_dev_archive_content_proof_is_fd_derived_and_detects_toctou(
             expected_size=db.AC_LEGACY_ARCHIVE_SIZE_BYTES,
             content_digest=True,
         )
+
+
+def test_ac_dev_archive_cached_digest_is_compare_only(tmp_path):
+    """QA4 Y1: matching stat fields cannot authorize a forged digest."""
+
+    from agent.governance import db
+
+    legacy = tmp_path / "legacy.db"
+    with legacy.open("wb") as handle:
+        handle.truncate(db.AC_LEGACY_ARCHIVE_SIZE_BYTES)
+        handle.seek(4096)
+        handle.write(b"independent-fd-truth")
+    actual = db._cutover_database_stat(
+        legacy,
+        expected_size=db.AC_LEGACY_ARCHIVE_SIZE_BYTES,
+        content_digest=True,
+    )
+    forged = {
+        **actual,
+        "content_digest": "sha256-sparse-v1:" + "0" * 64,
+    }
+    with pytest.raises(ValueError, match="cached content digest mismatch"):
+        db._cutover_database_stat(
+            legacy,
+            expected_size=db.AC_LEGACY_ARCHIVE_SIZE_BYTES,
+            content_digest=True,
+            cached_identity=forged,
+        )

@@ -1170,7 +1170,7 @@ def _dev_storage_root(*, create: bool = False) -> Path:
 def _dev_runtime_root(*, create: bool = False) -> Path:
     """Return the dedicated non-symlink root for dev-world runtime artifacts."""
 
-    root = _dev_storage_root(create=False)
+    root = _dev_storage_root(create=create)
     runtime = root / "runtime"
     return _absolute_non_symlink_root(runtime, create=create)
 
@@ -1729,14 +1729,16 @@ def _cutover_database_stat(
             if cached and any(cached.get(key) != identity[key] for key in stat_keys):
                 raise ValueError("legacy AC archive identity changed")
             cached_digest = str(cached.get("content_digest") or "")
-            if cached_digest:
-                if not re.fullmatch(r"sha256-sparse-v1:[0-9a-f]{64}", cached_digest):
-                    raise ValueError("legacy AC archive content digest is invalid")
-                identity["content_digest"] = cached_digest
-            else:
-                identity["content_digest"] = _fd_sparse_content_digest(
-                    descriptor, size=int(before.st_size)
-                )
+            if cached and not re.fullmatch(
+                r"sha256-sparse-v1:[0-9a-f]{64}", cached_digest
+            ):
+                raise ValueError("legacy AC archive cached content digest is invalid")
+            actual_digest = _fd_sparse_content_digest(
+                descriptor, size=int(before.st_size)
+            )
+            if cached_digest and cached_digest != actual_digest:
+                raise ValueError("legacy AC archive cached content digest mismatch")
+            identity["content_digest"] = actual_digest
         after = os.fstat(descriptor)
         path_after = os.stat(absolute, follow_symlinks=False)
         immutable_keys = (
