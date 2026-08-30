@@ -30,7 +30,7 @@ def test_plane_bound_endpoint_selection_keeps_ac_off_stable_sidecar():
     from agent.deploy_chain import _plane_bound_endpoints
 
     assert _plane_bound_endpoints("proj") == (
-        "http://127.0.0.1:40000", "http://localhost:40101"
+        "http://127.0.0.1:40000", "http://127.0.0.1:40101"
     )
     assert _plane_bound_endpoints("aming-claw") == (
         "http://127.0.0.1:40008", "http://127.0.0.1:40109"

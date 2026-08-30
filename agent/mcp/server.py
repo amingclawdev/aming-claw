@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 from pathlib import Path
 from typing import Any
+from agent.runtime_plane import resolve_runtime_plane
 
 # Ensure agent package is importable
 _agent_dir = str(Path(__file__).resolve().parents[1])
@@ -359,7 +360,7 @@ class AmingClawMCP:
     """MCP Server main class."""
 
     def __init__(self, project_id: str, governance_url: str, workspace: str,
-                 redis_url: str, manager_url: str = "http://127.0.0.1:40101",
+                 redis_url: str, manager_url: str = "",
                  max_workers: int = 0, autostart_executor: bool = False,
                  enable_events: bool = False):
         self.project_id = str(project_id or "").strip()
@@ -367,7 +368,10 @@ class AmingClawMCP:
             self.project_id,
             governance_url,
         )
-        self.manager_url = manager_url.rstrip("/")
+        plane = resolve_runtime_plane(self.project_id)
+        if manager_url and manager_url.rstrip("/") != plane.manager_url:
+            raise ValueError("MCP manager URL crosses the project runtime plane")
+        self.manager_url = plane.manager_url
         self._workspace = workspace
         if self.project_id == _AC_PROJECT_ID:
             from agent.governance.db import _dev_runtime_root
@@ -1027,7 +1031,7 @@ def main():
     parser = argparse.ArgumentParser(description="Aming Claw MCP Server")
     parser.add_argument("--project", default="aming-claw", help="Project ID")
     parser.add_argument("--governance-url", default=None)
-    parser.add_argument("--manager-url", default=os.getenv("MANAGER_URL", "http://127.0.0.1:40101"))
+    parser.add_argument("--manager-url", default="")
     parser.add_argument("--workspace", default=os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[2])))
     parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:40079/0"))
     parser.add_argument("--workers", type=int, default=int(os.getenv("MCP_WORKERS", "1")))

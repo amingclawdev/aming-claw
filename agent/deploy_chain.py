@@ -40,6 +40,7 @@ if str(_agent_dir) not in sys.path:
     sys.path.insert(0, str(_agent_dir))
 
 from utils import save_json, tasks_root, utc_iso  # noqa: E402
+from runtime_plane import resolve_runtime_plane  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -59,19 +60,8 @@ def _plane_bound_endpoints(project_id: str) -> tuple[str, str]:
     stable manager sidecar, because that sidecar has different DB and process
     custody.
     """
-    if not isinstance(project_id, str) or not project_id:
-        raise ValueError("deploy operations require an explicit nonempty project_id")
-    raw = project_id
-    if raw != raw.strip():
-        raise ValueError("deploy project_id must not contain surrounding whitespace")
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", raw):
-        raise ValueError("deploy project_id must be an exact canonical key")
-    normalized = re.sub(r"[-_\s]+", "-", raw).strip("-").lower()
-    if normalized == "aming-claw" and raw != "aming-claw":
-        raise ValueError("AC deploy consumers require exact canonical project_id=aming-claw")
-    if raw == "aming-claw":
-        return (_AC_DEV_GOVERNANCE_URL, _AC_DEV_MANAGER_URL)
-    return (_STABLE_GOVERNANCE_URL, _STABLE_MANAGER_URL)
+    plane = resolve_runtime_plane(project_id)
+    return plane.governance_url, plane.manager_url
 
 
 def _matches_any(path: str, patterns: list[str]) -> bool:
@@ -216,7 +206,8 @@ def rebuild_governance(project_id: str) -> tuple[bool, str]:
     In host-runtime mode (no Docker), falls directly to restart_local_governance.
     Returns (success, output_summary).
     """
-    governance_url, _manager_url = _plane_bound_endpoints(project_id)
+    plane = resolve_runtime_plane(project_id)
+    governance_url = plane.governance_url
     governance_port = urlparse(governance_url).port
     # Docker compose owns only the stable world.  AC's dev listener is host
     # managed and must not be rebuilt through the stable compose project.
@@ -615,7 +606,7 @@ def smoke_test(affected_services: list[str] | None, project_id: str) -> dict[str
     if results["executor"] != "not_applicable":
         try:
             import requests
-            resp = requests.get("http://localhost:40100/status", timeout=5)
+            resp = requests.get(f"{resolve_runtime_plane(project_id).executor_url}/status", timeout=5)
             results["executor"] = resp.status_code == 200
         except Exception:  # noqa: BLE001
             results["executor"] = _executor_health_from_state()

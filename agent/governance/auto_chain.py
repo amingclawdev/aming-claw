@@ -26,6 +26,7 @@ from .doc_policy import (
 )
 from .dirty_worktree import DIRTY_IGNORE_PREFIXES as _DIRTY_IGNORE
 from . import backlog_runtime
+from agent.runtime_plane import resolve_runtime_plane
 
 log = logging.getLogger(__name__)
 
@@ -7105,7 +7106,7 @@ def _try_backlog_close_via_db(project_id, bug_id, commit_hash, conn=None):
                 pass
 
 
-def _post_manager_redeploy_governance_from_chain(chain_version: str) -> dict:
+def _post_manager_redeploy_governance_from_chain(chain_version: str, project_id: str) -> dict:
     """POST to localhost:40101/api/manager/redeploy/governance (PR1-R4).
 
     Uses urllib.request (already used elsewhere in auto_chain.py) — no new
@@ -7117,7 +7118,8 @@ def _post_manager_redeploy_governance_from_chain(chain_version: str) -> dict:
     import urllib.request
     import urllib.error
 
-    url = "http://localhost:40101/api/manager/redeploy/governance"
+    plane = resolve_runtime_plane(project_id)
+    url = f"{plane.manager_url}/api/manager/redeploy/governance"
     data = json.dumps({"chain_version": chain_version}).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -7135,7 +7137,7 @@ def _post_manager_redeploy_governance_from_chain(chain_version: str) -> dict:
                 "auto_chain: manager HTTP not reachable (ConnectionRefused); "
                 "fallback to legacy restart_local_governance"
             )
-            return _legacy_restart_local_governance_fallback()
+            return _legacy_restart_local_governance_fallback(project_id)
         log.warning("auto_chain: manager redeploy URLError: %s", exc)
         return {"ok": False, "detail": str(exc), "fallback": False}
     except ConnectionRefusedError:
@@ -7143,20 +7145,22 @@ def _post_manager_redeploy_governance_from_chain(chain_version: str) -> dict:
             "auto_chain: manager HTTP not reachable (ConnectionRefused); "
             "fallback to legacy restart_local_governance"
         )
-        return _legacy_restart_local_governance_fallback()
+        return _legacy_restart_local_governance_fallback(project_id)
     except Exception as exc:
         log.warning("auto_chain: manager redeploy error: %s", exc)
         return {"ok": False, "detail": str(exc), "fallback": False}
 
 
-def _legacy_restart_local_governance_fallback() -> dict:
+def _legacy_restart_local_governance_fallback(project_id: str) -> dict:
     """PR1-R5: Legacy fallback — restart governance via deploy_chain.restart_local_governance.
 
     Only called when the POST to localhost:40101 gets ConnectionRefusedError.
     """
     try:
         from agent.deploy_chain import restart_local_governance
-        ok, summary = restart_local_governance(port=40000)
+        from urllib.parse import urlparse
+        port = urlparse(resolve_runtime_plane(project_id).governance_url).port
+        ok, summary = restart_local_governance(port=port)
         return {"ok": ok, "detail": summary, "fallback": True}
     except Exception as exc:
         log.warning("auto_chain: legacy restart_local_governance fallback failed: %s", exc)
@@ -7186,7 +7190,7 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
         redeploy_via_manager = _post_manager_redeploy_governance_from_chain(
             metadata.get("chain_version", "")
             or result.get("chain_version", "")
-            or metadata.get("merge_commit", "")
+            or metadata.get("merge_commit", ""), project_id
         )
         finalize_result["governance_redeploy"] = redeploy_via_manager
         if redeploy_via_manager.get("ok"):

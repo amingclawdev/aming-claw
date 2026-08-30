@@ -19,6 +19,7 @@ import uuid as _uuid
 from datetime import datetime, timezone as _tz
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from agent.runtime_plane import resolve_runtime_plane
 
 log = logging.getLogger(__name__)
 
@@ -115,7 +116,7 @@ class ObserverManager:
         cls.generate_report(task_id, {"task_id": task_id, "status": "accepted"})
         return session_id
 
-PORT = int(os.getenv("EXECUTOR_API_PORT", "40100"))
+PORT = int(os.getenv("EXECUTOR_API_PORT", "0"))
 
 # References to shared state (set by executor.py on startup)
 _ai_manager = None
@@ -347,12 +348,12 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_tasks(self, qs):
         """GET /tasks — List tasks from governance."""
-        project_id = qs.get("project_id", ["amingClaw"])[0]
+        project_id = qs.get("project_id", [os.getenv("PROJECT_ID", "")])[0]
         status = qs.get("status", [""])[0]
         limit = int(qs.get("limit", ["20"])[0])
 
         token = os.getenv("GOV_COORDINATOR_TOKEN", "")
-        gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+        gov_url = resolve_runtime_plane(project_id).governance_url
 
         try:
             import requests
@@ -1582,10 +1583,14 @@ def unregister_worktree(task_id: str) -> None:
     _active_worktree_roots.pop(task_id, None)
 
 
-def start_api_server():
+def start_api_server(project_id: str):
     """Start the Executor API server in a background thread."""
-    server = HTTPServer(("0.0.0.0", PORT), ExecutorAPIHandler)
+    plane = resolve_runtime_plane(project_id)
+    port = urlparse(plane.executor_url).port
+    if PORT and PORT != port:
+        raise ValueError("EXECUTOR_API_PORT crosses the project runtime plane")
+    server = HTTPServer(("0.0.0.0", port), ExecutorAPIHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    log.info("Executor API server started on port %d", PORT)
+    log.info("Executor API server started on port %d", port)
     return server

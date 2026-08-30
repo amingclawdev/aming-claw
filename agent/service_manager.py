@@ -35,6 +35,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
+from agent.runtime_plane import resolve_runtime_plane
 
 # B48 FIX B (observer-hotfix 2026-04-23): Ensure the project root is on
 # sys.path so `from agent.manager_http_server import run_server` works when
@@ -761,6 +762,9 @@ class ServiceManager:
     def _spawn_executor_process(self) -> subprocess.Popen:
         """Spawn the executor and redirect output to a persistent host log file."""
         child_env = os.environ.copy()
+        child_env["EXECUTOR_API_PORT"] = str(
+            urlparse(resolve_runtime_plane(self.project_id).executor_url).port
+        )
         if self._managed_executor:
             token = self._verified_executor_session_token()
             child_env[EXECUTOR_SESSION_TOKEN_ENV] = token

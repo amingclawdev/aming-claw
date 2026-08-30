@@ -29,6 +29,7 @@ from .schema_contract import (
     MCP_TOOL_SCHEMA_VERSION,
     mcp_tool_schema_compatibility,
 )
+from agent.runtime_plane import resolve_runtime_plane
 
 log = logging.getLogger(__name__)
 
@@ -9900,7 +9901,12 @@ class ToolDispatcher:
 
     def _default_manager_api(self, method: str, path: str, data: dict | None = None) -> dict:
         """HTTP helper for manager sidecar when the MCP server did not inject one."""
-        manager_url = os.environ.get("MANAGER_URL", "http://127.0.0.1:40101").rstrip("/")
+        project_id = os.environ.get("AMING_CLAW_MCP_PROJECT_ID") or os.environ.get("PROJECT_ID")
+        plane = resolve_runtime_plane(project_id)
+        configured = os.environ.get("MANAGER_URL", "").rstrip("/")
+        if configured and configured != plane.manager_url:
+            raise ValueError("MCP manager URL crosses the project runtime plane")
+        manager_url = plane.manager_url
         url = f"{manager_url}{path}"
         try:
             if data is not None:

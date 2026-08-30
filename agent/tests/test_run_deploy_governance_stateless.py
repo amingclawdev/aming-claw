@@ -39,7 +39,7 @@ class TestPostManagerRedeployGovernanceFromChain(unittest.TestCase):
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_urlopen.return_value = mock_resp
 
-        result = _post_manager_redeploy_governance_from_chain("abc1234")
+        result = _post_manager_redeploy_governance_from_chain("abc1234", "proj")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["pid"], 1234)
@@ -47,7 +47,7 @@ class TestPostManagerRedeployGovernanceFromChain(unittest.TestCase):
         # Verify the request was made to the correct URL
         call_args = mock_urlopen.call_args
         req_obj = call_args[0][0]
-        self.assertEqual(req_obj.full_url, "http://localhost:40101/api/manager/redeploy/governance")
+        self.assertEqual(req_obj.full_url, "http://127.0.0.1:40101/api/manager/redeploy/governance")
         self.assertEqual(req_obj.method, "POST")
         body = json.loads(req_obj.data.decode("utf-8"))
         self.assertEqual(body["chain_version"], "abc1234")
@@ -60,7 +60,7 @@ class TestPostManagerRedeployGovernanceFromChain(unittest.TestCase):
         mock_urlopen.side_effect = urllib.error.URLError(ConnectionRefusedError("refused"))
         mock_fallback.return_value = {"ok": True, "detail": "legacy ok", "fallback": True}
 
-        result = _post_manager_redeploy_governance_from_chain("def5678")
+        result = _post_manager_redeploy_governance_from_chain("def5678", "proj")
 
         mock_fallback.assert_called_once()
         self.assertTrue(result["ok"])
@@ -75,7 +75,7 @@ class TestPostManagerRedeployGovernanceFromChain(unittest.TestCase):
         with patch("agent.governance.auto_chain._legacy_restart_local_governance_fallback",
                     return_value={"ok": False, "detail": "fail", "fallback": True}):
             with self.assertLogs("agent.governance.auto_chain", level="WARNING") as cm:
-                _post_manager_redeploy_governance_from_chain("xyz999")
+                _post_manager_redeploy_governance_from_chain("xyz999", "proj")
 
         # Check that at least one log message contains 'fallback'
         fallback_msgs = [m for m in cm.output if "fallback" in m.lower()]
@@ -106,7 +106,7 @@ class TestFinalizeChainGovernanceRedeploy(unittest.TestCase):
 
         _finalize_chain(mock_conn, "test-project", "task-1", result, metadata)
 
-        mock_redeploy.assert_called_once_with("abc123")
+        mock_redeploy.assert_called_once_with("abc123", "test-project")
 
     @patch("agent.governance.auto_chain._post_manager_redeploy_governance_from_chain")
     @patch("agent.governance.auto_chain._try_backlog_close_via_db", return_value=False)
@@ -134,7 +134,7 @@ class TestLegacyFallback(unittest.TestCase):
     @patch("agent.deploy_chain.restart_local_governance", return_value=(True, "restarted ok"))
     def test_fallback_calls_restart_local_governance(self, mock_restart):
         """Fallback invokes restart_local_governance from deploy_chain."""
-        result = _legacy_restart_local_governance_fallback()
+        result = _legacy_restart_local_governance_fallback("proj")
         self.assertTrue(result["ok"])
         self.assertTrue(result["fallback"])
         mock_restart.assert_called_once_with(port=40000)
@@ -142,7 +142,7 @@ class TestLegacyFallback(unittest.TestCase):
     @patch("agent.deploy_chain.restart_local_governance", side_effect=RuntimeError("boom"))
     def test_fallback_handles_exception(self, mock_restart):
         """Fallback returns ok=False on exception."""
-        result = _legacy_restart_local_governance_fallback()
+        result = _legacy_restart_local_governance_fallback("proj")
         self.assertFalse(result["ok"])
         self.assertTrue(result["fallback"])
 
