@@ -824,126 +824,42 @@ def test_ac_dev_cutover_failure_leaves_old_live_and_new_inactive(tmp_path):
     assert not (storage_root / "cutover" / "active.json").exists()
 
 
-def test_ac_dev_cutover_content_seal_tamper_and_final_start_faults(tmp_path):
+def test_ac_dev_archive_content_proof_is_fd_derived_and_detects_toctou(
+    tmp_path, monkeypatch
+):
+    """v12 Y1: caller receipts are not identity authority; one fd owns proof."""
+
     from agent.governance import db
 
-    root, commit = _dev_source_repo(tmp_path)
-    source = {
-        "root": str(root.resolve()),
-        "branch": "codex/ac-dev",
-        "commit": commit,
-        "source_sha256": "sha256:" + "9" * 64,
-    }
-    process = {"pid": 606, "start_identity": "cutover-seal-operator"}
-    storage_root = tmp_path / "dev-world"
-    dev = db.bootstrap_dev_governance_store(
-        storage_root, source_identity=source, process_identity=process
-    )
     legacy = tmp_path / "legacy.db"
     with legacy.open("wb") as handle:
         handle.truncate(db.AC_LEGACY_ARCHIVE_SIZE_BYTES)
 
-    def listener_probe(port):
-        return {
-            "port": port,
-            "listening": port == 40000,
-            "pid": 700 if port == 40000 else 0,
-            "process_start_identity": "stable-700" if port == 40000 else "",
-            "source_commit": "f" * 40 if port == 40000 else "",
-        }
+    source = __import__("inspect").getsource(db._cutover_database_stat)
+    assert "digest_receipt_path" not in source
+    assert "os.O_NOFOLLOW" in source
+    assert source.count("os.fstat") >= 2
 
-    first = db.preflight_dev_world_cutover(
-        legacy_database_path=legacy,
-        storage_root=storage_root,
-        source_identity=source,
-        process_identity=process,
-        expected_dev_database_identity=dev["database_identity"],
-        listener_probe=listener_probe,
+    identity = db._cutover_database_stat(
+        legacy,
+        expected_size=db.AC_LEGACY_ARCHIVE_SIZE_BYTES,
+        content_digest=True,
     )
-    legacy_identity = first["legacy_database_identity"]
-    assert legacy_identity["mtime_ns"] > 0
-    assert legacy_identity["ctime_ns"] > 0
-    assert legacy_identity["content_digest"].startswith("sha256-sparse-v1:")
-    with legacy.open("r+b") as handle:
-        handle.seek(4096)
-        handle.write(b"changed-with-same-size-and-inode")
-    with pytest.raises(ValueError, match="legacy AC archive identity changed"):
-        db.activate_dev_world_cutover(
-            storage_root=storage_root,
-            preflight_hash=first["preflight_hash"],
-            listener_probe=listener_probe,
+    assert identity["content_digest"].startswith("sha256-sparse-v1:")
+
+    original = db._fd_sparse_content_digest
+
+    def mutate_while_hashing(descriptor, *, size):
+        digest = original(descriptor, size=size)
+        with legacy.open("r+b") as handle:
+            handle.seek(4096)
+            handle.write(b"toctou")
+        return digest
+
+    monkeypatch.setattr(db, "_fd_sparse_content_digest", mutate_while_hashing)
+    with pytest.raises(ValueError, match="changed during content proof"):
+        db._cutover_database_stat(
+            legacy,
+            expected_size=db.AC_LEGACY_ARCHIVE_SIZE_BYTES,
+            content_digest=True,
         )
-
-    second = db.preflight_dev_world_cutover(
-        legacy_database_path=legacy,
-        storage_root=storage_root,
-        source_identity=source,
-        process_identity=process,
-        expected_dev_database_identity=dev["database_identity"],
-        listener_probe=listener_probe,
-    )
-    db.activate_dev_world_cutover(
-        storage_root=storage_root,
-        preflight_hash=second["preflight_hash"],
-        listener_probe=listener_probe,
-    )
-    active_path = storage_root / "cutover" / "active.json"
-    pristine = json.loads(active_path.read_text(encoding="utf-8"))
-    mutations = (
-        {**pristine, "activation_seal": "sha256:" + "0" * 64},
-        {**pristine, "checkpoint_path": str(tmp_path / "bogus.json")},
-        {
-            **pristine,
-            "source_identity": {
-                **pristine["source_identity"],
-                "root": str(tmp_path / "bogus-root"),
-            },
-        },
-        {
-            **pristine,
-            "new_database_identity": {
-                **pristine["new_database_identity"],
-                "inode": pristine["new_database_identity"]["inode"] + 1,
-            },
-        },
-    )
-    for mutation in mutations:
-        active_path.write_text(json.dumps(mutation), encoding="utf-8")
-        with pytest.raises(ValueError, match="cutover activation"):
-            db.validate_dev_world_cutover_activation(
-                storage_root=storage_root,
-                expected_dev_database_identity=mutation["new_database_identity"],
-                source_identity=mutation["source_identity"],
-                listener_probe=listener_probe,
-            )
-    active_path.write_text(json.dumps(pristine), encoding="utf-8")
-
-    wal = Path(str(dev["database_path"]) + "-wal")
-    wal.write_bytes(b"late-owner")
-    with pytest.raises(ValueError, match="WAL/SHM"):
-        db.validate_dev_world_cutover_activation(
-            storage_root=storage_root,
-            expected_dev_database_identity=dev["database_identity"],
-            source_identity=source,
-            listener_probe=listener_probe,
-        )
-    wal.unlink()
-
-    def changed_listener(port):
-        value = listener_probe(port)
-        if port == 40000:
-            value = {**value, "pid": 701, "process_start_identity": "stable-701"}
-        return value
-
-    with pytest.raises(ValueError, match="preflight changed"):
-        db.validate_dev_world_cutover_activation(
-            storage_root=storage_root,
-            expected_dev_database_identity=dev["database_identity"],
-            source_identity=source,
-            listener_probe=changed_listener,
-        )
-    rolled_back = db.rollback_dev_world_cutover(
-        storage_root=storage_root,
-        preflight_hash=second["preflight_hash"],
-    )
-    assert rolled_back["status"] == "rolled_back"

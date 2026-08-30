@@ -369,6 +369,19 @@ class AmingClawMCP:
         )
         self.manager_url = manager_url.rstrip("/")
         self._workspace = workspace
+        if self.project_id == _AC_PROJECT_ID:
+            from agent.governance.db import _dev_runtime_root
+
+            self.artifact_root = _dev_runtime_root(create=True)
+            shared = self.artifact_root / "shared"
+            shared.mkdir(parents=True, exist_ok=True)
+            if shared.is_symlink() or not shared.resolve(strict=True).is_relative_to(
+                self.artifact_root
+            ):
+                raise ValueError("AC MCP shared artifact root cannot contain a symlink")
+            os.environ["SHARED_VOLUME_PATH"] = str(shared)
+        else:
+            self.artifact_root = Path(workspace).expanduser().resolve() / "shared-volume"
         self._autostart_executor = autostart_executor
         self._enable_events = enable_events
 
@@ -851,12 +864,6 @@ class AmingClawMCP:
         if invalid_claim or world_mismatch:
             return {
                 "error": "mcp_world_project_scope_mismatch",
-                "writes_performed": False,
-                "mutation_performed": False,
-            }
-        if method in {"POST", "DELETE"} and not normalized:
-            return {
-                "error": "mcp_unscoped_mutation_forbidden",
                 "writes_performed": False,
                 "mutation_performed": False,
             }

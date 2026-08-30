@@ -93,11 +93,21 @@ def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str
 
 def _world_bound_log_root(project_id: str, workspace: str) -> Path:
     if project_id == "aming-claw":
-        root = os.getenv("AMING_CLAW_DEV_STORAGE_ROOT", "").strip()
-        if not root:
-            raise RuntimeError("AC executor requires AMING_CLAW_DEV_STORAGE_ROOT")
-        return Path(root).expanduser().resolve() / "runtime" / "logs"
+        from agent.governance.db import _dev_runtime_root
+
+        return _dev_runtime_root(create=True) / "logs"
     return Path(workspace or ".") / "shared-volume" / "codex-tasks" / "logs"
+
+
+def _world_bound_pid_path(project_id: str) -> Path:
+    if project_id == "aming-claw":
+        from agent.governance.db import _dev_runtime_root
+
+        state = _dev_runtime_root(create=True) / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        return state / f"executor-{project_id}.pid"
+    return Path(tempfile.gettempdir()) / f"aming-claw-executor-{project_id}.pid"
+
 
 # Task type → role.
 # Timeout is no longer hardcoded per task type.  The ai_lifecycle streaming watchdog
@@ -2737,10 +2747,7 @@ class ExecutorWorker:
         If an old PID file exists but the process is no longer running (stale
         lock), the file is overwritten and ``True`` is returned.
         """
-        pid_path = os.path.join(
-            tempfile.gettempdir(),
-            f"aming-claw-executor-{self.project_id}.pid",
-        )
+        pid_path = str(_world_bound_pid_path(self.project_id))
 
         if os.path.exists(pid_path):
             try:

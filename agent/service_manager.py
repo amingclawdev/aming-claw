@@ -144,10 +144,9 @@ def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) 
 def _shared_log_dir(project_id: str = "") -> Path:
     selected_project = str(project_id or _default_project_id()).strip()
     if selected_project == "aming-claw":
-        root = os.getenv("AMING_CLAW_DEV_STORAGE_ROOT", "").strip()
-        if not root:
-            raise RuntimeError("AC ServiceManager requires AMING_CLAW_DEV_STORAGE_ROOT")
-        return Path(root).expanduser().resolve() / "runtime" / "logs"
+        from agent.governance.db import _dev_runtime_root
+
+        return _dev_runtime_root(create=True) / "logs"
     return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "logs"
 
 
@@ -155,10 +154,9 @@ def _signal_file_path(project_id: str = "") -> Path:
     """Path to the manager restart signal file (manager_signal.json)."""
     selected_project = str(project_id or _default_project_id()).strip()
     if selected_project == "aming-claw":
-        root = os.getenv("AMING_CLAW_DEV_STORAGE_ROOT", "").strip()
-        if not root:
-            raise RuntimeError("AC ServiceManager requires AMING_CLAW_DEV_STORAGE_ROOT")
-        return Path(root).expanduser().resolve() / "runtime" / "manager_signal.json"
+        from agent.governance.db import _dev_runtime_root
+
+        return _dev_runtime_root(create=True) / "manager_signal.json"
     return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "state" / "manager_signal.json"
 
 

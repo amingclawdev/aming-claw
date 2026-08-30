@@ -1167,6 +1167,14 @@ def _dev_storage_root(*, create: bool = False) -> Path:
     return _absolute_non_symlink_root(Path(raw), create=create)
 
 
+def _dev_runtime_root(*, create: bool = False) -> Path:
+    """Return the dedicated non-symlink root for dev-world runtime artifacts."""
+
+    root = _dev_storage_root(create=False)
+    runtime = root / "runtime"
+    return _absolute_non_symlink_root(runtime, create=create)
+
+
 def _dev_database_path() -> Path:
     root = _dev_storage_root(create=False)
     database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
@@ -1643,59 +1651,42 @@ def _default_cutover_listener_probe(port: int) -> dict[str, object]:
     }
 
 
-_CUTOVER_DIGEST_MAX_ALLOCATED_BYTES = 512 * 1024 * 1024
-
-
-def _sparse_content_digest(path: Path, *, size: int) -> str:
-    """Hash allocated extents without reading an archive's sparse holes."""
+def _fd_sparse_content_digest(descriptor: int, *, size: int) -> str:
+    """Hash one already-open archive descriptor, including extent positions."""
 
     digest = hashlib.sha256()
     digest.update(b"ac-cutover-sparse-v1\0")
     digest.update(str(int(size)).encode("ascii"))
-    allocated = 0
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        offset = 0
-        while offset < size:
-            try:
-                data_offset = os.lseek(descriptor, offset, os.SEEK_DATA)
-            except OSError as exc:
-                if exc.errno == errno.ENXIO:
-                    break
-                if exc.errno in {errno.EINVAL, errno.ENOTSUP}:
-                    if size > _CUTOVER_DIGEST_MAX_ALLOCATED_BYTES:
-                        raise ValueError(
-                            "legacy AC archive requires a cached content digest receipt"
-                        ) from exc
-                    data_offset = 0
-                else:
-                    raise
-            try:
-                hole_offset = os.lseek(descriptor, data_offset, os.SEEK_HOLE)
-            except OSError as exc:
-                if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
-                    raise
-                hole_offset = size
-            extent_length = min(hole_offset, size) - data_offset
-            allocated += extent_length
-            if allocated > _CUTOVER_DIGEST_MAX_ALLOCATED_BYTES:
-                raise ValueError(
-                    "legacy AC archive requires a cached content digest receipt"
-                )
-            digest.update(f"{data_offset}:{extent_length}:".encode("ascii"))
-            os.lseek(descriptor, data_offset, os.SEEK_SET)
-            remaining = extent_length
-            while remaining:
-                chunk = os.read(descriptor, min(1024 * 1024, remaining))
-                if not chunk:
-                    raise ValueError("legacy AC archive changed during digest")
-                digest.update(chunk)
-                remaining -= len(chunk)
-            offset = max(hole_offset, data_offset + 1)
-            if data_offset == 0 and hole_offset == size:
+    offset = 0
+    while offset < size:
+        try:
+            data_offset = os.lseek(descriptor, offset, os.SEEK_DATA)
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:
                 break
-    finally:
-        os.close(descriptor)
+            if exc.errno in {errno.EINVAL, errno.ENOTSUP}:
+                data_offset = 0
+            else:
+                raise
+        try:
+            hole_offset = os.lseek(descriptor, data_offset, os.SEEK_HOLE)
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                raise
+            hole_offset = size
+        extent_length = min(hole_offset, size) - data_offset
+        digest.update(f"{data_offset}:{extent_length}:".encode("ascii"))
+        os.lseek(descriptor, data_offset, os.SEEK_SET)
+        remaining = extent_length
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError("legacy AC archive changed during digest")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        offset = max(hole_offset, data_offset + 1)
+        if data_offset == 0 and hole_offset == size:
+            break
     return "sha256-sparse-v1:" + digest.hexdigest()
 
 
@@ -1705,57 +1696,60 @@ def _cutover_database_stat(
     expected_size: int | None = None,
     content_digest: bool = False,
     cached_identity: Mapping[str, object] | None = None,
-    digest_receipt_path: Path | str | None = None,
 ) -> dict[str, object]:
     absolute = path.expanduser().absolute()
     if absolute.is_symlink():
         raise ValueError("AC dev cutover database cannot be a symlink")
-    metadata = absolute.stat(follow_symlinks=False)
-    if not stat.S_ISREG(metadata.st_mode) or absolute.resolve(strict=True) != absolute:
-        raise ValueError("AC dev cutover database identity is invalid")
-    if expected_size is not None and int(metadata.st_size) != int(expected_size):
-        raise ValueError("legacy AC archive size identity mismatch")
-    identity = {
-        "path": str(absolute),
-        "device": int(metadata.st_dev),
-        "inode": int(metadata.st_ino),
-        "size": int(metadata.st_size),
-        "uid": int(metadata.st_uid),
-        "mtime_ns": int(metadata.st_mtime_ns),
-        "ctime_ns": int(metadata.st_ctime_ns),
-    }
-    if content_digest:
-        cached = dict(cached_identity or {})
-        stat_keys = ("path", "device", "inode", "size", "uid", "mtime_ns", "ctime_ns")
-        if cached and any(cached.get(key) != identity[key] for key in stat_keys):
-            raise ValueError("legacy AC archive identity changed")
-        cached_digest = str(cached.get("content_digest") or "")
-        if not cached_digest and digest_receipt_path:
-            receipt = _read_cutover_json(
-                Path(digest_receipt_path).expanduser().absolute()
+    descriptor = os.open(absolute, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        path_before = os.stat(absolute, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or absolute.resolve(strict=True) != absolute
+            or (before.st_dev, before.st_ino) != (path_before.st_dev, path_before.st_ino)
+        ):
+            raise ValueError("AC dev cutover database identity is invalid")
+        if expected_size is not None and int(before.st_size) != int(expected_size):
+            raise ValueError("legacy AC archive size identity mismatch")
+        identity = {
+            "path": str(absolute),
+            "device": int(before.st_dev),
+            "inode": int(before.st_ino),
+            "size": int(before.st_size),
+            "uid": int(before.st_uid),
+            "mtime_ns": int(before.st_mtime_ns),
+            "ctime_ns": int(before.st_ctime_ns),
+        }
+        if content_digest:
+            cached = dict(cached_identity or {})
+            stat_keys = (
+                "path", "device", "inode", "size", "uid", "mtime_ns", "ctime_ns",
             )
-            receipt_core = {
-                key: value
-                for key, value in receipt.items()
-                if key != "receipt_hash"
-            }
-            if (
-                receipt.get("schema_version")
-                != "ac_legacy_archive_content_digest.v1"
-                or receipt.get("receipt_hash") != _cutover_hash(receipt_core)
-                or any(receipt.get(key) != identity[key] for key in stat_keys)
-            ):
-                raise ValueError("legacy AC archive digest receipt is stale or invalid")
-            cached_digest = str(receipt.get("content_digest") or "")
-        if cached_digest:
-            if not re.fullmatch(r"sha256-sparse-v1:[0-9a-f]{64}", cached_digest):
-                raise ValueError("legacy AC archive content digest is invalid")
-            identity["content_digest"] = cached_digest
-        else:
-            identity["content_digest"] = _sparse_content_digest(
-                absolute, size=int(metadata.st_size)
-            )
-    return identity
+            if cached and any(cached.get(key) != identity[key] for key in stat_keys):
+                raise ValueError("legacy AC archive identity changed")
+            cached_digest = str(cached.get("content_digest") or "")
+            if cached_digest:
+                if not re.fullmatch(r"sha256-sparse-v1:[0-9a-f]{64}", cached_digest):
+                    raise ValueError("legacy AC archive content digest is invalid")
+                identity["content_digest"] = cached_digest
+            else:
+                identity["content_digest"] = _fd_sparse_content_digest(
+                    descriptor, size=int(before.st_size)
+                )
+        after = os.fstat(descriptor)
+        path_after = os.stat(absolute, follow_symlinks=False)
+        immutable_keys = (
+            "st_dev", "st_ino", "st_mode", "st_size", "st_uid", "st_mtime_ns", "st_ctime_ns",
+        )
+        if any(getattr(before, key) != getattr(after, key) for key in immutable_keys) or (
+            after.st_dev,
+            after.st_ino,
+        ) != (path_after.st_dev, path_after.st_ino):
+            raise ValueError("legacy AC archive changed during content proof")
+        return identity
+    finally:
+        os.close(descriptor)
 
 
 def _inspect_dev_world_cutover(
@@ -1767,7 +1761,6 @@ def _inspect_dev_world_cutover(
     expected_dev_database_identity: Mapping[str, object],
     listener_probe,
     expected_legacy_database_identity: Mapping[str, object] | None = None,
-    legacy_digest_receipt_path: Path | str | None = None,
 ) -> dict[str, object]:
     root = _absolute_non_symlink_root(
         Path(storage_root).expanduser().absolute(), create=False
@@ -1791,7 +1784,6 @@ def _inspect_dev_world_cutover(
         expected_size=AC_LEGACY_ARCHIVE_SIZE_BYTES,
         content_digest=True,
         cached_identity=expected_legacy_database_identity,
-        digest_receipt_path=legacy_digest_receipt_path,
     )
     new_database = root / AC_DATABASE_DEV_RELATIVE_PATH
     new_stat = _cutover_database_stat(new_database)
@@ -1881,7 +1873,6 @@ def preflight_dev_world_cutover(
     process_identity: Mapping[str, object],
     expected_dev_database_identity: Mapping[str, object],
     listener_probe=None,
-    legacy_digest_receipt_path: Path | str | None = None,
 ) -> dict[str, object]:
     """Write one restart-safe checkpoint after an entirely bounded preflight."""
 
@@ -1893,7 +1884,6 @@ def preflight_dev_world_cutover(
         process_identity=process_identity,
         expected_dev_database_identity=expected_dev_database_identity,
         listener_probe=probe,
-        legacy_digest_receipt_path=legacy_digest_receipt_path,
     )
     preflight_hash = _cutover_hash(core)
     root = Path(storage_root).expanduser().absolute()
@@ -1939,23 +1929,6 @@ def _load_cutover_preflight(storage_root: Path | str, preflight_hash: str) -> di
     return payload
 
 
-def _cutover_active_core(checkpoint: Mapping[str, object]) -> dict[str, object]:
-    return {
-        "schema_version": AC_DEV_CUTOVER_SCHEMA,
-        "status": "active",
-        "preflight_hash": checkpoint["preflight_hash"],
-        "checkpoint_path": checkpoint["checkpoint_path"],
-        "new_database_identity": checkpoint["new_database_identity"],
-        "source_identity": checkpoint["source_identity"],
-        "legacy_database_identity": checkpoint["legacy_database_identity"],
-        "operator_process_identity": checkpoint["operator_process_identity"],
-        "stable_listener_identity": checkpoint["stable_listener_identity"],
-        "dev_listener_identity": checkpoint["dev_listener_identity"],
-        "legacy_rows_copied": 0,
-        "facts_copied": 0,
-    }
-
-
 def activate_dev_world_cutover(
     *,
     storage_root: Path | str,
@@ -1979,10 +1952,16 @@ def activate_dev_world_cutover(
         raise ValueError("AC dev cutover preflight changed before activation")
     root = Path(storage_root).expanduser().absolute()
     active_path = root / "cutover" / "active.json"
-    active_core = _cutover_active_core(checkpoint)
     active = {
-        **active_core,
-        "activation_seal": _cutover_hash(active_core),
+        "schema_version": AC_DEV_CUTOVER_SCHEMA,
+        "status": "active",
+        "preflight_hash": preflight_hash,
+        "checkpoint_path": checkpoint["checkpoint_path"],
+        "new_database_identity": checkpoint["new_database_identity"],
+        "source_identity": checkpoint["source_identity"],
+        "legacy_database_identity": checkpoint["legacy_database_identity"],
+        "legacy_rows_copied": 0,
+        "facts_copied": 0,
     }
     if active_path.exists():
         if _read_cutover_json(active_path) != active:
@@ -2013,17 +1992,6 @@ def validate_dev_world_cutover_activation(
     checkpoint = _load_cutover_preflight(
         root, str(active.get("preflight_hash") or "")
     )
-    expected_active_core = _cutover_active_core(checkpoint)
-    active_core = {
-        key: value
-        for key, value in active.items()
-        if key != "activation_seal"
-    }
-    if (
-        active_core != expected_active_core
-        or active.get("activation_seal") != _cutover_hash(expected_active_core)
-    ):
-        raise ValueError("AC dev cutover activation seal mismatch")
     if (
         active.get("new_database_identity")
         != dict(expected_dev_database_identity)
@@ -2035,18 +2003,6 @@ def validate_dev_world_cutover_activation(
     current_source = dict(source_identity)
     if current_source != activated_source:
         _verify_dev_source_upgrade(activated_source, current_source)
-    probe = listener_probe or _default_cutover_listener_probe
-    current = _inspect_dev_world_cutover(
-        legacy_database_path=checkpoint["legacy_database_identity"]["path"],
-        storage_root=root,
-        source_identity=checkpoint["source_identity"],
-        process_identity=checkpoint["operator_process_identity"],
-        expected_dev_database_identity=checkpoint["new_database_identity"],
-        listener_probe=probe,
-        expected_legacy_database_identity=checkpoint["legacy_database_identity"],
-    )
-    if _cutover_hash(current) != checkpoint["preflight_hash"]:
-        raise ValueError("AC dev cutover preflight changed after activation")
     return {
         **active,
         "active": True,

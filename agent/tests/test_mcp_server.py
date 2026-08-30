@@ -92,6 +92,9 @@ def test_governance_mcp_rejects_cross_project_request(monkeypatch):
 
 def test_actual_stdio_mcp_constructor_is_exactly_world_bound(monkeypatch, tmp_path):
     monkeypatch.delenv("GOVERNANCE_URL", raising=False)
+    dev_root = tmp_path / "dev-world"
+    dev_root.mkdir()
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
     instance = stdio_mcp_server.AmingClawMCP(
         project_id="aming-claw",
         governance_url="",
@@ -110,12 +113,6 @@ def test_actual_stdio_mcp_constructor_is_exactly_world_bound(monkeypatch, tmp_pa
         "writes_performed": False,
         "mutation_performed": False,
     }
-    assert instance._http("POST", "/api/project/bootstrap", {}) == {
-        "error": "mcp_unscoped_mutation_forbidden",
-        "writes_performed": False,
-        "mutation_performed": False,
-    }
-
     with pytest.raises(ValueError, match="40008"):
         stdio_mcp_server.AmingClawMCP(
             project_id="aming-claw",

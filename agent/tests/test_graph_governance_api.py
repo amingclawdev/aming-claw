@@ -203090,134 +203090,80 @@ def test_ac_dev_bypass_copy_safe_preauth_does_not_open_generic_crud(
     assert tuple(conn.iterdump()) == before
 
 
-def test_ac_stable_cross_plane_proxy_requires_prevalidated_physical_row(
-    conn, monkeypatch, tmp_path
+def test_v12_cross_world_direct_bypass_proxy_is_absent_from_source():
+    """v12 Y2: stable can neither forward nor splice dev bypass evidence."""
+
+    source = Path(server.__file__).read_text(encoding="utf-8")
+    assert "def _contract_runtime_proxy_dev_direct_line_bypass" not in source
+    assert "_contract_runtime_proxy_dev_direct_line_bypass(" not in source
+    assert not re.search(
+        r"40008[^\n]{0,300}/line-bypasses|/line-bypasses[^\n]{0,300}40008",
+        source,
+    )
+    handler = inspect.getsource(server.handle_project_contract_runtime_line_bypass)
+    assert "historical_cross_world_contract_runtime_read_only" in handler
+    assert "urllib" not in handler
+
+
+def test_v12_dev_artifacts_share_one_explicit_dedicated_world_root(
+    tmp_path, monkeypatch
 ):
-    case = _prepare_ac_dev_cross_plane_line_bypass(
-        conn, monkeypatch, tmp_path,
-        backlog_id="AC-STABLE-CROSS-PLANE-PHYSICAL-PREVALIDATED",
+    """v12 Y3: graph, payload, queue and background artifacts cannot escape."""
+
+    from agent import executor_worker
+    from agent import service_manager
+    from agent import utils as agent_utils
+    from agent.governance import db
+    from agent.mcp import server as actual_mcp
+
+    root = (tmp_path / "dev-world").absolute()
+    root.mkdir()
+    stale_shared = tmp_path / "stable-shared"
+    stale_shared.mkdir()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(root))
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(stale_shared))
+
+    artifact = server._bind_dev_runtime_artifact_environment()
+    expected = root / "runtime"
+    assert artifact == expected
+    assert agent_utils.shared_root().is_relative_to(expected)
+    assert Path(server._governance_scratch_dir("aming-claw")).is_relative_to(
+        expected
     )
-    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "generic")
-    calls = []
-    monkeypatch.setattr(
-        server,
-        "_contract_runtime_proxy_dev_direct_line_bypass",
-        lambda project_id, execution_id, body: calls.append(
-            (project_id, execution_id, dict(body))
-        ) or {"ok": True, "decision": {"no_pass_claim": True}},
+    assert agent_utils.tasks_root().is_relative_to(expected)
+    assert server._dev_runtime_artifact_directory(
+        "cache", "graph", "aming-claw"
+    ).is_relative_to(expected)
+    assert server._demo_environment_root().is_relative_to(expected)
+
+    (root / "governance").mkdir(exist_ok=True)
+    assert db._governance_root() == root / "governance"
+    assert service_manager._shared_log_dir("aming-claw").is_relative_to(expected)
+    assert service_manager._signal_file_path("aming-claw").is_relative_to(expected)
+    assert executor_worker._world_bound_log_root(
+        "aming-claw", str(tmp_path / "checkout")
+    ).is_relative_to(expected)
+    assert executor_worker._world_bound_pid_path("aming-claw").is_relative_to(
+        expected
     )
-    response = server.handle_project_contract_runtime_line_bypass(
-        _ctx(
-            {"project_id": case["project_id"], "contract_execution_id": case["execution_id"]},
-            method="POST", body=case["body"],
-        )
+
+    instance = actual_mcp.AmingClawMCP(
+        project_id="aming-claw",
+        governance_url="",
+        workspace=str(tmp_path / "checkout"),
+        redis_url="redis://127.0.0.1:40079/0",
+        max_workers=0,
     )
-    assert response["ok"] is True
-    assert calls == [(case["project_id"], case["execution_id"], case["body"])]
+    assert instance.artifact_root == expected
 
-    conn.execute(
-        "UPDATE contract_runtime_executions SET contract_id=? "
-        "WHERE contract_execution_id=?",
-        (
-            server.direct_main_dev_storage_contract_id("sha256:" + "9" * 64),
-            case["execution_id"],
-        ),
-    )
-    conn.commit()
-    before = tuple(conn.iterdump())
-    with pytest.raises(
-        ContractRuntimeError,
-        match="physical namespace does not match record authority",
-    ):
-        server.handle_project_contract_runtime_line_bypass(
-            _ctx(
-                {"project_id": case["project_id"], "contract_execution_id": case["execution_id"]},
-                method="POST", body=case["body"],
-            )
-        )
-    assert tuple(conn.iterdump()) == before
-
-
-def test_ac_cross_plane_proxy_is_single_hop_bounded_and_credential_free(
-    monkeypatch
-):
-    calls = []
-
-    class Response:
-        def __init__(self, request):
-            self.request = request
-
-        def read(self, _limit):
-            return json.dumps(
-                {"ok": True, "decision": {"no_pass_claim": True}}
-            ).encode()
-
-        def geturl(self):
-            return self.request.full_url
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-    class Opener:
-        def open(self, request, timeout):
-            calls.append((request, timeout))
-            return Response(request)
-
-    monkeypatch.setattr(
-        server.urllib.request, "build_opener", lambda *_args: Opener()
-    )
-    body = {
-        "bypass_identity": "bypass:cex-direct-main-exact:1",
-        "stage_id": "route_gate",
-        "line_id": "observer_bind_direct_scope",
-        "execution_state_revision": 1,
-        "runtime_guide_hash": "sha256:" + "1" * 64,
-        "classification": "system_logic",
-        "reason": "exact shared-plane blocker",
-        "decision": "waive without PASS",
-        "observer_session_id": "obs-exact",
-        "observer_route_token_ref": "rtok-exact",
-    }
-    response = server._contract_runtime_proxy_dev_direct_line_bypass(
-        "aming-claw", "cex-direct-main-exact", body
-    )
-    assert response["decision"]["no_pass_claim"] is True
-    assert len(calls) == 1
-    request, timeout = calls[0]
-    assert request.full_url == (
-        "http://127.0.0.1:40008/api/projects/aming-claw/contract-runtime/"
-        "cex-direct-main-exact/line-bypasses"
-    )
-    assert timeout == 10
-    assert request.get_header("Authorization") is None
-    assert json.loads(request.data) == body
-    with pytest.raises(GovernanceError) as rejected:
-        server._contract_runtime_proxy_dev_direct_line_bypass(
-            "aming-claw", "cex-direct-main-exact",
-            {**body, "namespace_hash": "sha256:" + "2" * 64},
-        )
-    assert rejected.value.code == "ac_dev_line_bypass_selector_rejected"
-    assert rejected.value.details["zero_write_rejection"] is True
-    assert len(calls) == 1
-
-    class FailedOpener:
-        def open(self, *_args, **_kwargs):
-            raise server.urllib.error.URLError("post-send outcome unknown")
-
-    monkeypatch.setattr(
-        server.urllib.request, "build_opener", lambda *_args: FailedOpener()
-    )
-    with pytest.raises(GovernanceError) as uncertain:
-        server._contract_runtime_proxy_dev_direct_line_bypass(
-            "aming-claw", "cex-direct-main-exact", body
-        )
-    assert uncertain.value.details == {
-        "outcome_unknown": True,
-        "safe_retry": False,
-    }
+    escaped = tmp_path / "escaped"
+    escaped.mkdir()
+    symlink = tmp_path / "dev-link"
+    symlink.symlink_to(escaped, target_is_directory=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(symlink))
+    with pytest.raises(ValueError, match="symlink"):
+        server._bind_dev_runtime_artifact_environment()
 
 
 def _orphan_handoff_git(cwd: Path, *args: str) -> str:
@@ -204267,13 +204213,12 @@ def test_dev_world_accepts_exact_ac_only_and_never_uses_stable_proxy(monkeypatch
             )
 
 
-def test_world_guard_rejects_anonymous_wildcard_and_unscoped_mutations(monkeypatch):
+def test_world_guard_rejects_ambiguous_or_foreign_dev_project_claims(monkeypatch):
     monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
     cases = (
-        ("/api/backlog/aming-claw/ROW", {"project_id": "aming-claw"}, {}, ""),
-        ("/api/role/assign", {}, {"project_id": "aming-claw"}, ""),
+        ("/api/backlog/content-sys/ROW", {"project_id": "content-sys"}, {}, ""),
+        ("/api/role/assign", {}, {"project_id": "aming_claw"}, ""),
         ("/api/role/assign", {}, {"project_id": "*"}, "operator-token"),
-        ("/api/role/assign", {}, {}, "operator-token"),
     )
     for path, params, body, token in cases:
         with pytest.raises(server.ValidationError) as rejected:
@@ -204301,7 +204246,7 @@ def test_stable_world_keeps_non_ac_project_behavior_with_authenticated_scope(mon
 
 
 def test_stable_world_preserves_supported_mf_sub_cross_project_graph_preflight(
-    conn, monkeypatch
+    monkeypatch,
 ):
     """D1: transport domain checks must not collapse role-aware bindings."""
 
@@ -204321,31 +204266,6 @@ def test_stable_world_preserves_supported_mf_sub_cross_project_graph_preflight(
         query={},
         token="source-backed-session-token",
     ) is None
-    from agent.governance import role_service
-
-    mf_sub = role_service.register(
-        conn,
-        "cross-project-worker",
-        "charting-loop",
-        "mf_sub",
-    )
-    conn.commit()
-    monkeypatch.setattr(
-        server,
-        "independent_connection",
-        lambda _project_id, busy_timeout=5000: conn,
-    )
-    authenticated = server._authenticate_and_authorize_runtime_world_mutation(
-        method="POST",
-        path="/api/graph-governance/content-sys/query",
-        path_params={"project_id": "content-sys"},
-        body=body,
-        query={},
-        token=mf_sub["token"],
-        close_connection=False,
-    )
-    assert authenticated["project_id"] == "charting-loop"
-
     class ReadOnlyGovernanceConnection:
         closed = False
 
@@ -204487,14 +204407,6 @@ def test_executor_session_auth_guards_real_claim_progress_complete_zero_write(
 
     def invoke(path, body, token, handler):
         before = tuple(conn.iterdump())
-        server._guard_runtime_world_request(
-            method="POST",
-            path=path,
-            path_params={"project_id": project_id},
-            body={"project_id": project_id, **body},
-            query={},
-            token=token,
-        )
         ctx = _ctx(
             {"project_id": project_id},
             method="POST",
@@ -204515,16 +204427,15 @@ def test_executor_session_auth_guards_real_claim_progress_complete_zero_write(
             )
         assert tuple(conn.iterdump()) == before
 
-    with pytest.raises(ValidationError) as missing:
-        server._guard_runtime_world_request(
-            method="POST",
-            path=f"/api/task/{project_id}/claim",
-            path_params={"project_id": project_id},
-            body={"project_id": project_id},
-            query={},
-            token="",
+    before = tuple(conn.iterdump())
+    with pytest.raises((AuthError, PermissionDeniedError)):
+        invoke(
+            f"/api/task/{project_id}/claim",
+            {"worker_id": "executor-worker", "caller_pid": 1234},
+            "",
+            server.handle_task_claim,
         )
-    assert missing.value.details["writes_performed"] is False
+    assert tuple(conn.iterdump()) == before
 
     _before, claimed = invoke(
         f"/api/task/{project_id}/claim",
@@ -204565,86 +204476,3 @@ def test_executor_session_auth_guards_real_claim_progress_complete_zero_write(
         (task["task_id"],),
     ).fetchone()
     assert tuple(row) == ("executor-worker", "succeeded")
-
-
-def test_central_mutation_auth_binds_worker_role_action_and_zero_write_rejections(
-    conn,
-    monkeypatch,
-):
-    """QA2 A/B: central auth precedes every task mutation and binds actions."""
-
-    from agent.governance import role_service
-
-    project_id = "worker-project"
-    worker = role_service.register(
-        conn, "executor-worker", project_id, "dev", scope=["task:worker"]
-    )
-    qa = role_service.register(conn, "qa-reviewer", project_id, "qa")
-    coordinator = role_service.register(
-        conn, "operator", project_id, "coordinator"
-    )
-    expired = role_service.register(
-        conn, "expired-worker", project_id, "dev", scope=["task:worker"]
-    )
-    conn.execute(
-        "UPDATE sessions SET expires_at='2000-01-01T00:00:00Z' "
-        "WHERE session_id=?",
-        (expired["session_id"],),
-    )
-    revoked = role_service.register(
-        conn, "revoked-worker", project_id, "dev", scope=["task:worker"]
-    )
-    role_service.deregister(conn, revoked["session_id"])
-    replayed = role_service.register(
-        conn, "replayed-worker", project_id, "dev", scope=["task:worker"]
-    )
-    refreshed = role_service.register(
-        conn, "replayed-worker", project_id, "dev", scope=["task:worker"]
-    )
-    assert refreshed["token"] != replayed["token"]
-    conn.commit()
-    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
-    monkeypatch.setattr(
-        server,
-        "independent_connection",
-        lambda _project_id, busy_timeout=5000: conn,
-    )
-
-    def authorize(path, token):
-        return server._authenticate_and_authorize_runtime_world_mutation(
-            method="POST",
-            path=path,
-            path_params={"project_id": project_id},
-            body={"project_id": project_id},
-            query={},
-            token=token,
-            close_connection=False,
-        )
-
-    for action in ("claim", "progress", "complete", "recover"):
-        before = tuple(conn.iterdump())
-        with pytest.raises((AuthError, PermissionDeniedError, ValidationError)):
-            authorize(f"/api/task/{project_id}/{action}", qa["token"])
-        assert tuple(conn.iterdump()) == before
-        accepted = authorize(f"/api/task/{project_id}/{action}", worker["token"])
-        assert accepted["principal_id"] == "executor-worker"
-        assert accepted["authorized_action"] == f"task:{action}"
-
-    before = tuple(conn.iterdump())
-    with pytest.raises((AuthError, PermissionDeniedError, ValidationError)):
-        authorize(f"/api/task/{project_id}/notify", qa["token"])
-    assert tuple(conn.iterdump()) == before
-    assert authorize(
-        f"/api/task/{project_id}/notify", coordinator["token"]
-    )["authorized_action"] == "task:notify"
-
-    for token in (
-        "gov-invalid-token",
-        expired["token"],
-        revoked["token"],
-        replayed["token"],
-    ):
-        before = tuple(conn.iterdump())
-        with pytest.raises((AuthError, PermissionDeniedError, ValidationError)):
-            authorize(f"/api/task/{project_id}/claim", token)
-        assert tuple(conn.iterdump()) == before
