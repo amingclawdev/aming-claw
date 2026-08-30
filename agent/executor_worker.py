@@ -480,6 +480,21 @@ class ExecutorWorker:
             raise ValueError("task worktree escapes executor workspace")
         return worktree.workspace.root
 
+    def _revalidate_effect_workspace(self, task_id: str, candidate: str) -> str:
+        """Authorize one imminent custody effect against live Git identity.
+
+        Effects never trust metadata paths.  Task-owned worktrees must have a
+        registered receipt; the executor root is bound to its own explicit
+        logical authority only when the effect is about to run.
+        """
+        if candidate == self.workspace:
+            identity = bind_git_worktree_identity(candidate, "executor-root")
+            validate_current_git_worktree_identity(identity)
+            return identity.workspace.root
+        if task_id in self._task_worktrees:
+            return self._validated_task_worktree(task_id, candidate)
+        raise ValueError("effect workspace has no registered task identity")
+
     def _api(self, method: str, path: str, data: dict = None, timeout: Optional[int] = None) -> dict:
         """Call governance API. Short timeouts to avoid MCP IO deadlock."""
         import requests
@@ -722,6 +737,7 @@ class ExecutorWorker:
             self._lifecycle = AILifecycleManager()
 
         _t1 = _time.time()
+        execution_workspace = self._revalidate_effect_workspace(task_id, execution_workspace)
         session = self._lifecycle.create_session(
             role=role,
             prompt=enhanced_prompt,
@@ -762,6 +778,7 @@ class ExecutorWorker:
             _timing(f"git_diff: skipped ({task_type})")
         else:
             _timing("git_diff: starting")
+            execution_workspace = self._revalidate_effect_workspace(task_id, execution_workspace)
             changed_files = self._get_git_changed_files(cwd=execution_workspace)
             _timing(f"git_diff: done, {len(changed_files)} files")
 
@@ -769,6 +786,7 @@ class ExecutorWorker:
         if changed_files:
             try:
                 import subprocess
+                execution_workspace = self._revalidate_effect_workspace(task_id, execution_workspace)
                 subprocess.run(
                     ["git", "add", "--"] + changed_files,
                     cwd=execution_workspace,
@@ -1021,6 +1039,7 @@ class ExecutorWorker:
         test_env = {**os.environ, "PYTHONPATH": _new_pp}
 
         try:
+            execution_workspace = self._revalidate_effect_workspace(task_id, execution_workspace)
             proc = _sp.run(
                 cmd,
                 cwd=execution_workspace,
@@ -1090,6 +1109,19 @@ class ExecutorWorker:
         merge_target_ref = reconcile_target_branch or "HEAD"
         merge_target_label = reconcile_target_branch or "main"
         self._report_progress(task_id, {"step": "merging"})
+
+        # A merge is a custody effect.  The branch/worktree pair must resolve
+        # to the live identity handed off by its producing task, never merely
+        # to a metadata pathname.
+        if branch and worktree:
+            parent_task_id = metadata.get("parent_task_id", "")
+            if not parent_task_id:
+                return {"status": "failed", "error": "merge worktree handoff requires parent_task_id"}
+            try:
+                self._handoff_task_worktree(parent_task_id, task_id, worktree)
+                worktree = self._revalidate_effect_workspace(task_id, worktree)
+            except ValueError as exc:
+                return {"status": "failed", "error": f"merge worktree identity rejected: {exc}"}
 
         # Chained merge without isolation metadata: check if changes already on main
         if metadata.get("parent_task_id") and not branch:
@@ -1173,6 +1205,7 @@ class ExecutorWorker:
                 worktree_available = bool(worktree and os.path.isdir(worktree))
                 branch_already_merged = False
                 if worktree_available:
+                    worktree = self._revalidate_effect_workspace(task_id, worktree)
                     subprocess.run(["git", "add", "-A"],
                                    cwd=worktree, capture_output=True, timeout=30)
                     status = subprocess.run(["git", "diff", "--cached", "--name-only"],
@@ -1180,6 +1213,7 @@ class ExecutorWorker:
                     staged = [f.strip() for f in status.stdout.splitlines() if f.strip()]
                     if staged:
                         msg = f"dev: {task_id}\n\nChanged files: {', '.join(staged[:10])}"
+                        worktree = self._revalidate_effect_workspace(task_id, worktree)
                         commit_proc = subprocess.run(["git", "commit", "-m", msg],
                                                      cwd=worktree, capture_output=True, text=True, timeout=30)
                         if commit_proc.returncode != 0:
@@ -1220,6 +1254,12 @@ class ExecutorWorker:
                     )
                     if not integration_worktree:
                         return {"status": "failed", "error": f"Integration worktree setup failed: {create_error[:300]}"}
+                    integration_worktree = self._register_task_worktree(
+                        f"{task_id}:integration", integration_worktree, logical_task_id=task_id
+                    )
+                    integration_worktree = self._revalidate_effect_workspace(
+                        f"{task_id}:integration", integration_worktree
+                    )
 
                     # Use chain_trailer for merge with 4-field trailer (Phase A §4.4)
                     from agent.governance.chain_trailer import write_merge_with_trailer, get_chain_state
@@ -1237,6 +1277,7 @@ class ExecutorWorker:
                         return {"status": "failed", "error": f"Merge conflict: {err[:300]}"}
 
                     if reconcile_target_branch:
+                        self._revalidate_effect_workspace(task_id, self.workspace)
                         ff_proc = subprocess.run(
                             ["git", "branch", "-f", reconcile_target_branch, merge_commit],
                             cwd=self.workspace, capture_output=True, text=True, timeout=30)
@@ -1284,6 +1325,7 @@ class ExecutorWorker:
                         log.warning("merge: pre-ff cleanup failed (non-fatal): %s", e)
 
                     # Advance real workspace main to the merge commit via ff-only
+                    self._revalidate_effect_workspace(task_id, self.workspace)
                     ff_proc = subprocess.run(
                         ["git", "merge", "--ff-only", merge_commit],
                         cwd=self.workspace, capture_output=True, text=True, timeout=30)
@@ -1548,6 +1590,9 @@ class ExecutorWorker:
             from deploy_chain import run_deploy
 
             chat_id = int(metadata.get("chat_id", 0) or 0)
+            # Deploy consumes HEAD/workspace and can restart services; bind it
+            # to the current physical Git root immediately before invocation.
+            self._revalidate_effect_workspace(task_id, self.workspace)
             expected_head = self._resolve_deploy_expected_head(metadata)
             report = run_deploy(
                 changed,
@@ -2534,17 +2579,26 @@ class ExecutorWorker:
 
     def _remove_worktree(self, worktree_path: str, branch_name: str, delete_branch: bool = True) -> None:
         """Remove worktree and optionally delete its branch."""
+        removed = False
         try:
             if worktree_path and os.path.isdir(worktree_path):
+                # Cleanup remains an effect: keep the receipt registered until
+                # Git has actually removed the worktree.
+                for task_id, identity in self._task_worktrees.items():
+                    if identity.workspace.root == worktree_path:
+                        self._validated_task_worktree(task_id, worktree_path)
+                        break
                 subprocess.run(
                     ["git", "worktree", "remove", worktree_path, "--force"],
                     cwd=self.workspace,
                     capture_output=True,
                     timeout=30,
                 )
+                removed = not os.path.exists(worktree_path)
             elif worktree_path and os.path.exists(worktree_path):
                 shutil.rmtree(worktree_path, ignore_errors=True)
-            if delete_branch and branch_name:
+                removed = not os.path.exists(worktree_path)
+            if removed and delete_branch and branch_name:
                 subprocess.run(
                     ["git", "branch", "-D", branch_name],
                     cwd=self.workspace,
@@ -2554,9 +2608,11 @@ class ExecutorWorker:
         except Exception:
             pass
         finally:
-            for task_id, identity in list(self._task_worktrees.items()):
-                if identity.workspace.root == worktree_path:
-                    self._task_worktrees.pop(task_id, None)
+            # Never erase the receipt before cleanup is demonstrably complete.
+            if removed:
+                for task_id, identity in list(self._task_worktrees.items()):
+                    if identity.workspace.root == worktree_path:
+                        self._task_worktrees.pop(task_id, None)
 
     def _create_integration_worktree(self, task_id: str, base_ref: str = "HEAD"):
         """Create a clean integration worktree used only for merge verification."""
