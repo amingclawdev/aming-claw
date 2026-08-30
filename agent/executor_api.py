@@ -145,6 +145,15 @@ def set_validator_result(result):
 class ExecutorAPIHandler(BaseHTTPRequestHandler):
     """HTTP handler for executor monitoring and intervention."""
 
+    def _executor_identity(self) -> dict:
+        identity = getattr(self.server, "executor_identity", None)
+        if not isinstance(identity, dict):
+            raise RuntimeError("executor API has no immutable launch identity")
+        return identity
+
+    def _tasks_root(self) -> Path:
+        return Path(self._executor_identity()["storage_root"]) / "codex-tasks"
+
     def log_message(self, format, *args):
         log.info("API %s", format % args)
 
@@ -1565,12 +1574,3 @@ def start_api_server(project_id: str):
     thread.start()
     log.info("Executor API server started on port %d", port)
     return server
-    def _executor_identity(self) -> dict:
-        identity = getattr(self.server, "executor_identity", None)
-        if not isinstance(identity, dict):
-            raise RuntimeError("executor API has no immutable launch identity")
-        return identity
-
-    def _tasks_root(self) -> Path:
-        root = Path(self._executor_identity()["storage_root"])
-        return root / "codex-tasks"
