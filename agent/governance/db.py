@@ -17,6 +17,8 @@ import re
 import fcntl
 import subprocess
 import errno
+import urllib.request
+import urllib.error
 from contextlib import closing
 from pathlib import Path
 from collections.abc import Mapping, Sequence
@@ -51,6 +53,63 @@ AC_DEV_LAUNCH_RECEIPT_NAME = "launch-receipt.json"
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
 _DEV_DATABASE_WRITER_LEASES_LOCK = threading.RLock()
+_TEST_STABLE_BINDING_PROBE = None
+
+
+def _set_test_stable_binding_probe(probe):
+    """Test-only in-process seam; never read from environment or requests."""
+    global _TEST_STABLE_BINDING_PROBE
+    _TEST_STABLE_BINDING_PROBE = probe
+
+
+def _verified_stable_binding() -> dict[str, object]:
+    """Read-only fixed-40000 + unique stable-worktree authority for AC dev."""
+    probe = _TEST_STABLE_BINDING_PROBE
+    if probe is not None:
+        health = probe()
+        if isinstance(health, Mapping) and health.get("shared_volume_path"):
+            return dict(health)
+    else:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:40000/api/health", timeout=2) as response:
+                health = json.loads(response.read(65536).decode("utf-8"))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise RuntimeError("AC stable authority is unavailable") from exc
+    if not isinstance(health, Mapping) or not (
+        health.get("status") == "ok" and health.get("service") == "governance"
+        and health.get("port") == 40000 and health.get("runtime_plane") == "stable"
+        and health.get("runtime_stale") is False and isinstance(health.get("pid"), int)
+    ):
+        raise RuntimeError("AC stable authority health is invalid")
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=5, check=False)
+    roots = []
+    for block in result.stdout.strip().split("\n\n"):
+        fields = dict(line.split(" ", 1) if " " in line else (line, "") for line in block.splitlines())
+        if fields.get("branch") == "refs/heads/codex/direct-no-pass-post-reconcile-r2" and fields.get("worktree"):
+            roots.append(Path(fields["worktree"]).resolve(strict=True))
+    if len(roots) != 1:
+        raise RuntimeError("AC stable authority worktree is unavailable")
+    stable_root = roots[0]
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=stable_root, capture_output=True, text=True, timeout=5, check=False).stdout.strip().lower()
+    source_path = stable_root / "agent" / "governance" / "server.py"
+    source_hash = "sha256:" + hashlib.sha256(source_path.read_bytes()).hexdigest()
+    identity = health.get("runtime_plane_identity") if isinstance(health.get("runtime_plane_identity"), Mapping) else {}
+    loaded = health.get("loaded_runtime_identity") if isinstance(health.get("loaded_runtime_identity"), Mapping) else {}
+    if not (
+        health.get("runtime_loaded_version") == head
+        and identity.get("worktree_root") == str(stable_root)
+        and identity.get("branch") == "codex/direct-no-pass-post-reconcile-r2"
+        and loaded.get("loaded_source_path") == str(source_path)
+        and loaded.get("loaded_source_sha256") == source_hash
+        and loaded.get("worktree_source_sha256") == source_hash
+        and "aming-claw" not in set(identity.get("project_allowlist") or [])
+    ):
+        raise RuntimeError("AC stable authority source identity is invalid")
+    shared = roots[0] / "shared-volume"
+    if not shared.is_dir() or shared.is_symlink() or shared.resolve(strict=True) != shared:
+        raise RuntimeError("AC stable authority shared volume is invalid")
+    return {"shared_volume_path": str(shared), "health": dict(health), "stable_head": head}
 
 _DEV_DENIED_SCHEMA_ACTIONS = frozenset(
     code
@@ -1163,10 +1222,11 @@ def _absolute_non_symlink_root(path: Path, *, create: bool) -> Path:
 
 def _dev_storage_root(*, create: bool = False) -> Path:
     """Resolve the only AC dev world; raw env values are assertions, not authority."""
+    binding = _verified_stable_binding()
+    stable = _absolute_non_symlink_root(Path(str(binding["shared_volume_path"])), create=False)
     stable_raw = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
-    if not stable_raw:
-        raise RuntimeError("AC dev runtime requires canonical AMING_CLAW_SHARED_VOLUME")
-    stable = _absolute_non_symlink_root(Path(stable_raw), create=False)
+    if not stable_raw or _absolute_non_symlink_root(Path(stable_raw), create=False) != stable:
+        raise RuntimeError("AC dev stable shared-volume claim mismatches verified authority")
     from agent.runtime_plane import resolve_ac_dev_storage_root
     expected = resolve_ac_dev_storage_root(stable)
     raw = os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
@@ -1195,7 +1255,8 @@ def write_dev_launch_receipt(
     """Persist the source-backed foreground launch admission before server exec."""
     root = _absolute_non_symlink_root(Path(storage_root), create=False)
     stable = _absolute_non_symlink_root(Path(stable_shared_volume), create=False)
-    current_stable = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
+    binding = _verified_stable_binding()
+    current_stable = str(binding.get("shared_volume_path") or "")
     if not current_stable or _absolute_non_symlink_root(Path(current_stable), create=False) != stable:
         raise ValueError("AC dev launch receipt stable volume is not current canonical authority")
     if project_id != AC_PROJECT_ID or port != 40008:
@@ -1254,10 +1315,8 @@ def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str)
         "storage_inode": int(root_stat.st_ino), "source_sha256": source_sha256}
     if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in required.items()):
         raise ValueError("AC dev launch receipt mismatch")
-    stable_raw = os.environ.get(AC_STABLE_SHARED_VOLUME_ENV, "").strip()
-    if not stable_raw:
-        raise ValueError("AC dev launch receipt stable authority unavailable")
-    stable = _absolute_non_symlink_root(Path(stable_raw), create=False)
+    binding = _verified_stable_binding()
+    stable = _absolute_non_symlink_root(Path(str(binding.get("shared_volume_path") or "")), create=False)
     if receipt.get("stable_shared_volume") != str(stable):
         raise ValueError("AC dev launch receipt stable volume claim mismatch")
     stable_stat = stable.stat(follow_symlinks=False)

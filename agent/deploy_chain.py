@@ -218,6 +218,12 @@ def rebuild_governance(project_id: str) -> tuple[bool, str]:
     # managed and must not be rebuilt through the stable compose project.
     if str(project_id or "").strip() == "aming-claw" and not _is_host_runtime_mode():
         return False, "AC dev governance cannot be rebuilt through stable Docker"
+    if str(project_id or "").strip() == "aming-claw":
+        try:
+            from agent.governance.db import _verified_stable_binding
+            _verified_stable_binding()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return False, "AC dev stable authority is invalid: " + str(exc)
 
     # R4: detect host-runtime mode and skip Docker
     if _is_host_runtime_mode():

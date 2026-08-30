@@ -221413,6 +221413,8 @@ def main():
         dev_storage_root = os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT", "").strip()
         if not dev_storage_root:
             raise GovernanceSingletonError("ac_dev_storage_root_required")
+        from .db import _verified_stable_binding
+        _verified_stable_binding()
         loaded_source = governance_loaded_runtime_identity().get("loaded_source_sha256")
         try:
             validate_dev_launch_receipt(dev_storage_root, source_sha256=str(loaded_source or ""))

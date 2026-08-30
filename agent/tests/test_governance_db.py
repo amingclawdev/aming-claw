@@ -23,6 +23,13 @@ def _canonical_dev_world(tmp_path: Path) -> tuple[Path, Path]:
     stable = Path(tmp_path).resolve() / "stable-shared-volume"
     stable.mkdir(parents=True, exist_ok=True)
     root = resolve_ac_dev_storage_root(stable)
+    from agent.governance import db
+    db._set_test_stable_binding_probe(lambda: {"shared_volume_path": str(stable)})
+    try:
+        from governance import db as legacy_db
+        legacy_db._set_test_stable_binding_probe(lambda: {"shared_volume_path": str(stable)})
+    except ImportError:
+        pass
     os.environ["AMING_CLAW_SHARED_VOLUME"] = str(stable)
     os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] = str(root)
     return root, stable
@@ -523,6 +530,7 @@ def test_ac_dev_launch_receipt_requires_canonical_persistent_sibling(tmp_path, m
 
     stable = (tmp_path / "stable-shared-volume").resolve()
     stable.mkdir()
+    db._set_test_stable_binding_probe(lambda: {"shared_volume_path": str(stable)})
     monkeypatch.setenv("AMING_CLAW_SHARED_VOLUME", str(stable))
     root = resolve_ac_dev_storage_root(stable)
     root.mkdir(parents=True)
@@ -638,6 +646,7 @@ def test_v27_writer_lease_blocks_second_process_before_database_open(tmp_path, m
     }
     stable_shared = tmp_path / "stable-shared-volume"
     stable_shared.mkdir()
+    db._set_test_stable_binding_probe(lambda: {"shared_volume_path": str(stable_shared)})
     storage_root = resolve_ac_dev_storage_root(stable_shared)
     monkeypatch.setenv("AMING_CLAW_SHARED_VOLUME", str(stable_shared))
     monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(storage_root))
@@ -661,6 +670,7 @@ def test_v27_writer_lease_blocks_second_process_before_database_open(tmp_path, m
         "os.environ['AMING_CLAW_RUNTIME_PLANE']='dev'; "
         "os.environ['AMING_CLAW_DEV_STORAGE_ROOT']=sys.argv[1]; "
         "os.environ['AMING_CLAW_SHARED_VOLUME']=sys.argv[2]; "
+        "from agent.governance import db; db._set_test_stable_binding_probe(lambda: {'shared_volume_path': sys.argv[2]}); "
         "from agent.governance import server; server.main()"
     )
     contender = subprocess.run(

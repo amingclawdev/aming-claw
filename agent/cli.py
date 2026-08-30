@@ -1222,7 +1222,8 @@ def start(
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor_commit):
             raise click.ClickException("AC dev runtime requires an exact local stable source anchor.")
         from agent.runtime_plane import resolve_ac_dev_storage_root
-        stable_shared = _canonical_ac_stable_shared_volume()
+        from agent.governance.db import _verified_stable_binding
+        stable_shared = Path(str(_verified_stable_binding()["shared_volume_path"]))
         selected_dev_storage = resolve_ac_dev_storage_root(stable_shared)
         if dev_storage_root and Path(dev_storage_root).expanduser().absolute() != selected_dev_storage:
             raise click.ClickException("AC dev storage root must equal the canonical stable-volume sibling.")
