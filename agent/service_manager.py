@@ -154,27 +154,6 @@ def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) 
     ]
 
 
-def _shared_log_dir(project_id: Optional[str] = None) -> Path:
-    selected_project = _default_project_id() if project_id is None else project_id
-    plane = resolve_runtime_plane(selected_project)
-    if plane.name == "dev":
-        from agent.governance.db import _dev_runtime_root
-
-        return _dev_runtime_root(create=True) / "logs"
-    return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "logs"
-
-
-def _signal_file_path(project_id: Optional[str] = None) -> Path:
-    """Path to the manager restart signal file (manager_signal.json)."""
-    selected_project = _default_project_id() if project_id is None else project_id
-    plane = resolve_runtime_plane(selected_project)
-    if plane.name == "dev":
-        from agent.governance.db import _dev_runtime_root
-
-        return _dev_runtime_root(create=True) / "manager_signal.json"
-    return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "state" / "manager_signal.json"
-
-
 def _identity_log_dir(identity: dict) -> Path:
     root = Path(identity["storage_root"])
     return root / "logs" if identity["plane"] == "dev" else root / "codex-tasks" / "logs"
@@ -928,13 +907,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Bind the full plane/storage authority before creating any log directory,
+    # handler, status probe, thread, or subprocess.
+    identity = _plane_bound_manager_identity(args.project, args.governance_url)
+    manager = ServiceManager(
+        project_id=args.project,
+        governance_url=args.governance_url,
+        workspace=args.workspace,
+    )
+    manager.manager_identity = identity
+    manager.sidecar_port = int(identity["sidecar_port"])
+
     # B48 FIX A (observer-hotfix 2026-04-23): Add RotatingFileHandler so SM logs
     # are captured to disk. Previously -WindowStyle Hidden + basicConfig with no
     # FileHandler silently discarded every SM log message. See
     # docs/dev/b48-investigation-and-fix-proposal.md §2.
     from logging.handlers import RotatingFileHandler
 
-    _log_dir = _shared_log_dir(args.project)
+    _log_dir = _identity_log_dir(identity)
     _log_dir.mkdir(parents=True, exist_ok=True)
     _sm_log_path = _log_dir / f"service-manager-{args.project}.log"
 
@@ -957,12 +947,6 @@ def main() -> None:
         handlers=[_file_handler, _stream_handler],
     )
     log.info("ServiceManager logging initialized: file=%s (B48 Fix A)", _sm_log_path)
-
-    manager = ServiceManager(
-        project_id=args.project,
-        governance_url=args.governance_url,
-        workspace=args.workspace,
-    )
 
     if args.status_only:
         print(manager.status())

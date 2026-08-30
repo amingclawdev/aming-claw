@@ -677,6 +677,24 @@ def test_manager_identity_keeps_ac_dev_sidecar_and_storage_disjoint(monkeypatch,
     assert dev["storage_root"] != stable["storage_root"]
 
 
+@pytest.mark.parametrize(
+    ("project_id", "governance_url"),
+    [(" aming-claw", "http://127.0.0.1:40008"), ("proj", "http://127.0.0.1:40008")],
+)
+def test_main_rejects_before_log_path_or_manager_effects(monkeypatch, project_id, governance_url):
+    import service_manager as sm
+
+    monkeypatch.setattr(
+        sys, "argv", ["service_manager.py", "--project", project_id,
+                        "--governance-url", governance_url, "--status-only"],
+    )
+    log_path = MagicMock()
+    monkeypatch.setattr(sm, "_identity_log_dir", log_path)
+    with pytest.raises(ValueError):
+        sm.main()
+    log_path.assert_not_called()
+
+
 def test_managed_service_manager_verifies_and_passes_session_token_only_by_env(
     monkeypatch,
     tmp_path,
@@ -688,7 +706,6 @@ def test_managed_service_manager_verifies_and_passes_session_token_only_by_env(
     (dev_root / "runtime").mkdir(parents=True)
     monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
     monkeypatch.setenv("AMING_EXECUTOR_SESSION_TOKEN", token)
-    monkeypatch.setattr(sm, "_shared_log_dir", lambda _project="": tmp_path / "logs")
 
     response = MagicMock()
     response.raise_for_status.return_value = None
@@ -724,7 +741,6 @@ def test_managed_service_manager_rejects_missing_invalid_or_wrong_project_token(
     dev_root = tmp_path / "dev-world"
     (dev_root / "runtime").mkdir(parents=True)
     monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
-    monkeypatch.setattr(sm, "_shared_log_dir", lambda _project="": tmp_path / "logs")
     popen = MagicMock()
     monkeypatch.setattr(sm.subprocess, "Popen", popen)
 
