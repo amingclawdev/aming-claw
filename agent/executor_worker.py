@@ -30,7 +30,6 @@ import tempfile
 import time
 import argparse
 import threading
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -494,6 +493,29 @@ class ExecutorWorker:
         if task_id in self._task_worktrees:
             return self._validated_task_worktree(task_id, candidate)
         raise ValueError("effect workspace has no registered task identity")
+
+    def _registered_cleanup_identity(self, worktree_path: str) -> GitWorktreeIdentity:
+        """Return the sole live receipt eligible to authorize cleanup.
+
+        Cleanup must never turn an arbitrary path into an authority.  Several
+        task ids may hand off the same immutable receipt, but there may be only
+        one distinct identity and the supplied pathname must be its exact
+        canonical root.
+        """
+        if not isinstance(worktree_path, str) or not worktree_path:
+            raise ValueError("cleanup requires an exact registered worktree path")
+        identities = {
+            identity
+            for identity in self._task_worktrees.values()
+            if identity.workspace.root == worktree_path
+        }
+        if len(identities) != 1:
+            raise ValueError("cleanup worktree is unregistered or ambiguous")
+        identity = identities.pop()
+        # This rechecks root path/device/inode and Git root/common-dir/git-dir
+        # before either Git or filesystem cleanup can be attempted.
+        validate_current_git_worktree_identity(identity)
+        return identity
 
     def _api(self, method: str, path: str, data: dict = None, timeout: Optional[int] = None) -> dict:
         """Call governance API. Short timeouts to avoid MCP IO deadlock."""
@@ -1266,6 +1288,7 @@ class ExecutorWorker:
                     chain_state = get_chain_state(cwd=integration_worktree)
                     parent_chain_sha = chain_state.get("chain_sha", "")
                     bug_id = metadata.get("bug_id", "") or metadata.get("chain_bug_id", "")
+                    self._revalidate_effect_workspace(f"{task_id}:integration", integration_worktree)
                     success, merge_commit, err = write_merge_with_trailer(
                         message=f"Auto-merge: {task_id}",
                         branch=branch,
@@ -1304,9 +1327,11 @@ class ExecutorWorker:
                     # B20: Clean leaked staged/untracked files before ff-only merge
                     try:
                         # Unstage any leaked files from worktree contamination
+                        self._revalidate_effect_workspace(task_id, self.workspace)
                         subprocess.run(["git", "reset", "HEAD", "--"],
                                        cwd=self.workspace, capture_output=True, timeout=10)
                         # Remove untracked files that conflict with merge
+                        self._revalidate_effect_workspace(f"{task_id}:integration", integration_worktree)
                         merge_files = subprocess.run(
                             ["git", "diff", "--name-only", "HEAD", merge_commit],
                             cwd=integration_worktree, capture_output=True, text=True, timeout=10
@@ -1314,11 +1339,13 @@ class ExecutorWorker:
                         for f in merge_files:
                             untracked = os.path.join(self.workspace, f)
                             if os.path.exists(untracked):
+                                self._revalidate_effect_workspace(task_id, self.workspace)
                                 tracked = subprocess.run(
                                     ["git", "ls-files", f],
                                     cwd=self.workspace, capture_output=True, text=True, timeout=5
                                 ).stdout.strip()
                                 if not tracked:
+                                    self._revalidate_effect_workspace(task_id, self.workspace)
                                     os.remove(untracked)
                                     log.info("merge: removed untracked %s before ff-only", f)
                     except Exception as e:
@@ -1365,13 +1392,16 @@ class ExecutorWorker:
 
             # Stage changed files (or all if none specified)
             if changed:
+                self._revalidate_effect_workspace(task_id, self.workspace)
                 subprocess.run(["git", "add", "--"] + changed,
                                cwd=self.workspace, capture_output=True, timeout=30)
             else:
+                self._revalidate_effect_workspace(task_id, self.workspace)
                 subprocess.run(["git", "add", "-A"],
                                cwd=self.workspace, capture_output=True, timeout=30)
 
             # Check if there's anything to commit
+            self._revalidate_effect_workspace(task_id, self.workspace)
             status = subprocess.run(["git", "diff", "--cached", "--name-only"],
                                     cwd=self.workspace, capture_output=True, text=True, timeout=10)
             staged = [f.strip() for f in status.stdout.splitlines() if f.strip()]
@@ -1385,9 +1415,11 @@ class ExecutorWorker:
             # Commit with 4-field Chain trailer (Phase A §4.4)
             msg = f"Auto-merge: {task_id}\n\nChanged files: {', '.join(staged[:10])}"
             from agent.governance.chain_trailer import write_merge_with_trailer, get_chain_state
+            self._revalidate_effect_workspace(task_id, self.workspace)
             chain_state = get_chain_state(cwd=self.workspace)
             parent_chain_sha = chain_state.get("chain_sha", "")
             bug_id = metadata.get("bug_id", "") or metadata.get("chain_bug_id", "")
+            self._revalidate_effect_workspace(task_id, self.workspace)
             success, commit_hash, err = write_merge_with_trailer(
                 message=msg, cwd=self.workspace,
                 task_id=task_id,
@@ -1409,6 +1441,7 @@ class ExecutorWorker:
                 # 1. Update VERSION file
                 ver_path = os.path.join(self.workspace, "VERSION")
                 if os.path.exists(ver_path):
+                    self._revalidate_effect_workspace(task_id, self.workspace)
                     with open(ver_path) as f:
                         content = f.read()
                     import re as _re
@@ -1416,7 +1449,9 @@ class ExecutorWorker:
                     with open(ver_path, 'w') as f:
                         f.write(content)
                     # Amend commit to include VERSION
+                    self._revalidate_effect_workspace(task_id, self.workspace)
                     subprocess.run(["git", "add", "VERSION"], cwd=self.workspace, capture_output=True, timeout=10)
+                    self._revalidate_effect_workspace(task_id, self.workspace)
                     subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=self.workspace, capture_output=True, timeout=10)
                     # Re-read hash after amend
                     rev2 = subprocess.run(["git", "rev-parse", "HEAD"],
@@ -2577,42 +2612,46 @@ class ExecutorWorker:
         except Exception:
             return None, None
 
-    def _remove_worktree(self, worktree_path: str, branch_name: str, delete_branch: bool = True) -> None:
-        """Remove worktree and optionally delete its branch."""
-        removed = False
+    def _remove_worktree(self, worktree_path: str, branch_name: str,
+                         delete_branch: bool = True) -> bool:
+        """Remove only the exact, live registered worktree; otherwise no-op.
+
+        The old fallback ``rmtree`` made a stale or unregistered pathname a
+        deletion capability.  Git owns cleanup for registered Git worktrees;
+        any missing receipt, symlink, inode change, or Git topology drift is a
+        fail-closed no-effect result.
+        """
         try:
-            if worktree_path and os.path.isdir(worktree_path):
-                # Cleanup remains an effect: keep the receipt registered until
-                # Git has actually removed the worktree.
-                for task_id, identity in self._task_worktrees.items():
-                    if identity.workspace.root == worktree_path:
-                        self._validated_task_worktree(task_id, worktree_path)
-                        break
-                subprocess.run(
-                    ["git", "worktree", "remove", worktree_path, "--force"],
-                    cwd=self.workspace,
-                    capture_output=True,
-                    timeout=30,
-                )
-                removed = not os.path.exists(worktree_path)
-            elif worktree_path and os.path.exists(worktree_path):
-                shutil.rmtree(worktree_path, ignore_errors=True)
-                removed = not os.path.exists(worktree_path)
-            if removed and delete_branch and branch_name:
+            identity = self._registered_cleanup_identity(worktree_path)
+            if not os.path.isdir(identity.workspace.root):
+                raise ValueError("registered cleanup worktree is not a directory")
+            subprocess.run(
+                ["git", "worktree", "remove", identity.workspace.root, "--force"],
+                cwd=self.workspace,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if os.path.exists(identity.workspace.root):
+                raise ValueError("Git did not remove registered worktree")
+            if delete_branch and branch_name:
+                self._revalidate_effect_workspace("cleanup-root", self.workspace)
                 subprocess.run(
                     ["git", "branch", "-D", branch_name],
                     cwd=self.workspace,
                     capture_output=True,
                     timeout=10,
+                    check=False,
                 )
-        except Exception:
-            pass
-        finally:
-            # Never erase the receipt before cleanup is demonstrably complete.
-            if removed:
-                for task_id, identity in list(self._task_worktrees.items()):
-                    if identity.workspace.root == worktree_path:
-                        self._task_worktrees.pop(task_id, None)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            log.warning("worktree cleanup refused: %s", exc)
+            return False
+
+        # Only a successful physical Git removal retires every shared handoff.
+        for task_id, registered in list(self._task_worktrees.items()):
+            if registered == identity:
+                self._task_worktrees.pop(task_id, None)
+        return True
 
     def _create_integration_worktree(self, task_id: str, base_ref: str = "HEAD"):
         """Create a clean integration worktree used only for merge verification."""

@@ -151,6 +151,71 @@ class TestDevWorktreeRound3(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Git"):
                 worker._register_task_worktree("task-no-git", repo)
 
+    def test_cleanup_rejects_unregistered_sibling_without_effect(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo, _ = _repo_with_worktree(tmpdir)
+            worker = _ac_worker(repo)
+            sibling = os.path.join(repo, ".worktrees", "unregistered")
+            os.makedirs(sibling)
+            marker = os.path.join(sibling, "keep")
+            with open(marker, "w", encoding="utf-8") as handle:
+                handle.write("must remain\n")
+
+            with patch("subprocess.run") as run:
+                self.assertFalse(worker._remove_worktree(sibling, "test/unregistered"))
+
+            self.assertTrue(os.path.isfile(marker))
+            run.assert_not_called()
+
+    def test_cleanup_rejects_symlink_claim_without_effect(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo, worktree = _repo_with_worktree(tmpdir)
+            worker = _ac_worker(repo)
+            worker._register_task_worktree("dev-root", worktree)
+            claim = os.path.join(repo, ".worktrees", "symlink-claim")
+            os.symlink(worktree, claim)
+
+            with patch("subprocess.run") as run:
+                self.assertFalse(worker._remove_worktree(claim, "test/worker"))
+
+            self.assertTrue(os.path.isdir(worktree))
+            run.assert_not_called()
+
+    def test_cleanup_rejects_identity_drift_without_deletion_or_branch_mutation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo, worktree = _repo_with_worktree(tmpdir)
+            worker = _ac_worker(repo)
+            worker._register_task_worktree("dev-root", worktree)
+            # Materially replace the registered Git worktree at its old path.
+            _git(["worktree", "remove", "--force", worktree], repo)
+            os.makedirs(worktree)
+            marker = os.path.join(worktree, "replacement")
+            with open(marker, "w", encoding="utf-8") as handle:
+                handle.write("do not delete\n")
+            ref_before = _git(["rev-parse", "test/worker"], repo).stdout.strip()
+
+            self.assertFalse(worker._remove_worktree(worktree, "test/worker"))
+
+            self.assertTrue(os.path.isfile(marker))
+            self.assertEqual(_git(["rev-parse", "test/worker"], repo).stdout.strip(), ref_before)
+            self.assertIn("dev-root", worker._task_worktrees)
+
+    def test_cleanup_unregisters_shared_handoffs_only_after_real_git_removal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo, worktree = _repo_with_worktree(tmpdir)
+            worker = _ac_worker(repo)
+            worker._register_task_worktree("dev-root", worktree)
+            worker._handoff_task_worktree("dev-root", "qa-child", worktree)
+
+            self.assertTrue(worker._remove_worktree(worktree, "test/worker"))
+
+            self.assertFalse(os.path.exists(worktree))
+            self.assertNotIn("dev-root", worker._task_worktrees)
+            self.assertNotIn("qa-child", worker._task_worktrees)
+            self.assertNotEqual(
+                _git(["branch", "--list", "test/worker"], repo).stdout.strip(), "test/worker"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
