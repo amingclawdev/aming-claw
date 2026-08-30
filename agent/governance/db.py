@@ -44,6 +44,8 @@ AC_DATABASE_STABLE_RELATIVE_PATH = (
 AC_DATABASE_DEV_RELATIVE_PATH = "governance/aming-claw/governance.db"
 AC_LEGACY_ARCHIVE_SIZE_BYTES = 178_625_794_048
 AC_DEV_CUTOVER_SCHEMA = "ac_dev_world_cutover.v1"
+AC_DEV_LAUNCH_RECEIPT_SCHEMA = "ac_dev_launch_receipt.v1"
+AC_DEV_LAUNCH_RECEIPT_NAME = "launch-receipt.json"
 
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
@@ -1165,6 +1167,77 @@ def _dev_storage_root(*, create: bool = False) -> Path:
             "AC dev runtime requires an explicit AMING_CLAW_DEV_STORAGE_ROOT"
         )
     return _absolute_non_symlink_root(Path(raw), create=create)
+
+
+def dev_launch_receipt_path(storage_root: Path | str) -> Path:
+    root = _absolute_non_symlink_root(Path(storage_root), create=False)
+    return root / AC_DEV_LAUNCH_RECEIPT_NAME
+
+
+def write_dev_launch_receipt(
+    storage_root: Path | str, *, stable_shared_volume: Path | str,
+    source_sha256: str, port: int, project_id: str = AC_PROJECT_ID,
+) -> dict[str, object]:
+    """Persist the source-backed foreground launch admission before server exec."""
+    root = _absolute_non_symlink_root(Path(storage_root), create=False)
+    stable = _absolute_non_symlink_root(Path(stable_shared_volume), create=False)
+    if project_id != AC_PROJECT_ID or port != 40008:
+        raise ValueError("AC dev launch receipt requires exact project and port")
+    if root == stable or stable in root.parents or root in stable.parents:
+        raise ValueError("AC dev launch receipt root must be disjoint from stable volume")
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    if root != resolve_ac_dev_storage_root(stable):
+        raise ValueError("AC dev launch receipt root must be canonical resolver output")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(source_sha256 or "")):
+        raise ValueError("AC dev launch receipt source hash is invalid")
+    root_stat, parent_stat = root.stat(follow_symlinks=False), stable.parent.stat(follow_symlinks=False)
+    receipt = {
+        "schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA,
+        "world_id": AC_DEV_WORLD_ID, "project_id": AC_PROJECT_ID,
+        "runtime_plane": DEV_RUNTIME_PLANE, "port": 40008, "background": False,
+        "storage_root": str(root), "storage_device": int(root_stat.st_dev), "storage_inode": int(root_stat.st_ino),
+        "stable_shared_volume": str(stable),
+        "stable_parent_device": int(parent_stat.st_dev), "stable_parent_inode": int(parent_stat.st_ino),
+        "source_sha256": str(source_sha256),
+    }
+    path = root / AC_DEV_LAUNCH_RECEIPT_NAME
+    if path.exists() and path.is_symlink():
+        raise ValueError("AC dev launch receipt cannot be a symlink")
+    temporary = root / (AC_DEV_LAUNCH_RECEIPT_NAME + ".tmp")
+    temporary.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, path)
+    return receipt
+
+
+def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str) -> dict[str, object]:
+    """Fail closed before a dev server opens SQLite or takes the writer lease."""
+    root = _absolute_non_symlink_root(Path(storage_root), create=False)
+    path = root / AC_DEV_LAUNCH_RECEIPT_NAME
+    if not path.is_file() or path.is_symlink() or path.resolve(strict=True) != path:
+        raise ValueError("AC dev launch receipt is missing or invalid")
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("AC dev launch receipt is unreadable") from exc
+    root_stat = root.stat(follow_symlinks=False)
+    required = {"schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA, "world_id": AC_DEV_WORLD_ID,
+        "project_id": AC_PROJECT_ID, "runtime_plane": DEV_RUNTIME_PLANE, "port": 40008,
+        "background": False, "storage_root": str(root), "storage_device": int(root_stat.st_dev),
+        "storage_inode": int(root_stat.st_ino), "source_sha256": source_sha256}
+    if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in required.items()):
+        raise ValueError("AC dev launch receipt mismatch")
+    stable = Path(str(receipt.get("stable_shared_volume") or ""))
+    if not stable.is_absolute() or stable.is_symlink() or not stable.is_dir() or stable.resolve(strict=True) != stable:
+        raise ValueError("AC dev launch receipt stable identity invalid")
+    parent_stat = stable.parent.stat(follow_symlinks=False)
+    if receipt.get("stable_parent_device") != int(parent_stat.st_dev) or receipt.get("stable_parent_inode") != int(parent_stat.st_ino):
+        raise ValueError("AC dev launch receipt stable parent identity changed")
+    if root == stable or stable in root.parents or root in stable.parents:
+        raise ValueError("AC dev launch receipt cross-world root invalid")
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    if root != resolve_ac_dev_storage_root(stable):
+        raise ValueError("AC dev launch receipt root is not the canonical resolver output")
+    return receipt
 
 
 def _dev_runtime_root(*, create: bool = False) -> Path:

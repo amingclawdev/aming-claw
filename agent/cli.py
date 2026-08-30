@@ -184,6 +184,25 @@ def _dev_source_identity_precheck() -> dict[str, str]:
     return {**identity, "root": root, "commit": commit}
 
 
+def _canonical_ac_stable_shared_volume() -> Path:
+    """Locate the one persistent shared volume belonging to the frozen stable branch."""
+    source_root = Path(str(_source_git_identity().get("root") or "")).resolve(strict=True)
+    result = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=source_root,
+        capture_output=True, text=True, timeout=5, check=False)
+    roots: list[Path] = []
+    if result.returncode == 0:
+        for block in result.stdout.strip().split("\n\n"):
+            fields = dict(line.split(" ", 1) if " " in line else (line, "") for line in block.splitlines())
+            if fields.get("branch") == "refs/heads/" + AC_STABLE_BRANCH and fields.get("worktree"):
+                roots.append(Path(fields["worktree"]).resolve(strict=True))
+    if len(roots) != 1:
+        raise click.ClickException("Exact stable shared-volume identity is unavailable.")
+    shared = roots[0] / "shared-volume"
+    if not shared.is_dir() or shared.is_symlink() or shared.resolve(strict=True) != shared:
+        raise click.ClickException("Canonical stable shared-volume identity is unavailable.")
+    return shared
+
+
 def _dev_running_identity_matches(
     health: Mapping[str, Any],
     expected: Mapping[str, str],
@@ -1202,15 +1221,11 @@ def start(
         stable_anchor_commit = stable_anchor_commit or _local_stable_source_anchor()
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor_commit):
             raise click.ClickException("AC dev runtime requires an exact local stable source anchor.")
-        if runtime_workspace:
-            runtime_root = Path(runtime_workspace).expanduser().absolute()
-        else:
-            runtime_root = Path(tempfile.gettempdir()) / "aming-claw-dev-40008"
-        selected_dev_storage = (
-            Path(dev_storage_root).expanduser().absolute()
-            if dev_storage_root
-            else runtime_root / "world"
-        )
+        from agent.runtime_plane import resolve_ac_dev_storage_root
+        stable_shared = _canonical_ac_stable_shared_volume()
+        selected_dev_storage = resolve_ac_dev_storage_root(stable_shared)
+        if dev_storage_root and Path(dev_storage_root).expanduser().absolute() != selected_dev_storage:
+            raise click.ClickException("AC dev storage root must equal the canonical stable-volume sibling.")
         # Listener ownership is the first dev-world admission decision.  A
         # running or foreign process must be rejected before bootstrap, source
         # CAS, activation validation, or any dedicated-root filesystem write.
@@ -1248,6 +1263,7 @@ def start(
             source_identity=dev_identity,
         )
         dev_storage_root = str(database_binding["dev_storage_root"])
+        runtime_root = Path(dev_storage_root) / "runtime"
         stable_identity = None
     elif runtime_plane == "stable":
         stable_identity = _stable_start_identity_precheck(
@@ -1298,11 +1314,7 @@ def start(
                 "AC dev runtime requires its bootstrapped governance.db; "
                 f"not found at {existing_db}."
             )
-        if runtime_workspace:
-            runtime_root = Path(runtime_workspace).expanduser().resolve()
-        else:
-            runtime_root = Path(tempfile.gettempdir()) / "aming-claw-dev-40008"
-        runtime_root = runtime_root.resolve()
+        runtime_root = (Path(dev_storage_root) / "runtime").absolute()
         if runtime_root == source_root or source_root in runtime_root.parents:
             raise click.ClickException(
                 "AC dev runtime workspace must be outside the source worktree."
@@ -1315,6 +1327,11 @@ def start(
         os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] = "deny"
         os.environ[AC_DEV_STORAGE_ROOT_ENV] = str(dev_storage)
         os.environ.pop("SHARED_VOLUME_PATH", None)
+        from agent.governance.db import write_dev_launch_receipt
+        server_source = Path(__file__).resolve().parent / "governance" / "server.py"
+        source_hash = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
+        write_dev_launch_receipt(dev_storage, stable_shared_volume=stable_shared,
+            source_sha256=source_hash, port=AC_DEV_SERVICE_PORT)
     elif runtime_plane == "stable":
         runtime_root = Path(workspace).resolve() if workspace else _default_runtime_workspace()
         os.environ["AMING_CLAW_RUNTIME_PLANE"] = "stable"

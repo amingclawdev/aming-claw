@@ -501,6 +501,31 @@ def test_ac_dev_storage_rejects_alias_foreign_and_symlink_roots(tmp_path, monkey
         )
 
 
+def test_ac_dev_launch_receipt_requires_canonical_persistent_sibling(tmp_path):
+    """A direct server may only consume the one resolver-derived dev world."""
+    from agent.governance import db
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+
+    stable = (tmp_path / "stable-shared-volume").resolve()
+    stable.mkdir()
+    root = resolve_ac_dev_storage_root(stable)
+    root.mkdir(parents=True)
+    source = "sha256:" + "d" * 64
+    receipt = db.write_dev_launch_receipt(
+        root, stable_shared_volume=stable, source_sha256=source, port=40008
+    )
+    assert db.validate_dev_launch_receipt(root, source_sha256=source) == receipt
+    with pytest.raises(ValueError, match="receipt mismatch"):
+        db.validate_dev_launch_receipt(root, source_sha256="sha256:" + "e" * 64)
+
+    foreign = tmp_path / "foreign-dev-world"
+    foreign.mkdir()
+    with pytest.raises(ValueError, match="canonical resolver output"):
+        db.write_dev_launch_receipt(
+            foreign, stable_shared_volume=stable, source_sha256=source, port=40008
+        )
+
+
 @pytest.mark.parametrize("plane", ["stable", "generic"])
 @pytest.mark.parametrize("project_id", ["aming-claw", "aming_claw", "amingClaw"])
 def test_v27_central_resolver_rejects_ac_before_mkdir(

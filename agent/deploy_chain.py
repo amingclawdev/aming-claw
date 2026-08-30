@@ -331,6 +331,11 @@ def restart_local_governance(port: int = 40000) -> tuple[bool, str]:
     - R5: stderr log content included in failure summary
     - R6: log.warning on restart failure
     """
+    # This legacy background launcher has no canonical stable-volume binding
+    # and therefore cannot mint the required foreground AC dev receipt.
+    # AC must enter through ``aming-claw start --runtime-plane dev``.
+    if port == 40008:
+        return False, "AC dev restart requires the canonical foreground CLI launcher"
     import tempfile
     import time as _time
     output_lines: list[str] = []

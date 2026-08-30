@@ -8,6 +8,40 @@ from pathlib import Path
 from dataclasses import dataclass
 
 
+AC_PROJECT_ID = "aming-claw"
+AC_DEV_STORAGE_NAMESPACE = ".aming-claw-dev-worlds"
+
+
+def resolve_ac_dev_storage_root(stable_shared_volume: str | Path) -> Path:
+    """Derive AC's only dev world from the persistent stable-volume identity.
+
+    This deliberately has no fallback to a worktree, ``/private/tmp``, session
+    home, or an operator-supplied dev pathname.  The result is a sibling of the
+    stable shared volume, in a reserved namespace, and is safe to create later.
+    """
+    candidate = Path(stable_shared_volume)
+    if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_dir():
+        raise ValueError("canonical stable shared volume must be an existing absolute non-symlink directory")
+    stable = candidate.resolve(strict=True)
+    if stable != candidate:
+        raise ValueError("canonical stable shared volume identity mismatch")
+    parent = stable.parent
+    if parent.is_symlink() or parent.resolve(strict=True) != parent:
+        raise ValueError("canonical stable shared-volume parent identity mismatch")
+    root = parent / AC_DEV_STORAGE_NAMESPACE / AC_PROJECT_ID
+    # Do not resolve a not-yet-created target: validate every existing parent.
+    probe = root
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    if probe.is_symlink() or probe.resolve(strict=True) != probe:
+        raise ValueError("AC dev storage root cannot traverse a symlink")
+    if root.exists() and (root.is_symlink() or root.resolve(strict=True) != root):
+        raise ValueError("AC dev storage root cannot alias its canonical path")
+    if root == stable or stable in root.parents or root in stable.parents:
+        raise ValueError("AC dev storage root must be a stable-volume sibling")
+    return root
+
+
 @dataclass(frozen=True)
 class RuntimePlane:
     project_id: str

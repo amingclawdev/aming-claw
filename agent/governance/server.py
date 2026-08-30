@@ -48,6 +48,7 @@ from .db import (
     get_connection,
     acquire_dev_runtime_writer_lease,
     release_dev_runtime_writer_lease,
+    validate_dev_launch_receipt,
     DBContext,
     independent_connection,
     sqlite_write_lock,
@@ -221412,6 +221413,11 @@ def main():
         dev_storage_root = os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT", "").strip()
         if not dev_storage_root:
             raise GovernanceSingletonError("ac_dev_storage_root_required")
+        loaded_source = governance_loaded_runtime_identity().get("loaded_source_sha256")
+        try:
+            validate_dev_launch_receipt(dev_storage_root, source_sha256=str(loaded_source or ""))
+        except (OSError, ValueError) as exc:
+            raise GovernanceSingletonError("ac_dev_launch_receipt_invalid") from exc
         acquire_dev_runtime_writer_lease(dev_storage_root)
     try:
         _validate_runtime_plane_startup()
