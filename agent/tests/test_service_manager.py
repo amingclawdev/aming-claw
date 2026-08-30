@@ -434,7 +434,7 @@ class TestHostDefaults(unittest.TestCase):
         ):
             mgr = ServiceManager()
         self.assertEqual(mgr.project_id, "runtime-project")
-        self.assertEqual(mgr.governance_url, "http://localhost:40000")
+        self.assertEqual(mgr.governance_url, "http://127.0.0.1:40000")
         self.assertEqual(mgr.workspace, "C:/runtime/workspace")
         self.assertEqual(
             mgr._executor_cmd,
@@ -444,7 +444,7 @@ class TestHostDefaults(unittest.TestCase):
                 "--project",
                 "runtime-project",
                 "--url",
-                "http://localhost:40000",
+                "http://127.0.0.1:40000",
                 "--workspace",
                 "C:/runtime/workspace",
             ],

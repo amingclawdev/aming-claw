@@ -70,9 +70,11 @@ def _matches_any(path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(normalized, p) for p in patterns)
 
 
-def _executor_health_from_state() -> bool:
+def _executor_health_from_state(project_id: str) -> bool:
     """Fallback executor health check when the HTTP status port is unavailable."""
     try:
+        if resolve_runtime_plane(project_id).name == "dev":
+            return False
         status_path = _state_dir() / "manager_status.json"
         if not status_path.exists():
             return False
@@ -609,7 +611,7 @@ def smoke_test(affected_services: list[str] | None, project_id: str) -> dict[str
             resp = requests.get(f"{resolve_runtime_plane(project_id).executor_url}/status", timeout=5)
             results["executor"] = resp.status_code == 200
         except Exception:  # noqa: BLE001
-            results["executor"] = _executor_health_from_state()
+            results["executor"] = _executor_health_from_state(project_id)
 
     # --- governance ---
     if results["governance"] != "not_applicable":

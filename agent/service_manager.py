@@ -97,29 +97,14 @@ def _default_project_id() -> str:
     return os.getenv("EXECUTOR_PROJECT_ID", os.getenv("PROJECT_ID", "aming-claw"))
 
 
-def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str:
+def _world_bound_governance_url(project_id: str, requested_url: str = "", *, allow_test_url: bool = False) -> str:
     """Bind one manager/executor generation to exactly one governance world."""
 
-    raw = str(project_id or "").strip()
-    canonical = re.sub(r"-+", "-", re.sub(r"[\s_]+", "-", raw)).lower().strip("-")
-    if canonical == "aming-claw" and raw != "aming-claw":
-        raise ValueError("AC ServiceManager project id must be exact aming-claw")
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", canonical):
-        raise ValueError("ServiceManager project id is invalid")
-    if canonical != "aming-claw":
-        selected = str(requested_url or "http://127.0.0.1:40000").rstrip("/")
-        if selected.endswith(":40008"):
-            raise ValueError("port 40008 is reserved to exact project aming-claw")
-        return selected
-    expected = os.getenv(
-        "AC_DEV_GOVERNANCE_URL", "http://127.0.0.1:40008"
-    ).rstrip("/")
-    selected = str(requested_url or expected).rstrip("/")
-    if selected not in {expected, "http://localhost:40008"}:
-        raise ValueError(
-            f"project {canonical} is bound to governance world {expected}, got {selected}"
-        )
-    return expected
+    plane = resolve_runtime_plane(project_id)
+    equivalent = requested_url.rstrip("/").replace("localhost", "127.0.0.1") == plane.governance_url
+    if requested_url and not equivalent and not allow_test_url:
+        raise ValueError("ServiceManager governance URL crosses the project runtime plane")
+    return plane.governance_url
 
 
 def _default_workspace() -> str:
@@ -224,6 +209,7 @@ class ServiceManager:
             governance_url
             if governance_url is not None
             else os.getenv("GOVERNANCE_URL", ""),
+            allow_test_url=executor_cmd is not None and self.project_id != "aming-claw",
         )
         self.manager_identity: Optional[dict] = None
         self.sidecar_port: Optional[int] = None

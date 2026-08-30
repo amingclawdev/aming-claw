@@ -7927,21 +7927,13 @@ class ToolDispatcher:
         bound_owner = getattr(self._api, "__self__", None)
         url = getattr(bound_owner, "gov_url", None) if bound_owner is not None else None
         configured = str(url or os.environ.get("GOVERNANCE_URL", "")).rstrip("/")
-        project_id = str(
-            os.environ.get("AMING_CLAW_MCP_PROJECT_ID")
-            or os.environ.get("PROJECT_ID")
-            or ""
-        ).strip()
-        if project_id == "aming-claw":
-            expected = os.environ.get(
-                "AC_DEV_GOVERNANCE_URL", "http://127.0.0.1:40008"
-            ).rstrip("/")
-            if configured and configured not in {expected, "http://localhost:40008"}:
-                raise ValueError("AC MCP tools are bound exclusively to dev port 40008")
-            return expected
-        if configured.endswith(":40008"):
-            raise ValueError("port 40008 is reserved to exact project aming-claw")
-        return configured or "http://localhost:40000"
+        project_id = os.environ.get("AMING_CLAW_MCP_PROJECT_ID") or os.environ.get("PROJECT_ID")
+        if project_id:
+            plane = resolve_runtime_plane(project_id)
+            if configured and configured != plane.governance_url:
+                raise ValueError("MCP governance URL crosses required dev port 40008")
+            return plane.governance_url
+        return configured
 
     def _api_with_role_token(
         self,
