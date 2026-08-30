@@ -34,6 +34,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 # B48 FIX B (observer-hotfix 2026-04-23): Ensure the project root is on
 # sys.path so `from agent.manager_http_server import run_server` works when
@@ -61,6 +62,8 @@ EXECUTOR_SESSION_TOKEN_ENV = "AMING_EXECUTOR_SESSION_TOKEN"
 
 _RELOAD_TIMEOUT: int = int(os.getenv("SERVICE_RELOAD_TIMEOUT", "120"))
 _POLL_INTERVAL: float = float(os.getenv("SERVICE_POLL_INTERVAL", "2"))
+_STABLE_MANAGER_SIDECAR_PORT = 40101
+_AC_DEV_MANAGER_SIDECAR_PORT = 40109
 
 _agent_dir = str(Path(__file__).resolve().parent)
 
@@ -120,6 +123,33 @@ def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str
 
 def _default_workspace() -> str:
     return os.getenv("CODEX_WORKSPACE", str(_repo_root()))
+
+
+def _plane_bound_manager_identity(
+    project_id: str, governance_url: str, storage_root: Optional[str] = None,
+    *, allow_test_port: bool = False,
+) -> dict:
+    """Return the immutable manager/sidecar identity for one runtime plane.
+
+    A manager is never a host-global service: the project, governance listener,
+    storage root, and sidecar port form one custody boundary.
+    """
+    project = str(project_id or "").strip()
+    url = _world_bound_governance_url(project, governance_url)
+    if project == "aming-claw":
+        raw_root = str(storage_root or os.getenv("AMING_CLAW_DEV_STORAGE_ROOT", "")).strip()
+        if not raw_root:
+            raise ValueError("AC ServiceManager requires explicit AMING_CLAW_DEV_STORAGE_ROOT")
+        root = Path(raw_root).expanduser().absolute()
+        if root.is_symlink():
+            raise ValueError("AC ServiceManager storage root cannot be a symlink")
+        return {"project_id": project, "plane": "dev", "governance_url": url,
+                "storage_root": str(root), "sidecar_port": _AC_DEV_MANAGER_SIDECAR_PORT}
+    if urlparse(url).port != 40000 and not allow_test_port:
+        raise ValueError("stable ServiceManager must use the stable governance port 40000")
+    root = Path(storage_root or os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))).expanduser().absolute()
+    return {"project_id": project, "plane": "stable", "governance_url": url,
+            "storage_root": str(root), "sidecar_port": _STABLE_MANAGER_SIDECAR_PORT}
 
 
 def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) -> list[str]:
@@ -194,6 +224,8 @@ class ServiceManager:
             if governance_url is not None
             else os.getenv("GOVERNANCE_URL", ""),
         )
+        self.manager_identity: Optional[dict] = None
+        self.sidecar_port: Optional[int] = None
         self.reload_timeout = reload_timeout
         self.poll_interval = poll_interval
         self.workspace = workspace or _default_workspace()
@@ -450,6 +482,14 @@ class ServiceManager:
             log.info("ServiceManager: sidecar already running")
             return
 
+        # Bind the full launch identity immediately before a listening sidecar
+        # exists.  Construction alone is deliberately side-effect free.
+        self.manager_identity = _plane_bound_manager_identity(
+            self.project_id, self.governance_url,
+            allow_test_port=self._managed_executor is False and self.project_id != "aming-claw",
+        )
+        self.sidecar_port = int(self.manager_identity["sidecar_port"])
+
         self._sidecar_crashed = False
 
         def _sidecar_runner():
@@ -465,8 +505,17 @@ class ServiceManager:
             """
             try:
                 from agent.manager_http_server import run_server
-                log.info("ServiceManager: sidecar thread starting manager_http_server")
-                run_server()
+                log.info(
+                    "ServiceManager: sidecar thread starting manager_http_server "
+                    "for %s/%s on %d",
+                    self.manager_identity["plane"], self.project_id, self.sidecar_port,
+                )
+                run_server(
+                    port=self.sidecar_port,
+                    project_id=self.project_id,
+                    governance_url=self.governance_url,
+                    storage_root=self.manager_identity["storage_root"],
+                )
             except Exception as exc:
                 log.error(
                     "ServiceManager: sidecar crashed (non-fatal, monitor loop continues): %s",

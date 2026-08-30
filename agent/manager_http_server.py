@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 
 MANAGER_HTTP_HOST = "127.0.0.1"
 MANAGER_HTTP_PORT = 40101
+AC_DEV_MANAGER_HTTP_PORT = 40109
 
 _HEALTH_CHECK_TIMEOUT = 30  # seconds to wait for governance health endpoint
 _HEALTH_CHECK_INTERVAL = 1  # seconds between health polls
@@ -106,6 +107,31 @@ def derive_runtime_deployment_verification_status(
 def _project_root() -> Path:
     """Return the project root directory (parent of agent/)."""
     return Path(__file__).resolve().parent.parent
+
+
+def plane_bound_manager_identity(
+    project_id: str, governance_url: str, storage_root: str,
+) -> dict:
+    """Validate the immutable custody boundary for one manager sidecar."""
+    project = str(project_id or "").strip()
+    url = str(governance_url or "").rstrip("/")
+    root = Path(str(storage_root or "")).expanduser().absolute()
+    if not project or not url or not str(storage_root or "").strip():
+        raise ValueError("manager sidecar requires explicit project, governance URL, and storage root")
+    parsed = urlparse(url)
+    if parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise ValueError("manager sidecar governance URL must be loopback")
+    if project == "aming-claw":
+        if url not in {"http://127.0.0.1:40008", "http://localhost:40008"}:
+            raise ValueError("AC manager sidecar is bound to dev governance port 40008")
+        if root.is_symlink():
+            raise ValueError("AC manager sidecar storage root cannot be a symlink")
+        return {"project_id": project, "plane": "dev", "governance_url": url,
+                "storage_root": str(root), "sidecar_port": AC_DEV_MANAGER_HTTP_PORT}
+    if parsed.port != 40000:
+        raise ValueError("stable manager sidecar is bound to governance port 40000")
+    return {"project_id": project, "plane": "stable", "governance_url": url,
+            "storage_root": str(root), "sidecar_port": MANAGER_HTTP_PORT}
 
 
 def _profile_auth_controller():
@@ -864,6 +890,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                 "service": "manager_http_server",
                 "runtime_version": runtime_version,
                 **_runtime_checkout_branch_state(),
+                "manager_identity": getattr(self.server, "manager_identity", {}),
             })
             return
         self._send_json({"ok": False, "detail": "Not found"}, 404)
@@ -1147,19 +1174,31 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
 def create_server(
     host: str = MANAGER_HTTP_HOST,
     port: int = MANAGER_HTTP_PORT,
+    *,
+    project_id: str = "proj",
+    governance_url: str = "http://127.0.0.1:40000",
+    storage_root: str = "",
 ) -> ThreadingHTTPServer:
-    """Create a ThreadingHTTPServer bound to host:port."""
+    """Create a sidecar bound to one project-plane custody identity."""
+    if not storage_root:
+        storage_root = os.getenv("SHARED_VOLUME_PATH", str(_project_root() / "shared-volume"))
+    identity = plane_bound_manager_identity(project_id, governance_url, storage_root)
+    if int(port) not in {0, int(identity["sidecar_port"])}:
+        raise ValueError("manager sidecar port does not match its project-plane identity")
     server = ThreadingHTTPServer((host, port), ManagerHTTPHandler)
+    server.manager_identity = identity
     return server
 
 
-def run_server(host: str = MANAGER_HTTP_HOST, port: int = MANAGER_HTTP_PORT) -> None:
+def run_server(host: str = MANAGER_HTTP_HOST, port: int = MANAGER_HTTP_PORT, *,
+               project_id: str, governance_url: str, storage_root: str) -> None:
     """Run the HTTP server (blocking). Intended to be called from a thread.
 
-    Contract: service_manager.py imports and calls this function from its
-    sidecar thread. Signature must remain (host, port) -> None.
+    The caller must supply the same explicit project, governance listener, and
+    storage root that launched the manager; there is no host-global sidecar.
     """
-    server = create_server(host, port)
+    server = create_server(host, port, project_id=project_id,
+                           governance_url=governance_url, storage_root=storage_root)
     log.info("manager_http_server: starting on %s:%d", host, port)
     try:
         server.serve_forever()
@@ -1175,4 +1214,4 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
     )
-    run_server()
+    raise SystemExit("manager_http_server must be launched by a plane-bound ServiceManager")

@@ -11,6 +11,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
@@ -85,6 +87,19 @@ def test_executor_target_returns_404():
     assert status == 404
     assert body["ok"] is False
     assert body["error_code"] == "UNKNOWN_TARGET"
+
+
+def test_sidecar_rejects_cross_plane_port_and_reports_bound_identity(tmp_path):
+    with patch.object(manager_http_server, "_project_root", return_value=tmp_path):
+        with _running_manager() as base:
+            with urllib.request.urlopen(f"{base}/api/manager/health") as response:
+                body = json.loads(response.read().decode("utf-8"))
+    assert body["manager_identity"]["plane"] == "stable"
+    with pytest.raises(ValueError, match="port"):
+        manager_http_server.create_server(
+            "127.0.0.1", 40101, project_id="aming-claw",
+            governance_url="http://127.0.0.1:40008", storage_root=str(tmp_path / "dev"),
+        )
 
 
 def test_respawn_executor_writes_restart_signal(tmp_path):

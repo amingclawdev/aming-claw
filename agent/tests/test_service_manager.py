@@ -21,6 +21,7 @@ from service_manager import (  # noqa: E402
     ServiceManager,
     get_manager,
     _install_signal_handlers,
+    _plane_bound_manager_identity,
     _world_bound_governance_url,
 )
 
@@ -653,6 +654,16 @@ def test_ac_service_manager_is_world_bound_to_dev_40008(monkeypatch, tmp_path):
         _world_bound_governance_url("aming_claw", "http://127.0.0.1:40008")
     with pytest.raises(ValueError):
         _world_bound_governance_url("content-sys", "http://127.0.0.1:40008")
+
+
+def test_manager_identity_keeps_ac_dev_sidecar_and_storage_disjoint(monkeypatch, tmp_path):
+    dev_root = tmp_path / "dev-world"
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
+    dev = _plane_bound_manager_identity("aming-claw", "http://127.0.0.1:40008")
+    stable = _plane_bound_manager_identity("proj", "http://127.0.0.1:40000", str(tmp_path / "stable"))
+    assert (dev["plane"], dev["sidecar_port"], dev["storage_root"]) == ("dev", 40109, str(dev_root.absolute()))
+    assert (stable["plane"], stable["sidecar_port"]) == ("stable", 40101)
+    assert dev["storage_root"] != stable["storage_root"]
 
 
 def test_managed_service_manager_verifies_and_passes_session_token_only_by_env(

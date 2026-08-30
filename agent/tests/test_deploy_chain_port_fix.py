@@ -25,6 +25,17 @@ def test_port_40101_present_in_deploy_chain():
     assert "localhost:40101" in text, "Expected localhost:40101 in deploy_chain.py"
 
 
+def test_plane_bound_endpoint_selection_keeps_ac_off_stable_sidecar():
+    from agent.deploy_chain import _plane_bound_endpoints
+
+    assert _plane_bound_endpoints("proj") == (
+        "http://127.0.0.1:40000", "http://localhost:40101"
+    )
+    assert _plane_bound_endpoints("aming-claw") == (
+        "http://127.0.0.1:40008", "http://127.0.0.1:40109"
+    )
+
+
 def test_port_40200_absent_in_deploy_chain():
     """AC0: grep 'localhost:40200' returns 0 matches."""
     src = Path(__file__).resolve().parent.parent / "deploy_chain.py"

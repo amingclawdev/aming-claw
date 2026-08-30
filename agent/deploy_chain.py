@@ -25,6 +25,10 @@ from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+_STABLE_GOVERNANCE_URL = "http://127.0.0.1:40000"
+_STABLE_MANAGER_URL = "http://localhost:40101"
+_AC_DEV_GOVERNANCE_URL = "http://127.0.0.1:40008"
+_AC_DEV_MANAGER_URL = "http://127.0.0.1:40109"
 
 # ---------------------------------------------------------------------------
 # Path bootstrap so we can import utils regardless of CWD
@@ -44,6 +48,18 @@ def _state_dir() -> Path:
     d = tasks_root() / "state"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _plane_bound_endpoints(project_id: str) -> tuple[str, str]:
+    """Return the governance and manager endpoints for one project plane.
+
+    AC is the only dev-world project.  It must never fall through to the
+    stable manager sidecar, because that sidecar has different DB and process
+    custody.
+    """
+    if str(project_id or "").strip() == "aming-claw":
+        return (_AC_DEV_GOVERNANCE_URL, _AC_DEV_MANAGER_URL)
+    return (_STABLE_GOVERNANCE_URL, _STABLE_MANAGER_URL)
 
 
 def _matches_any(path: str, patterns: list[str]) -> bool:
@@ -604,7 +620,7 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _post_redeploy(target: str, task_id: str = "", expected_head: str = "",
-                   drain_grace_seconds: int = 5) -> dict[str, Any]:
+                   drain_grace_seconds: int = 5, project_id: str = "") -> dict[str, Any]:
     """POST to the governance redeploy endpoint for a target service.
 
     Returns the JSON response dict, or an error dict on failure.
@@ -612,7 +628,8 @@ def _post_redeploy(target: str, task_id: str = "", expected_head: str = "",
     import urllib.request
     import urllib.error
 
-    url = f"http://localhost:40000/api/governance/redeploy/{target}"
+    governance_url, _manager_url = _plane_bound_endpoints(project_id)
+    url = f"{governance_url}/api/governance/redeploy/{target}"
     payload = json.dumps({
         "task_id": task_id,
         "expected_head": expected_head,
@@ -638,12 +655,15 @@ def _post_redeploy(target: str, task_id: str = "", expected_head: str = "",
 
 
 def _post_manager_redeploy_governance(task_id: str = "", expected_head: str = "",
-                                      drain_grace_seconds: int = 5) -> dict[str, Any]:
+                                      drain_grace_seconds: int = 5, project_id: str = "") -> dict[str, Any]:
     """POST to /api/manager/redeploy/governance (PR-1 service_manager endpoint)."""
     import urllib.request
     import urllib.error
 
-    url = "http://localhost:40101/api/manager/redeploy/governance"
+    # Stable sidecar remains localhost:40101; AC selects its separate :40109
+    # sidecar through the project-plane resolver.
+    _governance_url, manager_url = _plane_bound_endpoints(project_id)
+    url = f"{manager_url}/api/manager/redeploy/governance"
     # observer-hotfix: manager_http_server reads body.get("chain_version") not "expected_head".
     # Send both names for compat; manager picks chain_version, future PR3 can rename.
     payload = json.dumps({
@@ -740,8 +760,8 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
             _cv = expected_head or ""
             _hdr = {"Content-Type": "application/json"}
             _payload = json.dumps({"task_id": task_id, "chain_version": _cv}).encode()
-            gov_url = f"http://localhost:40000/api/governance/redeploy-after-merge/{_pid}"
-            sm_url = "http://localhost:40101"
+            plane_governance_url, sm_url = _plane_bound_endpoints(_pid)
+            gov_url = f"{plane_governance_url}/api/governance/redeploy-after-merge/{_pid}"
             ok = True
             summary_parts: list[str] = []
             for label, url in [("gov-ack", gov_url),
@@ -766,7 +786,7 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
             # [redeploy] POST to redeploy endpoint
             redeploy_result = _post_redeploy(
                 "executor", task_id=task_id,
-                expected_head=expected_head,
+                expected_head=expected_head, **({"project_id": project_id} if project_id else {}),
             )
             log.info("[redeploy] executor: %s", redeploy_result)
 
@@ -796,7 +816,7 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
             # [redeploy] POST to redeploy endpoint
             redeploy_result = _post_redeploy(
                 "gateway", task_id=task_id,
-                expected_head=expected_head,
+                expected_head=expected_head, **({"project_id": project_id} if project_id else {}),
             )
             log.info("[redeploy] gateway: %s", redeploy_result)
 
@@ -815,7 +835,7 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         if "service_manager" in affected:
             redeploy_result = _post_redeploy(
                 "service_manager", task_id=task_id,
-                expected_head=expected_head,
+                expected_head=expected_head, **({"project_id": project_id} if project_id else {}),
             )
             log.info("[redeploy] service_manager: %s", redeploy_result)
             steps["service_manager"] = {
