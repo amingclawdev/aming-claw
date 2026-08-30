@@ -225,7 +225,7 @@ class TestRestartExecutorWritesSignal:
         mock_state_dir.return_value = tmp_path
 
         with caplog.at_level(logging.INFO, logger="agent.deploy_chain"):
-            result = restart_executor()
+            result = restart_executor("proj")
 
         assert result is True
 

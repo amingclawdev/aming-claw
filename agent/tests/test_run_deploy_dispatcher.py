@@ -83,7 +83,7 @@ class TestDispatchExecutorOnly:
         assert "executor" in report["affected_services"]
         # Redeploy was called for executor
         mock_redeploy.assert_called_once_with(
-            "executor", task_id="t1", expected_head="abc",
+            "executor", project_id="aming-claw", task_id="t1", expected_head="abc",
         )
         mock_legacy.assert_not_called()
         mock_mark.assert_not_called()
@@ -190,7 +190,7 @@ class TestDispatchGatewayOnly:
 
         assert "gateway" in report["affected_services"]
         mock_redeploy.assert_called_once_with(
-            "gateway", task_id="t1", expected_head="abc",
+            "gateway", project_id="aming-claw", task_id="t1", expected_head="abc",
         )
         mock_legacy.assert_called_once()
 

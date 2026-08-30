@@ -41,7 +41,7 @@ class TestNonGatewayDeployNotApplicable(unittest.TestCase):
         with mock.patch("deploy_chain.subprocess"), \
              mock.patch("requests.get", return_value=mock.Mock(status_code=200)), \
              mock.patch("time.sleep"):
-            result = smoke_test(affected_services=["governance"])
+            result = smoke_test(affected_services=["governance"], project_id="proj")
 
         self.assertEqual(result["gateway"], "not_applicable")
         self.assertEqual(result["executor"], "not_applicable")
@@ -64,7 +64,7 @@ class TestNonGatewayDeployNotApplicable(unittest.TestCase):
              mock.patch("deploy_chain.urllib.request.urlopen", return_value=_urlopen_ok()), \
              mock.patch("deploy_chain.smoke_test", return_value=fake_smoke), \
              mock.patch("deploy_chain._save_report"):
-            report = run_deploy(["agent/governance/server.py"])
+            report = run_deploy(["agent/governance/server.py"], project_id="proj")
 
         self.assertTrue(report["success"])
         self.assertEqual(report["smoke_test"]["gateway"], "not_applicable")
@@ -77,7 +77,7 @@ class TestNonGatewayDeployNotApplicable(unittest.TestCase):
         with mock.patch("deploy_chain.subprocess"), \
              mock.patch("requests.get", return_value=mock.Mock(status_code=200)), \
              mock.patch("time.sleep"):
-            result = smoke_test(affected_services=["executor"])
+            result = smoke_test(affected_services=["executor"], project_id="proj")
 
         # gateway must be 'not_applicable', never False
         self.assertEqual(result["gateway"], "not_applicable")
@@ -111,7 +111,7 @@ class TestSuccessAllPassCoherence(unittest.TestCase):
              mock.patch("deploy_chain.urllib.request.urlopen", side_effect=RuntimeError("redeploy fail")), \
              mock.patch("deploy_chain.smoke_test", return_value=fake_smoke), \
              mock.patch("deploy_chain._save_report"):
-            report = run_deploy(["agent/telegram_gateway/bot.py"])
+            report = run_deploy(["agent/telegram_gateway/bot.py"], project_id="proj")
 
         self.assertFalse(report["success"],
                          "success=True with all_pass=False is impossible")
@@ -144,7 +144,7 @@ class TestSuccessAllPassCoherence(unittest.TestCase):
              mock.patch("deploy_chain.urllib.request.urlopen", side_effect=RuntimeError("redeploy fail")), \
              mock.patch("deploy_chain.smoke_test", return_value=fake_smoke), \
              mock.patch("deploy_chain._save_report"):
-            report = run_deploy(["agent/governance/server.py"])
+            report = run_deploy(["agent/governance/server.py"], project_id="proj")
         self.assertFalse(report["success"],
                          "success must be False when a step fails")
 
@@ -239,7 +239,7 @@ class TestGatewayDeployFullParticipation(unittest.TestCase):
              mock.patch("requests.get", return_value=mock.Mock(status_code=200)), \
              mock.patch("time.sleep"):
             mock_sp.run.return_value = mock.Mock(stdout="true\n", returncode=0)
-            result = smoke_test(affected_services=["executor", "governance", "gateway"])
+            result = smoke_test(affected_services=["executor", "governance", "gateway"], project_id="proj")
 
         # gateway must be a bool, not 'not_applicable'
         self.assertIsInstance(result["gateway"], bool)
@@ -254,7 +254,7 @@ class TestGatewayDeployFullParticipation(unittest.TestCase):
              mock.patch("requests.get", return_value=mock.Mock(status_code=200)), \
              mock.patch("time.sleep"):
             mock_sp.run.return_value = mock.Mock(stdout="false\n", returncode=0)
-            result = smoke_test(affected_services=["executor", "governance", "gateway"])
+            result = smoke_test(affected_services=["executor", "governance", "gateway"], project_id="proj")
 
         self.assertFalse(result["gateway"])
         self.assertFalse(result["all_pass"])

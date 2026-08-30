@@ -59,7 +59,13 @@ def _plane_bound_endpoints(project_id: str) -> tuple[str, str]:
     stable manager sidecar, because that sidecar has different DB and process
     custody.
     """
-    raw = str(project_id or "").strip()
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError("deploy operations require an explicit nonempty project_id")
+    raw = project_id
+    if raw != raw.strip():
+        raise ValueError("deploy project_id must not contain surrounding whitespace")
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", raw):
+        raise ValueError("deploy project_id must be an exact canonical key")
     normalized = re.sub(r"[-_\s]+", "-", raw).strip("-").lower()
     if normalized == "aming-claw" and raw != "aming-claw":
         raise ValueError("AC deploy consumers require exact canonical project_id=aming-claw")
@@ -158,13 +164,22 @@ def detect_affected_services(changed_files: list[str], project_id: str = "") -> 
 # 2. restart_executor
 # ---------------------------------------------------------------------------
 
-def restart_executor() -> bool:
+def restart_executor(project_id: str) -> bool:
     """Write state/manager_signal.json with action='restart'.
 
     Returns True on success, False if an exception occurred.
     """
-    try:
+    _plane_bound_endpoints(project_id)
+    if project_id == "aming-claw":
+        dev_root = os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT", "")
+        if not dev_root:
+            raise ValueError("AC executor restart requires explicit dev storage root")
+        signal_path = Path(dev_root).absolute() / "runtime" / "manager_signal.json"
+    else:
         signal_path = _state_dir() / "manager_signal.json"
+    try:
+        if project_id == "aming-claw":
+            signal_path.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
             "action": "restart",
             "requested_at": utc_iso(),
@@ -194,7 +209,7 @@ def _is_host_runtime_mode() -> bool:
     return not compose_file.exists()
 
 
-def rebuild_governance(project_id: str = "") -> tuple[bool, str]:
+def rebuild_governance(project_id: str) -> tuple[bool, str]:
     """Rebuild + restart governance Docker container, then health-check.
 
     Uses docker compose build + up directly (Windows-compatible).
@@ -473,12 +488,15 @@ def restart_local_governance(port: int = 40000) -> tuple[bool, str]:
 # 4. restart_gateway
 # ---------------------------------------------------------------------------
 
-def restart_gateway() -> tuple[bool, str]:
+def restart_gateway(project_id: str) -> tuple[bool, str]:
     """Rebuild + restart telegram-gateway Docker container, then verify via logs.
 
     Uses build + up (not just restart) to ensure latest code is deployed.
     Returns (success, output_summary).
     """
+    _plane_bound_endpoints(project_id)
+    if project_id == "aming-claw":
+        return False, "AC dev gateway cannot use stable Docker"
     compose_file = (
         Path(__file__).resolve().parent.parent / "docker-compose.governance.yml"
     )
@@ -560,7 +578,7 @@ def restart_gateway() -> tuple[bool, str]:
 # 5. smoke_test
 # ---------------------------------------------------------------------------
 
-def smoke_test(affected_services: list[str] | None = None, project_id: str = "") -> dict[str, Any]:
+def smoke_test(affected_services: list[str] | None, project_id: str) -> dict[str, Any]:
     """Quick health check for executor, governance, and gateway.
 
     Parameters
@@ -633,8 +651,8 @@ def smoke_test(affected_services: list[str] | None = None, project_id: str = "")
 # 6. run_deploy
 # ---------------------------------------------------------------------------
 
-def _post_redeploy(target: str, task_id: str = "", expected_head: str = "",
-                   drain_grace_seconds: int = 5, project_id: str = "") -> dict[str, Any]:
+def _post_redeploy(target: str, project_id: str, task_id: str = "", expected_head: str = "",
+                   drain_grace_seconds: int = 5) -> dict[str, Any]:
     """POST to the governance redeploy endpoint for a target service.
 
     Returns the JSON response dict, or an error dict on failure.
@@ -668,8 +686,8 @@ def _post_redeploy(target: str, task_id: str = "", expected_head: str = "",
         return {"ok": False, "error": str(exc)}
 
 
-def _post_manager_redeploy_governance(task_id: str = "", expected_head: str = "",
-                                      drain_grace_seconds: int = 5, project_id: str = "") -> dict[str, Any]:
+def _post_manager_redeploy_governance(project_id: str, task_id: str = "", expected_head: str = "",
+                                      drain_grace_seconds: int = 5) -> dict[str, Any]:
     """POST to /api/manager/redeploy/governance (PR-1 service_manager endpoint)."""
     import urllib.request
     import urllib.error
@@ -705,7 +723,7 @@ def _post_manager_redeploy_governance(task_id: str = "", expected_head: str = ""
         return {"ok": False, "error": str(exc)}
 
 
-def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
+def run_deploy(changed_files: list[str], project_id: str, chat_id: int = 0,
                skip_services: list[str] = None,
                task_id: str = "", expected_head: str = "") -> dict[str, Any]:
     """Full deploy orchestration with double-write (legacy + redeploy).
@@ -723,6 +741,7 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
 
     Returns a full report dict.
     """
+    _plane_bound_endpoints(project_id)
     started_at = utc_iso()
     report: dict[str, Any] = {
         "started_at": started_at,
@@ -770,7 +789,7 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
 
         # R7: Event-driven governance restart — executor orchestrates 3 POSTs
         if "governance" in affected:
-            _pid = project_id or "aming-claw"
+            _pid = project_id
             _cv = expected_head or ""
             _hdr = {"Content-Type": "application/json"}
             _payload = json.dumps({"task_id": task_id, "chain_version": _cv}).encode()
@@ -799,8 +818,8 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         if "executor" in affected:
             # [redeploy] POST to redeploy endpoint
             redeploy_result = _post_redeploy(
-                "executor", task_id=task_id,
-                expected_head=expected_head, **({"project_id": project_id} if project_id else {}),
+                "executor", project_id=project_id, task_id=task_id,
+                expected_head=expected_head,
             )
             log.info("[redeploy] executor: %s", redeploy_result)
 
@@ -829,13 +848,13 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         if "gateway" in affected:
             # [redeploy] POST to redeploy endpoint
             redeploy_result = _post_redeploy(
-                "gateway", task_id=task_id,
-                expected_head=expected_head, **({"project_id": project_id} if project_id else {}),
+                "gateway", project_id=project_id, task_id=task_id,
+                expected_head=expected_head,
             )
             log.info("[redeploy] gateway: %s", redeploy_result)
 
             # [legacy] existing restart path
-            ok, summary = restart_gateway()
+            ok, summary = restart_gateway(project_id)
             log.info("[legacy] gateway: success=%s", ok)
 
             steps["gateway"] = {
@@ -848,8 +867,8 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         # R9: For service_manager, governance performs restart via redeploy endpoint
         if "service_manager" in affected:
             redeploy_result = _post_redeploy(
-                "service_manager", task_id=task_id,
-                expected_head=expected_head, **({"project_id": project_id} if project_id else {}),
+                "service_manager", project_id=project_id, task_id=task_id,
+                expected_head=expected_head,
             )
             log.info("[redeploy] service_manager: %s", redeploy_result)
             steps["service_manager"] = {
@@ -860,10 +879,7 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         report["steps"] = steps
 
         # 3. Smoke test — only check affected services (R5)
-        smoke = smoke_test(
-            affected_services=affected,
-            **({"project_id": project_id} if project_id else {}),
-        )
+        smoke = smoke_test(affected_services=affected, project_id=project_id)
         report["smoke_test"] = smoke
 
         # R2: Single derivation — success = all steps OK AND smoke_test.all_pass
@@ -896,9 +912,8 @@ def _mark_task_succeeded_pre_kill(task_id: str, project_id: str) -> None:
     import urllib.request
     import urllib.error
 
-    canonical_project = str(project_id or "proj").strip()
-    governance_url, _manager_url = _plane_bound_endpoints(canonical_project)
-    url = f"{governance_url}/api/task/{canonical_project}/complete"
+    governance_url, _manager_url = _plane_bound_endpoints(project_id)
+    url = f"{governance_url}/api/task/{project_id}/complete"
     payload = json.dumps({
         "task_id": task_id,
         "status": "succeeded",

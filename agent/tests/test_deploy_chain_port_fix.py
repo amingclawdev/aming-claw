@@ -70,6 +70,33 @@ def test_noncanonical_ac_project_fails_closed_instead_of_selecting_stable():
         _plane_bound_endpoints("aming_claw")
 
 
+@pytest.mark.parametrize("project_id", ["", " ", " aming-claw", "aming-claw ", "amingClaw", "aming_claw"])
+def test_invalid_project_id_is_rejected_before_deploy_effects(monkeypatch, project_id):
+    import agent.deploy_chain as deploy
+
+    touched = []
+    monkeypatch.setattr(deploy, "detect_affected_services", lambda *_args, **_kwargs: touched.append("detect"))
+    monkeypatch.setattr(deploy, "_save_report", lambda *_args, **_kwargs: touched.append("write"))
+    with pytest.raises(ValueError):
+        deploy.run_deploy(["agent/governance/server.py"], project_id=project_id)
+    assert touched == []
+
+
+def test_exact_ac_and_non_ac_ids_select_only_their_own_plane():
+    from agent.deploy_chain import _plane_bound_endpoints
+
+    assert _plane_bound_endpoints("proj")[0].endswith(":40000")
+    assert _plane_bound_endpoints("aming-claw")[0].endswith(":40008")
+
+
+def test_ac_restart_requires_dev_storage_before_writing(monkeypatch):
+    import agent.deploy_chain as deploy
+
+    monkeypatch.delenv("AMING_CLAW_DEV_STORAGE_ROOT", raising=False)
+    with pytest.raises(ValueError, match="dev storage"):
+        deploy.restart_executor("aming-claw")
+
+
 def test_port_40200_absent_in_deploy_chain():
     """AC0: grep 'localhost:40200' returns 0 matches."""
     src = Path(__file__).resolve().parent.parent / "deploy_chain.py"
@@ -114,6 +141,7 @@ def test_governance_before_executor_ordering(
     from agent.deploy_chain import run_deploy
     report = run_deploy(
         changed_files=["agent/governance/server.py", "agent/executor.py"],
+        project_id="proj",
         task_id="test-task",
         expected_head="abc123",
     )
@@ -127,7 +155,7 @@ def test_governance_before_executor_ordering(
 
     # Executor redeploy must have been called
     mock_post_redeploy.assert_called_once_with(
-        "executor", task_id="test-task", expected_head="abc123",
+        "executor", project_id="proj", task_id="test-task", expected_head="abc123",
     )
 
     # The URL list above verifies the governance event-driven order; executor
@@ -170,6 +198,7 @@ def test_governance_before_executor_call_order(
     from agent.deploy_chain import run_deploy
     run_deploy(
         changed_files=["agent/governance/server.py", "agent/executor.py"],
+        project_id="proj",
         task_id="test-task",
         expected_head="abc123",
     )
