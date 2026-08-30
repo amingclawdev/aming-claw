@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import subprocess
 from unittest.mock import MagicMock, patch
 
 agent_dir = os.path.join(os.path.dirname(__file__), "..")
@@ -18,11 +19,31 @@ def _ac_worker(workspace):
         return ExecutorWorker("aming-claw", governance_url="http://127.0.0.1:40008", workspace=workspace)
 
 
+def _git(cmd, cwd):
+    return subprocess.run(["git", *cmd], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _repo_with_worktree(tmpdir, name="worker"):
+    repo = os.path.join(tmpdir, "repo")
+    os.makedirs(repo)
+    _git(["init"], repo)
+    _git(["config", "user.email", "test@example.invalid"], repo)
+    _git(["config", "user.name", "Test"], repo)
+    with open(os.path.join(repo, "README"), "w", encoding="utf-8") as handle:
+        handle.write("base\n")
+    _git(["add", "README"], repo)
+    _git(["commit", "-m", "base"], repo)
+    worktree = os.path.join(repo, ".worktrees", name)
+    os.makedirs(os.path.dirname(worktree), exist_ok=True)
+    _git(["worktree", "add", "-b", f"test/{name}", worktree, "HEAD"], repo)
+    return repo, os.path.realpath(worktree)
+
+
 class TestDevWorktreeRound3(unittest.TestCase):
     def test_dev_session_uses_worktree_workspace(self):
-        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory(dir=repo) as worktree:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo, worktree = _repo_with_worktree(tmpdir)
             worker = _ac_worker(repo)
-            worktree = os.path.realpath(worktree)
             worker._register_task_worktree("task-dev-1", worktree)
             fake_session = MagicMock(pid=123, status="completed", stderr="", session_id="sess-1")
             fake_session.stdout = '{"schema_version":"v1","summary":"ok","changed_files":[]}'
@@ -35,10 +56,19 @@ class TestDevWorktreeRound3(unittest.TestCase):
                 "task_id": "task-dev-1", "type": "dev", "prompt": "Implement change",
                 "metadata": {"target_files": ["agent/executor_worker.py"]},
             }
+            real_run = subprocess.run
+
+            def _run(cmd, **kwargs):
+                # Identity revalidation is intentionally real; only the
+                # following staging effect is a spy in this unit test.
+                if cmd[:2] == ["git", "rev-parse"]:
+                    return real_run(cmd, **kwargs)
+                return MagicMock(returncode=0, stdout="", stderr="")
+
             with patch.object(worker, "_create_worktree", return_value=(worktree, "dev/task-dev-1")), \
                  patch.object(worker, "_build_prompt", return_value="prompt"), \
                  patch.object(worker, "_get_git_changed_files", return_value=["agent/executor_worker.py"]), \
-                 patch.object(worker, "_write_memory"), patch("subprocess.run") as mock_run:
+                 patch.object(worker, "_write_memory"), patch("subprocess.run", side_effect=_run) as mock_run:
                 result = worker._execute_task(task)
 
             self.assertEqual(result["status"], "succeeded")
@@ -78,40 +108,48 @@ class TestDevWorktreeRound3(unittest.TestCase):
             self.assertEqual(len(files), 3)
 
     def test_create_worktree_uses_attempt_scoped_path_for_retry(self):
-        with tempfile.TemporaryDirectory() as repo:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo, _ = _repo_with_worktree(tmpdir)
             worker = _ac_worker(repo)
-            ok = MagicMock(returncode=0, stdout="", stderr="")
-
-            def _run(cmd, **kwargs):
-                if cmd[:3] == ["git", "worktree", "add"]:
-                    os.makedirs(cmd[-2], exist_ok=True)
-                return ok
-            with patch("subprocess.run", side_effect=_run) as mock_run:
-                worktree_path, branch_name = worker._create_worktree("task-abc", attempt_num=2)
+            worktree_path, branch_name = worker._create_worktree("task-abc", attempt_num=2)
 
             self.assertEqual(branch_name, "dev/task-abc-attempt-2")
             self.assertEqual(
                 worktree_path,
                 os.path.realpath(os.path.join(repo, ".worktrees", "dev-task-abc-attempt-2")),
             )
-            add_cmd = mock_run.call_args_list[1].args[0]
-            self.assertEqual(add_cmd[:5], ["git", "worktree", "add", "-b", "dev/task-abc-attempt-2"])
-            self.assertEqual(os.path.realpath(add_cmd[5]), worktree_path)
+            self.assertTrue(os.path.isdir(worktree_path))
+            self.assertEqual(_git(["rev-parse", "--show-toplevel"], worktree_path).stdout.strip(), worktree_path)
 
     def test_create_worktree_keeps_first_attempt_names(self):
-        with tempfile.TemporaryDirectory() as repo:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo, _ = _repo_with_worktree(tmpdir)
             worker = _ac_worker(repo)
-            ok = MagicMock(returncode=0, stdout="", stderr="")
-
-            def _run(cmd, **kwargs):
-                if cmd[:3] == ["git", "worktree", "add"]:
-                    os.makedirs(cmd[-2], exist_ok=True)
-                return ok
-            with patch("subprocess.run", side_effect=_run):
-                worktree_path, branch_name = worker._create_worktree("task-abc", attempt_num=1)
+            worktree_path, branch_name = worker._create_worktree("task-abc", attempt_num=1)
 
             self.assertEqual(branch_name, "dev/task-abc")
             self.assertEqual(worktree_path, os.path.realpath(os.path.join(repo, ".worktrees", "dev-task-abc")))
+
+    def test_child_handoff_requires_registered_parent_and_exact_git_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo, worktree = _repo_with_worktree(tmpdir)
+            worker = _ac_worker(repo)
+            worker._register_task_worktree("dev-root", worktree)
+
+            self.assertEqual(
+                worker._handoff_task_worktree("dev-root", "qa-child", worktree), worktree
+            )
+            self.assertEqual(worker._validated_task_worktree("qa-child", worktree), worktree)
+            with self.assertRaisesRegex(ValueError, "parent task"):
+                worker._handoff_task_worktree("missing", "test-child", worktree)
+            with self.assertRaisesRegex(ValueError, "claim"):
+                worker._handoff_task_worktree("dev-root", "wrong-child", repo)
+
+    def test_registration_rejects_non_git_directory(self):
+        with tempfile.TemporaryDirectory() as repo:
+            worker = _ac_worker(repo)
+            with self.assertRaisesRegex(ValueError, "Git"):
+                worker._register_task_worktree("task-no-git", repo)
 
 
 if __name__ == "__main__":

@@ -47,8 +47,9 @@ if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
 from agent.runtime_plane import (
-    WorkspaceIdentity, bind_workspace_identity, resolve_runtime_plane,
-    validate_current_workspace_identity,
+    GitWorktreeIdentity, WorkspaceIdentity, bind_git_worktree_identity,
+    bind_workspace_identity, resolve_runtime_plane,
+    validate_current_git_worktree_identity, validate_current_workspace_identity,
 )
 
 log = logging.getLogger("executor_worker")
@@ -414,7 +415,9 @@ class ExecutorWorker:
         self.base_url = _world_bound_governance_url(project_id, governance_url)
         self.worker_id = worker_id
         self.workspace = self.workspace_identity.root
-        self._task_worktrees: Dict[str, WorkspaceIdentity] = {}
+        # task id -> immutable Git identity.  Children may only receive the
+        # exact registered identity of their logical root task.
+        self._task_worktrees: Dict[str, GitWorktreeIdentity] = {}
         self.log_root = _world_bound_log_root(self.project_id, self.workspace)
         self._session_token = str(
             os.getenv(EXECUTOR_SESSION_TOKEN_ENV, "")
@@ -432,22 +435,50 @@ class ExecutorWorker:
     def _validated_workspace(self) -> str:
         return validate_current_workspace_identity(self.workspace_identity).root
 
-    def _register_task_worktree(self, task_id: str, worktree_path: str) -> str:
-        worktree = bind_workspace_identity(worktree_path)
+    def _register_task_worktree(self, task_id: str, worktree_path: str,
+                                logical_task_id: str = "") -> str:
+        """Register a newly materialized Git worktree for one logical task."""
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task id is required for worktree registration")
+        logical_task_id = logical_task_id or task_id
+        worktree = bind_git_worktree_identity(worktree_path, logical_task_id)
         root = Path(self._validated_workspace())
-        if not Path(worktree.root).is_relative_to(root):
+        if not Path(worktree.workspace.root).is_relative_to(root):
             raise ValueError("task worktree escapes executor workspace")
+        existing = self._task_worktrees.get(task_id)
+        if existing is not None and existing != worktree:
+            raise ValueError("task already has a different registered worktree identity")
         self._task_worktrees[task_id] = worktree
-        return worktree.root
+        return worktree.workspace.root
+
+    def _handoff_task_worktree(self, parent_task_id: str, task_id: str,
+                               candidate: str) -> str:
+        """Bind a child to its parent's live immutable worktree identity.
+
+        Metadata paths are merely untrusted routing claims.  The parent must
+        already be registered in this executor and the claimed path must match
+        the live physical and Git facts before the child receives authority.
+        """
+        parent = self._task_worktrees.get(parent_task_id)
+        if parent is None:
+            raise ValueError("parent task has no registered worktree identity")
+        if candidate != parent.workspace.root:
+            raise ValueError("child worktree claim does not match parent identity")
+        validate_current_git_worktree_identity(parent)
+        existing = self._task_worktrees.get(task_id)
+        if existing is not None and existing != parent:
+            raise ValueError("child task already has a different worktree identity")
+        self._task_worktrees[task_id] = parent
+        return parent.workspace.root
 
     def _validated_task_worktree(self, task_id: str, candidate: str) -> str:
         worktree = self._task_worktrees.get(task_id)
-        if worktree is None or candidate != worktree.root:
+        if worktree is None or candidate != worktree.workspace.root:
             raise ValueError("task has no bound worktree identity")
-        validate_current_workspace_identity(worktree)
-        if not Path(worktree.root).is_relative_to(Path(self._validated_workspace())):
+        validate_current_git_worktree_identity(worktree)
+        if not Path(worktree.workspace.root).is_relative_to(Path(self._validated_workspace())):
             raise ValueError("task worktree escapes executor workspace")
-        return worktree.root
+        return worktree.workspace.root
 
     def _api(self, method: str, path: str, data: dict = None, timeout: Optional[int] = None) -> dict:
         """Call governance API. Short timeouts to avoid MCP IO deadlock."""
@@ -632,6 +663,10 @@ class ExecutorWorker:
             inherited_worktree = metadata.get("_worktree", "")
             inherited_branch = metadata.get("_branch", "")
             if inherited_worktree:
+                parent_task_id = metadata.get("parent_task_id", "")
+                if not parent_task_id:
+                    raise ValueError("child worktree handoff requires parent_task_id")
+                self._handoff_task_worktree(parent_task_id, task_id, inherited_worktree)
                 execution_workspace = self._validated_task_worktree(task_id, inherited_worktree)
                 worktree_path = inherited_worktree
                 branch_name = inherited_branch
@@ -896,6 +931,10 @@ class ExecutorWorker:
         execution_workspace = self._validated_workspace()
         inherited_worktree = metadata.get("_worktree", "")
         if inherited_worktree:
+            parent_task_id = metadata.get("parent_task_id", "")
+            if not parent_task_id:
+                return {"status": "failed", "error": "child worktree handoff requires parent_task_id"}
+            self._handoff_task_worktree(parent_task_id, task_id, inherited_worktree)
             execution_workspace = self._validated_task_worktree(task_id, inherited_worktree)
 
         if _is_reconcile_cluster_without_tests(metadata):
@@ -2516,7 +2555,7 @@ class ExecutorWorker:
             pass
         finally:
             for task_id, identity in list(self._task_worktrees.items()):
-                if identity.root == worktree_path:
+                if identity.workspace.root == worktree_path:
                     self._task_worktrees.pop(task_id, None)
 
     def _create_integration_worktree(self, task_id: str, base_ref: str = "HEAD"):
