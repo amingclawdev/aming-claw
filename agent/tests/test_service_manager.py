@@ -478,7 +478,7 @@ class TestCheckRestartSignal(unittest.TestCase):
 
     def _patch_signal_path(self):
         """Return a patch that makes _signal_file_path() return our temp path."""
-        return patch("service_manager._signal_file_path", return_value=self.signal_file)
+        return patch("service_manager._identity_signal_file_path", return_value=self.signal_file)
 
     @patch("service_manager.subprocess.Popen")
     def test_restart_signal_stops_and_starts_executor(self, mock_popen):
@@ -668,10 +668,11 @@ def test_manager_plane_identity_rejects_raw_noncanonical_project_ids(project_id)
 
 def test_manager_identity_keeps_ac_dev_sidecar_and_storage_disjoint(monkeypatch, tmp_path):
     dev_root = tmp_path / "dev-world"
+    (dev_root / "runtime").mkdir(parents=True)
     monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
     dev = _plane_bound_manager_identity("aming-claw", "http://127.0.0.1:40008")
-    stable = _plane_bound_manager_identity("proj", "http://127.0.0.1:40000", str(tmp_path / "stable"))
-    assert (dev["plane"], dev["sidecar_port"], dev["storage_root"]) == ("dev", 40109, str(dev_root.absolute()))
+    stable = _plane_bound_manager_identity("proj", "http://127.0.0.1:40000")
+    assert (dev["plane"], dev["sidecar_port"], dev["storage_root"]) == ("dev", 40109, str((dev_root / "runtime").absolute()))
     assert (stable["plane"], stable["sidecar_port"]) == ("stable", 40101)
     assert dev["storage_root"] != stable["storage_root"]
 
@@ -683,7 +684,9 @@ def test_managed_service_manager_verifies_and_passes_session_token_only_by_env(
     import service_manager as sm
 
     token = "gov-service-manager-worker-token"
-    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "dev-world"))
+    dev_root = tmp_path / "dev-world"
+    (dev_root / "runtime").mkdir(parents=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
     monkeypatch.setenv("AMING_EXECUTOR_SESSION_TOKEN", token)
     monkeypatch.setattr(sm, "_shared_log_dir", lambda _project="": tmp_path / "logs")
 
@@ -718,7 +721,9 @@ def test_managed_service_manager_rejects_missing_invalid_or_wrong_project_token(
 ):
     import service_manager as sm
 
-    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "dev-world"))
+    dev_root = tmp_path / "dev-world"
+    (dev_root / "runtime").mkdir(parents=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_root))
     monkeypatch.setattr(sm, "_shared_log_dir", lambda _project="": tmp_path / "logs")
     popen = MagicMock()
     monkeypatch.setattr(sm.subprocess, "Popen", popen)

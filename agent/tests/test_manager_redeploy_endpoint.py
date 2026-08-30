@@ -71,7 +71,7 @@ class TestManagerRedeployEndpoint(unittest.TestCase):
         cls.server = create_server(
             "127.0.0.1", 0, project_id="proj",
             governance_url="http://127.0.0.1:40000",
-            storage_root="/tmp/manager-redeploy-test",
+            storage_root=str(_root / "shared-volume"),
         )  # port 0 = random available
         cls.server_address = cls.server.server_address
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -681,7 +681,7 @@ class TestRedeployEndpointRuntimeCheckout(unittest.TestCase):
         cls.server = create_server(
             "127.0.0.1", 0, project_id="proj",
             governance_url="http://127.0.0.1:40000",
-            storage_root="/tmp/manager-redeploy-test",
+            storage_root=str(_root / "shared-volume"),
         )
         cls.server_address = cls.server.server_address
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -803,7 +803,7 @@ class TestRedeployResponseCarriesProbeDerivedStatus(unittest.TestCase):
         cls.server = create_server(
             "127.0.0.1", 0, project_id="proj",
             governance_url="http://127.0.0.1:40000",
-            storage_root="/tmp/manager-redeploy-test",
+            storage_root=str(_root / "shared-volume"),
         )
         cls.server_address = cls.server.server_address
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)

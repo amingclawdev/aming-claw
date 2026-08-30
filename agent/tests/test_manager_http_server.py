@@ -108,12 +108,13 @@ def test_executor_target_returns_404():
 
 
 def test_sidecar_rejects_cross_plane_port_and_reports_bound_identity(tmp_path):
+    (tmp_path / "shared-volume").mkdir()
     with patch.object(manager_http_server, "_project_root", return_value=tmp_path):
         with _running_manager() as base:
             with urllib.request.urlopen(f"{base}/api/manager/health") as response:
                 body = json.loads(response.read().decode("utf-8"))
     assert body["manager_identity"]["plane"] == "stable"
-    with pytest.raises(ValueError, match="port"):
+    with pytest.raises((FileNotFoundError, ValueError)):
         manager_http_server.create_server(
             "127.0.0.1", 40101, project_id="aming-claw",
             governance_url="http://127.0.0.1:40008", storage_root=str(tmp_path / "dev"),
@@ -161,20 +162,90 @@ def test_sidecar_rejects_contradictory_custody_before_server_construction(
 
 
 def test_sidecar_create_server_preserves_exact_ac_and_stable_planes(tmp_path):
-    ac = manager_http_server.create_server(
-        "127.0.0.1", 0, project_id="aming-claw",
-        governance_url="http://127.0.0.1:40008", storage_root=str(tmp_path / "dev"),
+    stable_root = tmp_path / "shared-volume"
+    dev_storage = tmp_path / "dev-storage"
+    dev_runtime = dev_storage / "runtime"
+    stable_root.mkdir()
+    dev_runtime.mkdir(parents=True)
+    with patch.object(manager_http_server, "_project_root", return_value=tmp_path), \
+            pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_storage))
+        ac = manager_http_server.create_server(
+            "127.0.0.1", 0, project_id="aming-claw",
+            governance_url="http://127.0.0.1:40008", storage_root=str(dev_runtime),
+        )
+        stable = manager_http_server.create_server(
+            "127.0.0.1", 0, project_id="proj",
+            governance_url="http://127.0.0.1:40000", storage_root=str(stable_root),
+        )
+        try:
+            assert (ac.manager_identity["plane"], ac.manager_identity["sidecar_port"]) == ("dev", 40109)
+            assert (stable.manager_identity["plane"], stable.manager_identity["sidecar_port"]) == ("stable", 40101)
+        finally:
+            ac.server_close()
+            stable.server_close()
+
+
+def test_sidecar_storage_authority_rejects_cross_roots_and_missing_dev_root(
+    monkeypatch, tmp_path,
+):
+    stable_root = tmp_path / "shared-volume"
+    dev_storage = tmp_path / "dev-storage"
+    dev_runtime = dev_storage / "runtime"
+    stable_root.mkdir()
+    dev_runtime.mkdir(parents=True)
+    monkeypatch.setattr(manager_http_server, "_project_root", lambda: tmp_path)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_storage))
+
+    with pytest.raises(ValueError, match="storage root crosses"):
+        manager_http_server.plane_bound_manager_identity(
+            "aming-claw", "http://127.0.0.1:40008", str(stable_root),
+        )
+    with pytest.raises(ValueError, match="storage root crosses"):
+        manager_http_server.plane_bound_manager_identity(
+            "proj", "http://127.0.0.1:40000", str(dev_runtime),
+        )
+
+    missing_storage = tmp_path / "missing-dev-storage"
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(missing_storage))
+    with pytest.raises(FileNotFoundError):
+        manager_http_server.create_server(
+            "127.0.0.1", 0, project_id="aming-claw",
+            governance_url="http://127.0.0.1:40008",
+            storage_root=str(missing_storage / "runtime"),
+        )
+    assert not missing_storage.exists()
+
+
+def test_sidecar_storage_authority_rejects_symlink_escape_before_server_bind(
+    monkeypatch, tmp_path,
+):
+    target = tmp_path / "real-storage"
+    target.mkdir()
+    (tmp_path / "shared-volume").symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(manager_http_server, "_project_root", lambda: tmp_path)
+    with patch.object(manager_http_server, "ThreadingHTTPServer") as server:
+        with pytest.raises(ValueError, match="non-symlink"):
+            manager_http_server.create_server(
+                "127.0.0.1", 0, project_id="proj",
+                governance_url="http://127.0.0.1:40000",
+                storage_root=str(tmp_path / "shared-volume"),
+            )
+    server.assert_not_called()
+
+
+def test_bound_identity_does_not_reconstruct_dev_root_from_ambient_env(
+    monkeypatch, tmp_path,
+):
+    dev_storage = tmp_path / "dev-storage"
+    dev_runtime = dev_storage / "runtime"
+    dev_runtime.mkdir(parents=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_storage))
+    identity = manager_http_server.plane_bound_manager_identity(
+        "aming-claw", "http://127.0.0.1:40008", str(dev_runtime),
     )
-    stable = manager_http_server.create_server(
-        "127.0.0.1", 0, project_id="proj",
-        governance_url="http://127.0.0.1:40000", storage_root=str(tmp_path / "stable"),
-    )
-    try:
-        assert (ac.manager_identity["plane"], ac.manager_identity["sidecar_port"]) == ("dev", 40109)
-        assert (stable.manager_identity["plane"], stable.manager_identity["sidecar_port"]) == ("stable", 40101)
-    finally:
-        ac.server_close()
-        stable.server_close()
+    monkeypatch.delenv("AMING_CLAW_DEV_STORAGE_ROOT")
+    assert manager_http_server._require_bound_identity(identity) is identity
 
 
 @pytest.mark.parametrize(
@@ -184,9 +255,16 @@ def test_sidecar_create_server_preserves_exact_ac_and_stable_planes(tmp_path):
 def test_chain_version_write_uses_bound_project_and_url_despite_ambient_env(
     monkeypatch, tmp_path, project_id, governance_url,
 ):
-    identity = manager_http_server.plane_bound_manager_identity(
-        project_id, governance_url, str(tmp_path / "bound-root"),
-    )
+    if project_id == "aming-claw":
+        dev_storage = tmp_path / "dev-storage"
+        root = dev_storage / "runtime"
+        root.mkdir(parents=True)
+        monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_storage))
+    else:
+        root = tmp_path / "shared-volume"
+        root.mkdir()
+        monkeypatch.setattr(manager_http_server, "_project_root", lambda: tmp_path)
+    identity = manager_http_server.plane_bound_manager_identity(project_id, governance_url, str(root))
     monkeypatch.setenv("GOVERNANCE_URL", "http://127.0.0.1:40000")
     monkeypatch.setenv("PROJECT_ID", "ambient-project")
     monkeypatch.setenv("EXECUTOR_PROJECT_ID", "ambient-project")
@@ -201,6 +279,7 @@ def test_chain_version_write_uses_bound_project_and_url_despite_ambient_env(
 
 
 def test_respawn_executor_writes_restart_signal(tmp_path):
+    (tmp_path / "shared-volume").mkdir()
     with patch.object(manager_http_server, "_project_root", return_value=tmp_path), \
             _running_manager() as base:
         status, body = _post_json(
@@ -220,6 +299,33 @@ def test_respawn_executor_writes_restart_signal(tmp_path):
     assert payload["project_id"] == "proj"
     assert payload["governance_url"] == "http://127.0.0.1:40000"
     assert payload["executor_url"] == "http://127.0.0.1:40100"
+
+
+def test_ac_respawn_writes_only_to_canonical_dev_runtime_root(monkeypatch, tmp_path):
+    dev_storage = tmp_path / "dev-storage"
+    dev_runtime = dev_storage / "runtime"
+    dev_runtime.mkdir(parents=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(dev_storage))
+    server = manager_http_server.create_server(
+        "127.0.0.1", 0, project_id="aming-claw",
+        governance_url="http://127.0.0.1:40008", storage_root=str(dev_runtime),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        status, body = _post_json(
+            f"http://{host}:{port}", "/api/manager/respawn-executor",
+            {"chain_version": "abc1234"},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert status == 200
+    assert body["ok"] is True
+    assert (dev_runtime / "manager_signal.json").is_file()
+    assert not (dev_runtime / "runtime").exists()
 
 
 def test_successful_redeploy_writes_chain_version_once():

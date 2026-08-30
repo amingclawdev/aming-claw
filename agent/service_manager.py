@@ -119,22 +119,20 @@ def _plane_bound_manager_identity(
     A manager is never a host-global service: the project, governance listener,
     storage root, and sidecar port form one custody boundary.
     """
+    if allow_test_port:
+        raise ValueError("ServiceManager sidecar requires canonical runtime identity")
+    from agent.manager_http_server import plane_bound_manager_identity
+
     project = project_id
     url = _world_bound_governance_url(project, governance_url)
-    if project == "aming-claw":
-        raw_root = str(storage_root or os.getenv("AMING_CLAW_DEV_STORAGE_ROOT", "")).strip()
-        if not raw_root:
-            raise ValueError("AC ServiceManager requires explicit AMING_CLAW_DEV_STORAGE_ROOT")
-        root = Path(raw_root).expanduser().absolute()
-        if root.is_symlink():
-            raise ValueError("AC ServiceManager storage root cannot be a symlink")
-        return {"project_id": project, "plane": "dev", "governance_url": url,
-                "storage_root": str(root), "sidecar_port": _AC_DEV_MANAGER_SIDECAR_PORT}
-    if urlparse(url).port != 40000 and not allow_test_port:
-        raise ValueError("stable ServiceManager must use the stable governance port 40000")
-    root = Path(storage_root or os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))).expanduser().absolute()
-    return {"project_id": project, "plane": "stable", "governance_url": url,
-            "storage_root": str(root), "sidecar_port": _STABLE_MANAGER_SIDECAR_PORT}
+    if storage_root is None:
+        if project == "aming-claw":
+            from agent.governance.db import _dev_runtime_root
+
+            storage_root = str(_dev_runtime_root(create=False))
+        else:
+            storage_root = str(_repo_root() / "shared-volume")
+    return plane_bound_manager_identity(project, url, storage_root)
 
 
 def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) -> list[str]:
@@ -175,6 +173,16 @@ def _signal_file_path(project_id: Optional[str] = None) -> Path:
 
         return _dev_runtime_root(create=True) / "manager_signal.json"
     return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "state" / "manager_signal.json"
+
+
+def _identity_log_dir(identity: dict) -> Path:
+    root = Path(identity["storage_root"])
+    return root / "logs" if identity["plane"] == "dev" else root / "codex-tasks" / "logs"
+
+
+def _identity_signal_file_path(identity: dict) -> Path:
+    root = Path(identity["storage_root"])
+    return root / "manager_signal.json" if identity["plane"] == "dev" else root / "codex-tasks" / "state" / "manager_signal.json"
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +254,14 @@ class ServiceManager:
     # ------------------------------------------------------------------
     # start / stop
     # ------------------------------------------------------------------
+
+    def _bound_manager_identity(self) -> dict:
+        if self.manager_identity is None:
+            self.manager_identity = _plane_bound_manager_identity(
+                self.project_id, self.governance_url,
+            )
+            self.sidecar_port = int(self.manager_identity["sidecar_port"])
+        return self.manager_identity
 
     def start(self) -> bool:
         """Spawn the executor subprocess if it is not already running.
@@ -469,14 +485,10 @@ class ServiceManager:
             log.info("ServiceManager: sidecar already running")
             return
 
+        identity = self._bound_manager_identity()
+
         # Bind the full launch identity immediately before a listening sidecar
         # exists.  Construction alone is deliberately side-effect free.
-        self.manager_identity = _plane_bound_manager_identity(
-            self.project_id, self.governance_url,
-            allow_test_port=self._managed_executor is False and self.project_id != "aming-claw",
-        )
-        self.sidecar_port = int(self.manager_identity["sidecar_port"])
-
         self._sidecar_crashed = False
 
         def _sidecar_runner():
@@ -495,13 +507,13 @@ class ServiceManager:
                 log.info(
                     "ServiceManager: sidecar thread starting manager_http_server "
                     "for %s/%s on %d",
-                    self.manager_identity["plane"], self.project_id, self.sidecar_port,
+                    identity["plane"], self.project_id, self.sidecar_port,
                 )
                 run_server(
                     port=self.sidecar_port,
                     project_id=self.project_id,
                     governance_url=self.governance_url,
-                    storage_root=self.manager_identity["storage_root"],
+                    storage_root=identity["storage_root"],
                 )
             except Exception as exc:
                 log.error(
@@ -663,7 +675,7 @@ class ServiceManager:
         * Valid restart signal → stop current executor, start fresh one, delete
           signal file.  Does NOT increment circuit breaker (R5).
         """
-        signal_path = _signal_file_path(self.project_id)
+        signal_path = _identity_signal_file_path(self._bound_manager_identity())
         if not signal_path.exists():
             return
 
@@ -747,14 +759,23 @@ class ServiceManager:
 
     def _spawn_executor_process(self) -> subprocess.Popen:
         """Spawn the executor and redirect output to a persistent host log file."""
+        identity = self._bound_manager_identity()
         child_env = os.environ.copy()
-        child_env["EXECUTOR_API_PORT"] = str(
-            urlparse(resolve_runtime_plane(self.project_id).executor_url).port
-        )
+        for key in ("GOVERNANCE_URL", "EXECUTOR_PROJECT_ID", "PROJECT_ID",
+                    "SHARED_VOLUME_PATH", "EXECUTOR_API_PORT", "MANAGER_URL"):
+            child_env.pop(key, None)
+        child_env.update({
+            "GOVERNANCE_URL": identity["governance_url"],
+            "EXECUTOR_PROJECT_ID": identity["project_id"],
+            "PROJECT_ID": identity["project_id"],
+            "SHARED_VOLUME_PATH": identity["storage_root"],
+            "MANAGER_URL": identity["manager_url"],
+            "EXECUTOR_API_PORT": str(urlparse(identity["executor_url"]).port),
+        })
         if self._managed_executor:
             token = self._verified_executor_session_token()
             child_env[EXECUTOR_SESSION_TOKEN_ENV] = token
-        log_dir = _shared_log_dir(self.project_id)
+        log_dir = _identity_log_dir(identity)
         log_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = log_dir / f"service-manager-executor-{self.project_id}.log"
         stderr_path = log_dir / f"service-manager-executor-{self.project_id}.err.log"

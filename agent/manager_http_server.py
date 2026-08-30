@@ -111,6 +111,29 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _existing_non_symlink_root(path: Path, label: str) -> Path:
+    """Validate an existing physical storage authority without creating it."""
+    absolute = path.expanduser().absolute()
+    if not absolute.exists():
+        raise FileNotFoundError(f"{label} does not exist: {absolute}")
+    if absolute.is_symlink() or not absolute.is_dir():
+        raise ValueError(f"{label} must be a non-symlink directory")
+    if absolute.resolve(strict=True) != absolute:
+        raise ValueError(f"{label} escaped its physical root")
+    return absolute
+
+
+def _canonical_storage_root(plane_name: str) -> Path:
+    """Return the established storage authority for exactly one runtime plane."""
+    if plane_name == "dev":
+        from agent.governance.db import _dev_runtime_root
+
+        return _dev_runtime_root(create=False)
+    return _existing_non_symlink_root(
+        _project_root() / "shared-volume", "stable shared-volume root",
+    )
+
+
 def plane_bound_manager_identity(
     project_id: str, governance_url: str, storage_root: str,
 ) -> dict:
@@ -120,14 +143,23 @@ def plane_bound_manager_identity(
         raise ValueError("manager sidecar governance URL crosses the project runtime plane")
     if not isinstance(storage_root, str) or not storage_root or storage_root != storage_root.strip():
         raise ValueError("manager sidecar requires explicit project, governance URL, and storage root")
-    root = Path(storage_root).expanduser().absolute()
-    if plane.name == "dev":
-        if root.is_symlink():
-            raise ValueError("AC manager sidecar storage root cannot be a symlink")
+    supplied_root = _existing_non_symlink_root(
+        Path(storage_root), "manager sidecar storage root",
+    )
+    canonical_root = _canonical_storage_root(plane.name)
+    supplied_stat = supplied_root.stat(follow_symlinks=False)
+    canonical_stat = canonical_root.stat(follow_symlinks=False)
+    if (
+        supplied_root != canonical_root
+        or (supplied_stat.st_dev, supplied_stat.st_ino)
+        != (canonical_stat.st_dev, canonical_stat.st_ino)
+    ):
+        raise ValueError("manager sidecar storage root crosses the project runtime plane")
     return {"project_id": plane.project_id, "plane": plane.name,
             "governance_url": plane.governance_url, "manager_url": plane.manager_url,
-            "executor_url": plane.executor_url, "storage_root": str(root),
-            "sidecar_port": urlparse(plane.manager_url).port}
+            "executor_url": plane.executor_url, "storage_root": str(canonical_root),
+            "sidecar_port": urlparse(plane.manager_url).port,
+            "storage_device": canonical_stat.st_dev, "storage_inode": canonical_stat.st_ino}
 
 
 def _profile_auth_controller():
@@ -396,17 +428,27 @@ def _require_bound_identity(identity: dict) -> dict:
     if not isinstance(identity, dict):
         raise RuntimeError("manager sidecar has no immutable launch identity")
     try:
-        bound = plane_bound_manager_identity(
-            identity.get("project_id"), identity.get("governance_url"),
-            identity.get("storage_root"),
+        plane = resolve_runtime_plane(identity.get("project_id"))
+        root = _existing_non_symlink_root(
+            Path(identity.get("storage_root", "")), "manager sidecar storage root",
         )
     except (TypeError, ValueError) as exc:
         raise RuntimeError("manager sidecar launch identity is invalid") from exc
-    for field in ("project_id", "plane", "governance_url", "manager_url",
-                  "executor_url", "storage_root", "sidecar_port"):
-        if identity.get(field) != bound[field]:
+    except FileNotFoundError as exc:
+        raise RuntimeError("manager sidecar storage authority is unavailable") from exc
+    expected = {
+        "project_id": plane.project_id, "plane": plane.name,
+        "governance_url": plane.governance_url, "manager_url": plane.manager_url,
+        "executor_url": plane.executor_url,
+        "sidecar_port": urlparse(plane.manager_url).port,
+        "storage_root": str(root),
+        "storage_device": root.stat(follow_symlinks=False).st_dev,
+        "storage_inode": root.stat(follow_symlinks=False).st_ino,
+    }
+    for field, value in expected.items():
+        if identity.get(field) != value:
             raise RuntimeError("manager sidecar launch identity is inconsistent")
-    return bound
+    return identity
 
 
 def _governance_log_paths(identity: dict, chain_version: str) -> tuple[Path, Path]:
@@ -922,11 +964,7 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         try:
             identity = self._bound_identity()
             root = Path(identity["storage_root"])
-            state_dir = (
-                root / "runtime"
-                if identity["plane"] == "dev"
-                else root / "codex-tasks" / "state"
-            )
+            state_dir = root if identity["plane"] == "dev" else root / "codex-tasks" / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             sig = {
                 "action": "restart",

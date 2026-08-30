@@ -22,8 +22,10 @@ def test_spawn_governance_uses_host_entrypoint_for_bundled_python(monkeypatch, t
 
     monkeypatch.setattr(manager_http_server.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(manager_http_server.sys, "executable", "python-test")
+    (tmp_path / "shared-volume").mkdir()
+    monkeypatch.setattr(manager_http_server, "_project_root", lambda: tmp_path)
     identity = manager_http_server.plane_bound_manager_identity(
-        "proj", "http://127.0.0.1:40000", str(tmp_path / "shared"),
+        "proj", "http://127.0.0.1:40000", str(tmp_path / "shared-volume"),
     )
 
     proc = manager_http_server._spawn_governance_process(identity, "abc1234")
@@ -48,9 +50,11 @@ def test_spawn_governance_persists_stdout_and_stderr(monkeypatch, tmp_path):
         captured["kwargs"] = kwargs
         return Proc()
 
-    shared = tmp_path / "shared"
+    shared = tmp_path / "shared-volume"
+    shared.mkdir()
     monkeypatch.setattr(manager_http_server.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(manager_http_server.sys, "executable", "python-test")
+    monkeypatch.setattr(manager_http_server, "_project_root", lambda: tmp_path)
     identity = manager_http_server.plane_bound_manager_identity(
         "proj", "http://127.0.0.1:40000", str(shared),
     )
@@ -101,9 +105,16 @@ def test_spawn_environment_cannot_escape_bound_identity(
     monkeypatch.setenv("SHARED_VOLUME_PATH", "/ambient/root")
     monkeypatch.setenv("MANAGER_URL", "http://127.0.0.1:40101")
     monkeypatch.setenv("EXECUTOR_API_PORT", "40100")
-    identity = manager_http_server.plane_bound_manager_identity(
-        project_id, governance_url, str(tmp_path / "bound-root"),
-    )
+    if project_id == "aming-claw":
+        storage = tmp_path / "dev-storage"
+        root = storage / "runtime"
+        root.mkdir(parents=True)
+        monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(storage))
+    else:
+        root = tmp_path / "shared-volume"
+        root.mkdir()
+        monkeypatch.setattr(manager_http_server, "_project_root", lambda: tmp_path)
+    identity = manager_http_server.plane_bound_manager_identity(project_id, governance_url, str(root))
 
     manager_http_server._spawn_governance_process(identity, "abc1234")
 
