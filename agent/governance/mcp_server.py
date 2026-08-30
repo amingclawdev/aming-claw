@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 try:
     from agent.mcp.host_envelope_continuity import (
@@ -3532,8 +3532,38 @@ TOOLS: list[dict] = [
 # Governance HTTP client helpers
 # ---------------------------------------------------------------------------
 
-def _gov_url() -> str:
-    return os.environ.get("GOVERNANCE_URL", "http://localhost:40000").rstrip("/")
+def _mcp_bound_project_id() -> str:
+    return str(
+        os.environ.get("AMING_CLAW_MCP_PROJECT_ID")
+        or os.environ.get("PROJECT_ID")
+        or ""
+    ).strip()
+
+
+def _request_project_id(path: str, body: Mapping[str, Any] | None) -> str:
+    payload = body if isinstance(body, Mapping) else {}
+    explicit = str(payload.get("project_id") or "").strip()
+    if explicit:
+        return explicit
+    parts = [part for part in str(path or "").split("/") if part]
+    if "aming-claw" in parts:
+        return "aming-claw"
+    return _mcp_bound_project_id()
+
+
+def _gov_url(project_id: str = "") -> str:
+    project = str(project_id or _mcp_bound_project_id()).strip()
+    configured = os.environ.get("GOVERNANCE_URL", "").rstrip("/")
+    if project == "aming-claw":
+        expected = os.environ.get(
+            "AC_DEV_GOVERNANCE_URL", "http://127.0.0.1:40008"
+        ).rstrip("/")
+        if configured and configured not in {expected, "http://localhost:40008"}:
+            raise ValueError("AC MCP is bound exclusively to dev port 40008")
+        return expected
+    if configured.endswith(":40008"):
+        raise ValueError("port 40008 is reserved to exact project aming-claw")
+    return configured or "http://localhost:40000"
 
 
 def _gov_token() -> str:
@@ -3549,7 +3579,25 @@ def _http(
     timeout_seconds: int | None = None,
 ) -> dict:
     """Make an HTTP request to the governance service."""
-    url = f"{_gov_url()}{path}"
+    request_project = _request_project_id(path, body)
+    bound_project = _mcp_bound_project_id()
+    if bound_project and request_project and bound_project != request_project:
+        return {
+            "ok": False,
+            "error": "mcp_world_project_scope_mismatch",
+            "writes_performed": False,
+            "pass_synthesized": False,
+        }
+    try:
+        url = f"{_gov_url(request_project)}{path}"
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": "mcp_world_endpoint_rejected",
+            "message": str(exc),
+            "writes_performed": False,
+            "pass_synthesized": False,
+        }
     data = json.dumps(body, ensure_ascii=False).encode() if body else None
     request_timeout = int(timeout_seconds or 10)
     req = urllib.request.Request(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from agent.governance import mcp_server
 
 
@@ -66,3 +68,22 @@ def test_contract_runtime_bypass_mcp_exposes_only_opaque_cross_plane_authority(
         )
     ]
     assert "raw-credential" not in repr(calls[0][2])
+def test_governance_mcp_world_binding_has_no_ac_stable_fallback(monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_MCP_PROJECT_ID", "aming-claw")
+    monkeypatch.delenv("GOVERNANCE_URL", raising=False)
+    assert mcp_server._gov_url() == "http://127.0.0.1:40008"
+    monkeypatch.setenv("GOVERNANCE_URL", "http://127.0.0.1:40000")
+    with pytest.raises(ValueError, match="40008"):
+        mcp_server._gov_url()
+
+
+def test_governance_mcp_rejects_cross_project_request(monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_MCP_PROJECT_ID", "aming-claw")
+    monkeypatch.delenv("GOVERNANCE_URL", raising=False)
+    result = mcp_server._http(
+        "GET",
+        "/api/backlog/content-sys",
+        {"project_id": "content-sys"},
+    )
+    assert result["error"] == "mcp_world_project_scope_mismatch"
+    assert result["writes_performed"] is False

@@ -10,6 +10,8 @@ import os
 import unittest
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 
 class TestAuthSmokeTestPresence(unittest.TestCase):
     """AC-D: run_loop must contain auth smoke test call."""
@@ -77,3 +79,22 @@ class TestAuthSmokeTestBehavior(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+def test_executor_world_binding_routes_ac_only_to_dev(monkeypatch, tmp_path):
+    from agent import executor_worker
+
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "dev-world"))
+    assert (
+        executor_worker._world_bound_governance_url("aming-claw", "")
+        == "http://127.0.0.1:40008"
+    )
+    assert executor_worker._world_bound_log_root("aming-claw", str(tmp_path)).is_relative_to(
+        tmp_path / "dev-world"
+    )
+    with pytest.raises(ValueError):
+        executor_worker._world_bound_governance_url(
+            "aming-claw", "http://127.0.0.1:40000"
+        )
+    with pytest.raises(ValueError):
+        executor_worker._world_bound_governance_url(
+            "content-sys", "http://127.0.0.1:40008"
+        )

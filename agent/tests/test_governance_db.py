@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from governance.db import SCHEMA_VERSION
@@ -48,6 +50,7 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
         os.environ.pop("AMING_CLAW_RUNTIME_PLANE", None)
+        os.environ.pop("AMING_CLAW_DEV_STORAGE_ROOT", None)
 
     def tearDown(self):
         for key in (
@@ -55,9 +58,28 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
             "AMING_CLAW_RUNTIME_PLANE",
             "AMING_CLAW_DB_MIGRATION_POLICY",
             "AMING_CLAW_ALLOWED_PROJECT_IDS",
+            "AMING_CLAW_DEV_STORAGE_ROOT",
         ):
             os.environ.pop(key, None)
         self.tmp.cleanup()
+
+    def _bootstrap_dev_db(self):
+        from governance import db
+
+        storage_root = Path(self.tmp.name).resolve() / "dev-world"
+        receipt = db.bootstrap_dev_governance_store(
+            storage_root,
+            source_identity={
+                "root": str(Path(self.tmp.name) / "source"),
+                "branch": "codex/ac-dev",
+                "commit": "a" * 40,
+                "source_sha256": "sha256:" + "b" * 64,
+            },
+            process_identity={"pid": 1234, "start_identity": "pytest"},
+        )
+        os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] = str(storage_root)
+        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        return Path(receipt["database_path"])
 
     def _create_ac_db(self):
         from governance.db import get_connection
@@ -129,16 +151,15 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
     def test_dev_external_reader_requires_exact_registered_public_safe_identity(self):
         from governance.db import registered_public_safe_external_project
 
-        self._create_registered_external_db()
+        path = self._create_registered_external_db()
+        before = self._database_metadata(path)
         os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
-        registered = registered_public_safe_external_project("content-sys")
-        self.assertEqual(registered["project_id"], "content-sys")
-        self.assertTrue(registered["public_safe"])
-        for rejected in ("content_sys", "contentSys", "../content-sys", "missing"):
-            with self.subTest(rejected=rejected), self.assertRaises(
-                (FileNotFoundError, ValueError)
+        for rejected in ("content-sys", "content_sys", "contentSys", "../content-sys", "missing"):
+            with self.subTest(rejected=rejected), self.assertRaisesRegex(
+                ValueError, "external project discovery is retired"
             ):
                 registered_public_safe_external_project(rejected)
+        self.assertEqual(self._database_metadata(path), before)
 
     def test_dev_external_registry_validation_never_opens_sqlite_storage(self):
         from governance import db as governance_db
@@ -189,10 +210,10 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
                 "connect",
                 side_effect=AssertionError("external sqlite3.connect is forbidden"),
             ), mock.patch.object(Path, "open", guarded_open):
-                registered = governance_db.registered_public_safe_external_project(
-                    "content-sys"
-                )
-            self.assertTrue(registered["storage_validated_without_database_open"])
+                with self.assertRaisesRegex(ValueError, "discovery is retired"):
+                    governance_db.registered_public_safe_external_project(
+                        "content-sys"
+                    )
             self.assertEqual(storage_snapshot(), before)
             self.assertEqual(owner.total_changes, 1)
         finally:
@@ -217,7 +238,7 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
         path.replace(outside)
         path.symlink_to(outside)
         os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
-        with self.assertRaisesRegex(ValueError, "symlink"):
+        with self.assertRaisesRegex(ValueError, "discovery is retired"):
             registered_public_safe_external_project("content-sys")
 
     def test_dev_external_registry_rejects_symlink_and_nonregular_sidecars(self):
@@ -229,22 +250,19 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
         wal = Path(str(path) + "-wal")
         wal.symlink_to(outside)
         os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
-        with self.assertRaisesRegex(ValueError, "symlink"):
+        with self.assertRaisesRegex(ValueError, "discovery is retired"):
             registered_public_safe_external_project("content-sys")
 
         wal.unlink()
         wal.mkdir()
-        with self.assertRaisesRegex(ValueError, "file type"):
+        with self.assertRaisesRegex(ValueError, "discovery is retired"):
             registered_public_safe_external_project("content-sys")
 
     def test_dev_rejects_foreign_empty_and_traversal_before_project_creation(self):
         from governance.db import get_connection
 
-        self._create_ac_db()
-        root = os.path.join(
-            self.tmp.name, "codex-tasks", "state", "governance"
-        )
-        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        self._bootstrap_dev_db()
+        root = Path(os.environ["AMING_CLAW_DEV_STORAGE_ROOT"]) / "governance"
         for project_id in (
             "",
             "foreign",
@@ -254,28 +272,24 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 get_connection(project_id)
-        self.assertFalse(os.path.exists(os.path.join(root, "foreign")))
+        self.assertFalse((root / "foreign").exists())
 
     def test_dev_requires_existing_database_and_never_creates_it(self):
         from governance.db import get_connection
 
-        root = os.path.join(
-            self.tmp.name,
-            "codex-tasks",
-            "state",
-            "governance",
-            "aming-claw",
-        )
-        os.makedirs(root, exist_ok=True)
+        storage_root = Path(self.tmp.name).resolve() / "missing-dev-world"
+        root = storage_root / "governance" / "aming-claw"
+        root.mkdir(parents=True)
+        os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] = str(storage_root)
         os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
         with self.assertRaises(FileNotFoundError):
             get_connection("aming-claw")
-        self.assertFalse(os.path.exists(os.path.join(root, "governance.db")))
+        self.assertFalse((root / "governance.db").exists())
 
     def test_dev_schema_mismatch_fails_without_auto_migration(self):
         from governance.db import get_connection
 
-        path = self._create_ac_db()
+        path = self._bootstrap_dev_db()
         raw = sqlite3.connect(path)
         raw.execute(
             "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
@@ -284,7 +298,6 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
         raw.commit()
         raw.close()
 
-        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
         with self.assertRaisesRegex(RuntimeError, "schema mismatch"):
             get_connection("aming-claw")
 
@@ -298,8 +311,7 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
     def test_dev_opens_exact_existing_compatible_database(self):
         from governance.db import get_connection
 
-        self._create_ac_db()
-        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        self._bootstrap_dev_db()
         conn = get_connection("aming-claw")
         value = conn.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
@@ -310,9 +322,7 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
     def test_canonical_database_identity_survives_normal_sqlite_writes(self):
         from governance.db import canonical_ac_database_identity
 
-        path = self._create_ac_db()
-        os.environ["SHARED_VOLUME_PATH"] = str(Path(self.tmp.name).resolve())
-        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        path = self._bootstrap_dev_db()
         before = canonical_ac_database_identity()
         raw = sqlite3.connect(path)
         raw.execute(
@@ -329,12 +339,10 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
     def test_dev_rejects_governance_database_symlink_escape(self):
         from governance.db import get_connection
 
-        path = self._create_ac_db()
+        path = self._bootstrap_dev_db()
         outside = os.path.join(self.tmp.name, "outside-governance.db")
         os.replace(path, outside)
         os.symlink(outside, path)
-        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
-
         with self.assertRaisesRegex(ValueError, "cannot be a symlink"):
             get_connection("aming-claw")
 
@@ -343,8 +351,7 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
     def test_dev_connection_denies_schema_and_attachment_mutation(self):
         from governance.db import get_connection
 
-        path = self._create_ac_db()
-        os.environ["AMING_CLAW_RUNTIME_PLANE"] = "dev"
+        path = self._bootstrap_dev_db()
         conn = get_connection("aming-claw")
         with self.assertRaises(sqlite3.DatabaseError):
             conn.execute("CREATE TABLE dev_should_not_exist (id INTEGER)")
@@ -400,3 +407,94 @@ class TestACDevDatabaseIsolation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+def test_ac_dev_world_bootstrap_is_source_only_and_physically_disjoint(tmp_path, monkeypatch):
+    import sqlite3
+
+    from agent.governance import db
+
+    legacy_shared = tmp_path / "legacy" / "shared-volume"
+    legacy_db = (
+        legacy_shared
+        / "codex-tasks"
+        / "state"
+        / "governance"
+        / "aming-claw"
+        / "governance.db"
+    )
+    legacy_db.parent.mkdir(parents=True)
+    legacy_db.write_bytes(b"immutable legacy archive")
+    legacy_before = legacy_db.read_bytes()
+
+    source = {
+        "root": str(tmp_path / "source"),
+        "branch": "codex/ac-dev",
+        "commit": "a" * 40,
+        "source_sha256": "sha256:" + "b" * 64,
+    }
+    storage_root = tmp_path / "dev-world"
+    receipt = db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity=source,
+        process_identity={"pid": 123, "start_identity": "test-process"},
+    )
+
+    dev_db = Path(receipt["database_path"])
+    assert dev_db.is_file()
+    assert not dev_db.is_symlink()
+    assert dev_db != legacy_db
+    assert legacy_db.read_bytes() == legacy_before
+    assert receipt["schema_version"] == "ac_governance_world_genesis.v1"
+    assert receipt["world_id"] == "ac-dev"
+    assert receipt["project_id"] == "aming-claw"
+    assert receipt["rows_copied"] == 0
+    assert receipt["source_only"] is True
+    assert receipt["database_identity"]["inode"] == dev_db.stat().st_ino
+
+    conn = sqlite3.connect(dev_db)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+        assert meta["governance_world_id"] == "ac-dev"
+        assert meta["governance_world_genesis_sha256"] == receipt["genesis_sha256"]
+        assert int(meta["schema_version"]) == db.SCHEMA_VERSION
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(storage_root))
+    monkeypatch.delenv("SHARED_VOLUME_PATH", raising=False)
+    conn = db.get_connection("aming-claw")
+    try:
+        opened = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        assert opened == dev_db.resolve()
+        identity = db.canonical_ac_database_identity(conn)
+        assert identity["world_id"] == "ac-dev"
+        assert identity["genesis_sha256"] == receipt["genesis_sha256"]
+    finally:
+        conn.close()
+
+
+def test_ac_dev_storage_rejects_alias_foreign_and_symlink_roots(tmp_path, monkeypatch):
+    from agent.governance import db
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "missing"))
+    for project_id in ("aming_claw", "amingClaw", "other-project", "*", ""):
+        with pytest.raises((ValueError, FileNotFoundError, RuntimeError)):
+            db.get_connection(project_id)
+
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias_root = tmp_path / "alias"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(alias_root))
+    with pytest.raises(ValueError, match="symlink"):
+        db.bootstrap_dev_governance_store(
+            alias_root,
+            source_identity={
+                "root": str(tmp_path / "source"),
+                "branch": "codex/ac-dev",
+                "commit": "a" * 40,
+                "source_sha256": "sha256:" + "b" * 64,
+            },
+            process_identity={"pid": 123, "start_identity": "test-process"},
+        )

@@ -57,6 +57,7 @@ AC_STABLE_ANCHOR_COMMIT = "a25838f15f949ac434cf78e03f20760e82ff81f0"
 AC_DATABASE_STABLE_RELATIVE_PATH = (
     "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
 )
+AC_DEV_STORAGE_ROOT_ENV = "AMING_CLAW_DEV_STORAGE_ROOT"
 _GOVERNANCE_PROBE_HEALTH_BYTES = 64 * 1024
 _GOVERNANCE_PROBE_GRAPH_BYTES = 256 * 1024
 
@@ -97,10 +98,16 @@ def _source_git_identity() -> dict[str, str]:
             return ""
         return result.stdout.strip() if result.returncode == 0 else ""
 
+    try:
+        source_sha256 = "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        source_sha256 = ""
     return {
         "root": run("rev-parse", "--show-toplevel") or str(root),
         "branch": run("branch", "--show-current"),
         "commit": run("rev-parse", "HEAD").lower(),
+        "tree": run("rev-parse", "HEAD^{tree}").lower(),
+        "source_sha256": source_sha256,
         "dirty": run("status", "--porcelain"),
     }
 
@@ -182,7 +189,7 @@ def _dev_running_identity_matches(
     expected: Mapping[str, str],
     *,
     stable_anchor_commit: str,
-    stable_database_identity: Mapping[str, Any],
+    dev_database_identity: Mapping[str, Any],
 ) -> bool:
     identity = health.get("runtime_plane_identity")
     if not isinstance(identity, Mapping):
@@ -199,9 +206,53 @@ def _dev_running_identity_matches(
         and identity.get("branch") == AC_DEV_BRANCH
         and identity.get("commit") == expected.get("commit")
         and identity.get("stable_anchor_commit") == stable_anchor_commit
-        and identity.get("stable_database_identity")
-        == dict(stable_database_identity)
+        and identity.get("database_identity") == dict(dev_database_identity)
+        and identity.get("world_id") == "ac-dev"
     )
+
+
+def _canonical_dev_database_binding(
+    storage_root: str,
+    *,
+    source_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bootstrap or verify one source-only, physically separate dev world."""
+
+    if not str(storage_root or "").strip():
+        raise click.ClickException("AC dev runtime requires --dev-storage-root")
+    root_input = Path(storage_root).expanduser().absolute()
+    if root_input.is_symlink():
+        raise click.ClickException("AC dev storage root cannot be a symlink")
+    stable_shared = os.environ.get("SHARED_VOLUME_PATH", "").strip()
+    if stable_shared:
+        try:
+            if root_input.resolve() == Path(stable_shared).expanduser().resolve():
+                raise click.ClickException(
+                    "AC dev storage root must be physically separate from stable"
+                )
+        except OSError as exc:
+            raise click.ClickException("AC dev storage identity is unavailable") from exc
+    from agent.governance.db import bootstrap_dev_governance_store
+
+    try:
+        receipt = bootstrap_dev_governance_store(
+            root_input,
+            source_identity=source_identity,
+            process_identity={
+                "pid": os.getpid(),
+                "start_identity": f"pid:{os.getpid()}:cli-bootstrap",
+            },
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    return {
+        "dev_storage_root": str(root_input),
+        "database_path": str(receipt["database_path"]),
+        "dev_database_identity": dict(receipt["database_identity"]),
+        "genesis_sha256": str(receipt["genesis_sha256"]),
+        "source_only": receipt.get("source_only") is True,
+        "rows_copied": int(receipt.get("rows_copied") or 0),
+    }
 
 
 def _canonical_stable_database_binding(
@@ -535,6 +586,28 @@ def _current_stable_anchor_commit() -> str:
             "on port 40000."
         )
     return str(authority["commit"])
+
+
+def _local_stable_source_anchor() -> str:
+    """Resolve the frozen stable source ref without contacting port 40000."""
+
+    identity = _source_git_identity()
+    root = Path(str(identity.get("root") or "")).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", f"refs/heads/{AC_STABLE_BRANCH}"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise click.ClickException("Local stable source anchor is unavailable.") from exc
+    commit = result.stdout.strip().lower() if result.returncode == 0 else ""
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise click.ClickException("Local stable source anchor is unavailable.")
+    return commit
 
 
 def _run_dev_governance() -> None:
@@ -1030,7 +1103,12 @@ def _launcher_html(governance_url: str) -> str:
 @click.option(
     "--shared-volume-path",
     default="",
-    help="Existing shared-volume root. Required by the dev plane.",
+    help="Stable/generic shared-volume root. Forbidden for the dev plane.",
+)
+@click.option(
+    "--dev-storage-root",
+    default="",
+    help="Dedicated non-symlink AC dev-world storage root.",
 )
 @click.option(
     "--stable-anchor-commit",
@@ -1046,6 +1124,7 @@ def start(
     runtime_plane,
     runtime_workspace,
     shared_volume_path,
+    dev_storage_root,
     stable_anchor_commit,
 ):
     """Start governance in the foreground without spawning plugin-owned workers."""
@@ -1056,17 +1135,27 @@ def start(
                 f"AC dev runtime is reserved to port {AC_DEV_SERVICE_PORT}; got {port}."
             )
         dev_identity = _dev_source_identity_precheck()
-        current_stable_anchor = _current_stable_anchor_commit()
-        stable_anchor_commit = stable_anchor_commit or current_stable_anchor
-        if stable_anchor_commit != current_stable_anchor:
+        if shared_volume_path:
             raise click.ClickException(
-                "AC dev runtime anchor must equal the currently loaded stable commit."
+                "AC dev runtime cannot bind --shared-volume-path; use --dev-storage-root."
             )
-        database_binding = _canonical_stable_database_binding(
-            shared_volume_path,
-            stable_anchor_commit=stable_anchor_commit,
+        stable_anchor_commit = stable_anchor_commit or _local_stable_source_anchor()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor_commit):
+            raise click.ClickException("AC dev runtime requires an exact local stable source anchor.")
+        if runtime_workspace:
+            runtime_root = Path(runtime_workspace).expanduser().absolute()
+        else:
+            runtime_root = Path(tempfile.gettempdir()) / "aming-claw-dev-40008"
+        selected_dev_storage = (
+            Path(dev_storage_root).expanduser().absolute()
+            if dev_storage_root
+            else runtime_root / "world"
         )
-        shared_volume_path = str(database_binding["shared_volume_path"])
+        database_binding = _canonical_dev_database_binding(
+            str(selected_dev_storage),
+            source_identity=dev_identity,
+        )
+        dev_storage_root = str(database_binding["dev_storage_root"])
         stable_identity = None
     elif runtime_plane == "stable":
         stable_identity = _stable_start_identity_precheck(
@@ -1085,8 +1174,8 @@ def start(
                 health,
                 dev_identity or {},
                 stable_anchor_commit=stable_anchor_commit,
-                stable_database_identity=(database_binding or {}).get(
-                    "stable_database_identity", {}
+                dev_database_identity=(database_binding or {}).get(
+                    "dev_database_identity", {}
                 ),
             ):
                 raise click.ClickException(
@@ -1121,22 +1210,13 @@ def start(
             r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor_commit
         ):
             raise click.ClickException("AC dev runtime requires an exact stable anchor commit.")
-        if not shared_volume_path:
-            raise click.ClickException(
-                "AC dev runtime requires --shared-volume-path pointing to an existing AC database."
-            )
-        shared_root = Path(shared_volume_path).expanduser().resolve()
-        existing_db = (
-            shared_root
-            / "codex-tasks"
-            / "state"
-            / "governance"
-            / "aming-claw"
-            / "governance.db"
-        )
+        if not dev_storage_root:
+            raise click.ClickException("AC dev runtime requires a dedicated dev storage root.")
+        dev_storage = Path(dev_storage_root).expanduser().resolve()
+        existing_db = dev_storage / "governance" / "aming-claw" / "governance.db"
         if not existing_db.is_file():
             raise click.ClickException(
-                "AC dev runtime requires the existing aming-claw governance.db; "
+                "AC dev runtime requires its bootstrapped governance.db; "
                 f"not found at {existing_db}."
             )
         if runtime_workspace:
@@ -1152,9 +1232,10 @@ def start(
         os.environ["AMING_CLAW_STABLE_ANCHOR_COMMIT"] = stable_anchor_commit
         os.environ["AMING_CLAW_ALLOWED_PROJECT_IDS"] = "aming-claw"
         os.environ["AMING_CLAW_DB_MIGRATION_POLICY"] = "verify-only"
-        os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] = "deny"
+        os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] = "dev-world-only"
         os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] = "deny"
-        os.environ["SHARED_VOLUME_PATH"] = str(shared_root)
+        os.environ[AC_DEV_STORAGE_ROOT_ENV] = str(dev_storage)
+        os.environ.pop("SHARED_VOLUME_PATH", None)
     elif runtime_plane == "stable":
         runtime_root = Path(workspace).resolve() if workspace else _default_runtime_workspace()
         os.environ["AMING_CLAW_RUNTIME_PLANE"] = "stable"
@@ -1199,57 +1280,34 @@ def branch_service():
 
 
 def _local_branch_service_validate(payload: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
-    """Run the candidate's safe supervisor locally, never through frozen 40000."""
+    """Fail closed: shared-DB branch supervision was superseded by dev start."""
 
-    from agent.governance.server import (
-        RequestContext,
-        handle_branch_service_validate,
-    )
-
-    ctx = RequestContext(
-        handler=None,
-        method="POST",
-        path_params={},
-        query={},
-        body=dict(payload),
-        request_id=f"local-branch-service-{os.getpid()}",
-        token="",
-        idem_key="",
-    )
-    result = handle_branch_service_validate(ctx)
-    if isinstance(result, tuple):
-        if isinstance(result[0], int):
-            return int(result[0]), dict(result[1])
-        return int(result[1]), dict(result[0])
-    return 200, dict(result)
+    _ = payload
+    return 410, {
+        "ok": False,
+        "error": "shared_database_branch_service_retired",
+        "replacement": "aming-claw start --runtime-plane dev --dev-storage-root <root>",
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "process_started": False,
+    }
 
 
 def _local_branch_service_adopt_stop_handoff(
     payload: Mapping[str, Any],
 ) -> tuple[int, dict[str, Any]]:
-    """Run exact orphan recovery in the local candidate supervisor."""
+    """Fail closed: cross-world orphan handoff is not a storage authority."""
 
-    from agent.governance.server import (
-        RequestContext,
-        handle_branch_service_adopt_stop_handoff,
-    )
-
-    ctx = RequestContext(
-        handler=None,
-        method="POST",
-        path_params={},
-        query={},
-        body=dict(payload),
-        request_id=f"local-branch-orphan-handoff-{os.getpid()}",
-        token="",
-        idem_key="",
-    )
-    result = handle_branch_service_adopt_stop_handoff(ctx)
-    if isinstance(result, tuple):
-        if isinstance(result[0], int):
-            return int(result[0]), dict(result[1])
-        return int(result[1]), dict(result[0])
-    return 200, dict(result)
+    _ = payload
+    return 410, {
+        "ok": False,
+        "error": "shared_database_orphan_handoff_retired",
+        "replacement": "stop the exact old process, then run source-only dev bootstrap",
+        "zero_write_rejection": True,
+        "writes_performed": False,
+        "signals_sent": False,
+        "process_started": False,
+    }
 
 
 @branch_service.command("validate")
@@ -1299,49 +1357,24 @@ def branch_service_validate(
     keep_running,
     json_output,
 ):
-    """Start and health-check the candidate through its local safe supervisor."""
-    current_stable_anchor = _current_stable_anchor_commit()
-    stable_anchor_commit = stable_anchor_commit or current_stable_anchor
-    if stable_anchor_commit != current_stable_anchor:
-        raise click.ClickException(
-            "Branch-service anchor must equal the currently loaded stable commit."
-        )
-    database_binding = _canonical_stable_database_binding(
+    """Reject the retired shared-database branch-service bootstrap."""
+    _ = (
+        worktree_path,
+        port,
+        governance_url,
+        runtime_workspace,
         shared_volume_path,
-        stable_anchor_commit=stable_anchor_commit,
+        stable_anchor_commit,
+        python_bin,
+        timeout_sec,
+        keep_running,
+        json_output,
     )
-    payload: dict[str, Any] = {
-        "worktree_path": str(Path(worktree_path).expanduser().resolve()),
-        "port": port,
-        "timeout_sec": timeout_sec,
-        "keep_running": keep_running,
-        "stable_anchor_commit": stable_anchor_commit,
-    }
-    if runtime_workspace:
-        payload["runtime_workspace"] = str(Path(runtime_workspace).expanduser().resolve())
-    payload["shared_volume_path"] = database_binding["shared_volume_path"]
-    payload["stable_database_identity"] = database_binding[
-        "stable_database_identity"
-    ]
-    if python_bin:
-        payload["python"] = python_bin
-    _ = governance_url
-    status, result = _local_branch_service_validate(payload)
-    result.setdefault("launch_authority", "client_local_candidate_supervisor")
-    result.setdefault("stable_service_contacted", False)
-    if json_output or status >= 400 or not result.get("ok"):
-        click.echo(json.dumps(result, indent=2, sort_keys=True))
-    else:
-        click.echo(
-            "Branch service validation ok: "
-            f"port={result.get('actual_listening_port') or result.get('requested_port')} "
-            f"pid={result.get('pid')} "
-            f"worktree={result.get('worktree_root') or result.get('worktree_path')}"
-        )
-    if status >= 400 or not result.get("ok"):
-        raise click.ClickException(
-            str(result.get("error") or result.get("detail") or "branch service validation failed")
-        )
+    raise click.ClickException(
+        "Shared-database branch-service validation is retired. Use `aming-claw "
+        "start --runtime-plane dev --dev-storage-root <dedicated-root>`; the "
+        "dev world must never bind or proxy the stable governance database."
+    )
 
 
 @branch_service.command("adopt-stop-handoff")
@@ -1391,59 +1424,24 @@ def branch_service_adopt_stop_handoff(
     kill_timeout_sec,
     replacement_timeout_sec,
 ):
-    """Inspect, then explicitly execute, an exact AC dev orphan handoff."""
+    """Reject the retired cross-world orphan handoff path."""
 
-    payload: dict[str, Any] = {
-        "action": "execute" if inspection_receipt else "inspect",
-        "orphan_worktree_path": str(
-            Path(orphan_worktree_path).expanduser().resolve()
-        ),
-        "successor_worktree_path": str(
-            Path(successor_worktree_path).expanduser().resolve()
-        ),
-        "orphan_pid": int(orphan_pid),
-        "allow_kill": bool(allow_kill),
-        "term_timeout_sec": float(term_timeout_sec),
-        "kill_timeout_sec": float(kill_timeout_sec),
-        "replacement_timeout_sec": float(replacement_timeout_sec),
-    }
-    if inspection_receipt:
-        receipt_path = Path(inspection_receipt).expanduser()
-        try:
-            metadata = receipt_path.stat(follow_symlinks=False)
-            if receipt_path.is_symlink() or metadata.st_size > 256 * 1024:
-                raise ValueError("inspection receipt must be a bounded regular file")
-            parsed = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
-            raise click.ClickException("Inspection receipt is unreadable or invalid.") from exc
-        if not isinstance(parsed, Mapping):
-            raise click.ClickException("Inspection receipt must be a JSON object.")
-        parsed_receipt = (
-            parsed.get("inspection")
-            if isinstance(parsed.get("inspection"), Mapping)
-            else parsed
-        )
-        payload["inspection_receipt"] = dict(parsed_receipt)
-        payload["inspection_receipt_sha256"] = str(
-            parsed_receipt.get("inspection_receipt_sha256") or ""
-        )
-        if not runtime_workspace:
-            raise click.ClickException(
-                "Execute mode requires --runtime-workspace for the replacement."
-            )
-        payload["runtime_workspace"] = str(
-            Path(runtime_workspace).expanduser().resolve()
-        )
-    elif allow_kill:
-        raise click.ClickException(
-            "--allow-kill is accepted only with an explicit inspection receipt."
-        )
-    status, result = _local_branch_service_adopt_stop_handoff(payload)
-    click.echo(json.dumps(result, indent=2, sort_keys=True))
-    if status >= 400 or not result.get("ok"):
-        raise click.ClickException(
-            str(result.get("error") or "branch-service orphan handoff failed")
-        )
+    _ = (
+        orphan_worktree_path,
+        successor_worktree_path,
+        orphan_pid,
+        inspection_receipt,
+        runtime_workspace,
+        allow_kill,
+        term_timeout_sec,
+        kill_timeout_sec,
+        replacement_timeout_sec,
+    )
+    raise click.ClickException(
+        "Shared-database orphan handoff is retired. Stop the exact old process, "
+        "preserve its bytes as an archive, and start the dedicated dev world "
+        "from source with a fresh genesis."
+    )
 
 
 @main.command("open")

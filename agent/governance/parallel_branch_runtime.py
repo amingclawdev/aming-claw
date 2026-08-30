@@ -26,7 +26,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
-from .db import dev_runtime_verify_only, verify_existing_schema_capabilities
+from .db import (
+    assert_runtime_world_project_identity,
+    dev_runtime_verify_only,
+    verify_existing_schema_capabilities,
+)
 from .worker_transcript_verify import verify_worker_transcript
 
 
@@ -11956,6 +11960,13 @@ def upsert_branch_context(
     *,
     now_iso: str = "",
 ) -> BranchTaskRuntimeContext:
+    assert_runtime_world_project_identity(
+        context.project_id,
+        referenced_project_ids={
+            "governance_project_id": context.governance_project_id,
+            "target_project_id": context.target_project_id,
+        },
+    )
     ensure_branch_runtime_schema(conn)
     previous_status_row = conn.execute(
         """

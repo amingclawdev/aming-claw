@@ -41,6 +41,7 @@ import time
 
 log = logging.getLogger(__name__)
 from .db import (
+    AC_PROJECT_ID,
     AC_DATABASE_STABLE_RELATIVE_PATH,
     canonical_ac_database_identity,
     DevRuntimeSchemaVerificationError,
@@ -411,6 +412,8 @@ def _runtime_bind_host() -> str:
 
 
 def _stable_runtime_health() -> dict[str, Any]:
+    if _runtime_plane() == "dev":
+        return {}
     try:
         health = _dev_stable_proxy_json(
             "/api/health",
@@ -422,6 +425,8 @@ def _stable_runtime_health() -> dict[str, Any]:
 
 
 def _stable_runtime_graph_status() -> dict[str, Any]:
+    if _runtime_plane() == "dev":
+        return {}
     try:
         status = _dev_stable_proxy_json(
             "/api/graph-governance/aming-claw/status",
@@ -596,6 +601,9 @@ def _verified_generic_stable_authority(
 def _current_stable_runtime_authority() -> dict[str, Any]:
     """Read stable, legacy a258, or fully verified generic 40000 authority."""
 
+    if _runtime_plane() == "dev":
+        return {}
+
     health = _stable_runtime_health()
     loaded = str(health.get("runtime_loaded_version") or "").strip().lower()
     if not (
@@ -715,12 +723,12 @@ def _runtime_plane_identity() -> dict[str, Any]:
         else git_identity["branch"]
     )
     violations: list[str] = []
-    stable_database_identity: dict[str, object] = {}
+    database_identity: dict[str, object] = {}
     if plane in {"stable", "dev"}:
         try:
-            stable_database_identity = canonical_ac_database_identity()
+            database_identity = canonical_ac_database_identity()
         except (OSError, RuntimeError, ValueError, sqlite3.Error):
-            violations.append("stable_database_identity_invalid")
+            violations.append("database_identity_invalid")
     if plane not in {"generic", "stable", "dev"}:
         violations.append("runtime_plane_unsupported")
     elif plane == "dev":
@@ -767,12 +775,15 @@ def _runtime_plane_identity() -> dict[str, Any]:
         "worktree_dirty": bool(git_identity["dirty"]),
         "worktree_dirty_files": git_identity["dirty"].splitlines(),
         "stable_anchor_commit": stable_anchor,
-        "stable_database_identity": stable_database_identity,
+        "world_id": "ac-dev" if plane == "dev" else "ac-stable" if plane == "stable" else "generic",
+        "database_identity": database_identity,
+        "stable_database_identity": database_identity if plane == "stable" else {},
         "project_allowlist": ["aming-claw"] if plane == "dev" else [],
-        "schema_policy": "verify_only_no_auto_migration" if plane == "dev" else "managed",
-        "active_graph_activation_allowed": plane != "dev",
+        "schema_policy": "source_bootstrap_then_verify_only" if plane == "dev" else "managed",
+        "active_graph_activation_allowed": True,
         "stable_deploy_allowed": plane != "dev",
         "background_workers_enabled": plane != "dev",
+        "background_worker_policy": "dedicated_dev_world_only" if plane == "dev" else "stable_multi_project",
         "status": "ready" if not violations else "invalid",
         "violations": violations,
     }
@@ -787,59 +798,21 @@ def _validate_runtime_plane_startup() -> dict[str, Any]:
     if identity["plane"] != "dev":
         return identity
     root = Path(str(identity["worktree_root"])).resolve()
-    canonical_shared_volume, canonical_database_identity = (
-        _branch_service_stable_database_binding(root)
-    )
-    shared_volume_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
-    if not shared_volume_raw:
-        raise GovernanceSingletonError(
-            "ac_dev_canonical_stable_shared_volume_required"
-        )
-    shared_volume_input = Path(shared_volume_raw).expanduser().absolute()
+    if os.environ.get("SHARED_VOLUME_PATH", "").strip():
+        raise GovernanceSingletonError("ac_dev_stable_shared_volume_forbidden")
+    database_identity = identity.get("database_identity")
+    if not _ac_dev_database_identity_valid(database_identity):
+        raise GovernanceSingletonError("ac_dev_database_identity_invalid")
     try:
-        supplied_shared_volume = shared_volume_input.resolve(strict=True)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise GovernanceSingletonError(
-            "ac_dev_canonical_stable_shared_volume_unavailable"
-        ) from exc
-    if (
-        shared_volume_input.is_symlink()
-        or supplied_shared_volume != shared_volume_input
-        or supplied_shared_volume != canonical_shared_volume
-        or identity.get("stable_database_identity")
-        != canonical_database_identity
-    ):
-        raise GovernanceSingletonError(
-            "ac_dev_canonical_stable_database_identity_mismatch"
-        )
-    stable_authority = _current_stable_runtime_authority()
-    current_stable_commit = str(
-        stable_authority.get("commit") or _current_stable_runtime_commit()
-    )
-    if not current_stable_commit:
-        raise GovernanceSingletonError("ac_dev_current_stable_identity_unavailable")
-    if identity["stable_anchor_commit"] != current_stable_commit:
-        raise GovernanceSingletonError("ac_dev_stable_anchor_not_current")
-    current_stable_database_identity = dict(
-        stable_authority.get("database_identity")
-        or _current_stable_runtime_database_identity()
-        or {}
-    )
-    if current_stable_database_identity:
-        if (
-            identity.get("stable_database_identity")
-            != current_stable_database_identity
-        ):
-            raise GovernanceSingletonError(
-                "ac_dev_stable_database_identity_not_current"
-            )
-    elif not (
-        current_stable_commit == AC_STABLE_ANCHOR_COMMIT
-        or stable_authority.get("mode") == "verified_generic"
-    ):
-        raise GovernanceSingletonError(
-            "ac_dev_current_stable_database_identity_unavailable"
-        )
+        stable_ref = _branch_service_git_output(
+            root,
+            ["rev-parse", "--verify", f"refs/heads/{AC_STABLE_BRANCH}"],
+        ).strip().lower()
+    except Exception as exc:
+        raise GovernanceSingletonError("ac_dev_stable_source_anchor_unavailable") from exc
+    current_stable_commit = str(identity["stable_anchor_commit"] or "").strip().lower()
+    if stable_ref != current_stable_commit:
+        raise GovernanceSingletonError("ac_dev_stable_source_anchor_mismatch")
     runtime_home_raw = os.environ.get("AMING_CLAW_HOME", "").strip()
     if not runtime_home_raw:
         raise GovernanceSingletonError("ac_dev_runtime_home_required")
@@ -870,7 +843,12 @@ def _validate_runtime_plane_startup() -> dict[str, Any]:
     except Exception as exc:
         raise GovernanceSingletonError("ac_dev_database_preflight_failed") from exc
     else:
-        conn.close()
+        try:
+            opened_identity = canonical_ac_database_identity(conn)
+            if opened_identity != database_identity:
+                raise GovernanceSingletonError("ac_dev_database_identity_changed")
+        finally:
+            conn.close()
     return identity
 
 
@@ -3395,6 +3373,125 @@ def _dev_project_id_claims(
             )
 
 
+def _runtime_world_zero_write_rejection(
+    *,
+    code: str,
+    path: str,
+    detail: str,
+) -> ValidationError:
+    plane = _runtime_plane()
+    return ValidationError(
+        code,
+        {
+            "schema_version": "ac_runtime_world_project_domain.v1",
+            "runtime_plane": plane,
+            "path": path,
+            "detail": detail,
+            "stable_service_port": AC_STABLE_SERVICE_PORT,
+            "dev_service_port": AC_DEV_SERVICE_PORT,
+            "zero_write_rejection": True,
+            "writes_performed": False,
+            "mutation_performed": False,
+            "pass_synthesized": False,
+            "project_domain_enforced_pre_database": True,
+        },
+    )
+
+
+def _guard_runtime_world_request(
+    *,
+    method: str,
+    path: str,
+    path_params: Mapping[str, Any],
+    body: Mapping[str, Any],
+    query: Mapping[str, Any] | None,
+    token: str,
+) -> None:
+    """Enforce stable/dev project domains before handlers or DB access.
+
+    Port 40000 owns every non-AC project and rejects both the canonical AC id
+    and any value that normalizes to it.  Port 40008 owns exactly the canonical
+    ``aming-claw`` spelling.  No cross-world read bridge exists: a caller must
+    connect to the owning service.  Mutations additionally require a scoped
+    project claim and a non-empty credential; authentication remains the
+    handler's responsibility after this zero-effect domain gate.
+    """
+
+    plane = _runtime_plane()
+    if plane not in {"dev", "stable", "generic"}:
+        raise _runtime_world_zero_write_rejection(
+            code="runtime_world_unsupported",
+            path=path,
+            detail="runtime plane has no source-backed project domain",
+        )
+    claims = (
+        list(_dev_project_id_claims(path_params, source="path_params"))
+        + list(_dev_project_id_claims(body, source="body"))
+        + list(_dev_project_id_claims(query or {}, source="query"))
+    )
+    normalized_claims: list[tuple[str, str, str]] = []
+    for source, claim in claims:
+        raw = str(claim or "").strip()
+        try:
+            canonical = validate_project_id_syntax(raw)
+        except (TypeError, ValueError) as exc:
+            raise _runtime_world_zero_write_rejection(
+                code="runtime_world_project_identity_invalid",
+                path=path,
+                detail=f"{source}: {exc}",
+            ) from exc
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", canonical):
+            raise _runtime_world_zero_write_rejection(
+                code="runtime_world_project_identity_invalid",
+                path=path,
+                detail=f"{source}: project identity is not an exact safe key",
+            )
+        normalized_claims.append((source, raw, canonical))
+
+    unique = {canonical for _source, _raw, canonical in normalized_claims}
+    if len(unique) > 1:
+        raise _runtime_world_zero_write_rejection(
+            code="runtime_world_project_identity_ambiguous",
+            path=path,
+            detail="request contains conflicting project identities",
+        )
+    if plane == "dev":
+        for source, raw, canonical in normalized_claims:
+            if raw != AC_PROJECT_ID or canonical != AC_PROJECT_ID:
+                raise _runtime_world_zero_write_rejection(
+                    code="ac_dev_project_domain_rejected",
+                    path=path,
+                    detail=f"{source}: dev accepts exact project_id={AC_PROJECT_ID}",
+                )
+    else:
+        for source, _raw, canonical in normalized_claims:
+            if canonical == AC_PROJECT_ID:
+                raise _runtime_world_zero_write_rejection(
+                    code="ac_stable_project_domain_rejected",
+                    path=path,
+                    detail=f"{source}: AC is owned exclusively by port 40008",
+                )
+
+    if method not in {"POST", "DELETE"}:
+        return None
+    if not str(token or "").strip():
+        raise _runtime_world_zero_write_rejection(
+            code="anonymous_mutation_forbidden",
+            path=path,
+            detail="anonymous wildcard authority is read-only",
+        )
+    if not normalized_claims:
+        raise _runtime_world_zero_write_rejection(
+            code="unscoped_mutation_forbidden",
+            path=path,
+            detail=(
+                "mutations require one explicit project identity; local AC "
+                "bootstrap/process controls are not HTTP authority"
+            ),
+        )
+    return None
+
+
 _dev_source_root_keys = (
     "project_root",
     "target_project_root",
@@ -5539,12 +5636,13 @@ class GovernanceHandler(BaseHTTPRequestHandler):
         try:
             request_body = self._read_body() if method == "POST" else {}
             request_query = self._query_params()
-            dev_external_route = _guard_dev_runtime_request(
+            _guard_runtime_world_request(
                 method=method,
                 path=urlparse(self.path).path,
                 path_params=path_params,
                 body=request_body,
                 query=request_query,
+                token=self.headers.get("X-Gov-Token", ""),
             )
             ctx = RequestContext(
                 handler=self,
@@ -5556,14 +5654,7 @@ class GovernanceHandler(BaseHTTPRequestHandler):
                 token=self.headers.get("X-Gov-Token", ""),
                 idem_key=self.headers.get("Idempotency-Key", ""),
             )
-            result = (
-                _handle_dev_external_read_only_discovery(
-                    ctx,
-                    route_kind=dev_external_route,
-                )
-                if dev_external_route
-                else handler(ctx)
-            )
+            result = handler(ctx)
             # Streaming handlers (SSE) write headers + body directly via
             # self.wfile and return the STREAMED_RESPONSE sentinel; skip the
             # normal JSON response path so we don't double-write.
@@ -146178,8 +146269,8 @@ def _operator_supervised_direct_main_dev_world_authority() -> dict[str, Any]:
         loaded.get("loaded_source_sha256") or ""
     ).strip().lower()
     database_identity = (
-        dict(identity.get("stable_database_identity") or {})
-        if isinstance(identity.get("stable_database_identity"), Mapping)
+        dict(identity.get("database_identity") or {})
+        if isinstance(identity.get("database_identity"), Mapping)
         else {}
     )
     violations: list[str] = []
@@ -146207,8 +146298,8 @@ def _operator_supervised_direct_main_dev_world_authority() -> dict[str, Any]:
         violations.append("loaded_runtime_commit_mismatch")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", loaded_source_sha256):
         violations.append("loaded_runtime_source_sha256_invalid")
-    if not _ac_stable_database_identity_valid(database_identity):
-        violations.append("stable_database_identity_invalid")
+    if not _ac_dev_database_identity_valid(database_identity):
+        violations.append("dev_database_identity_invalid")
     core = {
         "schema_version": (
             "operator_supervised_direct_main.dev_runtime_world.v1"
@@ -146225,7 +146316,8 @@ def _operator_supervised_direct_main_dev_world_authority() -> dict[str, Any]:
         "target_ref": f"refs/heads/{AC_DEV_BRANCH}",
         "target_head_commit": commit,
         "stable_anchor_commit": stable_anchor,
-        "stable_database_identity": database_identity,
+        "database_identity": database_identity,
+        "world_id": "ac-dev",
         "loaded_runtime_commit": loaded_commit,
         "loaded_runtime_source_sha256": loaded_source_sha256,
         "runtime_stale": bool(loaded.get("runtime_stale")),
@@ -146237,9 +146329,7 @@ def _operator_supervised_direct_main_dev_world_authority() -> dict[str, Any]:
     authority = {
         **core,
         "world_hash": world_hash,
-        "storage_contract_id": direct_main_dev_storage_contract_id(
-            core["namespace_hash"]
-        ),
+        "storage_contract_id": "operator_supervised_direct_main",
     }
     authority["authority_hash"] = stable_sha256(authority)
     if violations:
@@ -146296,10 +146386,12 @@ def _operator_supervised_direct_main_dev_selector_authority(
             "SELECT project_id, backlog_id, contract_id, "
             "contract_execution_id, record_json "
             "FROM contract_runtime_executions "
-            "WHERE contract_id GLOB "
-            "'operator_supervised_direct_main.dev_world.*'"
+            "WHERE project_id=? AND contract_id=?"
         )
-        rows = conn.execute(query).fetchall()
+        rows = conn.execute(
+            query,
+            (project_id, "operator_supervised_direct_main"),
+        ).fetchall()
     except sqlite3.Error:
         rows = []
     for row in rows:
@@ -146326,25 +146418,14 @@ def _operator_supervised_direct_main_dev_selector_authority(
             if isinstance(binding.get("runtime_world_authority"), Mapping)
             else {}
         )
-        namespace_hash = str(world.get("namespace_hash") or "").strip()
-        try:
-            expected_project_id = direct_main_dev_storage_project_id(
-                project_id,
-                namespace_hash,
-            )
-            expected_contract_id = direct_main_dev_storage_contract_id(
-                namespace_hash
-            )
-        except ContractRuntimeError:
-            continue
         if (
             record.get("project_id") == project_id
             and record.get("contract_id")
             == "operator_supervised_direct_main"
-            and physical_project_id == expected_project_id
+            and physical_project_id == project_id
             and physical_backlog_id
             == str(record.get("backlog_id") or "").strip()
-            and physical_contract_id == expected_contract_id
+            and physical_contract_id == "operator_supervised_direct_main"
             and execution_id
             == str(record.get("contract_execution_id") or "").strip()
         ):
@@ -146876,7 +146957,7 @@ def _operator_supervised_direct_main_record_matches_dev_world(
         "schema_version", "accepted", "server_derived", "caller_claims_trusted",
         "runtime_plane", "runtime_port", "bind_host", "target_project_root",
         "worktree_path", "branch", "target_ref", "stable_anchor_commit",
-        "stable_database_identity", "runtime_stale", "violations",
+        "database_identity", "world_id", "runtime_stale", "violations",
         "namespace_hash", "storage_contract_id",
     )
     if not (
@@ -201952,6 +202033,27 @@ def _ac_stable_database_identity_valid(value: Any) -> bool:
         and re.fullmatch(
             r"sha256:[0-9a-f]{64}",
             str(value.get("stable_relative_path_sha256") or ""),
+        )
+    )
+
+
+def _ac_dev_database_identity_valid(value: Any) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and value.get("schema_version") == "ac_governance_database_identity.v2"
+        and value.get("world_id") == "ac-dev"
+        and value.get("project_id") == AC_PROJECT_ID
+        and type(value.get("device")) is int
+        and type(value.get("inode")) is int
+        and int(value.get("device") or 0) >= 0
+        and int(value.get("inode") or 0) > 0
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(value.get("relative_path_sha256") or ""),
+        )
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(value.get("genesis_sha256") or ""),
         )
     )
 

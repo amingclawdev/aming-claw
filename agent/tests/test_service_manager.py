@@ -10,12 +10,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock
 
+import pytest
+
 # Ensure agent directory is on the path
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
-from service_manager import ServiceManager, get_manager, _install_signal_handlers  # noqa: E402
+from service_manager import (  # noqa: E402
+    ServiceManager,
+    get_manager,
+    _install_signal_handlers,
+    _world_bound_governance_url,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +398,7 @@ class TestHostDefaults(unittest.TestCase):
     def test_default_governance_url_prefers_nginx_entrypoint(self):
         import service_manager as sm
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(sm._default_governance_url(), "http://localhost:40000")
+            self.assertEqual(sm._default_governance_url(), "http://127.0.0.1:40008")
 
     def test_default_executor_cmd_includes_host_routing(self):
         import service_manager as sm
@@ -637,3 +644,12 @@ class TestCheckRestartSignal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+def test_ac_service_manager_is_world_bound_to_dev_40008(monkeypatch, tmp_path):
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "dev-world"))
+    assert _world_bound_governance_url("aming-claw", "") == "http://127.0.0.1:40008"
+    with pytest.raises(ValueError):
+        _world_bound_governance_url("aming-claw", "http://127.0.0.1:40000")
+    with pytest.raises(ValueError):
+        _world_bound_governance_url("aming_claw", "http://127.0.0.1:40008")
+    with pytest.raises(ValueError):
+        _world_bound_governance_url("content-sys", "http://127.0.0.1:40008")

@@ -62,6 +62,7 @@ from agent.governance.mf_subagent_contract import (
     _normalized_action as _gate_normalized_action,
 )
 from agent.governance.db import (
+    assert_runtime_world_project_identity,
     dev_runtime_verify_only,
     verify_existing_schema_capabilities,
 )
@@ -1202,13 +1203,23 @@ def _route_registry_storage_project_id(
     project_id: str,
     storage_project_id: str = "",
 ) -> str:
-    """Keep the public scope project distinct from a physical registry key."""
+    """Return the canonical world-owned route-registry project.
+
+    Older Direct Main generations synthesized a second project key inside the
+    stable database.  Dual-world storage makes that indirection both needless
+    and unsafe: route refs live in the same physically isolated database as
+    their canonical public scope.
+    """
 
     canonical = _string(project_id)
     storage = _string(storage_project_id) or canonical
     if not canonical or not storage:
         raise ValueError("project_id and route registry storage project are required")
-    return storage
+    assert_runtime_world_project_identity(
+        canonical,
+        referenced_project_ids={"storage_project_id": storage},
+    )
+    return canonical
 _REF_LINEAGE_COLUMNS = {
     "parent_route_lineage": "parent_route_lineage_json",
     "child_route_lineage": "child_route_lineage_json",

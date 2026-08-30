@@ -14,6 +14,7 @@ import threading
 import hashlib
 import json
 import re
+import fcntl
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 
@@ -29,12 +30,19 @@ SCHEMA_VERSION = 47
 AC_PROJECT_ID = "aming-claw"
 DEV_RUNTIME_PLANE = "dev"
 RUNTIME_PLANE_ENV = "AMING_CLAW_RUNTIME_PLANE"
+AC_DEV_STORAGE_ROOT_ENV = "AMING_CLAW_DEV_STORAGE_ROOT"
+AC_DEV_WORLD_ID = "ac-dev"
+AC_STABLE_WORLD_ID = "ac-stable"
+AC_WORLD_GENESIS_SCHEMA = "ac_governance_world_genesis.v1"
 
 AC_DATABASE_STABLE_RELATIVE_PATH = (
     "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
 )
+AC_DATABASE_DEV_RELATIVE_PATH = "governance/aming-claw/governance.db"
 
 _SQLITE_WRITE_LOCK = threading.RLock()
+_DEV_DATABASE_WRITER_LEASES: dict[str, object] = {}
+_DEV_DATABASE_WRITER_LEASES_LOCK = threading.RLock()
 
 _DEV_DENIED_SCHEMA_ACTIONS = frozenset(
     code
@@ -561,7 +569,7 @@ def sqlite_write_lock() -> threading.RLock:
 def canonical_ac_database_identity(
     conn: sqlite3.Connection | None = None,
 ) -> dict[str, object]:
-    """Return the public-safe physical identity of the one stable AC DB.
+    """Return the public-safe physical identity of this runtime world's AC DB.
 
     The identity deliberately excludes the host's absolute path.  Normal
     SQLite writes preserve device/inode, while file substitution, an alternate
@@ -570,6 +578,41 @@ def canonical_ac_database_identity(
     ``$AMING_CLAW_HOME/shared-volume``; dev-plane callers may open that same
     file but cannot nominate a different AC-shaped database.
     """
+
+    if _is_dev_runtime():
+        db_path = _dev_database_path()
+        metadata = db_path.stat(follow_symlinks=False)
+        if db_path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("canonical AC dev database must be a non-symlink file")
+        if db_path.resolve(strict=True) != db_path.absolute():
+            raise ValueError("canonical AC dev database escaped its world root")
+        if conn is not None:
+            rows = conn.execute("PRAGMA database_list").fetchall()
+            main_paths = [
+                Path(str(row[2])).resolve(strict=True)
+                for row in rows
+                if str(row[1]) == "main" and str(row[2])
+            ]
+            if main_paths != [db_path.resolve(strict=True)]:
+                raise ValueError("opened AC dev database identity mismatch")
+        with sqlite3.connect(db_path) as identity_conn:
+            meta = dict(identity_conn.execute("SELECT key, value FROM schema_meta"))
+        genesis_sha256 = str(meta.get("governance_world_genesis_sha256") or "")
+        if (
+            meta.get("governance_world_id") != AC_DEV_WORLD_ID
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", genesis_sha256)
+        ):
+            raise ValueError("canonical AC dev database genesis is invalid")
+        return {
+            "schema_version": "ac_governance_database_identity.v2",
+            "world_id": AC_DEV_WORLD_ID,
+            "project_id": AC_PROJECT_ID,
+            "device": int(metadata.st_dev),
+            "inode": int(metadata.st_ino),
+            "relative_path_sha256": "sha256:"
+            + hashlib.sha256(AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")).hexdigest(),
+            "genesis_sha256": genesis_sha256,
+        }
 
     shared_raw = os.environ.get("SHARED_VOLUME_PATH", "").strip()
     if not shared_raw:
@@ -1085,20 +1128,203 @@ CREATE INDEX IF NOT EXISTS idx_graph_asset_bindings_path
 """
 
 
+def _absolute_non_symlink_root(path: Path, *, create: bool) -> Path:
+    """Resolve one physical root without accepting a symlink at any component."""
+
+    absolute = path.expanduser().absolute()
+    probe = absolute
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    if probe.is_symlink():
+        raise ValueError("AC dev storage root cannot contain a symlink")
+    if probe.resolve(strict=True) != probe:
+        raise ValueError("AC dev storage root escaped its physical parent")
+    if absolute.exists():
+        if absolute.is_symlink():
+            raise ValueError("AC dev storage root cannot be a symlink")
+        if absolute.resolve(strict=True) != absolute or not absolute.is_dir():
+            raise ValueError("AC dev storage root identity mismatch")
+    elif create:
+        absolute.mkdir(parents=True, exist_ok=False)
+    else:
+        raise FileNotFoundError("AC dev storage root does not exist: " + str(absolute))
+    if absolute.is_symlink() or absolute.resolve(strict=True) != absolute:
+        raise ValueError("AC dev storage root cannot be a symlink")
+    return absolute
+
+
+def _dev_storage_root(*, create: bool = False) -> Path:
+    raw = os.environ.get(AC_DEV_STORAGE_ROOT_ENV, "").strip()
+    if not raw:
+        raise RuntimeError(
+            "AC dev runtime requires an explicit AMING_CLAW_DEV_STORAGE_ROOT"
+        )
+    return _absolute_non_symlink_root(Path(raw), create=create)
+
+
+def _dev_database_path() -> Path:
+    root = _dev_storage_root(create=False)
+    database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+    if database.is_symlink():
+        raise ValueError("AC dev governance database cannot be a symlink")
+    if database.parent.resolve(strict=True) != (
+        root / "governance" / AC_PROJECT_ID
+    ).absolute():
+        raise ValueError("AC dev governance database escaped its world root")
+    return database
+
+
+def _world_genesis_hash(genesis: Mapping[str, object]) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            dict(genesis),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def bootstrap_dev_governance_store(
+    storage_root: Path | str,
+    *,
+    source_identity: Mapping[str, object],
+    process_identity: Mapping[str, object],
+) -> dict[str, object]:
+    """Create or verify the source-only AC dev world without copying stable rows.
+
+    This is the sole schema/genesis bootstrap.  Ordinary dev connections remain
+    verify-only, so a later source change cannot silently migrate a running
+    world.  A restart may re-read an exact existing genesis but cannot replace
+    it or import any stable governance bytes.
+    """
+
+    root_input = Path(storage_root).expanduser().absolute()
+    if root_input.is_symlink():
+        raise ValueError("AC dev storage root cannot be a symlink")
+    root = _absolute_non_symlink_root(root_input, create=not root_input.exists())
+    source = {
+        "root": str(source_identity.get("root") or "").strip(),
+        "branch": str(source_identity.get("branch") or "").strip(),
+        "commit": str(source_identity.get("commit") or "").strip().lower(),
+        "source_sha256": str(source_identity.get("source_sha256") or "")
+        .strip()
+        .lower(),
+    }
+    process = {
+        "pid": int(process_identity.get("pid") or 0),
+        "start_identity": str(process_identity.get("start_identity") or "").strip(),
+    }
+    if not (
+        source["root"]
+        and source["branch"] == "codex/ac-dev"
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", source["commit"])
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", source["source_sha256"])
+        and process["pid"] > 0
+        and process["start_identity"]
+    ):
+        raise ValueError("AC dev source/process bootstrap identity is incomplete")
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    database.parent.mkdir(parents=True, exist_ok=True)
+    if database.parent.is_symlink() or database.parent.resolve(strict=True) != database.parent:
+        raise ValueError("AC dev governance directory cannot be a symlink")
+    genesis = {
+        "schema_version": AC_WORLD_GENESIS_SCHEMA,
+        "world_id": AC_DEV_WORLD_ID,
+        "project_id": AC_PROJECT_ID,
+        "source_identity": source,
+        "bootstrap_process_identity": process,
+        "source_only": True,
+        "rows_copied": 0,
+    }
+    genesis_sha256 = _world_genesis_hash(genesis)
+    created = not database.exists()
+    if database.is_symlink():
+        raise ValueError("AC dev governance database cannot be a symlink")
+    conn = sqlite3.connect(str(database), timeout=30)
+    try:
+        conn.row_factory = sqlite3.Row
+        if created:
+            _configure_connection(conn, busy_timeout=10000)
+            _ensure_schema(conn)
+            conn.executemany(
+                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                (
+                    ("governance_world_id", AC_DEV_WORLD_ID),
+                    ("governance_world_genesis_sha256", genesis_sha256),
+                    (
+                        "governance_world_genesis_json",
+                        json.dumps(genesis, sort_keys=True, separators=(",", ":")),
+                    ),
+                ),
+            )
+            conn.commit()
+        else:
+            _verify_existing_schema(conn)
+            meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+            try:
+                stored_genesis = json.loads(
+                    str(meta.get("governance_world_genesis_json") or "")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("existing AC dev world genesis is unreadable") from exc
+            stored_hash = str(meta.get("governance_world_genesis_sha256") or "")
+            if not (
+                meta.get("governance_world_id") == AC_DEV_WORLD_ID
+                and isinstance(stored_genesis, Mapping)
+                and stored_genesis.get("schema_version") == AC_WORLD_GENESIS_SCHEMA
+                and stored_genesis.get("world_id") == AC_DEV_WORLD_ID
+                and stored_genesis.get("project_id") == AC_PROJECT_ID
+                and stored_genesis.get("source_identity") == source
+                and stored_genesis.get("source_only") is True
+                and stored_genesis.get("rows_copied") == 0
+                and stored_hash == _world_genesis_hash(stored_genesis)
+            ):
+                raise ValueError("existing AC dev world genesis differs from source")
+            genesis = dict(stored_genesis)
+            genesis_sha256 = stored_hash
+    except Exception:
+        conn.close()
+        if created:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                candidate = Path(str(database) + suffix)
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    metadata = database.stat(follow_symlinks=False)
+    identity = {
+        "schema_version": "ac_governance_database_identity.v2",
+        "world_id": AC_DEV_WORLD_ID,
+        "project_id": AC_PROJECT_ID,
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "relative_path_sha256": "sha256:"
+        + hashlib.sha256(AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")).hexdigest(),
+        "genesis_sha256": genesis_sha256,
+    }
+    return {
+        **genesis,
+        "genesis_sha256": genesis_sha256,
+        "database_path": str(database),
+        "database_identity": identity,
+        "created": created,
+        "restart_safe": True,
+        "legacy_rows_imported": False,
+        "current_process_identity": process,
+    }
+
+
 def _governance_root() -> Path:
     """Root directory for governance data."""
     if _is_dev_runtime():
-        shared_volume = os.environ.get("SHARED_VOLUME_PATH", "").strip()
-        if not shared_volume:
-            raise RuntimeError(
-                "AC dev runtime requires an explicit existing SHARED_VOLUME_PATH"
-            )
-        root = (
-            Path(shared_volume).expanduser().resolve()
-            / "codex-tasks"
-            / "state"
-            / "governance"
-        )
+        root = _dev_storage_root(create=False) / "governance"
         if not root.is_dir():
             raise FileNotFoundError(
                 "AC dev runtime governance root must already exist: " + str(root)
@@ -1150,6 +1376,50 @@ def _is_dev_runtime() -> bool:
     return os.environ.get(RUNTIME_PLANE_ENV, "").strip().lower() == DEV_RUNTIME_PLANE
 
 
+def assert_runtime_world_project_identity(
+    project_id: str,
+    *,
+    referenced_project_ids: Mapping[str, Any] | None = None,
+) -> str:
+    """Validate one write scope against the source-backed runtime world.
+
+    This is deliberately a validation helper, not another authority engine.
+    ContractRuntime remains the authority for line/state/Facts; this function
+    only prevents an internal writer from persisting a row into the wrong
+    physical world when it bypasses the HTTP transport guard.
+
+    Generic test/library use retains the historical normalized project key.
+    A launched service always sets an explicit ``stable`` or ``dev`` plane:
+    stable rejects AC (including aliases), while dev accepts the exact
+    canonical spelling only.  Any supplied secondary project identity must
+    name the same world-owned project.
+    """
+
+    raw = str(project_id or "").strip()
+    canonical = validate_project_id_syntax(raw)
+    plane = os.environ.get(RUNTIME_PLANE_ENV, "").strip().lower()
+    if plane == DEV_RUNTIME_PLANE:
+        if raw != AC_PROJECT_ID or canonical != AC_PROJECT_ID:
+            raise ValueError(
+                "AC dev world accepts exact project_id=" + AC_PROJECT_ID
+            )
+    elif plane == "stable" and canonical == AC_PROJECT_ID:
+        raise ValueError("stable world cannot persist AC project state")
+
+    if plane in {DEV_RUNTIME_PLANE, "stable"}:
+        for label, value in dict(referenced_project_ids or {}).items():
+            if value in (None, ""):
+                continue
+            ref_raw = str(value).strip()
+            ref_canonical = validate_project_id_syntax(ref_raw)
+            if ref_raw != raw or ref_canonical != canonical:
+                raise ValueError(
+                    f"{label} crosses runtime project/world boundary: "
+                    f"expected exact {raw}"
+                )
+    return canonical
+
+
 def validate_project_id(project_id: str) -> str:
     """Validate one project id before any filesystem or SQLite side effect.
 
@@ -1196,6 +1466,14 @@ def registered_public_safe_external_project(project_id: str) -> dict:
 
     if not _is_dev_runtime():
         raise RuntimeError("external read-only discovery is dev-plane only")
+    _ = project_id
+    raise ValueError(
+        "AC dev external project discovery is retired; use the owning stable "
+        "project service without a cross-world storage bridge"
+    )
+    # The code below is retained temporarily as unreachable archive logic so a
+    # later cleanup can compare exact historical validation behavior.  No
+    # runtime entry reaches it after the dual-world cutover.
     canonical = validate_project_id_syntax(project_id, require_exact=True)
     if canonical == AC_PROJECT_ID:
         raise ValueError("external discovery requires a non-AC project")
@@ -1384,6 +1662,19 @@ def _connect_existing(db_path: Path, *, timeout: float) -> sqlite3.Connection:
     resolved = absolute.resolve(strict=True)
     if resolved != absolute:
         raise ValueError("AC dev runtime governance database escaped its canonical path")
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease_key = str(resolved)
+        if lease_key not in _DEV_DATABASE_WRITER_LEASES:
+            lease_path = Path(str(absolute) + ".writer.lock")
+            lease_handle = open(lease_path, "a+", encoding="utf-8")
+            try:
+                fcntl.flock(lease_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError) as exc:
+                lease_handle.close()
+                raise RuntimeError(
+                    "AC dev governance database already has a different writer"
+                ) from exc
+            _DEV_DATABASE_WRITER_LEASES[lease_key] = lease_handle
     uri = absolute.as_uri() + "?mode=rw"
     conn = sqlite3.connect(uri, timeout=timeout, uri=True)
     database_file = str(conn.execute("PRAGMA database_list").fetchone()[2] or "")

@@ -6734,3 +6734,13 @@ def test_qa_verification_that_genuinely_fails_still_fails():
 
     other_role = _qa_pass_verification_without_top_level_status()
     assert guard(record, other_role, actor_role="observer") == {}
+def test_dev_contract_runtime_uses_canonical_keys_in_physically_separate_database(monkeypatch):
+    from agent.governance.contracts import runtime
+
+    monkeypatch.setattr(runtime, "dev_runtime_verify_only", lambda: True)
+    namespace = "sha256:" + "1" * 64
+    assert runtime.direct_main_dev_storage_project_id("aming-claw", namespace) == "aming-claw"
+    assert (
+        runtime.direct_main_dev_storage_contract_id(namespace)
+        == "operator_supervised_direct_main"
+    )

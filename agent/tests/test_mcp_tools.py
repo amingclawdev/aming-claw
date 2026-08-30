@@ -7512,3 +7512,11 @@ def test_finish_attestation_schema_and_missing_identity_are_zero_http():
         assert result["zero_write_rejection"] is True
         assert result["http_request_performed"] is False
         assert recorder.calls == []
+def test_mcp_tools_ac_endpoint_is_dev_only(monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_MCP_PROJECT_ID", "aming-claw")
+    monkeypatch.delenv("GOVERNANCE_URL", raising=False)
+    tools = ToolDispatcher(lambda *_args, **_kwargs: {}, None)
+    assert tools._governance_url() == "http://127.0.0.1:40008"
+    monkeypatch.setenv("GOVERNANCE_URL", "http://127.0.0.1:40000")
+    with pytest.raises(ValueError, match="40008"):
+        tools._governance_url()

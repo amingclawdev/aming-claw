@@ -1190,3 +1190,25 @@ def test_endpoint_sanitizes_wildcard_allowed_actions():
     )
     assert code == 400
     assert "wildcard" in payload["error"] or "*" in payload["error"]
+def test_route_registry_storage_is_canonical_and_rejects_cross_world_alias(
+    monkeypatch,
+) -> None:
+    from agent.governance import observer_route_context
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    assert (
+        observer_route_context._route_registry_storage_project_id(
+            "aming-claw", "aming-claw"
+        )
+        == "aming-claw"
+    )
+    for alternate in (
+        "amingClaw",
+        "aming_claw",
+        "aming-claw--direct-main-dev",
+        "judgment-brain",
+    ):
+        with pytest.raises(ValueError, match="runtime project/world boundary"):
+            observer_route_context._route_registry_storage_project_id(
+                "aming-claw", alternate
+            )

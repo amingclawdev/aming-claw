@@ -358,6 +358,24 @@ class TestExplicitACPromotionScript:
         assert "governance-dev" not in text
         assert "docker compose" not in text
 
+    def test_script_enforces_source_only_promotion_delta(self):
+        text = self._script().read_text(encoding="utf-8")
+
+        assert "SOURCE_ONLY_PROMOTION_FENCE" in text
+        assert "source_only_git_delta_verified" in text
+        assert "database/runtime bytes are outside the source-only Git fence" in text
+        for forbidden in (
+            '".db"',
+            '".sqlite"',
+            '"-wal"',
+            '"-shm"',
+            '"shared-volume/"',
+            '"graph-snapshots/"',
+            '"graph-index/"',
+        ):
+            assert forbidden in text
+        assert "git diff --name-only -z" in text
+
     def test_every_quoted_python_heredoc_parses(self):
         lines = self._script().read_text(encoding="utf-8").splitlines()
         snippets = []

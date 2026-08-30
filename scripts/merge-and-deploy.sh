@@ -1506,6 +1506,41 @@ if ! git merge-base --is-ancestor "$CURRENT_STABLE" "$CANDIDATE_COMMIT"; then
     echo "Promotion blocked: candidate is not a linear descendant of current stable." >&2; exit 1
 fi
 
+# Dual-world promotion carries Git source and nothing else.  In particular,
+# the fresh dev genesis, SQLite companions, graph/session/runtime artifacts and
+# the immutable legacy AC database are never promotion inputs.  This check runs
+# before the stable database is opened even read-only.
+SOURCE_ONLY_PROMOTION_FENCE="$(
+    git diff --name-only -z "$CURRENT_STABLE..$CANDIDATE_COMMIT" -- . |
+    python3 -c '
+import sys
+
+paths = [item.decode("utf-8", "strict") for item in sys.stdin.buffer.read().split(b"\0") if item]
+forbidden = []
+for path in paths:
+    lowered = path.lower()
+    if (
+        lowered.startswith(("shared-volume/", ".aming-claw/", "runtime/"))
+        or "/runtime/" in lowered
+        or lowered.endswith((".db", ".sqlite", ".sqlite3", "-wal", "-shm", "-journal"))
+        or "graph-snapshots/" in lowered
+        or "graph-index/" in lowered
+    ):
+        forbidden.append(path)
+if forbidden:
+    print("\n".join(forbidden))
+    raise SystemExit(19)
+print("source_only_git_delta_verified")
+'
+)" || {
+    echo "Promotion blocked: database/runtime bytes are outside the source-only Git fence." >&2
+    exit 1
+}
+if [ "$SOURCE_ONLY_PROMOTION_FENCE" != "source_only_git_delta_verified" ]; then
+    echo "Promotion blocked: source-only Git fence did not produce exact evidence." >&2
+    exit 1
+fi
+
 DIFF_SHA256="sha256:$(git diff --no-ext-diff --no-textconv --binary --full-index -M "$CURRENT_STABLE..$CANDIDATE_COMMIT" -- . | shasum -a 256 | awk '{print $1}')"
 VERIFIER_SHA256="sha256:$(shasum -a 256 "$0" | awk '{print $1}')"
 LIVE_DB="$(python3 - "$STABLE_WORKTREE" "${SHARED_VOLUME_PATH}" <<'PY'

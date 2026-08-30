@@ -29,7 +29,11 @@ from .dashboard_read_cache import (
     timeline_database_scope,
     timeline_database_scope_from_path,
 )
-from .db import dev_runtime_verify_only, verify_existing_schema_capabilities
+from .db import (
+    assert_runtime_world_project_identity,
+    dev_runtime_verify_only,
+    verify_existing_schema_capabilities,
+)
 
 log = logging.getLogger(__name__)
 
@@ -2288,6 +2292,14 @@ def record_event(
 
     if not project_id or not event_type:
         raise ValueError("project_id and event_type are required")
+    assert_runtime_world_project_identity(
+        project_id,
+        referenced_project_ids={
+            "payload.project_id": (payload or {}).get("project_id"),
+            "verification.project_id": (verification or {}).get("project_id"),
+            "artifact_refs.project_id": (artifact_refs or {}).get("project_id"),
+        },
+    )
     inserted = _insert_event(
         conn,
         {
@@ -2547,6 +2559,14 @@ def enqueue_event(
     set wait=False and accept best-effort delivery.
     """
 
+    assert_runtime_world_project_identity(
+        project_id,
+        referenced_project_ids={
+            "payload.project_id": (payload or {}).get("project_id"),
+            "verification.project_id": (verification or {}).get("project_id"),
+            "artifact_refs.project_id": (artifact_refs or {}).get("project_id"),
+        },
+    )
     return _WRITE_QUEUE.enqueue(
         {
             "project_id": project_id,

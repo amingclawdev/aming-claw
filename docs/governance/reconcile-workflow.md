@@ -19,6 +19,41 @@ implemented codebase state diverges from what the governance graph records. This
 This spec formalizes the reconcile workflow as a first-class governance operation with
 defined phases, contracts, failure modes, and rollback paths.
 
+### 1.2 AC dual-world bootstrap and cutover boundary
+
+AC development and the frozen stable service are separate runtime worlds, not
+namespaces in one database:
+
+- Stable port `40000` rejects the canonical `aming-claw` project and every
+  source-backed alias before handler, database, or filesystem effects. It
+  continues to serve non-AC projects.
+- Dev port `40008` accepts only the exact canonical `aming-claw` spelling. It
+  uses a dedicated, non-symlink storage root and a fresh source-created genesis.
+  Its database, WAL/SHM, graph, sessions, routes, CEX, ContractRuntime Facts,
+  timeline, backlog and queues are physically disjoint from stable storage.
+- The legacy AC database whose recorded archive size is `178625794048` bytes is
+  immutable archive identity. No governance row or Fact is copied into dev.
+- ContractRuntime source definitions and state semantics are identical in both
+  worlds. Dev has no alternate grant cache, authority state machine, PASS
+  synthesis, cross-world receipt or compatibility proxy.
+- Promotion transports Git source only. Database files, SQLite companions,
+  graph snapshots/indexes, runtime roots and process/session bytes never cross
+  the boundary. A promoted stable source still does not acquire AC project
+  authority.
+
+Bootstrap is restart-safe: reopening the same dev storage must reproduce the
+same source-bound genesis and database device/inode while recording the current
+process separately. Before activation, the operator verifies exact source
+commit/tree, storage path/device/inode, listener/PID, WAL/SHM ownership, and a
+single writer per physical database. Any mismatch stops before cutover; rollback
+means stopping the unactivated dev process and retaining/removing only its
+disposable dedicated root. It never modifies stable storage.
+
+Because evidence cannot cross worlds, a pre-cutover AC row cannot be closed by
+fresh dev Facts. It remains honestly OPEN/WAIVED and a fresh dev-world successor
+must run implementation, independent QA, reconcile and close. Source generation
+or source-only promotion is not managed PASS and cannot synthesize one.
+
 ### 1.1 Relationship to Other Governance Docs
 
 - **[auto-chain.md](auto-chain.md)** — Reconcile leverages the auto-chain pipeline for execution;

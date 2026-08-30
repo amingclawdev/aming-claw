@@ -442,21 +442,24 @@ def direct_main_dev_namespace_hash(
 
 
 def direct_main_dev_storage_contract_id(namespace_hash: str) -> str:
-    """Return the stable-invisible physical namespace for one dev lifecycle."""
+    """Return the canonical ContractRuntime key in the physical dev database.
+
+    World separation is a database property.  ContractRuntime therefore keeps
+    the same source-backed contract id in both worlds instead of creating a
+    second namespace/state machine inside the legacy stable database.
+    """
 
     normalized = str(namespace_hash or "").strip().lower()
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", normalized):
         raise ContractRuntimeError("dev Direct namespace hash is invalid")
-    return _DIRECT_MAIN_DEV_STORAGE_PREFIX + normalized.removeprefix(
-        "sha256:"
-    )
+    return _DIRECT_MAIN_CANONICAL_CONTRACT_ID
 
 
 def direct_main_dev_storage_project_id(
     canonical_project_id: str,
     namespace_hash: str,
 ) -> str:
-    """Return a physical project key invisible to frozen stable selectors."""
+    """Return the canonical project key in the physically isolated dev DB."""
 
     project_id = str(canonical_project_id or "").strip()
     normalized = str(namespace_hash or "").strip().lower()
@@ -464,37 +467,13 @@ def direct_main_dev_storage_project_id(
         raise ContractRuntimeError("dev Direct canonical project id is required")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", normalized):
         raise ContractRuntimeError("dev Direct namespace hash is invalid")
-    return (
-        _DIRECT_MAIN_DEV_PROJECT_PREFIX
-        + normalized.removeprefix("sha256:")
-        + "."
-        + project_id
-    )
+    return project_id
 
 
 def _contract_runtime_storage_contract_id(record: Mapping[str, Any]) -> str:
-    """Select a physical index namespace without changing canonical JSON.
+    """Select the source-backed canonical key in this physical database."""
 
-    Frozen stable a258 selects strict Direct records by the physical
-    ``contract_id`` column.  A dev-world execution therefore uses a lifecycle
-    namespace while its source-backed record JSON retains the exact
-    canonical contract id and definition.  The alternate namespace is accepted
-    only in the dev plane and only when its immutable authority self-hash is
-    exact.
-    """
-
-    canonical = str(record.get("contract_id") or "").strip()
-    if not (
-        dev_runtime_verify_only()
-        and canonical == _DIRECT_MAIN_CANONICAL_CONTRACT_ID
-    ):
-        return canonical
-    metadata = record.get("metadata")
-    binding = metadata.get(_DIRECT_MAIN_RUNTIME_BINDING_KEY) if isinstance(metadata, Mapping) else None
-    authority = binding.get("runtime_world_authority") if isinstance(binding, Mapping) else None
-    if not isinstance(authority, Mapping) or not authority:
-        return canonical
-    return _direct_main_dev_physical_storage_identity(record)[2]
+    return str(record.get("contract_id") or "").strip()
 
 
 def _direct_main_dev_physical_storage_identity(
@@ -559,29 +538,7 @@ def _direct_main_dev_physical_storage_identity(
 
 
 def _contract_runtime_storage_project_id(record: Mapping[str, Any]) -> str:
-    canonical_project_id = str(record.get("project_id") or "").strip()
-    storage_contract_id = _contract_runtime_storage_contract_id(record)
-    if storage_contract_id == str(record.get("contract_id") or "").strip():
-        return canonical_project_id
-    metadata = (
-        record.get("metadata")
-        if isinstance(record.get("metadata"), Mapping)
-        else {}
-    )
-    binding = (
-        metadata.get(_DIRECT_MAIN_RUNTIME_BINDING_KEY)
-        if isinstance(metadata.get(_DIRECT_MAIN_RUNTIME_BINDING_KEY), Mapping)
-        else {}
-    )
-    authority = (
-        binding.get("runtime_world_authority")
-        if isinstance(binding.get("runtime_world_authority"), Mapping)
-        else {}
-    )
-    return direct_main_dev_storage_project_id(
-        canonical_project_id,
-        str(authority.get("namespace_hash") or ""),
-    )
+    return str(record.get("project_id") or "").strip()
 
 
 def _require_contract_runtime_storage_consistency(
@@ -983,17 +940,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_implementation_results_correction_l
                 raise ContractRuntimeError(
                     "storage_contract_id selection is dev-plane only"
                 )
-            suffix = str(storage_contract_id).removeprefix(
-                _DIRECT_MAIN_DEV_STORAGE_PREFIX
-            )
-            if not re.fullmatch(r"[0-9a-f]{64}", suffix):
+            if str(storage_contract_id) != _DIRECT_MAIN_CANONICAL_CONTRACT_ID:
                 raise ContractRuntimeError(
-                    "dev Direct storage contract namespace is invalid"
+                    "dev Direct storage contract id must remain canonical"
                 )
-            storage_project_id = direct_main_dev_storage_project_id(
-                project_id,
-                "sha256:" + suffix,
-            )
         params: list[Any] = [storage_project_id, backlog_id]
         where = "project_id = ? AND backlog_id = ?"
         if storage_contract_id:

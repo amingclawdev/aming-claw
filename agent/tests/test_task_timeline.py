@@ -19,6 +19,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 
 def _fake_sha(label: str) -> str:
     """Valid-format sha256:<64hex> digest derived from a label.
@@ -82,6 +84,51 @@ STRICT_GOVERNANCE_POLICY = {
         "close_timeline": True,
     },
 }
+
+
+def test_dev_timeline_cross_world_ref_is_rejected_before_schema_or_row(
+    monkeypatch,
+) -> None:
+    from agent.governance import task_timeline
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+
+    with pytest.raises(ValueError, match="runtime project/world boundary"):
+        task_timeline.record_event(
+            conn,
+            project_id="aming-claw",
+            event_type="implementation.completed",
+            payload={"project_id": "judgment-brain"},
+            post_commit_hooks=False,
+        )
+
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='task_timeline_events'"
+    ).fetchone() is None
+
+
+def test_stable_timeline_rejects_ac_alias_before_schema_or_row(monkeypatch) -> None:
+    from agent.governance import task_timeline
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+
+    with pytest.raises(ValueError, match="stable world cannot persist AC"):
+        task_timeline.record_event(
+            conn,
+            project_id="amingClaw",
+            event_type="implementation.completed",
+            post_commit_hooks=False,
+        )
+
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='task_timeline_events'"
+    ).fetchone() is None
 
 
 def test_first_deep_text_rejects_self_cycle_without_mutation():

@@ -25,6 +25,7 @@ Design notes
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -84,11 +85,36 @@ def _load_env_file(env_path: Optional[Path] = None) -> None:
 
 
 def _default_governance_url() -> str:
-    return os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+    return _world_bound_governance_url(_default_project_id(), os.getenv("GOVERNANCE_URL", ""))
 
 
 def _default_project_id() -> str:
     return os.getenv("EXECUTOR_PROJECT_ID", os.getenv("PROJECT_ID", "aming-claw"))
+
+
+def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str:
+    """Bind one manager/executor generation to exactly one governance world."""
+
+    raw = str(project_id or "").strip()
+    canonical = re.sub(r"-+", "-", re.sub(r"[\s_]+", "-", raw)).lower().strip("-")
+    if canonical == "aming-claw" and raw != "aming-claw":
+        raise ValueError("AC ServiceManager project id must be exact aming-claw")
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", canonical):
+        raise ValueError("ServiceManager project id is invalid")
+    if canonical != "aming-claw":
+        selected = str(requested_url or "http://127.0.0.1:40000").rstrip("/")
+        if selected.endswith(":40008"):
+            raise ValueError("port 40008 is reserved to exact project aming-claw")
+        return selected
+    expected = os.getenv(
+        "AC_DEV_GOVERNANCE_URL", "http://127.0.0.1:40008"
+    ).rstrip("/")
+    selected = str(requested_url or expected).rstrip("/")
+    if selected not in {expected, "http://localhost:40008"}:
+        raise ValueError(
+            f"project {canonical} is bound to governance world {expected}, got {selected}"
+        )
+    return expected
 
 
 def _default_workspace() -> str:
@@ -114,12 +140,24 @@ def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) 
     ]
 
 
-def _shared_log_dir() -> Path:
+def _shared_log_dir(project_id: str = "") -> Path:
+    selected_project = str(project_id or _default_project_id()).strip()
+    if selected_project == "aming-claw":
+        root = os.getenv("AMING_CLAW_DEV_STORAGE_ROOT", "").strip()
+        if not root:
+            raise RuntimeError("AC ServiceManager requires AMING_CLAW_DEV_STORAGE_ROOT")
+        return Path(root).expanduser().resolve() / "runtime" / "logs"
     return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "logs"
 
 
-def _signal_file_path() -> Path:
+def _signal_file_path(project_id: str = "") -> Path:
     """Path to the manager restart signal file (manager_signal.json)."""
+    selected_project = str(project_id or _default_project_id()).strip()
+    if selected_project == "aming-claw":
+        root = os.getenv("AMING_CLAW_DEV_STORAGE_ROOT", "").strip()
+        if not root:
+            raise RuntimeError("AC ServiceManager requires AMING_CLAW_DEV_STORAGE_ROOT")
+        return Path(root).expanduser().resolve() / "runtime" / "manager_signal.json"
     return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "state" / "manager_signal.json"
 
 
@@ -151,7 +189,12 @@ class ServiceManager:
         workspace: Optional[str] = None,
     ) -> None:
         self.project_id = project_id or _default_project_id()
-        self.governance_url = (governance_url or _default_governance_url()).rstrip("/")
+        self.governance_url = _world_bound_governance_url(
+            self.project_id,
+            governance_url
+            if governance_url is not None
+            else os.getenv("GOVERNANCE_URL", ""),
+        )
         self.reload_timeout = reload_timeout
         self.poll_interval = poll_interval
         self.workspace = workspace or _default_workspace()
@@ -584,7 +627,7 @@ class ServiceManager:
         * Valid restart signal → stop current executor, start fresh one, delete
           signal file.  Does NOT increment circuit breaker (R5).
         """
-        signal_path = _signal_file_path()
+        signal_path = _signal_file_path(self.project_id)
         if not signal_path.exists():
             return
 
@@ -668,7 +711,7 @@ class ServiceManager:
 
     def _spawn_executor_process(self) -> subprocess.Popen:
         """Spawn the executor and redirect output to a persistent host log file."""
-        log_dir = _shared_log_dir()
+        log_dir = _shared_log_dir(self.project_id)
         log_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = log_dir / f"service-manager-executor-{self.project_id}.log"
         stderr_path = log_dir / f"service-manager-executor-{self.project_id}.err.log"
@@ -790,7 +833,7 @@ def main() -> None:
     # docs/dev/b48-investigation-and-fix-proposal.md §2.
     from logging.handlers import RotatingFileHandler
 
-    _log_dir = _shared_log_dir()
+    _log_dir = _shared_log_dir(args.project)
     _log_dir.mkdir(parents=True, exist_ok=True)
     _sm_log_path = _log_dir / f"service-manager-{args.project}.log"
 

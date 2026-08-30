@@ -3173,6 +3173,10 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
     monkeypatch,
     tmp_path,
 ):
+    # The old assertion used a synthetic project/contract namespace inside the
+    # stable database.  Dual-world isolation makes the database physical and
+    # keeps ContractRuntime keys source-canonical within the dev database.
+    project_id = server.AC_PROJECT_ID
     _initialize_ac_dev_guide_schema(conn)
     backlog_id = "AC-DEV-ROUTE-BOUND-WORLD-MATERIALIZATION"
     _insert_simple_mf_close_backlog(conn, backlog_id)
@@ -3181,46 +3185,6 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
         "UPDATE backlog_bugs SET target_files=?, test_files='[]' WHERE bug_id=?",
         (json.dumps(row_files), backlog_id),
     )
-    old_task_id = server._operator_supervised_direct_main_execution_id(
-        PID,
-        backlog_id,
-        revision="rev3",
-    )
-    old_record = {
-        "project_id": PID,
-        "backlog_id": backlog_id,
-        "contract_execution_id": old_task_id,
-        "contract_id": "operator_supervised_direct_main",
-        "version": "v1",
-        "revision": "rev3",
-        "execution_state_revision": 1,
-        "metadata": {
-            "operator_supervised_direct_main_runtime_binding": {
-                "strict_runtime_binding_required": True,
-            }
-        },
-    }
-    conn.execute(
-        """INSERT INTO contract_runtime_executions (
-               contract_execution_id, project_id, backlog_id, contract_id,
-               version, revision, execution_state_revision, record_json,
-               created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            old_task_id,
-            PID,
-            backlog_id,
-            "operator_supervised_direct_main",
-            "v1",
-            "rev3",
-            1,
-            json.dumps(old_record),
-            "2026-08-27T00:00:00Z",
-            "2026-08-27T00:00:00Z",
-        ),
-    )
-    conn.commit()
-
     root = tmp_path / "ac-dev-materialize"
     root.mkdir()
     commit = "e" * 40
@@ -3232,7 +3196,7 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
         lambda: copy.deepcopy(world),
     )
     task_id = server._operator_supervised_direct_main_execution_id(
-        PID,
+        project_id,
         backlog_id,
         revision="rev3",
         world_authority=world,
@@ -3248,7 +3212,7 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
     }
     observer_route_context.persist_route_token_ref(
         conn,
-        project_id=PID,
+        project_id=project_id,
         route_token_ref=route_token_ref,
         token={
             **route_identity,
@@ -3259,7 +3223,7 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
             "target_files": row_files,
             "owned_files": row_files,
             "scope": {
-                "project_id": PID,
+                "project_id": project_id,
                 "backlog_id": backlog_id,
                 "task_id": task_id,
             },
@@ -3267,10 +3231,12 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
             "evidence_refs": [f"backlog:{backlog_id}"],
         },
     )
-    world_ref = server._operator_supervised_direct_main_world_ref(project_id=PID)
+    world_ref = server._operator_supervised_direct_main_world_ref(
+        project_id=project_id
+    )
     first = server._operator_supervised_direct_main_start_runtime(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
         task_id=task_id,
         route_token_ref=route_token_ref,
@@ -3285,7 +3251,7 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
     ).fetchone()[0] == 0
     first = server._operator_supervised_direct_main_start_runtime(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
         task_id=task_id,
         route_token_ref=route_token_ref,
@@ -3302,23 +3268,23 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
     assert json.loads(physical["record_json"])["contract_id"] == (
         "operator_supervised_direct_main"
     )
-    frozen_visible = conn.execute(
+    canonical_visible = conn.execute(
         "SELECT contract_execution_id FROM contract_runtime_executions "
         "WHERE project_id=? AND backlog_id=? "
         "AND contract_id='operator_supervised_direct_main'",
-        (PID, backlog_id),
+        (project_id, backlog_id),
     ).fetchall()
-    assert [row["contract_execution_id"] for row in frozen_visible] == [old_task_id]
+    assert [row["contract_execution_id"] for row in canonical_visible] == [task_id]
     assert conn.execute(
         "SELECT COUNT(*) FROM backlog_contract_chain_bindings "
-        "WHERE contract_execution_id=?",
-        (task_id,),
-    ).fetchone()[0] == 0
+        "WHERE project_id=? AND contract_execution_id=?",
+        (project_id, task_id),
+    ).fetchone()[0] == 1
 
     before_retry = conn.total_changes
     replay = server._operator_supervised_direct_main_start_runtime(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
         task_id=task_id,
         route_token_ref=route_token_ref,
@@ -3337,7 +3303,7 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
     assert advanced_world["namespace_hash"] == world["namespace_hash"]
     assert advanced_world["world_hash"] != world["world_hash"]
     assert server._operator_supervised_direct_main_execution_id(
-        PID,
+        project_id,
         backlog_id,
         revision="rev3",
         world_authority=advanced_world,
@@ -3359,7 +3325,7 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
     before_restart = conn.total_changes
     restarted = server._onboard_operator_supervised_direct_main_runtime_response(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
         route_token_ref=route_token_ref,
         role="observer",
@@ -3378,11 +3344,13 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
     assert conn.total_changes == before_restart
     replay_after_restart = server._operator_supervised_direct_main_start_runtime(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
         task_id=task_id,
         route_token_ref=route_token_ref,
-        world_ref=server._operator_supervised_direct_main_world_ref(project_id=PID),
+        world_ref=server._operator_supervised_direct_main_world_ref(
+            project_id=project_id
+        ),
     )
     assert replay_after_restart["contract_execution_id"] == task_id
     assert replay_after_restart["execution_state_revision"] == first[
@@ -3399,7 +3367,7 @@ def test_ac_dev_route_bound_materialization_is_world_namespaced_and_idempotent(
     with pytest.raises(GovernanceError) as unrelated:
         server._operator_supervised_direct_main_strict_records(
             conn,
-            project_id=PID,
+            project_id=project_id,
             backlog_id=backlog_id,
         )
     assert unrelated.value.code == "ac_dev_direct_main_runtime_world_lineage_invalid"
@@ -3412,6 +3380,10 @@ def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
     monkeypatch,
     tmp_path,
 ):
+    # The synthetic project-id namespace asserted by this legacy node is
+    # superseded.  Preserve its frozen-rebuild invariant while proving it via
+    # two physically distinct databases that both use the canonical key.
+    project_id = server.AC_PROJECT_ID
     monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE", raising=False)
     _initialize_ac_dev_guide_schema(conn)
     fixed_now = "2026-08-27T00:00:00Z"
@@ -3419,7 +3391,7 @@ def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
     backlog_id = "AC-DEV-FROZEN-REBUILD-PHYSICAL-PROJECT-ISOLATION"
     stable_execution_id = "cex-stable-frozen-rebuild"
     stable_record = {
-        "project_id": PID,
+        "project_id": project_id,
         "backlog_id": backlog_id,
         "contract_execution_id": stable_execution_id,
         "contract_id": "operator_supervised_direct_main",
@@ -3446,7 +3418,7 @@ def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
                 for row in conn.execute(
                     "SELECT * FROM backlog_contract_chain_bindings "
                     "WHERE project_id=? AND backlog_id=? ORDER BY id",
-                    (PID, backlog_id),
+                    (project_id, backlog_id),
                 ).fetchall()
             ],
             "edges": [
@@ -3454,7 +3426,7 @@ def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
                 for row in conn.execute(
                     "SELECT * FROM contract_chain_edges "
                     "WHERE project_id=? AND backlog_id=? ORDER BY id",
-                    (PID, backlog_id),
+                    (project_id, backlog_id),
                 ).fetchall()
             ],
             "current": [
@@ -3462,7 +3434,7 @@ def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
                 for row in conn.execute(
                     "SELECT * FROM backlog_contract_chain_current "
                     "WHERE project_id=? AND backlog_id=?",
-                    (PID, backlog_id),
+                    (project_id, backlog_id),
                 ).fetchall()
             ],
         }
@@ -3470,7 +3442,7 @@ def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
     before = stable_projection_bytes()
     before_read = contract_runtime.read_backlog_contract_chain_current(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
     )
     assert before_read["current_contract_execution_id"] == stable_execution_id
@@ -3480,7 +3452,7 @@ def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
     root.mkdir()
     world = _fixed_ac_dev_direct_world(root, "d" * 40)
     dev_execution_id = server._operator_supervised_direct_main_execution_id(
-        PID,
+        project_id,
         backlog_id,
         revision="rev3",
         world_authority=world,
@@ -3497,33 +3469,38 @@ def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
             }
         },
     }
+    dev_db = tmp_path / "ac-dev-frozen-rebuild.db"
+    dev_conn = sqlite3.connect(dev_db)
+    dev_conn.row_factory = sqlite3.Row
+    _initialize_ac_dev_guide_schema(dev_conn)
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
-    dev_store = SQLiteContractExecutionStore(conn)
+    dev_store = SQLiteContractExecutionStore(dev_conn)
     dev_store.create(dev_record)
-    conn.commit()
-    physical = conn.execute(
+    dev_conn.commit()
+    physical = dev_conn.execute(
         "SELECT project_id, backlog_id, contract_id, record_json "
         "FROM contract_runtime_executions WHERE contract_execution_id=?",
         (dev_execution_id,),
     ).fetchone()
     expected_storage_project = contract_runtime.direct_main_dev_storage_project_id(
-        PID,
+        project_id,
         world["namespace_hash"],
     )
     assert physical["project_id"] == expected_storage_project
-    assert physical["project_id"] != PID
+    assert physical["project_id"] == project_id
     assert physical["backlog_id"] == backlog_id
-    assert json.loads(physical["record_json"])["project_id"] == PID
+    assert json.loads(physical["record_json"])["project_id"] == project_id
     assert json.loads(physical["record_json"])["backlog_id"] == backlog_id
     loaded = dev_store.get(dev_execution_id)
-    assert loaded["project_id"] == PID
+    assert loaded["project_id"] == project_id
     dev_store.update(
         dev_execution_id,
         loaded,
         expected_revision=loaded["execution_state_revision"],
     )
     assert dev_store.get(dev_execution_id) == loaded
-    conn.commit()
+    dev_conn.commit()
+    dev_conn.close()
 
     base_source = subprocess.run(
         [
@@ -3556,14 +3533,14 @@ def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
     monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE", raising=False)
     rebuilt = contract_runtime.rebuild_backlog_contract_chain_projection(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
     )
     conn.commit()
     after = stable_projection_bytes()
     after_read = contract_runtime.read_backlog_contract_chain_current(
         conn,
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
     )
     assert rebuilt["current_contract_execution_id"] == stable_execution_id
@@ -3571,11 +3548,11 @@ def test_frozen_a258_rebuild_cannot_see_dev_physical_project_namespace(
     assert after_read == before_read
     assert after == before
     assert stable_store.list_by_backlog(
-        project_id=PID,
+        project_id=project_id,
         backlog_id=backlog_id,
     ) == [stable_record]
     assert conn.execute(
-        "SELECT COUNT(*) FROM backlog_contract_chain_bindings "
+        "SELECT COUNT(*) FROM contract_runtime_executions "
         "WHERE contract_execution_id=?",
         (dev_execution_id,),
     ).fetchone()[0] == 0
@@ -14623,47 +14600,24 @@ def test_ac_dev_graph_status_rejects_untyped_raw_identity(
 def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
     monkeypatch, tmp_path
 ):
+    # This node formerly exercised a read-only bridge from dev 40008 to stable
+    # 40000.  The bridge is superseded by physical project-domain isolation:
+    # every foreign GET/POST is rejected before DB, ContractRuntime, handler,
+    # stable-health, or stable-transport access.
     paths = _dev_external_discovery_fixture(monkeypatch, tmp_path)
     before = {project_id: path.read_bytes() for project_id, path in paths.items()}
-    proxied_paths = []
-
-    def stable_get_many(request_paths):
-        proxied_paths.extend(request_paths)
-        return [_dev_external_stable_payload(path) for path in request_paths]
-
-    def stable_get_with_size(path, *, max_bytes):
-        proxied_paths.append(path)
-        payload = _dev_external_stable_payload(path)
-        sized = _dev_sized_stable_payload(payload)
-        assert sized[1] <= max_bytes
-        return sized
-
-    monkeypatch.setattr(
-        server,
+    stable_accesses = []
+    for name in (
         "_dev_stable_external_public_get_many",
-        stable_get_many,
-    )
-    monkeypatch.setattr(
-        server,
         "_dev_stable_external_public_get_with_size",
-        stable_get_with_size,
-    )
-    stable_health_checks = []
-    monkeypatch.setattr(
-        server,
         "_dev_stable_proxy_health_identity",
-        lambda: stable_health_checks.append(True) or {
-            "required_health_tuple": {
-                "status": "ok",
-                "service": "governance",
-                "port": 40000,
-                "runtime_loaded_version": server._DEV_LEGACY_STABLE_HEALTH_COMMIT,
-                "runtime_stale": False,
-                "pid": 61297,
-            },
-            "legacy_a258_health": True,
-        },
-    )
+    ):
+        monkeypatch.setattr(
+            server,
+            name,
+            lambda *_args, _name=name, **_kwargs: stable_accesses.append(_name)
+            or pytest.fail(f"foreign dev request reached {_name}"),
+        )
     tripwires = {
         "_ensure_backlog_read_schema": "backlog DDL",
         "get_connection": "write connection",
@@ -14677,130 +14631,64 @@ def test_ac_dev_registered_external_read_discovery_is_bounded_no_authority(
             server,
             name,
             lambda *_args, _label=label, **_kwargs: pytest.fail(
-                f"external read entered {_label}"
+                f"foreign request entered {_label}"
             ),
         )
-    monkeypatch.setattr(
-        governance_db.sqlite3,
-        "connect",
-        lambda *_args, **_kwargs: pytest.fail("external sqlite3.connect is forbidden"),
+
+    requests = (
+        ("GET", "/api/backlog/{project}", {}, {}),
+        ("GET", "/api/backlog/{project}/{backlog}", {}, {}),
+        ("GET", "/api/graph-governance/{project}/status", {}, {}),
+        (
+            "POST",
+            "/api/projects/{project}/onboard-route-guide",
+            {"role": "observer", "work_type": "direct_main"},
+            {},
+        ),
     )
-
-    def discover(kind, method, path, params, *, body=None, query=None):
-        body, query = body or {}, query or {}
-        route = server._guard_dev_runtime_request(
-            method=method,
-            path=path,
-            path_params=params,
-            body=body,
-            query=query,
-        )
-        assert route == kind
-        return server._handle_dev_external_read_only_discovery(
-            _ctx(params, method=method, body=body, query=query),
-            route_kind=route,
-        )
-
-    for project_id in paths:
-        backlog = discover(
-            "backlog_list", "GET", f"/api/backlog/{project_id}",
-            {"project_id": project_id}, query={"view": "compact", "limit": "5"},
-        )
-        assert backlog["count"] == 1
-        assert "details_md" not in backlog["bugs"][0]
-        assert "route_token_ref" not in backlog["bugs"][0]
-        assert backlog["stable_read_authority"]["project_id"] == project_id
-        assert backlog["stable_read_authority"]["generation"] == 7
-
+    for project_id, path_on_disk in paths.items():
         backlog_id = f"{project_id.upper()}-PUBLIC"
-        item = discover(
-            "backlog_item", "GET", f"/api/backlog/{project_id}/{backlog_id}",
-            {"project_id": project_id, "bug_id": backlog_id},
-        )
-        assert item["bug"]["public_safe"] is True
-        assert item["backlog_id"] == backlog_id
-        assert item["stable_read_authority"]["project_id"] == project_id
-        assert item["stable_read_authority"]["generation"] == 7
-        assert (
-            item["stable_read_authority"]["authority_generation"]
-            == backlog["stable_read_authority"]["authority_generation"]
-        )
-        assert (
-            item["stable_read_authority"]["scope_sha256"]
-            != backlog["stable_read_authority"]["scope_sha256"]
-        )
-        assert "chain_trigger_json" not in item["bug"]
+        for method, template, body_extra, query in requests:
+            path = template.format(project=project_id, backlog=backlog_id)
+            body = {"project_id": project_id, **body_extra}
+            before_bytes = path_on_disk.read_bytes()
+            with pytest.raises(ValidationError) as rejected:
+                server._guard_runtime_world_request(
+                    method=method,
+                    path=path,
+                    path_params={
+                        "project_id": project_id,
+                        **(
+                            {"bug_id": backlog_id}
+                            if "{backlog}" in template
+                            else {}
+                        ),
+                    },
+                    body=body if method == "POST" else {},
+                    query=query,
+                    token="operator-token" if method == "POST" else "",
+                )
+            assert rejected.value.message == "ac_dev_project_domain_rejected"
+            assert rejected.value.details["project_domain_enforced_pre_database"] is True
+            assert rejected.value.details["writes_performed"] is False
+            assert path_on_disk.read_bytes() == before_bytes
 
-        graph = discover(
-            "graph_status", "GET", f"/api/graph-governance/{project_id}/status",
-            {"project_id": project_id},
-        )
-        assert graph["graph_available"] is True
-        assert "pending_scope_reconcile" not in graph
-
-        onboard_body = {
-            "project_id": project_id,
-            "backlog_id": backlog_id,
-            "role": "observer",
-            "work_type": "direct_main",
-        }
-        onboard = discover(
-            "onboard", "POST", f"/api/projects/{project_id}/onboard-route-guide",
-            {"project_id": project_id}, body=onboard_body,
-        )
-        assert onboard["schema_version"] == "ac_dev_external_read_only_discovery.v1"
-        for field in (
-            "route_authority",
-            "route_authority_accepted",
-            "cex_minted",
-            "route_minted",
-            "contract_runtime_materialized",
-            "timeline_written",
-            "graph_mutated",
-            "close_authority_minted",
-            "session_minted",
-            "qa_authority_minted",
-            "managed_pass",
-            "pass_implied",
-        ):
-            assert onboard[field] is False
-
-    # Exercise real middleware dispatch; normal Onboard remains a tripwire.
-    handler = _bare_handler()
-    handler.path = "/api/projects/content-sys/onboard-route-guide"
-    handler._find_handler = lambda _method: (
-        lambda _ctx: pytest.fail("external request reached matched handler"),
-        {"project_id": "content-sys"},
-        "",
-    )
-    handler._read_body = lambda: {
-        "project_id": "content-sys",
-        "backlog_id": "CONTENT-SYS-PUBLIC",
-        "role": "observer",
-        "work_type": "direct_main",
-    }
-    handler._query_params = lambda: {}
-    captured = {}
-    handler._respond = lambda code, body, *_args: captured.update(code=code, body=body)
-    handler._handle("POST")
-    assert captured["code"] == 200
-    assert captured["body"]["status"] == "read_only_discovery_only"
-    assert captured["body"]["stable_health_verified"] is True
-    assert stable_health_checks
-    assert not any("onboard-route-guide" in path for path in proxied_paths)
-    for project_id, path in paths.items():
-        assert path.read_bytes() == before[project_id]
-
+    assert stable_accesses == []
+    for project_id, path_on_disk in paths.items():
+        assert path_on_disk.read_bytes() == before[project_id]
 
 def test_ac_dev_external_onboard_requires_unchanged_stable_health(monkeypatch, tmp_path):
-    _dev_external_discovery_fixture(monkeypatch, tmp_path)
-    before = {"required_health_tuple": {"pid": 61297}}
-    after = {"required_health_tuple": {"pid": 61298}}
-    health = iter((before, after))
+    # External discovery used to proxy a bounded Onboard projection through
+    # stable 40000 and then compare two health reads.  That cross-world premise
+    # is superseded: dev rejects the foreign project before any health read.
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    health_reads = []
     monkeypatch.setattr(
         server,
         "_dev_stable_proxy_health_identity",
-        lambda: next(health),
+        lambda: health_reads.append(True) or pytest.fail(
+            "dev must not inspect stable health for a foreign project"
+        ),
     )
     monkeypatch.setattr(
         server,
@@ -14813,20 +14701,18 @@ def test_ac_dev_external_onboard_requires_unchanged_stable_health(monkeypatch, t
         "role": "observer",
         "work_type": "direct_main",
     }
-    route = server._guard_dev_runtime_request(
-        method="POST",
-        path="/api/projects/content-sys/onboard-route-guide",
-        path_params={"project_id": "content-sys"},
-        body=body,
-        query={},
-    )
-    with pytest.raises(GovernanceError) as rejected:
-        server._handle_dev_external_read_only_discovery(
-            _ctx({"project_id": "content-sys"}, method="POST", body=body),
-            route_kind=route,
+    with pytest.raises(ValidationError) as rejected:
+        server._guard_runtime_world_request(
+            method="POST",
+            path="/api/projects/content-sys/onboard-route-guide",
+            path_params={"project_id": "content-sys"},
+            body=body,
+            query={},
+            token="operator-token",
         )
-    assert rejected.value.code == "ac_dev_stable_proxy_identity_drift"
+    assert rejected.value.message == "ac_dev_project_domain_rejected"
     assert rejected.value.details["writes_performed"] is False
+    assert health_reads == []
 
 
 @pytest.mark.parametrize(
@@ -14942,36 +14828,36 @@ def test_ac_dev_external_backlog_http_boundary_retains_and_rejects_blank_queries
     retained_field,
     expected_code,
 ):
-    _dev_external_discovery_fixture(monkeypatch, tmp_path)
+    # Blank-query proxy validation remains covered by parsing, but its stable
+    # transport error is no longer reachable: the dev world rejects the
+    # foreign project domain before query policy or transport.
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     handler = _bare_handler()
     handler.path = f"/api/backlog/content-sys?{raw_query}"
     query = handler._query_params()
     retained = query[retained_field]
     assert retained == "" or "" in retained
     path = "/api/backlog/content-sys"
-    try:
-        route = server._guard_dev_runtime_request(
+    stable_transport_calls = []
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_external_public_get_with_size",
+        lambda *_args, **_kwargs: stable_transport_calls.append(True)
+        or pytest.fail("foreign dev read reached stable transport"),
+    )
+    with pytest.raises(ValidationError) as rejected:
+        server._guard_runtime_world_request(
             method="GET",
             path=path,
             path_params={"project_id": "content-sys"},
             body={},
             query=query,
+            token="",
         )
-    except GovernanceError as exc:
-        assert expected_code in str(exc)
-        return
-    assert route == "backlog_list"
-    monkeypatch.setattr(
-        server,
-        "_dev_stable_external_public_get_with_size",
-        lambda *_args, **_kwargs: pytest.fail(
-            "blank query reached stable transport"
-        ),
-    )
-    with pytest.raises(GovernanceError) as rejected:
-        server._dev_external_backlog_list_projection("content-sys", query)
-    assert rejected.value.code == expected_code
+    assert expected_code.startswith("ac_dev_external_backlog_")
+    assert rejected.value.message == "ac_dev_project_domain_rejected"
     assert rejected.value.details["zero_write_rejection"] is True
+    assert stable_transport_calls == []
 
 
 def test_query_blank_preservation_is_not_global(monkeypatch):
@@ -15390,93 +15276,27 @@ def test_verified_generic_stable_graph_fails_closed(mutation):
 
 
 def test_dev_runtime_tracks_current_stable_after_bootstrap(monkeypatch, tmp_path):
+    # This legacy node previously proved that dev reused the stable shared DB.
+    # It now proves the stable commit is a source-only ancestry anchor while
+    # runtime state comes from a fresh, dedicated dev-world genesis.
     stable = "c" * 40
     candidate = "d" * 40
-    database_identity = _promotion_database_identity()
-    canonical_shared = tmp_path / "stable" / "shared-volume"
-    canonical_shared.mkdir(parents=True)
-    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
-    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", stable)
-    monkeypatch.setenv("AMING_CLAW_HOME", "/tmp/ac-dev-runtime")
-    monkeypatch.setenv("SHARED_VOLUME_PATH", str(canonical_shared.resolve()))
-    monkeypatch.setattr(server, "PORT", server.AC_DEV_SERVICE_PORT)
-    monkeypatch.setattr(
-        server,
-        "_git_identity",
-        lambda _root: {
-            "worktree_root": "/tmp/ac-dev",
+    storage_root = tmp_path / "dev-world"
+    receipt = governance_db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity={
+            "root": str(tmp_path / "source"),
             "branch": server.AC_DEV_BRANCH,
             "commit": candidate,
-            "dirty": "",
+            "source_sha256": "sha256:" + "a" * 64,
         },
+        process_identity={"pid": 1234, "start_identity": "pytest-start"},
     )
-    monkeypatch.setattr(server, "_current_stable_runtime_commit", lambda: stable)
-    monkeypatch.setattr(
-        server,
-        "_current_stable_runtime_database_identity",
-        lambda: dict(database_identity),
-    )
-    monkeypatch.setattr(
-        server,
-        "canonical_ac_database_identity",
-        lambda: dict(database_identity),
-    )
-    monkeypatch.setattr(
-        server,
-        "_branch_service_stable_database_binding",
-        lambda _root: (canonical_shared.resolve(), dict(database_identity)),
-    )
-    monkeypatch.setattr(
-        server.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
-    )
-
-    class Connection:
-        def close(self):
-            return None
-
-    monkeypatch.setattr(server, "get_connection", lambda _project_id: Connection())
-
-    identity = server._validate_runtime_plane_startup()
-
-    assert identity["status"] == "ready"
-    assert identity["stable_anchor_commit"] == stable
-
-
-def test_direct_dev_startup_rejects_alternate_database_before_open(
-    monkeypatch, tmp_path
-):
-    candidate = "d" * 40
-    canonical_shared = tmp_path / "stable" / "shared-volume"
-    canonical_shared.mkdir(parents=True)
-    alternate_shared = tmp_path / "alternate" / "shared-volume"
-    alternate_db = (
-        alternate_shared
-        / "codex-tasks"
-        / "state"
-        / "governance"
-        / "aming-claw"
-        / "governance.db"
-    )
-    alternate_db.parent.mkdir(parents=True)
-    alternate_db.touch()
-    alternate_metadata = alternate_db.stat()
-    alternate_identity = {
-        **_promotion_database_identity(),
-        "device": int(alternate_metadata.st_dev),
-        "inode": int(alternate_metadata.st_ino),
-    }
-    canonical_identity = {
-        **_promotion_database_identity(),
-        "inode": int(alternate_metadata.st_ino) + 1,
-    }
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
-    monkeypatch.setenv(
-        "AMING_CLAW_STABLE_ANCHOR_COMMIT", server.AC_STABLE_ANCHOR_COMMIT
-    )
-    monkeypatch.setenv("AMING_CLAW_HOME", str(tmp_path / "runtime"))
-    monkeypatch.setenv("SHARED_VOLUME_PATH", str(alternate_shared.resolve()))
+    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", stable)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(storage_root))
+    monkeypatch.setenv("AMING_CLAW_HOME", str(tmp_path / "runtime-home"))
+    monkeypatch.delenv("SHARED_VOLUME_PATH", raising=False)
     monkeypatch.setattr(server, "PORT", server.AC_DEV_SERVICE_PORT)
     monkeypatch.setattr(
         server,
@@ -15490,28 +15310,74 @@ def test_direct_dev_startup_rejects_alternate_database_before_open(
     )
     monkeypatch.setattr(
         server,
-        "canonical_ac_database_identity",
-        lambda: dict(alternate_identity),
+        "_branch_service_git_output",
+        lambda _root, args: stable
+        if args == ["rev-parse", "--verify", f"refs/heads/{server.AC_STABLE_BRANCH}"]
+        else "",
     )
     monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    identity = server._validate_runtime_plane_startup()
+
+    assert identity["status"] == "ready"
+    assert identity["stable_anchor_commit"] == stable
+    assert identity["database_identity"] == receipt["database_identity"]
+    assert identity["database_identity"]["world_id"] == "ac-dev"
+    assert Path(receipt["database_path"]).is_relative_to(storage_root)
+
+def test_direct_dev_startup_rejects_alternate_database_before_open(
+    monkeypatch, tmp_path
+):
+    # The old alternate-shared-DB comparison is superseded because dev never
+    # accepts a shared stable volume.  Preserve the pre-open invariant: even
+    # with an otherwise valid fresh dev genesis, a shared-volume binding is a
+    # zero-DB-open startup failure.
+    stable = "c" * 40
+    candidate = "d" * 40
+    storage_root = tmp_path / "dev-world"
+    governance_db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity={
+            "root": str(tmp_path / "source"),
+            "branch": server.AC_DEV_BRANCH,
+            "commit": candidate,
+            "source_sha256": "sha256:" + "b" * 64,
+        },
+        process_identity={"pid": 1234, "start_identity": "pytest-start"},
+    )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setenv("AMING_CLAW_STABLE_ANCHOR_COMMIT", stable)
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(storage_root))
+    monkeypatch.setenv("AMING_CLAW_HOME", str(tmp_path / "runtime-home"))
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(tmp_path / "stable-shared"))
+    monkeypatch.setattr(server, "PORT", server.AC_DEV_SERVICE_PORT)
+    monkeypatch.setattr(
         server,
-        "_branch_service_stable_database_binding",
-        lambda _root: (canonical_shared.resolve(), dict(canonical_identity)),
+        "_git_identity",
+        lambda _root: {
+            "worktree_root": str(tmp_path / "ac-dev"),
+            "branch": server.AC_DEV_BRANCH,
+            "commit": candidate,
+            "dirty": "",
+        },
     )
     monkeypatch.setattr(
         server,
         "get_connection",
         lambda _project_id: pytest.fail(
-            "alternate dev DB must fail before any database open"
+            "shared-volume rejection must happen before any database open"
         ),
     )
 
     with pytest.raises(
         server.GovernanceSingletonError,
-        match="canonical_stable_database_identity_mismatch",
+        match="ac_dev_stable_shared_volume_forbidden",
     ):
         server._validate_runtime_plane_startup()
-
 
 def test_generic_runtime_from_ac_dev_checkout_fails_closed(monkeypatch):
     monkeypatch.delenv("AMING_CLAW_RUNTIME_PLANE", raising=False)
@@ -204338,3 +204204,84 @@ def test_verified_generic_recovery_authority_allows_only_explicit_occupied_dev_p
     assert recovered["mode"] == "verified_generic"
     assert recovered["commit"] == commit
     assert recovered["graph"]["active_snapshot_id"] == "full-stable"
+@pytest.mark.parametrize("alias", ["aming-claw", "aming_claw", "amingClaw", "AMING-CLAW"])
+def test_stable_world_rejects_ac_canonical_and_aliases_before_effect(monkeypatch, alias):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+    with pytest.raises(server.ValidationError) as rejected:
+        server._guard_runtime_world_request(
+            method="GET",
+            path=f"/api/backlog/{alias}",
+            path_params={"project_id": alias},
+            body={},
+            query={},
+            token="",
+        )
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert rejected.value.details["writes_performed"] is False
+    assert rejected.value.details["runtime_plane"] == "stable"
+
+
+def test_dev_world_accepts_exact_ac_only_and_never_uses_stable_proxy(monkeypatch):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server,
+        "_dev_stable_proxy_json",
+        lambda: (_ for _ in ()).throw(AssertionError("stable proxy forbidden")),
+    )
+    assert server._stable_runtime_health() == {}
+    assert server._stable_runtime_graph_status() == {}
+    assert server._current_stable_runtime_authority() == {}
+    handler_source = inspect.getsource(server.GovernanceHandler._handle)
+    assert "_handle_dev_external_read_only_discovery" not in handler_source
+    assert "_guard_dev_runtime_request" not in handler_source
+    assert server._guard_runtime_world_request(
+        method="GET",
+        path="/api/backlog/aming-claw",
+        path_params={"project_id": "aming-claw"},
+        body={},
+        query={},
+        token="",
+    ) is None
+    for project_id in ("aming_claw", "amingClaw", "other-project", "*", ""):
+        with pytest.raises(server.ValidationError):
+            server._guard_runtime_world_request(
+                method="GET",
+                path=f"/api/backlog/{project_id}",
+                path_params={"project_id": project_id},
+                body={},
+                query={},
+                token="",
+            )
+
+
+def test_world_guard_rejects_anonymous_wildcard_and_unscoped_mutations(monkeypatch):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    cases = (
+        ("/api/backlog/aming-claw/ROW", {"project_id": "aming-claw"}, {}, ""),
+        ("/api/role/assign", {}, {"project_id": "aming-claw"}, ""),
+        ("/api/role/assign", {}, {"project_id": "*"}, "operator-token"),
+        ("/api/role/assign", {}, {}, "operator-token"),
+    )
+    for path, params, body, token in cases:
+        with pytest.raises(server.ValidationError) as rejected:
+            server._guard_runtime_world_request(
+                method="POST",
+                path=path,
+                path_params=params,
+                body=body,
+                query={},
+                token=token,
+            )
+        assert rejected.value.details["writes_performed"] is False
+
+
+def test_stable_world_keeps_non_ac_project_behavior_with_authenticated_scope(monkeypatch):
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+    assert server._guard_runtime_world_request(
+        method="POST",
+        path="/api/backlog/content-sys/ROW",
+        path_params={"project_id": "content-sys"},
+        body={"project_id": "content-sys"},
+        query={},
+        token="operator-token",
+    ) is None

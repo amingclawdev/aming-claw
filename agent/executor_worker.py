@@ -15,7 +15,7 @@ Flow:
 
 Usage:
   python -m agent.executor_worker --project aming-claw
-  GOVERNANCE_URL=http://localhost:40000 python -m agent.executor_worker
+  AC_DEV_GOVERNANCE_URL=http://127.0.0.1:40008 python -m agent.executor_worker
 
 Full chain verified: dev→test→qa→merge→deploy.
 """
@@ -50,7 +50,9 @@ log = logging.getLogger("executor_worker")
 
 # --- Configuration ---
 
-GOVERNANCE_URL = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+# Empty means "derive from the exact project world".  A module-level stable
+# default made an otherwise unconfigured AC executor silently target 40000.
+GOVERNANCE_URL = os.getenv("GOVERNANCE_URL", "")
 POLL_INTERVAL = int(os.getenv("EXECUTOR_POLL_INTERVAL", "10"))
 WORKER_ID = os.getenv("EXECUTOR_WORKER_ID", f"executor-{os.getpid()}")
 WORKSPACE = os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[1]))
@@ -65,6 +67,36 @@ SHUTDOWN_TIMEOUT = int(os.getenv("SHUTDOWN_TIMEOUT", "120"))
 # finished work. Retry only after error-shaped responses from _api().
 COMPLETE_RETRY_DELAYS = (5, 15, 30)
 COMPLETE_REQUEST_TIMEOUT = int(os.getenv("COMPLETE_REQUEST_TIMEOUT", "900"))
+
+
+def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str:
+    raw = str(project_id or "").strip()
+    canonical = re.sub(r"-+", "-", re.sub(r"[\s_]+", "-", raw)).lower().strip("-")
+    if canonical == "aming-claw" and raw != "aming-claw":
+        raise ValueError("AC executor project id must be exact aming-claw")
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", canonical):
+        raise ValueError("executor project id is invalid")
+    selected = str(requested_url or "").rstrip("/")
+    if canonical == "aming-claw":
+        expected = os.getenv(
+            "AC_DEV_GOVERNANCE_URL", "http://127.0.0.1:40008"
+        ).rstrip("/")
+        if selected and selected not in {expected, "http://localhost:40008"}:
+            raise ValueError("AC executor is bound exclusively to dev port 40008")
+        return expected
+    selected = selected or "http://127.0.0.1:40000"
+    if selected.endswith(":40008"):
+        raise ValueError("port 40008 is reserved to exact project aming-claw")
+    return selected
+
+
+def _world_bound_log_root(project_id: str, workspace: str) -> Path:
+    if project_id == "aming-claw":
+        root = os.getenv("AMING_CLAW_DEV_STORAGE_ROOT", "").strip()
+        if not root:
+            raise RuntimeError("AC executor requires AMING_CLAW_DEV_STORAGE_ROOT")
+        return Path(root).expanduser().resolve() / "runtime" / "logs"
+    return Path(workspace or ".") / "shared-volume" / "codex-tasks" / "logs"
 
 # Task type → role.
 # Timeout is no longer hardcoded per task type.  The ai_lifecycle streaming watchdog
@@ -372,9 +404,10 @@ class ExecutorWorker:
     def __init__(self, project_id: str, governance_url: str = GOVERNANCE_URL,
                  worker_id: str = WORKER_ID, workspace: str = WORKSPACE):
         self.project_id = project_id
-        self.base_url = governance_url.rstrip("/")
+        self.base_url = _world_bound_governance_url(project_id, governance_url)
         self.worker_id = worker_id
         self.workspace = workspace
+        self.log_root = _world_bound_log_root(project_id, workspace)
         self._running = False
         self._current_task = None
         self._lifecycle = None
@@ -475,7 +508,7 @@ class ExecutorWorker:
         import time as _time
         _t0 = _time.time()
         # Write timing to a file for debugging (host process logs may not be visible)
-        _timing_file = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+        _timing_file = os.path.join(str(self.log_root),
                                      f"timing-{task_id}.txt")
         os.makedirs(os.path.dirname(_timing_file), exist_ok=True)
         def _timing(msg):
@@ -1555,7 +1588,7 @@ class ExecutorWorker:
             _bt0 = _bt.time()
             def _bp_log(msg):
                 try:
-                    bp_path = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                    bp_path = os.path.join(str(self.log_root),
                                            f"build-prompt-{context.get('task_id','?')}.txt")
                     with open(bp_path, "a") as f:
                         f.write(f"{_bt.time()-_bt0:.1f}s {msg}\n")
@@ -1882,7 +1915,7 @@ class ExecutorWorker:
             _bt0 = _bt.time()
             def _bp_log(msg):
                 try:
-                    log_path = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                    log_path = os.path.join(str(self.log_root),
                                             f"build-prompt-{context.get('task_id','?')}.txt")
                     with open(log_path, "a") as f:
                         f.write(f"{_bt.time()-_bt0:.1f}s {msg}\n")
@@ -2082,7 +2115,7 @@ class ExecutorWorker:
 
         # Debug: dump raw output to file for observability
         try:
-            dump_path = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+            dump_path = os.path.join(str(self.log_root),
                                      f"coordinator-{task['task_id']}.raw.txt")
             os.makedirs(os.path.dirname(dump_path), exist_ok=True)
             with open(dump_path, "w", encoding="utf-8") as f:
@@ -2177,7 +2210,7 @@ class ExecutorWorker:
         def _hv_log(msg):
             # Write to file FIRST (log.info may block in MCP subprocess)
             try:
-                _log_path = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                _log_path = os.path.join(str(self.log_root),
                                           f"coordinator-flow-{task.get('task_id','?')}.txt")
                 with open(_log_path, "a") as f:
                     f.write(f"  handle_v1 {_t.time()-_hv_t0:.1f}s {msg}\n")
@@ -2774,7 +2807,7 @@ class ExecutorWorker:
                 self._last_query_memories = []
                 import time as _t
                 _ct0 = _t.time()
-                _coord_log = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                _coord_log = os.path.join(str(self.log_root),
                                           f"coordinator-flow-{task_id}.txt")
                 os.makedirs(os.path.dirname(_coord_log), exist_ok=True)
                 def _clog(msg):
@@ -2902,7 +2935,7 @@ class ExecutorWorker:
             elif chain.get("deploy"):
                 chain_msg = f"deploy: {chain['deploy']}"
             try:
-                complete_file = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                complete_file = os.path.join(str(self.log_root),
                                              f"complete-{task_id}.txt")
                 with open(complete_file, "w") as f:
                     f.write(f"status: {status}\n")
@@ -2916,7 +2949,7 @@ class ExecutorWorker:
 
         except Exception as e:
             try:
-                err_file = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                err_file = os.path.join(str(self.log_root),
                                         f"error-{task_id}.txt")
                 with open(err_file, "w") as f:
                     f.write(f"error: {e}\n")

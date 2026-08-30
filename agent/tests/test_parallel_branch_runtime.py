@@ -209,6 +209,51 @@ def _batch_read_model_planned_item_and_contexts(
     return item, contexts
 
 
+def test_dev_parallel_context_cross_world_refs_are_zero_write_rejected(
+    monkeypatch,
+) -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        governance_project_id="aming-claw",
+        target_project_id="judgment-brain",
+        task_id="cex-cross-world",
+        branch_ref="refs/heads/codex/cross-world",
+        status=STATE_WORKTREE_READY,
+    )
+
+    with pytest.raises(ValueError, match="runtime project/world boundary"):
+        upsert_branch_context(conn, context, now_iso=NOW)
+
+    table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='parallel_branch_runtime_contexts'"
+    ).fetchone()
+    assert table is None
+
+
+def test_dev_parallel_context_exact_ac_refs_are_persisted(monkeypatch) -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    ensure_branch_runtime_schema(conn)
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    context = BranchTaskRuntimeContext(
+        project_id="aming-claw",
+        governance_project_id="aming-claw",
+        target_project_id="aming-claw",
+        task_id="cex-dev-world",
+        branch_ref="refs/heads/codex/dev-world",
+        status=STATE_WORKTREE_READY,
+    )
+
+    saved = upsert_branch_context(conn, context, now_iso=NOW)
+
+    assert saved.project_id == "aming-claw"
+    assert get_branch_context(conn, "aming-claw", "cex-dev-world") is not None
+
+
 def test_batch_planned_item_binding_without_runtime_uses_exact_unique_identity() -> None:
     item, contexts = _batch_read_model_planned_item_and_contexts()
 

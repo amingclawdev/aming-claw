@@ -3461,18 +3461,8 @@ class TestACDevRuntimeCli:
     ):
         import agent.cli as cli
 
-        shared = tmp_path / "shared"
-        db_path = (
-            shared
-            / "codex-tasks"
-            / "state"
-            / "governance"
-            / "aming-claw"
-            / "governance.db"
-        )
-        db_path.parent.mkdir(parents=True)
-        db_path.touch()
         runtime_root = tmp_path / "runtime"
+        dev_storage_root = tmp_path / "dev-world"
         calls = []
         legacy_start = types.ModuleType("start_governance")
 
@@ -3484,22 +3474,8 @@ class TestACDevRuntimeCli:
         monkeypatch.setattr(cli, "_run_dev_governance", lambda: calls.append("guarded"))
         monkeypatch.setattr(
             cli,
-            "_current_stable_anchor_commit",
+            "_local_stable_source_anchor",
             lambda: cli.AC_STABLE_ANCHOR_COMMIT,
-        )
-        database_identity = {
-            "schema_version": "ac_stable_database_identity.v1",
-            "device": 1,
-            "inode": 2,
-            "stable_relative_path_sha256": "sha256:" + "1" * 64,
-        }
-        monkeypatch.setattr(
-            cli,
-            "_canonical_stable_database_binding",
-            lambda *_args, **_kwargs: {
-                "shared_volume_path": str(shared.resolve()),
-                "stable_database_identity": database_identity,
-            },
         )
         monkeypatch.setattr(
             cli,
@@ -3509,8 +3485,10 @@ class TestACDevRuntimeCli:
                 "branch": cli.AC_DEV_BRANCH,
                 "commit": "b" * 40,
                 "dirty": "",
+                "source_sha256": "sha256:" + "c" * 64,
             },
         )
+        monkeypatch.delenv("SHARED_VOLUME_PATH", raising=False)
         monkeypatch.setattr(cli, "_require_source_checkout_matches_loaded_package", lambda workspace: None)
         monkeypatch.setattr(cli, "_probe_governance", lambda port: None)
         monkeypatch.setattr(cli, "_port_is_open", lambda port: False)
@@ -3537,8 +3515,8 @@ class TestACDevRuntimeCli:
                 "40008",
                 "--runtime-workspace",
                 str(runtime_root),
-                "--shared-volume-path",
-                str(shared),
+                "--dev-storage-root",
+                str(dev_storage_root),
             ],
         )
 
@@ -3548,8 +3526,12 @@ class TestACDevRuntimeCli:
         assert os.environ["AMING_CLAW_STABLE_ANCHOR_COMMIT"] == cli.AC_STABLE_ANCHOR_COMMIT
         assert os.environ["AMING_CLAW_ALLOWED_PROJECT_IDS"] == "aming-claw"
         assert os.environ["AMING_CLAW_DB_MIGRATION_POLICY"] == "verify-only"
-        assert os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] == "deny"
+        assert os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] == "dev-world-only"
         assert os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] == "deny"
+        assert os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] == str(
+            dev_storage_root.resolve()
+        )
+        assert "SHARED_VOLUME_PATH" not in os.environ
         for key in (
             "AMING_CLAW_RUNTIME_PLANE",
             "AMING_CLAW_STABLE_ANCHOR_COMMIT",
@@ -3560,6 +3542,7 @@ class TestACDevRuntimeCli:
             "SHARED_VOLUME_PATH",
             "AMING_CLAW_HOME",
             "GOVERNANCE_PORT",
+            "AMING_CLAW_DEV_STORAGE_ROOT",
         ):
             os.environ.pop(key, None)
 
@@ -3588,6 +3571,7 @@ class TestACDevRuntimeCli:
             "branch": cli.AC_DEV_BRANCH,
             "commit": candidate,
             "dirty": "",
+            "source_sha256": "sha256:" + "c" * 64,
         }
         runtime_identity = {
             "status": "ready",
@@ -3598,12 +3582,16 @@ class TestACDevRuntimeCli:
             "stable_anchor_commit": stable,
         }
         database_identity = {
-            "schema_version": "ac_stable_database_identity.v1",
+            "schema_version": "ac_governance_database_identity.v2",
+            "world_id": "ac-dev",
+            "project_id": "aming-claw",
             "device": 1,
             "inode": 2,
-            "stable_relative_path_sha256": "sha256:" + "1" * 64,
+            "relative_path_sha256": "sha256:" + "1" * 64,
+            "genesis_sha256": "sha256:" + "2" * 64,
         }
-        runtime_identity["stable_database_identity"] = database_identity
+        runtime_identity["database_identity"] = database_identity
+        runtime_identity["world_id"] = "ac-dev"
         runtime_identity.update(identity_override)
         health = {
             "status": "ok",
@@ -3620,13 +3608,17 @@ class TestACDevRuntimeCli:
             cli, "_require_source_checkout_matches_loaded_package", lambda _workspace: None
         )
         monkeypatch.setattr(cli, "_source_git_identity", lambda: source_identity)
-        monkeypatch.setattr(cli, "_current_stable_anchor_commit", lambda: stable)
+        monkeypatch.setattr(cli, "_local_stable_source_anchor", lambda: stable)
         monkeypatch.setattr(
             cli,
-            "_canonical_stable_database_binding",
+            "_canonical_dev_database_binding",
             lambda *_args, **_kwargs: {
-                "shared_volume_path": str((tmp_path / "shared").resolve()),
-                "stable_database_identity": database_identity,
+                "dev_storage_root": str((tmp_path / "dev-world").resolve()),
+                "database_path": str(tmp_path / "dev-world" / "governance.db"),
+                "dev_database_identity": database_identity,
+                "genesis_sha256": "sha256:" + "2" * 64,
+                "source_only": True,
+                "rows_copied": 0,
             },
         )
         monkeypatch.setattr(cli, "_probe_governance", lambda _port: health)
@@ -3644,44 +3636,6 @@ class TestACDevRuntimeCli:
     ):
         import agent.cli as cli
 
-        calls = []
-
-        def fake_local(payload):
-            calls.append(payload)
-            return 200, {
-                "ok": True,
-                "actual_listening_port": 40008,
-                "pid": 123,
-                "worktree_root": str(tmp_path),
-            }
-
-        monkeypatch.setattr(cli, "_local_branch_service_validate", fake_local)
-        monkeypatch.setattr(
-            cli,
-            "_current_stable_anchor_commit",
-            lambda: cli.AC_STABLE_ANCHOR_COMMIT,
-        )
-        database_identity = {
-            "schema_version": "ac_stable_database_identity.v1",
-            "device": 1,
-            "inode": 2,
-            "stable_relative_path_sha256": "sha256:" + "1" * 64,
-        }
-        monkeypatch.setattr(
-            cli,
-            "_canonical_stable_database_binding",
-            lambda *_args, **_kwargs: {
-                "shared_volume_path": str((tmp_path / "shared").resolve()),
-                "stable_database_identity": database_identity,
-            },
-        )
-        monkeypatch.setattr(
-            cli,
-            "_http_json",
-            lambda *args, **kwargs: pytest.fail(
-                "frozen stable service must not spawn the dev runtime"
-            ),
-        )
         result = CliRunner().invoke(
             main,
             [
@@ -3694,12 +3648,9 @@ class TestACDevRuntimeCli:
             ],
         )
 
-        assert result.exit_code == 0, result.output
-        payload = calls[0]
-        assert payload["port"] == 40008
-        assert payload["stable_anchor_commit"] == cli.AC_STABLE_ANCHOR_COMMIT
-        assert payload["shared_volume_path"] == str((tmp_path / "shared").resolve())
-        assert payload["stable_database_identity"] == database_identity
+        assert result.exit_code != 0
+        assert "Shared-database branch-service validation is retired" in result.output
+        assert "--runtime-plane dev --dev-storage-root" in result.output
 
     def test_dev_database_binding_rejects_alternate_ac_shaped_volume(
         self, monkeypatch, tmp_path
@@ -3760,28 +3711,8 @@ def test_branch_service_orphan_handoff_cli_is_two_phase_and_copy_safe(
 
     orphan = tmp_path / "orphan"
     successor = tmp_path / "successor"
-    runtime = tmp_path / "runtime"
     orphan.mkdir()
     successor.mkdir()
-    runtime.mkdir()
-    receipt = {
-        "schema_version": "ac_dev_orphan_adopt_stop_handoff_inspection.v1",
-        "inspection_receipt_sha256": "sha256:" + "1" * 64,
-    }
-    calls = []
-
-    def fake_local(payload):
-        calls.append(payload)
-        return 200, {
-            "ok": True,
-            "action": payload["action"],
-            "inspection": receipt,
-            "pass_synthesized": False,
-        }
-
-    monkeypatch.setattr(
-        cli, "_local_branch_service_adopt_stop_handoff", fake_local
-    )
     inspect_result = CliRunner().invoke(
         main,
         [
@@ -3795,49 +3726,9 @@ def test_branch_service_orphan_handoff_cli_is_two_phase_and_copy_safe(
             "43210",
         ],
     )
-    assert inspect_result.exit_code == 0, inspect_result.output
-    assert calls[-1] == {
-        "action": "inspect",
-        "orphan_worktree_path": str(orphan.resolve()),
-        "successor_worktree_path": str(successor.resolve()),
-        "orphan_pid": 43210,
-        "allow_kill": False,
-        "term_timeout_sec": 5.0,
-        "kill_timeout_sec": 5.0,
-        "replacement_timeout_sec": 30.0,
-    }
-
-    receipt_path = tmp_path / "inspection.json"
-    receipt_path.write_text(
-        json.dumps({"ok": True, "inspection": receipt}), encoding="utf-8"
-    )
-    execute_result = CliRunner().invoke(
-        main,
-        [
-            "branch-service",
-            "adopt-stop-handoff",
-            "--orphan-worktree",
-            str(orphan),
-            "--successor-worktree",
-            str(successor),
-            "--orphan-pid",
-            "43210",
-            "--inspection-receipt",
-            str(receipt_path),
-            "--runtime-workspace",
-            str(runtime),
-            "--allow-kill",
-        ],
-    )
-    assert execute_result.exit_code == 0, execute_result.output
-    assert calls[-1]["action"] == "execute"
-    assert calls[-1]["inspection_receipt"] == receipt
-    assert calls[-1]["inspection_receipt_sha256"] == (
-        "sha256:" + "1" * 64
-    )
-    assert calls[-1]["allow_kill"] is True
-    assert calls[-1]["runtime_workspace"] == str(runtime.resolve())
-    assert "raw_token" not in execute_result.output
+    assert inspect_result.exit_code != 0
+    assert "Shared-database orphan handoff is retired" in inspect_result.output
+    assert "fresh genesis" in inspect_result.output
 
 
 def test_branch_service_orphan_handoff_cli_never_authorizes_kill_at_inspection(
@@ -3862,4 +3753,4 @@ def test_branch_service_orphan_handoff_cli_never_authorizes_kill_at_inspection(
         ],
     )
     assert result.exit_code != 0
-    assert "only with an explicit inspection receipt" in result.output
+    assert "Shared-database orphan handoff is retired" in result.output
