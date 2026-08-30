@@ -17,12 +17,14 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 _STABLE_GOVERNANCE_URL = "http://127.0.0.1:40000"
@@ -57,7 +59,11 @@ def _plane_bound_endpoints(project_id: str) -> tuple[str, str]:
     stable manager sidecar, because that sidecar has different DB and process
     custody.
     """
-    if str(project_id or "").strip() == "aming-claw":
+    raw = str(project_id or "").strip()
+    normalized = re.sub(r"[-_\s]+", "-", raw).strip("-").lower()
+    if normalized == "aming-claw" and raw != "aming-claw":
+        raise ValueError("AC deploy consumers require exact canonical project_id=aming-claw")
+    if raw == "aming-claw":
         return (_AC_DEV_GOVERNANCE_URL, _AC_DEV_MANAGER_URL)
     return (_STABLE_GOVERNANCE_URL, _STABLE_MANAGER_URL)
 
@@ -188,16 +194,23 @@ def _is_host_runtime_mode() -> bool:
     return not compose_file.exists()
 
 
-def rebuild_governance() -> tuple[bool, str]:
+def rebuild_governance(project_id: str = "") -> tuple[bool, str]:
     """Rebuild + restart governance Docker container, then health-check.
 
     Uses docker compose build + up directly (Windows-compatible).
     In host-runtime mode (no Docker), falls directly to restart_local_governance.
     Returns (success, output_summary).
     """
+    governance_url, _manager_url = _plane_bound_endpoints(project_id)
+    governance_port = urlparse(governance_url).port
+    # Docker compose owns only the stable world.  AC's dev listener is host
+    # managed and must not be rebuilt through the stable compose project.
+    if str(project_id or "").strip() == "aming-claw" and not _is_host_runtime_mode():
+        return False, "AC dev governance cannot be rebuilt through stable Docker"
+
     # R4: detect host-runtime mode and skip Docker
     if _is_host_runtime_mode():
-        return restart_local_governance(port=40000)
+        return restart_local_governance(port=governance_port or 40000)
 
     repo_root = Path(__file__).resolve().parent.parent
     compose_file = repo_root / "docker-compose.governance.yml"
@@ -246,7 +259,7 @@ def rebuild_governance() -> tuple[bool, str]:
             if attempt > 0:
                 _time.sleep(5)
             try:
-                resp = requests.get("http://localhost:40000/api/health", timeout=10)
+                resp = requests.get(f"{governance_url}/api/health", timeout=10)
                 if resp.status_code == 200:
                     output_lines.append("[health] governance OK")
                     return True, "\n".join(output_lines)
@@ -547,7 +560,7 @@ def restart_gateway() -> tuple[bool, str]:
 # 5. smoke_test
 # ---------------------------------------------------------------------------
 
-def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
+def smoke_test(affected_services: list[str] | None = None, project_id: str = "") -> dict[str, Any]:
     """Quick health check for executor, governance, and gateway.
 
     Parameters
@@ -569,6 +582,7 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
     all_services = ["executor", "governance", "gateway"]
     results: dict[str, Any] = {svc: False for svc in all_services}
     results["all_pass"] = False
+    governance_url, _manager_url = _plane_bound_endpoints(project_id)
 
     import time as _time
     _time.sleep(5)  # Brief pause to let services stabilize after restarts
@@ -592,7 +606,7 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
     if results["governance"] != "not_applicable":
         try:
             import requests
-            resp = requests.get("http://localhost:40000/api/health", timeout=5)
+            resp = requests.get(f"{governance_url}/api/health", timeout=5)
             results["governance"] = resp.status_code == 200
         except Exception:  # noqa: BLE001
             results["governance"] = False
@@ -846,7 +860,10 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         report["steps"] = steps
 
         # 3. Smoke test — only check affected services (R5)
-        smoke = smoke_test(affected_services=affected)
+        smoke = smoke_test(
+            affected_services=affected,
+            **({"project_id": project_id} if project_id else {}),
+        )
         report["smoke_test"] = smoke
 
         # R2: Single derivation — success = all steps OK AND smoke_test.all_pass
@@ -879,7 +896,9 @@ def _mark_task_succeeded_pre_kill(task_id: str, project_id: str) -> None:
     import urllib.request
     import urllib.error
 
-    url = f"http://localhost:40000/api/task/{project_id or 'aming-claw'}/complete"
+    canonical_project = str(project_id or "proj").strip()
+    governance_url, _manager_url = _plane_bound_endpoints(canonical_project)
+    url = f"{governance_url}/api/task/{canonical_project}/complete"
     payload = json.dumps({
         "task_id": task_id,
         "status": "succeeded",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import textwrap
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -34,6 +35,39 @@ def test_plane_bound_endpoint_selection_keeps_ac_off_stable_sidecar():
     assert _plane_bound_endpoints("aming-claw") == (
         "http://127.0.0.1:40008", "http://127.0.0.1:40109"
     )
+
+
+def test_smoke_test_uses_ac_dev_health_not_healthy_stable(monkeypatch):
+    import agent.deploy_chain as deploy
+
+    class Response:
+        status_code = 200
+
+    called = []
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(deploy, "_executor_health_from_state", lambda: True)
+    monkeypatch.setitem(__import__("sys").modules, "requests", type("Requests", (), {
+        "get": staticmethod(lambda url, timeout: called.append(url) or Response())
+    }))
+    result = deploy.smoke_test(["governance"], project_id="aming-claw")
+    assert result["governance"] is True
+    assert called == ["http://127.0.0.1:40008/api/health"]
+
+
+def test_ac_rebuild_refuses_stable_docker_path(monkeypatch):
+    import agent.deploy_chain as deploy
+
+    monkeypatch.setattr(deploy, "_is_host_runtime_mode", lambda: False)
+    ok, detail = deploy.rebuild_governance(project_id="aming-claw")
+    assert ok is False
+    assert "stable Docker" in detail
+
+
+def test_noncanonical_ac_project_fails_closed_instead_of_selecting_stable():
+    from agent.deploy_chain import _plane_bound_endpoints
+
+    with pytest.raises(ValueError, match="exact canonical"):
+        _plane_bound_endpoints("aming_claw")
 
 
 def test_port_40200_absent_in_deploy_chain():
