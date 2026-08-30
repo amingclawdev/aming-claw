@@ -15,6 +15,8 @@ import hashlib
 import json
 import re
 import fcntl
+import subprocess
+from contextlib import closing
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 
@@ -39,6 +41,8 @@ AC_DATABASE_STABLE_RELATIVE_PATH = (
     "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
 )
 AC_DATABASE_DEV_RELATIVE_PATH = "governance/aming-claw/governance.db"
+AC_LEGACY_ARCHIVE_SIZE_BYTES = 178_625_794_048
+AC_DEV_CUTOVER_SCHEMA = "ac_dev_world_cutover.v1"
 
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, object] = {}
@@ -595,7 +599,7 @@ def canonical_ac_database_identity(
             ]
             if main_paths != [db_path.resolve(strict=True)]:
                 raise ValueError("opened AC dev database identity mismatch")
-        with sqlite3.connect(db_path) as identity_conn:
+        with closing(sqlite3.connect(db_path)) as identity_conn:
             meta = dict(identity_conn.execute("SELECT key, value FROM schema_meta"))
         genesis_sha256 = str(meta.get("governance_world_genesis_sha256") or "")
         if (
@@ -1185,11 +1189,100 @@ def _world_genesis_hash(genesis: Mapping[str, object]) -> str:
     ).hexdigest()
 
 
+def _world_source_tip_hash(source: Mapping[str, object]) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            dict(source),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _verify_dev_source_upgrade(
+    previous: Mapping[str, object],
+    candidate: Mapping[str, object],
+) -> None:
+    """Verify one clean exact-branch Git descendant without changing source."""
+
+    try:
+        previous_root = Path(
+            str(previous.get("root") or "")
+        ).expanduser().resolve(strict=True)
+        candidate_root = Path(
+            str(candidate.get("root") or "")
+        ).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("AC dev source upgrade root mismatch") from exc
+    if candidate_root != previous_root:
+        raise ValueError("AC dev source upgrade root mismatch")
+    if (
+        str(previous.get("branch") or "") != "codex/ac-dev"
+        or str(candidate.get("branch") or "") != "codex/ac-dev"
+    ):
+        raise ValueError("AC dev source upgrade branch mismatch")
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=candidate_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError("AC dev source upgrade Git identity unavailable")
+        return result.stdout.strip()
+
+    if Path(git("rev-parse", "--show-toplevel")).resolve(strict=True) != candidate_root:
+        raise ValueError("AC dev source upgrade top-level mismatch")
+    if git("branch", "--show-current") != "codex/ac-dev":
+        raise ValueError("AC dev source upgrade checked-out branch mismatch")
+    if git("status", "--porcelain"):
+        raise ValueError("AC dev source upgrade requires a clean worktree")
+    if git("rev-parse", "HEAD").lower() != str(candidate.get("commit") or ""):
+        raise ValueError("AC dev source upgrade HEAD mismatch")
+    ancestor = subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            str(previous.get("commit") or ""),
+            str(candidate.get("commit") or ""),
+        ],
+        cwd=candidate_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        raise ValueError("AC dev source upgrade candidate is not a descendant")
+
+
+def _exclusive_writer_file_lease(database: Path):
+    """Acquire the same physical writer fence used by the running dev world."""
+
+    lease_path = Path(str(database) + ".writer.lock")
+    handle = open(lease_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError) as exc:
+        handle.close()
+        raise RuntimeError("AC dev governance database has a concurrent writer") from exc
+    return handle
+
+
 def bootstrap_dev_governance_store(
     storage_root: Path | str,
     *,
     source_identity: Mapping[str, object],
     process_identity: Mapping[str, object],
+    expected_source_tip_sha256: str = "",
+    expected_previous_process_identity: Mapping[str, object] | None = None,
+    expected_database_identity: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Create or verify the source-only AC dev world without copying stable rows.
 
@@ -1238,6 +1331,11 @@ def bootstrap_dev_governance_store(
         "rows_copied": 0,
     }
     genesis_sha256 = _world_genesis_hash(genesis)
+    source_tip_identity = dict(source)
+    source_tip_sha256 = _world_source_tip_hash(source_tip_identity)
+    source_tip_revision = 1
+    current_process_identity = dict(process)
+    source_upgraded = False
     created = not database.exists()
     if database.is_symlink():
         raise ValueError("AC dev governance database cannot be a symlink")
@@ -1255,6 +1353,16 @@ def bootstrap_dev_governance_store(
                     (
                         "governance_world_genesis_json",
                         json.dumps(genesis, sort_keys=True, separators=(",", ":")),
+                    ),
+                    (
+                        "governance_world_source_tip_json",
+                        json.dumps(source_tip_identity, sort_keys=True, separators=(",", ":")),
+                    ),
+                    ("governance_world_source_tip_sha256", source_tip_sha256),
+                    ("governance_world_source_tip_revision", "1"),
+                    (
+                        "governance_world_current_process_json",
+                        json.dumps(current_process_identity, sort_keys=True, separators=(",", ":")),
                     ),
                 ),
             )
@@ -1275,14 +1383,127 @@ def bootstrap_dev_governance_store(
                 and stored_genesis.get("schema_version") == AC_WORLD_GENESIS_SCHEMA
                 and stored_genesis.get("world_id") == AC_DEV_WORLD_ID
                 and stored_genesis.get("project_id") == AC_PROJECT_ID
-                and stored_genesis.get("source_identity") == source
                 and stored_genesis.get("source_only") is True
                 and stored_genesis.get("rows_copied") == 0
                 and stored_hash == _world_genesis_hash(stored_genesis)
             ):
-                raise ValueError("existing AC dev world genesis differs from source")
+                raise ValueError("existing AC dev world genesis is invalid")
             genesis = dict(stored_genesis)
             genesis_sha256 = stored_hash
+            try:
+                source_tip_identity = json.loads(
+                    str(meta.get("governance_world_source_tip_json") or "")
+                )
+            except (TypeError, ValueError):
+                source_tip_identity = dict(stored_genesis.get("source_identity") or {})
+            if not isinstance(source_tip_identity, Mapping):
+                raise ValueError("existing AC dev source tip is unreadable")
+            source_tip_identity = dict(source_tip_identity)
+            source_tip_sha256 = str(
+                meta.get("governance_world_source_tip_sha256")
+                or _world_source_tip_hash(source_tip_identity)
+            )
+            if source_tip_sha256 != _world_source_tip_hash(source_tip_identity):
+                raise ValueError("existing AC dev source tip hash is invalid")
+            source_tip_revision = int(
+                meta.get("governance_world_source_tip_revision") or 1
+            )
+            try:
+                current_process_identity = json.loads(
+                    str(meta.get("governance_world_current_process_json") or "")
+                )
+            except (TypeError, ValueError):
+                current_process_identity = dict(
+                    stored_genesis.get("bootstrap_process_identity") or {}
+                )
+            if not isinstance(current_process_identity, Mapping):
+                raise ValueError("existing AC dev process identity is unreadable")
+            current_process_identity = dict(current_process_identity)
+
+            metadata = database.stat(follow_symlinks=False)
+            actual_database_identity = {
+                "schema_version": "ac_governance_database_identity.v2",
+                "world_id": AC_DEV_WORLD_ID,
+                "project_id": AC_PROJECT_ID,
+                "device": int(metadata.st_dev),
+                "inode": int(metadata.st_ino),
+                "relative_path_sha256": "sha256:"
+                + hashlib.sha256(
+                    AC_DATABASE_DEV_RELATIVE_PATH.encode("utf-8")
+                ).hexdigest(),
+                "genesis_sha256": genesis_sha256,
+            }
+            if expected_database_identity is not None and (
+                dict(expected_database_identity) != actual_database_identity
+            ):
+                raise ValueError("AC dev source upgrade database identity mismatch")
+
+            if source != source_tip_identity:
+                if (
+                    expected_source_tip_sha256
+                    and expected_source_tip_sha256 != source_tip_sha256
+                ):
+                    raise ValueError("AC dev source tip CAS mismatch")
+                if expected_previous_process_identity is not None and (
+                    dict(expected_previous_process_identity)
+                    != current_process_identity
+                ):
+                    raise ValueError("AC dev source upgrade process identity mismatch")
+                _verify_dev_source_upgrade(source_tip_identity, source)
+                lease = _exclusive_writer_file_lease(database)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    locked_meta = dict(
+                        conn.execute(
+                            "SELECT key, value FROM schema_meta WHERE key IN "
+                            "('governance_world_source_tip_sha256', "
+                            "'governance_world_source_tip_revision')"
+                        )
+                    )
+                    locked_hash = str(
+                        locked_meta.get("governance_world_source_tip_sha256")
+                        or _world_source_tip_hash(source_tip_identity)
+                    )
+                    locked_revision = int(
+                        locked_meta.get("governance_world_source_tip_revision")
+                        or source_tip_revision
+                    )
+                    if (
+                        locked_hash != source_tip_sha256
+                        or locked_revision != source_tip_revision
+                    ):
+                        raise ValueError("AC dev source tip CAS changed while locked")
+                    next_hash = _world_source_tip_hash(source)
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                        (
+                            (
+                                "governance_world_source_tip_json",
+                                json.dumps(source, sort_keys=True, separators=(",", ":")),
+                            ),
+                            ("governance_world_source_tip_sha256", next_hash),
+                            (
+                                "governance_world_source_tip_revision",
+                                str(source_tip_revision + 1),
+                            ),
+                            (
+                                "governance_world_current_process_json",
+                                json.dumps(process, sort_keys=True, separators=(",", ":")),
+                            ),
+                        ),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+                    lease.close()
+                source_tip_identity = dict(source)
+                source_tip_sha256 = _world_source_tip_hash(source_tip_identity)
+                source_tip_revision += 1
+                current_process_identity = dict(process)
+                source_upgraded = True
     except Exception:
         conn.close()
         if created:
@@ -1317,7 +1538,409 @@ def bootstrap_dev_governance_store(
         "created": created,
         "restart_safe": True,
         "legacy_rows_imported": False,
-        "current_process_identity": process,
+        "current_process_identity": current_process_identity,
+        "source_tip_identity": source_tip_identity,
+        "source_tip_sha256": source_tip_sha256,
+        "source_tip_revision": source_tip_revision,
+        "source_upgraded": source_upgraded,
+    }
+
+
+def _cutover_hash(payload: Mapping[str, object]) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _atomic_cutover_json(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise ValueError("AC dev cutover directory cannot be a symlink")
+    temporary = path.parent / f".{path.name}.tmp-{os.getpid()}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        body = json.dumps(
+            dict(payload), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        os.write(descriptor, body)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _read_cutover_json(path: Path) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("AC dev cutover checkpoint is unavailable")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError("AC dev cutover checkpoint is unreadable") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("AC dev cutover checkpoint is invalid")
+    return dict(value)
+
+
+def _default_cutover_listener_probe(port: int) -> dict[str, object]:
+    """Inspect one local listener without starting, stopping, or signalling it."""
+
+    result = subprocess.run(
+        ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-Fp"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    pids = sorted(
+        {
+            int(line[1:])
+            for line in result.stdout.splitlines()
+            if line.startswith("p") and line[1:].isdigit()
+        }
+    )
+    if len(pids) > 1:
+        raise ValueError("AC dev cutover listener ownership is ambiguous")
+    pid = pids[0] if pids else 0
+    start_identity = ""
+    if pid:
+        process = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        start_identity = process.stdout.strip() if process.returncode == 0 else ""
+    return {
+        "port": int(port),
+        "listening": bool(pid),
+        "pid": pid,
+        "process_start_identity": start_identity,
+        "source_commit": (
+            os.environ.get("AMING_CLAW_STABLE_ANCHOR_COMMIT", "").strip().lower()
+            if int(port) == 40000
+            else ""
+        ),
+    }
+
+
+def _cutover_database_stat(path: Path, *, expected_size: int | None = None) -> dict[str, object]:
+    absolute = path.expanduser().absolute()
+    if absolute.is_symlink():
+        raise ValueError("AC dev cutover database cannot be a symlink")
+    metadata = absolute.stat(follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode) or absolute.resolve(strict=True) != absolute:
+        raise ValueError("AC dev cutover database identity is invalid")
+    if expected_size is not None and int(metadata.st_size) != int(expected_size):
+        raise ValueError("legacy AC archive size identity mismatch")
+    return {
+        "path": str(absolute),
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "size": int(metadata.st_size),
+        "uid": int(metadata.st_uid),
+    }
+
+
+def _inspect_dev_world_cutover(
+    *,
+    legacy_database_path: Path | str,
+    storage_root: Path | str,
+    source_identity: Mapping[str, object],
+    process_identity: Mapping[str, object],
+    expected_dev_database_identity: Mapping[str, object],
+    listener_probe,
+) -> dict[str, object]:
+    root = _absolute_non_symlink_root(
+        Path(storage_root).expanduser().absolute(), create=False
+    )
+    source = {
+        "root": str(source_identity.get("root") or "").strip(),
+        "branch": str(source_identity.get("branch") or "").strip(),
+        "commit": str(source_identity.get("commit") or "").strip().lower(),
+        "source_sha256": str(source_identity.get("source_sha256") or "").strip().lower(),
+    }
+    process = {
+        "pid": int(process_identity.get("pid") or 0),
+        "start_identity": str(process_identity.get("start_identity") or "").strip(),
+    }
+    if process["pid"] <= 0 or not process["start_identity"]:
+        raise ValueError("AC dev cutover operator process identity is incomplete")
+    _verify_dev_source_upgrade(source, source)
+
+    legacy = _cutover_database_stat(
+        Path(legacy_database_path), expected_size=AC_LEGACY_ARCHIVE_SIZE_BYTES
+    )
+    new_database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    new_stat = _cutover_database_stat(new_database)
+    if (legacy["device"], legacy["inode"]) == (
+        new_stat["device"],
+        new_stat["inode"],
+    ):
+        raise ValueError("AC dev cutover old/new database identity overlaps")
+
+    for database in (Path(legacy["path"]), Path(new_stat["path"])):
+        companions = [
+            str(candidate)
+            for suffix in ("-wal", "-shm", "-journal")
+            if (candidate := Path(str(database) + suffix)).exists()
+        ]
+        if companions:
+            raise ValueError("AC dev cutover WAL/SHM ownership must be absent")
+
+    with closing(sqlite3.connect(new_database)) as connection:
+        previous_plane = os.environ.get(RUNTIME_PLANE_ENV)
+        previous_root = os.environ.get(AC_DEV_STORAGE_ROOT_ENV)
+        os.environ[RUNTIME_PLANE_ENV] = DEV_RUNTIME_PLANE
+        os.environ[AC_DEV_STORAGE_ROOT_ENV] = str(root)
+        try:
+            new_identity = canonical_ac_database_identity(connection)
+        finally:
+            if previous_plane is None:
+                os.environ.pop(RUNTIME_PLANE_ENV, None)
+            else:
+                os.environ[RUNTIME_PLANE_ENV] = previous_plane
+            if previous_root is None:
+                os.environ.pop(AC_DEV_STORAGE_ROOT_ENV, None)
+            else:
+                os.environ[AC_DEV_STORAGE_ROOT_ENV] = previous_root
+    if new_identity != dict(expected_dev_database_identity):
+        raise ValueError("AC dev cutover new database identity mismatch")
+
+    stable_listener = dict(listener_probe(40000) or {})
+    dev_listener = dict(listener_probe(40008) or {})
+    if not (
+        stable_listener.get("port") == 40000
+        and stable_listener.get("listening") is True
+        and int(stable_listener.get("pid") or 0) > 0
+        and str(stable_listener.get("process_start_identity") or "").strip()
+        and re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(stable_listener.get("source_commit") or "").strip().lower(),
+        )
+    ):
+        raise ValueError("AC dev cutover stable listener identity is invalid")
+    if not (
+        dev_listener.get("port") == 40008
+        and dev_listener.get("listening") is False
+        and int(dev_listener.get("pid") or 0) == 0
+    ):
+        raise ValueError("AC dev cutover requires port 40008 inactive")
+
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        if str(new_database.resolve(strict=True)) in _DEV_DATABASE_WRITER_LEASES:
+            raise RuntimeError("AC dev cutover found an in-process database writer")
+    lease = _exclusive_writer_file_lease(new_database)
+    try:
+        return {
+            "schema_version": AC_DEV_CUTOVER_SCHEMA,
+            "legacy_database_identity": legacy,
+            "new_database_stat": new_stat,
+            "new_database_identity": new_identity,
+            "source_identity": source,
+            "operator_process_identity": process,
+            "stable_listener_identity": stable_listener,
+            "dev_listener_identity": dev_listener,
+            "wal_shm_absent": True,
+            "concurrent_writer_absent": True,
+            "legacy_rows_copied": 0,
+            "facts_copied": 0,
+        }
+    finally:
+        fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+        lease.close()
+
+
+def preflight_dev_world_cutover(
+    *,
+    legacy_database_path: Path | str,
+    storage_root: Path | str,
+    source_identity: Mapping[str, object],
+    process_identity: Mapping[str, object],
+    expected_dev_database_identity: Mapping[str, object],
+    listener_probe=None,
+) -> dict[str, object]:
+    """Write one restart-safe checkpoint after an entirely bounded preflight."""
+
+    probe = listener_probe or _default_cutover_listener_probe
+    core = _inspect_dev_world_cutover(
+        legacy_database_path=legacy_database_path,
+        storage_root=storage_root,
+        source_identity=source_identity,
+        process_identity=process_identity,
+        expected_dev_database_identity=expected_dev_database_identity,
+        listener_probe=probe,
+    )
+    preflight_hash = _cutover_hash(core)
+    root = Path(storage_root).expanduser().absolute()
+    checkpoint = root / "cutover" / "checkpoints" / (
+        preflight_hash.removeprefix("sha256:") + ".json"
+    )
+    payload = {
+        **core,
+        "status": "ready",
+        "preflight_hash": preflight_hash,
+        "checkpoint_path": str(checkpoint),
+    }
+    if checkpoint.exists():
+        if _read_cutover_json(checkpoint) != payload:
+            raise ValueError("AC dev cutover checkpoint collision")
+    else:
+        _atomic_cutover_json(checkpoint, payload)
+    return payload
+
+
+def _load_cutover_preflight(storage_root: Path | str, preflight_hash: str) -> dict[str, object]:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(preflight_hash or "")):
+        raise ValueError("AC dev cutover preflight hash is invalid")
+    root = _absolute_non_symlink_root(
+        Path(storage_root).expanduser().absolute(), create=False
+    )
+    checkpoint = root / "cutover" / "checkpoints" / (
+        str(preflight_hash).removeprefix("sha256:") + ".json"
+    )
+    payload = _read_cutover_json(checkpoint)
+    core = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"status", "preflight_hash", "checkpoint_path"}
+    }
+    if payload.get("preflight_hash") != preflight_hash or _cutover_hash(core) != preflight_hash:
+        raise ValueError("AC dev cutover checkpoint hash mismatch")
+    return payload
+
+
+def activate_dev_world_cutover(
+    *,
+    storage_root: Path | str,
+    preflight_hash: str,
+    listener_probe=None,
+) -> dict[str, object]:
+    """Atomically activate one unchanged preflight; never starts a process."""
+
+    checkpoint = _load_cutover_preflight(storage_root, preflight_hash)
+    probe = listener_probe or _default_cutover_listener_probe
+    current = _inspect_dev_world_cutover(
+        legacy_database_path=checkpoint["legacy_database_identity"]["path"],
+        storage_root=storage_root,
+        source_identity=checkpoint["source_identity"],
+        process_identity=checkpoint["operator_process_identity"],
+        expected_dev_database_identity=checkpoint["new_database_identity"],
+        listener_probe=probe,
+    )
+    if _cutover_hash(current) != preflight_hash:
+        raise ValueError("AC dev cutover preflight changed before activation")
+    root = Path(storage_root).expanduser().absolute()
+    active_path = root / "cutover" / "active.json"
+    active = {
+        "schema_version": AC_DEV_CUTOVER_SCHEMA,
+        "status": "active",
+        "preflight_hash": preflight_hash,
+        "checkpoint_path": checkpoint["checkpoint_path"],
+        "new_database_identity": checkpoint["new_database_identity"],
+        "source_identity": checkpoint["source_identity"],
+        "legacy_database_identity": checkpoint["legacy_database_identity"],
+        "legacy_rows_copied": 0,
+        "facts_copied": 0,
+    }
+    if active_path.exists():
+        if _read_cutover_json(active_path) != active:
+            raise ValueError("a different AC dev cutover is already active")
+        return {**active, "idempotent": True}
+    _atomic_cutover_json(active_path, active)
+    return {**active, "idempotent": False}
+
+
+def validate_dev_world_cutover_activation(
+    *,
+    storage_root: Path | str,
+    expected_dev_database_identity: Mapping[str, object],
+    source_identity: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the atomic activation and a same-or-descendant source tip."""
+
+    root = _absolute_non_symlink_root(
+        Path(storage_root).expanduser().absolute(), create=False
+    )
+    try:
+        active = _read_cutover_json(root / "cutover" / "active.json")
+    except ValueError as exc:
+        raise ValueError("AC dev cutover activation is unavailable") from exc
+    if active.get("status") != "active":
+        raise ValueError("AC dev cutover activation is not active")
+    checkpoint = _load_cutover_preflight(
+        root, str(active.get("preflight_hash") or "")
+    )
+    if (
+        active.get("new_database_identity")
+        != dict(expected_dev_database_identity)
+        or checkpoint.get("new_database_identity")
+        != dict(expected_dev_database_identity)
+    ):
+        raise ValueError("AC dev cutover activation database identity mismatch")
+    activated_source = dict(active.get("source_identity") or {})
+    current_source = dict(source_identity)
+    if current_source != activated_source:
+        _verify_dev_source_upgrade(activated_source, current_source)
+    return {
+        **active,
+        "active": True,
+        "current_source_identity": current_source,
+        "source_descendant_verified": True,
+    }
+
+
+def rollback_dev_world_cutover(
+    *,
+    storage_root: Path | str,
+    preflight_hash: str,
+) -> dict[str, object]:
+    """Atomically remove only the matching new-world activation marker."""
+
+    root = _absolute_non_symlink_root(
+        Path(storage_root).expanduser().absolute(), create=False
+    )
+    active_path = root / "cutover" / "active.json"
+    active = _read_cutover_json(active_path)
+    if active.get("preflight_hash") != preflight_hash:
+        raise ValueError("AC dev cutover rollback hash mismatch")
+    destination = root / "cutover" / "rolled-back" / (
+        preflight_hash.removeprefix("sha256:") + ".json"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise ValueError("AC dev cutover rollback destination already exists")
+    os.replace(active_path, destination)
+    directory_fd = os.open(active_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return {
+        "schema_version": AC_DEV_CUTOVER_SCHEMA,
+        "status": "rolled_back",
+        "preflight_hash": preflight_hash,
+        "active": False,
+        "legacy_unchanged": True,
+        "new_process_started": False,
     }
 
 

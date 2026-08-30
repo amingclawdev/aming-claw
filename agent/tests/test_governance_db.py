@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import sqlite3
 import json
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -498,3 +499,325 @@ def test_ac_dev_storage_rejects_alias_foreign_and_symlink_roots(tmp_path, monkey
             },
             process_identity={"pid": 123, "start_identity": "test-process"},
         )
+
+
+def _dev_source_repo(tmp_path: Path) -> tuple[Path, str]:
+    root = tmp_path / "source"
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "codex/ac-dev"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "AC Test"],
+        cwd=root,
+        check=True,
+    )
+    (root / "source.txt").write_text("A\n", encoding="utf-8")
+    subprocess.run(["git", "add", "source.txt"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-m", "A"], cwd=root, check=True, capture_output=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return root, commit
+
+
+def _advance_dev_source(root: Path, value: str) -> str:
+    (root / "source.txt").write_text(value + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "source.txt"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", value],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_ac_dev_source_tip_cas_upgrade_is_descendant_and_genesis_immutable(tmp_path):
+    from agent.governance import db
+
+    root, commit_a = _dev_source_repo(tmp_path)
+    storage_root = tmp_path / "dev-world"
+    source_a = {
+        "root": str(root.resolve()),
+        "branch": "codex/ac-dev",
+        "commit": commit_a,
+        "source_sha256": "sha256:" + "a" * 64,
+    }
+    process_a = {"pid": 101, "start_identity": "process-a"}
+    first = db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity=source_a,
+        process_identity=process_a,
+    )
+    commit_b = _advance_dev_source(root, "B")
+    source_b = {
+        **source_a,
+        "commit": commit_b,
+        "source_sha256": "sha256:" + "b" * 64,
+    }
+    process_b = {"pid": 202, "start_identity": "process-b"}
+    upgraded = db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity=source_b,
+        process_identity=process_b,
+        expected_source_tip_sha256=first["source_tip_sha256"],
+        expected_previous_process_identity=process_a,
+        expected_database_identity=first["database_identity"],
+    )
+    assert upgraded["source_upgraded"] is True
+    assert upgraded["source_tip_revision"] == 2
+    assert upgraded["source_tip_identity"] == source_b
+    assert upgraded["genesis_sha256"] == first["genesis_sha256"]
+    assert upgraded["database_identity"] == first["database_identity"]
+
+    replay = db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity=source_b,
+        process_identity=process_b,
+        expected_source_tip_sha256=upgraded["source_tip_sha256"],
+        expected_previous_process_identity=process_b,
+        expected_database_identity=first["database_identity"],
+    )
+    assert replay["source_upgraded"] is False
+    assert replay["source_tip_revision"] == 2
+
+    commit_c = _advance_dev_source(root, "C")
+    source_c = {
+        **source_b,
+        "commit": commit_c,
+        "source_sha256": "sha256:" + "c" * 64,
+    }
+    with pytest.raises(ValueError, match="source tip CAS"):
+        db.bootstrap_dev_governance_store(
+            storage_root,
+            source_identity=source_c,
+            process_identity={"pid": 303, "start_identity": "process-c"},
+            expected_source_tip_sha256=first["source_tip_sha256"],
+            expected_previous_process_identity=process_b,
+            expected_database_identity=first["database_identity"],
+        )
+    readback = db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity=source_b,
+        process_identity=process_b,
+    )
+    assert readback["source_tip_identity"] == source_b
+
+
+def test_ac_dev_source_upgrade_rejects_non_descendant_root_branch_db_and_process(tmp_path):
+    from agent.governance import db
+
+    root, commit_a = _dev_source_repo(tmp_path)
+    storage_root = tmp_path / "dev-world"
+    source_a = {
+        "root": str(root.resolve()),
+        "branch": "codex/ac-dev",
+        "commit": commit_a,
+        "source_sha256": "sha256:" + "a" * 64,
+    }
+    process_a = {"pid": 101, "start_identity": "process-a"}
+    first = db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity=source_a,
+        process_identity=process_a,
+    )
+    commit_b = _advance_dev_source(root, "B")
+    source_b = {**source_a, "commit": commit_b, "source_sha256": "sha256:" + "b" * 64}
+
+    cases = (
+        ({**source_b, "root": str(tmp_path / "other")}, process_a, first["database_identity"]),
+        ({**source_b, "branch": "main"}, process_a, first["database_identity"]),
+        (source_b, {"pid": 999, "start_identity": "wrong"}, first["database_identity"]),
+        (source_b, process_a, {**first["database_identity"], "inode": first["database_identity"]["inode"] + 1}),
+    )
+    for source, expected_process, expected_database in cases:
+        with pytest.raises(ValueError):
+            db.bootstrap_dev_governance_store(
+                storage_root,
+                source_identity=source,
+                process_identity={"pid": 202, "start_identity": "process-b"},
+                expected_source_tip_sha256=first["source_tip_sha256"],
+                expected_previous_process_identity=expected_process,
+                expected_database_identity=expected_database,
+            )
+
+    subprocess.run(
+        ["git", "checkout", "--orphan", "non-descendant"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    (root / "source.txt").write_text("orphan\n", encoding="utf-8")
+    subprocess.run(["git", "add", "source.txt"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-m", "orphan"], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "branch", "-D", "codex/ac-dev"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "branch", "-m", "codex/ac-dev"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    orphan = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    with pytest.raises(ValueError, match="descendant"):
+        db.bootstrap_dev_governance_store(
+            storage_root,
+            source_identity={**source_a, "commit": orphan, "source_sha256": "sha256:" + "d" * 64},
+            process_identity={"pid": 202, "start_identity": "process-b"},
+            expected_source_tip_sha256=first["source_tip_sha256"],
+            expected_previous_process_identity=process_a,
+            expected_database_identity=first["database_identity"],
+        )
+
+
+def test_ac_dev_cutover_preflight_activation_idempotency_and_rollback(tmp_path):
+    from agent.governance import db
+
+    root, commit = _dev_source_repo(tmp_path)
+    source = {
+        "root": str(root.resolve()),
+        "branch": "codex/ac-dev",
+        "commit": commit,
+        "source_sha256": "sha256:" + "e" * 64,
+    }
+    process = {"pid": 404, "start_identity": "cutover-operator"}
+    storage_root = tmp_path / "dev-world"
+    dev = db.bootstrap_dev_governance_store(
+        storage_root,
+        source_identity=source,
+        process_identity=process,
+    )
+    legacy = tmp_path / "legacy" / "governance.db"
+    legacy.parent.mkdir()
+    with legacy.open("wb") as handle:
+        handle.truncate(db.AC_LEGACY_ARCHIVE_SIZE_BYTES)
+
+    def listener_probe(port):
+        if port == 40000:
+            return {
+                "port": 40000,
+                "listening": True,
+                "pid": 700,
+                "process_start_identity": "stable-700",
+                "source_commit": "f" * 40,
+            }
+        return {
+            "port": 40008,
+            "listening": False,
+            "pid": 0,
+            "process_start_identity": "",
+            "source_commit": "",
+        }
+
+    preflight = db.preflight_dev_world_cutover(
+        legacy_database_path=legacy,
+        storage_root=storage_root,
+        source_identity=source,
+        process_identity=process,
+        expected_dev_database_identity=dev["database_identity"],
+        listener_probe=listener_probe,
+    )
+    assert preflight["status"] == "ready"
+    assert preflight["legacy_database_identity"]["size"] == db.AC_LEGACY_ARCHIVE_SIZE_BYTES
+    assert preflight["new_database_identity"] == dev["database_identity"]
+    assert Path(preflight["checkpoint_path"]).is_file()
+    legacy_before = legacy.stat()
+
+    activated = db.activate_dev_world_cutover(
+        storage_root=storage_root,
+        preflight_hash=preflight["preflight_hash"],
+        listener_probe=listener_probe,
+    )
+    assert activated["status"] == "active"
+    replay = db.activate_dev_world_cutover(
+        storage_root=storage_root,
+        preflight_hash=preflight["preflight_hash"],
+        listener_probe=listener_probe,
+    )
+    assert replay["idempotent"] is True
+    assert legacy.stat().st_ino == legacy_before.st_ino
+    assert legacy.stat().st_size == legacy_before.st_size
+
+    validation = db.validate_dev_world_cutover_activation(
+        storage_root=storage_root,
+        expected_dev_database_identity=dev["database_identity"],
+        source_identity=source,
+    )
+    assert validation["active"] is True
+    rolled_back = db.rollback_dev_world_cutover(
+        storage_root=storage_root,
+        preflight_hash=preflight["preflight_hash"],
+    )
+    assert rolled_back["status"] == "rolled_back"
+    with pytest.raises(ValueError, match="activation"):
+        db.validate_dev_world_cutover_activation(
+            storage_root=storage_root,
+            expected_dev_database_identity=dev["database_identity"],
+            source_identity=source,
+        )
+
+
+def test_ac_dev_cutover_failure_leaves_old_live_and_new_inactive(tmp_path):
+    from agent.governance import db
+
+    root, commit = _dev_source_repo(tmp_path)
+    source = {
+        "root": str(root.resolve()),
+        "branch": "codex/ac-dev",
+        "commit": commit,
+        "source_sha256": "sha256:" + "f" * 64,
+    }
+    process = {"pid": 505, "start_identity": "cutover-operator"}
+    storage_root = tmp_path / "dev-world"
+    dev = db.bootstrap_dev_governance_store(storage_root, source_identity=source, process_identity=process)
+    legacy = tmp_path / "legacy.db"
+    with legacy.open("wb") as handle:
+        handle.truncate(db.AC_LEGACY_ARCHIVE_SIZE_BYTES)
+    wal = Path(str(dev["database_path"]) + "-wal")
+    wal.write_bytes(b"owned")
+
+    def listener_probe(port):
+        return {
+            "port": port,
+            "listening": port == 40000,
+            "pid": 700 if port == 40000 else 0,
+            "process_start_identity": "stable-700" if port == 40000 else "",
+            "source_commit": "f" * 40 if port == 40000 else "",
+        }
+
+    with pytest.raises(ValueError, match="WAL/SHM"):
+        db.preflight_dev_world_cutover(
+            legacy_database_path=legacy,
+            storage_root=storage_root,
+            source_identity=source,
+            process_identity=process,
+            expected_dev_database_identity=dev["database_identity"],
+            listener_probe=listener_probe,
+        )
+    assert legacy.stat().st_size == db.AC_LEGACY_ARCHIVE_SIZE_BYTES
+    assert not (storage_root / "cutover" / "active.json").exists()

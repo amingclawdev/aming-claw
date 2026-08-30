@@ -67,6 +67,7 @@ SHUTDOWN_TIMEOUT = int(os.getenv("SHUTDOWN_TIMEOUT", "120"))
 # finished work. Retry only after error-shaped responses from _api().
 COMPLETE_RETRY_DELAYS = (5, 15, 30)
 COMPLETE_REQUEST_TIMEOUT = int(os.getenv("COMPLETE_REQUEST_TIMEOUT", "900"))
+EXECUTOR_SESSION_TOKEN_ENV = "AMING_EXECUTOR_SESSION_TOKEN"
 
 
 def _world_bound_governance_url(project_id: str, requested_url: str = "") -> str:
@@ -402,12 +403,18 @@ class ExecutorWorker:
     """Polls governance API, claims tasks, executes via Claude CLI."""
 
     def __init__(self, project_id: str, governance_url: str = GOVERNANCE_URL,
-                 worker_id: str = WORKER_ID, workspace: str = WORKSPACE):
+                 worker_id: str = WORKER_ID, workspace: str = WORKSPACE,
+                 session_token: Optional[str] = None):
         self.project_id = project_id
         self.base_url = _world_bound_governance_url(project_id, governance_url)
         self.worker_id = worker_id
         self.workspace = workspace
         self.log_root = _world_bound_log_root(project_id, workspace)
+        self._session_token = str(
+            os.getenv(EXECUTOR_SESSION_TOKEN_ENV, "")
+            if session_token is None
+            else session_token
+        ).strip()
         self._running = False
         self._current_task = None
         self._lifecycle = None
@@ -420,17 +427,38 @@ class ExecutorWorker:
         """Call governance API. Short timeouts to avoid MCP IO deadlock."""
         import requests
         url = f"{self.base_url}{path}"
+        headers = {"X-Gov-Token": self._session_token}
         try:
             if method == "GET":
-                r = requests.get(url, timeout=timeout or 5)
+                r = requests.get(url, timeout=timeout or 5, headers=headers)
             else:
                 r = requests.post(url, json=data or {}, timeout=timeout or 10,
-                                  headers={"Content-Type": "application/json"})
+                                  headers={
+                                      "Content-Type": "application/json",
+                                      **headers,
+                                  })
             r.raise_for_status()
             return r.json()
         except Exception as e:
             # DO NOT use log.warning here — it blocks in MCP subprocess (IO pipe deadlock)
             return {"error": str(e)}
+
+    def _validate_session_credential(self) -> dict:
+        """Verify the one opaque source-backed worker session before mutation."""
+
+        if not self._session_token:
+            raise RuntimeError("executor session credential is required")
+        verified = self._api("GET", "/api/role/verify")
+        if not (
+            verified.get("valid") is True
+            and str(verified.get("project_id") or "") == self.project_id
+            and str(verified.get("session_id") or "").strip()
+            and str(verified.get("role") or "").strip()
+        ):
+            raise RuntimeError(
+                "executor session credential is invalid for the bound project/world"
+            )
+        return verified
 
     def _check_queued_tasks(self) -> int:
         """R6: Check how many queued tasks exist via GET /api/task/{project}/list."""
@@ -525,6 +553,7 @@ class ExecutorWorker:
             import requests as _req
             _req.post(f"{self.base_url}/api/task/{self.project_id}/progress",
                       json={"task_id": task_id, "progress": {"step": "starting", "role": role}},
+                      headers={"X-Gov-Token": self._session_token},
                       timeout=3)
         except Exception:
             pass
@@ -650,6 +679,7 @@ class ExecutorWorker:
         try:
             _req.post(f"{self.base_url}/api/task/{self.project_id}/progress",
                       json={"task_id": task_id, "progress": {"step": "running", "session_id": session.session_id}},
+                      headers={"X-Gov-Token": self._session_token},
                       timeout=3)
         except Exception:
             pass
@@ -1575,6 +1605,7 @@ class ExecutorWorker:
             import requests as _req
             _req.post(f"{self.base_url}/api/context/{self.project_id}/log",
                       json={"type": "coordinator_turn", **entry},
+                      headers={"X-Gov-Token": self._session_token},
                       timeout=3)
         except Exception as e:
             log.debug("_write_conversation_history failed (non-fatal): %s", e)
@@ -2760,6 +2791,7 @@ class ExecutorWorker:
         loop continues without interruption.
         """
         try:
+            self._validate_session_credential()
             task = self._claim_task()
         except Exception:
             # Transient claim error — treat as empty poll
@@ -2980,6 +3012,11 @@ class ExecutorWorker:
 
     def run_loop(self):
         """Main polling loop with parallel dispatch support (R4, R8)."""
+        try:
+            self._validate_session_credential()
+        except RuntimeError as exc:
+            log.error("Executor startup rejected: %s", exc)
+            return
         self._running = True
         # R1: Initialize worker pool for parallel dispatch
         self._worker_pool = WorkerPool(self, max_workers=MAX_CONCURRENT_WORKERS)

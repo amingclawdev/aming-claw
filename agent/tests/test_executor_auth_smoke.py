@@ -5,6 +5,7 @@ health check and _recover_stuck_tasks.
 """
 
 import inspect
+import json
 import logging
 import os
 import unittest
@@ -98,3 +99,57 @@ def test_executor_world_binding_routes_ac_only_to_dev(monkeypatch, tmp_path):
         executor_worker._world_bound_governance_url(
             "content-sys", "http://127.0.0.1:40008"
         )
+
+
+def test_executor_session_token_is_header_only_and_startup_verified(monkeypatch, tmp_path):
+    from agent import executor_worker
+
+    token = "gov-test-worker-session-token"
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "dev-world"))
+    worker = executor_worker.ExecutorWorker(
+        "aming-claw",
+        session_token=token,
+    )
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "valid": True,
+                "project_id": "aming-claw",
+                "session_id": "ses-worker",
+                "role": "dev",
+            }
+
+    class Requests:
+        @staticmethod
+        def get(url, **kwargs):
+            calls.append(("GET", url, kwargs))
+            return Response()
+
+        @staticmethod
+        def post(url, **kwargs):
+            calls.append(("POST", url, kwargs))
+            return Response()
+
+    monkeypatch.setitem(__import__("sys").modules, "requests", Requests)
+    assert worker._validate_session_credential()["project_id"] == "aming-claw"
+    worker._api(
+        "POST",
+        "/api/task/aming-claw/progress",
+        {"task_id": "task-1", "percent": 1},
+    )
+    assert calls
+    for _method, _url, kwargs in calls:
+        assert kwargs["headers"]["X-Gov-Token"] == token
+        assert token not in _url
+        assert token not in json.dumps(kwargs.get("json") or {})
+
+    with pytest.raises(RuntimeError, match="session credential"):
+        executor_worker.ExecutorWorker(
+            "aming-claw",
+            session_token="",
+        )._validate_session_credential()

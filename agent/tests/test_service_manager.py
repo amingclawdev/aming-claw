@@ -653,3 +653,71 @@ def test_ac_service_manager_is_world_bound_to_dev_40008(monkeypatch, tmp_path):
         _world_bound_governance_url("aming_claw", "http://127.0.0.1:40008")
     with pytest.raises(ValueError):
         _world_bound_governance_url("content-sys", "http://127.0.0.1:40008")
+
+
+def test_managed_service_manager_verifies_and_passes_session_token_only_by_env(
+    monkeypatch,
+    tmp_path,
+):
+    import service_manager as sm
+
+    token = "gov-service-manager-worker-token"
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "dev-world"))
+    monkeypatch.setenv("AMING_EXECUTOR_SESSION_TOKEN", token)
+    monkeypatch.setattr(sm, "_shared_log_dir", lambda _project="": tmp_path / "logs")
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "valid": True,
+        "project_id": "aming-claw",
+        "session_id": "ses-worker",
+        "role": "dev",
+    }
+    monkeypatch.setattr(sm.requests, "get", MagicMock(return_value=response))
+    process = _make_fake_process(pid=8080)
+    popen = MagicMock(return_value=process)
+    monkeypatch.setattr(sm.subprocess, "Popen", popen)
+
+    manager = ServiceManager(
+        project_id="aming-claw",
+        governance_url="http://127.0.0.1:40008",
+    )
+    assert manager.start() is True
+    call = popen.call_args
+    assert call.kwargs["env"]["AMING_EXECUTOR_SESSION_TOKEN"] == token
+    assert token not in " ".join(call.args[0])
+    verify_call = sm.requests.get.call_args
+    assert verify_call.kwargs["headers"] == {"X-Gov-Token": token}
+
+
+def test_managed_service_manager_rejects_missing_invalid_or_wrong_project_token(
+    monkeypatch,
+    tmp_path,
+):
+    import service_manager as sm
+
+    monkeypatch.setenv("AMING_CLAW_DEV_STORAGE_ROOT", str(tmp_path / "dev-world"))
+    monkeypatch.setattr(sm, "_shared_log_dir", lambda _project="": tmp_path / "logs")
+    popen = MagicMock()
+    monkeypatch.setattr(sm.subprocess, "Popen", popen)
+
+    monkeypatch.delenv("AMING_EXECUTOR_SESSION_TOKEN", raising=False)
+    missing = ServiceManager(project_id="aming-claw")
+    with pytest.raises(RuntimeError, match="session credential"):
+        missing.start()
+    popen.assert_not_called()
+
+    for payload in (
+        {"valid": False},
+        {"valid": True, "project_id": "content-sys", "session_id": "ses-wrong"},
+    ):
+        monkeypatch.setenv("AMING_EXECUTOR_SESSION_TOKEN", "gov-invalid")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = payload
+        monkeypatch.setattr(sm.requests, "get", MagicMock(return_value=response))
+        manager = ServiceManager(project_id="aming-claw")
+        with pytest.raises(RuntimeError, match="session credential"):
+            manager.start()
+    popen.assert_not_called()

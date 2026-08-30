@@ -3498,6 +3498,14 @@ class TestACDevRuntimeCli:
             lambda: {"status": "already_sufficient"},
         )
         monkeypatch.setattr(
+            cli,
+            "_require_dev_cutover_activation",
+            lambda *_args, **_kwargs: {
+                "preflight_hash": "sha256:" + "d" * 64,
+                "active": True,
+            },
+        )
+        monkeypatch.setattr(
             cli.subprocess,
             "run",
             lambda *args, **kwargs: types.SimpleNamespace(
@@ -3531,6 +3539,9 @@ class TestACDevRuntimeCli:
         assert os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] == str(
             dev_storage_root.resolve()
         )
+        assert os.environ["AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH"] == (
+            "sha256:" + "d" * 64
+        )
         assert "SHARED_VOLUME_PATH" not in os.environ
         for key in (
             "AMING_CLAW_RUNTIME_PLANE",
@@ -3543,6 +3554,7 @@ class TestACDevRuntimeCli:
             "AMING_CLAW_HOME",
             "GOVERNANCE_PORT",
             "AMING_CLAW_DEV_STORAGE_ROOT",
+            "AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH",
         ):
             os.environ.pop(key, None)
 

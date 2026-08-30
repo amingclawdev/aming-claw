@@ -53,6 +53,7 @@ except ImportError:  # pragma: no cover — requests may be absent in minimal te
 
 log = logging.getLogger(__name__)
 _RESTART_SIGNAL_ACTIONS = {"restart", "respawn_executor"}
+EXECUTOR_SESSION_TOKEN_ENV = "AMING_EXECUTOR_SESSION_TOKEN"
 
 # ---------------------------------------------------------------------------
 # Configuration defaults (all overridable via environment variables)
@@ -199,6 +200,7 @@ class ServiceManager:
         self.poll_interval = poll_interval
         self.workspace = workspace or _default_workspace()
 
+        self._managed_executor = executor_cmd is None
         self._executor_cmd: list = executor_cmd or _default_executor_cmd(
             self.project_id,
             self.governance_url,
@@ -711,6 +713,10 @@ class ServiceManager:
 
     def _spawn_executor_process(self) -> subprocess.Popen:
         """Spawn the executor and redirect output to a persistent host log file."""
+        child_env = os.environ.copy()
+        if self._managed_executor:
+            token = self._verified_executor_session_token()
+            child_env[EXECUTOR_SESSION_TOKEN_ENV] = token
         log_dir = _shared_log_dir(self.project_id)
         log_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = log_dir / f"service-manager-executor-{self.project_id}.log"
@@ -723,10 +729,43 @@ class ServiceManager:
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 cwd=str(_repo_root()),
+                env=child_env,
             )
         finally:
             stdout_handle.close()
             stderr_handle.close()
+
+    def _verified_executor_session_token(self) -> str:
+        """Resolve and verify one raw token without logging or persisting it."""
+
+        token = str(os.environ.get(EXECUTOR_SESSION_TOKEN_ENV) or "").strip()
+        if not token:
+            raise RuntimeError("executor session credential is required")
+        if requests is None:
+            raise RuntimeError("executor session credential cannot be verified")
+        try:
+            response = requests.get(
+                f"{self.governance_url}/api/role/verify",
+                timeout=5,
+                headers={"X-Gov-Token": token},
+            )
+            response.raise_for_status()
+            verified = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                "executor session credential verification failed"
+            ) from exc
+        if not (
+            isinstance(verified, dict)
+            and verified.get("valid") is True
+            and str(verified.get("project_id") or "") == self.project_id
+            and str(verified.get("session_id") or "").strip()
+            and str(verified.get("role") or "").strip()
+        ):
+            raise RuntimeError(
+                "executor session credential is invalid for the bound project/world"
+            )
+        return token
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -745,7 +784,11 @@ class ServiceManager:
         """
         try:
             url = f"{self.governance_url}/api/task/{self.project_id}/list"
-            resp = requests.get(url, timeout=5)
+            headers = {}
+            token = str(os.environ.get(EXECUTOR_SESSION_TOKEN_ENV) or "").strip()
+            if token:
+                headers["X-Gov-Token"] = token
+            resp = requests.get(url, timeout=5, headers=headers)
             resp.raise_for_status()
             data = resp.json()
             tasks: list = data.get("tasks", [])

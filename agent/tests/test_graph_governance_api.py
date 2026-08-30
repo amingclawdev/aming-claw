@@ -15320,6 +15320,19 @@ def test_dev_runtime_tracks_current_stable_after_bootstrap(monkeypatch, tmp_path
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
+    monkeypatch.setattr(
+        server,
+        "governance_loaded_runtime_identity",
+        lambda _version="": {"loaded_source_sha256": "sha256:" + "a" * 64},
+    )
+    monkeypatch.setattr(
+        server,
+        "validate_dev_world_cutover_activation",
+        lambda **_kwargs: {
+            "active": True,
+            "preflight_hash": "sha256:" + "e" * 64,
+        },
+    )
 
     identity = server._validate_runtime_plane_startup()
 
@@ -204285,3 +204298,244 @@ def test_stable_world_keeps_non_ac_project_behavior_with_authenticated_scope(mon
         query={},
         token="operator-token",
     ) is None
+
+
+def test_stable_world_preserves_supported_mf_sub_cross_project_graph_preflight(monkeypatch):
+    """D1: transport domain checks must not collapse role-aware bindings."""
+
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+    body = {
+        "project_id": "content-sys",
+        "governance_project_id": "charting-loop",
+        "target_project_id": "content-sys",
+        "query_source": "mf_subagent",
+        "runtime_context_id": "runtime-context-cross-project",
+    }
+    assert server._guard_runtime_world_request(
+        method="POST",
+        path="/api/graph-governance/content-sys/query",
+        path_params={"project_id": "content-sys"},
+        body=body,
+        query={},
+        token="source-backed-session-token",
+    ) is None
+
+    class ReadOnlyGovernanceConnection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    governance_conn = ReadOnlyGovernanceConnection()
+    context = SimpleNamespace(task_id="task-cross-project")
+    record = {
+        "completed_lines": [
+            {
+                "line_id": "worker_graph_context",
+                "evidence": {
+                    "runtime_context_id": body["runtime_context_id"],
+                    "task_id": context.task_id,
+                },
+            }
+        ]
+    }
+    runtime = SimpleNamespace(
+        pinned_definition_has_line=lambda _cex, line: line == "worker_graph_context",
+        store=SimpleNamespace(get=lambda _cex: record),
+    )
+    monkeypatch.setattr(server, "get_connection", lambda project: governance_conn)
+    monkeypatch.setattr(
+        parallel_branch_runtime,
+        "get_branch_context_by_runtime_context_id",
+        lambda _conn, project, runtime_context: context
+        if project == "charting-loop"
+        and runtime_context == body["runtime_context_id"]
+        else None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_latest_contract_revision_payload",
+        lambda _conn, _context: {"contract_execution_id": "cex-cross-project"},
+    )
+    monkeypatch.setattr(
+        server,
+        "_runtime_context_contract_execution_identity",
+        lambda payload: payload,
+    )
+    monkeypatch.setattr(server, "_contract_runtime", lambda _conn: runtime)
+    preflight = server._runtime_context_cross_project_graph_contract_preflight(
+        target_project_id="content-sys",
+        body=body,
+    )
+    assert preflight == {
+        "schema_version": "runtime_context.canonical_contract_line.v1",
+        "accepted": True,
+        "status": "already_completed",
+        "canonical": True,
+        "contract_execution_id": "cex-cross-project",
+        "runtime_context_id": body["runtime_context_id"],
+        "task_id": context.task_id,
+        "line_id": "worker_graph_context",
+        "governance_project_id": "charting-loop",
+        "target_project_id": "content-sys",
+    }
+    assert governance_conn.closed is True
+
+    for alias in ("aming-claw", "aming_claw", "amingClaw"):
+        rejected_body = {**body, "governance_project_id": alias}
+        with pytest.raises(ValidationError) as rejected:
+            server._guard_runtime_world_request(
+                method="POST",
+                path="/api/graph-governance/content-sys/query",
+                path_params={"project_id": "content-sys"},
+                body=rejected_body,
+                query={},
+                token="source-backed-session-token",
+            )
+        assert rejected.value.details["writes_performed"] is False
+
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    with pytest.raises(ValidationError) as dev_rejected:
+        server._guard_runtime_world_request(
+            method="POST",
+            path="/api/graph-governance/aming-claw/query",
+            path_params={"project_id": "aming-claw"},
+            body={
+                **body,
+                "project_id": "aming-claw",
+                "target_project_id": "aming-claw",
+            },
+            query={},
+            token="source-backed-session-token",
+        )
+    assert dev_rejected.value.details["writes_performed"] is False
+
+
+def test_executor_session_auth_guards_real_claim_progress_complete_zero_write(
+    conn,
+    monkeypatch,
+):
+    """D2: all executor mutations use one active source-backed session."""
+
+    from agent.governance import role_service, task_registry
+
+    project_id = "worker-project"
+    worker = role_service.register(
+        conn,
+        "executor-worker",
+        project_id,
+        "dev",
+        scope=["task:worker"],
+    )
+    wrong_world = role_service.register(
+        conn,
+        "foreign-worker",
+        "foreign-project",
+        "dev",
+        scope=["task:worker"],
+    )
+    task = task_registry.create_task(
+        conn,
+        project_id,
+        "bounded executor auth integration",
+        task_type="dev",
+    )
+    conn.commit()
+
+    class SharedDBContext:
+        def __init__(self, _project_id):
+            self.project_id = _project_id
+
+        def __enter__(self):
+            return conn
+
+        def __exit__(self, exc_type, _exc, _tb):
+            if exc_type is None:
+                conn.commit()
+            else:
+                conn.rollback()
+            return False
+
+    monkeypatch.setattr(server, "DBContext", SharedDBContext)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+
+    def invoke(path, body, token, handler):
+        before = tuple(conn.iterdump())
+        server._guard_runtime_world_request(
+            method="POST",
+            path=path,
+            path_params={"project_id": project_id},
+            body={"project_id": project_id, **body},
+            query={},
+            token=token,
+        )
+        ctx = _ctx(
+            {"project_id": project_id},
+            method="POST",
+            body=body,
+        )
+        ctx.token = token
+        result = handler(ctx)
+        return before, result
+
+    for bad_token in ("wrong-token", wrong_world["token"]):
+        before = tuple(conn.iterdump())
+        with pytest.raises((AuthError, PermissionDeniedError)):
+            invoke(
+                f"/api/task/{project_id}/claim",
+                {"worker_id": "executor-worker", "caller_pid": 1234},
+                bad_token,
+                server.handle_task_claim,
+            )
+        assert tuple(conn.iterdump()) == before
+
+    with pytest.raises(ValidationError) as missing:
+        server._guard_runtime_world_request(
+            method="POST",
+            path=f"/api/task/{project_id}/claim",
+            path_params={"project_id": project_id},
+            body={"project_id": project_id},
+            query={},
+            token="",
+        )
+    assert missing.value.details["writes_performed"] is False
+
+    _before, claimed = invoke(
+        f"/api/task/{project_id}/claim",
+        {"worker_id": "caller-controlled", "caller_pid": 1234},
+        worker["token"],
+        server.handle_task_claim,
+    )
+    assert claimed["task"]["task_id"] == task["task_id"]
+    assignment = conn.execute(
+        "SELECT assigned_to FROM tasks WHERE task_id=?", (task["task_id"],)
+    ).fetchone()
+    assert assignment["assigned_to"] == "executor-worker"
+
+    invoke(
+        f"/api/task/{project_id}/progress",
+        {
+            "task_id": task["task_id"],
+            "phase": "implementation",
+            "percent": 50,
+            "message": "bounded",
+        },
+        worker["token"],
+        server.handle_task_progress,
+    )
+    invoke(
+        f"/api/task/{project_id}/complete",
+        {
+            "task_id": task["task_id"],
+            "status": "succeeded",
+            "result": {},
+            "fence_token": claimed["fence_token"],
+        },
+        worker["token"],
+        server.handle_task_complete,
+    )
+    row = conn.execute(
+        "SELECT assigned_to, execution_status FROM tasks WHERE task_id=?",
+        (task["task_id"],),
+    ).fetchone()
+    assert tuple(row) == ("executor-worker", "succeeded")

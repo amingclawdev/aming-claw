@@ -52,6 +52,7 @@ from .db import (
     validate_project_id,
     validate_project_id_syntax,
     registered_public_safe_external_project,
+    validate_dev_world_cutover_activation,
     verify_existing_schema_capabilities,
 )
 from . import role_service
@@ -803,6 +804,28 @@ def _validate_runtime_plane_startup() -> dict[str, Any]:
     database_identity = identity.get("database_identity")
     if not _ac_dev_database_identity_valid(database_identity):
         raise GovernanceSingletonError("ac_dev_database_identity_invalid")
+    loaded = governance_loaded_runtime_identity(str(identity.get("commit") or ""))
+    source_sha256 = str(loaded.get("loaded_source_sha256") or "").strip().lower()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_sha256):
+        raise GovernanceSingletonError("ac_dev_loaded_source_identity_invalid")
+    try:
+        cutover = validate_dev_world_cutover_activation(
+            storage_root=os.environ.get("AMING_CLAW_DEV_STORAGE_ROOT", ""),
+            expected_dev_database_identity=database_identity,
+            source_identity={
+                "root": str(identity["worktree_root"]),
+                "branch": str(identity["branch"]),
+                "commit": str(identity["commit"]),
+                "source_sha256": source_sha256,
+            },
+        )
+    except Exception as exc:
+        raise GovernanceSingletonError("ac_dev_cutover_activation_invalid") from exc
+    expected_cutover = os.environ.get(
+        "AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH", ""
+    ).strip()
+    if expected_cutover and cutover.get("preflight_hash") != expected_cutover:
+        raise GovernanceSingletonError("ac_dev_cutover_activation_hash_mismatch")
     try:
         stable_ref = _branch_service_git_output(
             root,
@@ -3449,7 +3472,12 @@ def _guard_runtime_world_request(
         normalized_claims.append((source, raw, canonical))
 
     unique = {canonical for _source, _raw, canonical in normalized_claims}
-    if len(unique) > 1:
+    # Stable legitimately transports role-bound cross-project graph requests
+    # (for example an mf_sub runtime governed by charting-loop querying a
+    # content-sys graph).  Equality belongs to the handler/runtime-context
+    # contract, not this domain boundary.  Dev is a single-project world and
+    # therefore retains exact equality across every claim.
+    if plane != "stable" and len(unique) > 1:
         raise _runtime_world_zero_write_rejection(
             code="runtime_world_project_identity_ambiguous",
             path=path,
@@ -109070,22 +109098,48 @@ def handle_task_create(ctx: RequestContext):
     return result
 
 
+def _require_executor_session(
+    ctx: RequestContext,
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> dict[str, Any]:
+    """Bind an executor mutation to the existing role/session authority."""
+
+    session = ctx.require_auth(conn)
+    if str(session.get("project_id") or "").strip() != project_id:
+        raise PermissionDeniedError(
+            str(session.get("role") or "unknown"),
+            "executor_project_world",
+            {
+                "expected_project_id": project_id,
+                "session_project_id": str(session.get("project_id") or ""),
+                "zero_write_rejection": True,
+                "writes_performed": False,
+            },
+        )
+    if not (
+        str(session.get("session_id") or "").strip()
+        and str(session.get("principal_id") or "").strip()
+        and str(session.get("role") or "").strip()
+    ):
+        raise PermissionDeniedError(
+            "unknown",
+            "executor_active_session",
+            {"zero_write_rejection": True, "writes_performed": False},
+        )
+    return session
+
+
 @route("POST", "/api/task/{project_id}/claim")
 def handle_task_claim(ctx: RequestContext):
-    """Claim a task. Auth optional — uses principal_id if token provided, else body worker_id."""
+    """Claim a task for one active source-backed worker session."""
     project_id = ctx.get_project_id()
-    log.info("API task.claim: project=%s worker=%s", project_id, ctx.body.get("worker_id", "anonymous"))
     from . import task_registry
-    worker_id = ctx.body.get("worker_id", "anonymous")
-    if ctx.token:
-        try:
-            with DBContext(project_id) as conn:
-                session = ctx.require_auth(conn)
-                worker_id = session.get("principal_id", worker_id)
-        except Exception:
-            pass
     caller_pid = int(ctx.body.get("caller_pid", 0) or 0)
     with DBContext(project_id) as conn:
+        session = _require_executor_session(ctx, conn, project_id)
+        worker_id = str(session.get("principal_id") or "").strip()
+        log.info("API task.claim: project=%s worker=%s", project_id, worker_id)
         claimed = task_registry.claim_task(conn, project_id, worker_id, caller_pid=caller_pid)
         if isinstance(claimed, tuple):
             task, fence_token = claimed
@@ -109118,7 +109172,7 @@ def handle_task_claim(ctx: RequestContext):
 
 @route("POST", "/api/task/{project_id}/complete")
 def handle_task_complete(ctx: RequestContext):
-    """Complete a task. No auth required."""
+    """Complete a task for its authenticated worker session."""
     project_id = ctx.get_project_id()
     log.info("API task.complete: project=%s task=%s status=%s result_keys=%s",
              project_id, ctx.body.get("task_id", "?"), ctx.body.get("status", "?"),
@@ -109126,13 +109180,14 @@ def handle_task_complete(ctx: RequestContext):
     from . import task_registry
     route_gate = {}
     result_payload = ctx.body.get("result") or {}
-    if ctx.body.get("status", "succeeded") == "succeeded" and _task_complete_result_mutates(result_payload):
-        route_gate = _require_route_token_mutation_gate(
-            ctx,
-            action="task_complete",
-            task_id=ctx.body.get("task_id", ""),
-        )
     with DBContext(project_id) as conn:
+        session = _require_executor_session(ctx, conn, project_id)
+        if ctx.body.get("status", "succeeded") == "succeeded" and _task_complete_result_mutates(result_payload):
+            route_gate = _require_route_token_mutation_gate(
+                ctx,
+                action="task_complete",
+                task_id=ctx.body.get("task_id", ""),
+            )
         if route_gate:
             _record_route_token_gate_event(
                 conn,
@@ -109147,7 +109202,7 @@ def handle_task_complete(ctx: RequestContext):
             error_message=ctx.body.get("error_message", ""),
             fence_token=ctx.body.get("fence_token", ""),
             project_id=project_id,
-            completed_by=ctx.body.get("worker_id", ""),
+            completed_by=str(session.get("principal_id") or ""),
             override_reason=ctx.body.get("override_reason", ""),
         )
 
@@ -201884,6 +201939,7 @@ def handle_task_progress(ctx: RequestContext):
     project_id = ctx.get_project_id()
     from . import task_registry
     with DBContext(project_id) as conn:
+        _require_executor_session(ctx, conn, project_id)
         return task_registry.update_progress(
             conn, ctx.body.get("task_id", ""),
             phase=ctx.body.get("phase", "running"),

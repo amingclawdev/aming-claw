@@ -255,6 +255,29 @@ def _canonical_dev_database_binding(
     }
 
 
+def _require_dev_cutover_activation(
+    storage_root: str,
+    *,
+    source_identity: Mapping[str, Any],
+    database_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Require the operator's atomic cutover marker before port 40008 starts."""
+
+    from agent.governance.db import validate_dev_world_cutover_activation
+
+    try:
+        return validate_dev_world_cutover_activation(
+            storage_root=storage_root,
+            expected_dev_database_identity=database_identity,
+            source_identity=source_identity,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise click.ClickException(
+            "AC dev runtime requires an active verified dev-cutover checkpoint: "
+            + str(exc)
+        ) from exc
+
+
 def _canonical_stable_database_binding(
     requested_shared_volume: str,
     *,
@@ -1156,6 +1179,11 @@ def start(
             source_identity=dev_identity,
         )
         dev_storage_root = str(database_binding["dev_storage_root"])
+        cutover_activation = _require_dev_cutover_activation(
+            dev_storage_root,
+            source_identity=dev_identity,
+            database_identity=database_binding["dev_database_identity"],
+        )
         stable_identity = None
     elif runtime_plane == "stable":
         stable_identity = _stable_start_identity_precheck(
@@ -1235,6 +1263,9 @@ def start(
         os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] = "dev-world-only"
         os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] = "deny"
         os.environ[AC_DEV_STORAGE_ROOT_ENV] = str(dev_storage)
+        os.environ["AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH"] = str(
+            (cutover_activation or {}).get("preflight_hash") or ""
+        )
         os.environ.pop("SHARED_VOLUME_PATH", None)
     elif runtime_plane == "stable":
         runtime_root = Path(workspace).resolve() if workspace else _default_runtime_workspace()
@@ -1271,6 +1302,87 @@ def start(
         import start_governance
 
         start_governance.main(workspace_root=runtime_root)
+
+
+@main.group("dev-cutover")
+def dev_cutover():
+    """Preflight, activate, or roll back the isolated AC dev world."""
+
+
+@dev_cutover.command("preflight")
+@click.option("--dev-storage-root", required=True, type=click.Path(path_type=str))
+@click.option(
+    "--legacy-database",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+)
+@click.option("--stable-anchor-commit", required=True)
+def dev_cutover_preflight(dev_storage_root, legacy_database, stable_anchor_commit):
+    """Write a read-only, restart-safe cutover checkpoint; start nothing."""
+
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor_commit):
+        raise click.ClickException("Cutover requires an exact stable source commit.")
+    source = _dev_source_identity_precheck()
+    binding = _canonical_dev_database_binding(
+        dev_storage_root, source_identity=source
+    )
+    from agent.governance.db import preflight_dev_world_cutover
+
+    os.environ["AMING_CLAW_STABLE_ANCHOR_COMMIT"] = stable_anchor_commit.lower()
+    try:
+        receipt = preflight_dev_world_cutover(
+            legacy_database_path=legacy_database,
+            storage_root=binding["dev_storage_root"],
+            source_identity=source,
+            process_identity={
+                "pid": os.getpid(),
+                "start_identity": f"pid:{os.getpid()}:dev-cutover-preflight",
+            },
+            expected_dev_database_identity=binding["dev_database_identity"],
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(receipt, indent=2, sort_keys=True))
+
+
+@dev_cutover.command("activate")
+@click.option("--dev-storage-root", required=True, type=click.Path(path_type=str))
+@click.option("--preflight-hash", required=True)
+@click.option("--stable-anchor-commit", required=True)
+def dev_cutover_activate(dev_storage_root, preflight_hash, stable_anchor_commit):
+    """Atomically activate an unchanged checkpoint; start no listener."""
+
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", stable_anchor_commit):
+        raise click.ClickException("Cutover requires an exact stable source commit.")
+    from agent.governance.db import activate_dev_world_cutover
+
+    os.environ["AMING_CLAW_STABLE_ANCHOR_COMMIT"] = stable_anchor_commit.lower()
+    try:
+        receipt = activate_dev_world_cutover(
+            storage_root=dev_storage_root,
+            preflight_hash=preflight_hash,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(receipt, indent=2, sort_keys=True))
+
+
+@dev_cutover.command("rollback")
+@click.option("--dev-storage-root", required=True, type=click.Path(path_type=str))
+@click.option("--preflight-hash", required=True)
+def dev_cutover_rollback(dev_storage_root, preflight_hash):
+    """Atomically retire only the matching inactive-world activation marker."""
+
+    from agent.governance.db import rollback_dev_world_cutover
+
+    try:
+        receipt = rollback_dev_world_cutover(
+            storage_root=dev_storage_root,
+            preflight_hash=preflight_hash,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(receipt, indent=2, sort_keys=True))
 
 
 @main.group("branch-service")
