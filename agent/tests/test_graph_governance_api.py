@@ -16260,6 +16260,9 @@ def test_dev_persisted_registration_route_rejections_are_pre_session_dml(
         conn.commit()
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(
+        server, "_route_registry_storage_project_id", lambda project_id: project_id
+    )
     before = conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0]
     status, result = server.handle_observer_session_register(
         _ctx({"project_id": "aming-claw"}, method="POST", body=body)
@@ -198953,6 +198956,105 @@ def _prepare_ac_dev_direct_route_bootstrap(
             guide["next_legal_action"]["copy_safe_body"]
         ),
     }
+
+
+def test_ac_dev_public_guide_route_issue_register_and_heartbeat_exact_chain(
+    conn, monkeypatch, tmp_path
+):
+    backlog_id = "AC-DEV-GUIDE-ROUTE-SESSION-BOOTSTRAP"
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn, monkeypatch, tmp_path, backlog_id=backlog_id
+    )
+    issue_body = prepared["issue_body"]
+    assert "observer_session_register" in issue_body["allowed_actions"]
+    assert issue_body["allowed_actions"] == list(
+        server._OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+    )
+    issued = server.handle_observer_route_context_issue(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body=issue_body,
+        )
+    )
+    storage_project_id = server.direct_main_dev_storage_project_id(
+        "aming-claw", prepared["world"]["namespace_hash"]
+    )
+    persisted = conn.execute(
+        "SELECT allowed_actions_json FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (storage_project_id, issued["route_token_ref"]),
+    ).fetchone()
+    assert json.loads(persisted["allowed_actions_json"]) == issue_body["allowed_actions"]
+
+    registration_body = {
+        "project_id": "aming-claw",
+        "route_token_ref": issued["route_token_ref"],
+        "backlog_id": backlog_id,
+        "task_id": prepared["task_id"],
+        "cex_id": prepared["task_id"],
+    }
+    server._guard_dev_runtime_request(
+        method="POST",
+        path="/api/projects/aming-claw/observer-sessions/register",
+        path_params={"project_id": "aming-claw"},
+        body=registration_body,
+    )
+    status, registered = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body=registration_body,
+        )
+    )
+    assert status == 201
+    heartbeat = server.handle_observer_session_heartbeat(
+        _ctx(
+            {
+                "project_id": "aming-claw",
+                "session_id": registered["observer_session_id"],
+            },
+            method="POST",
+            body={"session_token": registered["session_token"]},
+        )
+    )
+    assert heartbeat["session"]["computed_status"] == "active"
+
+
+@pytest.mark.parametrize("mutation", ["manual_action", "wrong_scope"])
+def test_ac_dev_public_guide_route_issue_rejects_manual_action_or_scope_zero_write(
+    conn, monkeypatch, tmp_path, mutation
+):
+    backlog_id = f"AC-DEV-GUIDE-ROUTE-REJECT-{mutation.upper()}"
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn, monkeypatch, tmp_path, backlog_id=backlog_id
+    )
+    body = copy.deepcopy(prepared["issue_body"])
+    if mutation == "manual_action":
+        body["allowed_actions"].append("manually_claimed_action")
+    else:
+        body["task_id"] = "cex-direct-main-wrong-scope"
+    route_rows_before = conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0]
+    session_rows_before = conn.execute(
+        "SELECT COUNT(*) FROM observer_sessions"
+    ).fetchone()[0]
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_observer_route_context_issue(
+            _ctx(
+                {"project_id": "aming-claw"},
+                method="POST",
+                body=body,
+            )
+        )
+    assert rejected.value.code in {
+        "ac_dev_direct_route_bootstrap_not_guide_bound",
+        "ac_direct_main_runtime_candidate_identity_mismatch",
+    }
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert conn.execute("SELECT COUNT(*) FROM observer_route_token_refs").fetchone()[0] == route_rows_before
+    assert conn.execute("SELECT COUNT(*) FROM observer_sessions").fetchone()[0] == session_rows_before
 
 
 def _insert_ac_dev_active_observer_session(

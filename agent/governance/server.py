@@ -7075,6 +7075,7 @@ def handle_observer_session_register(ctx: RequestContext):
                 capabilities = observer_route_context.resolve_observer_session_registration_route(
                     conn,
                     project_id=project_id,
+                    storage_project_id=_route_registry_storage_project_id(project_id),
                     route_token_ref=str(ctx.body.get("route_token_ref") or ""),
                     backlog_id=str(ctx.body.get("backlog_id") or ""),
                     task_id=str(ctx.body.get("task_id") or ""),
@@ -144325,6 +144326,7 @@ _ONBOARD_CONTRACT_ROUTE_TOKEN_ALLOWED_ACTIONS = (
     "task_timeline_append",
 )
 _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS = (
+    "observer_session_register",
     "graph_query",
     "observer_direct_mutation_exception",
     "task_timeline_append",

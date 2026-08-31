@@ -2719,6 +2719,7 @@ def resolve_observer_session_registration_route(
     conn: sqlite3.Connection,
     *,
     project_id: str,
+    storage_project_id: str = "",
     route_token_ref: str,
     backlog_id: str,
     task_id: str,
@@ -2733,6 +2734,7 @@ def resolve_observer_session_registration_route(
     resolved = resolve_route_token_ref(
         conn,
         project_id=project_id,
+        storage_project_id=storage_project_id,
         route_token_ref=route_token_ref,
         backlog_id=backlog_id,
         task_id=task_id,
@@ -2754,7 +2756,9 @@ def resolve_observer_session_registration_route(
             code="route_token_ref_action_not_allowed",
         )
     evidence_refs = {_string(item) for item in resolved.get("evidence_refs") or []}
-    if not cex_id or cex_id not in evidence_refs:
+    if not cex_id or not {
+        _string(cex_id), f"contract_runtime:{_string(cex_id)}"
+    }.intersection(evidence_refs):
         raise RouteTokenRefError(
             "route_token_ref does not carry the exact Direct CEX",
             code="route_token_ref_cex_mismatch",
