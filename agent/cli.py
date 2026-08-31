@@ -39,6 +39,7 @@ import stat
 import shlex
 import signal
 import ctypes
+import secrets
 import http.client
 import urllib.error
 import urllib.parse
@@ -2492,6 +2493,35 @@ def _durable_receipt_sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _durable_content_receipt(directory: Path, prefix: str, payload: Mapping[str, Any]) -> tuple[Path, str]:
+    raw = _canonical_json_bytes(payload)
+    digest = hashlib.sha256(raw).hexdigest()
+    destination = directory / f"{prefix}.{digest}.json"
+    temporary = directory / f".{prefix}.{secrets.token_hex(16)}.pending"
+    _posix_exclusive_json(temporary, payload)
+    _noreplace_promote(temporary, destination)
+    return destination, "sha256:" + digest
+
+
+def _read_durable_content_receipt(path: Path, prefix: str) -> tuple[dict[str, Any], str]:
+    if path.is_symlink() or not path.is_file():
+        raise click.ClickException(f"AC dev durable {prefix} receipt is not canonical")
+    match = re.fullmatch(rf"{re.escape(prefix)}\.([0-9a-f]{{64}})\.json", path.name)
+    if match is None:
+        raise click.ClickException(f"AC dev durable {prefix} receipt has noncanonical name")
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != match.group(1):
+        raise click.ClickException(f"AC dev durable {prefix} receipt digest mismatch")
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise click.ClickException(f"AC dev durable {prefix} receipt is malformed") from exc
+    if not isinstance(payload, dict):
+        raise click.ClickException(f"AC dev durable {prefix} receipt is malformed")
+    return payload, "sha256:" + digest
+
+
 def _durable_exit_binding(receipt: Mapping[str, Any], receipt_sha256: str) -> dict[str, Any]:
     process = receipt["process"]
     return {
@@ -2506,6 +2536,9 @@ def _durable_exit_binding(receipt: Mapping[str, Any], receipt_sha256: str) -> di
         "database_path": receipt["database_path"], "database_identity": receipt["database_identity"],
         "dev_storage_root": receipt["dev_storage_root"], "project_id": receipt["project_id"],
         "port": receipt["port"], "policy": receipt["policy"],
+        "linked_v3_receipt_sha256": receipt["linked_v3_receipt_sha256"],
+        "log_path": receipt["log_path"], "log_identity": receipt["log_identity"],
+        "health": receipt["health"],
     }
 
 
@@ -2525,11 +2558,8 @@ def _durable_dev_launch(
     if os.name != "posix":
         raise click.ClickException("AC dev durable launch requires POSIX")
     runtime = dev_storage / "runtime" / "durable-launch"
-    active = runtime / "launch.completed.json"
-    pending = runtime / "launch.pending.json"
-    exit_path = runtime / "exit-status.json"
     lock = runtime / "launch.lock"
-    if any(path.exists() or path.is_symlink() for path in (active, pending, exit_path, lock)):
+    if lock.exists() or lock.is_symlink() or list(runtime.glob("launch.*.json")):
         raise click.ClickException("AC dev durable launch has stale or active receipt state")
     linked_digest, _linked = _validated_linked_v3_receipt(
         linked_receipt, dev_storage=dev_storage, database=database,
@@ -2551,9 +2581,9 @@ def _durable_dev_launch(
         sys.executable, "-m", "agent.cli", "start", "--runtime-plane", "dev",
         "--port", str(AC_DEV_SERVICE_PORT), "--dev-storage-root", str(dev_storage),
         "--stable-anchor-commit", stable_anchor_commit,
-        "--durable-child-exit-receipt", str(exit_path),
+        "--durable-child-exit-receipt", str(runtime),
         "--durable-child-launch-id", launch_id,
-        "--durable-child-completed-receipt", str(active),
+        "--durable-child-completed-receipt", str(runtime),
     ]
     try:
         child = _posix_detached_popen(argv, cwd=source_root, log_fd=log_fd)
@@ -2574,7 +2604,7 @@ def _durable_dev_launch(
             "database_path": str(database), "database_identity": dict(database_identity),
             "dev_storage_root": str(dev_storage), "project_id": "aming-claw",
             "port": AC_DEV_SERVICE_PORT, "linked_v3_receipt_sha256": linked_digest,
-            "log_path": str(log_path), "exit_receipt": str(exit_path),
+            "log_path": str(log_path), "log_identity": _admission_identity(log_path),
             "policy": {"runtime_plane": "dev", "migration": "verify-only",
                        "stable_deployment": "deny", "graph_activation": "deny",
                        "background_workers": "deny"},
@@ -2594,11 +2624,11 @@ def _durable_dev_launch(
         ):
             raise click.ClickException("AC dev durable child health identity mismatch")
         completed = {**base, "health": health}
-        _posix_exclusive_json(pending, completed)
-        _noreplace_promote(pending, active)
+        active, active_sha256 = _durable_content_receipt(runtime, "launch", completed)
         lock.unlink()
         _fsync_parent(lock)
-        click.echo(json.dumps({"status": "started", "pid": child.pid, "receipt": str(active)}, sort_keys=True))
+        click.echo(json.dumps({"status": "started", "pid": child.pid, "receipt": str(active),
+                               "receipt_sha256": active_sha256}, sort_keys=True))
     except BaseException:
         if child.poll() is None:
             os.kill(child.pid, signal.SIGTERM)
@@ -2613,13 +2643,11 @@ def _durable_dev_launch(
 
 def _durable_dev_stop(dev_storage: Path) -> None:
     runtime = dev_storage / "runtime" / "durable-launch"
-    receipt_path = runtime / "launch.completed.json"
-    if receipt_path.is_symlink() or not receipt_path.is_file():
+    launch_paths = list(runtime.glob("launch.*.json"))
+    if len(launch_paths) != 1:
         raise click.ClickException("AC dev durable stop requires completed launch receipt")
-    try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise click.ClickException("AC dev durable launch receipt is malformed") from exc
+    receipt_path = launch_paths[0]
+    receipt, launch_sha256 = _read_durable_content_receipt(receipt_path, "launch")
     pid = int(receipt.get("pid") or 0) if isinstance(receipt, dict) else 0
     if (
         not isinstance(receipt, dict) or receipt.get("schema_version") != _AC_DEV_DURABLE_LAUNCH_VERSION
@@ -2631,9 +2659,9 @@ def _durable_dev_stop(dev_storage: Path) -> None:
         receipt_root = Path(str(receipt.get("dev_storage_root") or "")).resolve(strict=True)
         source_root = Path(str(receipt.get("source_root") or "")).resolve(strict=True)
         database = Path(str(receipt.get("database_path") or "")).resolve(strict=True)
+        log_path = Path(str(receipt.get("log_path") or "")).resolve(strict=True)
         current_source = _source_git_identity()
         database_identity = _admission_identity(database)
-        database_stat = database.stat(follow_symlinks=False)
         server_sha = "sha256:" + hashlib.sha256(
             (source_root / "agent" / "governance" / "server.py").read_bytes()
         ).hexdigest()
@@ -2642,14 +2670,16 @@ def _durable_dev_stop(dev_storage: Path) -> None:
     if (
         receipt_root != dev_storage.resolve(strict=True)
         or not isinstance(receipt.get("database_identity"), dict)
-        or receipt["database_identity"].get("device") != int(database_stat.st_dev)
-        or receipt["database_identity"].get("inode") != int(database_stat.st_ino)
+        or receipt["database_identity"] != database_identity
+        or receipt.get("log_identity") != _admission_identity(log_path)
+        or log_path.parent != runtime.resolve(strict=True)
         or current_source.get("root") != str(source_root)
         or current_source.get("commit") != receipt.get("source_commit")
         or current_source.get("tree") != receipt.get("source_tree")
         or current_source.get("dirty") != ""
         or server_sha != receipt.get("server_sha256")
         or receipt.get("python") != str(Path(sys.executable).resolve())
+        or receipt.get("cwd") != str(source_root)
         or receipt.get("policy") != {"runtime_plane": "dev", "migration": "verify-only",
             "stable_deployment": "deny", "graph_activation": "deny",
             "background_workers": "deny"}
@@ -2666,16 +2696,24 @@ def _durable_dev_stop(dev_storage: Path) -> None:
     if validated_digest != linked_digest:
         raise click.ClickException("AC dev durable stop linked-v3 identity mismatch")
     process = _posix_process_identity(pid)
+    current_health = _probe_governance(AC_DEV_SERVICE_PORT, timeout=0.5)
     if (
         process != receipt.get("process") or process["cwd"] != receipt.get("cwd")
+        or not isinstance(receipt.get("argv"), list)
+        or shlex.split(process["argv"]) != receipt.get("argv")
         or _durable_listener_pid(AC_DEV_SERVICE_PORT) != pid
+        or current_health != receipt.get("health")
     ):
         raise click.ClickException("AC dev durable stop process identity mismatch")
-    exit_path = Path(str(receipt.get("exit_receipt") or ""))
-    if exit_path.exists() or exit_path.is_symlink():
-        raise click.ClickException("AC dev durable stop rejects pre-existing exit receipt")
-    completed_sha256 = _durable_receipt_sha256(receipt_path)
-    expected_exit_binding = _durable_exit_binding(receipt, completed_sha256)
+    before_exits = {path.name for path in runtime.glob("exit.*.json")}
+    challenge_payload = {
+        "schema_version": "ac_dev_durable_stop_challenge.v1", "stage": "term_requested",
+        "nonce": secrets.token_hex(32), "launch_sha256": launch_sha256,
+        "binding": _durable_exit_binding(receipt, launch_sha256),
+    }
+    challenge_path, challenge_sha256 = _durable_content_receipt(
+        runtime, "stop-challenge", challenge_payload,
+    )
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -2686,26 +2724,30 @@ def _durable_dev_stop(dev_storage: Path) -> None:
         time.sleep(0.1)
     else:
         raise click.ClickException("AC dev durable stop TERM timeout; SIGKILL not authorized")
-    if exit_path.is_symlink() or not exit_path.is_file():
+    new_exits = [path for path in runtime.glob("exit.*.json") if path.name not in before_exits]
+    if len(new_exits) != 1:
         raise click.ClickException("AC dev durable child exit receipt is missing")
-    try:
-        exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise click.ClickException("AC dev durable child exit receipt is malformed") from exc
+    exit_path = new_exits[0]
+    exit_receipt, exit_sha256 = _read_durable_content_receipt(exit_path, "exit")
     if (
         not isinstance(exit_receipt, dict)
         or exit_receipt.get("schema_version") != "ac_dev_durable_exit.v1"
         or exit_receipt.get("pid") != pid
         or exit_receipt.get("status") not in {"terminated", "normal", "python_exception"}
         or not isinstance(exit_receipt.get("exit_code"), int)
-        or exit_receipt.get("binding") != expected_exit_binding
+        or exit_receipt.get("binding") != challenge_payload["binding"]
+        or exit_receipt.get("challenge_sha256") != challenge_sha256
+        or exit_receipt.get("launch_sha256") != launch_sha256
         or (exit_receipt.get("status"), exit_receipt.get("exit_code")) not in {
             ("terminated", 143), ("normal", 0), ("python_exception", 1),
         }
     ):
         raise click.ClickException("AC dev durable child exit receipt is malformed")
-    stopped = runtime / f"launch-{receipt['launch_id']}.stopped.json"
-    os.replace(receipt_path, stopped)
+    stopped, stopped_sha256 = _durable_content_receipt(runtime, "stop", {
+        "schema_version": "ac_dev_durable_stop.v1", "stage": "completed",
+        "launch_sha256": launch_sha256, "challenge_sha256": challenge_sha256,
+        "exit_sha256": exit_sha256,
+    })
     click.echo(json.dumps({"status": "stopped", "pid": pid, "receipt": str(stopped)}, sort_keys=True))
 
 
@@ -2812,12 +2854,36 @@ def start(
         stable_shared = Path(str(verified_stable_database_binding(
             stable_anchor_commit=stable_anchor_commit
         )["shared_volume_path"]))
-        selected_dev_storage = resolve_ac_dev_storage_root(stable_shared)
-        if dev_storage_root and Path(dev_storage_root).expanduser().absolute() != selected_dev_storage:
+        canonical_dev_storage = resolve_ac_dev_storage_root(stable_shared)
+        selected_dev_storage = canonical_dev_storage
+        if (durable_launch or durable_stop) and dev_storage_root:
+            requested = Path(dev_storage_root).expanduser().absolute()
+            try:
+                requested_resolved = requested.resolve(strict=True)
+                source_resolved = Path(dev_identity["root"]).resolve(strict=True)
+                stable_resolved = stable_shared.resolve(strict=True)
+            except OSError as exc:
+                raise click.ClickException("AC dev durable isolated root is unavailable") from exc
+            if (requested.is_symlink() or requested_resolved in {source_resolved, stable_resolved}
+                    or source_resolved in requested_resolved.parents
+                    or stable_resolved in requested_resolved.parents):
+                raise click.ClickException("AC dev durable root is not physically isolated")
+            selected_dev_storage = requested_resolved
+        elif dev_storage_root and Path(dev_storage_root).expanduser().absolute() != selected_dev_storage:
             raise click.ClickException("AC dev storage root must equal the canonical stable-volume sibling.")
         if durable_stop:
             _durable_dev_stop(selected_dev_storage)
             return
+        if durable_launch:
+            isolated_database = selected_dev_storage / "governance" / "aming-claw" / "governance.db"
+            if not isolated_database.is_file():
+                raise click.ClickException("AC dev durable launch requires its existing receipt-bound database")
+            _validated_linked_v3_receipt(
+                linked_v3_receipt, dev_storage=selected_dev_storage,
+                database=isolated_database,
+                database_identity=_admission_identity(isolated_database),
+                source_identity=dev_identity,
+            )
         # Listener ownership is the first dev-world admission decision.  A
         # running or foreign process must be rejected before bootstrap, source
         # CAS, activation validation, or any dedicated-root filesystem write.
@@ -2970,39 +3036,45 @@ def start(
         if durable_child_exit_receipt is None:
             _run_dev_governance()
         else:
-            exit_path = durable_child_exit_receipt.absolute()
-            completed_path = durable_child_completed_receipt.absolute()
+            durable_runtime = durable_child_exit_receipt.absolute()
+            completed_runtime = durable_child_completed_receipt.absolute()
             previous_term = signal.getsignal(signal.SIGTERM)
             def _term_handler(_signum, _frame):
                 raise SystemExit(143)
+            def _write_bound_exit(status: str, exit_code: int, exception_type: str) -> None:
+                launches = []
+                for candidate in completed_runtime.glob("launch.*.json"):
+                    value, digest = _read_durable_content_receipt(candidate, "launch")
+                    if value.get("launch_id") == durable_child_launch_id:
+                        launches.append((value, digest))
+                if len(launches) != 1:
+                    return
+                launch, launch_sha256 = launches[0]
+                challenges = []
+                for candidate in durable_runtime.glob("stop-challenge.*.json"):
+                    value, digest = _read_durable_content_receipt(candidate, "stop-challenge")
+                    if (value.get("launch_sha256") == launch_sha256
+                            and value.get("binding") == _durable_exit_binding(launch, launch_sha256)):
+                        challenges.append((value, digest))
+                challenge_sha256 = challenges[0][1] if len(challenges) == 1 else None
+                _durable_content_receipt(durable_runtime, "exit", {
+                    "schema_version": "ac_dev_durable_exit.v1", "pid": os.getpid(),
+                    "status": status, "exit_code": exit_code, "exception_type": exception_type,
+                    "launch_sha256": launch_sha256, "challenge_sha256": challenge_sha256,
+                    "binding": _durable_exit_binding(launch, launch_sha256),
+                })
             signal.signal(signal.SIGTERM, _term_handler)
             try:
                 _run_dev_governance()
             except BaseException as exc:
-                if not completed_path.is_file():
-                    raise
-                completed_receipt = json.loads(completed_path.read_text(encoding="utf-8"))
-                completed_sha256 = _durable_receipt_sha256(completed_path)
-                if completed_receipt.get("launch_id") != durable_child_launch_id:
-                    raise click.ClickException("AC dev durable child launch binding mismatch")
-                _durable_child_exit(exit_path, {
-                    "schema_version": "ac_dev_durable_exit.v1", "pid": os.getpid(),
-                    "status": "terminated" if isinstance(exc, SystemExit) else "python_exception",
-                    "exit_code": int(exc.code or 0) if isinstance(exc, SystemExit) else 1,
-                    "exception_type": type(exc).__name__,
-                    "binding": _durable_exit_binding(completed_receipt, completed_sha256),
-                })
+                _write_bound_exit(
+                    "terminated" if isinstance(exc, SystemExit) else "python_exception",
+                    int(exc.code or 0) if isinstance(exc, SystemExit) else 1,
+                    type(exc).__name__,
+                )
                 raise
             else:
-                if not completed_path.is_file():
-                    raise click.ClickException("AC dev durable completed receipt is unavailable")
-                completed_receipt = json.loads(completed_path.read_text(encoding="utf-8"))
-                completed_sha256 = _durable_receipt_sha256(completed_path)
-                _durable_child_exit(exit_path, {
-                    "schema_version": "ac_dev_durable_exit.v1", "pid": os.getpid(),
-                    "status": "normal", "exit_code": 0, "exception_type": "",
-                    "binding": _durable_exit_binding(completed_receipt, completed_sha256),
-                })
+                _write_bound_exit("normal", 0, "")
             finally:
                 signal.signal(signal.SIGTERM, previous_term)
     else:

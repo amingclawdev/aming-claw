@@ -4500,6 +4500,13 @@ def test_posix_durable_launch_lock_has_exactly_one_concurrent_winner(tmp_path):
     assert len(winners) == 1
     assert json.loads(lock.read_text(encoding="utf-8")) == {"winner": winners[0]}
 
+    launch, digest = cli._durable_content_receipt(tmp_path, "launch", {"immutable": True})
+    assert launch.name == f"launch.{digest[7:]}.json"
+    payload, read_digest = cli._read_durable_content_receipt(launch, "launch")
+    assert payload == {"immutable": True} and read_digest == digest
+    with pytest.raises(cli.click.ClickException, match="collision"):
+        cli._durable_content_receipt(tmp_path, "launch", {"immutable": True})
+
 
 def test_posix_detached_popen_uses_no_shell_new_session_and_devnull(tmp_path, monkeypatch):
     import agent.cli as cli
@@ -4535,12 +4542,16 @@ def test_durable_exit_binding_discriminates_every_authorized_launch_field():
         "policy": {"runtime_plane": "dev", "migration": "verify-only",
                    "stable_deployment": "deny", "graph_activation": "deny",
                    "background_workers": "deny"},
+        "linked_v3_receipt_sha256": "sha256:" + "4" * 64,
+        "log_path": "/dev/log", "log_identity": {"path": "/dev/log", "device": 3, "inode": 4},
+        "health": {"pid": 123},
     }
     baseline = cli._durable_exit_binding(receipt, "sha256:" + "3" * 64)
     assert baseline["completed_receipt_sha256"] == "sha256:" + "3" * 64
     for field in ("launch_id", "pid", "argv", "cwd", "python", "source_commit", "source_tree",
                   "server_sha256", "source_root", "database_path", "database_identity",
-                  "dev_storage_root", "project_id", "port", "policy"):
+                  "dev_storage_root", "project_id", "port", "policy",
+                  "linked_v3_receipt_sha256", "log_path", "log_identity", "health"):
         mutated = copy.deepcopy(receipt)
         mutated[field] = ["mutated"] if field == "argv" else "mutated"
         assert cli._durable_exit_binding(mutated, "sha256:" + "3" * 64) != baseline, field
@@ -4557,31 +4568,37 @@ def test_durable_stop_attacks_fail_closed(tmp_path, monkeypatch, attack):
     server = source / "agent" / "governance" / "server.py"; server.write_text("server\n", encoding="utf-8")
     database = dev / "governance" / "aming-claw" / "governance.db"; database.parent.mkdir(parents=True); database.write_bytes(b"db")
     details = database.stat()
+    log = runtime / "governance.log"; log.write_text("", encoding="utf-8")
     receipt = {
         "schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION, "stage": "completed",
         "launch_id": "fixture", "pid": 424242, "project_id": "aming-claw", "port": 40008,
         "dev_storage_root": str(dev), "source_root": str(source), "source_commit": "a" * 40,
         "source_tree": "b" * 40, "server_sha256": "sha256:" + hashlib.sha256(server.read_bytes()).hexdigest(),
         "python": str(Path(sys.executable).resolve()), "database_path": str(database),
-        "database_identity": {"device": details.st_dev, "inode": details.st_ino},
-        "process": {"start_identity": "sha256:" + "c" * 64, "argv": "expected", "cwd": str(source)},
+        "database_identity": {"path": str(database), "device": details.st_dev, "inode": details.st_ino},
+        "process": {"start_identity": "sha256:" + "c" * 64,
+                    "argv": f"{sys.executable} child", "cwd": str(source)},
         "argv": [sys.executable, "child"], "cwd": str(source), "exit_receipt": str(runtime / "exit-status.json"),
         "linked_v3_receipt_sha256": "sha256:" + "e" * 64,
         "policy": {"runtime_plane": "dev", "migration": "verify-only",
                    "stable_deployment": "deny", "graph_activation": "deny",
                    "background_workers": "deny"},
+        "log_path": str(log), "log_identity": cli._admission_identity(log),
+        "health": {"pid": 424242},
     }
-    (runtime / "launch.completed.json").write_text(json.dumps(receipt), encoding="utf-8")
+    cli._durable_content_receipt(runtime, "launch", receipt)
     monkeypatch.setattr(cli, "_source_git_identity", lambda: {
         "root": str(source), "commit": "a" * 40, "tree": "b" * 40, "dirty": "",
     })
     if attack in {"preforged_exit", "missing_exit_after_term"}:
-        (runtime / "exit-status.json").write_text("{}", encoding="utf-8")
+        cli._durable_content_receipt(runtime, "exit", {"forged": True})
         if attack == "missing_exit_after_term":
-            (runtime / "exit-status.json").unlink()
+            for candidate in runtime.glob("exit.*.json"):
+                candidate.unlink()
         monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: receipt["process"])
         monkeypatch.setattr(cli, "_durable_listener_pid", lambda _port: receipt["pid"])
-        expected = "pre-existing exit receipt" if attack == "preforged_exit" else "exit receipt is missing"
+        monkeypatch.setattr(cli, "_probe_governance", lambda *_args, **_kwargs: receipt["health"])
+        expected = "exit receipt is missing"
     else:
         monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: {
             "start_identity": "sha256:" + "d" * 64, "argv": "attacker", "cwd": str(source),
@@ -4593,12 +4610,12 @@ def test_durable_stop_attacks_fail_closed(tmp_path, monkeypatch, attack):
     signals = []
     def fake_kill(pid, sig):
         signals.append((pid, sig))
-        if attack == "missing_exit_after_term" and sig == 0:
+        if attack in {"missing_exit_after_term", "preforged_exit"} and sig == 0:
             raise ProcessLookupError
     monkeypatch.setattr(cli.os, "kill", fake_kill)
     with pytest.raises(cli.click.ClickException, match=expected):
         cli._durable_dev_stop(dev)
-    if attack == "missing_exit_after_term":
+    if attack in {"missing_exit_after_term", "preforged_exit"}:
         assert signals == [(receipt["pid"], cli.signal.SIGTERM), (receipt["pid"], 0)]
     else:
         assert signals == []
