@@ -1123,6 +1123,82 @@ def test_graph_activation_classifies_exact_validated_cow_successor(tmp_path, mon
     assert policy["classification_reason"] == "verified_dev_cow_successor_receipt_history"
 
 
+@pytest.mark.parametrize("row_factory", [None, sqlite3.Row])
+def test_cow_quick_check_accepts_exact_tuple_or_row_shape(row_factory):
+    from agent.governance import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = row_factory
+    try:
+        assert db._quick_check_returns_literal_ok(conn) is True
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        None,
+        (),
+        ("ok", "extra"),
+        (1,),
+        (b"ok",),
+        (type("StringSubclass", (str,), {})("ok"),),
+        ("OK",),
+        ("not ok",),
+    ],
+)
+def test_cow_quick_check_rejects_missing_cardinality_type_or_value(row):
+    from agent.governance import db
+
+    class Cursor:
+        def fetchone(self):
+            return row
+
+    class Connection:
+        def execute(self, statement):
+            assert statement == "PRAGMA quick_check"
+            return Cursor()
+
+    assert db._quick_check_returns_literal_ok(Connection()) is False
+
+
+def test_cow_quick_check_rejects_malformed_row_shape():
+    from agent.governance import db
+
+    class Cursor:
+        def fetchone(self):
+            return object()
+
+    class Connection:
+        def execute(self, statement):
+            assert statement == "PRAGMA quick_check"
+            return Cursor()
+
+    assert db._quick_check_returns_literal_ok(Connection()) is False
+
+
+def test_graph_activation_rejects_failed_cow_quick_check(tmp_path, monkeypatch):
+    from agent.governance import db
+
+    db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    monkeypatch.setattr(
+        db, "_verify_current_cow_successor_source", lambda *_args, **_kwargs: None
+    )
+
+    def fail_quick_check(_conn):
+        raise sqlite3.DatabaseError("malformed quick_check result")
+
+    monkeypatch.setattr(db, "_quick_check_returns_literal_ok", fail_quick_check)
+    try:
+        policy = db.classify_graph_activation_connection(conn)
+    finally:
+        conn.close()
+    assert policy["runtime_plane"] == "unknown"
+    assert policy["classification_reason"] == "dev_database_binding_unverified"
+
+
 def test_graph_materialization_admits_valid_cow_without_parallel_runtime_inventory(
     tmp_path, monkeypatch,
 ):
@@ -1153,6 +1229,10 @@ def test_graph_materialization_admits_valid_cow_without_parallel_runtime_invento
     assert conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'graph_%'"
     ).fetchone() == (0,)
+    # Match get_connection/_connect_existing: handler connections use Row and
+    # retain the dev schema authorizer until admission temporarily owns DDL.
+    conn.row_factory = sqlite3.Row
+    conn.set_authorizer(db._dev_schema_authorizer)
 
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
@@ -1177,7 +1257,7 @@ def test_graph_materialization_admits_valid_cow_without_parallel_runtime_invento
         assert result["runtime_plane"] == "dev"
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'parallel_branch_%'"
-        ).fetchone() == (0,)
+        ).fetchone()[0] == 0
     finally:
         conn.close()
 

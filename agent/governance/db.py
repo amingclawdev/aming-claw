@@ -384,6 +384,21 @@ def _verify_current_cow_successor_source(
     _verify_dev_source_upgrade(anchor, current)
 
 
+def _quick_check_returns_literal_ok(conn: sqlite3.Connection) -> bool:
+    """Accept only SQLite's exact one-column, string ``ok`` result."""
+
+    row = conn.execute("PRAGMA quick_check").fetchone()
+    if row is None:
+        return False
+    try:
+        if len(row) != 1:
+            return False
+        value = row[0]
+    except (IndexError, KeyError, TypeError):
+        return False
+    return type(value) is str and value == "ok"
+
+
 def classify_graph_activation_connection(
     conn: sqlite3.Connection,
 ) -> dict[str, object]:
@@ -524,7 +539,7 @@ def classify_graph_activation_connection(
                 return _unknown_graph_activation_connection(
                     "dev_cow_successor_identity_invalid"
                 )
-            if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            if not _quick_check_returns_literal_ok(conn):
                 return _unknown_graph_activation_connection(
                     "dev_cow_successor_current_database_invalid"
                 )
