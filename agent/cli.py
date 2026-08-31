@@ -4486,7 +4486,7 @@ def start(
                         dev_storage, source_identity=dev_identity or {},
                         process_identity=custody,
                         linked_v3_receipt=durable_child_linked_v3_receipt,
-                        expected_database_identity=_canonical_dev_database_identity_projection(canonical_database),
+                        expected_database_identity=pending_database,
                         expected_pre_sha256=pending["database_sha256_before"],
                     )
                 else:
