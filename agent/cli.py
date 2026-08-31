@@ -2682,6 +2682,98 @@ def _durable_dev_launch(
     for path in runtime.glob("launch.*.json"):
         value, digest = _read_durable_content_receipt(path, "launch")
         existing_launches.append((path, value, digest))
+    expected_policy = {"runtime_plane": "dev", "migration": "verify-only",
+                       "stable_deployment": "deny", "graph_activation": "deny",
+                       "background_workers": "deny"}
+
+    def completed_chain_is_valid(value: Mapping[str, Any]) -> bool:
+        pending_sha = str(value.get("pending_sha256") or "")
+        readiness_sha = str(value.get("readiness_sha256") or "")
+        if not (_exact_sha256(pending_sha) and _exact_sha256(readiness_sha)):
+            return False
+        pending, pending_read = _read_durable_content_receipt(
+            runtime / f"pending.{pending_sha[7:]}.json", "pending",
+        )
+        readiness, readiness_read = _read_durable_content_receipt(
+            runtime / f"readiness.{readiness_sha[7:]}.json", "readiness",
+        )
+        return bool(
+            value.get("schema_version") == _AC_DEV_DURABLE_LAUNCH_VERSION
+            and value.get("stage") == "completed"
+            and value.get("source_root") == str(source_root)
+            and value.get("source_commit") == source_identity.get("commit")
+            and value.get("source_tree") == source_identity.get("tree")
+            and value.get("server_sha256") == server_sha
+            and value.get("dev_storage_root") == str(dev_storage)
+            and value.get("database_path") == str(database)
+            and isinstance(value.get("database_identity"), dict)
+            and value.get("database_identity") == readiness.get("database_identity")
+            and value.get("database_identity", {}).get("device") == _admission_identity(database)["device"]
+            and value.get("database_identity", {}).get("inode") == _admission_identity(database)["inode"]
+            and value.get("project_id") == "aming-claw"
+            and value.get("port") == AC_DEV_SERVICE_PORT
+            and value.get("policy") == expected_policy
+            and value.get("linked_v3_receipt_sha256") == linked_digest
+            and pending_read == pending_sha and readiness_read == readiness_sha
+            and pending.get("launch_id") == value.get("launch_id")
+            and pending.get("linked_v3_receipt_sha256") == linked_digest
+            and readiness.get("pending_sha256") == pending_sha
+            and readiness.get("launch_id") == value.get("launch_id")
+            and readiness.get("pid") == value.get("pid")
+            and readiness.get("database_sha256_after") == value.get("database_sha256_after")
+        )
+
+    stop_values = []
+    for path in runtime.glob("stop.*.json"):
+        value, digest = _read_durable_content_receipt(path, "stop")
+        stop_values.append((value, digest))
+    exit_values = {}
+    for path in runtime.glob("exit.*.json"):
+        value, digest = _read_durable_content_receipt(path, "exit")
+        exit_values[digest] = value
+    abnormal_values = []
+    for path in runtime.glob("abnormal.*.json"):
+        value, digest = _read_durable_content_receipt(path, "abnormal")
+        abnormal_values.append((value, digest))
+
+    invalid_generations = []
+    dead_unsealed = []
+    for path, value, digest in existing_launches:
+        try:
+            valid_chain = completed_chain_is_valid(value)
+        except click.ClickException:
+            valid_chain = False
+        if not valid_chain:
+            invalid_generations.append(path)
+            continue
+        process = None
+        try:
+            process = _posix_process_identity(int(value.get("pid") or 0))
+        except click.ClickException:
+            pass
+        if process is not None:
+            continue
+        stops = [stop for stop, _ in stop_values if stop.get("launch_sha256") == digest]
+        stopped = False
+        if len(stops) == 1:
+            exit_value = exit_values.get(str(stops[0].get("exit_sha256") or ""))
+            stopped = bool(
+                exit_value
+                and exit_value.get("launch_sha256") == digest
+                and exit_value.get("binding") == _durable_exit_binding(value, digest)
+                and exit_value.get("challenge_sha256") == stops[0].get("challenge_sha256")
+            )
+        seals = [seal for seal, _ in abnormal_values
+                 if seal.get("launch_sha256") == digest]
+        sealed = len(seals) == 1 and seals[0].get("stage") == "completed_child_absent"
+        if len(stops) > 1 or len(seals) > 1 or (stops and not stopped) or (seals and not sealed):
+            invalid_generations.append(path)
+        elif not stopped and not sealed:
+            dead_unsealed.append((path, value, digest))
+    if invalid_generations:
+        raise click.ClickException("AC dev durable completed generation is unclassifiable")
+    if len(dead_unsealed) > 1:
+        raise click.ClickException("AC dev durable multiple dead unsealed generations")
     live_generations = []
     for _path, value, digest in existing_launches:
         pid = int(value.get("pid") or 0)
@@ -2719,6 +2811,30 @@ def _durable_dev_launch(
     listener_before_recovery = _durable_listener_pid(AC_DEV_SERVICE_PORT)
     if listener_before_recovery:
         raise click.ClickException("AC dev durable unknown listener owns port 40008")
+    if dead_unsealed:
+        _path, dead_value, dead_digest = dead_unsealed[0]
+        # The PID lookup above proved the exact Darwin start identity absent;
+        # the listener lookup proved the reserved port free.  Seal that readback
+        # before any lock claim or successor child creation.
+        seal_payload = {
+            "schema_version": "ac_dev_durable_abnormal_seal.v1",
+            "stage": "completed_child_absent", "launch_sha256": dead_digest,
+            "pid": dead_value.get("pid"), "process": dead_value.get("process"),
+            "database_sha256": current_database_sha256(),
+            "listener_pid": None,
+        }
+        existing_seals = [(value, digest) for value, digest in abnormal_values
+                          if value.get("launch_sha256") == dead_digest]
+        if existing_seals:
+            if len(existing_seals) != 1 or existing_seals[0][0] != seal_payload:
+                raise click.ClickException("AC dev durable abnormal seal mismatch")
+        else:
+            seal_path, seal_digest = _durable_content_receipt(
+                runtime, "abnormal", seal_payload,
+            )
+            replay, replay_digest = _read_durable_content_receipt(seal_path, "abnormal")
+            if replay != seal_payload or replay_digest != seal_digest:
+                raise click.ClickException("AC dev durable abnormal seal readback mismatch")
     if lock.is_symlink():
         raise click.ClickException("AC dev durable launch lock is not canonical")
     if lock.exists():
