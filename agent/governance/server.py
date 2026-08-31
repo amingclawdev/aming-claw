@@ -92,6 +92,9 @@ from .contracts.runtime import (
     ContractRetirementError,
     ContractRuntime,
     ContractRuntimeError,
+    CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS,
+    CANONICAL_REF_ADOPTION_QA_PAYLOAD_REQUIRED_KEYS,
+    CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION,
     LINE_EVIDENCE_OPTIONAL_FIELDS,
     LEGACY_CONTRACT_RECOVERY_ACTIONS,
     MF_PARALLEL_ATOMIC_LANE_WRITER_BINDING_FIELDS,
@@ -7711,72 +7714,34 @@ _CANONICAL_REF_ADOPTION_SCHEMA = "canonical_ref_adoption_route_bound.v1"
 # optional diagnostics.  Keep the list source-owned and deliberately local to
 # canonical adoption: accepting a missing field (or an almost-identical field)
 # would silently turn an older/caller-shaped projection into authority.
-_CANONICAL_REF_ADOPTION_QA_AUTHORITY_FLAGS = {
-    "line": {
-        "authoritative_pass_synthesized": False,
-        "observer_impersonation": False,
-    },
-    "payload": {
-        "authoritative_pass_synthesized": False,
-        "pass_synthesized": False,
-    },
-    "provenance": {
-        "server_derived": True,
-        "observer_impersonation": False,
-        "parent_materialization_authorized": False,
-    },
-    "binding": {
-        "server_derived": True,
-        "independent_verification_session_matched": True,
-    },
-}
+def _canonical_ref_adoption_qa_payload_is_exact(value: Any) -> bool:
+    """Validate the closed, ContractRuntime-owned QA adoption projection.
 
-
-def _canonical_ref_adoption_qa_authority_flags_are_exact(
-    *,
-    line: Any,
-    payload: Any,
-    provenance: Any,
-    binding: Any,
-) -> bool:
-    """Fail closed unless the whole persisted QA authority flag set is exact.
-
-    ContractRuntime stores JSON objects, so duplicate JSON keys cannot survive
-    into this projection as separate values.  Requiring ordinary ``dict``
-    containers and all named keys therefore gives one unambiguous value per
-    source-owned flag.  It also rejects Mapping-like caller inputs should this
-    helper ever be reached outside the durable projection reader.
+    This is intentionally a new compact payload, not a fuzzy scan of an
+    arbitrary QA evidence object.  It is overwritten by ContractRuntime on an
+    authenticated independent-QA write, has no extension namespace, and is
+    recursively closed so typo/case/confusable/nested-key variants cannot be
+    interpreted as authority at the adoption boundary.
     """
-    containers = {
-        "line": line,
-        "payload": payload,
-        "provenance": provenance,
-        "binding": binding,
-    }
-    # A misspelt flag must not be interpreted as a harmless extension.  Limit
-    # this to authority-shaped spellings so unrelated evidence fields retain
-    # their existing forward-compatible schema behavior.
-    authority_fragments = (
-        "pass", "synthes", "impersonat", "server_deriv",
-        "materializ", "verification_session",
+    if type(value) is not dict or set(value) != CANONICAL_REF_ADOPTION_QA_PAYLOAD_REQUIRED_KEYS:
+        return False
+    if value.get("schema_version") != CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION:
+        return False
+    if not all(
+        type(value.get(key)) is str
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value[key])
+        for key in ("candidate_commit_sha", "candidate_tree")
+    ):
+        return False
+    flags = value.get("authority_flags")
+    return bool(
+        type(flags) is dict
+        and set(flags) == set(CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS)
+        and all(
+            type(flags.get(key)) is bool and flags[key] is expected
+            for key, expected in CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS.items()
+        )
     )
-    for container_name, expected in _CANONICAL_REF_ADOPTION_QA_AUTHORITY_FLAGS.items():
-        container = containers[container_name]
-        if type(container) is not dict:
-            return False
-        for key, expected_value in expected.items():
-            if key not in container or type(container[key]) is not bool:
-                return False
-            if container[key] is not expected_value:
-                return False
-        if any(
-            isinstance(key, str)
-            and any(fragment in key.lower() for fragment in authority_fragments)
-            and key not in expected
-            for key in container
-        ):
-            return False
-    return True
 
 
 def _canonical_ref_adoption_active_qa_fact(
@@ -7819,6 +7784,7 @@ def _canonical_ref_adoption_active_qa_fact(
             if isinstance(candidate.get("payload"), Mapping)
             else {}
         )
+        adoption_qa_payload = payload.get("canonical_ref_adoption_qa_payload")
         provenance = (
             candidate.get("qa_evidence_provenance")
             if isinstance(candidate.get("qa_evidence_provenance"), Mapping)
@@ -7830,22 +7796,17 @@ def _canonical_ref_adoption_active_qa_fact(
             else {}
         )
         candidate_commit = str(
-            payload.get("candidate_commit_sha")
-            or candidate.get("commit_sha") or ""
+            adoption_qa_payload.get("candidate_commit_sha")
+            if isinstance(adoption_qa_payload, Mapping) else ""
         ).strip().lower()
         candidate_tree = str(
-            payload.get("candidate_tree")
-            or payload.get("target_tree") or ""
+            adoption_qa_payload.get("candidate_tree")
+            if isinstance(adoption_qa_payload, Mapping) else ""
         ).strip().lower()
         qa_session_id = str(binding.get("qa_session_id") or "").strip()
         principal_id = str(binding.get("qa_principal") or "").strip()
         if not (
-            _canonical_ref_adoption_qa_authority_flags_are_exact(
-                line=candidate,
-                payload=payload,
-                provenance=provenance,
-                binding=binding,
-            )
+            _canonical_ref_adoption_qa_payload_is_exact(adoption_qa_payload)
             and
             str(candidate.get("line_id") or "").strip()
             == "qa_independent_verification"
@@ -7864,6 +7825,12 @@ def _canonical_ref_adoption_active_qa_fact(
             )
             and candidate_commit == expected_commit
             and candidate_tree == expected_tree
+            and str(candidate.get("commit_sha") or "").strip().lower()
+            == candidate_commit
+            and str(payload.get("candidate_commit_sha") or "").strip().lower()
+            == candidate_commit
+            and str(payload.get("candidate_tree") or "").strip().lower()
+            == candidate_tree
             and qa_session_id and principal_id
         ):
             continue

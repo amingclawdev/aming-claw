@@ -352,6 +352,12 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
                 "candidate_commit_sha": "b" * 40, "candidate_tree": "c" * 40,
                 "authoritative_pass_synthesized": False,
                 "pass_synthesized": False,
+                "canonical_ref_adoption_qa_payload": {
+                    "schema_version": server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION,
+                    "candidate_commit_sha": "b" * 40,
+                    "candidate_tree": "c" * 40,
+                    "authority_flags": dict(server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS),
+                },
             },
         }],
     })
@@ -507,37 +513,27 @@ def test_canonical_ref_adoption_qa_fact_flags_are_independent_fail_closed(
 
     missing = object()
     invalid_false = (missing, None, True, "false", 0, [], {})
-    invalid_true = (missing, None, False, "true", 1, [], {})
+    invalid_text = (missing, None, False, "true", 1, [], {})
     cases = [
-        ("line.authoritative_pass_synthesized", invalid_false),
-        ("line.observer_impersonation", invalid_false),
-        ("payload.authoritative_pass_synthesized", invalid_false),
-        ("payload.pass_synthesized", invalid_false),
-        ("provenance.server_derived", invalid_true),
-        ("provenance.observer_impersonation", invalid_false),
-        ("provenance.parent_materialization_authorized", invalid_false),
-        ("binding.server_derived", invalid_true),
-        ("binding.independent_verification_session_matched", invalid_true),
+        ("projection.schema_version", invalid_text),
+        ("projection.candidate_commit_sha", invalid_text),
+        ("projection.candidate_tree", invalid_text),
+        ("projection.authority_flags.authoritative_pass_synthesized", invalid_false),
+        ("projection.authority_flags.pass_synthesized", invalid_false),
         # Authority-looking spellings are not forward-compatible extension
         # points.  They can otherwise conceal a misspelt required assertion.
-        ("extra.line.authoritative_pass_synthesised", (False,)),
-        ("extra.payload.pass_synthezised", (False,)),
-        ("extra.provenance.server_derive", (True,)),
-        ("extra.binding.independent_verification_session_match", (True,)),
-        # A correct no-synthesis marker cannot compensate for other forged
-        # provenance markers.
-        ("combined", ((True, True, False),)),
+        ("extra.projection.random", (False,)),
+        ("extra.projection.Authority_Flags", (False,)),
+        ("extra.projection.authority_flags.nested", ({},)),
+        ("extra.projection.authority_fⅼags", (False,)),
     ]
 
     def set_field(line, field, value):
-        containers = {
-            "line": line,
-            "payload": line["payload"],
-            "provenance": line["qa_evidence_provenance"],
-            "binding": line["qa_evidence_provenance"]["authenticated_qa_binding"],
-        }
-        container_name, key = field.split(".")
-        container = containers[container_name]
+        container = line["payload"]["canonical_ref_adoption_qa_payload"]
+        path = field.split(".")[1:]
+        for key in path[:-1]:
+            container = container[key]
+        key = path[-1]
         if value is missing:
             container.pop(key, None)
         else:
@@ -620,20 +616,20 @@ def test_canonical_ref_adoption_qa_fact_flags_are_independent_fail_closed(
                     "candidate_commit_sha": "b" * 40, "candidate_tree": "c" * 40,
                     "authoritative_pass_synthesized": False,
                     "pass_synthesized": False,
+                    "canonical_ref_adoption_qa_payload": {
+                        "schema_version": server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION,
+                        "candidate_commit_sha": "b" * 40,
+                        "candidate_tree": "c" * 40,
+                        "authority_flags": dict(server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS),
+                    },
                 },
             }
-            if field == "combined":
-                line["authoritative_pass_synthesized"] = value[0]
-                provenance["observer_impersonation"] = value[1]
-                line["payload"]["pass_synthesized"] = value[2]
-            elif field.startswith("extra."):
-                _, container_name, key = field.split(".")
-                {
-                    "line": line,
-                    "payload": line["payload"],
-                    "provenance": provenance,
-                    "binding": binding,
-                }[container_name][key] = value
+            if field.startswith("extra."):
+                _, _, *path = field.split(".")
+                container = line["payload"]["canonical_ref_adoption_qa_payload"]
+                for key in path[:-1]:
+                    container = container[key]
+                container[path[-1]] = value
             else:
                 set_field(line, field, value)
             SQLiteContractExecutionStore(conn).create({
@@ -675,6 +671,31 @@ def test_canonical_ref_adoption_qa_fact_flags_are_independent_fail_closed(
                 ).fetchone()[0] == 1, (field, value)
             finally:
                 conn.close()
+
+
+def test_contract_runtime_replaces_canonical_adoption_qa_payload_projection():
+    """The exact adoption payload is emitted by ContractRuntime, not callers."""
+    write = {
+        "line_id": "qa_independent_verification",
+        "evidence_kind": "independent_verification",
+        "commit_sha": "b" * 40,
+        "payload": {
+            "candidate_commit_sha": "b" * 40,
+            "candidate_tree": "c" * 40,
+            "canonical_ref_adoption_qa_payload": {
+                "schema_version": "caller.version",
+                "unexpected": {"nested": True},
+            },
+        },
+    }
+    contract_runtime._enrich_qa_evidence_provenance(write, "qa")
+    projection = write["payload"]["canonical_ref_adoption_qa_payload"]
+    assert projection == {
+        "schema_version": server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION,
+        "candidate_commit_sha": "b" * 40,
+        "candidate_tree": "c" * 40,
+        "authority_flags": dict(server.CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS),
+    }
 
 
 def test_canonical_ref_adoption_rejects_before_dev_bootstrap_on_missing_qa_fact(

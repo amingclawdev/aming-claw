@@ -12286,6 +12286,27 @@ _QA_EVIDENCE_PROVENANCE_FIELDS = (
     "qa_session_token_ref",
     "parent_materialization_authorized",
 )
+
+# Canonical-ref adoption consumes a deliberately small QA projection.  It is
+# not the caller supplied ``payload`` (which may contain ordinary test output
+# and diagnostics); ContractRuntime replaces this projection on every
+# authenticated independent-QA write.  Keeping this schema here, alongside
+# the line-writer vocabulary, prevents the issuer and writer from drifting.
+CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION = (
+    "contract_runtime.canonical_ref_adoption_qa_payload.v1"
+)
+CANONICAL_REF_ADOPTION_QA_PAYLOAD_REQUIRED_KEYS = frozenset(
+    {
+        "schema_version",
+        "candidate_commit_sha",
+        "candidate_tree",
+        "authority_flags",
+    }
+)
+CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS = {
+    "authoritative_pass_synthesized": False,
+    "pass_synthesized": False,
+}
 _RAW_TOKEN_FIELD_NAMES = {
     "governance_token",
     "governance_tokens",
@@ -12386,6 +12407,27 @@ def _enrich_qa_evidence_provenance(
         "server_derived": True,
     }
     write["qa_evidence_provenance"] = provenance
+    # This is a source-owned authority projection, never a caller extension
+    # point.  The issuer validates its closed recursive schema and cross-checks
+    # both identities against the enclosing ContractRuntime line.
+    payload = (
+        dict(write.get("payload"))
+        if isinstance(write.get("payload"), Mapping)
+        else {}
+    )
+    candidate_commit = str(
+        payload.get("candidate_commit_sha") or write.get("commit_sha") or ""
+    ).strip().lower()
+    candidate_tree = str(
+        payload.get("candidate_tree") or payload.get("target_tree") or ""
+    ).strip().lower()
+    payload["canonical_ref_adoption_qa_payload"] = {
+        "schema_version": CANONICAL_REF_ADOPTION_QA_PAYLOAD_SCHEMA_VERSION,
+        "candidate_commit_sha": candidate_commit,
+        "candidate_tree": candidate_tree,
+        "authority_flags": dict(CANONICAL_REF_ADOPTION_QA_PAYLOAD_AUTHORITY_FLAGS),
+    }
+    write["payload"] = payload
 
 
 def _enrich_line_instance_fields(write: dict[str, Any]) -> None:
