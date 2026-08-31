@@ -199209,6 +199209,197 @@ def test_ac_dev_source_free_projects_real_r4_durable_handoff_shape(conn):
     assert authority["source_mutation_forbidden"] is True
 
 
+def _completed_source_free_system_operation_case(conn, backlog_id):
+    _initialize_ac_dev_guide_schema(conn)
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    topology = (
+        "existing_unique_ac_observer;"
+        "_source_mutation_forbidden;"
+        "_no_implementation_worker;"
+        "_source_free_operation_only"
+    )
+    trigger = {
+        "subsystem_backlog_handoff": {
+            "schema_version": "judgment_subsystem_backlog_handoff.v1",
+            "execution_owner": "selected_subsystem_observer",
+            "selected_subsystem_gate_remains_authoritative": True,
+            "allowed_actions": [
+                "fresh_onboard_route_guide",
+                "fresh_route_issue",
+                "observer_session_register",
+                "observer_session_heartbeat",
+                "graph_query",
+                "task_timeline_append",
+                "single_full_reconcile",
+                "readback",
+                "honest_archive_or_close",
+                "backlog_close_if_authorized",
+            ],
+            "blocked_actions": [
+                "source_mutation",
+                "file_edit",
+                "old_graph_input",
+                "bypass_reconcile",
+                "stable_40000_mutation",
+                "second_authority_runtime",
+                "synthesized_pass",
+            ],
+        },
+        "judgment_plan_precheck": {
+            "subject": {"normalized_topology": topology},
+            "evidence": {
+                "route_context": {
+                    "normalized_proposed_topology": topology
+                }
+            },
+        },
+    }
+    conn.execute(
+        "UPDATE backlog_bugs SET status='OPEN', target_files='[]', "
+        "test_files='[]', chain_trigger_json=? WHERE bug_id=?",
+        (json.dumps(trigger), backlog_id),
+    )
+    conn.commit()
+    execution_id = server._onboard_service_execution_id("aming-claw", backlog_id)
+    authority = server._backlog_source_free_operation_authority(
+        conn, project_id="aming-claw", backlog_id=backlog_id
+    )
+    resume = {
+        "status": "contract_complete",
+        "readiness_state": "contract_complete",
+        "current_contract_execution_id": execution_id,
+        "root_contract_execution_id": execution_id,
+        "next_legal_action": {},
+    }
+    return authority, resume, execution_id
+
+
+def test_completed_onboard_service_projects_fresh_source_free_system_operation_route(
+    conn,
+):
+    backlog_id = "AC-DEV-COMPLETED-SYSTEM-OPERATION-R2"
+    authority, resume, execution_id = _completed_source_free_system_operation_case(
+        conn, backlog_id
+    )
+
+    action = server._onboard_route_guide_completed_next_action(
+        role="observer",
+        work_type="system_operation",
+        runtime_resume=resume,
+        backlog_row_status="OPEN",
+        project_id="aming-claw",
+        backlog_id=backlog_id,
+        target_files=[],
+        source_free_operation_authority=authority,
+    )
+
+    assert action["id"] == "completed_system_operation_route_issue"
+    assert action["action"] == "observer_route_context_issue"
+    assert action["action_input_ready"] is True
+    assert action["copy_safe_body"] == action["action_input"]
+    assert action["copy_safe_body"]["task_id"] == execution_id
+    assert action["copy_safe_body"]["target_files"] == []
+    assert action["copy_safe_body"]["owned_files"] == []
+    assert action["copy_safe_body"]["allowed_actions"] == list(
+        server._OPERATOR_SOURCE_FREE_ACTIONS
+    )
+    assert action["source_mutation_forbidden"] is True
+    assert action["old_evidence_carry_forward"] is False
+
+
+def test_onboard_route_guide_completed_source_free_system_operation_uses_durable_authority(
+    conn,
+):
+    backlog_id = "AC-DEV-COMPLETED-SYSTEM-OPERATION-HANDLER-R2"
+    _authority, _resume, execution_id = _completed_source_free_system_operation_case(
+        conn, backlog_id
+    )
+
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "system_operation",
+            },
+        )
+    )
+
+    action = result["next_legal_action"]
+    assert result["runtime_resume"]["readiness_state"] == "contract_complete"
+    assert action["id"] == "completed_system_operation_route_issue"
+    assert action["copy_safe_body"]["task_id"] == execution_id
+    assert action["server_derived_authority"]["accepted"] is True
+    assert action["server_derived_authority"]["caller_claims_trusted"] is False
+    assert action["copy_safe_body"]["allowed_actions"] == list(
+        server._OPERATOR_SOURCE_FREE_ACTIONS
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_role",
+        "wrong_work_type",
+        "closed",
+        "stale_route",
+        "nonempty_fence",
+        "wrong_parent",
+        "incomplete_authority",
+        "mixed_action",
+    ],
+)
+def test_completed_source_free_system_operation_selector_fails_closed(
+    conn, mutation
+):
+    backlog_id = f"AC-DEV-COMPLETED-SYSTEM-OPERATION-{mutation}"
+    authority, resume, _execution_id = _completed_source_free_system_operation_case(
+        conn, backlog_id
+    )
+    kwargs = {
+        "role": "observer",
+        "work_type": "system_operation",
+        "runtime_resume": resume,
+        "backlog_row_status": "OPEN",
+        "project_id": "aming-claw",
+        "backlog_id": backlog_id,
+        "route_token_ref": "",
+        "target_files": [],
+        "source_free_operation_authority": authority,
+    }
+    if mutation == "wrong_role":
+        kwargs["role"] = "qa"
+    elif mutation == "wrong_work_type":
+        kwargs["work_type"] = "continue_contract_chain"
+    elif mutation == "closed":
+        kwargs["backlog_row_status"] = "FIXED"
+    elif mutation == "stale_route":
+        kwargs["route_token_ref"] = "rtok-stale"
+    elif mutation == "nonempty_fence":
+        kwargs["source_free_operation_authority"] = {
+            **authority,
+            "target_files": ["agent/governance/server.py"],
+        }
+    elif mutation == "wrong_parent":
+        kwargs["runtime_resume"] = {**resume, "current_contract_execution_id": "foreign"}
+    elif mutation == "incomplete_authority":
+        kwargs["source_free_operation_authority"] = {
+            **authority,
+            "accepted": False,
+        }
+    else:
+        kwargs["source_free_operation_authority"] = {
+            **authority,
+            "allowed_actions": [*authority["allowed_actions"], "merge"],
+        }
+
+    action = server._onboard_route_guide_completed_next_action(**kwargs)
+    assert action["action"] == "no_runtime_action"
+    assert action["id"] == "contract_complete_no_runtime_action"
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

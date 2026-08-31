@@ -159179,6 +159179,7 @@ def _onboard_route_guide_completed_next_action(
     request_body: Mapping[str, Any] | None = None,
     onboard_service_continuation_authority: Mapping[str, Any] | None = None,
     mf_parallel_entry_authority: Mapping[str, Any] | None = None,
+    source_free_operation_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
@@ -159223,6 +159224,94 @@ def _onboard_route_guide_completed_next_action(
             "next_step": (
                 "backlog row is terminal and contract runtime is complete; do not "
                 "issue a successor-enter route or current runtime write requirement."
+            ),
+        }
+    operation_authority = (
+        source_free_operation_authority
+        if isinstance(source_free_operation_authority, Mapping)
+        else {}
+    )
+    operation_authority_payload = dict(operation_authority)
+    operation_authority_hash = str(
+        operation_authority_payload.pop("authority_hash", "") or ""
+    ).strip()
+    expected_service_execution_id = _onboard_service_execution_id(
+        project_id, backlog_id
+    )
+    current_execution_id = str(
+        resume.get("current_contract_execution_id") or ""
+    ).strip()
+    root_execution_id = str(
+        resume.get("root_contract_execution_id") or ""
+    ).strip()
+    operation_route_ready = bool(
+        selected_role == "observer"
+        and selected_work_type == "system_operation"
+        and normalized_backlog_status == "OPEN"
+        and operation_authority.get("accepted") is True
+        and operation_authority.get("server_derived") is True
+        and operation_authority.get("caller_claims_trusted") is False
+        and bool(operation_authority_hash)
+        and operation_authority_hash
+        == stable_sha256(operation_authority_payload)
+        and operation_authority.get("project_id") == project_id
+        and operation_authority.get("backlog_id") == backlog_id
+        and operation_authority.get("source_free_operation") is True
+        and operation_authority.get("source_mutation_forbidden") is True
+        and list(operation_authority.get("target_files") or []) == []
+        and list(operation_authority.get("owned_files") or []) == []
+        and list(operation_authority.get("allowed_actions") or [])
+        == list(_OPERATOR_SOURCE_FREE_ACTIONS)
+        and not str(route_token_ref or "").strip()
+        and bool(expected_service_execution_id)
+        and current_execution_id == expected_service_execution_id
+        and root_execution_id == expected_service_execution_id
+    )
+    if operation_route_ready:
+        route_body = {
+            "project_id": project_id,
+            "caller_role": "observer",
+            "backlog_id": backlog_id,
+            "task_id": expected_service_execution_id,
+            "target_files": [],
+            "owned_files": [],
+            "allowed_actions": list(_OPERATOR_SOURCE_FREE_ACTIONS),
+            "source_free_operation": True,
+            "evidence_refs": [
+                f"backlog:{backlog_id}",
+                f"contract_runtime:{expected_service_execution_id}",
+                "authority:backlog.source_free_operation_authority.v1",
+            ],
+        }
+        return {
+            **base,
+            "id": "completed_system_operation_route_issue",
+            "action": "observer_route_context_issue",
+            "interface": "observer_route_context_issue",
+            "mcp_tool": "observer_route_context_issue",
+            "owner_role": "observer",
+            "requires_role": "observer",
+            "requires_active_observer_session": True,
+            "requires_route_token_ref": False,
+            "action_input": dict(route_body),
+            "copy_safe_body": dict(route_body),
+            "action_input_copy_safe": True,
+            "action_input_ready": True,
+            "action_input_missing_fields": [],
+            "source_free_operation": True,
+            "source_mutation_forbidden": True,
+            "allowed_actions": list(_OPERATOR_SOURCE_FREE_ACTIONS),
+            "server_derived_authority": dict(operation_authority),
+            "source_of_authority": (
+                "completed_onboard_service+"
+                "backlog.source_free_operation_authority.v1"
+            ),
+            "old_evidence_carry_forward": False,
+            "parent_contract_execution_id": expected_service_execution_id,
+            "next_step": (
+                "register or heartbeat an active observer session, issue this "
+                "fresh operation-only route, then refresh onboard guidance; "
+                "do not reopen the completed service parent"
             ),
         }
     continuation_authority = (
@@ -168680,6 +168769,16 @@ def _onboard_route_guide_service_response(
                 target_files=target_files,
             )
         )
+    source_free_operation_authority = (
+        _backlog_source_free_operation_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+        if str(role or "").strip() == "observer"
+        and str(work_type or "").strip() == "system_operation"
+        else {}
+    )
     next_action = _onboard_route_guide_service_next_action(
         role=role,
         work_type=work_type,
@@ -168701,6 +168800,9 @@ def _onboard_route_guide_service_response(
                     onboard_service_continuation_authority
                 ),
                 mf_parallel_entry_authority=mf_parallel_entry_authority,
+                source_free_operation_authority=(
+                    source_free_operation_authority
+                ),
             )
         elif runtime_resume.get("scheduler_eligible") is False:
             next_action = {}
@@ -168721,6 +168823,9 @@ def _onboard_route_guide_service_response(
                     onboard_service_continuation_authority
                 ),
                 mf_parallel_entry_authority=mf_parallel_entry_authority,
+                source_free_operation_authority=(
+                    source_free_operation_authority
+                ),
             )
     if wrong_family_contract_update_supersession:
         supersession_authority = dict(
@@ -168764,6 +168869,7 @@ def _onboard_route_guide_service_response(
                 onboard_service_continuation_authority
             ),
             mf_parallel_entry_authority=mf_parallel_entry_authority,
+            source_free_operation_authority=source_free_operation_authority,
         )
         if str(fresh_action.get("action") or "") == "no_runtime_action":
             next_action = terminal_action
