@@ -2700,7 +2700,12 @@ def _durable_dev_launch(
             health, source_identity, stable_anchor_commit=stable_anchor_commit,
             dev_database_identity=database_identity,
         ):
-            raise click.ClickException("AC dev durable child health identity mismatch")
+            raise click.ClickException(
+                "AC dev durable child health identity mismatch: "
+                + json.dumps({"health": health, "source": dict(source_identity),
+                              "database_identity": dict(database_identity),
+                              "stable_anchor_commit": stable_anchor_commit}, sort_keys=True)
+            )
         lock.unlink()
         _fsync_parent(lock)
         click.echo(json.dumps({"status": "started", "pid": child.pid, "receipt": str(active),
