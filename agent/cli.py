@@ -2939,7 +2939,7 @@ def start(
         )["shared_volume_path"]))
         canonical_dev_storage = resolve_ac_dev_storage_root(stable_shared)
         selected_dev_storage = canonical_dev_storage
-        if (durable_launch or durable_stop) and dev_storage_root:
+        if (durable_launch or durable_stop or durable_child_runtime_dir is not None) and dev_storage_root:
             requested = Path(dev_storage_root).expanduser().absolute()
             try:
                 requested_resolved = requested.resolve(strict=True)
