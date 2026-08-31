@@ -1366,6 +1366,21 @@ CREATE INDEX IF NOT EXISTS idx_backlog_contract_chain_current_chain
 """
 
 
+def authority_projection_schema_statements() -> tuple[str, ...]:
+    """Return the source-owned DDL for the AC authority projection namespace.
+
+    This intentionally does not execute DDL.  The offline dev admission uses
+    these exact definitions in its one caller-owned transaction; normal
+    runtime owners retain their existing verify-only behaviour on dev.
+    """
+    source = SQLiteContractExecutionStore.SCHEMA_SQL + "\n" + CONTRACT_CHAIN_MAPPING_SCHEMA_SQL
+    return tuple(
+        statement.strip().replace(" IF NOT EXISTS", "")
+        for statement in source.split(";")
+        if statement.strip()
+    )
+
+
 DIRECT_FIX_CONTRACT_IDS = frozenset({"direct_fix", "direct_fix.v1"})
 MF_PARALLEL_CONTRACT_IDS = frozenset({"mf_parallel", "mf_parallel.v2", "mf_parallel.v1"})
 _SOURCE_CONTRACT_DEFINITION_REGISTRY = ContractDefinitionRegistry()

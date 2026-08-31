@@ -7782,6 +7782,121 @@ def _canonical_ref_adoption_bind_issued_intent(
     return bound
 
 
+def _canonical_ref_adoption_server_issue_body(
+    ctx: RequestContext, *, project_id: str, body: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Authenticate and derive the narrow adoption issue payload server-side.
+
+    The caller identifies a session, an existing scoped route and a CEX.  It
+    never supplies Git identities, custody, generation, or QA/source hashes.
+    This is intentionally a read-before-write gate: every failure happens
+    before the ordinary issuer can mint or persist a route token.
+    """
+    from . import observer_route_context, observer_session, task_timeline
+
+    forbidden = {
+        "caller_role", "target_files", "owned_files", "allowed_actions",
+        "evidence_refs", "generation", "custody", "canonical_ref",
+        "expected_commit", "target_commit", "target_tree",
+        "source_content_sha256", "qa_content_sha256", "issued_at", "expires_at",
+    }
+    claimed = set(body) & forbidden
+    nested = body.get("canonical_ref_adoption")
+    if not isinstance(nested, Mapping):
+        raise ValueError("canonical_ref_adoption reference is required")
+    if set(nested) - {"contract_execution_id", "action", "backlog_id"}:
+        raise ValueError("canonical_ref_adoption accepts references only")
+    if claimed:
+        raise ValueError("canonical_ref_adoption rejects caller authority claims")
+    session_id = str(body.get("observer_session_id") or "").strip()
+    route_ref = str(body.get("observer_route_token_ref") or body.get("route_token_ref") or "").strip()
+    contract_execution_id = str(nested.get("contract_execution_id") or "").strip()
+    if str(nested.get("action") or "").strip() != _CANONICAL_REF_ADOPTION_ACTION:
+        raise ValueError("canonical_ref_adoption action is invalid")
+    if not session_id or not route_ref or not contract_execution_id:
+        raise ValueError("active observer session, route ref, and CEX are required")
+    try:
+        authorization = str(ctx.handler.headers.get("Authorization", "") or "")
+    except Exception:
+        authorization = ""
+    bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    if not bearer:
+        raise ValueError("observer session bearer is required")
+    conn = get_connection(project_id)
+    try:
+        try:
+            observer_session.authenticate_session(
+                conn, project_id=project_id, session_id=session_id,
+                session_token=bearer, action=_CANONICAL_REF_ADOPTION_ACTION,
+            )
+        except observer_session.ObserverSessionError as exc:
+            raise ValueError(str(exc)) from exc
+        route = observer_route_context.resolve_route_token_ref(
+            conn, project_id=project_id,
+            storage_project_id=_route_registry_storage_project_id(project_id),
+            route_token_ref=route_ref,
+        )
+        if not isinstance(route, Mapping) or str(route.get("caller_role") or "") != "observer":
+            raise ValueError("observer route authority is missing")
+        row = conn.execute(
+            "SELECT backlog_id, record_json FROM contract_runtime_executions "
+            "WHERE project_id=? AND contract_execution_id=?",
+            (project_id, contract_execution_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("contract runtime execution is missing")
+        backlog_id = str(row[0] or "").strip()
+        if str(nested.get("backlog_id") or backlog_id).strip() != backlog_id:
+            raise ValueError("CEX backlog scope mismatch")
+        if str(route.get("backlog_id") or "").strip() != backlog_id:
+            raise ValueError("route backlog scope mismatch")
+        record = json.loads(str(row[1] or "{}"))
+        adoption = record.get("canonical_ref_adoption") if isinstance(record, Mapping) else None
+        if not isinstance(adoption, Mapping):
+            raise ValueError("CEX lacks canonical adoption authority")
+        required = ("generation", "custody", "canonical_ref", "expected_commit", "target_commit", "target_tree", "source_content_sha256")
+        if any(not str(adoption.get(key) or "").strip() for key in required):
+            raise ValueError("CEX adoption authority is incomplete")
+        events = task_timeline.list_events(conn, project_id, backlog_id=backlog_id, limit=200)
+        qa_hash = ""
+        for event in events:
+            if str(event.get("task_id") or "") != contract_execution_id:
+                continue
+            if "qa" not in str(event.get("actor") or "").lower():
+                continue
+            verification = event.get("verification") if isinstance(event.get("verification"), Mapping) else {}
+            candidate = str(verification.get("qa_content_sha256") or event.get("qa_content_sha256") or "").strip()
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", candidate):
+                qa_hash = candidate; break
+        if not qa_hash:
+            raise ValueError("authenticated QA Fact is missing")
+        target_files = route.get("target_files") if isinstance(route.get("target_files"), list) else []
+        if not target_files or _CANONICAL_REF_ADOPTION_ACTION not in set(route.get("allowed_actions") or []):
+            raise ValueError("route lacks canonical adoption scope")
+        derived_intent = {
+            "schema_version": _CANONICAL_REF_ADOPTION_SCHEMA,
+            "project_id": project_id, "backlog_id": backlog_id,
+            "action": _CANONICAL_REF_ADOPTION_ACTION,
+            "contract_execution_id": contract_execution_id,
+            **{key: str(adoption[key]).strip() for key in required},
+            "qa_content_sha256": qa_hash,
+            # These two are overwritten by the issuer, but are required by its
+            # typed parser and are never client-controlled here.
+            "issued_at": "server-derived", "expires_at": "server-derived",
+            "replay_identity": "server-derived",
+        }
+        return {
+            "caller_role": "observer", "backlog_id": backlog_id,
+            "task_id": contract_execution_id, "target_files": list(target_files),
+            "owned_files": list(route.get("owned_files") or target_files),
+            "allowed_actions": [_CANONICAL_REF_ADOPTION_ACTION],
+            "evidence_refs": list(route.get("evidence_refs") or []),
+            "canonical_ref_adoption": derived_intent,
+        }
+    finally:
+        conn.close()
+
+
 def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:
     if not isinstance(allowed_actions, list):
         return allowed_actions
@@ -8632,6 +8747,22 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             project_id=project_id,
             body=body,
         )
+
+    # Canonical-ref adoption is the one route kind whose authority may not be
+    # self-declared in the request.  Convert its three references into the
+    # normal issuer shape only after session/CEX/QA/route verification.
+    if "canonical_ref_adoption" in body:
+        try:
+            body = _canonical_ref_adoption_server_issue_body(
+                ctx, project_id=project_id, body=body,
+            )
+        except (ValueError, PermissionError) as exc:
+            return _observer_route_context_issue_rejection(
+                status=403, project_id=project_id, body=body,
+                error=str(exc), field="canonical_ref_adoption",
+                expected="authenticated session + route + CEX + QA Fact references",
+                actual={"present": True}, source_gate="canonical_ref_adoption_authority",
+            )
 
     # Authorization: this endpoint mints a WRITE-authorizing route token, so the
     # caller must declare the observer role. The shared operator gate does not

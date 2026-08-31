@@ -1506,6 +1506,7 @@ def _validate_admission_receipt_chain(
 
 def _offline_dev_schema_admission(
     storage_root: Path, *, project_id: str, port: int, resume_receipt: Path | None,
+    authority_projection: bool = False,
 ) -> dict[str, Any]:
     """One-shot, offline-only repair for the bounded dev backlog-read plan.
 
@@ -1544,12 +1545,15 @@ def _offline_dev_schema_admission(
         raise click.ClickException("offline AC dev schema admission requires a readable launch receipt") from exc
     if not isinstance(launch_data, dict) or launch_data.get("world_id") != "ac-dev" or launch_data.get("project_id") != project_id or launch_data.get("port") != port:
         raise click.ClickException("offline AC dev schema admission launch receipt mismatch")
-    from agent.governance.db import (
-        admit_missing_backlog_read_schema,
-        backlog_read_schema_drift,
-        backlog_read_schema_inventory,
-        backlog_read_schema_plan,
-    )
+    from agent.governance import db as _db
+    if authority_projection:
+        admit = _db.admit_missing_authority_projection_schema
+        drift = _db.authority_projection_schema_drift
+        plan_fn = _db.authority_projection_schema_plan
+    else:
+        admit = _db.admit_missing_backlog_read_schema
+        drift = _db.backlog_read_schema_drift
+        plan_fn = _db.backlog_read_schema_plan
     conn = sqlite3.connect(str(database), timeout=5)
     try:
         meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key IN ('governance_world_id','governance_world_genesis_json','governance_world_source_tip_json')"))
@@ -1558,10 +1562,10 @@ def _offline_dev_schema_admission(
         root_identity = _admission_identity(root)
         database_identity = _admission_identity(database)
         source_identity = _admission_source_identity(str(meta["governance_world_source_tip_json"]))
-        plan = backlog_read_schema_plan()
+        plan = plan_fn()
         plan_sha256 = "sha256:" + hashlib.sha256(_canonical_json_bytes(plan)).hexdigest()
         archive = root / "archive" / "schema-admission"
-        before = backlog_read_schema_drift(conn)
+        before = drift(conn)
         if before["invalid"]:
             raise click.ClickException("offline AC dev schema admission rejects unexpected schema drift")
         inventory_before = backlog_read_schema_inventory(conn)
@@ -1599,7 +1603,7 @@ def _offline_dev_schema_admission(
             raise click.ClickException("AC dev schema admission backup digest mismatch")
         backup_identity = _admission_identity(backup)
         try:
-            result = admit_missing_backlog_read_schema(conn)
+            result = admit(conn)
         except BaseException as exc:
             conn.rollback()
             after_meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key='governance_world_source_tip_json'"))
@@ -1625,7 +1629,7 @@ def _offline_dev_schema_admission(
         post_meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key='governance_world_source_tip_json'"))
         if post_meta.get("governance_world_source_tip_json") != meta["governance_world_source_tip_json"]:
             raise click.ClickException("AC dev schema admission source-tip advanced unexpectedly")
-        if backlog_read_schema_drift(conn)["missing"] or inventory_after == inventory_before and before["missing"]:
+        if drift(conn)["missing"] or inventory_after == inventory_before and before["missing"]:
             raise click.ClickException("AC dev schema admission postcondition failed")
         receipt_payload = {
             "schema_version": _AC_DEV_SCHEMA_ADMISSION_RECEIPT_VERSION,
@@ -1653,6 +1657,24 @@ def dev_admit_schema(dev_storage_root: Path, project_id: str, port: int, resume_
     """Admit only the known missing backlog-read objects into a stopped dev world."""
     try:
         click.echo(json.dumps(_offline_dev_schema_admission(dev_storage_root, project_id=project_id, port=port, resume_receipt=resume_receipt), sort_keys=True))
+    except click.ClickException:
+        raise
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@main.command("dev-admit-authority-schema")
+@click.option("--dev-storage-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--project-id", required=True)
+@click.option("--port", required=True, type=int)
+@click.option("--resume-receipt", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def dev_admit_authority_schema(dev_storage_root: Path, project_id: str, port: int, resume_receipt: Path | None) -> None:
+    """Offline-only admission of the complete six-table AC authority plan."""
+    try:
+        click.echo(json.dumps(_offline_dev_schema_admission(
+            dev_storage_root, project_id=project_id, port=port,
+            resume_receipt=resume_receipt, authority_projection=True,
+        ), sort_keys=True))
     except click.ClickException:
         raise
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:

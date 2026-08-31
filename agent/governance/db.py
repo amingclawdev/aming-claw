@@ -2106,6 +2106,102 @@ BACKLOG_READ_SCHEMA_OBJECTS = frozenset({
     *(f"trg_dashboard_backlog_cache_{event.lower()}" for event in BACKLOG_READ_SCHEMA_TRIGGER_SQL),
 })
 
+# This is a second, deliberately fixed admission capability.  It is not a
+# migration framework: all definitions are exported by their owning modules,
+# and an admission may only create a pristine absence of the complete set.
+AC_AUTHORITY_SCHEMA_PLAN_VERSION = "ac_dev_authority_projection_schema_plan.v1"
+AC_AUTHORITY_SCHEMA_TABLES = frozenset({
+    "observer_route_token_refs",
+    "contract_runtime_executions",
+    "worker_implementation_test_results_corrections",
+    "backlog_contract_chain_bindings",
+    "contract_chain_edges",
+    "backlog_contract_chain_current",
+})
+
+
+def _authority_projection_schema_statements() -> tuple[str, ...]:
+    """Compose, but never duplicate, the six-owner authority DDL."""
+    from .contracts.runtime import authority_projection_schema_statements
+    from .observer_route_context import authority_route_registry_schema_statements
+    return authority_route_registry_schema_statements() + authority_projection_schema_statements()
+
+
+def _canonical_authority_projection_schema_inventory(*, include_plan: bool) -> tuple[tuple[str, str, str, str], ...]:
+    with closing(sqlite3.connect(":memory:")) as memory:
+        memory.row_factory = sqlite3.Row
+        _configure_connection(memory, busy_timeout=10000)
+        _ensure_schema(memory)
+        if include_plan:
+            for statement in _authority_projection_schema_statements():
+                memory.execute(statement)
+        return _sqlite_master_inventory(memory)
+
+
+def authority_projection_schema_plan() -> dict[str, object]:
+    statements = _authority_projection_schema_statements()
+    return {
+        "schema_version": AC_AUTHORITY_SCHEMA_PLAN_VERSION,
+        "tables": tuple(sorted(AC_AUTHORITY_SCHEMA_TABLES)),
+        "statements_sha256": "sha256:" + hashlib.sha256(
+            json.dumps(statements, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def authority_projection_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Fail closed unless this is exactly the six-object pristine absence."""
+    base = _canonical_authority_projection_schema_inventory(include_plan=False)
+    full = _canonical_authority_projection_schema_inventory(include_plan=True)
+    actual = _sqlite_master_inventory(conn)
+    base_map = {(k, n, t): s for k, n, t, s in base}
+    full_map = {(k, n, t): s for k, n, t, s in full}
+    actual_map = {(k, n, t): s for k, n, t, s in actual}
+    invalid: list[str] = []
+    for key in sorted(set(actual_map) - set(full_map)):
+        invalid.append("inventory_extra:" + ":".join(key))
+    for key in sorted(set(base_map) - set(actual_map)):
+        invalid.append("inventory_missing:" + ":".join(key))
+    for key in sorted(set(actual_map) & set(full_map)):
+        if actual_map[key] != full_map[key]:
+            invalid.append("inventory_altered:" + ":".join(key))
+    plan_keys = set(full_map) - set(base_map)
+    present = plan_keys & set(actual_map)
+    if present and present != plan_keys:
+        invalid.append("inventory_partial_plan")
+    # A table can be absent while one of its auto indexes is necessarily also
+    # absent.  sqlite_master inventories explicit objects; validate all PK and
+    # UNIQUE autoindexes separately so an altered replacement cannot hide.
+    for table in sorted(AC_AUTHORITY_SCHEMA_TABLES):
+        if table in {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}:
+            expected = _DEV_SCHEMA_PRIMARY_KEYS.get(table)
+            columns = tuple(str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})") if int(r[5]))
+            if expected and columns != expected:
+                invalid.append("primary_key_altered:" + table)
+    missing = [] if present == plan_keys else sorted(AC_AUTHORITY_SCHEMA_TABLES)
+    return {"missing": missing, "invalid": sorted(set(invalid))}
+
+
+def admit_missing_authority_projection_schema(conn: sqlite3.Connection) -> dict[str, object]:
+    """Create the complete authority namespace in one caller-owned txn."""
+    before = authority_projection_schema_drift(conn)
+    if before["invalid"]:
+        raise ValueError("AC dev authority schema admission rejects invalid drift")
+    if not before["missing"]:
+        return {"changed": False, "missing": []}
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in _authority_projection_schema_statements():
+            conn.execute(statement)
+        after = authority_projection_schema_drift(conn)
+        if after["missing"] or after["invalid"]:
+            raise ValueError("AC dev authority schema admission postcondition failed")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {"changed": True, "missing": before["missing"]}
+
 
 def backlog_read_schema_plan() -> dict[str, object]:
     """Return the one canonical operator plan shared by stable/dev/CLI."""

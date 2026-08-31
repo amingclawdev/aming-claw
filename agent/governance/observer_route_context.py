@@ -2159,6 +2159,32 @@ def _ensure_ref_registry_schema(conn: sqlite3.Connection) -> None:
             )
 
 
+def authority_route_registry_schema_statements() -> tuple[str, ...]:
+    """Return the exact route-registry DDL without executing it.
+
+    Offline admission is deliberately the only dev-plane writer for this
+    namespace.  Keeping the SQL beside its runtime owner prevents a second,
+    drifting copy in the CLI or migration code.
+    """
+    return (
+        "CREATE TABLE observer_route_token_refs ("
+        "project_id TEXT NOT NULL, route_token_ref TEXT NOT NULL, "
+        "token_digest TEXT NOT NULL, salt TEXT NOT NULL, route_id TEXT NOT NULL DEFAULT '', "
+        "route_context_hash TEXT NOT NULL DEFAULT '', prompt_contract_id TEXT NOT NULL DEFAULT '', "
+        "prompt_contract_hash TEXT NOT NULL DEFAULT '', visible_injection_manifest_hash TEXT NOT NULL DEFAULT '', "
+        "backlog_id TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '', caller_role TEXT NOT NULL DEFAULT '', "
+        "allowed_actions_json TEXT NOT NULL DEFAULT '[]', expires_at TEXT NOT NULL DEFAULT '', "
+        "evidence_refs_json TEXT NOT NULL DEFAULT '[]', scope_json TEXT NOT NULL DEFAULT '{}', "
+        "target_files_json TEXT NOT NULL DEFAULT '[]', owned_files_json TEXT NOT NULL DEFAULT '[]', "
+        "parent_route_lineage_json TEXT NOT NULL DEFAULT '{}', child_route_lineage_json TEXT NOT NULL DEFAULT '{}', "
+        "route_lineage_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'active', "
+        "issued_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, "
+        "PRIMARY KEY (project_id, route_token_ref))",
+        "CREATE INDEX idx_route_token_refs_status ON observer_route_token_refs "
+        "(project_id, status, route_token_ref)",
+    )
+
+
 def persist_route_token_ref(
     conn: sqlite3.Connection,
     *,
