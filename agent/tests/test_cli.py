@@ -4523,7 +4523,7 @@ def test_posix_detached_popen_uses_no_shell_new_session_and_devnull(tmp_path, mo
     assert captured == {
         "argv": [sys.executable, "-m", "agent.cli"], "cwd": tmp_path,
         "stdin": subprocess.DEVNULL, "stdout": 17, "stderr": 17,
-        "start_new_session": True, "shell": False, "close_fds": True,
+        "start_new_session": True, "shell": False, "close_fds": True, "pass_fds": (),
     }
 
 

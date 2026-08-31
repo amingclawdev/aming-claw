@@ -2558,11 +2558,13 @@ def _durable_exit_binding(receipt: Mapping[str, Any], receipt_sha256: str) -> di
     }
 
 
-def _posix_detached_popen(argv: list[str], *, cwd: Path, log_fd: int) -> subprocess.Popen:
+def _posix_detached_popen(
+    argv: list[str], *, cwd: Path, log_fd: int, pass_fds: tuple[int, ...] = (),
+) -> subprocess.Popen:
     """The sole no-shell/session-detached child creation primitive."""
     return subprocess.Popen(
         argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd,
-        start_new_session=True, shell=False, close_fds=True,
+        start_new_session=True, shell=False, close_fds=True, pass_fds=pass_fds,
     )
 
 
