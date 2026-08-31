@@ -3443,6 +3443,17 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
     _revalidate_stable_database_binding(stable)
     stable_identity = dict(stable.get("stable_database_identity") or {})
     receipt_stable = dict(receipt.get("stable_binding") or {})
+    expected_top_level_fields = {
+        "schema_version", "stage", "project_id", "port", "root", "listener",
+        "genesis", "predecessor", "successor", "operator_evidence", "history",
+        "stable_binding",
+    }
+    expected_successor_fields = {
+        "identity", "quick_check", "row_count", "status_counts",
+        "managed_inventory", "managed_inventory_drift", "protected_inventory",
+        "protected_projection", "backlog_projection_sha256", "source_schema",
+        "governance_world_id", "genesis_json", "genesis_sha256",
+    }
 
     def inventory_binding_valid(value: object) -> bool:
         binding = dict(value or {}) if isinstance(value, Mapping) else {}
@@ -3457,7 +3468,26 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
         return binding.get("sha256") == "sha256:" + hashlib.sha256(encoded).hexdigest()
 
     if (
-        operator.get("sha256") != operator_sha
+        set(receipt) != expected_top_level_fields
+        or receipt.get("listener")
+        != {"host": "127.0.0.1", "port": 40008, "listening": False}
+        or set(successor) != expected_successor_fields
+        or set(successor_identity)
+        != {"path", "device", "inode", "size", "nlink", "sha256"}
+        or set(source_schema) != {"required_tables", "inventory", "sha256"}
+        or set(dict(successor.get("managed_inventory") or {}))
+        != {"inventory", "sha256"}
+        or set(dict(successor.get("protected_inventory") or {}))
+        != {"inventory", "sha256"}
+        or set(genesis) != {"raw_json", "sha256"}
+        or set(dict(receipt.get("predecessor") or {})) != {"backup"}
+        or set(operator) != {"path", "sha256", "payload"}
+        or set(history) != {"linked_v3", "adoption"}
+        or set(linked) != {"path", "sha256"}
+        or set(adoption) != {"path", "sha256"}
+        or receipt_stable
+        != {"database": stable_identity, "runtime_commit": stable.get("commit")}
+        or operator.get("sha256") != operator_sha
         or operator.get("payload") != operator_payload
         or operator_payload.get("schema_version")
         != "ac_dev_operator_exception_cow_import.v1"
@@ -3531,7 +3561,6 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
         or successor_identity.get("device") != int(database_metadata.st_dev)
         or successor_identity.get("inode") != int(database_metadata.st_ino)
         or successor_identity.get("nlink") != int(database_metadata.st_nlink)
-        or receipt_stable.get("database") != stable_identity
         or (
             stable_identity.get("device"),
             stable_identity.get("inode"),

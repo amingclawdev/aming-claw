@@ -1711,6 +1711,63 @@ def test_ac_dev_cow_successor_v2_restart_allows_legitimate_fresh_backlog_row(
     assert Path(created["receipt"]).read_bytes() == receipt_raw
 
 
+def test_ac_dev_cow_successor_v2_rejects_rehashed_listener_and_stable_tampering(
+    tmp_path, monkeypatch
+):
+    from agent.governance import db
+
+    root, _database, backup, operator, linked = _real_cow_successor_cli_fixture(
+        tmp_path, monkeypatch
+    )
+    created = db.create_dev_cow_successor_receipt(
+        root,
+        operator_receipt=operator,
+        predecessor_backup=backup,
+        linked_v3_receipt=linked,
+    )
+    receipt_path = Path(created["receipt"])
+    original_raw = receipt_path.read_bytes()
+    original = json.loads(original_raw)
+
+    def set_nested(payload, *path_and_value):
+        *path, value = path_and_value
+        current = payload
+        for key in path[:-1]:
+            current = current[key]
+        current[path[-1]] = value
+
+    cases = (
+        ("listener", "host", "evil.example"),
+        ("listener", "port", 1),
+        ("listener", "listening", True),
+        ("listener", "pid", 99999),
+        ("stable_binding", "runtime_commit", "tampered"),
+        ("stable_binding", "database", "inode", 99999),
+        ("stable_binding", "database", "path", "/foreign/stable.db"),
+        ("stable_binding", "path", "/foreign/stable"),
+    )
+    for case in cases:
+        payload = json.loads(original_raw)
+        set_nested(payload, *case)
+        tampered_raw = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode()
+        tampered_path = receipt_path.with_name(
+            f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}."
+            f"{hashlib.sha256(tampered_raw).hexdigest()}.json"
+        )
+        receipt_path.unlink()
+        tampered_path.write_bytes(tampered_raw)
+        try:
+            with pytest.raises(ValueError, match="historical issuance"):
+                db.validate_dev_cow_successor_receipt(root)
+        finally:
+            tampered_path.unlink()
+            receipt_path.write_bytes(original_raw)
+
+    assert json.loads(receipt_path.read_bytes()) == original
+
+
 def test_current_dev_backlog_runtime_invariants_reject_schema_and_generation(
     tmp_path
 ):
