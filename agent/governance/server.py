@@ -7872,7 +7872,7 @@ def _canonical_ref_adoption_active_qa_fact(
 
 def _canonical_ref_adoption_issue_intent(
     value: Any, *, project_id: str, backlog_id: str, task_id: str, allowed_actions: Any
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Validate the narrow, durable adoption payload before route issuance.
 
     The payload is subsequently persisted inside the already-digest-bound route
@@ -7907,12 +7907,38 @@ def _canonical_ref_adoption_issue_intent(
     if any(not re.fullmatch(r"sha256:[0-9a-f]{64}", intent[key])
            for key in ("source_content_sha256", "qa_content_sha256")):
         raise ValueError("canonical_ref_adoption requires content-addressed source and QA evidence")
+    # The source-route binding is server material only.  Preserve it verbatim
+    # through the typed issuer so it is already part of the child token before
+    # the token digest is calculated.  The writer repeats the lookup under its
+    # transaction and rejects a replacement even when its visible scope is the
+    # same.
+    source_route_binding = value.get("source_route_binding")
+    if source_route_binding is not None:
+        if not isinstance(source_route_binding, Mapping):
+            raise ValueError("canonical_ref_adoption source route binding is invalid")
+        binding_required = (
+            "schema_version", "route_token_ref", "route_id",
+            "route_context_hash", "source_token_digest", "source_token_version",
+        )
+        binding = {
+            key: str(source_route_binding.get(key) or "").strip()
+            for key in binding_required
+        }
+        if (
+            set(source_route_binding) != set(binding_required)
+            or any(not binding[key] for key in binding_required)
+            or binding["schema_version"]
+            != "canonical_ref_adoption.source_route_binding.v1"
+            or not re.fullmatch(r"[0-9a-f]{64}", binding["source_token_digest"])
+        ):
+            raise ValueError("canonical_ref_adoption source route binding is invalid")
+        intent["source_route_binding"] = binding
     return {"schema_version": _CANONICAL_REF_ADOPTION_SCHEMA, **intent}
 
 
 def _canonical_ref_adoption_bind_issued_intent(
-    intent: Mapping[str, str], *, issued_at: datetime, expires_at: datetime
-) -> dict[str, str]:
+    intent: Mapping[str, Any], *, issued_at: datetime, expires_at: datetime
+) -> dict[str, Any]:
     """Bind an adoption intent to the server's exact route issue window.
 
     Request payload timestamps and replay labels are evidence inputs, never a
@@ -7936,12 +7962,58 @@ def _canonical_ref_adoption_bind_issued_intent(
             "source_content_sha256", "qa_content_sha256",
         )
     }
+    if "source_route_binding" in bound:
+        replay_binding["source_route_binding"] = bound["source_route_binding"]
     bound["replay_identity"] = "cra-" + hashlib.sha256(
         json.dumps(replay_binding, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
         )
     ).hexdigest()
     return bound
+
+
+def _canonical_ref_adoption_source_route_binding(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    route_token_ref: str,
+    route: Mapping[str, Any],
+) -> dict[str, str]:
+    """Read the immutable source-route custody identity from its registry row.
+
+    ``issued_at`` is the durable registry version for a token digest: a source
+    ref with an identical visible scope but a newly issued token cannot silently
+    become the authority for an already-derived child adoption route.
+    """
+    registry_project_id = _route_registry_storage_project_id(project_id)
+    row = conn.execute(
+        "SELECT route_token_ref, route_id, route_context_hash, token_digest, "
+        "issued_at, status FROM observer_route_token_refs "
+        "WHERE project_id=? AND route_token_ref=?",
+        (registry_project_id, route_token_ref),
+    ).fetchone()
+    if row is None:
+        raise ValueError("canonical_ref_adoption source route binding is missing")
+    stored = dict(row)
+    binding = {
+        "schema_version": "canonical_ref_adoption.source_route_binding.v1",
+        "route_token_ref": str(stored.get("route_token_ref") or "").strip(),
+        "route_id": str(stored.get("route_id") or "").strip(),
+        "route_context_hash": str(stored.get("route_context_hash") or "").strip(),
+        "source_token_digest": str(stored.get("token_digest") or "").strip(),
+        "source_token_version": str(stored.get("issued_at") or "").strip(),
+    }
+    if (
+        str(stored.get("status") or "").strip() != "active"
+        or any(not value for key, value in binding.items() if key != "schema_version")
+        or binding["route_token_ref"] != route_token_ref
+        or binding["route_id"] != str(route.get("route_id") or "").strip()
+        or binding["route_context_hash"]
+        != str(route.get("route_context_hash") or "").strip()
+        or not re.fullmatch(r"[0-9a-f]{64}", binding["source_token_digest"])
+    ):
+        raise ValueError("canonical_ref_adoption source route binding is invalid")
+    return binding
 
 
 def _canonical_ref_adoption_server_issue_body(
@@ -8006,6 +8078,12 @@ def _canonical_ref_adoption_server_issue_body(
             raise ValueError(str(exc)) from exc
         if not isinstance(route, Mapping):
             raise ValueError("observer route authority is missing")
+        source_route_binding = _canonical_ref_adoption_source_route_binding(
+            conn,
+            project_id=project_id,
+            route_token_ref=route_ref,
+            route=route,
+        )
         row = conn.execute(
             "SELECT backlog_id, record_json FROM contract_runtime_executions "
             "WHERE project_id=? AND contract_execution_id=?",
@@ -8069,6 +8147,7 @@ def _canonical_ref_adoption_server_issue_body(
             # typed parser and are never client-controlled here.
             "issued_at": "server-derived", "expires_at": "server-derived",
             "replay_identity": "server-derived",
+            "source_route_binding": source_route_binding,
         }
         return {
             "caller_role": "observer", "backlog_id": backlog_id,
@@ -8202,6 +8281,14 @@ def _canonical_ref_adoption_revalidate_in_writer(
     }
     if any(str(bound.get(key) or "").strip() != value for key, value in expected.items()):
         raise ValueError("canonical_ref_adoption token no longer matches final authority")
+    source_route_binding = _canonical_ref_adoption_source_route_binding(
+        conn,
+        project_id=project_id,
+        route_token_ref=route_ref,
+        route=route,
+    )
+    if bound.get("source_route_binding") != source_route_binding:
+        raise ValueError("canonical_ref_adoption source route binding changed")
 
 
 def _observer_route_context_issue_allowed_actions(allowed_actions: Any) -> Any:

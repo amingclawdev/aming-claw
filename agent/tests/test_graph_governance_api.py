@@ -365,6 +365,15 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
         }],
     })
     conn.commit(); conn.close()
+    conn = connection_for_test("aming-claw")
+    try:
+        source_route_row = dict(conn.execute(
+            "SELECT route_id, route_context_hash, token_digest, issued_at "
+            "FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?",
+            ("aming-claw", "rr-adoption-authority"),
+        ).fetchone())
+    finally:
+        conn.close()
     body = {
         "observer_session_id": session["observer_session_id"],
         "observer_route_token_ref": "rr-adoption-authority",
@@ -525,6 +534,61 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
                 ("rr-adoption-authority",),
             ),
         ),
+        (
+            "source-route-id-rebound",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET route_id=? WHERE route_token_ref=?",
+                ("route-adoption-rebound", "rr-adoption-authority"),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET route_id=? WHERE route_token_ref=?",
+                (source_route_row["route_id"], "rr-adoption-authority"),
+            ),
+        ),
+        (
+            "source-route-context-rebound",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET route_context_hash=? WHERE route_token_ref=?",
+                ("sha256:" + "9" * 64, "rr-adoption-authority"),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET route_context_hash=? WHERE route_token_ref=?",
+                (source_route_row["route_context_hash"], "rr-adoption-authority"),
+            ),
+        ),
+        (
+            "source-token-digest-rebound",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET token_digest=? WHERE route_token_ref=?",
+                ("0" * 64, "rr-adoption-authority"),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET token_digest=? WHERE route_token_ref=?",
+                (source_route_row["token_digest"], "rr-adoption-authority"),
+            ),
+        ),
+        (
+            "source-token-version-rebound",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET issued_at=? WHERE route_token_ref=?",
+                ("2099-01-01T00:00:00Z", "rr-adoption-authority"),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET issued_at=? WHERE route_token_ref=?",
+                (source_route_row["issued_at"], "rr-adoption-authority"),
+            ),
+        ),
+        (
+            "source-route-ref-replaced",
+            lambda changed: changed.execute(
+                "UPDATE observer_route_token_refs SET route_token_ref=? WHERE route_token_ref=?",
+                ("rr-adoption-authority-replaced", "rr-adoption-authority"),
+            ),
+            lambda restored: restored.execute(
+                "UPDATE observer_route_token_refs SET route_token_ref=? WHERE route_token_ref=?",
+                ("rr-adoption-authority", "rr-adoption-authority-replaced"),
+            ),
+        ),
     )
     for name, mutate, restore in writer_gap_mutations:
         def mutate_then_enter_writer(*args, _mutate=mutate, **kwargs):
@@ -567,6 +631,14 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
     assert typed["issued_at"] == token["issued_at"]
     assert typed["expires_at"] == token["expires_at"]
     assert typed["target_commit"] == "b" * 40
+    assert typed["source_route_binding"] == {
+        "schema_version": "canonical_ref_adoption.source_route_binding.v1",
+        "route_token_ref": "rr-adoption-authority",
+        "route_id": source_route_row["route_id"],
+        "route_context_hash": source_route_row["route_context_hash"],
+        "source_token_digest": source_route_row["token_digest"],
+        "source_token_version": source_route_row["issued_at"],
+    }
     conn = connection_for_test("aming-claw")
     try:
         stored = conn.execute(
