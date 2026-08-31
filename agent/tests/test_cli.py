@@ -3856,6 +3856,36 @@ def test_v27_dev_startup_does_not_use_cutover_marker_as_authority():
     assert "AMING_CLAW_DEV_CUTOVER_PREFLIGHT_HASH" not in start_source
 
 
+def test_durable_start_never_uses_generic_occupied_health_fastpath():
+    import inspect
+
+    import agent.cli as cli
+
+    startup_source = inspect.getsource(cli.start.callback)
+    assert "not durable_launch and health" in startup_source
+    assert "not durable_launch and _port_is_open(port)" in startup_source
+    assert startup_source.index("not durable_launch and health") < startup_source.index(
+        "_durable_dev_launch("
+    )
+
+
+def test_durable_recovery_requires_old_child_absent_and_port_free_before_spawn():
+    import inspect
+
+    import agent.cli as cli
+
+    launch_source = inspect.getsource(cli._durable_dev_launch)
+    live_hold = '"AC dev durable recovery child is still live"'
+    port_hold = '"AC dev durable recovery requires free port 40008"'
+    spawn = "_posix_detached_popen("
+    assert live_hold in launch_source and port_hold in launch_source
+    assert launch_source.index(live_hold) < launch_source.index(spawn)
+    assert launch_source.index(port_hold) < launch_source.index(spawn)
+    assert '"AC dev durable multiple live generations"' in launch_source
+    assert '"AC dev durable live child remained unbound"' in launch_source
+    assert '"AC dev durable unknown listener owns port 40008"' in launch_source
+
+
 def test_dev_admit_schema_rejects_wrong_plane_before_database_write(tmp_path):
     root = tmp_path / "external-dev-world"
     database = root / "governance" / "aming-claw" / "governance.db"
