@@ -2615,7 +2615,12 @@ def validate_dev_preimage_only(
     connection = sqlite3.connect(uri, uri=True)
     try:
         _verify_existing_schema(connection)
-        _verify_dev_world_schema_inventory(connection)
+        previous_plane = os.environ.pop(RUNTIME_PLANE_ENV, None)
+        try:
+            _verify_dev_world_schema_inventory(connection)
+        finally:
+            if previous_plane is not None:
+                os.environ[RUNTIME_PLANE_ENV] = previous_plane
         meta = dict(connection.execute("SELECT key, value FROM schema_meta"))
     finally:
         connection.close()
@@ -2648,10 +2653,19 @@ def commit_dev_child_custody(
     if (pre["database_identity"] != dict(expected_database_identity)
             or pre["database_sha256"] != expected_pre_sha256):
         raise ValueError("AC dev durable child preimage CAS mismatch")
-    receipt = bootstrap_dev_governance_store(
-        storage_root, source_identity=source_identity,
-        process_identity=process_identity, linked_v3_receipt=linked_v3_receipt,
-    )
+    # The child has not bound and this is the sole explicitly authorized
+    # bootstrap transaction.  Source-contract construction must not inherit
+    # the later live server's verify-only capability mode (which would reject
+    # its pristine in-memory contract database before comparison).
+    previous_plane = os.environ.pop(RUNTIME_PLANE_ENV, None)
+    try:
+        receipt = bootstrap_dev_governance_store(
+            storage_root, source_identity=source_identity,
+            process_identity=process_identity, linked_v3_receipt=linked_v3_receipt,
+        )
+    finally:
+        if previous_plane is not None:
+            os.environ[RUNTIME_PLANE_ENV] = previous_plane
     database = Path(str(receipt["database_path"]))
     # The writer is closed by bootstrap.  Own durable bytes before readiness.
     checkpoint = sqlite3.connect(str(database), timeout=30)
