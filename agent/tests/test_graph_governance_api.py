@@ -499,6 +499,168 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
         conn.close()
 
 
+def test_canonical_ref_adoption_qa_fact_flags_are_independent_fail_closed(
+    tmp_path, monkeypatch,
+):
+    """Every QA-Fact authority flag is independently exact and pre-write."""
+
+    missing = object()
+    invalid_false = (missing, None, True, "false", 0, [], {})
+    invalid_true = (missing, None, False, "true", 1, [], {})
+    cases = [
+        ("line.authoritative_pass_synthesized", invalid_false),
+        ("line.observer_impersonation", invalid_false),
+        ("payload.authoritative_pass_synthesized", (True, "false", 0, [], {})),
+        ("payload.pass_synthesized", invalid_false),
+        ("provenance.server_derived", invalid_true),
+        ("provenance.observer_impersonation", invalid_false),
+        ("provenance.parent_materialization_authorized", invalid_false),
+        ("binding.server_derived", invalid_true),
+        ("binding.independent_verification_session_matched", invalid_true),
+        # A correct no-synthesis marker cannot compensate for other forged
+        # provenance markers.
+        ("combined", ((True, True, False),)),
+    ]
+
+    def set_field(line, field, value):
+        containers = {
+            "line": line,
+            "payload": line["payload"],
+            "provenance": line["qa_evidence_provenance"],
+            "binding": line["qa_evidence_provenance"]["authenticated_qa_binding"],
+        }
+        container_name, key = field.split(".")
+        container = containers[container_name]
+        if value is missing:
+            container.pop(key, None)
+        else:
+            container[key] = value
+
+    for case_index, (field, values) in enumerate(cases):
+        for value_index, value in enumerate(values):
+            database = tmp_path / f"canonical-adoption-flags-{case_index}-{value_index}.db"
+            setup = sqlite3.connect(database)
+            setup.row_factory = sqlite3.Row
+            _ensure_schema(setup)
+            setup.commit()
+            setup.close()
+
+            def connection_for_test(_project_id):
+                conn = sqlite3.connect(database, timeout=5)
+                conn.row_factory = sqlite3.Row
+                return conn
+
+            monkeypatch.setattr(server, "get_connection", connection_for_test)
+            monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+            monkeypatch.setattr(
+                server, "_route_registry_storage_project_id", lambda project_id: project_id,
+            )
+            conn = connection_for_test("aming-claw")
+            observer = observer_session.register_session(
+                conn, project_id="aming-claw", capabilities=["canonical_ref_adoption"],
+            )
+            backlog_id = f"ADOPTION-FLAGS-{case_index}-{value_index}"
+            execution_id = f"cex-adoption-flags-{case_index}-{value_index}"
+            _persist_contract_runtime_observer_route_ref(
+                conn, backlog_id=backlog_id, contract_execution_id=execution_id,
+                route_token_ref="rr-adoption-flags",
+                allowed_actions=["canonical_ref_adoption"], target_files=["agent/cli.py"],
+            )
+            conn.execute(
+                "UPDATE observer_route_token_refs SET project_id=?, scope_json=replace(scope_json, ?, ?) "
+                "WHERE route_token_ref=?",
+                ("aming-claw", PID, "aming-claw", "rr-adoption-flags"),
+            )
+            qa_scope = [
+                f"backlog:{backlog_id}", f"task:{execution_id}", f"commit:{'b' * 40}",
+                server._qa_scope_binding_ref(
+                    project_id="aming-claw", backlog_id=backlog_id,
+                    task_id=execution_id, commit_sha="b" * 40,
+                ),
+            ]
+            qa_session = role_service.register(
+                conn, principal_id="qa-adoption-flags", project_id="aming-claw",
+                role="qa", scope=qa_scope,
+            )
+            binding = {
+                "schema_version": "contract_runtime.authenticated_qa_binding.v1",
+                "server_derived": True, "qa_principal": "qa-adoption-flags",
+                "qa_session_id": qa_session["session_id"],
+                "independent_verification_session_matched": True,
+                "qa_scope_binding_ref": server._qa_scope_binding_ref(
+                    project_id="aming-claw", backlog_id=backlog_id,
+                    task_id=execution_id, commit_sha="b" * 40,
+                ),
+            }
+            provenance = {
+                "schema_version": "qa_evidence_provenance.v1", "server_derived": True,
+                "authorization_source": "qa_session_token_ref", "evidence_owner_role": "qa",
+                "evidence_owner_actor": "qa-adoption-flags",
+                "evidence_owner_session": qa_session["session_id"],
+                "submitter_principal": "qa-adoption-flags",
+                "submitter_session": qa_session["session_id"],
+                "observer_impersonation": False,
+                "parent_materialization_authorized": False,
+                "authenticated_qa_binding": binding,
+            }
+            line = {
+                "stage_id": "qa", "line_id": "qa_independent_verification",
+                "actor_role": "qa", "evidence_kind": "independent_verification",
+                "commit_sha": "b" * 40, "authoritative_pass_synthesized": False,
+                "authorization_source": "qa_session_token_ref",
+                "observer_impersonation": False, "qa_evidence_provenance": provenance,
+                "payload": {
+                    "candidate_commit_sha": "b" * 40, "candidate_tree": "c" * 40,
+                    "pass_synthesized": False,
+                },
+            }
+            if field == "combined":
+                line["authoritative_pass_synthesized"] = value[0]
+                provenance["observer_impersonation"] = value[1]
+                line["payload"]["pass_synthesized"] = value[2]
+            else:
+                set_field(line, field, value)
+            SQLiteContractExecutionStore(conn).create({
+                "contract_execution_id": execution_id, "project_id": "aming-claw",
+                "backlog_id": backlog_id, "contract_id": "adoption", "version": "1",
+                "revision": "1", "execution_state_revision": 1,
+                "canonical_ref_adoption": {
+                    "generation": "gen-flags", "custody": "custody-flags",
+                    "canonical_ref": "refs/heads/codex/ac-dev", "expected_commit": "a" * 40,
+                    "target_commit": "b" * 40, "target_tree": "c" * 40,
+                    "source_content_sha256": "sha256:" + "d" * 64,
+                },
+                "completed_lines": [line],
+            })
+            conn.commit()
+            conn.close()
+            request = _ctx(
+                {"project_id": "aming-claw"}, method="POST",
+                body={
+                    "observer_session_id": observer["observer_session_id"],
+                    "observer_route_token_ref": "rr-adoption-flags",
+                    "canonical_ref_adoption": {
+                        "action": "canonical_ref_adoption",
+                        "contract_execution_id": execution_id,
+                    },
+                },
+            )
+            request.handler = SimpleNamespace(
+                headers={"Authorization": f"Bearer {observer['session_token']}"}
+            )
+            status, response = server.handle_observer_route_context_issue(request)
+            assert status == 403, (field, value)
+            assert response["writes_performed"] is False, (field, value)
+            conn = connection_for_test("aming-claw")
+            try:
+                assert conn.execute(
+                    "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+                    ("aming-claw",),
+                ).fetchone()[0] == 1, (field, value)
+            finally:
+                conn.close()
+
+
 def test_canonical_ref_adoption_rejects_before_dev_bootstrap_on_missing_qa_fact(
     tmp_path, monkeypatch,
 ):

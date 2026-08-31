@@ -7786,11 +7786,20 @@ def _canonical_ref_adoption_active_qa_fact(
             )
             and candidate_commit == expected_commit
             and candidate_tree == expected_tree
+            # These are separate no-synthesis assertions, not substitutes for
+            # one another.  A false value in one location must never mask a
+            # true, missing, or caller-shaped value in another.  ``is`` is
+            # intentional: 0, "false", and other falsey values are not an
+            # authority assertion.
+            and candidate.get("authoritative_pass_synthesized") is False
+            # Older projections do not materialize this duplicate payload
+            # field.  If a projection does include it, however, it must agree
+            # exactly; an explicit true or non-boolean is a forged claim.
             and (
-                candidate.get("authoritative_pass_synthesized") is False
+                "authoritative_pass_synthesized" not in payload
                 or payload.get("authoritative_pass_synthesized") is False
-                or payload.get("pass_synthesized") is False
             )
+            and payload.get("pass_synthesized") is False
             and qa_session_id and principal_id
         ):
             continue
