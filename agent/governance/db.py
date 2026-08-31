@@ -1616,7 +1616,34 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
     if supplied.is_symlink():
         raise ValueError("AC dev storage root cannot be a symlink")
     if supplied != expected:
-        raise ValueError("AC dev storage root must equal canonical resolver output")
+        root = _absolute_non_symlink_root(supplied, create=False)
+        runtime = root / "runtime" / "durable-launch"
+        launches = list(runtime.glob("launch.*.json"))
+        if len(launches) != 1:
+            raise ValueError("AC dev storage root must equal canonical resolver output")
+        launch = launches[0]
+        match = re.fullmatch(r"launch\.([0-9a-f]{64})\.json", launch.name)
+        raw = launch.read_bytes()
+        try:
+            durable = json.loads(raw)
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError("AC dev isolated durable root receipt is unreadable") from exc
+        database = root / AC_DATABASE_DEV_RELATIVE_PATH
+        physical = database.stat(follow_symlinks=False)
+        if (launch.is_symlink() or match is None
+                or hashlib.sha256(raw).hexdigest() != match.group(1)
+                or not isinstance(durable, Mapping)
+                or durable.get("schema_version") != "ac_dev_durable_launch.v1"
+                or durable.get("stage") != "completed"
+                or durable.get("pid") != os.getpid()
+                or durable.get("dev_storage_root") != str(root)
+                or durable.get("database_path") != str(database)
+                or durable.get("project_id") != AC_PROJECT_ID
+                or durable.get("port") != 40008
+                or dict(durable.get("database_identity") or {}).get("device") != int(physical.st_dev)
+                or dict(durable.get("database_identity") or {}).get("inode") != int(physical.st_ino)):
+            raise ValueError("AC dev isolated durable root receipt mismatch")
+        return root
     return _absolute_non_symlink_root(expected, create=create)
 
 
