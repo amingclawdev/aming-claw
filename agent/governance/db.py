@@ -3451,6 +3451,10 @@ def _cow_historical_backlog_snapshot(
 def _reconstruct_dev_cow_successor_payload(
     root: Path, receipt: Mapping[str, object]
 ) -> dict[str, object]:
+    legacy_paths = sorted(_cow_successor_archive(root).glob("successor.*.json"))
+    if len(legacy_paths) != 1:
+        raise ValueError("AC dev COW successor historical v1 authority is missing or ambiguous")
+    legacy, _legacy_sha = _cow_raw_receipt(legacy_paths[0], prefix="successor")
     operator_ref = dict(receipt.get("operator_evidence") or {})
     operator_path = Path(str(operator_ref.get("path") or ""))
     operator, operator_sha = _cow_raw_receipt(operator_path, prefix="cow-import")
@@ -3468,7 +3472,17 @@ def _reconstruct_dev_cow_successor_payload(
     quarantine_path = Path(str(quarantine_ref.get("path") or ""))
     _quarantine, quarantine_sha = _cow_raw_receipt(quarantine_path, prefix="manifest")
     if (
-        operator_path.parent != root / "archive" / "operator-exceptions"
+        legacy.get("schema_version") != "ac_dev_cow_database_successor.v1"
+        or legacy.get("stage") != "completed"
+        or legacy.get("project_id") != AC_PROJECT_ID
+        or legacy.get("port") != 40008
+        or legacy.get("root") != str(root)
+        or legacy.get("listener")
+        != {"host": "127.0.0.1", "port": 40008, "listening": False}
+        or legacy.get("predecessor") != receipt.get("predecessor")
+        or legacy.get("operator_evidence") != receipt.get("operator_evidence")
+        or legacy.get("history") != receipt.get("history")
+        or operator_path.parent != root / "archive" / "operator-exceptions"
         or predecessor_path.parent != root / "archive" / "operator-exception-backups"
         or linked_path.parent != root / "archive" / "schema-admission"
         or adoption_path.parent != root / "archive" / "canonical-legacy-postimage-adoption"
@@ -3541,20 +3555,32 @@ def _reconstruct_dev_cow_successor_payload(
                 Path(str(temporary) + suffix).unlink()
             except FileNotFoundError:
                 pass
-    database = root / AC_DATABASE_DEV_RELATIVE_PATH
-    physical = database.stat(follow_symlinks=False)
-    reconstructed["identity"] = {
-        "path": str(database), "device": int(physical.st_dev),
-        "inode": int(physical.st_ino), "size": reconstructed["identity"]["size"],
-        "nlink": int(physical.st_nlink), "sha256": operator.get("target_sha256_after"),
-    }
+    historical_successor = dict(legacy.get("successor") or {})
+    historical_identity = dict(historical_successor.get("identity") or {})
+    if (
+        set(historical_identity) != {"path", "device", "inode", "size", "nlink", "sha256"}
+        or historical_identity.get("path") != str(root / AC_DATABASE_DEV_RELATIVE_PATH)
+        or historical_identity.get("sha256") != operator.get("target_sha256_after")
+        or historical_identity.get("size") != reconstructed["identity"]["size"]
+    ):
+        raise ValueError("AC dev COW successor historical v1 database authority mismatch")
+    reconstructed["identity"] = historical_identity
     reconstructed.update(snapshot)
-    stable = verified_stable_database_binding()
-    _revalidate_stable_database_binding(stable)
+    stable_binding = dict(legacy.get("stable_binding") or {})
+    stable_identity = dict(stable_binding.get("database") or {})
+    if (
+        set(stable_binding) != {"database", "runtime_commit"}
+        or set(stable_identity)
+        != {"schema_version", "device", "inode", "stable_relative_path_sha256"}
+        or stable_identity.get("schema_version") != "ac_stable_database_identity.v1"
+        or (stable_identity.get("device"), stable_identity.get("inode"))
+        == (historical_identity.get("device"), historical_identity.get("inode"))
+    ):
+        raise ValueError("AC dev COW successor historical v1 stable authority mismatch")
     return {
         "schema_version": AC_DEV_COW_SUCCESSOR_SCHEMA, "stage": "completed",
         "project_id": AC_PROJECT_ID, "port": 40008, "root": str(root),
-        "listener": {"host": "127.0.0.1", "port": 40008, "listening": False},
+        "listener": dict(legacy["listener"]),
         "genesis": {"raw_json": reconstructed["genesis_json"],
                     "sha256": reconstructed["genesis_sha256"]},
         "predecessor": {"backup": predecessor}, "successor": reconstructed,
@@ -3562,8 +3588,7 @@ def _reconstruct_dev_cow_successor_payload(
                               "payload": operator},
         "history": {"linked_v3": {"path": str(linked_path), "sha256": linked_sha},
                     "adoption": {"path": str(adoption_path), "sha256": adoption_sha}},
-        "stable_binding": {"database": dict(stable["stable_database_identity"]),
-                           "runtime_commit": stable.get("commit")},
+        "stable_binding": stable_binding,
     }
 
 

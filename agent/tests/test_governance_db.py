@@ -1700,6 +1700,17 @@ def _real_cow_successor_cli_fixture(tmp_path, monkeypatch):
     return root, database, backup, operator, linked
 
 
+def _write_historical_v1_from_v2(receipt_path):
+    payload = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
+    payload["schema_version"] = "ac_dev_cow_database_successor.v1"
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    path = Path(receipt_path).with_name(
+        f"successor.{hashlib.sha256(raw).hexdigest()}.json"
+    )
+    path.write_bytes(raw)
+    return path
+
+
 def test_ac_dev_cow_successor_public_cli_real_sqlite_create_and_replay(tmp_path, monkeypatch):
     pytest.importorskip("click")
     from click.testing import CliRunner
@@ -1732,6 +1743,7 @@ def test_ac_dev_cow_successor_v2_restart_allows_legitimate_fresh_backlog_row(
         predecessor_backup=backup,
         linked_v3_receipt=linked,
     )
+    _write_historical_v1_from_v2(created["receipt"])
     receipt_raw = Path(created["receipt"]).read_bytes()
     connection = sqlite3.connect(database)
     connection.execute(
@@ -1747,6 +1759,12 @@ def test_ac_dev_cow_successor_v2_restart_allows_legitimate_fresh_backlog_row(
         path = Path(str(database) + suffix)
         if path.exists():
             path.unlink()
+    monkeypatch.setattr(
+        db, "verified_stable_database_binding",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("current stable binding must not reconstruct issuance")
+        ),
+    )
 
     replay = db.validate_dev_cow_successor_receipt(root)
     assert replay["successor"]["row_count"] == 3603
@@ -1767,65 +1785,68 @@ def test_ac_dev_cow_successor_v2_rejects_recursive_rehashed_tampering(
         predecessor_backup=backup,
         linked_v3_receipt=linked,
     )
+    _write_historical_v1_from_v2(created["receipt"])
     receipt_path = Path(created["receipt"])
     original_raw = receipt_path.read_bytes()
     original = json.loads(original_raw)
-
-    def set_nested(payload, *path_and_value):
-        *path, value = path_and_value
-        current = payload
-        for key in path[:-1]:
-            current = current[key]
-        current[path[-1]] = value
-
-    cases = (
-        ("listener", "host", "evil.example"),
-        ("listener", "port", 1),
-        ("listener", "listening", True),
-        ("listener", "pid", 99999),
-        ("stable_binding", "runtime_commit", "tampered"),
-        ("stable_binding", "database", "inode", 99999),
-        ("stable_binding", "database", "path", "/foreign/stable.db"),
-        ("stable_binding", "path", "/foreign/stable"),
-        ("successor", "status_counts", {"FIXED": 1, "OPEN": 3602}),
-        ("successor", "backlog_projection_sha256", "sha256:" + "1" * 64),
-        ("successor", "source_schema", "sha256", "sha256:" + "2" * 64),
-        ("successor", "managed_inventory", "sha256", "sha256:" + "3" * 64),
-        ("successor", "protected_inventory", "sha256", "sha256:" + "4" * 64),
-        ("successor", "genesis_sha256", "sha256:" + "5" * 64),
-        ("successor", "row_count", 3603.0),
-        ("predecessor", "backup", "size", 1),
-        ("operator_evidence", "sha256", "sha256:" + "6" * 64),
-        ("history", "linked_v3", "sha256", "sha256:" + "7" * 64),
-        ("history", "adoption", "sha256", "sha256:" + "8" * 64),
+    monkeypatch.setattr(
+        db, "_reconstruct_dev_cow_successor_payload",
+        lambda _root, _receipt: original,
     )
-    for case in cases:
-        payload = json.loads(original_raw)
-        set_nested(payload, *case)
-        tampered_raw = json.dumps(
-            payload, sort_keys=True, separators=(",", ":")
-        ).encode()
-        tampered_path = receipt_path.with_name(
-            f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}."
-            f"{hashlib.sha256(tampered_raw).hexdigest()}.json"
-        )
-        receipt_path.unlink()
-        tampered_path.write_bytes(tampered_raw)
-        try:
-            with pytest.raises(ValueError, match="COW successor"):
-                db.validate_dev_cow_successor_receipt(root)
-        finally:
-            tampered_path.unlink()
-            receipt_path.write_bytes(original_raw)
 
-    structural_cases = []
-    payload = json.loads(original_raw)
-    payload["unexpected"] = "authority"
-    structural_cases.append(payload)
-    payload = json.loads(original_raw)
-    del payload["successor"]["status_counts"]
-    structural_cases.append(payload)
-    for payload in structural_cases:
+    def changed_scalar(value):
+        if value is None:
+            return "not-none"
+        if isinstance(value, bool):
+            return not value
+        if isinstance(value, int):
+            return float(value)
+        return str(value) + "#tampered"
+
+    def recursive_mutations(value, path=()):
+        if isinstance(value, dict):
+            payload = json.loads(original_raw)
+            target = payload
+            for part in path:
+                target = target[part]
+            target["__unexpected_authority__"] = True
+            yield payload
+            if value:
+                payload = json.loads(original_raw)
+                target = payload
+                for part in path:
+                    target = target[part]
+                del target[next(iter(value))]
+                yield payload
+            for key, child in value.items():
+                yield from recursive_mutations(child, path + (key,))
+        elif isinstance(value, list):
+            payload = json.loads(original_raw)
+            target = payload
+            for part in path:
+                target = target[part]
+            target.append("__unexpected_authority__")
+            yield payload
+            if value:
+                payload = json.loads(original_raw)
+                target = payload
+                for part in path:
+                    target = target[part]
+                del target[0]
+                yield payload
+            for index, child in enumerate(value):
+                yield from recursive_mutations(child, path + (index,))
+        else:
+            payload = json.loads(original_raw)
+            target = payload
+            for part in path[:-1]:
+                target = target[part]
+            target[path[-1]] = changed_scalar(value)
+            yield payload
+
+    mutation_count = 0
+    for payload in recursive_mutations(original):
+        mutation_count += 1
         tampered_raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         tampered_path = receipt_path.with_name(
             f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}."
@@ -1840,7 +1861,42 @@ def test_ac_dev_cow_successor_v2_rejects_recursive_rehashed_tampering(
             tampered_path.unlink()
             receipt_path.write_bytes(original_raw)
 
+    assert mutation_count > 100
     assert json.loads(receipt_path.read_bytes()) == original
+
+
+def test_ac_dev_cow_successor_v2_rejects_replaced_database_and_adjusted_receipt(
+    tmp_path, monkeypatch
+):
+    from agent.governance import db
+
+    root, database, backup, operator, linked = _real_cow_successor_cli_fixture(
+        tmp_path, monkeypatch
+    )
+    created = db.create_dev_cow_successor_receipt(
+        root, operator_receipt=operator, predecessor_backup=backup,
+        linked_v3_receipt=linked,
+    )
+    _write_historical_v1_from_v2(created["receipt"])
+    receipt_path = Path(created["receipt"])
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    replacement = database.with_name("replacement.sqlite")
+    shutil.copy2(database, replacement)
+    os.replace(replacement, database)
+    metadata = database.stat(follow_symlinks=False)
+    payload["successor"]["identity"].update({
+        "device": metadata.st_dev, "inode": metadata.st_ino,
+        "nlink": metadata.st_nlink,
+    })
+    tampered_raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    tampered_path = receipt_path.with_name(
+        f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(tampered_raw).hexdigest()}.json"
+    )
+    receipt_path.unlink()
+    tampered_path.write_bytes(tampered_raw)
+
+    with pytest.raises(ValueError, match="reconstructed issuance"):
+        db.validate_dev_cow_successor_receipt(root)
 
 
 def test_current_dev_backlog_runtime_invariants_reject_schema_and_generation(
