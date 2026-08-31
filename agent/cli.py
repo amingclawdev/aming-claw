@@ -2444,6 +2444,7 @@ def _durable_listener_pid(port: int) -> int:
 def _validated_linked_v3_receipt(
     receipt_path: Path, *, dev_storage: Path, database: Path,
     database_identity: Mapping[str, object], source_identity: Mapping[str, object],
+    allow_postimage: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     archive = dev_storage / "archive" / "schema-admission"
     receipt, digest = _read_admission_receipt(receipt_path.absolute(), archive=archive)
@@ -2470,9 +2471,9 @@ def _validated_linked_v3_receipt(
         or database_identity.get("device") != canonical_database_identity["device"]
         or database_identity.get("inode") != canonical_database_identity["inode"]
         or receipt.get("plan_sha256") != plan_sha256
-        or receipt.get("database_sha256_after") != _admission_database_sha256(
+        or (receipt.get("database_sha256_after") != _admission_database_sha256(
             database, expected_identity=canonical_database_identity,
-        )
+        ) and not allow_postimage)
     ):
         raise click.ClickException("AC dev durable launch linked-v3 receipt mismatch")
     _validate_admission_receipt_chain(
@@ -2554,7 +2555,9 @@ def _durable_exit_binding(receipt: Mapping[str, Any], receipt_sha256: str) -> di
         "port": receipt["port"], "policy": receipt["policy"],
         "linked_v3_receipt_sha256": receipt["linked_v3_receipt_sha256"],
         "log_path": receipt["log_path"], "log_identity": receipt["log_identity"],
-        "health": receipt["health"],
+        "readiness_sha256": receipt["readiness_sha256"],
+        "database_sha256_before": receipt["database_sha256_before"],
+        "database_sha256_after": receipt["database_sha256_after"],
     }
 
 
@@ -2582,6 +2585,12 @@ def _durable_dev_launch(
     linked_digest, _linked = _validated_linked_v3_receipt(
         linked_receipt, dev_storage=dev_storage, database=database,
         database_identity=database_identity, source_identity=source_identity,
+        allow_postimage=True,
+    )
+    from agent.governance.db import validate_dev_preimage_only
+    preimage = validate_dev_preimage_only(
+        dev_storage, source_identity=source_identity,
+        linked_v3_receipt=linked_receipt,
     )
     source_root = Path(str(source_identity["root"])).resolve(strict=True)
     server = source_root / "agent" / "governance" / "server.py"
@@ -2595,23 +2604,60 @@ def _durable_dev_launch(
     log_fd = os.open(
         log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600,
     )
+    parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    parent_sock.settimeout(15)
+    pending, pending_sha256 = _durable_content_receipt(runtime, "pending", {
+        "schema_version": "ac_dev_durable_pending.v1", "stage": "pending",
+        "launch_id": launch_id, "parent_pid": os.getpid(),
+        "source_identity": dict(source_identity), "dev_storage_root": str(dev_storage),
+        "database_path": str(database), "database_identity": dict(preimage["database_identity"]),
+        "database_sha256_before": preimage["database_sha256"],
+        "linked_v3_receipt": str(linked_receipt.absolute()),
+        "linked_v3_receipt_sha256": linked_digest,
+    })
     argv = [
         sys.executable, "-m", "agent.cli", "start", "--runtime-plane", "dev",
         "--port", str(AC_DEV_SERVICE_PORT), "--dev-storage-root", str(dev_storage),
         "--stable-anchor-commit", stable_anchor_commit,
         "--durable-child-runtime-dir", str(runtime),
         "--durable-child-launch-id", launch_id,
+        "--durable-child-control-fd", str(child_sock.fileno()),
+        "--durable-child-pending-receipt", str(pending),
+        "--durable-child-linked-v3-receipt", str(linked_receipt.absolute()),
     ]
     try:
-        child = _posix_detached_popen(argv, cwd=source_root, log_fd=log_fd)
+        child = _posix_detached_popen(
+            argv, cwd=source_root, log_fd=log_fd, pass_fds=(child_sock.fileno(),),
+        )
     except BaseException:
         os.close(log_fd)
+        parent_sock.close(); child_sock.close()
         raise
+    child_sock.close()
     os.close(log_fd)
     try:
         process = _posix_process_identity(child.pid)
         if shlex.split(process["argv"]) != argv:
             raise click.ClickException("AC dev durable child argv identity mismatch")
+        raw = b""
+        while b"\n" not in raw and len(raw) < 65536:
+            chunk = parent_sock.recv(65536 - len(raw))
+            if not chunk:
+                raise click.ClickException("AC dev durable child readiness pipe EOF")
+            raw += chunk
+        if b"\n" not in raw:
+            raise click.ClickException("AC dev durable child readiness is oversized")
+        message = json.loads(raw.split(b"\n", 1)[0])
+        readiness_path = Path(str(message.get("readiness_path") or ""))
+        readiness, readiness_sha256 = _read_durable_content_receipt(readiness_path, "readiness")
+        if (message.get("readiness_sha256") != readiness_sha256
+                or readiness.get("pending_sha256") != pending_sha256
+                or readiness.get("launch_id") != launch_id
+                or readiness.get("pid") != child.pid
+                or readiness.get("database_sha256_before") != preimage["database_sha256"]
+                or _durable_listener_pid(AC_DEV_SERVICE_PORT) != 0):
+            raise click.ClickException("AC dev durable child readiness mismatch")
+        database_identity = dict(readiness.get("database_identity") or {})
         base = {
             "schema_version": _AC_DEV_DURABLE_LAUNCH_VERSION, "stage": "completed",
             "launch_id": launch_id, "pid": child.pid, "process": process,
@@ -2625,7 +2671,17 @@ def _durable_dev_launch(
             "policy": {"runtime_plane": "dev", "migration": "verify-only",
                        "stable_deployment": "deny", "graph_activation": "deny",
                        "background_workers": "deny"},
+            "pending_sha256": pending_sha256,
+            "readiness_sha256": readiness_sha256,
+            "database_sha256_before": readiness["database_sha256_before"],
+            "database_sha256_after": readiness["database_sha256_after"],
         }
+        completed = base
+        active, active_sha256 = _durable_content_receipt(runtime, "launch", completed)
+        parent_sock.sendall(_canonical_json_bytes({
+            "completed_path": str(active), "completed_sha256": active_sha256,
+        }) + b"\n")
+        parent_sock.close()
         deadline = time.monotonic() + 15
         health = None
         while time.monotonic() < deadline and child.poll() is None:
@@ -2640,13 +2696,12 @@ def _durable_dev_launch(
             dev_database_identity=database_identity,
         ):
             raise click.ClickException("AC dev durable child health identity mismatch")
-        completed = {**base, "health": health}
-        active, active_sha256 = _durable_content_receipt(runtime, "launch", completed)
         lock.unlink()
         _fsync_parent(lock)
         click.echo(json.dumps({"status": "started", "pid": child.pid, "receipt": str(active),
                                "receipt_sha256": active_sha256}, sort_keys=True))
     except BaseException:
+        parent_sock.close()
         if child.poll() is None:
             os.kill(child.pid, signal.SIGTERM)
         failure = runtime / f"launch-{launch_id}.failed.json"
@@ -2719,7 +2774,7 @@ def _durable_dev_stop(dev_storage: Path) -> None:
         or not isinstance(receipt.get("argv"), list)
         or shlex.split(process["argv"]) != receipt.get("argv")
         or _durable_listener_pid(AC_DEV_SERVICE_PORT) != pid
-        or current_health != receipt.get("health")
+        or not current_health or current_health.get("pid") != pid
     ):
         raise click.ClickException("AC dev durable stop process identity mismatch")
     before_exits = {path.name for path in runtime.glob("exit.*.json")}
@@ -2812,6 +2867,9 @@ def _durable_dev_stop(dev_storage: Path) -> None:
 @click.option("--linked-v3-receipt", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--durable-child-runtime-dir", default=None, type=click.Path(file_okay=False, dir_okay=True, path_type=Path), hidden=True)
 @click.option("--durable-child-launch-id", default="", hidden=True)
+@click.option("--durable-child-control-fd", default=-1, type=int, hidden=True)
+@click.option("--durable-child-pending-receipt", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path), hidden=True)
+@click.option("--durable-child-linked-v3-receipt", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path), hidden=True)
 def start(
     workspace,
     port,
@@ -2825,6 +2883,9 @@ def start(
     linked_v3_receipt,
     durable_child_runtime_dir,
     durable_child_launch_id,
+    durable_child_control_fd,
+    durable_child_pending_receipt,
+    durable_child_linked_v3_receipt,
 ):
     """Start governance in the foreground without spawning plugin-owned workers."""
     from agent.runtime_plane import graph_activation_policy
@@ -2837,7 +2898,9 @@ def start(
         raise click.ClickException("AC dev durable launch requires --linked-v3-receipt")
     if not durable_launch and linked_v3_receipt is not None:
         raise click.ClickException("--linked-v3-receipt is valid only with --durable-launch")
-    child_binding_args = bool(durable_child_launch_id) and durable_child_runtime_dir is not None
+    child_binding_args = all((bool(durable_child_launch_id), durable_child_runtime_dir is not None,
+                              durable_child_control_fd >= 0, durable_child_pending_receipt is not None,
+                              durable_child_linked_v3_receipt is not None))
     if bool(durable_child_runtime_dir) != child_binding_args:
         raise click.ClickException("AC dev durable child requires its complete launch binding")
 
@@ -2935,11 +2998,28 @@ def start(
         # treats the dev-root env only as an equality assertion.
         os.environ["AMING_CLAW_SHARED_VOLUME"] = str(stable_shared)
         os.environ[AC_DEV_STORAGE_ROOT_ENV] = str(selected_dev_storage)
-        database_binding = _canonical_dev_database_binding(
-            str(selected_dev_storage),
-            source_identity=dev_identity,
-            linked_v3_receipt=linked_v3_receipt if durable_launch else None,
-        )
+        if durable_launch or durable_child_runtime_dir is not None:
+            from agent.governance.db import validate_dev_preimage_only
+            lifecycle_receipt = (
+                linked_v3_receipt if durable_launch else durable_child_linked_v3_receipt
+            )
+            try:
+                preimage_binding = validate_dev_preimage_only(
+                    selected_dev_storage, source_identity=dev_identity,
+                    linked_v3_receipt=lifecycle_receipt,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise click.ClickException(str(exc)) from exc
+            database_binding = {
+                "dev_storage_root": str(selected_dev_storage),
+                "database_path": preimage_binding["database_path"],
+                "dev_database_identity": preimage_binding["database_identity"],
+                "preimage": preimage_binding,
+            }
+        else:
+            database_binding = _canonical_dev_database_binding(
+                str(selected_dev_storage), source_identity=dev_identity,
+            )
         dev_storage_root = str(database_binding["dev_storage_root"])
         if durable_launch:
             _durable_dev_launch(
@@ -3014,11 +3094,78 @@ def start(
         os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] = "deny"
         os.environ[AC_DEV_STORAGE_ROOT_ENV] = str(dev_storage)
         os.environ.pop("SHARED_VOLUME_PATH", None)
-        from agent.governance.db import write_dev_launch_receipt
-        server_source = Path(__file__).resolve().parent / "governance" / "server.py"
-        source_hash = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
-        write_dev_launch_receipt(dev_storage, stable_shared_volume=stable_shared,
-            source_sha256=source_hash, port=AC_DEV_SERVICE_PORT)
+        if durable_child_runtime_dir is not None:
+            durable_runtime = _validated_durable_runtime_dir(
+                durable_child_runtime_dir, dev_storage,
+            )
+            pending, pending_sha256 = _read_durable_content_receipt(
+                durable_child_pending_receipt, "pending",
+            )
+            if (pending.get("launch_id") != durable_child_launch_id
+                    or pending.get("dev_storage_root") != str(dev_storage)
+                    or pending.get("source_identity") != dict(dev_identity or {})):
+                raise click.ClickException("AC dev durable child pending binding mismatch")
+            control = socket.socket(fileno=durable_child_control_fd)
+            control.settimeout(15)
+            child_process = _posix_process_identity(os.getpid())
+            custody = {
+                "pid": os.getpid(), "start_identity": child_process["start_identity"],
+                "argv": sys.argv, "cwd": child_process["cwd"],
+                "source_root": str(source_root), "source_commit": (dev_identity or {})["commit"],
+                "source_tree": (dev_identity or {})["tree"], "dev_storage_root": str(dev_storage),
+                "project_id": "aming-claw", "port": AC_DEV_SERVICE_PORT,
+                "launch_id": durable_child_launch_id,
+                "policy": {"runtime_plane": "dev", "migration": "verify-only",
+                           "stable_deployment": "deny", "graph_activation": "deny",
+                           "background_workers": "deny"},
+            }
+            from agent.governance.db import commit_dev_child_custody
+            try:
+                committed = commit_dev_child_custody(
+                    dev_storage, source_identity=dev_identity or {},
+                    process_identity=custody,
+                    linked_v3_receipt=durable_child_linked_v3_receipt,
+                    expected_database_identity=pending["database_identity"],
+                    expected_pre_sha256=pending["database_sha256_before"],
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise click.ClickException(str(exc)) from exc
+            readiness, readiness_sha256 = _durable_content_receipt(
+                durable_runtime, "readiness", {
+                    "schema_version": "ac_dev_durable_readiness.v1", "stage": "ready_unbound",
+                    "launch_id": durable_child_launch_id, "pid": os.getpid(),
+                    "pending_sha256": pending_sha256,
+                    "database_sha256_before": committed["database_sha256_before"],
+                    "database_sha256_after": committed["database_sha256_after"],
+                    "database_identity": committed["database_identity"],
+                    "custody_projection": committed["custody_projection"],
+                },
+            )
+            control.sendall(_canonical_json_bytes({
+                "readiness_path": str(readiness), "readiness_sha256": readiness_sha256,
+            }) + b"\n")
+            raw = b""
+            while b"\n" not in raw and len(raw) < 65536:
+                chunk = control.recv(65536 - len(raw))
+                if not chunk:
+                    raise click.ClickException("AC dev durable parent release pipe EOF")
+                raw += chunk
+            release = json.loads(raw.split(b"\n", 1)[0])
+            completed_path = Path(str(release.get("completed_path") or ""))
+            completed, completed_sha256 = _read_durable_content_receipt(completed_path, "launch")
+            if (release.get("completed_sha256") != completed_sha256
+                    or completed.get("launch_id") != durable_child_launch_id
+                    or completed.get("readiness_sha256") != readiness_sha256
+                    or completed.get("pid") != os.getpid()):
+                raise click.ClickException("AC dev durable completed release mismatch")
+            control.close()
+            database_binding["dev_database_identity"] = committed["database_identity"]
+        else:
+            from agent.governance.db import write_dev_launch_receipt
+            server_source = Path(__file__).resolve().parent / "governance" / "server.py"
+            source_hash = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
+            write_dev_launch_receipt(dev_storage, stable_shared_volume=stable_shared,
+                source_sha256=source_hash, port=AC_DEV_SERVICE_PORT)
     elif runtime_plane == "stable":
         runtime_root = Path(workspace).resolve() if workspace else _default_runtime_workspace()
         os.environ["AMING_CLAW_RUNTIME_PLANE"] = "stable"

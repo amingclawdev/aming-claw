@@ -19,6 +19,7 @@ import subprocess
 import errno
 import urllib.request
 import urllib.error
+import urllib.parse
 from contextlib import closing
 from pathlib import Path
 from collections.abc import Mapping, Sequence
@@ -1493,7 +1494,7 @@ def _absolute_non_symlink_root(path: Path, *, create: bool) -> Path:
 
 def _validated_isolated_dev_receipt(
     receipt_path: Path, root: Path, source_identity: Mapping[str, object],
-    stable_binding: Mapping[str, object],
+    stable_binding: Mapping[str, object], *, allow_postimage: bool = False,
 ) -> Path:
     archive = root / "archive" / "schema-admission"
     path = receipt_path.expanduser().absolute()
@@ -1529,6 +1530,8 @@ def _validated_isolated_dev_receipt(
     expected_source = dict(source_identity)
     source = receipt.get("source_identity") if isinstance(receipt, Mapping) else None
     cli_source = source.get("cli_source") if isinstance(source, Mapping) else None
+    receipt_database_sha = str(receipt.get("database_sha256_after") or "")
+    current_database_sha = "sha256:" + digest.hexdigest()
     if (
         receipt.get("schema_version") != "ac_dev_offline_schema_admission.v3"
         or receipt.get("stage") != "completed" or receipt.get("changed") is not False
@@ -1536,7 +1539,7 @@ def _validated_isolated_dev_receipt(
         or receipt.get("project_id") != AC_PROJECT_ID or receipt.get("port") != 40008
         or receipt.get("root_identity") != {"path": str(root), "device": int(root_stat.st_dev), "inode": int(root_stat.st_ino)}
         or receipt.get("database_identity") != {"path": str(database), "device": int(db_stat.st_dev), "inode": int(db_stat.st_ino)}
-        or receipt.get("database_sha256_after") != "sha256:" + digest.hexdigest()
+        or (receipt_database_sha != current_database_sha and not allow_postimage)
         or cli_source != expected_source or receipt.get("plan_sha256") != plan_sha
         or not isinstance(inventory, Mapping)
         or inventory.get("sha256") != AC_AUTHORITY_SCHEMA_INVENTORY_SHA256
@@ -1547,6 +1550,28 @@ def _validated_isolated_dev_receipt(
         ).encode("utf-8")).hexdigest() != AC_AUTHORITY_SCHEMA_INVENTORY_SHA256
     ):
         raise ValueError("AC dev isolated receipt binding mismatch")
+    if receipt_database_sha != current_database_sha:
+        # A linked-v3 receipt is immutable authority for the admitted preimage.
+        # After the child-owned custody transaction the current database is a
+        # postimage, so validate its source-owned genesis without pretending
+        # that the historical receipt names the new bytes.
+        uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            meta = dict(connection.execute(
+                "SELECT key, value FROM schema_meta WHERE key IN "
+                "('governance_world_id','governance_world_genesis_json',"
+                "'governance_world_genesis_sha256')"
+            ))
+            genesis = json.loads(str(meta.get("governance_world_genesis_json") or ""))
+            if (meta.get("governance_world_id") != AC_DEV_WORLD_ID
+                    or not isinstance(genesis, Mapping)
+                    or genesis.get("world_id") != AC_DEV_WORLD_ID
+                    or genesis.get("project_id") != AC_PROJECT_ID
+                    or meta.get("governance_world_genesis_sha256") != _world_genesis_hash(genesis)):
+                raise ValueError("AC dev isolated postimage genesis mismatch")
+        finally:
+            connection.close()
     stable_database = Path(str(stable_binding["database_path"])).resolve(strict=True)
     stable_stat = stable_database.stat(follow_symlinks=False)
     stable_root = Path(str(stable_binding["shared_volume_path"])).resolve(strict=True)
@@ -1562,7 +1587,8 @@ def _validated_isolated_dev_receipt(
 
 
 def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = None,
-                      source_identity: Mapping[str, object] | None = None) -> Path:
+                      source_identity: Mapping[str, object] | None = None,
+                      allow_postimage: bool = False) -> Path:
     """Resolve the only AC dev world; raw env values are assertions, not authority."""
     # Reject the missing required dev claim before contacting any authority or
     # resolving a potentially hostile sibling path.  This is zero-mutation.
@@ -1582,6 +1608,7 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
         root = _absolute_non_symlink_root(supplied, create=False)
         return _validated_isolated_dev_receipt(
             isolated_receipt, root, source_identity or {}, binding,
+            allow_postimage=allow_postimage,
         )
     from agent.runtime_plane import resolve_ac_dev_storage_root
     expected = resolve_ac_dev_storage_root(stable)
@@ -2550,6 +2577,103 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
         )
 
 
+def _durable_database_sha256(database: Path) -> str:
+    """Hash one stable, no-follow database inode."""
+    before = database.stat(follow_symlinks=False)
+    if database.is_symlink() or not stat.S_ISREG(before.st_mode):
+        raise ValueError("AC dev durable database is not a canonical regular file")
+    descriptor = os.open(database, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    digest = hashlib.sha256()
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
+        raise ValueError("AC dev durable database changed during hashing")
+    return "sha256:" + digest.hexdigest()
+
+
+def validate_dev_preimage_only(
+    storage_root: Path | str, *, source_identity: Mapping[str, object],
+    linked_v3_receipt: Path,
+) -> dict[str, object]:
+    """Validate an admitted preimage or exact source-owned custody postimage.
+
+    This function is deliberately immutable: it takes no writer lease, creates
+    no directory, and opens SQLite only through immutable read-only mode.
+    """
+    root = _dev_storage_root(
+        create=False, isolated_receipt=linked_v3_receipt,
+        source_identity=source_identity, allow_postimage=True,
+    )
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    physical = database.stat(follow_symlinks=False)
+    pre_sha256 = _durable_database_sha256(database)
+    uri = "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        _verify_existing_schema(connection)
+        _verify_dev_world_schema_inventory(connection)
+        meta = dict(connection.execute("SELECT key, value FROM schema_meta"))
+    finally:
+        connection.close()
+    current = {}
+    if meta.get("governance_world_current_process_json"):
+        try:
+            current = json.loads(str(meta["governance_world_current_process_json"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("AC dev durable custody projection is unreadable") from exc
+        if not isinstance(current, Mapping):
+            raise ValueError("AC dev durable custody projection is invalid")
+    return {
+        "dev_storage_root": str(root), "database_path": str(database),
+        "database_identity": {"device": int(physical.st_dev), "inode": int(physical.st_ino)},
+        "database_sha256": pre_sha256, "custody_projection": dict(current),
+        "has_genesis": bool(meta.get("governance_world_genesis_sha256")),
+    }
+
+
+def commit_dev_child_custody(
+    storage_root: Path | str, *, source_identity: Mapping[str, object],
+    process_identity: Mapping[str, object], linked_v3_receipt: Path,
+    expected_database_identity: Mapping[str, object], expected_pre_sha256: str,
+) -> dict[str, object]:
+    """Child-owned, CAS-bound custody commit used before any listener bind."""
+    pre = validate_dev_preimage_only(
+        storage_root, source_identity=source_identity,
+        linked_v3_receipt=linked_v3_receipt,
+    )
+    if (pre["database_identity"] != dict(expected_database_identity)
+            or pre["database_sha256"] != expected_pre_sha256):
+        raise ValueError("AC dev durable child preimage CAS mismatch")
+    receipt = bootstrap_dev_governance_store(
+        storage_root, source_identity=source_identity,
+        process_identity=process_identity, linked_v3_receipt=linked_v3_receipt,
+    )
+    database = Path(str(receipt["database_path"]))
+    # The writer is closed by bootstrap.  Own durable bytes before readiness.
+    checkpoint = sqlite3.connect(str(database), timeout=30)
+    try:
+        result = tuple(checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+        if result != (0, 0, 0):
+            raise RuntimeError("AC dev durable child checkpoint did not truncate")
+    finally:
+        checkpoint.close()
+    post = validate_dev_preimage_only(
+        storage_root, source_identity=source_identity,
+        linked_v3_receipt=linked_v3_receipt,
+    )
+    if dict(post["custody_projection"]) != dict(process_identity):
+        raise ValueError("AC dev durable child custody projection mismatch")
+    return {
+        **receipt, "database_sha256_before": expected_pre_sha256,
+        "database_sha256_after": post["database_sha256"],
+        "custody_projection": post["custody_projection"],
+    }
+
+
 def bootstrap_dev_governance_store(
     storage_root: Path | str,
     *,
@@ -2582,7 +2706,7 @@ def bootstrap_dev_governance_store(
             raise ValueError("AC dev storage root must be disjoint from shared storage")
     root = _dev_storage_root(
         create=not root_existed, isolated_receipt=linked_v3_receipt,
-        source_identity=source_identity,
+        source_identity=source_identity, allow_postimage=True,
     )
     source = {
         "root": str(source_identity.get("root") or "").strip(),
@@ -2596,6 +2720,12 @@ def bootstrap_dev_governance_store(
         "pid": int(process_identity.get("pid") or 0),
         "start_identity": str(process_identity.get("start_identity") or "").strip(),
     }
+    for key in (
+        "argv", "cwd", "source_root", "source_commit", "source_tree",
+        "dev_storage_root", "project_id", "port", "policy", "launch_id",
+    ):
+        if key in process_identity:
+            process[key] = process_identity[key]
     if not (
         source["root"]
         and source["branch"] == "codex/ac-dev"
@@ -2611,7 +2741,7 @@ def bootstrap_dev_governance_store(
     # proven prior world.  Do not create child directories in that case.
     if root_existed and created:
         raise ValueError("AC dev fresh bootstrap requires an absent dedicated root")
-    if not created:
+    if not created and linked_v3_receipt is None:
         _validate_existing_adoption_receipt(root)
     else:
         database.parent.mkdir(parents=True, exist_ok=True)
@@ -2652,9 +2782,17 @@ def bootstrap_dev_governance_store(
     try:
         conn = sqlite3.connect(str(database), timeout=30)
         conn.row_factory = sqlite3.Row
-        if created:
+        admitted_preimage = False
+        if not created and linked_v3_receipt is not None:
+            existing_meta = dict(conn.execute(
+                "SELECT key, value FROM schema_meta WHERE key IN "
+                "('governance_world_genesis_sha256','governance_world_genesis_json')"
+            ))
+            admitted_preimage = not bool(existing_meta.get("governance_world_genesis_sha256"))
+        if created or admitted_preimage:
             _configure_connection(conn, busy_timeout=10000)
-            _ensure_schema(conn)
+            if created:
+                _ensure_schema(conn)
             _verify_dev_world_schema_inventory(conn)
             required_tables, _allowed_tables, _source_objects = _source_schema_table_contract()
             for table in sorted(

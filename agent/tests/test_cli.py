@@ -4544,14 +4544,17 @@ def test_durable_exit_binding_discriminates_every_authorized_launch_field():
                    "background_workers": "deny"},
         "linked_v3_receipt_sha256": "sha256:" + "4" * 64,
         "log_path": "/dev/log", "log_identity": {"path": "/dev/log", "device": 3, "inode": 4},
-        "health": {"pid": 123},
+        "readiness_sha256": "sha256:" + "5" * 64,
+        "database_sha256_before": "sha256:" + "6" * 64,
+        "database_sha256_after": "sha256:" + "7" * 64,
     }
     baseline = cli._durable_exit_binding(receipt, "sha256:" + "3" * 64)
     assert baseline["completed_receipt_sha256"] == "sha256:" + "3" * 64
     for field in ("launch_id", "pid", "argv", "cwd", "python", "source_commit", "source_tree",
                   "server_sha256", "source_root", "database_path", "database_identity",
                   "dev_storage_root", "project_id", "port", "policy",
-                  "linked_v3_receipt_sha256", "log_path", "log_identity", "health"):
+                  "linked_v3_receipt_sha256", "log_path", "log_identity",
+                  "readiness_sha256", "database_sha256_before", "database_sha256_after"):
         mutated = copy.deepcopy(receipt)
         mutated[field] = ["mutated"] if field == "argv" else "mutated"
         assert cli._durable_exit_binding(mutated, "sha256:" + "3" * 64) != baseline, field
@@ -4599,6 +4602,9 @@ def test_durable_stop_attacks_fail_closed(tmp_path, monkeypatch, attack):
                    "stable_deployment": "deny", "graph_activation": "deny",
                    "background_workers": "deny"},
         "log_path": str(log), "log_identity": cli._admission_identity(log),
+        "readiness_sha256": "sha256:" + "f" * 64,
+        "database_sha256_before": "sha256:" + "1" * 64,
+        "database_sha256_after": "sha256:" + "2" * 64,
         "health": {"pid": 424242},
     }
     cli._durable_content_receipt(runtime, "launch", receipt)
