@@ -2710,6 +2710,66 @@ def backlog_read_schema_inventory(conn: sqlite3.Connection) -> dict[str, object]
     }
 
 
+def _backlog_read_managed_object_names() -> frozenset[str]:
+    """The only sqlite_master names an offline backlog admission may create."""
+    return frozenset({
+        "dashboard_backlog_cache_generation",
+        "idx_backlog_bugs_dashboard_keyset",
+        *(f"trg_dashboard_backlog_cache_{event.lower()}"
+          for event in BACKLOG_READ_SCHEMA_TRIGGER_SQL),
+    })
+
+
+def _schema_inventory_binding(
+    rows: tuple[tuple[str, str, str, str], ...], *, hash_sql: bool,
+) -> dict[str, object]:
+    """Serialize a deterministic SQLite inventory without trusting names alone."""
+    values = tuple(
+        (kind, name, table, "sha256:" + hashlib.sha256(sql.encode("utf-8")).hexdigest())
+        if hash_sql else (kind, name, table, sql)
+        for kind, name, table, sql in rows
+    )
+    encoded = json.dumps(values, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return {
+        "inventory": [list(item) for item in values],
+        "sha256": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def backlog_read_schema_managed_inventory(conn: sqlite3.Connection) -> dict[str, object]:
+    """Bind exactly the five source-owned backlog-read objects, and no others."""
+    names = _backlog_read_managed_object_names()
+    return _schema_inventory_binding(
+        tuple(row for row in _sqlite_master_inventory(conn) if row[1] in names),
+        hash_sql=False,
+    )
+
+
+def canonical_backlog_read_schema_managed_inventory() -> dict[str, object]:
+    """Return the exact post-admission managed-object binding without a target DB."""
+    names = _backlog_read_managed_object_names()
+    return _schema_inventory_binding(
+        tuple(
+            row for row in _canonical_backlog_read_schema_inventory(include_plan=True)
+            if row[1] in names
+        ),
+        hash_sql=False,
+    )
+
+
+def backlog_read_schema_protected_inventory(conn: sqlite3.Connection) -> dict[str, object]:
+    """Bind every non-managed object before an offline admission mutates sqlite."""
+    names = _backlog_read_managed_object_names()
+    return _schema_inventory_binding(
+        tuple(
+            row for row in _sqlite_master_inventory(conn)
+            if row[1] not in names
+            and not row[1].startswith("sqlite_autoindex_dashboard_backlog_cache_generation_")
+        ),
+        hash_sql=True,
+    )
+
+
 def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
     """Classify the bounded backlog-read plan without writing.
 
@@ -2758,10 +2818,7 @@ def backlog_read_schema_drift(conn: sqlite3.Connection) -> dict[str, list[str]]:
     # observer, worker, and contract objects are protected by the caller's
     # complete inventory/projection binding; treating them as backlog drift
     # would incorrectly force a pristine whole-world database.
-    managed_names = {
-        "dashboard_backlog_cache_generation", "idx_backlog_bugs_dashboard_keyset",
-        *(f"trg_dashboard_backlog_cache_{event.lower()}" for event in BACKLOG_READ_SCHEMA_TRIGGER_SQL),
-    }
+    managed_names = _backlog_read_managed_object_names()
     base_names = {name for _kind, name, _table, _sql in _canonical_backlog_read_schema_inventory(include_plan=False)}
     for kind, name, table_name, _sql in _sqlite_master_inventory(conn):
         # Any collision/shadow object that claims the managed backlog naming

@@ -1716,6 +1716,28 @@ def test_ac_dev_offline_backlog_schema_admission_repairs_only_exact_missing_set(
         conn.close()
 
 
+def test_ac_dev_backlog_admission_binds_managed_and_protected_inventories():
+    """Admission may add its five objects without reinterpreting other schema."""
+    from governance import db
+
+    conn = sqlite3.connect(":memory:")
+    db._ensure_schema(conn)
+    conn.execute("CREATE TABLE worker_runtime_contract (name TEXT PRIMARY KEY, value TEXT)")
+    protected_before = db.backlog_read_schema_protected_inventory(conn)
+    managed_before = db.backlog_read_schema_managed_inventory(conn)
+    try:
+        assert managed_before["inventory"] == []
+        assert db.admit_missing_backlog_read_schema(conn)["changed"] is True
+        assert db.backlog_read_schema_managed_inventory(conn) == (
+            db.canonical_backlog_read_schema_managed_inventory()
+        )
+        assert db.backlog_read_schema_protected_inventory(conn) == protected_before
+        conn.execute("CREATE INDEX worker_runtime_contract_name ON worker_runtime_contract(name)")
+        assert db.backlog_read_schema_protected_inventory(conn) != protected_before
+    finally:
+        conn.close()
+
+
 def test_ac_dev_authority_projection_admission_is_complete_and_fail_closed():
     """The Phase-Z offline capability admits only its exact six-owner ABI."""
     from governance import db
