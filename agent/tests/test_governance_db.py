@@ -100,6 +100,107 @@ class TestDB(unittest.TestCase):
         close_connection(conn)
 
 
+def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(monkeypatch):
+    from agent.governance import db, graph_events, graph_snapshot_store
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_root_receipt_genesis",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        first = db.admit_ac_dev_graph_materialization_schema(
+            conn, project_id="aming-claw"
+        )
+        inventory = db._graph_materialization_inventory(conn)
+        second = db.admit_ac_dev_graph_materialization_schema(
+            conn, project_id="aming-claw"
+        )
+        changes = conn.total_changes
+        graph_snapshot_store.ensure_schema(conn)
+        graph_events.ensure_schema(conn)
+        assert conn.total_changes == changes
+        assert db._graph_materialization_inventory(conn) == inventory
+        assert first == second
+    finally:
+        conn.close()
+
+
+def test_ac_dev_graph_materialization_admission_rolls_back_partial_schema(monkeypatch):
+    from agent.governance import db, graph_correction_patches
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "dev",
+            "classification_reason": "verified_dev_root_receipt_genesis",
+            "active_graph_activation_allowed": False,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    original = graph_correction_patches.ensure_schema
+
+    def fail_target_only(candidate):
+        original(candidate)
+        if candidate is conn:
+            raise RuntimeError("injected owner failure")
+
+    monkeypatch.setattr(graph_correction_patches, "ensure_schema", fail_target_only)
+    with pytest.raises(RuntimeError, match="injected owner failure"):
+        db.admit_ac_dev_graph_materialization_schema(conn, project_id="aming-claw")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'graph_%'"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_ac_dev_graph_materialization_admission_denies_wrong_world_without_write(monkeypatch):
+    from agent.governance import db
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    monkeypatch.setattr(
+        db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "runtime_plane": "stable",
+            "classification_reason": "verified_stable_database_binding",
+            "active_graph_activation_allowed": True,
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    before = conn.total_changes
+    with pytest.raises(ValueError, match="identity is not admitted"):
+        db.admit_ac_dev_graph_materialization_schema(conn, project_id="aming-claw")
+    assert conn.total_changes == before
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
+    conn.close()
+
+
 class TestACDevDatabaseIsolation(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

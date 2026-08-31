@@ -526,7 +526,15 @@ def utc_now() -> str:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(GRAPH_SNAPSHOT_SCHEMA_SQL)
+    from . import db
+
+    if db.dev_runtime_verify_only() and not db.graph_materialization_admission_active(conn):
+        db.verify_graph_materialization_schema(conn)
+        return
+    if db.graph_materialization_admission_active(conn):
+        db.execute_graph_schema_sql(conn, GRAPH_SNAPSHOT_SCHEMA_SQL)
+    else:
+        conn.executescript(GRAPH_SNAPSHOT_SCHEMA_SQL)
     _ensure_graph_snapshot_ref_columns(conn)
     _ensure_reconcile_terminalization_ledger_columns(conn)
     _migrate_pending_scope_reconcile_branch_identity(conn)

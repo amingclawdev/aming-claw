@@ -727,6 +727,181 @@ def dev_runtime_verify_only() -> bool:
     return _is_dev_runtime()
 
 
+_GRAPH_MATERIALIZATION_ADMISSION_LOCAL = threading.local()
+
+
+def graph_materialization_admission_active(conn: sqlite3.Connection) -> bool:
+    """Return whether ``conn`` is inside the one bounded graph-schema admission."""
+
+    return id(conn) in getattr(
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", frozenset()
+    )
+
+
+def execute_graph_schema_sql(conn: sqlite3.Connection, sql: str) -> None:
+    """Execute a schema script without ``executescript``'s implicit COMMIT.
+
+    This path is used only by the dev materialization admission.  Stable keeps
+    the historical ``executescript`` behavior byte-for-byte at each owner.
+    """
+
+    statement = ""
+    for line in str(sql).splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise ValueError("graph schema source contains an incomplete statement")
+
+
+def _graph_materialization_inventory(conn: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
+    rows = conn.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+        "WHERE type IN ('table','index','trigger','view') ORDER BY type,name,tbl_name"
+    ).fetchall()
+    return [tuple(str(value or "") for value in row) for row in rows]
+
+
+def _graph_materialization_canonical_inventory() -> list[tuple[str, str, str, str]]:
+    from . import graph_correction_patches, graph_events, graph_snapshot_store
+
+    canonical = sqlite3.connect(":memory:")
+    try:
+        connection_ids = set(
+            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+        )
+        connection_ids.add(id(canonical))
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+        graph_snapshot_store.ensure_schema(canonical)
+        graph_events.ensure_schema(canonical)
+        graph_correction_patches.ensure_schema(canonical)
+        return _graph_materialization_inventory(canonical)
+    finally:
+        connection_ids = set(
+            getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+        )
+        connection_ids.discard(id(canonical))
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+        canonical.close()
+
+
+def _graph_materialization_managed_inventory(
+    inventory: Sequence[tuple[str, str, str, str]],
+    canonical: Sequence[tuple[str, str, str, str]],
+) -> list[tuple[str, str, str, str]]:
+    names = {row[1] for row in canonical}
+    tables = {row[2] for row in canonical if row[0] == "table"}
+    return [row for row in inventory if row[1] in names or row[2] in tables]
+
+
+def verify_graph_materialization_schema(conn: sqlite3.Connection) -> None:
+    """Verify the three source-owned rebuildable graph schemas without writes."""
+
+    canonical = _graph_materialization_canonical_inventory()
+    actual = _graph_materialization_inventory(conn)
+    managed = _graph_materialization_managed_inventory(actual, canonical)
+    extra_graph = [
+        row for row in actual
+        if row[1].startswith("graph_") and row[1] not in {item[1] for item in canonical}
+    ]
+    if managed != canonical or extra_graph:
+        raise DevRuntimeSchemaVerificationError(
+            "graph_materialization",
+            missing_tables=[
+                row[1] for row in canonical
+                if row[0] == "table" and row not in managed
+            ],
+        )
+
+
+def admit_ac_dev_graph_materialization_schema(
+    conn: sqlite3.Connection, *, project_id: str
+) -> dict[str, object]:
+    """Initialize/verify only the source-owned graph materialization schema.
+
+    Authority is derived from the opened database's physical world identity;
+    caller plane claims cannot widen it.  All owner DDL and postcondition
+    verification share one ``BEGIN IMMEDIATE`` transaction.
+    """
+
+    from . import graph_correction_patches, graph_events, graph_snapshot_store
+
+    if project_id != AC_PROJECT_ID or not _is_dev_runtime():
+        raise ValueError("AC dev graph materialization admission is dev/aming-claw only")
+    database_identity = canonical_ac_database_identity(conn)
+    if (
+        database_identity.get("world_id") != AC_DEV_WORLD_ID
+        or database_identity.get("project_id") != AC_PROJECT_ID
+    ):
+        raise ValueError("AC dev graph materialization custody identity is not admitted")
+    policy = classify_graph_activation_connection(conn)
+    if (
+        policy.get("runtime_plane") != DEV_RUNTIME_PLANE
+        or policy.get("classification_reason") != "verified_dev_root_receipt_genesis"
+        or policy.get("active_graph_activation_allowed") is not False
+    ):
+        raise ValueError("AC dev graph materialization database identity is not admitted")
+
+    canonical = _graph_materialization_canonical_inventory()
+    before_inventory = _graph_materialization_inventory(conn)
+    before_managed = _graph_materialization_managed_inventory(
+        before_inventory, canonical
+    )
+    canonical_names = {item[1] for item in canonical}
+    extra_graph_before = [
+        row for row in before_inventory
+        if row[1].startswith("graph_") and row[1] not in canonical_names
+    ]
+    # Admission initializes one absent rebuildable materialization or replays
+    # one exact current source inventory.  A partial, altered, extra, or legacy
+    # graph layout is not migrated and cannot be laundered by IF NOT EXISTS.
+    if extra_graph_before or (before_managed and before_managed != canonical):
+        raise ValueError("AC dev graph materialization preimage is not exact or empty")
+    connection_ids = set(
+        getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())
+    )
+    if id(conn) in connection_ids:
+        raise RuntimeError("nested graph materialization admission is forbidden")
+    prior_authorizer = _dev_schema_authorizer
+    try:
+        with sqlite_write_lock():
+            conn.execute("BEGIN IMMEDIATE")
+            conn.set_authorizer(None)
+            connection_ids.add(id(conn))
+            _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+            graph_snapshot_store.ensure_schema(conn)
+            graph_events.ensure_schema(conn)
+            graph_correction_patches.ensure_schema(conn)
+            actual = _graph_materialization_inventory(conn)
+            if _graph_materialization_managed_inventory(actual, canonical) != canonical:
+                raise ValueError("AC dev graph materialization schema postcondition failed")
+            extra_graph = [
+                row for row in actual
+                if row[1].startswith("graph_")
+                and row[1] not in canonical_names
+            ]
+            if extra_graph:
+                raise ValueError("AC dev graph materialization schema has extra authority")
+            conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        connection_ids.discard(id(conn))
+        _GRAPH_MATERIALIZATION_ADMISSION_LOCAL.connection_ids = frozenset(connection_ids)
+        conn.set_authorizer(prior_authorizer)
+    return {
+        "schema_version": "ac_dev_graph_materialization_admission.v1",
+        "project_id": project_id,
+        "runtime_plane": DEV_RUNTIME_PLANE,
+        "world_id": AC_DEV_WORLD_ID,
+        "object_count": len(canonical),
+        "active_graph_activation_allowed": False,
+    }
+
+
 def verify_existing_schema_capabilities(
     conn: sqlite3.Connection,
     *,

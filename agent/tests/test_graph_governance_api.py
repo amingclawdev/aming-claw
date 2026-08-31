@@ -18909,6 +18909,70 @@ def test_lower_full_reconcile_strips_reserved_current_full_marker(
     assert calls[0]["notes_extra"] == {"caller_note": "preserved"}
 
 
+@pytest.mark.parametrize(
+    "handler,auth_name,next_name",
+    [
+        (
+            server.handle_graph_governance_full_reconcile,
+            "_require_graph_governance_operator",
+            "run_state_only_full_reconcile",
+        ),
+        (
+            server.handle_graph_governance_current_full_reconcile,
+            "_require_current_full_reconcile_auth",
+            "_git_head_commit",
+        ),
+    ],
+)
+def test_dev_reconcile_handlers_admit_after_auth_before_graph_access(
+    conn, monkeypatch, tmp_path, handler, auth_name, next_name
+):
+    calls: list[str] = []
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    monkeypatch.setattr(server, "dev_runtime_verify_only", lambda: True)
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: tmp_path,
+    )
+    monkeypatch.setattr(
+        server,
+        auth_name,
+        lambda *_args, **_kwargs: calls.append("auth") or {},
+    )
+    monkeypatch.setattr(
+        server,
+        "admit_ac_dev_graph_materialization_schema",
+        lambda *_args, **_kwargs: calls.append("admission") or {},
+    )
+
+    class StopAfterAdmission(RuntimeError):
+        pass
+
+    if next_name == "run_state_only_full_reconcile":
+        monkeypatch.setattr(
+            state_reconcile,
+            next_name,
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAfterAdmission()),
+        )
+    else:
+        monkeypatch.setattr(
+            server,
+            next_name,
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAfterAdmission()),
+        )
+    with pytest.raises(StopAfterAdmission):
+        handler(
+            _ctx_with_role(
+                {"project_id": PID},
+                "coordinator",
+                method="POST",
+                body={"activate": False},
+            )
+        )
+    assert calls == ["auth", "admission"]
+
+
 def test_current_full_state_rejects_notes_only_and_premerge_provenance(conn):
     commit_sha = "c" * 40
     snapshot_id = "full-notes-only-current-full"

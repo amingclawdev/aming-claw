@@ -45,6 +45,8 @@ from .db import (
     AC_DATABASE_STABLE_RELATIVE_PATH,
     canonical_ac_database_identity,
     DevRuntimeSchemaVerificationError,
+    admit_ac_dev_graph_materialization_schema,
+    dev_runtime_verify_only,
     get_connection,
     acquire_dev_runtime_writer_lease,
     release_dev_runtime_writer_lease,
@@ -95701,6 +95703,10 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.full")
+        if dev_runtime_verify_only():
+            admit_ac_dev_graph_materialization_schema(
+                conn, project_id=project_id
+            )
         try:
             result = run_state_only_full_reconcile(
                 conn,
@@ -97099,6 +97105,10 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             conn,
             "graph-governance.reconcile.current-full",
         )
+        if dev_runtime_verify_only():
+            admit_ac_dev_graph_materialization_schema(
+                conn, project_id=project_id
+            )
         head_commit = _git_head_commit(root)
         target_commit = str(
             body.get("target_commit_sha")

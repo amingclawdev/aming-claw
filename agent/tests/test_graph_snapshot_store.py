@@ -96,6 +96,18 @@ def test_schema_migration_is_idempotent(conn):
     assert version["value"] == str(db.SCHEMA_VERSION)
 
 
+def test_dev_component_schema_guard_is_exact_verify_only(conn, monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    store.ensure_schema(conn)
+    conn.execute("CREATE TABLE graph_unowned_extra (id TEXT PRIMARY KEY)")
+    conn.commit()
+    before = conn.total_changes
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    with pytest.raises(db.DevRuntimeSchemaVerificationError):
+        store.ensure_schema(conn)
+    assert conn.total_changes == before
+
+
 def test_active_graph_effects_bind_to_durable_database_world_not_environment(
     conn, monkeypatch
 ):
