@@ -2691,7 +2691,9 @@ def _bootstrap_regular_database(path: Path, *, label: str) -> dict[str, Any]:
     }
 
 
-def _stopped_dashboard_bootstrap_ancestry(root: Path) -> dict[str, Any]:
+def _stopped_dashboard_bootstrap_ancestry(
+    root: Path, *, expected_database_sha256: str | None = None,
+) -> dict[str, Any]:
     """Prove the immutable adoption ancestor and exact latest stopped generation."""
     from agent.governance import db as _db
     adoptions = _canonical_adoption_receipts(root)
@@ -2708,11 +2710,26 @@ def _stopped_dashboard_bootstrap_ancestry(root: Path) -> dict[str, Any]:
         raise click.ClickException("dashboard backlog bootstrap adoption mismatch") from exc
     runtime = root / "runtime" / "durable-launch"
     database = root / "governance" / "aming-claw" / "governance.db"
-    current_sha = _file_sha256(database)
+    database_before = _bootstrap_regular_database(database, label="target")
+    current_sha = str(expected_database_sha256 or database_before["sha256"])
+    if not _exact_sha256(current_sha):
+        raise click.ClickException("dashboard backlog bootstrap ancestry database hash is invalid")
     candidates: list[tuple[str, dict[str, Any], str, str]] = []
     for launch_path in runtime.glob("launch.*.json") if runtime.is_dir() else ():
         launch, launch_sha = _read_durable_content_receipt(launch_path, "launch")
-        if launch.get("database_sha256_after") != current_sha:
+        # Cached receipt names never select authority: independently reread
+        # every content-addressed member and bind it to today's stopped DB.
+        if (launch.get("schema_version") != _AC_DEV_DURABLE_LAUNCH_VERSION
+                or launch.get("stage") != "completed"
+                or launch.get("project_id") != "aming-claw"
+                or launch.get("port") != AC_DEV_SERVICE_PORT
+                or launch.get("dev_storage_root") != str(root)
+                or launch.get("database_path") != str(database)
+                or launch.get("database_sha256_after") != current_sha
+                or launch.get("database_identity") != _admission_identity(database)
+                or launch.get("policy") != {"runtime_plane": "dev", "migration": "verify-only",
+                    "stable_deployment": "deny", "graph_activation": "deny",
+                    "background_workers": "deny"}):
             continue
         stops = []
         for stop_path in runtime.glob("stop.*.json"):
@@ -2737,11 +2754,26 @@ def _stopped_dashboard_bootstrap_ancestry(root: Path) -> dict[str, Any]:
             "dashboard backlog bootstrap latest stopped generation is missing or ambiguous"
         )
     launch_sha, launch, stop_sha, exit_sha = candidates[0]
-    return {
+    if _durable_listener_pid(AC_DEV_SERVICE_PORT):
+        raise click.ClickException("dashboard backlog bootstrap requires a free port 40008")
+    try:
+        _posix_process_identity(int(launch.get("pid") or 0))
+    except click.ClickException:
+        pass
+    else:
+        raise click.ClickException("dashboard backlog bootstrap generation is still live")
+    database_after = _bootstrap_regular_database(database, label="target")
+    if database_after != database_before:
+        raise click.ClickException("dashboard backlog bootstrap database drifted during ancestry read")
+    ancestry = {
         "adoption_receipt": str(adoptions[0]), "adoption_sha256": adoption_sha,
         "launch_sha256": launch_sha, "stop_sha256": stop_sha, "exit_sha256": exit_sha,
         "database_sha256": current_sha, "database_identity": launch.get("database_identity"),
     }
+    ancestry["ancestry_sha256"] = "sha256:" + hashlib.sha256(
+        _canonical_json_bytes(ancestry)
+    ).hexdigest()
+    return ancestry
 
 
 def _offline_dashboard_backlog_bootstrap(
@@ -2798,6 +2830,13 @@ def _offline_dashboard_backlog_bootstrap(
         except click.ClickException:
             pending_ok = False
         recorded_ancestry = dict(prior.get("ancestry") or {})
+        try:
+            current_ancestry = _stopped_dashboard_bootstrap_ancestry(
+                canonical,
+                expected_database_sha256=str(recorded_ancestry.get("database_sha256") or ""),
+            )
+        except click.ClickException:
+            current_ancestry = {}
         runtime = canonical / "runtime" / "durable-launch"
         immutable_chain = (
             (Path(str(recorded_ancestry.get("adoption_receipt") or "")), "adoption",
@@ -2816,7 +2855,8 @@ def _offline_dashboard_backlog_bootstrap(
             ) and all(_exact_sha256(str(digest or "")) for _path, _prefix, digest in immutable_chain)
         except click.ClickException:
             chain_ok = False
-        if (not pending_ok or not chain_ok or prior.get("source_identity") != source_before
+        if (not pending_ok or not chain_ok or current_ancestry != recorded_ancestry
+                or prior.get("source_identity") != source_before
                 or prior.get("source_projection") != source_projection
                 or prior.get("target_database_sha256_after") != target_before["sha256"]
                 or recorded_ancestry.get("database_identity") != _admission_identity(target)):
@@ -2845,7 +2885,18 @@ def _offline_dashboard_backlog_bootstrap(
                 or _admission_identity(pending_backup_path) != pending_backup.get("identity")
                 or _file_sha256(pending_backup_path) != pending_backup.get("sha256")):
             raise click.ClickException("dashboard backlog bootstrap pending backup mismatch")
-    ancestry = dict(pending.get("ancestry") or {}) if pending else _stopped_dashboard_bootstrap_ancestry(canonical)
+    if pending:
+        ancestry = dict(pending.get("ancestry") or {})
+        try:
+            if _stopped_dashboard_bootstrap_ancestry(
+                canonical,
+                expected_database_sha256=str(ancestry.get("database_sha256") or ""),
+            ) != ancestry:
+                raise click.ClickException("dashboard backlog bootstrap pending ancestry HOLD")
+        except click.ClickException:
+            raise
+    else:
+        ancestry = _stopped_dashboard_bootstrap_ancestry(canonical)
     connection = sqlite3.connect(str(target), timeout=5, isolation_level=None)
     preimage_sha = str(pending.get("target_database_sha256_before") or "") if pending else target_before["sha256"]
     backup = receipts_dir / f"{preimage_sha[7:]}.pre.sqlite"
