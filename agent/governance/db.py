@@ -516,7 +516,14 @@ def classify_graph_activation_connection(
                 return _unknown_graph_activation_connection(
                     "dev_cow_successor_current_database_invalid"
                 )
-            _verify_dev_world_schema_inventory(conn)
+            # Graph materialization identity is anchored by the immutable COW
+            # receipt/history chain, the opened inode, and the current source
+            # descendant below.  Do not turn unrelated optional subsystem
+            # inventory (for example parallel-branch runtime tables) into a
+            # second identity authority.  Ordinary dev startup continues to
+            # verify the complete source inventory at its existing call sites;
+            # the graph admission separately accepts only its exact canonical
+            # managed namespace or a completely empty one before issuing DDL.
             _verify_current_cow_successor_source(
                 conn, root, successor_receipt,
                 launch_source_sha256=str(receipt.get("source_sha256") or ""),
@@ -866,7 +873,14 @@ def _graph_materialization_canonical_inventory() -> list[tuple[str, str, str, st
         graph_snapshot_store.ensure_schema(canonical)
         graph_events.ensure_schema(canonical)
         graph_correction_patches.ensure_schema(canonical)
-        return _graph_materialization_inventory(canonical)
+        # ``sqlite_sequence`` is database-global SQLite bookkeeping created as
+        # an incidental consequence of AUTOINCREMENT.  It is not owned by the
+        # graph materialization namespace and may legitimately pre-exist for
+        # an unrelated governance table in an otherwise empty graph preimage.
+        return [
+            row for row in _graph_materialization_inventory(canonical)
+            if row[1] != "sqlite_sequence"
+        ]
     finally:
         connection_ids = set(
             getattr(_GRAPH_MATERIALIZATION_ADMISSION_LOCAL, "connection_ids", ())

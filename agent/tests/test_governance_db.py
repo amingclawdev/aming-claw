@@ -1123,6 +1123,65 @@ def test_graph_activation_classifies_exact_validated_cow_successor(tmp_path, mon
     assert policy["classification_reason"] == "verified_dev_cow_successor_receipt_history"
 
 
+def test_graph_materialization_admits_valid_cow_without_parallel_runtime_inventory(
+    tmp_path, monkeypatch,
+):
+    """Optional parallel runtime absence is not COW physical identity drift."""
+    db, conn, receipt = _cow_graph_identity_fixture(tmp_path, monkeypatch)
+    db._ensure_schema(conn)
+    optional_tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' "
+            "AND (name LIKE 'parallel_branch_%' OR name LIKE 'graph_%')"
+        )
+    } | {
+        row[1]
+        for row in db._graph_materialization_canonical_inventory()
+        if row[0] == "table"
+    }
+    assert len({
+        name for name in optional_tables if name.startswith("parallel_branch_")
+    }) == 12
+    for table in sorted(optional_tables):
+        conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'parallel_branch_%'"
+    ).fetchone() == (0,)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'graph_%'"
+    ).fetchone() == (0,)
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(db, "validate_dev_cow_successor_receipt", lambda _root: receipt)
+    monkeypatch.setattr(
+        db, "_verify_current_cow_successor_source", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
+        "canonical_ac_database_identity",
+        lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
+    )
+    try:
+        result = db.admit_ac_dev_graph_materialization_schema(
+            conn, project_id="aming-claw"
+        )
+        db.verify_graph_materialization_schema(conn)
+        assert result["runtime_plane"] == "dev"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'parallel_branch_%'"
+        ).fetchone() == (0,)
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("drift", ["inode", "history_gap", "source_descendant"])
 def test_graph_materialization_rejects_unverified_cow_before_write(
     tmp_path, monkeypatch, drift,
