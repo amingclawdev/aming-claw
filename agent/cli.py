@@ -3218,7 +3218,13 @@ def _completed_dashboard_bootstrap_binding(root: Path) -> dict[str, Any] | None:
     return {"database_path": str(database), "database_identity": _admission_identity(database),
             "database_sha256": current["sha256"], "bootstrap_receipt": str(completed[0]),
             "bootstrap_receipt_sha256": receipt_sha, "bootstrap_pending": str(pending_path),
-            "bootstrap_pending_sha256": pending_sha}
+            "bootstrap_pending_sha256": pending_sha,
+            "historical_launch_sha256": ancestry.get("launch_sha256"),
+            "historical_stop_sha256": ancestry.get("stop_sha256"),
+            "historical_exit_sha256": ancestry.get("exit_sha256"),
+            "historical_database_sha256": ancestry.get("database_sha256"),
+            "historical_database_postimage": pending.get("target_database_sha256_before"),
+            "historical_launch_id": None}
 
 
 def _durable_start_phase(root: Path) -> tuple[str, dict[str, Any] | None]:
@@ -3708,7 +3714,17 @@ def _durable_dev_launch(
             dead_unsealed.append((path, value, digest))
     if invalid_generations:
         raise click.ClickException("AC dev durable completed generation is unclassifiable")
-    if existing_launches:
+    if durable_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
+        assert bootstrap_binding is not None
+        historical_sha = str(bootstrap_binding.get("historical_launch_sha256") or "")
+        selected = [item for item in existing_launches if item[2] == historical_sha]
+        if (not _exact_sha256(historical_sha) or len(selected) != 1
+                or len(existing_launches) != 1
+                or selected[0][1].get("database_sha256_after")
+                != bootstrap_binding.get("historical_database_postimage")):
+            raise click.ClickException("AC dev durable bootstrap historical generation mismatch")
+        bootstrap_binding["historical_launch_id"] = selected[0][1].get("launch_id")
+    elif existing_launches:
         current_postimage = current_database_sha256()
         matching_postimages = [
             digest for _path, value, digest in existing_launches
@@ -3863,6 +3879,8 @@ def _durable_dev_launch(
             key: bootstrap_binding[key] for key in (
                 "bootstrap_receipt", "bootstrap_receipt_sha256",
                 "bootstrap_pending", "bootstrap_pending_sha256",
+                "historical_launch_sha256", "historical_stop_sha256",
+                "historical_exit_sha256", "historical_launch_id",
             )
         }
     pending, pending_sha256 = _durable_content_receipt(runtime, "pending", pending_payload)
