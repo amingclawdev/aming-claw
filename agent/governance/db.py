@@ -1705,6 +1705,8 @@ def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str)
     supplied = Path(storage_root).expanduser().absolute()
     try:
         root = _dev_storage_root(create=False)
+        if list((root / "runtime" / "durable-launch").glob("launch.*.json")):
+            raise ValueError("isolated durable receipt selected")
     except ValueError:
         # An isolated durable child is released only by the immutable
         # completed receipt written after its unbound custody transaction.
