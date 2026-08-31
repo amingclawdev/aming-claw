@@ -199209,6 +199209,89 @@ def test_ac_dev_source_free_projects_real_r4_durable_handoff_shape(conn):
     assert authority["source_mutation_forbidden"] is True
 
 
+def _set_source_free_topology(conn, backlog_id, topology):
+    row = conn.execute(
+        "SELECT chain_trigger_json FROM backlog_bugs WHERE bug_id=?",
+        (backlog_id,),
+    ).fetchone()
+    trigger = json.loads(row["chain_trigger_json"])
+    trigger["judgment_plan_precheck"]["subject"]["normalized_topology"] = topology
+    trigger["judgment_plan_precheck"]["evidence"]["route_context"][
+        "normalized_proposed_topology"
+    ] = topology
+    conn.execute(
+        "UPDATE backlog_bugs SET chain_trigger_json=? WHERE bug_id=?",
+        (json.dumps(trigger), backlog_id),
+    )
+    conn.commit()
+
+
+def test_ac_dev_source_free_projects_exact_real_r6_topology_to_empty_route(conn):
+    backlog_id = "AC-DEV-SOURCE-FREE-REAL-R6-TOPOLOGY"
+    _completed_source_free_system_operation_case(conn, backlog_id)
+    topology = (
+        "reuse_the_existing_unique_ac_observer."
+        "_source_free_system_operation_only;"
+        "_zero_implementation_workers;"
+        "_one_fresh_observer_route/session;"
+        "_exactly_one_full_reconcile."
+    )
+    _set_source_free_topology(conn, backlog_id, topology)
+
+    authority = server._backlog_source_free_operation_authority(
+        conn, project_id="aming-claw", backlog_id=backlog_id
+    )
+    result = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "system_operation",
+            },
+        )
+    )
+
+    assert authority["accepted"] is True
+    assert all(authority["contract_facts"].values())
+    assert result["next_legal_action"]["id"] == (
+        "completed_system_operation_route_issue"
+    )
+    assert result["next_legal_action"]["copy_safe_body"]["target_files"] == []
+    assert result["next_legal_action"]["copy_safe_body"]["owned_files"] == []
+
+
+@pytest.mark.parametrize(
+    "topology",
+    [
+        "",
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_one_implementation_worker;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_two_full_reconciles."
+        ),
+    ],
+)
+def test_ac_dev_real_r6_topology_missing_or_altered_fact_rejects(conn, topology):
+    backlog_id = "AC-DEV-SOURCE-FREE-REAL-R6-ALTERED"
+    _completed_source_free_system_operation_case(conn, backlog_id)
+    _set_source_free_topology(conn, backlog_id, topology)
+
+    assert server._backlog_source_free_operation_authority(
+        conn, project_id="aming-claw", backlog_id=backlog_id
+    ) == {}
+
+
 def _completed_source_free_system_operation_case(conn, backlog_id):
     _initialize_ac_dev_guide_schema(conn)
     _insert_simple_mf_close_backlog(conn, backlog_id)

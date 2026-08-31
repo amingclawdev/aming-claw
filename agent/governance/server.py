@@ -145214,6 +145214,59 @@ def _backlog_declared_direct_file_scope(conn, backlog_id: str) -> list[str]:
     return deduped
 
 
+def _source_free_operation_topology_facts(value: object) -> dict[str, bool]:
+    """Decode the closed JB source-free topology vocabulary into typed facts."""
+
+    clauses = tuple(
+        clause.strip().strip("_")
+        for clause in re.split(r"[.;]", str(value or "").strip())
+        if clause.strip().strip("_")
+    )
+    real_operation_shape = clauses == (
+        "reuse_the_existing_unique_ac_observer",
+        "source_free_system_operation_only",
+        "zero_implementation_workers",
+        "one_fresh_observer_route/session",
+        "exactly_one_full_reconcile",
+    )
+    explicit_legacy_shape = clauses == (
+        "existing_unique_ac_observer",
+        "source_mutation_forbidden",
+        "no_implementation_worker",
+        "source_free_operation_only",
+    )
+    revision_clause = clauses[1] if len(clauses) == 3 else ""
+    revision_parts = revision_clause.split("_because_r", 1)
+    revision_source_free = bool(
+        len(revision_parts) == 2
+        and revision_parts[0] == "no_implementation_worker"
+        and revision_parts[1].endswith("_is_source_free")
+        and revision_parts[1][: -len("_is_source_free")].isdigit()
+    )
+    revision_legacy_shape = bool(
+        len(clauses) == 3
+        and clauses[0] == "existing_unique_ac_observer"
+        and revision_source_free
+        and clauses[2]
+        == "role_distinct_qa_only_if_a_new_mutation_is_introduced"
+    )
+    accepted = bool(
+        real_operation_shape or explicit_legacy_shape or revision_legacy_shape
+    )
+    return {
+        "accepted": accepted,
+        "unique_observer": accepted,
+        "source_free_operation_only": accepted,
+        "zero_implementation_workers": accepted,
+        "fresh_observer_route_session": (
+            real_operation_shape or explicit_legacy_shape or revision_legacy_shape
+        ),
+        "single_full_reconcile": (
+            real_operation_shape or explicit_legacy_shape or revision_legacy_shape
+        ),
+    }
+
+
 def _backlog_source_free_operation_authority(
     conn,
     *,
@@ -145315,23 +145368,11 @@ def _backlog_source_free_operation_authority(
         aliases & blocked_set for aliases in blocked_semantic_aliases.values()
     )
 
-    topology_patterns = (
-        re.compile(
-            r"^existing_unique_ac_observer;"
-            r"_no_implementation_worker_because_r[0-9]+_is_source_free;"
-            r"_role_distinct_qa_only_if_a_new_mutation_is_introduced$"
-        ),
-        re.compile(
-            r"^existing_unique_ac_observer;"
-            r"_source_mutation_forbidden;"
-            r"_no_implementation_worker;"
-            r"_source_free_operation_only$"
-        ),
-    )
     subject_topology = str(subject.get("normalized_topology") or "").strip()
     evidence_topology = str(
         evidence_route.get("normalized_proposed_topology") or ""
     ).strip()
+    topology_facts = _source_free_operation_topology_facts(subject_topology)
     required_contract_facts = {
         "empty_file_scope": not row_files,
         "typed_handoff": handoff.get("schema_version")
@@ -145345,9 +145386,16 @@ def _backlog_source_free_operation_authority(
         "operation_actions_closed": allowed_actions_closed
         and allowed_semantics == expected_semantics,
         "source_mutation_blocked": blocked_actions_closed,
-        "no_worker_topology": any(
-            pattern.fullmatch(subject_topology) for pattern in topology_patterns
-        ),
+        "no_worker_topology": topology_facts["zero_implementation_workers"],
+        "source_free_operation_topology": topology_facts[
+            "source_free_operation_only"
+        ],
+        "fresh_observer_route_session_topology": topology_facts[
+            "fresh_observer_route_session"
+        ],
+        "single_full_reconcile_topology": topology_facts[
+            "single_full_reconcile"
+        ],
         "topology_independently_bound": subject_topology == evidence_topology,
     }
     if not all(required_contract_facts.values()):
