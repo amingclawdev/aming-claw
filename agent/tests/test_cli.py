@@ -4650,7 +4650,9 @@ def test_canonical_legacy_postimage_projection_excludes_only_schema_meta(tmp_pat
     assert drifted_projection != before_projection
 
 
-@pytest.mark.parametrize("attack", ["identity_drift", "preforged_exit", "missing_exit_after_term"])
+@pytest.mark.parametrize(
+    "attack", ["identity_drift", "postimage_drift", "preforged_exit", "missing_exit_after_term"],
+)
 def test_durable_stop_attacks_fail_closed(tmp_path, monkeypatch, attack):
     import agent.cli as cli
 
@@ -4677,13 +4679,16 @@ def test_durable_stop_attacks_fail_closed(tmp_path, monkeypatch, attack):
         "log_path": str(log), "log_identity": cli._admission_identity(log),
         "readiness_sha256": "sha256:" + "f" * 64,
         "database_sha256_before": "sha256:" + "1" * 64,
-        "database_sha256_after": "sha256:" + "2" * 64,
+        "database_sha256_after": "sha256:" + hashlib.sha256(database.read_bytes()).hexdigest(),
         "health": {"pid": 424242},
     }
     cli._durable_content_receipt(runtime, "launch", receipt)
     monkeypatch.setattr(cli, "_source_git_identity", lambda: {
         "root": str(source), "commit": "a" * 40, "tree": "b" * 40, "dirty": "",
     })
+    if attack == "postimage_drift":
+        database.write_bytes(b"drift")
+        expected = "bound identity mismatch"
     if attack in {"preforged_exit", "missing_exit_after_term"}:
         cli._durable_content_receipt(runtime, "exit", {"forged": True})
         if attack == "missing_exit_after_term":
@@ -4693,7 +4698,7 @@ def test_durable_stop_attacks_fail_closed(tmp_path, monkeypatch, attack):
         monkeypatch.setattr(cli, "_durable_listener_pid", lambda _port: receipt["pid"])
         monkeypatch.setattr(cli, "_probe_governance", lambda *_args, **_kwargs: receipt["health"])
         expected = "exit receipt is missing"
-    else:
+    elif attack == "identity_drift":
         monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: {
             "start_identity": "sha256:" + "d" * 64, "argv": "attacker", "cwd": str(source),
         })

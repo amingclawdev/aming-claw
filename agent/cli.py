@@ -2713,11 +2713,40 @@ def _validated_linked_v3_receipt(
     )
     historical_source = dict(receipt_source.get("cli_source") or {})
     if historical_source != dict(source_identity):
-        _canonical_legacy_postimage_adoption(
-            dev_storage, linked_v3_receipt=receipt_path,
-            source_identity=source_identity,
-        )
         adoptions = _canonical_adoption_receipts(dev_storage)
+        runtime = dev_storage / "runtime" / "durable-launch"
+        completed_generations = list(runtime.glob("launch.*.json")) if runtime.is_dir() else []
+        if completed_generations:
+            # Adoption is an immutable ancestor authority.  Once child custody
+            # has produced a completed generation the database is necessarily
+            # a postimage, so reconstructing the legacy payload is both
+            # impossible and the wrong state transition.  The DB validator
+            # proves the one immutable ancestor and its bounded custody delta;
+            # the durable generation validators below prove the exact current
+            # postimage and process/listener chain.
+            if len(adoptions) != 1:
+                raise click.ClickException(
+                    "AC dev durable launch canonical adoption is missing or ambiguous"
+                )
+            try:
+                _db._validated_canonical_legacy_postimage_adoption(
+                    dev_storage, receipt_path.absolute(), source_identity,
+                    _db.verified_stable_database_binding(),
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise click.ClickException(
+                    "AC dev durable launch canonical adoption mismatch"
+                ) from exc
+        else:
+            # Before the first completed generation, replay remains byte-exact
+            # against the legacy postimage and retains the free-port/no-holder
+            # admission gates.
+            _canonical_legacy_postimage_adoption(
+                dev_storage, linked_v3_receipt=receipt_path,
+                source_identity=source_identity,
+            )
+        if len(adoptions) != 1:
+            adoptions = _canonical_adoption_receipts(dev_storage)
         if len(adoptions) != 1:
             raise click.ClickException("AC dev durable launch linked-v3 source mismatch")
         adoption, _adoption_digest = _read_canonical_adoption_receipt(adoptions[0])
@@ -3037,6 +3066,16 @@ def _durable_dev_launch(
             dead_unsealed.append((path, value, digest))
     if invalid_generations:
         raise click.ClickException("AC dev durable completed generation is unclassifiable")
+    if existing_launches:
+        current_postimage = current_database_sha256()
+        matching_postimages = [
+            digest for _path, value, digest in existing_launches
+            if value.get("database_sha256_after") == current_postimage
+        ]
+        if len(matching_postimages) != 1:
+            raise click.ClickException(
+                "AC dev durable completed generation postimage is missing or ambiguous"
+            )
     if len(dead_unsealed) > 1:
         raise click.ClickException("AC dev durable multiple dead unsealed generations")
     live_generations = []
@@ -3337,6 +3376,7 @@ def _durable_dev_stop(dev_storage: Path) -> None:
         or receipt.get("policy") != {"runtime_plane": "dev", "migration": "verify-only",
             "stable_deployment": "deny", "graph_activation": "deny",
             "background_workers": "deny"}
+        or receipt.get("database_sha256_after") != _file_sha256(database)
     ):
         raise click.ClickException("AC dev durable stop bound identity mismatch")
     linked_digest = str(receipt.get("linked_v3_receipt_sha256") or "")
