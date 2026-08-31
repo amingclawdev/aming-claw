@@ -2567,8 +2567,10 @@ def _canonical_legacy_postimage_adoption(
                 raise click.ClickException("AC dev canonical adoption stale pidfile PID remains live")
         except ProcessLookupError:
             pass
+    # ``target`` above is deliberately scoped to quarantine sidecar validation;
+    # inventory authority is always the canonical admitted database.
     inventory_connection = sqlite3.connect(
-        "file:" + urllib.parse.quote(str(target)) + "?mode=ro&immutable=1", uri=True,
+        "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1", uri=True,
     )
     try:
         target_inventory_after = _db.backlog_read_schema_inventory(inventory_connection)
