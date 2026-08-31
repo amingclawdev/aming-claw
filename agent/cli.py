@@ -4404,6 +4404,13 @@ def start(
                     or pending.get("dev_storage_root") != str(dev_storage)
                     or pending.get("source_identity") != dict(dev_identity or {})):
                 raise click.ClickException("AC dev durable child pending binding mismatch")
+            pending_database = dict(pending.get("database_identity") or {})
+            canonical_database = dev_storage / "governance" / "aming-claw" / "governance.db"
+            if (pending_database.get("path") != str(canonical_database)
+                    or not isinstance(pending_database.get("device"), int)
+                    or not isinstance(pending_database.get("inode"), int)
+                    or _admission_identity(canonical_database) != pending_database):
+                raise click.ClickException("AC dev durable child pending database identity mismatch")
             control = socket.socket(fileno=durable_child_control_fd)
             control.settimeout(15)
             child_process = _posix_process_identity(os.getpid())

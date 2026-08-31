@@ -3042,14 +3042,28 @@ def commit_completed_bootstrap_child_custody(
     value is held byte-for-byte stable across the single transaction.
     """
     root = Path(storage_root).expanduser().absolute()
+    if root.is_symlink() or root.resolve(strict=True) != root:
+        raise ValueError("AC dev completed bootstrap custody root is invalid")
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    if (database.is_symlink() or not database.is_file()
+            or database.resolve(strict=True) != database):
+        raise ValueError("AC dev completed bootstrap custody database path is invalid")
     if (set(custody_updates) != set(_COMPLETED_BOOTSTRAP_CUSTODY_KEYS)
             or not all(isinstance(value, str) for value in custody_updates.values())
             or not isinstance(expected_schema_meta, Mapping)):
         raise ValueError("AC dev completed bootstrap custody context is invalid")
+    if (not isinstance(expected_database_identity.get("path"), str)
+            or expected_database_identity.get("path") != str(database)
+            or not isinstance(expected_database_identity.get("device"), int)
+            or not isinstance(expected_database_identity.get("inode"), int)):
+        raise ValueError("AC dev completed bootstrap custody receipt identity is invalid")
     physical_stat = database.stat(follow_symlinks=False)
+    if physical_stat.st_nlink != 1:
+        raise ValueError("AC dev completed bootstrap custody database link count is invalid")
     physical = {"device": int(physical_stat.st_dev), "inode": int(physical_stat.st_ino)}
-    if dict(expected_database_identity) != physical:
+    claimed_physical = {"device": expected_database_identity["device"],
+                        "inode": expected_database_identity["inode"]}
+    if claimed_physical != physical:
         raise ValueError("AC dev completed bootstrap custody identity mismatch")
     pre_sha = _durable_database_sha256(database)
     if pre_sha != expected_pre_sha256:
