@@ -1364,7 +1364,10 @@ def _dev_source_repo(tmp_path: Path) -> tuple[Path, str]:
         check=True,
     )
     (root / "source.txt").write_text("A\n", encoding="utf-8")
-    subprocess.run(["git", "add", "source.txt"], cwd=root, check=True)
+    cli_source = root / "agent" / "cli.py"
+    cli_source.parent.mkdir()
+    cli_source.write_text("# canonical CLI source producer\n", encoding="utf-8")
+    subprocess.run(["git", "add", "source.txt", "agent/cli.py"], cwd=root, check=True)
     subprocess.run(["git", "commit", "-m", "A"], cwd=root, check=True, capture_output=True)
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -1799,12 +1802,20 @@ def test_cow_receipt_reconstruction_keeps_issuance_schema_after_source_expands(
             )},
         ),
     )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        db,
+        "_ensure_schema",
+        lambda _conn: (_ for _ in ()).throw(
+            AssertionError("receipt reconstruction must not enter runtime schema setup")
+        ),
+    )
     reconstructed = db._reconstruct_dev_cow_successor_payload(root, immutable)
     assert reconstructed == immutable
     assert db.validate_dev_cow_successor_receipt(root) == immutable
 
 
-@pytest.mark.parametrize("drift", [None, "dirty", "non_descendant", "launch_hash"])
+@pytest.mark.parametrize("drift", [None, "dirty", "non_descendant", "cli_hash"])
 def test_current_cow_source_requires_clean_strict_same_root_descendant(
     tmp_path, monkeypatch, drift,
 ):
@@ -1814,7 +1825,8 @@ def test_current_cow_source_requires_clean_strict_same_root_descendant(
     subprocess.run(["git", "branch", "-M", "codex/ac-dev"], cwd=source_root, check=True)
     current_commit = _advance_dev_source(source_root, "descendant-one")
     current_commit = _advance_dev_source(source_root, "descendant-two")
-    source_sha = "sha256:" + "7" * 64
+    cli_source = source_root / "agent" / "cli.py"
+    source_sha = "sha256:" + hashlib.sha256(cli_source.read_bytes()).hexdigest()
     anchor = {
         "root": str(source_root.resolve()), "branch": "codex/ac-dev",
         "commit": anchor_commit, "source_sha256": "sha256:" + "6" * 64,
@@ -1867,20 +1879,106 @@ def test_current_cow_source_requires_clean_strict_same_root_descendant(
     conn.commit()
     if drift == "dirty":
         (source_root / "untracked-drift.txt").write_text("dirty\n")
-    launch_sha = "sha256:" + "8" * 64 if drift == "launch_hash" else source_sha
-    if drift is None:
-        db._verify_current_cow_successor_source(
-            conn, storage, receipt, launch_source_sha256=launch_sha,
+    if drift == "cli_hash":
+        current["source_sha256"] = "sha256:" + "7" * 64
+        conn.execute(
+            "UPDATE schema_meta SET value=? WHERE key='governance_world_source_tip_json'",
+            (json.dumps(current),),
         )
+        conn.execute(
+            "UPDATE schema_meta SET value=? WHERE key='governance_world_source_tip_sha256'",
+            (db._world_source_tip_hash(current),),
+        )
+        conn.commit()
+    if drift is None:
+        db._verify_current_cow_successor_source(conn, storage, receipt)
     else:
         with pytest.raises(ValueError):
-            db._verify_current_cow_successor_source(
-                conn, storage, receipt, launch_source_sha256=launch_sha,
-            )
+            db._verify_current_cow_successor_source(conn, storage, receipt)
     conn.close()
 
 
-def _real_cow_successor_cli_fixture(tmp_path, monkeypatch):
+def test_real_cow_clone_classifies_with_dev_plane_and_distinct_source_producers(
+    tmp_path, monkeypatch,
+):
+    """Replay the full receipt/history and live schema path without gate mocks."""
+    from agent import runtime_plane
+    from agent.governance import db
+
+    git_fixture = tmp_path / "git"
+    git_fixture.mkdir()
+    source_root, anchor_commit = _dev_source_repo(git_fixture)
+    anchor = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": anchor_commit, "source_sha256": "sha256:" + "6" * 64,
+    }
+    current_commit = _advance_dev_source(source_root, "descendant-one")
+    current_commit = _advance_dev_source(source_root, "descendant-two")
+    cli_sha = "sha256:" + hashlib.sha256(
+        (source_root / "agent" / "cli.py").read_bytes()
+    ).hexdigest()
+    current = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": current_commit, "source_sha256": cli_sha,
+    }
+    root, database, backup, operator, linked = _real_cow_successor_cli_fixture(
+        tmp_path, monkeypatch, candidate_source_identity=anchor,
+    )
+    created = db.create_dev_cow_successor_receipt(
+        root, operator_receipt=operator, predecessor_backup=backup,
+        linked_v3_receipt=linked,
+    )
+    _write_historical_v1_from_v2(created["receipt"])
+    connection = sqlite3.connect(database)
+    connection.executemany(
+        "INSERT OR REPLACE INTO schema_meta(key,value) VALUES (?,?)",
+        [
+            ("governance_world_source_tip_json", json.dumps(current)),
+            ("governance_world_source_tip_sha256", db._world_source_tip_hash(current)),
+            ("governance_world_source_tip_revision", "2"),
+        ],
+    )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+
+    stable_volume = tmp_path / "stable-volume"
+    stable_volume.mkdir()
+    stable_database = stable_volume / "governance.db"
+    stable_database.touch()
+    stable_stat = stable_database.stat(follow_symlinks=False)
+    binding = {
+        "shared_volume_path": str(stable_volume),
+        "database_path": str(stable_database),
+        "stable_database_identity": {
+            "device": stable_stat.st_dev, "inode": stable_stat.st_ino,
+        },
+    }
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: binding)
+    monkeypatch.setattr(db, "_revalidate_stable_database_binding", lambda _binding: None)
+    monkeypatch.setattr(runtime_plane, "resolve_ac_dev_storage_root", lambda _stable: root)
+    server_sha = "sha256:" + hashlib.sha256(
+        Path(db.__file__).with_name("server.py").read_bytes()
+    ).hexdigest()
+    assert server_sha != cli_sha
+    db.write_dev_launch_receipt(
+        root, stable_shared_volume=stable_volume,
+        source_sha256=server_sha, port=40008,
+    )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+
+    connection = sqlite3.connect(database)
+    try:
+        policy = db.classify_graph_activation_connection(connection)
+    finally:
+        connection.close()
+    assert policy["runtime_plane"] == "dev"
+    assert policy["classification_reason"] == "verified_dev_cow_successor_receipt_history"
+
+
+def _real_cow_successor_cli_fixture(
+    tmp_path, monkeypatch, *, candidate_source_identity=None,
+):
     from agent.governance import db
 
     root = tmp_path / "dev"
@@ -1893,7 +1991,11 @@ def _real_cow_successor_cli_fixture(tmp_path, monkeypatch):
     backup_stat = backup.stat(follow_symlinks=False)
     genesis = {"schema_version": db.AC_WORLD_GENESIS_SCHEMA, "world_id": db.AC_DEV_WORLD_ID,
                "project_id": db.AC_PROJECT_ID, "source_only": True, "rows_copied": 0,
-               "database_identity": {"device": backup_stat.st_dev, "inode": backup_stat.st_ino}}
+               "database_identity": {"device": backup_stat.st_dev, "inode": backup_stat.st_ino},
+               "storage_root_identity": {
+                   "path": str(root), "device": root.stat().st_dev,
+                   "inode": root.stat().st_ino,
+               }}
     genesis_raw = json.dumps(genesis, sort_keys=True, separators=(",", ":"))
     connection.executemany("INSERT OR REPLACE INTO schema_meta(key,value) VALUES (?,?)", [
         ("governance_world_id", db.AC_DEV_WORLD_ID),
@@ -1956,6 +2058,8 @@ def _real_cow_successor_cli_fixture(tmp_path, monkeypatch):
                         "stage": "completed", "project_id": "aming-claw", "port": 40008,
                         "linked_v3_receipt": str(linked),
                         "linked_v3_receipt_sha256": "sha256:" + linked_digest}
+    if candidate_source_identity is not None:
+        adoption_payload["candidate_source_identity"] = candidate_source_identity
     quarantine_dir = root / "quarantine" / "schema-admission-sidecars" / "fixture"
     quarantine_dir.mkdir(parents=True)
     quarantine_payload = {

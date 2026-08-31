@@ -336,7 +336,6 @@ def _unknown_graph_activation_connection(reason: str) -> dict[str, object]:
 
 def _verify_current_cow_successor_source(
     conn: sqlite3.Connection, root: Path, successor_receipt: Mapping[str, object],
-    *, launch_source_sha256: str,
 ) -> None:
     """Bind immutable adoption history to the clean current canonical descendant."""
 
@@ -356,15 +355,28 @@ def _verify_current_cow_successor_source(
         revision = int(meta.get("governance_world_source_tip_revision") or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("AC dev COW current source tip is invalid") from exc
+    if not isinstance(current, Mapping):
+        raise ValueError("AC dev COW current source tip is invalid")
+    try:
+        current_root = Path(str(current.get("root") or "")).resolve(strict=True)
+        cli_source = current_root / "agent" / "cli.py"
+        cli_metadata = cli_source.stat(follow_symlinks=False)
+        current_cli_sha256 = (
+            "sha256:" + hashlib.sha256(cli_source.read_bytes()).hexdigest()
+        )
+    except OSError as exc:
+        raise ValueError("AC dev COW current source tip producer is invalid") from exc
     if (
         adoption_path.parent
         != root / "archive" / "canonical-legacy-postimage-adoption"
         or adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}
-        or not isinstance(current, Mapping)
         or revision < 2
         or meta.get("governance_world_source_tip_sha256")
         != _world_source_tip_hash(current)
-        or str(current.get("source_sha256") or "") != launch_source_sha256
+        or cli_source.is_symlink()
+        or not stat.S_ISREG(cli_metadata.st_mode)
+        or cli_source.resolve(strict=True) != cli_source
+        or str(current.get("source_sha256") or "") != current_cli_sha256
         or str(anchor.get("root") or "") != str(current.get("root") or "")
         or str(anchor.get("commit") or "") == str(current.get("commit") or "")
     ):
@@ -526,7 +538,6 @@ def classify_graph_activation_connection(
             # managed namespace or a completely empty one before issuing DDL.
             _verify_current_cow_successor_source(
                 conn, root, successor_receipt,
-                launch_source_sha256=str(receipt.get("source_sha256") or ""),
             )
         _revalidate_stable_database_binding(binding)
         after = expected_database.stat(follow_symlinks=False)
@@ -2969,11 +2980,17 @@ def _sqlite_master_inventory(conn: sqlite3.Connection) -> tuple[tuple[str, str, 
 
 
 def _canonical_backlog_read_schema_inventory(*, include_plan: bool) -> tuple[tuple[str, str, str, str], ...]:
-    """Materialize the source ABI in memory; never infer it from the target."""
+    """Materialize the source-owned backlog plan without a runtime plane.
+
+    Receipt reconstruction needs the immutable SQL producer, not a simulated
+    service startup.  In particular, do not run migrations or DEV-plane
+    authorizers here: optional subsystem inventory is live-runtime authority,
+    while these exact backlog objects are a separately versioned source ABI.
+    """
     with closing(sqlite3.connect(":memory:")) as memory:
         memory.row_factory = sqlite3.Row
         _configure_connection(memory, busy_timeout=10000)
-        _ensure_schema(memory)
+        memory.executescript(SCHEMA_SQL)
         if include_plan:
             memory.execute(BACKLOG_READ_SCHEMA_TABLE_SQL)
             memory.execute(BACKLOG_READ_SCHEMA_INDEX_SQL)
@@ -3293,7 +3310,14 @@ def _cow_database_observation(
         with closing(sqlite3.connect(":memory:")) as canonical:
             canonical.row_factory = sqlite3.Row
             _configure_connection(canonical, busy_timeout=10000)
-            _ensure_schema(canonical)
+            if historical_source_schema is None:
+                _ensure_schema(canonical)
+            else:
+                # Immutable receipt replay owns its issuance-time source
+                # inventory below.  It needs only the source-defined backlog
+                # ABI here; current optional migration inventory must not
+                # become a second reconstruction authority.
+                canonical.executescript(SCHEMA_SQL)
             expected_sql_row = canonical.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='backlog_bugs'"
             ).fetchone()
