@@ -3936,6 +3936,14 @@ def _durable_dev_launch(
                 or _durable_listener_pid(AC_DEV_SERVICE_PORT) != 0):
             raise click.ClickException("AC dev durable child readiness mismatch")
         database_identity = dict(readiness.get("database_identity") or {})
+        if durable_phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
+            actual_post_custody = _canonical_dev_database_identity_projection(database)
+            if (readiness.get("durable_start_phase") != _DURABLE_START_COMPLETED_BOOTSTRAP
+                    or database_identity != actual_post_custody
+                    or readiness.get("database_sha256_after") != _file_sha256(database)
+                    or not isinstance(readiness.get("custody_delta"), Mapping)):
+                raise click.ClickException("AC dev durable bootstrap readiness post-custody mismatch")
+            database_identity = actual_post_custody
         base = {
             "schema_version": _AC_DEV_DURABLE_LAUNCH_VERSION, "stage": "completed",
             "launch_id": launch_id, "pid": child.pid, "process": process,
@@ -4481,6 +4489,7 @@ def start(
                         expected_protected_projection=projection,
                     )
                     committed["custody_projection"] = custody
+                    committed["database_identity"] = _canonical_dev_database_identity_projection(database)
                 elif phase == _DURABLE_START_LEGACY_ADOPTION:
                     committed = commit_dev_child_custody(
                         dev_storage, source_identity=dev_identity or {},
@@ -4502,6 +4511,8 @@ def start(
                     "database_sha256_after": committed["database_sha256_after"],
                     "database_identity": committed["database_identity"],
                     "custody_projection": committed["custody_projection"],
+                    "durable_start_phase": phase,
+                    "custody_delta": committed.get("custody_delta"),
                 },
             )
             control.sendall(_canonical_json_bytes({
