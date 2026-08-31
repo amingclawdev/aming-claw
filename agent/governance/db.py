@@ -58,6 +58,13 @@ _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
 _DEV_DATABASE_WRITER_LEASES_LOCK = threading.RLock()
 
 
+def _sqlite_quote_identifier(identifier: str) -> str:
+    """Return one deterministic SQLite double-quoted identifier."""
+    if not isinstance(identifier, str):
+        raise TypeError("SQLite identifier must be text")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 def _sqlite_projection_value(value: object) -> list[str]:
     """Encode one SQLite value without type, sign, or byte ambiguity."""
     if value is None:
@@ -92,11 +99,14 @@ def _sqlite_logical_projection(
     ) if str(row[0]) not in exclude_tables and not str(row[0]).startswith("sqlite_")]
     projection: dict[str, str] = {}
     for table in tables:
+        quoted_table = _sqlite_quote_identifier(table)
         columns = [str(row[1]) for row in connection.execute(
-            f'PRAGMA table_info("{table}")'
+            f"PRAGMA table_info({quoted_table})"
         )]
-        quoted = ",".join(f'"{column}"' for column in columns)
-        rows = connection.execute(f'SELECT {quoted} FROM "{table}"').fetchall()
+        quoted_columns = ",".join(_sqlite_quote_identifier(column) for column in columns)
+        rows = connection.execute(
+            f"SELECT {quoted_columns} FROM {quoted_table}"
+        ).fetchall()
         encoded_rows = [[_sqlite_projection_value(value) for value in row] for row in rows]
         encoded_rows.sort(key=lambda row: json.dumps(
             row, sort_keys=True, separators=(",", ":"), ensure_ascii=True,

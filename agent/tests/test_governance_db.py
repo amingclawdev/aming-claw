@@ -1965,3 +1965,30 @@ def test_sqlite_projection_detects_text_blob_numeric_and_signed_zero_collisions(
     connection.commit()
     assert db._sqlite_logical_projection(connection) != baseline
     connection.close()
+
+
+def test_sqlite_projection_quotes_every_identifier_and_public_path_is_shared(tmp_path):
+    from governance import db
+    import agent.cli as cli
+
+    table = 'odd"表'
+    columns = ('select', 'c"ol', '雪')
+    path = tmp_path / "quoted-identifiers.db"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT)")
+    quoted_table = db._sqlite_quote_identifier(table)
+    quoted_columns = ",".join(db._sqlite_quote_identifier(column) for column in columns)
+    connection.execute(f"CREATE TABLE {quoted_table} ({quoted_columns})")
+    connection.execute(
+        f"INSERT INTO {quoted_table} ({quoted_columns}) VALUES (?,?,?)",
+        ("reserved-word", b"", b"\x00\xff\xfe"),
+    )
+    connection.commit()
+    direct = db._sqlite_logical_projection(
+        connection, exclude_tables=frozenset({"schema_meta"}),
+    )
+    connection.close()
+    public, _meta = cli._immutable_sqlite_projection(path)
+    assert public == direct
+    assert set(public) == {table}
+    assert db._sqlite_quote_identifier('a"b') == '"a""b"'
