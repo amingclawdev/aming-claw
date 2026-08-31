@@ -223,6 +223,165 @@ def _revalidate_stable_database_binding(binding: Mapping[str, object]) -> None:
     if database.is_symlink() or not stat.S_ISREG(metadata.st_mode) or actual != dict(expected):
         raise RuntimeError("stable database identity changed before dev effect")
 
+
+def _connection_main_database_identity(
+    conn: sqlite3.Connection,
+) -> tuple[Path, os.stat_result] | None:
+    """Read the exact physical main SQLite file already opened by ``conn``."""
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        main_paths = [
+            str(row[2] or "")
+            for row in rows
+            if str(row[1] or "") == "main"
+        ]
+    except sqlite3.Error:
+        return None
+    if len(main_paths) != 1 or not main_paths[0]:
+        return None
+    candidate = Path(main_paths[0])
+    try:
+        if (
+            not candidate.is_absolute()
+            or candidate.is_symlink()
+            or not candidate.is_file()
+            or candidate.resolve(strict=True) != candidate
+        ):
+            return None
+        metadata = candidate.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    return candidate, metadata
+
+
+def _unknown_graph_activation_connection(reason: str) -> dict[str, object]:
+    from agent.runtime_plane import graph_activation_policy
+
+    return {**graph_activation_policy("unknown"), "classification_reason": reason}
+
+
+def classify_graph_activation_connection(
+    conn: sqlite3.Connection,
+) -> dict[str, object]:
+    """Classify an opened graph DB without accepting caller/environment plane claims.
+
+    Active graph truth is allowed only when this *opened connection* is the
+    exact live stable database.  A dev connection is recognized from the
+    canonical external root, receipt, and genesis invariants and is denied.
+    Everything else is ``unknown`` and denied before a graph ref, event, or
+    projection can be written.
+    """
+    from agent.runtime_plane import graph_activation_policy, resolve_ac_dev_storage_root
+
+    opened = _connection_main_database_identity(conn)
+    if opened is None:
+        return _unknown_graph_activation_connection("main_database_identity_unavailable")
+    database, before = opened
+    try:
+        binding = verified_stable_database_binding()
+        stable_database = Path(str(binding["database_path"])).absolute()
+        stable_identity = dict(binding["stable_database_identity"])
+        if (
+            database == stable_database
+            and int(before.st_dev) == int(stable_identity["device"])
+            and int(before.st_ino) == int(stable_identity["inode"])
+        ):
+            _revalidate_stable_database_binding(binding)
+            after = stable_database.stat(follow_symlinks=False)
+            if (
+                not stable_database.is_symlink()
+                and stat.S_ISREG(after.st_mode)
+                and (int(after.st_dev), int(after.st_ino))
+                == (int(before.st_dev), int(before.st_ino))
+            ):
+                return {
+                    **graph_activation_policy("stable"),
+                    "classification_reason": "verified_stable_database_binding",
+                }
+    except (KeyError, OSError, RuntimeError, ValueError, sqlite3.Error):
+        # A stable verification failure cannot be rescued by a claimed plane.
+        pass
+
+    try:
+        # This derives the dev root from live stable authority, rather than
+        # trusting AMING_CLAW_DEV_STORAGE_ROOT or a store caller.
+        binding = verified_stable_database_binding()
+        stable = Path(str(binding["shared_volume_path"])).absolute()
+        root = resolve_ac_dev_storage_root(stable)
+        expected_database = (root / AC_DATABASE_DEV_RELATIVE_PATH).absolute()
+        if database != expected_database:
+            return _unknown_graph_activation_connection("main_database_not_canonical_world")
+        root_meta = root.stat(follow_symlinks=False)
+        if root.is_symlink() or root.resolve(strict=True) != root:
+            return _unknown_graph_activation_connection("dev_storage_root_identity_invalid")
+        receipt_path = root / AC_DEV_LAUNCH_RECEIPT_NAME
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            return _unknown_graph_activation_connection("dev_launch_receipt_missing")
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        stable_meta = stable.stat(follow_symlinks=False)
+        stable_parent_meta = stable.parent.stat(follow_symlinks=False)
+        server_source = Path(__file__).with_name("server.py")
+        source_sha256 = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
+        required_receipt = {
+            "schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA,
+            "world_id": AC_DEV_WORLD_ID,
+            "project_id": AC_PROJECT_ID,
+            "runtime_plane": DEV_RUNTIME_PLANE,
+            "port": 40008,
+            "background": False,
+            "storage_root": str(root),
+            "storage_device": int(root_meta.st_dev),
+            "storage_inode": int(root_meta.st_ino),
+            "stable_shared_volume": str(stable),
+            "stable_shared_volume_device": int(stable_meta.st_dev),
+            "stable_shared_volume_inode": int(stable_meta.st_ino),
+            "stable_parent_device": int(stable_parent_meta.st_dev),
+            "stable_parent_inode": int(stable_parent_meta.st_ino),
+            "source_sha256": source_sha256,
+        }
+        if not isinstance(receipt, Mapping) or any(
+            receipt.get(key) != value for key, value in required_receipt.items()
+        ):
+            return _unknown_graph_activation_connection("dev_launch_receipt_mismatch")
+        meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+        genesis = json.loads(str(meta.get("governance_world_genesis_json") or ""))
+        genesis_hash = str(meta.get("governance_world_genesis_sha256") or "")
+        expected_genesis_hash = _world_genesis_hash(genesis)
+        database_identity = dict(genesis.get("database_identity") or {})
+        storage_identity = dict(genesis.get("storage_root_identity") or {})
+        if not (
+            meta.get("governance_world_id") == AC_DEV_WORLD_ID
+            and genesis_hash == expected_genesis_hash
+            and genesis.get("schema_version") == AC_WORLD_GENESIS_SCHEMA
+            and genesis.get("world_id") == AC_DEV_WORLD_ID
+            and genesis.get("project_id") == AC_PROJECT_ID
+            and genesis.get("source_only") is True
+            and genesis.get("rows_copied") == 0
+            and database_identity.get("device") == int(before.st_dev)
+            and database_identity.get("inode") == int(before.st_ino)
+            and storage_identity.get("path") == str(root)
+            and storage_identity.get("device") == int(root_meta.st_dev)
+            and storage_identity.get("inode") == int(root_meta.st_ino)
+        ):
+            return _unknown_graph_activation_connection("dev_genesis_identity_invalid")
+        _revalidate_stable_database_binding(binding)
+        after = expected_database.stat(follow_symlinks=False)
+        if (
+            expected_database.is_symlink()
+            or not stat.S_ISREG(after.st_mode)
+            or (int(after.st_dev), int(after.st_ino))
+            != (int(before.st_dev), int(before.st_ino))
+        ):
+            return _unknown_graph_activation_connection("dev_database_identity_changed")
+        return {
+            **graph_activation_policy("dev"),
+            "classification_reason": "verified_dev_root_receipt_genesis",
+        }
+    except (json.JSONDecodeError, KeyError, OSError, RuntimeError, ValueError, sqlite3.Error):
+        return _unknown_graph_activation_connection("dev_database_binding_unverified")
+
 _DEV_DENIED_SCHEMA_ACTIONS = frozenset(
     code
     for name in (

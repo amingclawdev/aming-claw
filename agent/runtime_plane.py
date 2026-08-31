@@ -10,6 +10,25 @@ from dataclasses import dataclass
 
 AC_PROJECT_ID = "aming-claw"
 AC_DEV_STORAGE_NAMESPACE = ".aming-claw-dev-worlds"
+GRAPH_ACTIVATION_POLICY_SCHEMA = "ac_graph_activation_policy.v1"
+
+
+def graph_activation_policy(runtime_plane: str) -> dict[str, object]:
+    """Return the one runtime-plane policy for active graph truth.
+
+    This is deliberately a pure mapping: callers may report the policy, but
+    they cannot use a request parameter or an environment variable to nominate
+    the plane of a database effect.  The graph store binds effects to its
+    already-open SQLite connection separately.
+    """
+    plane = str(runtime_plane or "").strip().lower()
+    if plane not in {"stable", "dev", "unknown"}:
+        raise ValueError("graph activation requires a stable, dev, or unknown runtime plane")
+    return {
+        "schema_version": GRAPH_ACTIVATION_POLICY_SCHEMA,
+        "runtime_plane": plane,
+        "active_graph_activation_allowed": plane == "stable",
+    }
 
 
 def _git_path(workspace_root: str, argument: str) -> str:

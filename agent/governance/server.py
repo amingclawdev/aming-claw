@@ -138,6 +138,7 @@ from agent.mcp.schema_contract import (
     mcp_tool_schema_compatibility,
     qa_session_register_http_fallback,
 )
+from agent.runtime_plane import graph_activation_policy
 
 import os
 import errno
@@ -789,6 +790,12 @@ def _runtime_plane_identity() -> dict[str, Any]:
             violations.append("stable_anchor_mismatch")
     elif git_identity["branch"] == AC_DEV_BRANCH:
         violations.append("ac_dev_checkout_requires_explicit_dev_plane")
+    try:
+        activation_policy = graph_activation_policy(plane)
+    except ValueError:
+        # Unsupported/generic planes are already reported in ``violations``;
+        # never advertise authority to activate graph truth from them.
+        activation_policy = {"active_graph_activation_allowed": False}
     return {
         "schema_version": "ac_runtime_plane_identity.v1",
         "plane": plane,
@@ -809,7 +816,9 @@ def _runtime_plane_identity() -> dict[str, Any]:
         "stable_database_identity": database_identity if plane == "stable" else {},
         "project_allowlist": ["aming-claw"] if plane == "dev" else [],
         "schema_policy": "source_bootstrap_then_verify_only" if plane == "dev" else "managed",
-        "active_graph_activation_allowed": True,
+        "active_graph_activation_allowed": bool(
+            activation_policy["active_graph_activation_allowed"]
+        ),
         "stable_deploy_allowed": plane != "dev",
         "background_workers_enabled": plane != "dev",
         "background_worker_policy": "dedicated_dev_world_only" if plane == "dev" else "stable_multi_project",
@@ -3927,8 +3936,10 @@ def _guard_dev_runtime_request(
 ) -> str | None:
     """Enforce the dev plane before a handler opens a DB or mutates state."""
 
-    if _runtime_plane() != "dev":
+    runtime_plane = _runtime_plane()
+    if runtime_plane != "dev":
         return None
+    activation_policy = graph_activation_policy(runtime_plane)
     external_route = _dev_external_discovery_request(
         method=method,
         path=path,
@@ -4014,7 +4025,10 @@ def _guard_dev_runtime_request(
         "/reconcile/backfill-escape",
         "/finalize",
     )
-    if any(marker in path for marker in always_activate_paths):
+    if (
+        any(marker in path for marker in always_activate_paths)
+        and activation_policy["active_graph_activation_allowed"] is not True
+    ):
         raise _dev_runtime_zero_write_rejection(
             code="ac_dev_active_graph_mutation_forbidden",
             path=path,
@@ -4025,7 +4039,10 @@ def _guard_dev_runtime_request(
         activate_requested = body.get("activate", True) is not False
     elif path.endswith("/reconcile/pending-scope/catch-up"):
         activate_requested = body.get("activate", True) is not False
-    if activate_requested:
+    if (
+        activate_requested
+        and activation_policy["active_graph_activation_allowed"] is not True
+    ):
         raise _dev_runtime_zero_write_rejection(
             code="ac_dev_active_graph_mutation_forbidden",
             path=path,
@@ -4362,7 +4379,9 @@ def _dev_stable_proxy_health_identity() -> dict[str, Any]:
         "stable_anchor_commit": expected_anchor,
         "project_allowlist": [],
         "schema_policy": "managed",
-        "active_graph_activation_allowed": True,
+        "active_graph_activation_allowed": graph_activation_policy("stable")[
+            "active_graph_activation_allowed"
+        ],
         "stable_deploy_allowed": True,
         "background_workers_enabled": True,
         "status": "ready",
@@ -205068,7 +205087,9 @@ def _branch_service_exact_dev_health_matches(
         "stable_database_identity": dict(stable_database_identity),
         "project_allowlist": ["aming-claw"],
         "schema_policy": "verify_only_no_auto_migration",
-        "active_graph_activation_allowed": False,
+        "active_graph_activation_allowed": graph_activation_policy("dev")[
+            "active_graph_activation_allowed"
+        ],
         "stable_deploy_allowed": False,
         "background_workers_enabled": False,
         "status": "ready",
@@ -205349,7 +205370,6 @@ def handle_branch_service_validate(ctx: RequestContext):
             _STABLE_ANCHOR_ENV: stable_anchor,
             "AMING_CLAW_ALLOWED_PROJECT_IDS": "aming-claw",
             "AMING_CLAW_DB_MIGRATION_POLICY": "verify-only",
-            "AMING_CLAW_ACTIVE_GRAPH_MUTATION": "deny",
             "AMING_CLAW_STABLE_DEPLOYMENT": "deny",
             "PYTHONPATH": (
                 str(worktree)

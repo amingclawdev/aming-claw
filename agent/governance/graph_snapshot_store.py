@@ -532,6 +532,31 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _migrate_pending_scope_reconcile_branch_identity(conn)
 
 
+def _graph_activation_policy_for_connection(
+    conn: sqlite3.Connection,
+) -> dict[str, object]:
+    """Bind active-graph effects to the opened DB's physical world identity.
+
+    No caller-supplied plane, outer HTTP guard, or ambient environment can
+    promote this connection.  This is the final pre-effect fence for graph
+    refs, semantic projection rebuilds, and graph-ref events.
+    """
+    from .db import classify_graph_activation_connection
+
+    return classify_graph_activation_connection(conn)
+
+
+def _require_active_graph_activation_for_connection(
+    conn: sqlite3.Connection,
+) -> dict[str, object]:
+    policy = _graph_activation_policy_for_connection(conn)
+    if policy.get("active_graph_activation_allowed") is not True:
+        raise ValueError(
+            "active graph activation is forbidden for this database runtime plane"
+        )
+    return policy
+
+
 RECONCILE_METRIC_PHYSICAL_IDENTITY_SCHEMA = (
     "graph_reconcile_metric_physical_identity.v1"
 )
@@ -2701,6 +2726,10 @@ def activate_graph_snapshot(
 ) -> dict[str, Any]:
     if not schema_ready:
         ensure_schema(conn)
+    # This must precede every ref/projection/event write below.  In particular,
+    # direct in-process callers cannot bypass the HTTP dev-plane guard by
+    # supplying a stable-looking argument or changing an environment value.
+    _require_active_graph_activation_for_connection(conn)
     if schema_ready and auto_rebuild_projection:
         raise ValueError(
             "transaction-safe graph activation requires auto_rebuild_projection=false"

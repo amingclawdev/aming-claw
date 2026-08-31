@@ -740,6 +740,59 @@ def test_stable_database_binding_revalidates_before_a_dev_effect(tmp_path, repla
     assert not forbidden.exists()
 
 
+def test_graph_activation_connection_classification_binds_opened_db_not_plane_env(
+    tmp_path, monkeypatch,
+):
+    """Only the exact opened stable DB may activate; a real dev DB remains denied."""
+    from governance import db
+
+    stable_binding = db.verified_stable_database_binding()
+    stable_database = Path(stable_binding["database_path"])
+    stable_conn = sqlite3.connect(stable_database)
+    try:
+        stable_policy = db.classify_graph_activation_connection(stable_conn)
+    finally:
+        stable_conn.close()
+    assert stable_policy["runtime_plane"] == "stable"
+    assert stable_policy["active_graph_activation_allowed"] is True
+
+    source = {
+        "root": str(tmp_path / "source"),
+        "branch": "codex/ac-dev",
+        "commit": "a" * 40,
+        "source_sha256": "sha256:" + "b" * 64,
+    }
+    dev_root, stable = _canonical_dev_world(tmp_path)
+    receipt = db.bootstrap_dev_governance_store(
+        dev_root,
+        source_identity=source,
+        process_identity={"pid": 123, "start_identity": "test-process"},
+    )
+    server_source = Path(db.__file__).with_name("server.py")
+    db.write_dev_launch_receipt(
+        dev_root,
+        stable_shared_volume=stable,
+        source_sha256="sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest(),
+        port=40008,
+    )
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
+    dev_conn = sqlite3.connect(str(receipt["database_path"]))
+    try:
+        dev_policy = db.classify_graph_activation_connection(dev_conn)
+    finally:
+        dev_conn.close()
+    assert dev_policy["runtime_plane"] == "dev"
+    assert dev_policy["active_graph_activation_allowed"] is False
+
+    unknown_conn = sqlite3.connect(str(tmp_path / "unbound.db"))
+    try:
+        unknown_policy = db.classify_graph_activation_connection(unknown_conn)
+    finally:
+        unknown_conn.close()
+    assert unknown_policy["runtime_plane"] == "unknown"
+    assert unknown_policy["active_graph_activation_allowed"] is False
+
+
 @pytest.mark.parametrize("plane", ["stable", "generic"])
 @pytest.mark.parametrize("project_id", ["aming-claw", "aming_claw", "amingClaw"])
 def test_v27_central_resolver_rejects_ac_before_mkdir(

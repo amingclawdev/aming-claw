@@ -1126,6 +1126,14 @@ def start(
     stable_anchor_commit,
 ):
     """Start governance in the foreground without spawning plugin-owned workers."""
+    from agent.runtime_plane import graph_activation_policy
+
+    if runtime_plane == "dev" and graph_activation_policy("dev")[
+        "active_graph_activation_allowed"
+    ]:
+        raise click.ClickException(
+            "AC dev runtime policy cannot authorize active graph activation."
+        )
     _require_source_checkout_matches_loaded_package(workspace)
     health = None
     database_binding = None
@@ -1252,7 +1260,6 @@ def start(
         os.environ["AMING_CLAW_STABLE_ANCHOR_COMMIT"] = stable_anchor_commit
         os.environ["AMING_CLAW_ALLOWED_PROJECT_IDS"] = "aming-claw"
         os.environ["AMING_CLAW_DB_MIGRATION_POLICY"] = "verify-only"
-        os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] = "dev-world-only"
         os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] = "deny"
         os.environ[AC_DEV_STORAGE_ROOT_ENV] = str(dev_storage)
         os.environ.pop("SHARED_VOLUME_PATH", None)

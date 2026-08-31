@@ -3533,7 +3533,6 @@ class TestACDevRuntimeCli:
         assert os.environ["AMING_CLAW_STABLE_ANCHOR_COMMIT"] == cli.AC_STABLE_ANCHOR_COMMIT
         assert os.environ["AMING_CLAW_ALLOWED_PROJECT_IDS"] == "aming-claw"
         assert os.environ["AMING_CLAW_DB_MIGRATION_POLICY"] == "verify-only"
-        assert os.environ["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] == "dev-world-only"
         assert os.environ["AMING_CLAW_STABLE_DEPLOYMENT"] == "deny"
         assert os.environ["AMING_CLAW_DEV_STORAGE_ROOT"] == str(
             dev_storage_root.resolve()
@@ -3545,7 +3544,6 @@ class TestACDevRuntimeCli:
             "AMING_CLAW_STABLE_ANCHOR_COMMIT",
             "AMING_CLAW_ALLOWED_PROJECT_IDS",
             "AMING_CLAW_DB_MIGRATION_POLICY",
-            "AMING_CLAW_ACTIVE_GRAPH_MUTATION",
             "AMING_CLAW_STABLE_DEPLOYMENT",
             "SHARED_VOLUME_PATH",
             "AMING_CLAW_HOME",

@@ -12641,6 +12641,16 @@ def conn(tmp_path, monkeypatch):
     c.row_factory = sqlite3.Row
     _ensure_schema(c)
     store.ensure_schema(c)
+    monkeypatch.setattr(
+        governance_db,
+        "classify_graph_activation_connection",
+        lambda _conn: {
+            "schema_version": "ac_graph_activation_policy.v1",
+            "runtime_plane": "stable",
+            "active_graph_activation_allowed": True,
+            "classification_reason": "test_verified_stable_connection",
+        },
+    )
     monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(c))
     monkeypatch.setattr("agent.governance.db.get_connection", lambda _project_id: _NoCloseConn(c))
     original_registry_project_config = server._registry_project_config
@@ -17450,7 +17460,7 @@ def test_branch_service_launches_guarded_module_with_dev_env(
     ]
     assert launched["env"]["AMING_CLAW_RUNTIME_PLANE"] == "dev"
     assert launched["env"]["GOVERNANCE_PORT"] == "40008"
-    assert launched["env"]["AMING_CLAW_ACTIVE_GRAPH_MUTATION"] == "deny"
+    assert "AMING_CLAW_ACTIVE_GRAPH_MUTATION" not in launched["env"]
     assert "start_governance.py" not in launched["command"]
     if keep_running:
         assert launched["stdin"] is subprocess.DEVNULL
