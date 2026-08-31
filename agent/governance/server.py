@@ -145217,7 +145217,7 @@ def _backlog_declared_direct_file_scope(conn, backlog_id: str) -> list[str]:
 def _source_free_operation_topology_facts(value: object) -> dict[str, bool]:
     """Match only canonical persisted JB source-free topology spellings."""
 
-    topology = str(value or "")
+    topology = value if isinstance(value, str) else ""
     real_operation_shape = topology == (
         "reuse_the_existing_unique_ac_observer."
         "_source_free_system_operation_only;"
@@ -145231,13 +145231,13 @@ def _source_free_operation_topology_facts(value: object) -> dict[str, bool]:
         "_no_implementation_worker;"
         "_source_free_operation_only"
     )
-    revision_legacy_shape = bool(
-        re.fullmatch(
-            r"existing_unique_ac_observer;"
-            r"_no_implementation_worker_because_r[0-9]+_is_source_free;"
-            r"_role_distinct_qa_only_if_a_new_mutation_is_introduced",
-            topology,
-        )
+    revision_legacy_shape = topology in (
+        "existing_unique_ac_observer;"
+        "_no_implementation_worker_because_r2_is_source_free;"
+        "_role_distinct_qa_only_if_a_new_mutation_is_introduced",
+        "existing_unique_ac_observer;"
+        "_no_implementation_worker_because_r3_is_source_free;"
+        "_role_distinct_qa_only_if_a_new_mutation_is_introduced",
     )
     accepted = bool(
         real_operation_shape or explicit_legacy_shape or revision_legacy_shape
@@ -145353,10 +145353,8 @@ def _backlog_source_free_operation_authority(
         aliases & blocked_set for aliases in blocked_semantic_aliases.values()
     )
 
-    subject_topology = str(subject.get("normalized_topology") or "").strip()
-    evidence_topology = str(
-        evidence_route.get("normalized_proposed_topology") or ""
-    ).strip()
+    subject_topology = subject.get("normalized_topology")
+    evidence_topology = evidence_route.get("normalized_proposed_topology")
     topology_facts = _source_free_operation_topology_facts(subject_topology)
     required_contract_facts = {
         "empty_file_scope": not row_files,

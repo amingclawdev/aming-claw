@@ -199266,6 +199266,21 @@ def test_ac_dev_source_free_projects_exact_real_r6_topology_to_empty_route(conn)
     "topology",
     [
         "",
+        123,
+        (
+            " reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile."
+        ),
+        (
+            "reuse_the_existing_unique_ac_observer."
+            "_source_free_system_operation_only;"
+            "_zero_implementation_workers;"
+            "_one_fresh_observer_route/session;"
+            "_exactly_one_full_reconcile. "
+        ),
         (
             "reuse_the_existing_unique_ac_observer;"
             "_source_free_system_operation_only;"
@@ -199337,6 +199352,21 @@ def test_ac_dev_source_free_projects_exact_real_r6_topology_to_empty_route(conn)
             "_one_fresh_observer_route/session;"
             "_exactly_one_full_reconcile;"
             "_extra_fact."
+        ),
+        (
+            "existing_unique_ac_observer;"
+            "_no_implementation_worker_because_r0_is_source_free;"
+            "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+        ),
+        (
+            "existing_unique_ac_observer;"
+            "_no_implementation_worker_because_r999_is_source_free;"
+            "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+        ),
+        (
+            "existing_unique_ac_observer;"
+            "_no_implementation_worker_because_r4_is_source_free;"
+            "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
         ),
     ],
 )
