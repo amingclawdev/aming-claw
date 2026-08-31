@@ -52,8 +52,9 @@ AC_LEGACY_ARCHIVE_SIZE_BYTES = 178_625_794_048
 AC_DEV_CUTOVER_SCHEMA = "ac_dev_world_cutover.v1"
 AC_DEV_LAUNCH_RECEIPT_SCHEMA = "ac_dev_launch_receipt.v1"
 AC_DEV_LAUNCH_RECEIPT_NAME = "launch-receipt.json"
-AC_DEV_COW_SUCCESSOR_SCHEMA = "ac_dev_cow_database_successor.v1"
+AC_DEV_COW_SUCCESSOR_SCHEMA = "ac_dev_cow_database_successor.v2"
 AC_DEV_COW_SUCCESSOR_ARCHIVE = "archive/cow-database-successor"
+AC_DEV_COW_SUCCESSOR_PREFIX = "successor-v2"
 
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
@@ -3015,6 +3016,16 @@ def _cow_database_observation(
             expected_columns = [tuple(row) for row in canonical.execute(
                 'PRAGMA table_info("backlog_bugs")'
             )]
+            if require_managed:
+                ensure_backlog_read_schema(canonical)
+            expected_required, _expected_allowed, _expected_objects = _source_schema_table_contract()
+            expected_placeholders = ",".join("?" for _ in expected_required)
+            expected_source_inventory = [tuple(row) for row in canonical.execute(
+                "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+                f"WHERE tbl_name IN ({expected_placeholders}) ORDER BY type,name,tbl_name",
+                tuple(sorted(expected_required)),
+            )]
+            expected_source_sha = _source_schema_inventory_hash(canonical, expected_required)
         actual_sql_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='backlog_bugs'"
         ).fetchone()
@@ -3041,17 +3052,33 @@ def _cow_database_observation(
             conn, exclude_tables=frozenset({"backlog_bugs", "dashboard_backlog_cache_generation"}),
         )
         backlog_projection = _sqlite_logical_projection(conn).get("backlog_bugs")
+        required_tables, _allowed_tables, _source_objects = _source_schema_table_contract()
+        placeholders = ",".join("?" for _ in required_tables)
+        source_inventory = [tuple(row) for row in conn.execute(
+            "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+            f"WHERE tbl_name IN ({placeholders}) ORDER BY type,name,tbl_name",
+            tuple(sorted(required_tables)),
+        )]
+        source_schema = {
+            "required_tables": sorted(required_tables),
+            "inventory": [list(row) for row in source_inventory],
+            "sha256": _source_schema_inventory_hash(conn, required_tables),
+        }
+        _verify_dev_world_schema_inventory(conn)
     finally:
         conn.close()
     if (row_count != expected_rows
             or (require_managed and managed != canonical_managed)
-            or (require_managed and drift.get("invalid"))):
+            or (require_managed and drift.get("invalid"))
+            or source_inventory != expected_source_inventory
+            or source_schema["sha256"] != expected_source_sha):
         raise ValueError("AC dev COW successor backlog projection is invalid")
     return {"identity": identity, "quick_check": "ok", "row_count": row_count,
             "status_counts": status_counts, "managed_inventory": managed,
             "managed_inventory_drift": [], "protected_inventory": protected_inventory,
             "protected_projection": protected_projection,
             "backlog_projection_sha256": backlog_projection,
+            "source_schema": source_schema,
             "governance_world_id": str(meta.get("governance_world_id") or ""),
             "genesis_json": str(meta.get("governance_world_genesis_json") or ""),
             "genesis_sha256": str(meta.get("governance_world_genesis_sha256") or "")}
@@ -3171,8 +3198,8 @@ def create_dev_cow_successor_receipt(
     archive.mkdir(parents=True, exist_ok=True)
     if archive.is_symlink() or archive.resolve(strict=True) != archive:
         raise ValueError("AC dev COW successor archive is invalid")
-    existing = sorted(archive.glob("successor.*.json"))
-    destination = archive / f"successor.{digest}.json"
+    existing = sorted(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json"))
+    destination = archive / f"{AC_DEV_COW_SUCCESSOR_PREFIX}.{digest}.json"
     if existing:
         if existing != [destination] or destination.read_bytes() != raw:
             raise ValueError("AC dev COW successor receipt is ambiguous")
@@ -3197,10 +3224,10 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
     """Cycle-free, source-owned revalidation of the unique COW successor."""
     root = Path(storage_root).expanduser().absolute()
     archive = _cow_successor_archive(root)
-    receipts = sorted(archive.glob("successor.*.json")) if archive.is_dir() else []
+    receipts = sorted(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json")) if archive.is_dir() else []
     if len(receipts) != 1:
         raise ValueError("AC dev COW successor receipt is missing or ambiguous")
-    receipt, digest = _cow_raw_receipt(receipts[0], prefix="successor")
+    receipt, digest = _cow_raw_receipt(receipts[0], prefix=AC_DEV_COW_SUCCESSOR_PREFIX)
     if (receipt.get("schema_version") != AC_DEV_COW_SUCCESSOR_SCHEMA
             or receipt.get("stage") != "completed" or receipt.get("project_id") != AC_PROJECT_ID
             or receipt.get("port") != 40008 or receipt.get("root") != str(root)):
@@ -3679,9 +3706,9 @@ def bootstrap_dev_governance_store(
                         or successor_identity.get("inode") != int(current_database.st_ino)):
                     raise ValueError("existing AC dev world COW successor identity mismatch")
             required_tables, _allowed_tables, _source_objects = _source_schema_table_contract()
-            if stored_genesis.get("source_schema_sha256") != _source_schema_inventory_hash(
-                conn, required_tables
-            ):
+            if (cow_successor_receipt is None
+                    and stored_genesis.get("source_schema_sha256")
+                    != _source_schema_inventory_hash(conn, required_tables)):
                 raise ValueError("existing AC dev source schema contract changed")
             genesis = dict(stored_genesis)
             genesis_sha256 = stored_hash

@@ -1146,6 +1146,8 @@ def test_ac_dev_cow_successor_replaces_only_genesis_physical_identity(tmp_path, 
     replacement = database.with_suffix(".cow")
     replacement.write_bytes(database.read_bytes())
     os.replace(replacement, database)
+    with sqlite3.connect(database) as connection:
+        db.ensure_backlog_read_schema(connection)
     new = database.stat(follow_symlinks=False)
     receipt = {
         "predecessor": {"backup": {"device": old.st_dev, "inode": old.st_ino}},
@@ -1170,6 +1172,28 @@ def test_ac_dev_cow_successor_replaces_only_genesis_physical_identity(tmp_path, 
             process_identity={"pid": 303, "start_identity": "wrong-successor"},
         )
     assert database.read_bytes() == before
+
+
+def test_ac_dev_no_successor_retains_genesis_source_schema_hash_gate(tmp_path):
+    from agent.governance import db
+
+    source_root, commit = _dev_source_repo(tmp_path)
+    storage_root, stable = _canonical_dev_world(tmp_path)
+    source = {"root": str(source_root.resolve()), "branch": "codex/ac-dev",
+              "commit": commit, "source_sha256": "sha256:" + "c" * 64}
+    first = db.bootstrap_dev_governance_store(
+        storage_root, source_identity=source,
+        process_identity={"pid": 101, "start_identity": "legacy-before"},
+    )
+    _admit_existing_dev_world(storage_root, stable)
+    db.release_dev_runtime_writer_lease(storage_root)
+    with sqlite3.connect(first["database_path"]) as connection:
+        db.ensure_backlog_read_schema(connection)
+    with pytest.raises(ValueError, match="source schema contract changed"):
+        db.bootstrap_dev_governance_store(
+            storage_root, source_identity=source,
+            process_identity={"pid": 202, "start_identity": "legacy-after"},
+        )
 
 
 def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path, monkeypatch):
@@ -1199,6 +1223,8 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
         "protected_inventory": {"sha256": "protected"},
         "protected_projection": {"schema_meta": "sha256:meta"},
         "governance_world_id": db.AC_DEV_WORLD_ID,
+        "source_schema": {"required_tables": ["backlog_bugs"], "inventory": [],
+                          "sha256": "sha256:" + "9" * 64},
         "genesis_json": genesis_raw, "genesis_sha256": genesis_sha,
     }
     backup_observation = {**successor_observation,
@@ -1251,13 +1277,19 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
     monkeypatch.setattr(db, "_revalidate_stable_database_binding", lambda _binding: None)
     monkeypatch.setattr(db, "_default_cutover_listener_probe",
                         lambda port: {"port": port, "listening": False, "pid": 0})
+    legacy_archive = root / db.AC_DEV_COW_SUCCESSOR_ARCHIVE
+    legacy_archive.mkdir(parents=True)
+    legacy_raw = b'{"schema_version":"ac_dev_cow_database_successor.v1"}'
+    legacy = legacy_archive / f"successor.{hashlib.sha256(legacy_raw).hexdigest()}.json"
+    legacy.write_bytes(legacy_raw)
     first = db.create_dev_cow_successor_receipt(
         root, operator_receipt=operator, predecessor_backup=backup,
         linked_v3_receipt=linked,
     )
     receipt = Path(first["receipt"])
     raw = receipt.read_bytes()
-    assert receipt.name == f"successor.{hashlib.sha256(raw).hexdigest()}.json"
+    assert receipt.name == f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(raw).hexdigest()}.json"
+    assert legacy.read_bytes() == legacy_raw
     second = db.create_dev_cow_successor_receipt(
         root, operator_receipt=operator, predecessor_backup=backup,
         linked_v3_receipt=linked,
@@ -1265,7 +1297,19 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
     assert second["status"] == "already_created"
     assert receipt.read_bytes() == raw
 
-    ambiguous = receipt.with_name("successor." + "f" * 64 + ".json")
+    wrong_schema = json.loads(raw)
+    wrong_schema["successor"]["source_schema"]["sha256"] = "sha256:" + "8" * 64
+    wrong_raw = json.dumps(wrong_schema, sort_keys=True, separators=(",", ":")).encode()
+    receipt.unlink()
+    wrong_receipt = receipt.with_name(
+        f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(wrong_raw).hexdigest()}.json"
+    )
+    wrong_receipt.write_bytes(wrong_raw)
+    with pytest.raises(ValueError, match="ambiguous"):
+        db.validate_dev_cow_successor_receipt(root)
+    wrong_receipt.unlink(); receipt.write_bytes(raw)
+
+    ambiguous = receipt.with_name(db.AC_DEV_COW_SUCCESSOR_PREFIX + "." + "f" * 64 + ".json")
     ambiguous.write_bytes(raw)
     with pytest.raises(ValueError, match="missing or ambiguous"):
         db.validate_dev_cow_successor_receipt(root)
@@ -1393,7 +1437,38 @@ def test_ac_dev_cow_successor_public_cli_wrong_real_schema_is_bounded(tmp_path, 
     assert result.exit_code != 0
     assert "backlog table ABI mismatch" in result.output
     assert "Traceback" not in result.output
-    assert not list((root / db.AC_DEV_COW_SUCCESSOR_ARCHIVE).glob("successor.*.json"))
+    assert not list((root / db.AC_DEV_COW_SUCCESSOR_ARCHIVE).glob(
+        f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.*.json"
+    ))
+
+
+def test_ac_dev_cow_successor_public_cli_rejects_one_source_object_mismatch(
+    tmp_path, monkeypatch,
+):
+    pytest.importorskip("click")
+    from click.testing import CliRunner
+    from agent.cli import main
+    from agent.governance import db
+
+    root, database, backup, operator, linked = _real_cow_successor_cli_fixture(
+        tmp_path, monkeypatch,
+    )
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TRIGGER trg_dashboard_backlog_cache_update")
+    connection.execute(
+        "CREATE TRIGGER trg_dashboard_backlog_cache_update AFTER UPDATE ON backlog_bugs "
+        "BEGIN UPDATE dashboard_backlog_cache_generation SET generation=generation+2 "
+        "WHERE resource='backlog'; END"
+    )
+    connection.commit(); connection.close()
+    result = CliRunner().invoke(main, [
+        "dev-create-cow-successor-receipt", "--dev-storage-root", str(root),
+        "--operator-receipt", str(operator), "--predecessor-backup", str(backup),
+        "--linked-v3-receipt", str(linked)])
+    assert result.exit_code != 0
+    assert "source schema inventory mismatch" in result.output
+    assert "Traceback" not in result.output
+    assert not (root / db.AC_DEV_COW_SUCCESSOR_ARCHIVE).exists()
 
 
 def test_ac_dev_cow_successor_public_cli_rejects_self_consistent_foreign_world(
@@ -1446,7 +1521,7 @@ def test_ac_dev_cow_successor_public_cli_rejects_self_consistent_foreign_world(
                "history": {"linked_v3": {"path": str(linked)}}}
     crafted_raw = json.dumps(crafted, sort_keys=True, separators=(",", ":")).encode()
     archive.mkdir(parents=True)
-    (archive / f"successor.{hashlib.sha256(crafted_raw).hexdigest()}.json").write_bytes(
+    (archive / f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(crafted_raw).hexdigest()}.json").write_bytes(
         crafted_raw
     )
     with pytest.raises(ValueError, match="protected preimage mismatch"):
