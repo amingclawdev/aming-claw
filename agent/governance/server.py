@@ -12884,6 +12884,9 @@ def _require_current_full_reconcile_auth(
         "route_token_ref": route_token_ref,
         "route_token_scope": expected_scope,
         "route_token_allowed_actions": normalized_allowed,
+        "route_token_source_free_operation": bool(
+            resolved.get("source_free_operation") is True
+        ),
     }
 
 
@@ -94959,6 +94962,7 @@ def _current_full_reconcile_runtime_context_scope(
     auth: Mapping[str, Any],
     target_commit_sha: str,
     candidate_only: bool = False,
+    source_free_reconcile_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve current-full runtime provenance from persisted branch identity.
 
@@ -95101,6 +95105,25 @@ def _current_full_reconcile_runtime_context_scope(
                         str(trusted_merge.get("task_id") or "").strip(),
                     )
     if context is None:
+        if (
+            isinstance(source_free_reconcile_authority, Mapping)
+            and source_free_reconcile_authority.get("accepted") is True
+        ):
+            # A completed source-free system operation is intentionally
+            # contextless.  Its exact persisted backlog/CE/R/session/request
+            # binding is established by the handler before any graph DDL.
+            return {
+                "project_id": project_id,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "source": "completed_source_free_reconcile_authority",
+                "server_derived": True,
+                "runtime_context_required": False,
+                "source_free_operation": True,
+                "authority_hash": str(
+                    source_free_reconcile_authority.get("authority_hash") or ""
+                ),
+            }
         # An incomplete-fanin batch parent is the one route-bound current-full
         # authority that intentionally has no child BranchTaskRuntimeContext.
         # Accept it only from the canonical observer route mode and only when
@@ -95475,6 +95498,122 @@ def _current_full_reconcile_runtime_context_scope(
     if contract_merge_authority:
         result["contract_merge_authority"] = contract_merge_authority
     return result
+
+
+def _current_full_reconcile_request_category(
+    conn,
+    *,
+    request_context: RequestContext,
+    project_id: str,
+    body: Mapping[str, Any],
+    auth: Mapping[str, Any],
+    target_commit_sha: str,
+) -> dict[str, Any]:
+    """Select one closed reconcile category before graph schema admission.
+
+    A source-free backlog is never allowed to fall through to ordinary or
+    direct-main handling.  Its completed authority must reproduce the exact
+    active route/session, target HEAD, and copy-safe request body.
+    """
+
+    route_scope = (
+        auth.get("route_token_scope")
+        if isinstance(auth.get("route_token_scope"), Mapping)
+        else {}
+    )
+    backlog_id = str(
+        route_scope.get("backlog_id") or body.get("backlog_id") or ""
+    ).strip()
+    route_token_ref = str(
+        auth.get("route_token_ref")
+        or body.get("observer_route_token_ref")
+        or body.get("route_token_ref")
+        or ""
+    ).strip()
+    raw_allowed_actions = [
+        str(action or "").strip()
+        for action in auth.get("route_token_allowed_actions") or []
+        if str(action or "").strip()
+    ]
+    source_free_route_claim = bool(
+        auth.get("route_token_source_free_operation") is True
+        or raw_allowed_actions == list(_OPERATOR_SOURCE_FREE_ACTIONS)
+    )
+    source_free = (
+        _backlog_source_free_operation_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        )
+        if backlog_id
+        else {}
+    )
+    if source_free or source_free_route_claim:
+        completed = _completed_source_free_reconcile_authority(
+            conn,
+            request_context=request_context,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=route_token_ref,
+            source_free_authority=source_free,
+        )
+        expected_body = (
+            completed.get("copy_safe_body")
+            if isinstance(completed.get("copy_safe_body"), Mapping)
+            else {}
+        )
+        exact_body = bool(expected_body and dict(body) == dict(expected_body))
+        exact_target = bool(
+            str(completed.get("target_commit") or "").strip().lower()
+            == str(target_commit_sha or "").strip().lower()
+        )
+        if not (
+            completed.get("accepted") is True
+            and exact_body
+            and exact_target
+        ):
+            raise GovernanceError(
+                "current_full_reconcile_source_free_authority_required",
+                "source-free reconcile requires one exact completed persisted authority",
+                409,
+                {
+                    "schema_version": (
+                        "graph_current_full_reconcile."
+                        "source_free_category_diagnostics.v1"
+                    ),
+                    "project_id": project_id,
+                    "backlog_id": backlog_id,
+                    "category": "source_free_system_operation",
+                    "completed_authority_count": (
+                        1 if completed.get("accepted") is True else 0
+                    ),
+                    "request_body_exact": exact_body,
+                    "target_head_exact": exact_target,
+                    "fail_closed": True,
+                    "fallback_allowed": False,
+                    "source": (
+                        "server._current_full_reconcile_request_category."
+                        "pre_admission_gate.v1"
+                    ),
+                },
+            )
+        return {
+            "category": "source_free_system_operation",
+            "source_free_reconcile_authority": dict(completed),
+        }
+
+    allowed_actions = {
+        str(action or "").strip().lower().replace("-", "_").replace(".", "_")
+        for action in raw_allowed_actions
+    }
+    direct = bool(
+        "observer_direct_mutation_exception" in allowed_actions
+        and "graph_current_full_reconcile" in allowed_actions
+    )
+    return {
+        "category": "operator_supervised_direct_main" if direct else "ordinary",
+        "source_free_reconcile_authority": {},
+    }
 
 
 def _record_pending_scope_reconcile_contract_event(
@@ -97175,10 +97314,6 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             conn,
             "graph-governance.reconcile.current-full",
         )
-        if dev_runtime_verify_only():
-            admit_ac_dev_graph_materialization_schema(
-                conn, project_id=project_id
-            )
         head_commit = _git_head_commit(root)
         target_commit = str(
             body.get("target_commit_sha")
@@ -97196,6 +97331,17 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 "target_commit_sha": target_commit,
             }
         activate_requested = bool(body.get("activate", True))
+        request_category = _current_full_reconcile_request_category(
+            conn,
+            request_context=ctx,
+            project_id=project_id,
+            body=body,
+            auth=current_full_auth,
+            target_commit_sha=target_commit,
+        )
+        source_free_reconcile_authority = request_category.get(
+            "source_free_reconcile_authority"
+        )
         direct_main_qa_preflight_authority = (
             _operator_supervised_direct_main_reconcile_qa_preflight_authority(
                 conn,
@@ -97251,6 +97397,11 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
             auth=current_full_auth,
             target_commit_sha=target_commit,
             candidate_only=not activate_requested,
+            source_free_reconcile_authority=(
+                source_free_reconcile_authority
+                if isinstance(source_free_reconcile_authority, Mapping)
+                else {}
+            ),
         )
         merge_queue_id = str(
             runtime_context_scope.get("merge_queue_id")
@@ -97267,6 +97418,13 @@ def handle_graph_governance_current_full_reconcile(ctx: RequestContext):
                 head_commit=head_commit,
             )
         )
+        # All category, target/HEAD, Direct-QA, and runtime-scope decisions are
+        # read-only and must complete before graph materialization can create
+        # or alter schema.
+        if dev_runtime_verify_only():
+            admit_ac_dev_graph_materialization_schema(
+                conn, project_id=project_id
+            )
         queue_item_id = str(body.get("queue_item_id") or "").strip()
         run_id = str(body.get("run_id") or "").strip() or (
             f"current-full-{target_commit[:7]}"

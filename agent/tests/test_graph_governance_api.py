@@ -19277,7 +19277,7 @@ def test_lower_full_reconcile_strips_reserved_current_full_marker(
         ),
     ],
 )
-def test_dev_reconcile_handlers_admit_after_auth_before_graph_access(
+def test_dev_reconcile_handlers_admission_order_respects_current_full_prechecks(
     conn, monkeypatch, tmp_path, handler, auth_name, next_name
 ):
     calls: list[str] = []
@@ -19299,22 +19299,22 @@ def test_dev_reconcile_handlers_admit_after_auth_before_graph_access(
         lambda *_args, **_kwargs: calls.append("admission") or {},
     )
 
-    class StopAfterAdmission(RuntimeError):
+    class StopAtNextBoundary(RuntimeError):
         pass
 
     if next_name == "run_state_only_full_reconcile":
         monkeypatch.setattr(
             state_reconcile,
             next_name,
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAfterAdmission()),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAtNextBoundary()),
         )
     else:
         monkeypatch.setattr(
             server,
             next_name,
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAfterAdmission()),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAtNextBoundary()),
         )
-    with pytest.raises(StopAfterAdmission):
+    with pytest.raises(StopAtNextBoundary):
         handler(
             _ctx_with_role(
                 {"project_id": PID},
@@ -19323,10 +19323,14 @@ def test_dev_reconcile_handlers_admit_after_auth_before_graph_access(
                 body={"activate": False},
             )
         )
-    assert calls == ["auth", "admission"]
+    assert calls == (
+        ["auth", "admission"]
+        if next_name == "run_state_only_full_reconcile"
+        else ["auth"]
+    )
 
 
-def test_current_full_cow_identity_admission_failure_precedes_graph_access(
+def test_current_full_cow_identity_admission_failure_follows_read_only_prechecks(
     conn, monkeypatch, tmp_path,
 ):
     calls: list[str] = []
@@ -19346,7 +19350,30 @@ def test_current_full_cow_identity_admission_failure_precedes_graph_access(
 
     monkeypatch.setattr(server, "admit_ac_dev_graph_materialization_schema", reject_identity)
     monkeypatch.setattr(
-        server, "_git_head_commit", lambda *_args: calls.append("graph-access"),
+        server,
+        "_git_head_commit",
+        lambda *_args: calls.append("head-precheck") or "a" * 40,
+    )
+    monkeypatch.setattr(
+        server,
+        "_current_full_reconcile_request_category",
+        lambda *_args, **_kwargs: calls.append("category-precheck")
+        or {"category": "ordinary", "source_free_reconcile_authority": {}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_operator_supervised_direct_main_reconcile_qa_preflight_authority",
+        lambda *_args, **_kwargs: calls.append("qa-precheck") or {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_current_full_reconcile_runtime_context_scope",
+        lambda *_args, **_kwargs: calls.append("runtime-precheck") or {},
+    )
+    monkeypatch.setattr(
+        server,
+        "_verify_incomplete_fanin_reconcile_target",
+        lambda *_args, **_kwargs: False,
     )
     with pytest.raises(ValueError, match="identity is not admitted"):
         server.handle_graph_governance_current_full_reconcile(
@@ -19355,7 +19382,14 @@ def test_current_full_cow_identity_admission_failure_precedes_graph_access(
                 body={"activate": False},
             )
         )
-    assert calls == ["auth", "identity-rejected"]
+    assert calls == [
+        "auth",
+        "head-precheck",
+        "category-precheck",
+        "qa-precheck",
+        "runtime-precheck",
+        "identity-rejected",
+    ]
 
 
 def test_current_full_state_rejects_notes_only_and_premerge_provenance(conn):
@@ -20648,6 +20682,152 @@ def test_current_full_reconcile_narrow_direct_main_route_reports_zero_write_corr
         for table in zero_write_tables
     } == counts_before
     assert conn.total_changes == total_changes_before
+
+
+def test_current_full_source_free_category_requires_exact_completed_body_zero_write(
+    conn,
+    monkeypatch,
+):
+    body = {
+        "project_id": PID,
+        "target_commit_sha": "a" * 40,
+        "activate": True,
+        "require_clean": True,
+        "semantic_use_ai": False,
+        "semantic_enrich": False,
+        "enqueue_stale": False,
+        "backlog_id": "AC-SOURCE-FREE-CATEGORY",
+        "task_id": "onboard-service-source-free",
+        "contract_execution_id": "onboard-service-source-free",
+        "observer_session_id": "obs-source-free",
+        "observer_route_token_ref": "rtok-source-free",
+        "response_view": "compact",
+    }
+    monkeypatch.setattr(
+        server,
+        "_backlog_source_free_operation_authority",
+        lambda *_args, **_kwargs: {"accepted": True},
+    )
+    monkeypatch.setattr(
+        server,
+        "_completed_source_free_reconcile_authority",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "target_commit": "a" * 40,
+            "copy_safe_body": dict(body),
+            "authority_hash": "authority-source-free",
+        },
+    )
+    auth = {
+        "route_token_scope": {
+            "backlog_id": body["backlog_id"],
+            "task_id": body["task_id"],
+        },
+        "route_token_ref": body["observer_route_token_ref"],
+        "route_token_allowed_actions": list(server._OPERATOR_SOURCE_FREE_ACTIONS),
+    }
+    ctx = _ctx({"project_id": PID}, method="POST", body=body)
+    total_changes_before = conn.total_changes
+    schema_before = conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()
+
+    category = server._current_full_reconcile_request_category(
+        conn,
+        request_context=ctx,
+        project_id=PID,
+        body=body,
+        auth=auth,
+        target_commit_sha="a" * 40,
+    )
+    assert category["category"] == "source_free_system_operation"
+
+    mismatched = {**body, "semantic_enrich": True}
+    with pytest.raises(GovernanceError) as exc:
+        server._current_full_reconcile_request_category(
+            conn,
+            request_context=_ctx(
+                {"project_id": PID}, method="POST", body=mismatched
+            ),
+            project_id=PID,
+            body=mismatched,
+            auth=auth,
+            target_commit_sha="a" * 40,
+        )
+    assert exc.value.code == "current_full_reconcile_source_free_authority_required"
+    assert exc.value.details["fallback_allowed"] is False
+    assert "zero_write_rejection" not in exc.value.details
+    assert conn.total_changes == total_changes_before
+    assert conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall() == schema_before
+
+
+def test_current_full_source_free_category_precedes_admission_and_bypasses_direct_gate(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    head, calls = _stub_current_full_reconcile(monkeypatch, tmp_path)
+    backlog_id = "AC-SOURCE-FREE-PRE-ADMISSION"
+    session_id = _insert_active_observer_session_ref(
+        conn, session_id="obs-source-free-pre-admission"
+    )
+    route_ref = "rtok-source-free-pre-admission"
+    record = server._onboard_service_materialize_parent_record(
+        conn,
+        project_id=PID,
+        backlog_id=backlog_id,
+        route_token_ref=route_ref,
+    )
+    task_id = record["contract_execution_id"]
+    _persist_contract_runtime_observer_route_ref(
+        conn,
+        backlog_id=backlog_id,
+        contract_execution_id=task_id,
+        route_token_ref=route_ref,
+        allowed_actions=list(server._OPERATOR_SOURCE_FREE_ACTIONS),
+    )
+    authority = {"accepted": True, "authority_hash": "source-free-exact"}
+    ordering = []
+    monkeypatch.setattr(
+        server,
+        "_current_full_reconcile_request_category",
+        lambda *_args, **_kwargs: (
+            ordering.append("category")
+            or {
+                "category": "source_free_system_operation",
+                "source_free_reconcile_authority": authority,
+            }
+        ),
+    )
+    monkeypatch.setattr(server, "dev_runtime_verify_only", lambda: True)
+    monkeypatch.setattr(
+        server,
+        "admit_ac_dev_graph_materialization_schema",
+        lambda *_args, **_kwargs: ordering.append("admission"),
+    )
+
+    status, result = server.handle_graph_governance_current_full_reconcile(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": head,
+                "activate": False,
+                "semantic_enrich": False,
+                "backlog_id": backlog_id,
+                "task_id": task_id,
+                "observer_session_id": session_id,
+                "observer_route_token_ref": route_ref,
+            },
+        )
+    )
+
+    assert status == 201
+    assert result["current_full_reconcile"] is True
+    assert ordering == ["category", "admission"]
+    assert [call["activate"] for call in calls] == [False]
 
 
 def test_current_full_reconcile_custom_run_ref_uses_graph_status_active_authority(
