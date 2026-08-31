@@ -322,6 +322,10 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
             "server_derived": True, "qa_principal": "qa-adoption",
             "qa_session_id": qa_session["session_id"],
             "independent_verification_session_matched": True,
+            "qa_scope_binding_ref": server._qa_scope_binding_ref(
+                project_id="aming-claw", backlog_id=backlog_id,
+                task_id=execution_id, commit_sha="b" * 40,
+            ),
         },
     }
     SQLiteContractExecutionStore(conn).create({
@@ -364,6 +368,97 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
         request = _ctx({"project_id": "aming-claw"}, method="POST", body=copy.deepcopy(body))
         request.handler = SimpleNamespace(headers={"Authorization": f"Bearer {session['session_token']}"})
         return server.handle_observer_route_context_issue(request)
+
+    # A durable QA Fact is not permanent authority: canonical issue must
+    # re-check the authoritative session before the registry writer starts.
+    conn = connection_for_test("aming-claw")
+    try:
+        conn.execute(
+            "UPDATE sessions SET expires_at=? WHERE session_id=?",
+            ("2000-01-01T00:00:00Z", qa_session["session_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status, expired = issue_once()
+    assert status == 403
+    assert expired["writes_performed"] is False
+    conn = connection_for_test("aming-claw")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+            ("aming-claw",),
+        ).fetchone()[0] == 1
+        conn.execute(
+            "UPDATE sessions SET expires_at=? WHERE session_id=?",
+            (qa_session["expires_at"], qa_session["session_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # Revocation and a later scope reduction are also current-state failures;
+    # neither may reserve a second registry row.
+    conn = connection_for_test("aming-claw")
+    try:
+        conn.execute(
+            "UPDATE sessions SET status='revoked' WHERE session_id=?",
+            (qa_session["session_id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status, revoked = issue_once()
+    assert status == 403
+    assert revoked["writes_performed"] is False
+    conn = connection_for_test("aming-claw")
+    try:
+        conn.execute(
+            "UPDATE sessions SET status='active', scope_json=? WHERE session_id=?",
+            (json.dumps([f"backlog:{backlog_id}"]), qa_session["session_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status, narrowed = issue_once()
+    assert status == 403
+    assert narrowed["writes_performed"] is False
+    conn = connection_for_test("aming-claw")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
+            ("aming-claw",),
+        ).fetchone()[0] == 1
+        conn.execute(
+            "UPDATE sessions SET scope_json=? WHERE session_id=?",
+            (json.dumps(qa_scope), qa_session["session_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # The observer route is also a live authority dependency.  A superseded
+    # route cannot be used to consume a still-valid QA deposit.
+    conn = connection_for_test("aming-claw")
+    try:
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status='superseded' WHERE route_token_ref=?",
+            ("rr-adoption-authority",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status, superseded_route = issue_once()
+    assert status == 403
+    assert superseded_route["writes_performed"] is False
+    conn = connection_for_test("aming-claw")
+    try:
+        conn.execute(
+            "UPDATE observer_route_token_refs SET status='active' WHERE route_token_ref=?",
+            ("rr-adoption-authority",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = [future.result() for future in (pool.submit(issue_once), pool.submit(issue_once))]

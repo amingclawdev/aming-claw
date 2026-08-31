@@ -7708,6 +7708,128 @@ _CANONICAL_REF_ADOPTION_ACTION = "canonical_ref_adoption"
 _CANONICAL_REF_ADOPTION_SCHEMA = "canonical_ref_adoption_route_bound.v1"
 
 
+def _canonical_ref_adoption_active_qa_fact(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    backlog_id: str,
+    contract_execution_id: str,
+    expected_commit: str,
+    expected_tree: str,
+    completed_lines: Sequence[Any],
+) -> Mapping[str, Any] | None:
+    """Return one *currently* authorized independent-QA Fact.
+
+    A ContractRuntime projection records that a QA bearer was authenticated at
+    write time; it is deliberately not a transferable bearer.  Canonical
+    adoption therefore re-reads the persistent QA session and exact scope at
+    issue time.  This makes expiry, revocation, supersession and a later scope
+    reduction fail before the route registry's first write, while allowing the
+    observer (who has its own authenticated bearer) to use the durable QA
+    deposit without re-presenting a QA credential.
+    """
+    expected_scope = {
+        f"backlog:{backlog_id}",
+        f"task:{contract_execution_id}",
+        f"commit:{expected_commit}",
+        _qa_scope_binding_ref(
+            project_id=project_id,
+            backlog_id=backlog_id,
+            task_id=contract_execution_id,
+            commit_sha=expected_commit,
+        ),
+    }
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    for candidate in reversed(completed_lines):
+        if not isinstance(candidate, Mapping):
+            continue
+        payload = (
+            candidate.get("payload")
+            if isinstance(candidate.get("payload"), Mapping)
+            else {}
+        )
+        provenance = (
+            candidate.get("qa_evidence_provenance")
+            if isinstance(candidate.get("qa_evidence_provenance"), Mapping)
+            else {}
+        )
+        binding = (
+            provenance.get("authenticated_qa_binding")
+            if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
+            else {}
+        )
+        candidate_commit = str(
+            payload.get("candidate_commit_sha")
+            or candidate.get("commit_sha") or ""
+        ).strip().lower()
+        candidate_tree = str(
+            payload.get("candidate_tree")
+            or payload.get("target_tree") or ""
+        ).strip().lower()
+        qa_session_id = str(binding.get("qa_session_id") or "").strip()
+        principal_id = str(binding.get("qa_principal") or "").strip()
+        if not (
+            str(candidate.get("line_id") or "").strip()
+            == "qa_independent_verification"
+            and str(candidate.get("actor_role") or "").strip() == "qa"
+            and str(candidate.get("evidence_kind") or "").strip()
+            == "independent_verification"
+            # role == qa is the persistent Role-service capability required for
+            # this verification transition; no caller-shaped capability claim
+            # is accepted here.
+            and _contract_runtime_authenticated_qa_provenance(candidate)
+            and binding.get("independent_verification_session_matched") is True
+            and str(binding.get("qa_scope_binding_ref") or "").strip()
+            == _qa_scope_binding_ref(
+                project_id=project_id, backlog_id=backlog_id,
+                task_id=contract_execution_id, commit_sha=expected_commit,
+            )
+            and candidate_commit == expected_commit
+            and candidate_tree == expected_tree
+            and (
+                candidate.get("authoritative_pass_synthesized") is False
+                or payload.get("authoritative_pass_synthesized") is False
+                or payload.get("pass_synthesized") is False
+            )
+            and qa_session_id and principal_id
+        ):
+            continue
+        session_row = conn.execute(
+            "SELECT principal_id, project_id, role, scope_json, status, expires_at "
+            "FROM sessions WHERE session_id=?",
+            (qa_session_id,),
+        ).fetchone()
+        if session_row is None or not (
+            str(session_row["principal_id"] or "").strip() == principal_id
+            and str(session_row["project_id"] or "").strip() == project_id
+            and str(session_row["role"] or "").strip() == "qa"
+            and str(session_row["status"] or "").strip() == "active"
+        ):
+            continue
+        # Session expiry is an authority boundary, not an advisory field.  Be
+        # canonical about UTC so malformed or offset timestamps cannot slip
+        # through lexicographic comparisons.
+        expires_at = str(session_row["expires_at"] or "").strip()
+        try:
+            expiry = datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        if expiry <= now:
+            continue
+        try:
+            scope = json.loads(session_row["scope_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(scope, list) or not expected_scope.issubset(
+            {str(item or "").strip() for item in scope}
+        ):
+            continue
+        return candidate
+    return None
+
+
 def _canonical_ref_adoption_issue_intent(
     value: Any, *, project_id: str, backlog_id: str, task_id: str, allowed_actions: Any
 ) -> dict[str, str] | None:
@@ -7831,11 +7953,17 @@ def _canonical_ref_adoption_server_issue_body(
             )
         except observer_session.ObserverSessionError as exc:
             raise ValueError(str(exc)) from exc
-        route = observer_route_context.resolve_route_token_ref(
-            conn, project_id=project_id,
-            storage_project_id=_route_registry_storage_project_id(project_id),
-            route_token_ref=route_ref,
-        )
+        try:
+            route = observer_route_context.resolve_route_token_ref(
+                conn, project_id=project_id,
+                storage_project_id=_route_registry_storage_project_id(project_id),
+                route_token_ref=route_ref,
+                task_id=contract_execution_id,
+            )
+        except observer_route_context.RouteTokenRefError as exc:
+            # The public handler owns typed zero-write rejection; do not leak
+            # a registry exception past it for a revoked/superseded route.
+            raise ValueError(str(exc)) from exc
         if not isinstance(route, Mapping):
             raise ValueError("observer route authority is missing")
         row = conn.execute(
@@ -7852,6 +7980,9 @@ def _canonical_ref_adoption_server_issue_body(
         route_backlog_id = str(route.get("backlog_id") or route_scope.get("backlog_id") or "").strip()
         if route_backlog_id != backlog_id:
             raise ValueError("route backlog scope mismatch")
+        route_task_id = str(route.get("task_id") or route_scope.get("task_id") or "").strip()
+        if route_task_id != contract_execution_id:
+            raise ValueError("route CEX scope mismatch")
         record = json.loads(str(row[1] or "{}"))
         adoption = record.get("canonical_ref_adoption") if isinstance(record, Mapping) else None
         if not isinstance(adoption, Mapping):
@@ -7872,83 +8003,15 @@ def _canonical_ref_adoption_server_issue_body(
         )
         expected_commit = str(adoption.get("target_commit") or "").strip().lower()
         expected_tree = str(adoption.get("target_tree") or "").strip().lower()
-        qa_line: Mapping[str, Any] | None = None
-        for candidate in reversed(completed_lines):
-            if not isinstance(candidate, Mapping):
-                continue
-            payload = (
-                candidate.get("payload")
-                if isinstance(candidate.get("payload"), Mapping)
-                else {}
-            )
-            provenance = (
-                candidate.get("qa_evidence_provenance")
-                if isinstance(candidate.get("qa_evidence_provenance"), Mapping)
-                else {}
-            )
-            binding = (
-                provenance.get("authenticated_qa_binding")
-                if isinstance(provenance.get("authenticated_qa_binding"), Mapping)
-                else {}
-            )
-            candidate_commit = str(
-                payload.get("candidate_commit_sha")
-                or candidate.get("commit_sha") or ""
-            ).strip().lower()
-            candidate_tree = str(
-                payload.get("candidate_tree")
-                or payload.get("target_tree") or ""
-            ).strip().lower()
-            session_id = str(binding.get("qa_session_id") or "").strip()
-            principal_id = str(binding.get("qa_principal") or "").strip()
-            if not (
-                str(candidate.get("line_id") or "").strip()
-                == "qa_independent_verification"
-                and str(candidate.get("actor_role") or "").strip() == "qa"
-                and str(candidate.get("evidence_kind") or "").strip()
-                == "independent_verification"
-                and _contract_runtime_authenticated_qa_provenance(candidate)
-                and binding.get("independent_verification_session_matched") is True
-                and candidate_commit == expected_commit
-                and candidate_tree == expected_tree
-                and (
-                    candidate.get("authoritative_pass_synthesized") is False
-                    or payload.get("authoritative_pass_synthesized") is False
-                    or payload.get("pass_synthesized") is False
-                )
-                and session_id and principal_id
-            ):
-                continue
-            session_row = conn.execute(
-                "SELECT principal_id, project_id, role, scope_json, status "
-                "FROM sessions WHERE session_id=?",
-                (session_id,),
-            ).fetchone()
-            if session_row is None or not (
-                str(session_row["principal_id"] or "").strip() == principal_id
-                and str(session_row["project_id"] or "").strip() == project_id
-                and str(session_row["role"] or "").strip() == "qa"
-                and str(session_row["status"] or "").strip() == "active"
-            ):
-                continue
-            try:
-                scope = json.loads(session_row["scope_json"] or "[]")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            expected_scope = {
-                f"backlog:{backlog_id}", f"task:{contract_execution_id}",
-                f"commit:{expected_commit}",
-                _qa_scope_binding_ref(
-                    project_id=project_id, backlog_id=backlog_id,
-                    task_id=contract_execution_id, commit_sha=expected_commit,
-                ),
-            }
-            if not isinstance(scope, list) or not expected_scope.issubset(
-                {str(item or "").strip() for item in scope}
-            ):
-                continue
-            qa_line = candidate
-            break
+        qa_line = _canonical_ref_adoption_active_qa_fact(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            contract_execution_id=contract_execution_id,
+            expected_commit=expected_commit,
+            expected_tree=expected_tree,
+            completed_lines=completed_lines,
+        )
         if qa_line is None:
             raise ValueError("authenticated independent QA Fact is missing")
         qa_hash = stable_sha256(dict(qa_line))
