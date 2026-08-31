@@ -3068,6 +3068,8 @@ def commit_completed_bootstrap_child_custody(
     pre_sha = _durable_database_sha256(database)
     if pre_sha != expected_pre_sha256:
         raise ValueError("AC dev completed bootstrap custody preimage mismatch")
+    lease_created = str(database.absolute()) not in _DEV_DATABASE_WRITER_LEASES
+    acquire_dev_runtime_writer_lease(root)
     conn = sqlite3.connect(str(database), timeout=30, isolation_level=None)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -3116,6 +3118,8 @@ def commit_completed_bootstrap_child_custody(
         conn.commit()
     except Exception:
         conn.rollback()
+        if lease_created:
+            release_dev_runtime_writer_lease(root)
         raise
     finally:
         conn.close()
@@ -3125,6 +3129,12 @@ def commit_completed_bootstrap_child_custody(
             raise RuntimeError("AC dev completed bootstrap custody checkpoint failed")
     finally:
         checkpoint.close()
+    try:
+        _bind_dev_writer_lease_database_identity(database)
+    except Exception:
+        if lease_created:
+            release_dev_runtime_writer_lease(root)
+        raise
     post_stat = database.stat(follow_symlinks=False)
     post_identity = {"device": int(post_stat.st_dev), "inode": int(post_stat.st_ino)}
     return {"database_identity": post_identity, "database_sha256_before": pre_sha,
