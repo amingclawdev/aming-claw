@@ -487,7 +487,27 @@ def test_ac_dev_world_bootstrap_is_source_only_and_physically_disjoint(tmp_path,
         "commit": "a" * 40,
         "source_sha256": "sha256:" + "b" * 64,
     }
+    stable = Path(db._verified_stable_binding()["shared_volume_path"])
+    stable_git_root = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=stable,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    )
+    stable_git_common_dir = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=stable, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    )
+    stable_status_before = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=stable_git_root,
+        check=True, capture_output=True, text=True,
+    ).stdout
     storage_root, _ = _canonical_dev_world(tmp_path)
+    assert storage_root.parent.parent == stable_git_root.parent
+    assert stable_git_root not in storage_root.parents
+    assert stable_git_common_dir not in storage_root.parents
     receipt = db.bootstrap_dev_governance_store(
         storage_root,
         source_identity=source,
@@ -505,6 +525,10 @@ def test_ac_dev_world_bootstrap_is_source_only_and_physically_disjoint(tmp_path,
     assert receipt["rows_copied"] == 0
     assert receipt["source_only"] is True
     assert receipt["database_identity"]["inode"] == dev_db.stat().st_ino
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=stable_git_root,
+        check=True, capture_output=True, text=True,
+    ).stdout == stable_status_before
 
     conn = sqlite3.connect(dev_db)
     try:
@@ -527,6 +551,61 @@ def test_ac_dev_world_bootstrap_is_source_only_and_physically_disjoint(tmp_path,
         assert identity["genesis_sha256"] == receipt["genesis_sha256"]
     finally:
         conn.close()
+
+
+def test_ac_dev_storage_resolver_rejects_namespace_alias_and_never_creates_it(tmp_path):
+    """A reserved sibling namespace cannot be redirected back into stable Git."""
+    from agent.governance import db
+    from agent.runtime_plane import AC_DEV_STORAGE_NAMESPACE, resolve_ac_dev_storage_root
+
+    stable = Path(db._verified_stable_binding()["shared_volume_path"])
+    stable_git_root = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=stable,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    )
+    namespace = stable_git_root.parent / AC_DEV_STORAGE_NAMESPACE
+    namespace.symlink_to(stable_git_root, target_is_directory=True)
+    try:
+        with pytest.raises(ValueError, match="symlink"):
+            resolve_ac_dev_storage_root(stable)
+        assert namespace.is_symlink()
+        assert not (stable_git_root / AC_DEV_STORAGE_NAMESPACE / "aming-claw").exists()
+    finally:
+        namespace.unlink()
+
+
+def test_ac_dev_storage_resolver_is_outside_linked_worktree_and_common_dir(tmp_path):
+    """A linked stable checkout may not place dev state in either Git domain."""
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    for command in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.email", "test@example.invalid"],
+        ["git", "config", "user.name", "AC Test"],
+    ):
+        subprocess.run(command, cwd=primary, check=True, capture_output=True)
+    (primary / "README").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README"], cwd=primary, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=primary, check=True, capture_output=True)
+    linked = tmp_path / "linked" / "stable"
+    linked.parent.mkdir()
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "stable-fixture", str(linked)],
+        cwd=primary, check=True, capture_output=True,
+    )
+    shared = linked / "shared-volume"
+    shared.mkdir()
+    root = resolve_ac_dev_storage_root(shared)
+
+    common_dir = primary / ".git"
+    assert root == linked.parent / ".aming-claw-dev-worlds" / "aming-claw"
+    assert linked not in root.parents
+    assert common_dir not in root.parents
+    assert not root.exists()
 
 
 def test_ac_dev_storage_rejects_alias_foreign_and_symlink_roots(tmp_path, monkeypatch):

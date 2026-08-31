@@ -12,6 +12,43 @@ AC_PROJECT_ID = "aming-claw"
 AC_DEV_STORAGE_NAMESPACE = ".aming-claw-dev-worlds"
 
 
+def _git_path(workspace_root: str, argument: str) -> str:
+    """Resolve one Git-owned path from an existing physical workspace."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", argument],
+            cwd=workspace_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("workspace is not a readable Git worktree") from exc
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise ValueError("workspace is not a readable Git worktree")
+    value = Path(proc.stdout.strip())
+    if not value.is_absolute():
+        value = Path(workspace_root) / value
+    if not value.exists() or value.is_symlink() or value.resolve(strict=True) != value:
+        raise ValueError("workspace Git path must be an existing physical directory")
+    return str(value)
+
+
+def _is_within(candidate: Path, container: Path) -> bool:
+    return candidate == container or container in candidate.parents
+
+
+def _is_ephemeral_path(path: Path) -> bool:
+    """Reject only the host's known transient roots, not arbitrary test paths."""
+    # Do not use ``tempfile.gettempdir()`` here: hermetic test fixtures may
+    # live under a host-managed temporary parent while still modelling a
+    # persistent sibling layout.  These two public temp roots are the
+    # unsupported runtime locations and cover the legacy handoff lock path.
+    temporary_roots = (Path("/tmp"), Path("/private/tmp"))
+    return any(_is_within(path, root) for root in temporary_roots)
+
+
 def resolve_ac_dev_storage_root(stable_shared_volume: str | Path) -> Path:
     """Derive AC's only dev world from the persistent stable-volume identity.
 
@@ -25,10 +62,14 @@ def resolve_ac_dev_storage_root(stable_shared_volume: str | Path) -> Path:
     stable = candidate.resolve(strict=True)
     if stable != candidate:
         raise ValueError("canonical stable shared volume identity mismatch")
-    parent = stable.parent
+    git_root = Path(_git_path(str(stable), "--show-toplevel"))
+    git_common_dir = Path(_git_path(str(stable), "--git-common-dir"))
+    parent = git_root.parent
     if parent.is_symlink() or parent.resolve(strict=True) != parent:
-        raise ValueError("canonical stable shared-volume parent identity mismatch")
+        raise ValueError("canonical stable Git parent identity mismatch")
     root = parent / AC_DEV_STORAGE_NAMESPACE / AC_PROJECT_ID
+    if _is_ephemeral_path(root):
+        raise ValueError("AC dev storage root cannot be in a temporary directory")
     # Do not resolve a not-yet-created target: validate every existing parent.
     probe = root
     while not probe.exists() and probe != probe.parent:
@@ -37,8 +78,10 @@ def resolve_ac_dev_storage_root(stable_shared_volume: str | Path) -> Path:
         raise ValueError("AC dev storage root cannot traverse a symlink")
     if root.exists() and (root.is_symlink() or root.resolve(strict=True) != root):
         raise ValueError("AC dev storage root cannot alias its canonical path")
-    if root == stable or stable in root.parents or root in stable.parents:
-        raise ValueError("AC dev storage root must be a stable-volume sibling")
+    if _is_within(root, stable) or _is_within(stable, root):
+        raise ValueError("AC dev storage root must be disjoint from stable shared volume")
+    if _is_within(root, git_root) or _is_within(root, git_common_dir):
+        raise ValueError("AC dev storage root must be outside stable Git checkout and common-dir")
     return root
 
 
@@ -95,27 +138,6 @@ def validate_current_workspace_identity(identity: WorkspaceIdentity) -> Workspac
     if (current.device, current.inode) != (identity.device, identity.inode):
         raise ValueError("workspace identity changed")
     return identity
-
-
-def _git_path(workspace_root: str, argument: str) -> str:
-    """Resolve a Git path to one existing absolute non-symlink directory."""
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", argument],
-            cwd=workspace_root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError("workspace is not a readable Git worktree") from exc
-    if proc.returncode != 0 or not proc.stdout.strip():
-        raise ValueError("workspace is not a readable Git worktree")
-    value = Path(proc.stdout.strip())
-    if not value.is_absolute():
-        value = Path(workspace_root) / value
-    return str(value)
 
 
 def bind_git_worktree_identity(workspace_root: str, logical_task_id: str) -> GitWorktreeIdentity:
