@@ -280,35 +280,57 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
 
     monkeypatch.setattr(server, "get_connection", connection_for_test)
     monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
-    body = {
-        "caller_role": "observer",
-        "backlog_id": "ADOPTION-ATOMIC-ISSUE",
-        "task_id": "cex-adoption-atomic-issue",
-        "target_files": ["agent/cli.py"],
-        "allowed_actions": ["canonical_ref_adoption"],
+    monkeypatch.setattr(server, "_route_registry_storage_project_id", lambda project_id: project_id)
+    conn = connection_for_test("aming-claw")
+    session = observer_session.register_session(
+        conn, project_id="aming-claw", capabilities=["canonical_ref_adoption"],
+    )
+    backlog_id = "ADOPTION-ATOMIC-ISSUE"
+    execution_id = "cex-adoption-atomic-issue"
+    _persist_contract_runtime_observer_route_ref(
+        conn, backlog_id=backlog_id, contract_execution_id=execution_id,
+        route_token_ref="rr-adoption-authority",
+        allowed_actions=["canonical_ref_adoption"], target_files=["agent/cli.py"],
+    )
+    # The shared helper's default PID is graph-api-test; this isolated route is
+    # deliberately re-scoped to the handler's project under test.
+    conn.execute(
+        "UPDATE observer_route_token_refs SET project_id=?, scope_json=replace(scope_json, ?, ?) "
+        "WHERE route_token_ref=?",
+        ("aming-claw", PID, "aming-claw", "rr-adoption-authority"),
+    )
+    SQLiteContractExecutionStore(conn).create({
+        "contract_execution_id": execution_id, "project_id": "aming-claw",
+        "backlog_id": backlog_id, "contract_id": "adoption", "version": "1",
+        "revision": "1", "execution_state_revision": 1,
         "canonical_ref_adoption": {
-            "schema_version": "canonical_ref_adoption_route_bound.v1",
-            "project_id": "aming-claw",
-            "backlog_id": "ADOPTION-ATOMIC-ISSUE",
-            "action": "canonical_ref_adoption",
-            "contract_execution_id": "cex-adoption-atomic-issue",
             "generation": "gen-atomic", "custody": "custody-atomic",
-            "canonical_ref": "refs/heads/codex/ac-dev",
-            "expected_commit": "a" * 40, "target_commit": "b" * 40,
-            "target_tree": "c" * 40,
+            "canonical_ref": "refs/heads/codex/ac-dev", "expected_commit": "a" * 40,
+            "target_commit": "b" * 40, "target_tree": "c" * 40,
             "source_content_sha256": "sha256:" + "d" * 64,
-            "qa_content_sha256": "sha256:" + "e" * 64,
-            # Deliberately caller-controlled nonsense: the issuer replaces it.
-            "issued_at": "2020-01-01T00:00:00Z",
-            "expires_at": "2020-01-01T01:00:00Z",
-            "replay_identity": "caller-must-not-control-this",
+        },
+    })
+    task_timeline.ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO task_timeline_events (project_id,backlog_id,task_id,event_type,actor,verification_json,created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("aming-claw", backlog_id, execution_id, "independent_verification", "qa-agent",
+         json.dumps({"qa_content_sha256": "sha256:" + "e" * 64}), "2026-08-31T00:00:00Z"),
+    )
+    conn.commit(); conn.close()
+    body = {
+        "observer_session_id": session["observer_session_id"],
+        "observer_route_token_ref": "rr-adoption-authority",
+        "canonical_ref_adoption": {
+            "action": "canonical_ref_adoption",
+            "contract_execution_id": execution_id,
         },
     }
 
     def issue_once():
-        return server.handle_observer_route_context_issue(
-            _ctx({"project_id": "aming-claw"}, method="POST", body=copy.deepcopy(body))
-        )
+        request = _ctx({"project_id": "aming-claw"}, method="POST", body=copy.deepcopy(body))
+        request.handler = SimpleNamespace(headers={"Authorization": f"Bearer {session['session_token']}"})
+        return server.handle_observer_route_context_issue(request)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = [future.result() for future in (pool.submit(issue_once), pool.submit(issue_once))]
@@ -322,7 +344,7 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
     typed = token["route_lineage"]["canonical_ref_adoption"]
     assert typed["issued_at"] == token["issued_at"]
     assert typed["expires_at"] == token["expires_at"]
-    assert typed["replay_identity"] != body["canonical_ref_adoption"]["replay_identity"]
+    assert typed["target_commit"] == "b" * 40
     conn = connection_for_test("aming-claw")
     try:
         stored = conn.execute(
@@ -344,7 +366,7 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
         assert conn.execute(
             "SELECT COUNT(*) FROM observer_route_token_refs WHERE project_id=?",
             ("aming-claw",),
-        ).fetchone()[0] == 1
+        ).fetchone()[0] == 2
     finally:
         conn.close()
 

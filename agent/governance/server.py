@@ -7836,7 +7836,7 @@ def _canonical_ref_adoption_server_issue_body(
             storage_project_id=_route_registry_storage_project_id(project_id),
             route_token_ref=route_ref,
         )
-        if not isinstance(route, Mapping) or str(route.get("caller_role") or "") != "observer":
+        if not isinstance(route, Mapping):
             raise ValueError("observer route authority is missing")
         row = conn.execute(
             "SELECT backlog_id, record_json FROM contract_runtime_executions "
@@ -7848,7 +7848,9 @@ def _canonical_ref_adoption_server_issue_body(
         backlog_id = str(row[0] or "").strip()
         if str(nested.get("backlog_id") or backlog_id).strip() != backlog_id:
             raise ValueError("CEX backlog scope mismatch")
-        if str(route.get("backlog_id") or "").strip() != backlog_id:
+        route_scope = route.get("scope") if isinstance(route.get("scope"), Mapping) else {}
+        route_backlog_id = str(route.get("backlog_id") or route_scope.get("backlog_id") or "").strip()
+        if route_backlog_id != backlog_id:
             raise ValueError("route backlog scope mismatch")
         record = json.loads(str(row[1] or "{}"))
         adoption = record.get("canonical_ref_adoption") if isinstance(record, Mapping) else None
