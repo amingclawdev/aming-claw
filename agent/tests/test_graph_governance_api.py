@@ -268,7 +268,10 @@ def test_canonical_ref_adoption_issuance_rejects_boundary_expiry_and_reissue(tmp
     conn.close()
 
 
-def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, monkeypatch):
+@pytest.mark.parametrize("runtime_plane", ("stable", "dev"))
+def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(
+    tmp_path, monkeypatch, runtime_plane,
+):
     """Only one complete server issue can claim a typed adoption operation."""
     database = tmp_path / "canonical-adoption-issue.db"
     setup = sqlite3.connect(database)
@@ -283,8 +286,17 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
         return conn
 
     monkeypatch.setattr(server, "get_connection", connection_for_test)
-    monkeypatch.setattr(server, "_runtime_plane", lambda: "stable")
+    monkeypatch.setattr(server, "_runtime_plane", lambda: runtime_plane)
     monkeypatch.setattr(server, "_route_registry_storage_project_id", lambda project_id: project_id)
+    if runtime_plane == "dev":
+        def direct_bootstrap_must_not_run(*_args, **_kwargs):
+            raise AssertionError("canonical adoption was dispatched to Direct bootstrap")
+
+        monkeypatch.setattr(
+            server,
+            "_handle_ac_dev_direct_route_context_issue",
+            direct_bootstrap_must_not_run,
+        )
     conn = connection_for_test("aming-claw")
     session = observer_session.register_session(
         conn, project_id="aming-claw", capabilities=["canonical_ref_adoption"],
@@ -386,6 +398,13 @@ def test_canonical_ref_adoption_full_issue_is_digest_bound_and_atomic(tmp_path, 
     def issue_once():
         request = _ctx({"project_id": "aming-claw"}, method="POST", body=copy.deepcopy(body))
         request.handler = SimpleNamespace(headers={"Authorization": f"Bearer {session['session_token']}"})
+        if runtime_plane == "dev":
+            server._guard_dev_runtime_request(
+                method="POST",
+                path="/api/projects/aming-claw/observer/route-context/issue",
+                path_params={"project_id": "aming-claw"},
+                body=request.body,
+            )
         return server.handle_observer_route_context_issue(request)
 
     # A durable QA Fact is not permanent authority: canonical issue must
@@ -903,6 +922,63 @@ def test_canonical_ref_adoption_rejects_before_dev_bootstrap_on_missing_qa_fact(
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type='table' AND name='observer_route_token_refs'"
         ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"caller_role": "observer"},
+        {"unexpected_canonical_claim": "nope"},
+        {"route_token_ref": "also-present"},
+    ),
+)
+def test_dev_canonical_request_discriminator_rejects_mixed_or_ambiguous_zero_write(
+    tmp_path, monkeypatch, extra,
+):
+    """Canonical and Direct envelopes cannot be blended on the dev plane."""
+    database = tmp_path / "canonical-adoption-dev-discriminator.db"
+    conn = sqlite3.connect(database)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    before = tuple(conn.iterdump())
+    conn.close()
+
+    def connection_for_test(_project_id):
+        opened = sqlite3.connect(database)
+        opened.row_factory = sqlite3.Row
+        return opened
+
+    def direct_bootstrap_must_not_run(*_args, **_kwargs):
+        raise AssertionError("mixed canonical envelope reached Direct bootstrap")
+
+    monkeypatch.setattr(server, "get_connection", connection_for_test)
+    monkeypatch.setattr(server, "_runtime_plane", lambda: "dev")
+    monkeypatch.setattr(
+        server, "_handle_ac_dev_direct_route_context_issue",
+        direct_bootstrap_must_not_run,
+    )
+    body = {
+        "observer_session_id": "observer-discriminator",
+        "observer_route_token_ref": "route-discriminator",
+        "canonical_ref_adoption": {
+            "action": "canonical_ref_adoption",
+            "contract_execution_id": "cex-discriminator",
+        },
+        **extra,
+    }
+    status, rejected = server.handle_observer_route_context_issue(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    assert status == 400
+    assert rejected["writes_performed"] is False
+    assert rejected["mutation_performed"] is False
+    assert rejected["source"].endswith("request_kind_discriminator")
+    conn = connection_for_test("aming-claw")
+    try:
+        assert tuple(conn.iterdump()) == before
     finally:
         conn.close()
 

@@ -3988,11 +3988,21 @@ def _guard_dev_runtime_request(
         )
 
     if path == "/api/projects/aming-claw/observer/route-context/issue":
-        _ac_dev_direct_route_issue_precheck_from_request(
-            project_id="aming-claw",
-            body=body,
-            query={},
-        )
+        # Canonical adoption has a separate closed authority parser in the
+        # handler.  Do not run the Direct guide-copy precheck in front of it:
+        # that would make a valid canonical request unreachable on 40008.
+        # Shape errors deliberately continue to the handler's zero-write
+        # rejection instead of being reinterpreted as Direct bootstrap.
+        try:
+            request_kind = _observer_route_context_issue_request_kind(body)
+        except ValueError:
+            request_kind = "canonical_rejection"
+        if request_kind == "direct_bootstrap":
+            _ac_dev_direct_route_issue_precheck_from_request(
+                project_id="aming-claw",
+                body=body,
+                query={},
+            )
     if path == "/api/projects/aming-claw/observer/route-context/renew":
         _ac_dev_direct_route_renew_precheck_from_request(
             project_id="aming-claw",
@@ -8172,6 +8182,39 @@ def _canonical_ref_adoption_server_issue_body(
         conn.close()
 
 
+def _observer_route_context_issue_request_kind(
+    body: Mapping[str, Any],
+) -> str:
+    """Classify the only two dev issue shapes before either can write.
+
+    This discriminator is server-owned: a caller cannot select a permissive
+    handler with a request hint. Canonical adoption has a closed reference-only
+    envelope; an envelope without its marker is the legacy guide-copy Direct
+    bootstrap input. A Direct field beside the canonical marker is never
+    silently discarded or routed as a different dev operation.
+    """
+
+    if "canonical_ref_adoption" not in body:
+        return "direct_bootstrap"
+    canonical_fields = {
+        "observer_session_id",
+        "observer_route_token_ref",
+        "route_token_ref",
+        "canonical_ref_adoption",
+    }
+    if set(body) - canonical_fields:
+        raise ValueError(
+            "canonical_ref_adoption request mixes canonical and Direct fields"
+        )
+    if "observer_route_token_ref" in body and "route_token_ref" in body:
+        raise ValueError(
+            "canonical_ref_adoption request has ambiguous route reference"
+        )
+    # The typed helper below owns nested parsing, keeping malformed nested
+    # forms on its existing closed zero-write authority path.
+    return "canonical_ref_adoption"
+
+
 def _canonical_ref_adoption_revalidate_in_writer(
     conn: sqlite3.Connection,
     *,
@@ -9135,11 +9178,24 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     project_id = ctx.get_project_id()
     body = ctx.body if isinstance(ctx.body, dict) else {}
     canonical_final_authority: Mapping[str, Any] | None = None
+    try:
+        request_kind = _observer_route_context_issue_request_kind(body)
+    except ValueError as exc:
+        return _observer_route_context_issue_rejection(
+            status=400,
+            project_id=project_id,
+            body=body,
+            error=str(exc),
+            field="request_kind",
+            expected="one closed canonical-adoption or Direct-bootstrap request shape",
+            actual={"canonical_ref_adoption_present": "canonical_ref_adoption" in body},
+            source_gate="request_kind_discriminator",
+        )
 
     # Canonical-ref adoption is the one route kind whose authority may not be
     # self-declared in the request.  Convert its three references into the
     # normal issuer shape only after session/CEX/QA/route verification.
-    if "canonical_ref_adoption" in body:
+    if request_kind == "canonical_ref_adoption":
         try:
             body = _canonical_ref_adoption_server_issue_body(
                 ctx, project_id=project_id, body=body,
@@ -9161,7 +9217,7 @@ def handle_observer_route_context_issue(ctx: RequestContext):
     # Canonical adoption has already crossed its strict authority gate above.
     # Keep the ordinary dev bootstrap behaviour for every other issue shape,
     # but never permit that shortcut to preempt canonical QA validation.
-    if _runtime_plane() == "dev":
+    if _runtime_plane() == "dev" and request_kind == "direct_bootstrap":
         return _handle_ac_dev_direct_route_context_issue(
             ctx,
             project_id=project_id,
