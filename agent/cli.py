@@ -4404,13 +4404,27 @@ def start(
                     or pending.get("dev_storage_root") != str(dev_storage)
                     or pending.get("source_identity") != dict(dev_identity or {})):
                 raise click.ClickException("AC dev durable child pending binding mismatch")
+            phase = pending.get("durable_start_phase")
+            bootstrap_fields = {"dashboard_bootstrap"}
+            if phase is None:
+                if (pending.get("schema_version") != "ac_dev_durable_pending.v1"
+                        or any(field in pending for field in bootstrap_fields)):
+                    raise click.ClickException("AC dev durable child pending phase is missing")
+                phase = _DURABLE_START_LEGACY_ADOPTION
+            if phase not in {_DURABLE_START_LEGACY_ADOPTION, _DURABLE_START_COMPLETED_BOOTSTRAP}:
+                raise click.ClickException("AC dev durable child phase is invalid")
             pending_database = dict(pending.get("database_identity") or {})
             canonical_database = dev_storage / "governance" / "aming-claw" / "governance.db"
-            if (pending_database.get("path") != str(canonical_database)
+            if phase == _DURABLE_START_LEGACY_ADOPTION:
+                if ("dashboard_bootstrap" in pending
+                        or pending_database != _canonical_dev_database_identity_projection(canonical_database)):
+                    raise click.ClickException("AC dev durable child legacy database identity mismatch")
+            elif (pending_database.get("path") != str(canonical_database)
                     or not isinstance(pending_database.get("device"), int)
                     or not isinstance(pending_database.get("inode"), int)
-                    or _admission_identity(canonical_database) != pending_database):
-                raise click.ClickException("AC dev durable child pending database identity mismatch")
+                    or _admission_identity(canonical_database) != pending_database
+                    or not isinstance(pending.get("dashboard_bootstrap"), Mapping)):
+                raise click.ClickException("AC dev durable child bootstrap database identity mismatch")
             control = socket.socket(fileno=durable_child_control_fd)
             control.settimeout(15)
             child_process = _posix_process_identity(os.getpid())
@@ -4427,7 +4441,7 @@ def start(
             }
             from agent.governance.db import commit_dev_child_custody
             try:
-                if pending.get("durable_start_phase") == _DURABLE_START_COMPLETED_BOOTSTRAP:
+                if phase == _DURABLE_START_COMPLETED_BOOTSTRAP:
                     from agent.governance import db as _db
                     if not isinstance(pending.get("dashboard_bootstrap"), Mapping):
                         raise click.ClickException("AC dev durable bootstrap child context is missing")
@@ -4460,7 +4474,7 @@ def start(
                         expected_protected_projection=projection,
                     )
                     committed["custody_projection"] = custody
-                elif pending.get("durable_start_phase") == _DURABLE_START_LEGACY_ADOPTION:
+                elif phase == _DURABLE_START_LEGACY_ADOPTION:
                     committed = commit_dev_child_custody(
                         dev_storage, source_identity=dev_identity or {},
                         process_identity=custody,
