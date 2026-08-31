@@ -8,6 +8,7 @@ import json
 import hashlib
 import subprocess
 import shutil
+import socket
 from pathlib import Path
 from unittest import mock
 
@@ -106,6 +107,11 @@ def test_ac_dev_graph_materialization_admission_is_idempotent_and_verify_only(mo
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(
         db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
         "canonical_ac_database_identity",
         lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
     )
@@ -144,6 +150,11 @@ def test_ac_dev_graph_materialization_admission_rolls_back_partial_schema(monkey
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(
         db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
         "canonical_ac_database_identity",
         lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
     )
@@ -180,6 +191,11 @@ def test_ac_dev_graph_materialization_admission_denies_wrong_world_without_write
     monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
     monkeypatch.setattr(
         db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: {"host": "127.0.0.1", "port": 40008},
+    )
+    monkeypatch.setattr(
+        db,
         "canonical_ac_database_identity",
         lambda _conn: {"world_id": "ac-dev", "project_id": "aming-claw"},
     )
@@ -197,6 +213,137 @@ def test_ac_dev_graph_materialization_admission_denies_wrong_world_without_write
     with pytest.raises(ValueError, match="identity is not admitted"):
         db.admit_ac_dev_graph_materialization_schema(conn, project_id="aming-claw")
     assert conn.total_changes == before
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
+    conn.close()
+
+
+def test_graph_materialization_listener_requires_real_current_process_40008(monkeypatch):
+    from agent.governance import db
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 40008))
+    listener.listen(1)
+    try:
+        observed = db._default_cutover_listener_probe(40008)
+        assert observed["pid"] == os.getpid()
+        assert observed["listener_addresses"] == ["127.0.0.1:40008"]
+        db._validate_ac_dev_graph_materialization_listener(observed)
+    finally:
+        listener.close()
+
+
+def test_graph_materialization_runtime_custody_binds_real_listener_and_lease(
+    monkeypatch, tmp_path
+):
+    from agent.governance import db
+
+    database = (tmp_path / "governance.db").absolute()
+    connection = sqlite3.connect(database)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 40008))
+    listener.listen(1)
+    handle = open(tmp_path / "writer.lock", "a+", encoding="utf-8")
+    metadata = database.stat(follow_symlinks=False)
+    owner_start = db._writer_process_start_identity()
+    lease = {
+        "handle": handle,
+        "owner_pid": os.getpid(),
+        "owner_start_identity": owner_start,
+        "database_device": int(metadata.st_dev),
+        "database_inode": int(metadata.st_ino),
+    }
+    monkeypatch.setattr(db, "_dev_database_path", lambda: database)
+    monkeypatch.setattr(db, "_dev_storage_root", lambda **_kwargs: tmp_path)
+    monkeypatch.setattr(
+        db,
+        "validate_dev_launch_receipt",
+        lambda *_args, **_kwargs: {
+            "runtime_plane": "dev",
+            "world_id": "ac-dev",
+            "project_id": "aming-claw",
+            "port": 40008,
+            "background": False,
+        },
+    )
+    db._DEV_DATABASE_WRITER_LEASES[str(database)] = lease
+    try:
+        custody = db._require_ac_dev_graph_materialization_runtime_custody(
+            connection
+        )
+        assert custody["host"] == "127.0.0.1"
+        assert custody["port"] == 40008
+        assert custody["pid"] == os.getpid()
+    finally:
+        db._DEV_DATABASE_WRITER_LEASES.pop(str(database), None)
+        handle.close()
+        listener.close()
+        connection.close()
+
+
+def test_graph_materialization_listener_rejects_40009_and_env_spoof(monkeypatch):
+    from agent.governance import db
+
+    monkeypatch.setenv("GOVERNANCE_PORT", "40009")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 40009))
+    listener.listen(1)
+    try:
+        observed = db._default_cutover_listener_probe(40008)
+        with pytest.raises(ValueError, match="listener custody mismatch"):
+            db._validate_ac_dev_graph_materialization_listener(observed)
+    finally:
+        listener.close()
+
+
+def test_graph_materialization_listener_rejects_foreign_pid():
+    from agent.governance import db
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import socket,time; s=socket.socket(); "
+                "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); "
+                "s.bind(('127.0.0.1',40008)); s.listen(1); "
+                "print('ready',flush=True); time.sleep(10)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "ready"
+        observed = db._default_cutover_listener_probe(40008)
+        assert observed["pid"] == process.pid
+        with pytest.raises(ValueError, match="listener custody mismatch"):
+            db._validate_ac_dev_graph_materialization_listener(observed)
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+def test_graph_materialization_runtime_rejects_before_schema_begin(monkeypatch):
+    from agent.governance import db
+
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(
+        db,
+        "_require_ac_dev_graph_materialization_runtime_custody",
+        lambda _conn: (_ for _ in ()).throw(
+            ValueError("AC dev graph materialization listener custody mismatch")
+        ),
+    )
+    conn = sqlite3.connect(":memory:")
+    with pytest.raises(ValueError, match="listener custody mismatch"):
+        db.admit_ac_dev_graph_materialization_schema(
+            conn, project_id="aming-claw"
+        )
+    assert conn.in_transaction is False
     assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
     conn.close()
 

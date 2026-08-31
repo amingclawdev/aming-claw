@@ -830,6 +830,7 @@ def admit_ac_dev_graph_materialization_schema(
 
     if project_id != AC_PROJECT_ID or not _is_dev_runtime():
         raise ValueError("AC dev graph materialization admission is dev/aming-claw only")
+    runtime_custody = _require_ac_dev_graph_materialization_runtime_custody(conn)
     database_identity = canonical_ac_database_identity(conn)
     if (
         database_identity.get("world_id") != AC_DEV_WORLD_ID
@@ -899,6 +900,7 @@ def admit_ac_dev_graph_materialization_schema(
         "world_id": AC_DEV_WORLD_ID,
         "object_count": len(canonical),
         "active_graph_activation_allowed": False,
+        "runtime_custody": runtime_custody,
     }
 
 
@@ -4138,7 +4140,7 @@ def _default_cutover_listener_probe(port: int) -> dict[str, object]:
     """Inspect one local listener without starting, stopping, or signalling it."""
 
     result = subprocess.run(
-        ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-Fp"],
+        ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-Fpn"],
         capture_output=True,
         text=True,
         timeout=5,
@@ -4169,12 +4171,108 @@ def _default_cutover_listener_probe(port: int) -> dict[str, object]:
         "listening": bool(pid),
         "pid": pid,
         "process_start_identity": start_identity,
+        "listener_addresses": sorted(
+            {
+                line[1:].removesuffix(" (LISTEN)")
+                for line in result.stdout.splitlines()
+                if line.startswith("n") and line[1:].strip()
+            }
+        ),
         "source_commit": (
             os.environ.get("AMING_CLAW_STABLE_ANCHOR_COMMIT", "").strip().lower()
             if int(port) == 40000
             else ""
         ),
     }
+
+
+def _require_ac_dev_graph_materialization_runtime_custody(
+    conn: sqlite3.Connection,
+) -> dict[str, object]:
+    """Prove this process owns the exact live dev listener and DB lease."""
+
+    opened = _connection_main_database_identity(conn)
+    if opened is None:
+        raise ValueError("AC dev graph materialization database identity is unavailable")
+    database, metadata = opened
+    expected_database = _dev_database_path()
+    if (
+        database != expected_database
+        or (int(metadata.st_dev), int(metadata.st_ino))
+        != (
+            int(expected_database.stat(follow_symlinks=False).st_dev),
+            int(expected_database.stat(follow_symlinks=False).st_ino),
+        )
+    ):
+        raise ValueError("AC dev graph materialization database custody mismatch")
+
+    server_source = Path(__file__).with_name("server.py")
+    source_sha256 = "sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest()
+    launch = validate_dev_launch_receipt(
+        _dev_storage_root(create=False), source_sha256=source_sha256
+    )
+    if (
+        launch.get("runtime_plane") != DEV_RUNTIME_PLANE
+        or launch.get("world_id", AC_DEV_WORLD_ID) != AC_DEV_WORLD_ID
+        or launch.get("project_id") != AC_PROJECT_ID
+        or launch.get("port") != 40008
+        or launch.get("background", False) is not False
+    ):
+        raise ValueError("AC dev graph materialization launch custody mismatch")
+
+    listener = _default_cutover_listener_probe(40008)
+    _validate_ac_dev_graph_materialization_listener(listener)
+
+    with _DEV_DATABASE_WRITER_LEASES_LOCK:
+        lease = _DEV_DATABASE_WRITER_LEASES.get(str(expected_database))
+        if (
+            not lease
+            or getattr(lease.get("handle"), "closed", True)
+            or lease.get("owner_pid") != os.getpid()
+            or lease.get("owner_start_identity") != _writer_process_start_identity()
+            or lease.get("database_device") != int(metadata.st_dev)
+            or lease.get("database_inode") != int(metadata.st_ino)
+        ):
+            raise ValueError("AC dev graph materialization writer custody mismatch")
+    return {
+        "schema_version": "ac_dev_graph_materialization_runtime_custody.v1",
+        "runtime_plane": DEV_RUNTIME_PLANE,
+        "world_id": AC_DEV_WORLD_ID,
+        "project_id": AC_PROJECT_ID,
+        "host": "127.0.0.1",
+        "port": 40008,
+        "pid": os.getpid(),
+        "database_device": int(metadata.st_dev),
+        "database_inode": int(metadata.st_ino),
+    }
+
+
+def _validate_ac_dev_graph_materialization_listener(
+    listener: Mapping[str, object],
+) -> None:
+    """Validate an OS-observed exact loopback listener owned by this process."""
+
+    if (
+        listener.get("port") != 40008
+        or listener.get("listening") is not True
+        or int(listener.get("pid") or 0) != os.getpid()
+        or listener.get("listener_addresses") != ["127.0.0.1:40008"]
+    ):
+        raise ValueError("AC dev graph materialization listener custody mismatch")
+    process_started = subprocess.run(
+        ["ps", "-p", str(os.getpid()), "-o", "lstart="],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    if (
+        process_started.returncode != 0
+        or not process_started.stdout.strip()
+        or str(listener.get("process_start_identity") or "").strip()
+        != process_started.stdout.strip()
+    ):
+        raise ValueError("AC dev graph materialization listener process mismatch")
 
 
 def _fd_sparse_content_digest(descriptor: int, *, size: int) -> str:
