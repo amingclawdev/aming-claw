@@ -770,6 +770,44 @@ def _admission_regular_file(path: Path, *, archive: Path | None = None) -> None:
             raise click.ClickException("AC dev schema admission receipt is outside its canonical archive") from exc
 
 
+def _admission_database_sha256(
+    database: Path, *, expected_identity: Mapping[str, object],
+) -> str:
+    """Hash the canonical database through one immutable, bounded descriptor."""
+    _admission_regular_file(database)
+    if _admission_identity(database) != expected_identity:
+        raise click.ClickException("AC dev schema admission database identity changed")
+    try:
+        descriptor = os.open(database, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise click.ClickException("AC dev schema admission database is unreadable") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            int(before.st_dev) != expected_identity.get("device")
+            or int(before.st_ino) != expected_identity.get("inode")
+        ):
+            raise click.ClickException("AC dev schema admission database identity changed")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            int(after.st_dev) != int(before.st_dev)
+            or int(after.st_ino) != int(before.st_ino)
+            or int(after.st_size) != int(before.st_size)
+            or int(after.st_mtime_ns) != int(before.st_mtime_ns)
+            or int(after.st_ctime_ns) != int(before.st_ctime_ns)
+            or _admission_identity(database) != expected_identity
+        ):
+            raise click.ClickException("AC dev schema admission database changed during digest")
+        return "sha256:" + digest.hexdigest()
+    except OSError as exc:
+        raise click.ClickException("AC dev schema admission database is unreadable") from exc
+    finally:
+        os.close(descriptor)
+
+
 def _admission_source_identity(source_tip_raw: str) -> dict[str, object]:
     try:
         source_tip = json.loads(source_tip_raw)
@@ -962,14 +1000,21 @@ def _offline_dev_schema_admission(
                 database_identity=database_identity, source_identity=source_identity,
                 plan_sha256=plan_sha256,
             )
+            current_database_sha256 = _admission_database_sha256(
+                database, expected_identity=database_identity,
+            )
             if prior["stage"] == "completed":
                 if (prior["schema_inventory_after"] != inventory_before or before["missing"]
-                    or prior["database_sha256_after"] != _file_sha256(database)):
+                    or prior["database_sha256_after"] != current_database_sha256):
                     raise click.ClickException("AC dev schema admission completed receipt does not match current database")
                 return {"status": "already_admitted", "receipt_path": str(resume_receipt), "receipt_sha256": previous_sha256, "changed": False, "missing": []}
-            if prior["stage"] != "rolled_back" or prior["schema_inventory_after"] != inventory_before:
+            if (
+                prior["stage"] != "rolled_back"
+                or prior["schema_inventory_after"] != inventory_before
+                or prior["database_sha256_after"] != current_database_sha256
+            ):
                 raise click.ClickException("AC dev schema admission rollback receipt does not match current database")
-        pre_digest = _file_sha256(database)
+        pre_digest = _admission_database_sha256(database, expected_identity=database_identity)
         archive.mkdir(parents=True, exist_ok=True)
         backup = archive / (pre_digest.removeprefix("sha256:") + ".pre.sqlite")
         if backup.exists():
@@ -992,7 +1037,7 @@ def _offline_dev_schema_admission(
                 "source_identity": source_identity, "plan_sha256": plan_sha256,
                 "schema_inventory_before": inventory_before, "schema_inventory_after": inventory_after,
                 "backup": {"identity": backup_identity, "sha256": pre_digest},
-                "database_sha256_before": pre_digest, "database_sha256_after": _file_sha256(database),
+                "database_sha256_before": pre_digest, "database_sha256_after": _admission_database_sha256(database, expected_identity=database_identity),
                 "previous_receipt_sha256": previous_sha256, "changed": False,
                 "missing": before["missing"],
             }
@@ -1015,12 +1060,12 @@ def _offline_dev_schema_admission(
             "source_identity": source_identity, "plan_sha256": plan_sha256,
             "schema_inventory_before": inventory_before, "schema_inventory_after": inventory_after,
             "backup": {"identity": backup_identity, "sha256": pre_digest},
-            "database_sha256_before": pre_digest, "database_sha256_after": _file_sha256(database),
+            "database_sha256_before": pre_digest, "database_sha256_after": _admission_database_sha256(database, expected_identity=database_identity),
             "previous_receipt_sha256": previous_sha256, "changed": bool(result["changed"]),
             "missing": result["missing"],
         }
         receipt_path, receipt_digest = _write_admission_receipt(archive, receipt_payload)
-        return {"status": "admitted", "receipt_path": str(receipt_path), "receipt_sha256": receipt_digest, "changed": result["changed"], "missing": result["missing"], "post_sha256": _file_sha256(database)}
+        return {"status": "admitted", "receipt_path": str(receipt_path), "receipt_sha256": receipt_digest, "changed": result["changed"], "missing": result["missing"], "post_sha256": _admission_database_sha256(database, expected_identity=database_identity)}
     finally:
         conn.close()
 
@@ -1062,7 +1107,11 @@ def _aming_claw_source_checkout(start: Path) -> Optional[Path]:
 
 def _file_sha256(path: Path) -> str:
     try:
-        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return "sha256:" + digest.hexdigest()
     except OSError:
         return ""
 

@@ -3981,6 +3981,52 @@ def test_dev_admit_schema_forced_ddl_error_emits_rollback_receipt_and_resumes(tm
     finally:
         check.close()
     monkeypatch.setattr(db, "admit_missing_backlog_read_schema", original_admission)
+    rollback_database_bytes = database.read_bytes()
+
+    changed = sqlite3.connect(database)
+    changed.execute("PRAGMA user_version = 194")
+    changed.commit()
+    changed.close()
+    user_version_drift = database.read_bytes()
+    rejected_user_version = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(rollback_receipt)])
+    assert rejected_user_version.exit_code != 0
+    assert "rollback receipt does not match current database" in rejected_user_version.output
+    assert database.read_bytes() == user_version_drift
+
+    database.write_bytes(rollback_database_bytes)
+    arbitrary_bytes = bytearray(database.read_bytes())
+    arbitrary_bytes[68] ^= 1  # SQLite application_id: semantically inert but byte-distinct.
+    database.write_bytes(arbitrary_bytes)
+    arbitrary_byte_drift = database.read_bytes()
+    rejected_byte_drift = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(rollback_receipt)])
+    assert rejected_byte_drift.exit_code != 0
+    assert "rollback receipt does not match current database" in rejected_byte_drift.output
+    assert database.read_bytes() == arbitrary_byte_drift
+
+    database.write_bytes(rollback_database_bytes)
     resumed = CliRunner().invoke(main, ["dev-admit-schema", "--dev-storage-root", str(root), "--project-id", "aming-claw", "--port", "40008", "--resume-receipt", str(rollback_receipt)])
     assert resumed.exit_code == 0, resumed.output
     assert json.loads(resumed.output)["status"] == "admitted"
+
+
+def test_admission_database_sha256_reads_bounded_chunks_without_mutating_file(tmp_path, monkeypatch):
+    import agent.cli as cli
+
+    database = tmp_path / "governance.db"
+    payload = b"AC-dev-digest\n" * (3 * 1024 * 1024 // len(b"AC-dev-digest\n") + 1)
+    database.write_bytes(payload)
+    before = database.read_bytes()
+    expected_identity = cli._admission_identity(database)
+    original_read = cli.os.read
+    read_sizes = []
+
+    def bounded_read(descriptor, amount):
+        read_sizes.append(amount)
+        return original_read(descriptor, amount)
+
+    monkeypatch.setattr(cli.os, "read", bounded_read)
+    digest = cli._admission_database_sha256(database, expected_identity=expected_identity)
+
+    assert digest == "sha256:" + hashlib.sha256(before).hexdigest()
+    assert read_sizes and max(read_sizes) <= 1024 * 1024
+    assert database.read_bytes() == before
