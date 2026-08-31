@@ -2715,6 +2715,70 @@ def resolve_route_token_ref(
     )
 
 
+def resolve_observer_session_registration_route(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    route_token_ref: str,
+    backlog_id: str,
+    task_id: str,
+    cex_id: str,
+) -> dict[str, Any]:
+    """Resolve the one persisted route that may create a dev observer session.
+
+    This deliberately returns server-owned capability/provenance data.  The
+    registration caller supplies only opaque/scoped identity selectors and
+    cannot mint its own privileges.
+    """
+    resolved = resolve_route_token_ref(
+        conn,
+        project_id=project_id,
+        route_token_ref=route_token_ref,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    if resolved is None:
+        raise RouteTokenRefError(
+            "observer session registration route_token_ref is unknown",
+            code="route_token_ref_unknown",
+        )
+    if _string(resolved.get("caller_role")) != "observer":
+        raise RouteTokenRefError(
+            "observer session registration requires an observer route",
+            code="route_token_ref_not_observer",
+        )
+    allowed = set(_normalized_action_list(resolved.get("allowed_actions")))
+    if "observer_session_register" not in allowed:
+        raise RouteTokenRefError(
+            "route_token_ref does not allow observer_session_register",
+            code="route_token_ref_action_not_allowed",
+        )
+    evidence_refs = {_string(item) for item in resolved.get("evidence_refs") or []}
+    if not cex_id or cex_id not in evidence_refs:
+        raise RouteTokenRefError(
+            "route_token_ref does not carry the exact Direct CEX",
+            code="route_token_ref_cex_mismatch",
+        )
+    return {
+        "actions": list(observer_action for observer_action in (
+            "observer_session_heartbeat", "observer_session_close",
+            "observer_session_revoke", "observer_command_claim",
+            "observer_command_takeover", "observer_command_complete",
+            "observer_command_fail",
+        )),
+        "command_types": [],
+        "route_provenance": {
+            "route_token_ref": _string(resolved.get("route_token_ref")),
+            "route_id": _string(resolved.get("route_id")),
+            "route_context_hash": _string(resolved.get("route_context_hash")),
+            "prompt_contract_id": _string(resolved.get("prompt_contract_id")),
+            "backlog_id": _string(backlog_id),
+            "task_id": _string(task_id),
+            "cex_id": _string(cex_id),
+        },
+    }
+
+
 def resolve_route_token_ref_renewal_descendant(
     conn: sqlite3.Connection,
     *,

@@ -16031,7 +16031,6 @@ def test_ac_dev_request_guard_allows_candidate_only_and_repair_writes(monkeypatc
         "/api/branch-service/validate",
         "/api/projects/aming-claw/direct-fix/enter",
         "/api/projects/aming-claw/direct-fix/start",
-        "/api/projects/aming-claw/observer-sessions/register",
         "/api/role/assign",
     ],
 )
@@ -16048,6 +16047,139 @@ def test_ac_dev_request_guard_blocks_source_process_and_unlisted_writes(
         )
     assert "ac_dev_mutation_not_allowlisted" in str(raised.value)
     assert raised.value.details["writes_performed"] is False
+
+
+def test_ac_dev_request_guard_allows_only_exact_route_bound_observer_registration(
+    monkeypatch,
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    path = "/api/projects/aming-claw/observer-sessions/register"
+    exact = {
+        "project_id": "aming-claw",
+        "route_token_ref": "rtok-register",
+        "backlog_id": "AC-REGISTER",
+        "task_id": "observer-register",
+        "cex_id": "cex-direct-main-register",
+    }
+    server._guard_dev_runtime_request(
+        method="POST",
+        path=path,
+        path_params={"project_id": "aming-claw"},
+        body=exact,
+    )
+    for invalid in (
+        {**exact, "capabilities": {"actions": ["*"]}},
+        {**exact, "pid": 123},
+        {key: value for key, value in exact.items() if key != "route_token_ref"},
+    ):
+        with pytest.raises(ValidationError) as raised:
+            server._guard_dev_runtime_request(
+                method="POST",
+                path=path,
+                path_params={"project_id": "aming-claw"},
+                body=invalid,
+            )
+        assert raised.value.details["writes_performed"] is False
+
+
+def test_ac_dev_observer_registration_handler_derives_authority_server_side(
+    conn, monkeypatch
+):
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: conn)
+    derived = {
+        "actions": ["observer_session_heartbeat"],
+        "command_types": [],
+        "route_provenance": {"route_token_ref": "rtok-register"},
+    }
+    seen = {}
+    from agent.governance import observer_route_context
+
+    def resolve(_conn, **kwargs):
+        seen.update(kwargs)
+        return derived
+
+    monkeypatch.setattr(
+        observer_route_context,
+        "resolve_observer_session_registration_route",
+        resolve,
+    )
+    result = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "project_id": PID,
+                "route_token_ref": "rtok-register",
+                "backlog_id": "AC-REGISTER",
+                "task_id": "observer-register",
+                "cex_id": "cex-direct-main-register",
+            },
+        )
+    )
+    assert result[0] == 201
+    assert seen["route_token_ref"] == "rtok-register"
+    stored = conn.execute(
+        "SELECT observer_kind,pid,cwd,capabilities_json FROM observer_sessions "
+        "WHERE session_id=?",
+        (result[1]["observer_session_id"],),
+    ).fetchone()
+    assert (stored["observer_kind"], stored["pid"], stored["cwd"]) == ("codex", 0, "")
+    assert json.loads(stored["capabilities_json"]) == derived
+
+
+def test_observer_registration_route_requires_exact_action_scope_and_cex(
+    conn, monkeypatch
+):
+    from agent.governance import observer_route_context
+
+    resolved = {
+        "route_token_ref": "rtok-register",
+        "route_id": "route-register",
+        "route_context_hash": "sha256:route-register",
+        "prompt_contract_id": "rprompt-register",
+        "caller_role": "observer",
+        "allowed_actions": ["observer_session_register"],
+        "evidence_refs": ["cex-direct-main-register"],
+    }
+    monkeypatch.setattr(
+        observer_route_context,
+        "resolve_route_token_ref",
+        lambda *_args, **_kwargs: dict(resolved),
+    )
+    authority = observer_route_context.resolve_observer_session_registration_route(
+        conn,
+        project_id=PID,
+        route_token_ref="rtok-register",
+        backlog_id="AC-REGISTER",
+        task_id="observer-register",
+        cex_id="cex-direct-main-register",
+    )
+    assert authority["route_provenance"]["route_id"] == "route-register"
+    assert authority["actions"][0] == "observer_session_heartbeat"
+
+    for field, value in (
+        ("allowed_actions", ["graph_query"]),
+        ("evidence_refs", ["cex-direct-main-other"]),
+        ("caller_role", "worker"),
+    ):
+        monkeypatch.setattr(
+            observer_route_context,
+            "resolve_route_token_ref",
+            lambda *_args, _field=field, _value=value, **_kwargs: {
+                **resolved,
+                _field: _value,
+            },
+        )
+        with pytest.raises(observer_route_context.RouteTokenRefError):
+            observer_route_context.resolve_observer_session_registration_route(
+                conn,
+                project_id=PID,
+                route_token_ref="rtok-register",
+                backlog_id="AC-REGISTER",
+                task_id="observer-register",
+                cex_id="cex-direct-main-register",
+            )
 
 
 def test_ac_dev_candidate_graph_rejects_external_or_implicit_source_root(

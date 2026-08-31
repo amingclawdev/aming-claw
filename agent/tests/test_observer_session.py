@@ -70,6 +70,52 @@ def test_heartbeat_updates_last_seen_and_restores_active_status():
     assert heartbeat["session"]["computed_status"] == "active"
 
 
+def test_dev_session_register_and_heartbeat_are_verify_only_bounded_dml(monkeypatch):
+    conn = _conn()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    result = observer_session.register_session(
+        conn,
+        project_id="aming-claw",
+        capabilities={"actions": [observer_session.ACTION_SESSION_HEARTBEAT]},
+        now="2026-08-31T00:00:00Z",
+    )
+    observer_session.heartbeat_session(
+        conn,
+        project_id="aming-claw",
+        session_id=result["session_id"],
+        session_token=result["session_token"],
+        now="2026-08-31T00:01:00Z",
+    )
+
+    writes = [statement.strip().upper() for statement in statements]
+    assert not any(
+        statement.startswith(("CREATE ", "ALTER ", "DROP "))
+        for statement in writes
+    )
+    assert sum(statement.startswith("INSERT INTO OBSERVER_SESSIONS") for statement in writes) == 1
+    assert sum(statement.startswith("UPDATE OBSERVER_SESSIONS") for statement in writes) == 1
+
+
+def test_dev_session_schema_drift_rejects_before_dml(monkeypatch):
+    conn = _conn()
+    conn.execute("DROP INDEX idx_observer_commands_target")
+    conn.commit()
+    monkeypatch.setenv("AMING_CLAW_RUNTIME_PLANE", "dev")
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    with pytest.raises(Exception, match="schema"):
+        observer_session.register_session(conn, project_id="aming-claw")
+
+    assert not any(
+        statement.lstrip().upper().startswith("INSERT INTO OBSERVER_SESSIONS")
+        for statement in statements
+    )
+
+
 def test_stale_status_is_computed_from_last_seen():
     conn = _conn()
     result = observer_session.register_session(

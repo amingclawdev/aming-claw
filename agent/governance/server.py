@@ -3710,6 +3710,7 @@ def _dev_write_path_allowed(path: str) -> bool:
         "/api/projects/aming-claw/onboard-route-guide/capsule",
         "/api/projects/aming-claw/observer/route-context/issue",
         "/api/projects/aming-claw/observer/route-context/renew",
+        "/api/projects/aming-claw/observer-sessions/register",
         "/api/graph-governance/aming-claw/query",
         "/api/graph-governance/aming-claw/query-traces/start",
         "/api/graph-governance/aming-claw/reconcile/full",
@@ -3988,6 +3989,25 @@ def _guard_dev_runtime_request(
                 "ContractRuntime, candidate-only graph, and QA evidence"
             ),
         )
+
+    if path == "/api/projects/aming-claw/observer-sessions/register":
+        required = {"project_id", "route_token_ref", "backlog_id", "task_id", "cex_id"}
+        self_claims = {
+            "capabilities", "allowed_actions", "observer_kind", "pid", "cwd",
+            "session_id", "route_id", "route_context_hash", "prompt_contract_id",
+        }
+        missing = sorted(key for key in required if not str(body.get(key) or "").strip())
+        claimed = sorted(key for key in self_claims if key in body)
+        unknown = sorted(set(body) - required - {"session_label"})
+        if missing or claimed or unknown:
+            raise _dev_runtime_zero_write_rejection(
+                code="ac_dev_observer_session_registration_shape_rejected",
+                path=path,
+                detail=(
+                    "dev observer registration requires exact route-bound identity "
+                    f"(missing={missing}, self_claims={claimed}, unknown={unknown})"
+                ),
+            )
 
     if path == "/api/projects/aming-claw/observer/route-context/issue":
         # Canonical adoption has a separate closed authority parser in the
@@ -7040,22 +7060,50 @@ def _observer_error(exc: Exception):
 
 @route("POST", "/api/projects/{project_id}/observer-sessions/register")
 def handle_observer_session_register(ctx: RequestContext):
+    from . import observer_route_context
+
     project_id = ctx.get_project_id()
     conn = get_connection(project_id)
     try:
         with sqlite_write_lock():
+            capabilities = None
+            observer_kind = str(ctx.body.get("observer_kind") or "codex")
+            pid = int(ctx.body.get("pid") or 0)
+            cwd = str(ctx.body.get("cwd") or "")
+            session_id = str(ctx.body.get("session_id") or "") or None
+            if _runtime_plane() == "dev":
+                capabilities = observer_route_context.resolve_observer_session_registration_route(
+                    conn,
+                    project_id=project_id,
+                    route_token_ref=str(ctx.body.get("route_token_ref") or ""),
+                    backlog_id=str(ctx.body.get("backlog_id") or ""),
+                    task_id=str(ctx.body.get("task_id") or ""),
+                    cex_id=str(ctx.body.get("cex_id") or ""),
+                )
+                observer_kind = "codex"
+                pid = 0
+                cwd = ""
+                session_id = None
             result = observer_session.register_session(
                 conn,
                 project_id=project_id,
-                observer_kind=str(ctx.body.get("observer_kind") or "codex"),
+                observer_kind=observer_kind,
                 session_label=str(ctx.body.get("session_label") or ""),
-                pid=int(ctx.body.get("pid") or 0),
-                cwd=str(ctx.body.get("cwd") or ""),
-                capabilities=ctx.body.get("capabilities")
-                if isinstance(ctx.body.get("capabilities"), (dict, list))
-                else None,
-                session_id=str(ctx.body.get("session_id") or "") or None,
+                pid=pid,
+                cwd=cwd,
+                capabilities=(capabilities if capabilities is not None else (
+                    ctx.body.get("capabilities")
+                    if isinstance(ctx.body.get("capabilities"), (dict, list))
+                    else None
+                )),
+                session_id=session_id,
             )
+    except observer_route_context.RouteTokenRefError as exc:
+        return 403, {
+            "ok": False,
+            "error": str(getattr(exc, "code", "observer_registration_route_rejected")),
+            "message": "observer registration route authority rejected",
+        }
     except Exception as exc:
         return _observer_error(exc)
     return 201, {"project_id": project_id, **result}
