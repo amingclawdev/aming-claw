@@ -3466,6 +3466,7 @@ class TestACDevRuntimeCli:
         dev_storage_root = tmp_path / "dev-world"
         calls = []
         legacy_start = types.ModuleType("start_governance")
+        legacy_start.__file__ = "<test-start-governance>"
 
         def reject_legacy_start(_name):
             pytest.fail("dev startup must not import the legacy backfill wrapper")
@@ -4415,3 +4416,114 @@ def test_admission_database_sha256_reads_bounded_chunks_without_mutating_file(tm
     assert digest == "sha256:" + hashlib.sha256(before).hexdigest()
     assert read_sizes and max(read_sizes) <= 1024 * 1024
     assert database.read_bytes() == before
+
+
+def test_posix_detached_popen_survives_launcher_parent_on_real_temp_port(tmp_path):
+    import socket
+    import signal
+    import time
+
+    if os.name != "posix":
+        pytest.skip("POSIX lifecycle only")
+    probe = socket.socket(); probe.bind(("127.0.0.1", 0)); port = probe.getsockname()[1]; probe.close()
+    log = tmp_path / "child.log"
+    child_code = (
+        "import socket,time,sys; "
+        "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); "
+        "s.bind(('127.0.0.1',int(sys.argv[1]))); s.listen(); time.sleep(60)"
+    )
+    launcher_code = (
+        "import os,sys; from pathlib import Path; from agent.cli import _posix_detached_popen; "
+        "fd=os.open(sys.argv[2],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); "
+        "p=_posix_detached_popen([sys.executable,'-c',sys.argv[3],sys.argv[1]],cwd=Path.cwd(),log_fd=fd); "
+        "os.close(fd); print(p.pid,flush=True)"
+    )
+    launcher = subprocess.run(
+        [sys.executable, "-c", launcher_code, str(port), str(log), child_code],
+        cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
+        timeout=10, check=True,
+    )
+    pid = int(launcher.stdout.strip())
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            pytest.fail("detached child did not survive launcher parent")
+        os.kill(pid, 0)
+    finally:
+        os.kill(pid, signal.SIGTERM)
+
+
+def test_posix_exclusive_durable_receipt_rejects_collision_and_symlink(tmp_path):
+    import agent.cli as cli
+
+    receipt = tmp_path / "receipt.json"
+    cli._posix_exclusive_json(receipt, {"stage": "pending"})
+    before = receipt.read_bytes()
+    with pytest.raises(cli.click.ClickException, match="collision"):
+        cli._posix_exclusive_json(receipt, {"stage": "completed"})
+    assert receipt.read_bytes() == before
+    target = tmp_path / "target"; target.write_text("target", encoding="utf-8")
+    link = tmp_path / "link.json"; link.symlink_to(target)
+    with pytest.raises(cli.click.ClickException, match="canonical"):
+        cli._posix_exclusive_json(link, {"stage": "pending"})
+
+
+def test_posix_detached_popen_uses_no_shell_new_session_and_devnull(tmp_path, monkeypatch):
+    import agent.cli as cli
+
+    captured = {}
+    sentinel = object()
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda argv, **kwargs: (
+        captured.update(argv=argv, **kwargs) or sentinel
+    ))
+    result = cli._posix_detached_popen(
+        [sys.executable, "-m", "agent.cli"], cwd=tmp_path, log_fd=17,
+    )
+    assert result is sentinel
+    assert captured == {
+        "argv": [sys.executable, "-m", "agent.cli"], "cwd": tmp_path,
+        "stdin": subprocess.DEVNULL, "stdout": 17, "stderr": 17,
+        "start_new_session": True, "shell": False, "close_fds": True,
+    }
+
+
+def test_durable_stop_identity_drift_never_signals_other_pid(tmp_path, monkeypatch):
+    import agent.cli as cli
+
+    dev = tmp_path / "dev"; runtime = dev / "runtime" / "durable-launch"; runtime.mkdir(parents=True)
+    source = tmp_path / "source"; (source / "agent" / "governance").mkdir(parents=True)
+    server = source / "agent" / "governance" / "server.py"; server.write_text("server\n", encoding="utf-8")
+    database = dev / "governance" / "aming-claw" / "governance.db"; database.parent.mkdir(parents=True); database.write_bytes(b"db")
+    details = database.stat()
+    receipt = {
+        "schema_version": cli._AC_DEV_DURABLE_LAUNCH_VERSION, "stage": "completed",
+        "launch_id": "fixture", "pid": 424242, "project_id": "aming-claw", "port": 40008,
+        "dev_storage_root": str(dev), "source_root": str(source), "source_commit": "a" * 40,
+        "source_tree": "b" * 40, "server_sha256": "sha256:" + hashlib.sha256(server.read_bytes()).hexdigest(),
+        "python": str(Path(sys.executable).resolve()), "database_path": str(database),
+        "database_identity": {"device": details.st_dev, "inode": details.st_ino},
+        "process": {"start_identity": "sha256:" + "c" * 64, "argv": "expected", "cwd": str(source)},
+        "argv": [sys.executable, "child"], "cwd": str(source), "exit_receipt": str(runtime / "exit-status.json"),
+        "linked_v3_receipt_sha256": "sha256:" + "e" * 64,
+    }
+    (runtime / "launch.completed.json").write_text(json.dumps(receipt), encoding="utf-8")
+    monkeypatch.setattr(cli, "_source_git_identity", lambda: {
+        "root": str(source), "commit": "a" * 40, "tree": "b" * 40, "dirty": "",
+    })
+    monkeypatch.setattr(cli, "_posix_process_identity", lambda _pid: {
+        "start_identity": "sha256:" + "d" * 64, "argv": "attacker", "cwd": str(source),
+    })
+    monkeypatch.setattr(cli, "_validated_linked_v3_receipt", lambda *_args, **_kwargs: (
+        "sha256:" + "e" * 64, {},
+    ))
+    signals = []
+    monkeypatch.setattr(cli.os, "kill", lambda *args: signals.append(args))
+    with pytest.raises(cli.click.ClickException, match="process identity mismatch"):
+        cli._durable_dev_stop(dev)
+    assert signals == []
