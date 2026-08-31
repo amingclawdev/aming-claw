@@ -198650,6 +198650,12 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
     task_id = prepared["task_id"]
     project_id = prepared["project_id"]
     body = prepared["issue_body"]
+    # Stable and dev are distinct worlds.  Keep the preserved stable fixture
+    # in its own DB/registry custody so it cannot become a same-backlog Direct
+    # lineage candidate while this test exercises the dev bootstrap.
+    stable_conn = sqlite3.connect(tmp_path / "stable-preserved.db")
+    stable_conn.row_factory = sqlite3.Row
+    conn.backup(stable_conn)
     stable_task_id = "cex-direct-main-stable-preserved"
     stable_record = {
         "project_id": project_id,
@@ -198667,7 +198673,7 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
             }
         },
     }
-    conn.execute(
+    stable_conn.execute(
         """
         INSERT INTO contract_runtime_executions (
             contract_execution_id, project_id, backlog_id, contract_id,
@@ -198695,26 +198701,26 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
         target_files=["agent/stable_preserved.py"],
     )
     observer_route_context.persist_route_token_ref(
-        conn,
+        stable_conn,
         project_id=project_id,
         route_token_ref=stable_issued["route_token_ref"],
         token=stable_issued["route_token"],
     )
     stable_contract_before = tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM contract_runtime_executions WHERE project_id=? "
             "ORDER BY contract_execution_id",
             (project_id,),
         ).fetchall()
     )
     stable_route_before = tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?",
             (stable_issued["route_token_ref"],),
         ).fetchall()
     )
     stable_projection_before = tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM backlog_contract_chain_current WHERE project_id=? "
             "ORDER BY backlog_id",
             (project_id,),
@@ -198783,27 +198789,22 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
         task_id,
         "active",
     )
-    assert conn.execute(
-        "SELECT 1 FROM observer_route_token_refs "
-        "WHERE project_id=? AND route_token_ref=?",
-        (project_id, route_ref),
-    ).fetchone() is None
     assert first["route_token"]["scope"]["project_id"] == project_id
     assert tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM contract_runtime_executions WHERE project_id=? "
             "ORDER BY contract_execution_id",
             (project_id,),
         ).fetchall()
     ) == stable_contract_before
     assert tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM observer_route_token_refs WHERE route_token_ref=?",
             (stable_issued["route_token_ref"],),
         ).fetchall()
     ) == stable_route_before
     assert tuple(
-        conn.execute(
+        stable_conn.execute(
             "SELECT * FROM backlog_contract_chain_current WHERE project_id=? "
             "ORDER BY backlog_id",
             (project_id,),
@@ -198875,8 +198876,8 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
     )
     assert dev_gate["decision"] == "route_token_ref_resolved"
 
-    # Frozen a258 and a promoted/new stable default both select the canonical
-    # physical project id.  They must not resolve or authorize the dev ref.
+    # Stable owns a separate registry custody.  It must not resolve or
+    # authorize a ref materialized only in the dev fixture DB.
     with monkeypatch.context() as stable_runtime:
         stable_runtime.setenv("AMING_CLAW_RUNTIME_PLANE", "stable")
         frozen_routes = _load_frozen_a258_module(
@@ -198887,9 +198888,9 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
             "agent/governance/mf_subagent_contract.py",
             "mf_subagent_contract",
         )
-        stable_before = tuple(conn.iterdump())
+        stable_before = tuple(stable_conn.iterdump())
         assert frozen_routes.resolve_route_token_ref(
-            conn,
+            stable_conn,
             project_id=project_id,
             route_token_ref=route_ref,
             backlog_id=backlog_id,
@@ -198905,25 +198906,31 @@ def test_ac_dev_first_guide_route_issue_atomically_materializes_namespace_and_re
                 require_server_binding=True,
                 server_binding=None,
             )
-        assert server._resolve_route_token_ref_server_side(
-            {"route_token_ref": route_ref},
-            pid=project_id,
-            backlog_id=backlog_id,
-            task_id=task_id,
-        ) is None
-        with pytest.raises(GovernanceError, match="route_token"):
-            server._require_route_token_mutation_gate(
-                _ctx(
-                    {"project_id": project_id},
-                    method="POST",
-                    body={"route_token_ref": route_ref},
-                ),
-                action="task_timeline_append",
-                project_id=project_id,
-                backlog_id=backlog_id,
-                task_id=task_id,
+        with monkeypatch.context() as stable_storage:
+            stable_storage.setattr(
+                server, "get_connection", lambda _project_id: _NoCloseConn(stable_conn)
             )
-        assert tuple(conn.iterdump()) == stable_before
+            with pytest.raises(ValueError, match="stable world cannot persist AC"):
+                server._resolve_route_token_ref_server_side(
+                    {"route_token_ref": route_ref},
+                    pid=project_id,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                )
+            with pytest.raises(ValueError, match="stable world cannot persist AC"):
+                server._require_route_token_mutation_gate(
+                    _ctx(
+                        {"project_id": project_id},
+                        method="POST",
+                        body={"route_token_ref": route_ref},
+                    ),
+                    action="task_timeline_append",
+                    project_id=project_id,
+                    backlog_id=backlog_id,
+                    task_id=task_id,
+                )
+    assert tuple(stable_conn.iterdump()) == stable_before
+    stable_conn.close()
 
 
 def test_ac_dev_route_storage_scope_partition_supports_renewal_and_binding(
@@ -198944,6 +198951,9 @@ def test_ac_dev_route_storage_scope_partition_supports_renewal_and_binding(
         project_id,
         prepared["world"]["namespace_hash"],
     )
+    wrong_conn = sqlite3.connect(tmp_path / "other-dev-world.db")
+    wrong_conn.row_factory = sqlite3.Row
+    conn.backup(wrong_conn)
     fixed_now = datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc)
     issued = observer_route_context.issue_observer_write_route_context(
         project_id=project_id,
@@ -198962,43 +198972,38 @@ def test_ac_dev_route_storage_scope_partition_supports_renewal_and_binding(
         route_token_ref=old_ref,
         token=issued["route_token"],
     )
-    stable_before = tuple(
-        conn.execute(
-            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
-            (project_id,),
-        ).fetchall()
-    )
-    wrong_storage_project_id = server.direct_main_dev_storage_project_id(
-        project_id,
-        "sha256:" + ("f" * 64),
-    )
-    wrong_namespace_before = tuple(conn.iterdump())
+    # The worlds are physically isolated DBs, not project-id namespaces in one
+    # DB.  Exercise the same public ref against an independent dev custody.
+    wrong_namespace_before = tuple(wrong_conn.iterdump())
     assert observer_route_context.resolve_route_token_ref(
-        conn,
+        wrong_conn,
         project_id=project_id,
-        storage_project_id=wrong_storage_project_id,
+        storage_project_id=project_id,
         route_token_ref=old_ref,
+        now=fixed_now,
     ) is None
     with pytest.raises(
         observer_route_context.RouteTokenRefError,
         match="unknown; renewal refused",
     ):
         observer_route_context.renew_route_token_ref(
-            conn,
+            wrong_conn,
             project_id=project_id,
-            storage_project_id=wrong_storage_project_id,
+            storage_project_id=project_id,
             route_token_ref=old_ref,
             backlog_id=backlog_id,
             task_id=task_id,
             now=fixed_now + timedelta(minutes=50),
         )
-    assert tuple(conn.iterdump()) == wrong_namespace_before
+    assert tuple(wrong_conn.iterdump()) == wrong_namespace_before
+    wrong_conn.close()
 
     assert observer_route_context.resolve_route_token_ref(
         conn,
         project_id=project_id,
         route_token_ref=old_ref,
-    ) is None
+        now=fixed_now,
+    )["route_token_ref"] == old_ref
     resolved = observer_route_context.resolve_route_token_ref(
         conn,
         project_id=project_id,
@@ -199074,12 +199079,6 @@ def test_ac_dev_route_storage_scope_partition_supports_renewal_and_binding(
         "WHERE project_id=? AND route_token_ref=?",
         (storage_project_id, new_ref),
     ).fetchone()["status"] == "superseded"
-    assert tuple(
-        conn.execute(
-            "SELECT * FROM observer_route_token_refs WHERE project_id=?",
-            (project_id,),
-        ).fetchall()
-    ) == stable_before
 
 
 def test_ac_dev_route_consumers_reject_malformed_physical_scope_zero_write(
