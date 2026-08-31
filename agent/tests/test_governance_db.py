@@ -1898,3 +1898,70 @@ def test_canonical_legacy_postimage_adoption_is_exact_zero_connect_ingress(
                 create=False, isolated_receipt=linked, source_identity=source, allow_postimage=True,
             )
     assert connects == []
+
+
+def test_sqlite_projection_value_is_lossless_and_type_tagged():
+    from governance import db
+
+    encode = db._sqlite_projection_value
+    assert encode(None) == ["null", ""]
+    assert encode(False) == ["integer", "0"]
+    assert encode(True) == ["integer", "1"]
+    assert encode(-(2**63)) == ["integer", "-9223372036854775808"]
+    assert encode(2**63 - 1) == ["integer", "9223372036854775807"]
+    assert encode(1) != encode(1.0)
+    assert encode(0.0) != encode(-0.0)
+    assert encode(float("nan")) == ["float", "nan"]
+    assert encode(float("inf")) == ["float", "+inf"]
+    assert encode(float("-inf")) == ["float", "-inf"]
+    assert encode("") != encode(b"")
+    assert encode("ff") != encode(b"\xff")
+    assert encode(memoryview(b"\x00\xff")) == ["blob-hex", "00ff"]
+
+
+def test_sqlite_projection_covers_fts_shadow_blobs_and_is_row_order_independent(tmp_path):
+    from governance import db
+    import agent.cli as cli
+
+    projections = []
+    for number, row_order in enumerate(((2, 1), (1, 2))):
+        path = tmp_path / f"projection-{number}.db"
+        connection = sqlite3.connect(path)
+        connection.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT)")
+        connection.execute("CREATE TABLE typed(id INTEGER PRIMARY KEY, text_value, blob_value, real_value)")
+        for row_id in row_order:
+            connection.execute(
+                "INSERT INTO typed VALUES(?,?,?,?)",
+                (row_id, "\u2603" if row_id == 1 else "", b"\x00\xff" if row_id == 1 else b"", -0.0 if row_id == 1 else float("inf")),
+            )
+        connection.execute("CREATE VIRTUAL TABLE memories_fts USING fts5(body)")
+        connection.execute("INSERT INTO memories_fts(body) VALUES('realistic shadow block')")
+        connection.commit()
+        block = connection.execute(
+            "SELECT block FROM memories_fts_data WHERE block IS NOT NULL ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        assert isinstance(block, bytes) and block
+        projections.append(db._sqlite_logical_projection(
+            connection, exclude_tables=frozenset({"schema_meta"}),
+        ))
+        connection.close()
+        public_projection, _meta = cli._immutable_sqlite_projection(path)
+        assert public_projection == projections[-1]
+    assert projections[0] == projections[1]
+    assert "memories_fts_data" in projections[0]
+
+
+def test_sqlite_projection_detects_text_blob_numeric_and_signed_zero_collisions(tmp_path):
+    from governance import db
+
+    path = tmp_path / "collision.db"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE values_under_test(id INTEGER PRIMARY KEY, value)")
+    connection.executemany("INSERT INTO values_under_test VALUES(?,?)", [
+        (1, "same"), (2, b"same"), (3, 1), (4, 1.0), (5, 0.0), (6, -0.0),
+    ])
+    baseline = db._sqlite_logical_projection(connection)
+    connection.execute("UPDATE values_under_test SET value=? WHERE id=2", ("same",))
+    connection.commit()
+    assert db._sqlite_logical_projection(connection) != baseline
+    connection.close()

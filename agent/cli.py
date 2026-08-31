@@ -2372,26 +2372,15 @@ _AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION = (
 
 def _immutable_sqlite_projection(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     """Return source-independent logical hashes without ever opening a writer."""
+    from agent.governance import db as _db
     uri = "file:" + urllib.parse.quote(str(path)) + "?mode=ro&immutable=1"
     connection = sqlite3.connect(uri, uri=True)
     try:
         if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
             raise click.ClickException("AC dev canonical adoption quick-check failed")
-        tables = [row[0] for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        ) if row[0] != "schema_meta" and not row[0].startswith("sqlite_")]
-        projection: dict[str, str] = {}
-        for table in tables:
-            columns = [row[1] for row in connection.execute(
-                f'PRAGMA table_info("{table}")'
-            )]
-            quoted = ",".join(f'"{column}"' for column in columns)
-            rows = connection.execute(
-                f'SELECT {quoted} FROM "{table}" ORDER BY {quoted}'
-            ).fetchall()
-            projection[table] = "sha256:" + hashlib.sha256(
-                _canonical_json_bytes([list(row) for row in rows])
-            ).hexdigest()
+        projection = _db._sqlite_logical_projection(
+            connection, exclude_tables=frozenset({"schema_meta"}),
+        )
         meta = dict(connection.execute("SELECT key,value FROM schema_meta ORDER BY key"))
         return projection, {str(key): str(value) for key, value in meta.items()}
     finally:

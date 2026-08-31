@@ -17,6 +17,8 @@ import re
 import fcntl
 import subprocess
 import errno
+import math
+import struct
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -54,6 +56,60 @@ AC_DEV_LAUNCH_RECEIPT_NAME = "launch-receipt.json"
 _SQLITE_WRITE_LOCK = threading.RLock()
 _DEV_DATABASE_WRITER_LEASES: dict[str, dict[str, object]] = {}
 _DEV_DATABASE_WRITER_LEASES_LOCK = threading.RLock()
+
+
+def _sqlite_projection_value(value: object) -> list[str]:
+    """Encode one SQLite value without type, sign, or byte ambiguity."""
+    if value is None:
+        return ["null", ""]
+    # sqlite3 returns INTEGER as int.  Treat an injected Python bool by the
+    # same SQLite storage-class policy instead of inventing a BOOLEAN class.
+    if isinstance(value, bool):
+        return ["integer", "1" if value else "0"]
+    if isinstance(value, int):
+        return ["integer", str(value)]
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ["float", "nan"]
+        if math.isinf(value):
+            return ["float", "+inf" if value > 0 else "-inf"]
+        # IEEE-754 bytes are exact and preserve -0.0 independently of +0.0.
+        return ["float64-be", struct.pack(">d", value).hex()]
+    if isinstance(value, str):
+        # JSON's UTF-8 encoding is deterministic; the tag separates TEXT from BLOB.
+        return ["text-utf8", value]
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return ["blob-hex", bytes(value).hex()]
+    raise TypeError("unsupported SQLite projection value type: " + type(value).__name__)
+
+
+def _sqlite_logical_projection(
+    connection: sqlite3.Connection, *, exclude_tables: frozenset[str] = frozenset(),
+) -> dict[str, str]:
+    """Hash ordered tables/columns/rows with one lossless tagged encoding."""
+    tables = [str(row[0]) for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    ) if str(row[0]) not in exclude_tables and not str(row[0]).startswith("sqlite_")]
+    projection: dict[str, str] = {}
+    for table in tables:
+        columns = [str(row[1]) for row in connection.execute(
+            f'PRAGMA table_info("{table}")'
+        )]
+        quoted = ",".join(f'"{column}"' for column in columns)
+        rows = connection.execute(f'SELECT {quoted} FROM "{table}"').fetchall()
+        encoded_rows = [[_sqlite_projection_value(value) for value in row] for row in rows]
+        encoded_rows.sort(key=lambda row: json.dumps(
+            row, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8"))
+        payload = {
+            "table": table,
+            "columns": columns,
+            "rows": encoded_rows,
+        }
+        projection[table] = "sha256:" + hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")).hexdigest()
+    return projection
 def _stable_health_request() -> dict[str, object]:
     """Fixed read-only localhost stable health boundary."""
     try:
@@ -1663,22 +1719,9 @@ def _validated_canonical_legacy_postimage_adoption(
         try:
             if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                 raise ValueError("AC dev canonical adoption post-custody quick-check failed")
-            tables = [row[0] for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-            ) if row[0] != "schema_meta" and not row[0].startswith("sqlite_")]
-            projection = {}
-            for table in tables:
-                columns = [row[1] for row in connection.execute(
-                    f'PRAGMA table_info("{table}")'
-                )]
-                quoted = ",".join(f'"{column}"' for column in columns)
-                rows = connection.execute(
-                    f'SELECT {quoted} FROM "{table}" ORDER BY {quoted}'
-                ).fetchall()
-                projection[table] = "sha256:" + hashlib.sha256(json.dumps(
-                    [list(row) for row in rows], sort_keys=True, separators=(",", ":"),
-                    ensure_ascii=True,
-                ).encode("utf-8")).hexdigest()
+            projection = _sqlite_logical_projection(
+                connection, exclude_tables=frozenset({"schema_meta"}),
+            )
             meta = {str(key): str(value) for key, value in connection.execute(
                 "SELECT key,value FROM schema_meta ORDER BY key"
             )}
