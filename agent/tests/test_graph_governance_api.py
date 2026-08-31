@@ -198926,11 +198926,39 @@ def _prepare_ac_dev_direct_route_bootstrap(
     _initialize_ac_dev_guide_schema(conn)
     _insert_simple_mf_close_backlog(conn, backlog_id)
     if source_free:
+        source_free_actions = [
+            "fresh_onboard_route_guide",
+            "fresh_route_issue",
+            "observer_session_register",
+            "observer_session_heartbeat",
+            "single_full_reconcile",
+            "readback",
+            "timeline_precheck",
+            "honest_archive_or_close",
+            "close_r3_if_authorized",
+        ]
+        source_free_blocked_actions = [
+            "source_edit",
+            "empty_commit",
+            "old_graph_input",
+            "old_graph_migration",
+            "retry_prior_request",
+            "reuse_prior_session_or_route",
+            "bypass_reconcile",
+            "stable_40000_mutation",
+            "second_authority_runtime",
+            "synthesized_pass",
+        ]
+        topology = (
+            "existing_unique_ac_observer;"
+            "_no_implementation_worker_because_r3_is_source_free;"
+            "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+        )
         conn.execute(
             """
             UPDATE backlog_bugs
             SET status='OPEN', target_files='[]', test_files='[]',
-                acceptance_criteria=?, details_md=?
+                acceptance_criteria=?, details_md=?, chain_trigger_json=?
             WHERE bug_id=?
             """,
             (
@@ -198942,6 +198970,25 @@ def _prepare_ac_dev_direct_route_bootstrap(
                     ]
                 ),
                 "Do not edit source, create an empty commit, or merge source.",
+                json.dumps(
+                    {
+                        "subsystem_backlog_handoff": {
+                            "schema_version": "judgment_subsystem_backlog_handoff.v1",
+                            "execution_owner": "selected_subsystem_observer",
+                            "selected_subsystem_gate_remains_authoritative": True,
+                            "allowed_actions": source_free_actions,
+                            "blocked_actions": source_free_blocked_actions,
+                        },
+                        "judgment_plan_precheck": {
+                            "subject": {"normalized_topology": topology},
+                            "evidence": {
+                                "route_context": {
+                                    "normalized_proposed_topology": topology
+                                }
+                            },
+                        },
+                    }
+                ),
                 backlog_id,
             ),
         )
@@ -199034,6 +199081,164 @@ def test_ac_dev_source_free_guide_issues_exact_empty_fence_route(
     assert issued["route_token"]["target_files"] == []
     assert issued["route_token"]["source_free_operation"] is True
     assert issued["route_token"]["source_mutation_forbidden"] is True
+
+
+def test_ac_dev_source_free_structured_projection_is_wording_independent(
+    conn, monkeypatch, tmp_path
+):
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-SOURCE-FREE-R2-WORDING",
+        source_free=True,
+    )
+    row = conn.execute(
+        "SELECT chain_trigger_json FROM backlog_bugs WHERE bug_id=?",
+        ("AC-DEV-SOURCE-FREE-R2-WORDING",),
+    ).fetchone()
+    trigger = json.loads(row["chain_trigger_json"])
+    handoff = trigger["subsystem_backlog_handoff"]
+    handoff["allowed_actions"][-2:] = [
+        "honest_close_or_archive",
+        "close_r2_if_authorized",
+    ]
+    topology = (
+        "existing_unique_ac_observer;"
+        "_no_implementation_worker_because_r2_is_source_free;"
+        "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+    )
+    trigger["judgment_plan_precheck"]["subject"]["normalized_topology"] = topology
+    trigger["judgment_plan_precheck"]["evidence"]["route_context"][
+        "normalized_proposed_topology"
+    ] = topology
+    conn.execute(
+        "UPDATE backlog_bugs SET acceptance_criteria=?, details_md=?, "
+        "chain_trigger_json=? WHERE bug_id=?",
+        (
+            json.dumps(["Completely different human wording."]),
+            "No magic phrase is present here.",
+            json.dumps(trigger),
+            "AC-DEV-SOURCE-FREE-R2-WORDING",
+        ),
+    )
+    conn.commit()
+
+    guide = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"},
+            method="POST",
+            body={
+                "backlog_id": "AC-DEV-SOURCE-FREE-R2-WORDING",
+                "role": "observer",
+                "work_type": "operator_supervised_direct_main",
+                "target_project_root": str(prepared["root"]),
+                "target_head_commit": prepared["commit"],
+                "target_ref": server.AC_DEV_BRANCH,
+            },
+        )
+    )
+    assert guide["next_legal_action"]["copy_safe_body"]["allowed_actions"] == list(
+        server._OPERATOR_SOURCE_FREE_ACTIONS
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_handoff_schema",
+        "missing_operation",
+        "mixed_action",
+        "missing_source_block",
+        "missing_worker_topology",
+        "topology_mismatch",
+        "closed",
+        "nonempty_scope",
+    ],
+)
+def test_ac_dev_source_free_structured_fact_mutations_fail_closed(
+    conn, mutation
+):
+    backlog_id = f"AC-DEV-SOURCE-FREE-FACT-{mutation}"
+    _initialize_ac_dev_guide_schema(conn)
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    topology = (
+        "existing_unique_ac_observer;"
+        "_no_implementation_worker_because_r3_is_source_free;"
+        "_role_distinct_qa_only_if_a_new_mutation_is_introduced"
+    )
+    trigger = {
+        "subsystem_backlog_handoff": {
+            "schema_version": "judgment_subsystem_backlog_handoff.v1",
+            "execution_owner": "selected_subsystem_observer",
+            "selected_subsystem_gate_remains_authoritative": True,
+            "allowed_actions": [
+                "fresh_onboard_route_guide",
+                "fresh_route_issue",
+                "observer_session_register",
+                "observer_session_heartbeat",
+                "single_full_reconcile",
+                "readback",
+                "timeline_precheck",
+                "honest_archive_or_close",
+                "close_r3_if_authorized",
+            ],
+            "blocked_actions": [
+                "source_edit",
+                "empty_commit",
+                "old_graph_input",
+                "old_graph_migration",
+                "bypass_reconcile",
+                "stable_40000_mutation",
+                "second_authority_runtime",
+                "synthesized_pass",
+            ],
+        },
+        "judgment_plan_precheck": {
+            "subject": {"normalized_topology": topology},
+            "evidence": {
+                "route_context": {"normalized_proposed_topology": topology}
+            },
+        },
+    }
+    status = "OPEN"
+    target_files = "[]"
+    if mutation == "missing_handoff_schema":
+        trigger["subsystem_backlog_handoff"].pop("schema_version")
+    elif mutation == "missing_operation":
+        trigger["subsystem_backlog_handoff"]["allowed_actions"].remove("readback")
+    elif mutation == "mixed_action":
+        trigger["subsystem_backlog_handoff"]["allowed_actions"].append("merge")
+    elif mutation == "missing_source_block":
+        trigger["subsystem_backlog_handoff"]["blocked_actions"].remove("source_edit")
+    elif mutation == "missing_worker_topology":
+        trigger["judgment_plan_precheck"]["subject"]["normalized_topology"] = ""
+    elif mutation == "topology_mismatch":
+        trigger["judgment_plan_precheck"]["evidence"]["route_context"][
+            "normalized_proposed_topology"
+        ] = topology.replace("r3", "r2")
+    elif mutation == "closed":
+        status = "FIXED"
+    else:
+        target_files = json.dumps(["agent/governance/server.py"])
+    conn.execute(
+        "UPDATE backlog_bugs SET status=?, target_files=?, test_files='[]', "
+        "chain_trigger_json=?, acceptance_criteria=?, details_md=?, mf_type=? "
+        "WHERE bug_id=?",
+        (
+            status,
+            target_files,
+            json.dumps(trigger),
+            json.dumps(["no source or empty commit", "observer session reconcile close"]),
+            "Do not edit source",
+            "source_free_operation",
+            backlog_id,
+        ),
+    )
+    conn.commit()
+    assert server._backlog_source_free_operation_authority(
+        conn, project_id="aming-claw", backlog_id=backlog_id
+    ) == {}
 
 
 @pytest.mark.parametrize(

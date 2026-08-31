@@ -145220,19 +145220,17 @@ def _backlog_source_free_operation_authority(
     project_id: str,
     backlog_id: str,
 ) -> dict[str, Any]:
-    """Derive the narrow empty-fence authority from the durable backlog row.
+    """Project a narrow operation-only authority from a durable JB handoff.
 
-    Plain caller fields are deliberately not inputs.  Legacy backlog rows do
-    not have a typed source-free column, so this compatibility bridge requires
-    all of the explicit R2 contract statements as well as an empty durable file
-    scope.  Anything missing or ambiguous remains an ordinary source route.
+    The handoff is the typed authority.  Human prose, ``mf_type`` aliases, and
+    caller-supplied source-free flags are deliberately not inputs.
     """
 
     if project_id != "aming-claw" or not backlog_id:
         return {}
     row = conn.execute(
         """
-        SELECT status, target_files, test_files, acceptance_criteria, details_md
+        SELECT status, target_files, test_files, chain_trigger_json
         FROM backlog_bugs WHERE bug_id = ?
         """,
         (backlog_id,),
@@ -145245,17 +145243,111 @@ def _backlog_source_free_operation_authority(
             *_string_list_field(_row_get(row, "test_files", "")),
         }
     )
-    criteria = _string_list_field(_row_get(row, "acceptance_criteria", ""))
-    criteria_text = "\n".join(criteria).lower()
-    details_text = str(_row_get(row, "details_md", "") or "").lower()
+    trigger = backlog_runtime.parse_json_object(
+        _row_get(row, "chain_trigger_json", "{}")
+    )
+    handoff = (
+        trigger.get("subsystem_backlog_handoff")
+        if isinstance(trigger.get("subsystem_backlog_handoff"), Mapping)
+        else {}
+    )
+    precheck = (
+        trigger.get("judgment_plan_precheck")
+        if isinstance(trigger.get("judgment_plan_precheck"), Mapping)
+        else {}
+    )
+    subject = (
+        precheck.get("subject")
+        if isinstance(precheck.get("subject"), Mapping)
+        else {}
+    )
+    evidence = (
+        precheck.get("evidence")
+        if isinstance(precheck.get("evidence"), Mapping)
+        else {}
+    )
+    evidence_route = (
+        evidence.get("route_context")
+        if isinstance(evidence.get("route_context"), Mapping)
+        else {}
+    )
+
+    allowed = _string_list_field(handoff.get("allowed_actions"))
+    blocked = _string_list_field(handoff.get("blocked_actions"))
+    allowed_action_semantics = {
+        "fresh_onboard_route_guide": "bootstrap",
+        "fresh_route_issue": "bootstrap",
+        "observer_session_register": "observer_session_register",
+        "observer_session_heartbeat": "observer_session_heartbeat",
+        "single_full_reconcile": "graph_current_full_reconcile",
+        "readback": "graph_query",
+        "timeline_precheck": "task_timeline_append",
+        "honest_archive_or_close": "backlog_close",
+        "honest_close_or_archive": "backlog_close",
+        "close_r2_if_authorized": "backlog_close",
+        "close_r3_if_authorized": "backlog_close",
+    }
+    allowed_semantics = {
+        allowed_action_semantics[action]
+        for action in allowed
+        if action in allowed_action_semantics
+    }
+    expected_semantics = {"bootstrap", *_OPERATOR_SOURCE_FREE_ACTIONS}
+    expected_semantic_counts = {
+        "bootstrap": 2,
+        "observer_session_register": 1,
+        "observer_session_heartbeat": 1,
+        "graph_current_full_reconcile": 1,
+        "graph_query": 1,
+        "task_timeline_append": 1,
+        "backlog_close": 2,
+    }
+    semantic_counts = {
+        semantic: sum(
+            allowed_action_semantics.get(action) == semantic for action in allowed
+        )
+        for semantic in expected_semantics
+    }
+    allowed_actions_closed = bool(allowed) and all(
+        action in allowed_action_semantics for action in allowed
+    ) and semantic_counts == expected_semantic_counts
+
+    blocked_authority_actions = {
+        "source_edit",
+        "empty_commit",
+        "old_graph_input",
+        "old_graph_migration",
+        "bypass_reconcile",
+        "stable_40000_mutation",
+        "second_authority_runtime",
+        "synthesized_pass",
+    }
+    blocked_actions_closed = blocked_authority_actions.issubset(set(blocked))
+
+    topology_pattern = re.compile(
+        r"^existing_unique_ac_observer;"
+        r"_no_implementation_worker_because_r[0-9]+_is_source_free;"
+        r"_role_distinct_qa_only_if_a_new_mutation_is_introduced$"
+    )
+    subject_topology = str(subject.get("normalized_topology") or "").strip()
+    evidence_topology = str(
+        evidence_route.get("normalized_proposed_topology") or ""
+    ).strip()
     required_contract_facts = {
         "empty_file_scope": not row_files,
-        "source_free_declared": "no source or empty commit" in criteria_text,
-        "source_mutation_forbidden": "do not edit source" in details_text,
-        "session_operation_declared": "observer" in criteria_text
-        and "session" in criteria_text,
-        "reconcile_operation_declared": "reconcile" in criteria_text,
-        "close_operation_declared": "close" in criteria_text,
+        "typed_handoff": handoff.get("schema_version")
+        == "judgment_subsystem_backlog_handoff.v1",
+        "observer_owned": handoff.get("execution_owner")
+        == "selected_subsystem_observer",
+        "selected_gate_authoritative": handoff.get(
+            "selected_subsystem_gate_remains_authoritative"
+        )
+        is True,
+        "operation_actions_closed": allowed_actions_closed
+        and allowed_semantics == expected_semantics,
+        "source_mutation_blocked": blocked_actions_closed,
+        "no_worker_topology": bool(topology_pattern.fullmatch(subject_topology)),
+        "topology_independently_bound": subject_topology == evidence_topology,
     }
     if not all(required_contract_facts.values()):
         return {}
