@@ -3884,6 +3884,12 @@ def test_durable_recovery_requires_old_child_absent_and_port_free_before_spawn()
     assert '"AC dev durable multiple live generations"' in launch_source
     assert '"AC dev durable live child remained unbound"' in launch_source
     assert '"AC dev durable unknown listener owns port 40008"' in launch_source
+    assert '"AC dev durable completed generation is unclassifiable"' in launch_source
+    assert '"AC dev durable multiple dead unsealed generations"' in launch_source
+    seal = '"stage": "completed_child_absent"'
+    assert seal in launch_source
+    assert launch_source.index(seal) < launch_source.index(spawn)
+    assert "_durable_exit_binding(value, digest)" in launch_source
 
 
 def test_dev_admit_schema_rejects_wrong_plane_before_database_write(tmp_path):
