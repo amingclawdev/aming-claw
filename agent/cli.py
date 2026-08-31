@@ -3170,6 +3170,55 @@ def _offline_dashboard_backlog_bootstrap(
             "receipt_sha256": receipt_sha, "row_count": source_projection["row_count"]}
 
 
+def _completed_dashboard_bootstrap_binding(root: Path) -> dict[str, Any] | None:
+    """Return a receipt-bound postimage for durable start, or None if absent."""
+    from agent.governance import db as _db
+    receipts_dir = root / "archive" / "dashboard-backlog-bootstrap"
+    if not receipts_dir.exists():
+        return None
+    if receipts_dir.is_symlink() or not receipts_dir.is_dir():
+        raise click.ClickException("dashboard backlog bootstrap archive is invalid")
+    completed = sorted(receipts_dir.glob("bootstrap.*.json"))
+    pendings = sorted(receipts_dir.glob("bootstrap-pending.*.json"))
+    if len(completed) != 1 or len(pendings) != 1:
+        raise click.ClickException("dashboard backlog bootstrap start receipts are missing or ambiguous")
+    receipt, receipt_sha = _read_durable_content_receipt(completed[0], "bootstrap")
+    pending_path = Path(str(receipt.get("pending_receipt") or ""))
+    pending, pending_sha = _read_durable_content_receipt(pending_path, "bootstrap-pending")
+    if (pending_path != pendings[0] or receipt.get("pending_sha256") != pending_sha
+            or receipt.get("stage") != "completed" or pending.get("stage") != "pending"):
+        raise click.ClickException("dashboard backlog bootstrap start pending binding mismatch")
+    ancestry = dict(receipt.get("ancestry") or {})
+    if _stopped_dashboard_bootstrap_ancestry(
+        root, expected_database_sha256=str(ancestry.get("database_sha256") or ""),
+        phase="completed_replay",
+    ) != ancestry:
+        raise click.ClickException("dashboard backlog bootstrap start ancestry mismatch")
+    database = root / "governance" / "aming-claw" / "governance.db"
+    current = _bootstrap_regular_database(database, label="target")
+    if (receipt.get("target_database_sha256_after") != current["sha256"]
+            or not _matches_canonical_dev_database_identity(
+                database, receipt.get("target_database_identity_v2_after"))):
+        raise click.ClickException("dashboard backlog bootstrap start postimage mismatch")
+    connection = sqlite3.connect(
+        "file:" + urllib.parse.quote(str(database)) + "?mode=ro&immutable=1", uri=True,
+    )
+    try:
+        projection, _rows = _dashboard_backlog_table_projection(connection)
+        if (projection != receipt.get("source_projection")
+                or _db.backlog_read_schema_managed_inventory(connection)
+                != receipt.get("managed_inventory_after")
+                or _db.backlog_read_schema_protected_inventory(connection)
+                != receipt.get("protected_inventory_after")):
+            raise click.ClickException("dashboard backlog bootstrap start projection mismatch")
+    finally:
+        connection.close()
+    return {"database_path": str(database), "database_identity": _admission_identity(database),
+            "database_sha256": current["sha256"], "bootstrap_receipt": str(completed[0]),
+            "bootstrap_receipt_sha256": receipt_sha, "bootstrap_pending": str(pending_path),
+            "bootstrap_pending_sha256": pending_sha}
+
+
 @main.command("dev-bootstrap-dashboard-backlog")
 @click.option("--dev-storage-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--project-id", required=True)
@@ -3456,11 +3505,15 @@ def _durable_dev_launch(
         database_identity=database_identity, source_identity=source_identity,
         allow_postimage=True,
     )
-    from agent.governance.db import validate_dev_preimage_only
-    preimage = validate_dev_preimage_only(
-        dev_storage, source_identity=source_identity,
-        linked_v3_receipt=linked_receipt,
-    )
+    bootstrap_binding = _completed_dashboard_bootstrap_binding(dev_storage)
+    if bootstrap_binding is None:
+        from agent.governance.db import validate_dev_preimage_only
+        preimage = validate_dev_preimage_only(
+            dev_storage, source_identity=source_identity,
+            linked_v3_receipt=linked_receipt,
+        )
+    else:
+        preimage = bootstrap_binding
     source_root = Path(str(source_identity["root"])).resolve(strict=True)
     server = source_root / "agent" / "governance" / "server.py"
     server_sha = "sha256:" + hashlib.sha256(server.read_bytes()).hexdigest()
@@ -3775,7 +3828,7 @@ def _durable_dev_launch(
     )
     parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     parent_sock.settimeout(15)
-    pending, pending_sha256 = _durable_content_receipt(runtime, "pending", {
+    pending_payload = {
         "schema_version": "ac_dev_durable_pending.v1", "stage": "pending",
         "launch_id": launch_id, "parent_pid": os.getpid(),
         "source_identity": dict(source_identity), "dev_storage_root": str(dev_storage),
@@ -3783,7 +3836,15 @@ def _durable_dev_launch(
         "database_sha256_before": preimage["database_sha256"],
         "linked_v3_receipt": str(linked_receipt.absolute()),
         "linked_v3_receipt_sha256": linked_digest,
-    })
+    }
+    if bootstrap_binding is not None:
+        pending_payload["dashboard_bootstrap"] = {
+            key: bootstrap_binding[key] for key in (
+                "bootstrap_receipt", "bootstrap_receipt_sha256",
+                "bootstrap_pending", "bootstrap_pending_sha256",
+            )
+        }
+    pending, pending_sha256 = _durable_content_receipt(runtime, "pending", pending_payload)
     argv = [
         sys.executable, "-m", "agent.cli", "start", "--runtime-plane", "dev",
         "--port", str(AC_DEV_SERVICE_PORT), "--dev-storage-root", str(dev_storage),
@@ -3850,6 +3911,8 @@ def _durable_dev_launch(
             "database_sha256_before": readiness["database_sha256_before"],
             "database_sha256_after": readiness["database_sha256_after"],
         }
+        if bootstrap_binding is not None:
+            base["dashboard_bootstrap"] = pending_payload["dashboard_bootstrap"]
         completed = base
         active, active_sha256 = _durable_content_receipt(runtime, "launch", completed)
         parent_sock.sendall(_canonical_json_bytes({
@@ -4197,7 +4260,8 @@ def start(
                 linked_v3_receipt if durable_launch else durable_child_linked_v3_receipt
             )
             try:
-                preimage_binding = validate_dev_preimage_only(
+                bootstrap_preimage = _completed_dashboard_bootstrap_binding(selected_dev_storage)
+                preimage_binding = bootstrap_preimage or validate_dev_preimage_only(
                     selected_dev_storage, source_identity=dev_identity,
                     linked_v3_receipt=lifecycle_receipt,
                 )
