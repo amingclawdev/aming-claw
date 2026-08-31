@@ -1618,7 +1618,14 @@ def _dev_storage_root(*, create: bool = False, isolated_receipt: Path | None = N
     if supplied != expected:
         root = _absolute_non_symlink_root(supplied, create=False)
         runtime = root / "runtime" / "durable-launch"
-        launches = list(runtime.glob("launch.*.json"))
+        launches = []
+        for candidate in runtime.glob("launch.*.json"):
+            try:
+                value = json.loads(candidate.read_bytes())
+            except (OSError, ValueError, TypeError):
+                continue
+            if isinstance(value, Mapping) and value.get("pid") == os.getpid():
+                launches.append(candidate)
         if len(launches) != 1:
             raise ValueError("AC dev storage root must equal canonical resolver output")
         launch = launches[0]
@@ -1712,7 +1719,14 @@ def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str)
         # completed receipt written after its unbound custody transaction.
         root = _absolute_non_symlink_root(supplied, create=False)
         runtime = root / "runtime" / "durable-launch"
-        candidates = list(runtime.glob("launch.*.json"))
+        candidates = []
+        for item in runtime.glob("launch.*.json"):
+            try:
+                value = json.loads(item.read_bytes())
+            except (OSError, ValueError, TypeError):
+                continue
+            if isinstance(value, Mapping) and value.get("pid") == os.getpid():
+                candidates.append(item)
         if len(candidates) != 1:
             raise ValueError("AC dev isolated durable launch receipt is missing")
         candidate = candidates[0]
