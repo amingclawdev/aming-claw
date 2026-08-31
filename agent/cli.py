@@ -2567,6 +2567,13 @@ def _canonical_legacy_postimage_adoption(
                 raise click.ClickException("AC dev canonical adoption stale pidfile PID remains live")
         except ProcessLookupError:
             pass
+    inventory_connection = sqlite3.connect(
+        "file:" + urllib.parse.quote(str(target)) + "?mode=ro&immutable=1", uri=True,
+    )
+    try:
+        target_inventory_after = _db.backlog_read_schema_inventory(inventory_connection)
+    finally:
+        inventory_connection.close()
     payload = {
         "schema_version": _AC_DEV_CANONICAL_LEGACY_POSTIMAGE_ADOPTION_VERSION,
         "stage": "completed", "project_id": "aming-claw", "port": 40008,
@@ -2613,6 +2620,277 @@ def dev_adopt_canonical_legacy_postimage(dev_storage_root: Path, project_id: str
         raise click.ClickException("AC dev canonical adoption requires aming-claw on port 40008")
     click.echo(json.dumps(_canonical_legacy_postimage_adoption(
         dev_storage_root, linked_v3_receipt=linked_v3_receipt,
+    ), sort_keys=True))
+
+
+def _dashboard_backlog_table_projection(
+    connection: sqlite3.Connection,
+) -> tuple[dict[str, Any], list[tuple[object, ...]]]:
+    """Return the exact backlog table ABI and a lossless ordered row digest."""
+    from agent.governance import db as _db
+    table_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='backlog_bugs'"
+    ).fetchone()
+    if table_sql_row is None or not table_sql_row[0]:
+        raise click.ClickException("dashboard backlog bootstrap source table is missing")
+    columns = [tuple(row) for row in connection.execute("PRAGMA table_info(\"backlog_bugs\")")]
+    if not columns or str(columns[0][1]) != "bug_id":
+        raise click.ClickException("dashboard backlog bootstrap table schema is invalid")
+    names = [str(row[1]) for row in columns]
+    quoted = ",".join(_db._sqlite_quote_identifier(name) for name in names)
+    rows = []
+    for row in connection.execute(
+        f"SELECT {quoted} FROM \"backlog_bugs\" ORDER BY \"bug_id\""
+    ):
+        rows.append(tuple(row))
+    encoded_rows = [[_db._sqlite_projection_value(value) for value in row] for row in rows]
+    status_index = names.index("status")
+    statuses: dict[str, int] = {}
+    for row in rows:
+        status = str(row[status_index])
+        statuses[status] = statuses.get(status, 0) + 1
+    schema_payload = {
+        "table": "backlog_bugs", "sql": _db._backlog_read_normalized_sql(table_sql_row[0]),
+        "columns": [list(row) for row in columns], "order": ["bug_id", "ASC"],
+    }
+    row_payload = {"schema": schema_payload, "rows": encoded_rows}
+    return {
+        "schema": schema_payload,
+        "schema_sha256": "sha256:" + hashlib.sha256(
+            _canonical_json_bytes(schema_payload)
+        ).hexdigest(),
+        "rows_sha256": "sha256:" + hashlib.sha256(
+            _canonical_json_bytes(row_payload)
+        ).hexdigest(),
+        "row_count": len(rows), "status_counts": dict(sorted(statuses.items())),
+        "columns": names,
+    }, rows
+
+
+def _bootstrap_regular_database(path: Path, *, label: str) -> dict[str, Any]:
+    absolute = path.expanduser().absolute()
+    if absolute.is_symlink() or not absolute.is_file() or absolute.resolve(strict=True) != absolute:
+        raise click.ClickException(f"dashboard backlog bootstrap {label} database is invalid")
+    details = absolute.stat(follow_symlinks=False)
+    if details.st_nlink != 1:
+        raise click.ClickException(f"dashboard backlog bootstrap {label} database link count is invalid")
+    for suffix in ("-wal", "-shm", "-journal"):
+        companion = Path(str(absolute) + suffix)
+        if companion.exists() or companion.is_symlink():
+            raise click.ClickException(f"dashboard backlog bootstrap {label} requires sidecar-free bytes")
+    holders = subprocess.run(
+        ["lsof", "-t", "--", str(absolute)], capture_output=True, text=True,
+        check=False, timeout=3,
+    ).stdout.strip()
+    if holders:
+        raise click.ClickException(f"dashboard backlog bootstrap {label} rejects database holders")
+    return {
+        **_admission_identity(absolute), "size": int(details.st_size),
+        "mtime_ns": int(details.st_mtime_ns), "nlink": int(details.st_nlink),
+        "sha256": _file_sha256(absolute),
+    }
+
+
+def _stopped_dashboard_bootstrap_ancestry(root: Path) -> dict[str, Any]:
+    """Prove the immutable adoption ancestor and exact latest stopped generation."""
+    from agent.governance import db as _db
+    adoptions = _canonical_adoption_receipts(root)
+    if len(adoptions) != 1:
+        raise click.ClickException("dashboard backlog bootstrap adoption is missing or ambiguous")
+    adoption, adoption_sha = _read_canonical_adoption_receipt(adoptions[0])
+    linked = Path(str(adoption.get("linked_v3_receipt") or ""))
+    source = _source_git_identity()
+    try:
+        _db._validated_canonical_legacy_postimage_adoption(
+            root, linked, source, _db.verified_stable_database_binding(),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise click.ClickException("dashboard backlog bootstrap adoption mismatch") from exc
+    runtime = root / "runtime" / "durable-launch"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    current_sha = _file_sha256(database)
+    candidates: list[tuple[str, dict[str, Any], str, str]] = []
+    for launch_path in runtime.glob("launch.*.json") if runtime.is_dir() else ():
+        launch, launch_sha = _read_durable_content_receipt(launch_path, "launch")
+        if launch.get("database_sha256_after") != current_sha:
+            continue
+        stops = []
+        for stop_path in runtime.glob("stop.*.json"):
+            stop, stop_sha = _read_durable_content_receipt(stop_path, "stop")
+            if stop.get("launch_sha256") == launch_sha:
+                stops.append((stop, stop_sha))
+        if len(stops) != 1:
+            continue
+        stop, stop_sha = stops[0]
+        exit_sha = str(stop.get("exit_sha256") or "")
+        if not _exact_sha256(exit_sha):
+            continue
+        exit_value, read_exit_sha = _read_durable_content_receipt(
+            runtime / f"exit.{exit_sha[7:]}.json", "exit",
+        )
+        if (read_exit_sha == exit_sha and exit_value.get("launch_sha256") == launch_sha
+                and exit_value.get("binding") == _durable_exit_binding(launch, launch_sha)
+                and exit_value.get("challenge_sha256") == stop.get("challenge_sha256")):
+            candidates.append((launch_sha, launch, stop_sha, exit_sha))
+    if len(candidates) != 1:
+        raise click.ClickException(
+            "dashboard backlog bootstrap latest stopped generation is missing or ambiguous"
+        )
+    launch_sha, launch, stop_sha, exit_sha = candidates[0]
+    return {
+        "adoption_receipt": str(adoptions[0]), "adoption_sha256": adoption_sha,
+        "launch_sha256": launch_sha, "stop_sha256": stop_sha, "exit_sha256": exit_sha,
+        "database_sha256": current_sha, "database_identity": launch.get("database_identity"),
+    }
+
+
+def _offline_dashboard_backlog_bootstrap(
+    root: Path, *, project_id: str, port: int, source_database: Path,
+) -> dict[str, Any]:
+    """Copy only backlog_bugs from one immutable historical DB into stopped canonical dev."""
+    from agent.governance import db as _db
+    from agent.runtime_plane import resolve_ac_dev_storage_root
+    if project_id != "aming-claw" or port != AC_DEV_SERVICE_PORT:
+        raise click.ClickException("dashboard backlog bootstrap requires aming-claw on port 40008")
+    stable = _db.verified_stable_database_binding()
+    expected = resolve_ac_dev_storage_root(Path(str(stable["shared_volume_path"])).resolve(strict=True))
+    canonical = root.expanduser().absolute()
+    if canonical.is_symlink() or canonical.resolve(strict=True) != canonical or canonical != expected:
+        raise click.ClickException("dashboard backlog bootstrap requires the canonical dev root")
+    if _port_is_open(AC_DEV_SERVICE_PORT) or _durable_listener_pid(AC_DEV_SERVICE_PORT):
+        raise click.ClickException("dashboard backlog bootstrap requires stopped port 40008")
+    target = canonical / "governance" / "aming-claw" / "governance.db"
+    target_before = _bootstrap_regular_database(target, label="target")
+    source_file_before = _bootstrap_regular_database(source_database, label="source")
+    source_uri = "file:" + urllib.parse.quote(str(source_database.absolute())) + "?mode=ro&immutable=1"
+    source_connection = sqlite3.connect(source_uri, uri=True, timeout=0, isolation_level=None)
+    try:
+        source_connection.execute("PRAGMA query_only=ON")
+        if source_connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise click.ClickException("dashboard backlog bootstrap source quick-check failed")
+        if source_connection.execute(
+            "SELECT 1 FROM projects WHERE project_id='aming-claw'"
+        ).fetchone() is None:
+            raise click.ClickException("dashboard backlog bootstrap source project mismatch")
+        source_projection, rows = _dashboard_backlog_table_projection(source_connection)
+    finally:
+        source_connection.close()
+    if _bootstrap_regular_database(source_database, label="source") != source_file_before:
+        raise click.ClickException("dashboard backlog bootstrap source drifted during projection")
+    source_before = {
+        **source_file_before,
+        "backlog_schema_sha256": source_projection["schema_sha256"],
+    }
+    receipts_dir = canonical / "archive" / "dashboard-backlog-bootstrap"
+    existing = sorted(receipts_dir.glob("bootstrap.*.json")) if receipts_dir.is_dir() else []
+    if existing:
+        if len(existing) != 1:
+            raise click.ClickException("dashboard backlog bootstrap receipt is ambiguous")
+        prior, prior_sha = _read_durable_content_receipt(existing[0], "bootstrap")
+        recorded_ancestry = dict(prior.get("ancestry") or {})
+        runtime = canonical / "runtime" / "durable-launch"
+        immutable_chain = (
+            (Path(str(recorded_ancestry.get("adoption_receipt") or "")), "adoption",
+             recorded_ancestry.get("adoption_sha256")),
+            (runtime / f"launch.{str(recorded_ancestry.get('launch_sha256') or '')[7:]}.json",
+             "launch", recorded_ancestry.get("launch_sha256")),
+            (runtime / f"stop.{str(recorded_ancestry.get('stop_sha256') or '')[7:]}.json",
+             "stop", recorded_ancestry.get("stop_sha256")),
+            (runtime / f"exit.{str(recorded_ancestry.get('exit_sha256') or '')[7:]}.json",
+             "exit", recorded_ancestry.get("exit_sha256")),
+        )
+        try:
+            chain_ok = all(
+                _read_durable_content_receipt(path, prefix)[1] == digest
+                for path, prefix, digest in immutable_chain if _exact_sha256(str(digest or ""))
+            ) and all(_exact_sha256(str(digest or "")) for _path, _prefix, digest in immutable_chain)
+        except click.ClickException:
+            chain_ok = False
+        if (not chain_ok or prior.get("source_identity") != source_before
+                or prior.get("source_projection") != source_projection
+                or prior.get("target_database_sha256_after") != target_before["sha256"]
+                or recorded_ancestry.get("database_identity") != _admission_identity(target)):
+            raise click.ClickException("dashboard backlog bootstrap replay drift")
+        return {"status": "already_bootstrapped", "receipt": str(existing[0]),
+                "receipt_sha256": prior_sha, "row_count": source_projection["row_count"]}
+    ancestry = _stopped_dashboard_bootstrap_ancestry(canonical)
+    connection = sqlite3.connect(str(target), timeout=5, isolation_level=None)
+    backup = receipts_dir / f"{target_before['sha256'][7:]}.pre.sqlite"
+    try:
+        target_projection, target_rows = _dashboard_backlog_table_projection(connection)
+        if target_rows or target_projection["schema"] != source_projection["schema"]:
+            raise click.ClickException("dashboard backlog bootstrap target is not pristine")
+        target_inventory_before = _db.backlog_read_schema_inventory(connection)
+        protected_projection = _db._sqlite_logical_projection(
+            connection,
+            exclude_tables=frozenset({"backlog_bugs", "dashboard_backlog_cache_generation"}),
+        )
+        drift = _db.backlog_read_schema_drift(connection)
+        if drift["invalid"]:
+            raise click.ClickException("dashboard backlog bootstrap target schema mismatch")
+        receipts_dir.mkdir(parents=True, exist_ok=True)
+        if backup.exists() or backup.is_symlink():
+            raise click.ClickException("dashboard backlog bootstrap backup collision")
+        shutil.copy2(target, backup)
+        if _file_sha256(backup) != target_before["sha256"]:
+            raise click.ClickException("dashboard backlog bootstrap backup mismatch")
+        connection.execute("BEGIN IMMEDIATE")
+        admission = _db.admit_missing_backlog_read_schema(connection, commit=False)
+        columns = list(source_projection["columns"])
+        quoted = ",".join(_db._sqlite_quote_identifier(name) for name in columns)
+        placeholders = ",".join("?" for _ in columns)
+        connection.executemany(
+            f"INSERT INTO \"backlog_bugs\" ({quoted}) VALUES ({placeholders})", rows,
+        )
+        after_projection, _ = _dashboard_backlog_table_projection(connection)
+        protected_after = _db._sqlite_logical_projection(
+            connection,
+            exclude_tables=frozenset({"backlog_bugs", "dashboard_backlog_cache_generation"}),
+        )
+        if after_projection != source_projection or protected_after != protected_projection:
+            raise click.ClickException("dashboard backlog bootstrap transaction postcondition failed")
+        connection.commit()
+        checkpoint = tuple(int(value) for value in connection.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone())
+        if checkpoint != (0, 0, 0):
+            raise click.ClickException("dashboard backlog bootstrap checkpoint failed")
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    target_after = _bootstrap_regular_database(target, label="target")
+    payload = {
+        "schema_version": "ac_dev_dashboard_backlog_bootstrap.v1", "stage": "completed",
+        "project_id": project_id, "port": port, "source_identity": source_before,
+        "source_projection": source_projection, "target_identity": {
+            "before": target_before, "after": target_after,
+        }, "target_database_sha256_before": target_before["sha256"],
+        "target_database_sha256_after": target_after["sha256"],
+        "target_inventory_before": target_inventory_before,
+        "target_inventory_after": target_inventory_after,
+        "admission": admission, "ancestry": ancestry,
+        "backup": {"path": str(backup), "sha256": _file_sha256(backup)},
+        "row_count": source_projection["row_count"],
+        "status_counts": source_projection["status_counts"],
+    }
+    receipt, receipt_sha = _durable_content_receipt(receipts_dir, "bootstrap", payload)
+    return {"status": "bootstrapped", "receipt": str(receipt),
+            "receipt_sha256": receipt_sha, "row_count": source_projection["row_count"]}
+
+
+@main.command("dev-bootstrap-dashboard-backlog")
+@click.option("--dev-storage-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--project-id", required=True)
+@click.option("--port", required=True, type=int)
+@click.option("--source-database", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def dev_bootstrap_dashboard_backlog(
+    dev_storage_root: Path, project_id: str, port: int, source_database: Path,
+) -> None:
+    click.echo(json.dumps(_offline_dashboard_backlog_bootstrap(
+        dev_storage_root, project_id=project_id, port=port,
+        source_database=source_database,
     ), sort_keys=True))
 
 

@@ -4650,6 +4650,66 @@ def test_canonical_legacy_postimage_projection_excludes_only_schema_meta(tmp_pat
     assert drifted_projection != before_projection
 
 
+def test_dashboard_backlog_projection_is_lossless_ordered_and_large(tmp_path):
+    import agent.cli as cli
+    from agent.governance import db
+
+    database = tmp_path / "historical.db"
+    connection = sqlite3.connect(database)
+    db._ensure_schema(connection)
+    columns = [str(row[1]) for row in connection.execute("PRAGMA table_info(backlog_bugs)")]
+    defaults = {}
+    for row in connection.execute("PRAGMA table_info(backlog_bugs)"):
+        name, default = str(row[1]), row[4]
+        defaults[name] = "" if default is None else str(default).strip("'")
+    rows = []
+    for number in reversed(range(3603)):
+        value = dict(defaults)
+        value.update({
+            "bug_id": f"AC-BOOTSTRAP-{number:04d}",
+            "title": "large-" + ("雪\x00" * 64 if number == 17 else str(number)),
+            "status": "FIXED" if number % 3 == 0 else "OPEN",
+            "created_at": "2026-08-31T00:00:00Z", "updated_at": "2026-08-31T00:00:00Z",
+        })
+        rows.append(tuple(value[name] for name in columns))
+    quoted = ",".join(db._sqlite_quote_identifier(name) for name in columns)
+    connection.executemany(
+        f"INSERT INTO backlog_bugs ({quoted}) VALUES ({','.join('?' for _ in columns)})", rows,
+    )
+    connection.commit()
+    first, ordered = cli._dashboard_backlog_table_projection(connection)
+    connection.execute("CREATE TABLE reordered AS SELECT * FROM backlog_bugs ORDER BY bug_id DESC")
+    connection.execute("DELETE FROM backlog_bugs")
+    connection.execute(f"INSERT INTO backlog_bugs ({quoted}) SELECT {quoted} FROM reordered")
+    connection.commit()
+    second, reordered = cli._dashboard_backlog_table_projection(connection)
+    connection.close()
+
+    assert first == second
+    assert first["row_count"] == 3603
+    assert first["status_counts"] == {"FIXED": 1201, "OPEN": 2402}
+    assert [row[0] for row in ordered] == [row[0] for row in reordered]
+    assert ordered[17][1].endswith("雪\x00" * 64)
+
+
+def test_backlog_read_admission_can_join_caller_transaction_and_roll_back(tmp_path):
+    from agent.governance import db
+
+    database = tmp_path / "target.db"
+    connection = sqlite3.connect(database, isolation_level=None)
+    db._ensure_schema(connection)
+    connection.execute("BEGIN IMMEDIATE")
+    result = db.admit_missing_backlog_read_schema(connection, commit=False)
+    connection.execute(
+        "INSERT INTO backlog_bugs(bug_id,created_at,updated_at) VALUES('AC-TXN','now','now')"
+    )
+    connection.rollback()
+    assert result["changed"] is True
+    assert connection.execute("SELECT count(*) FROM backlog_bugs").fetchone() == (0,)
+    assert db.backlog_read_schema_drift(connection)["missing"]
+    connection.close()
+
+
 @pytest.mark.parametrize(
     "attack", ["identity_drift", "postimage_drift", "preforged_exit", "missing_exit_after_term"],
 )

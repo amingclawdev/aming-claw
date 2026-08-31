@@ -2786,14 +2786,19 @@ def ensure_backlog_read_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def admit_missing_backlog_read_schema(conn: sqlite3.Connection) -> dict[str, object]:
+def admit_missing_backlog_read_schema(
+    conn: sqlite3.Connection, *, commit: bool = True,
+) -> dict[str, object]:
     """Apply exactly the known missing-object set in one caller-owned transaction."""
     before = backlog_read_schema_drift(conn)
     if before["invalid"]:
         raise ValueError("AC dev schema admission rejects invalid backlog-read drift")
     if not before["missing"]:
         return {"changed": False, "missing": []}
-    conn.execute("BEGIN IMMEDIATE")
+    if commit:
+        conn.execute("BEGIN IMMEDIATE")
+    elif not conn.in_transaction:
+        raise ValueError("caller-owned backlog-read admission requires an active transaction")
     try:
         # The preflight allows only pristine absences; each statement is
         # unconditional so a concurrent/create race becomes a rollback.
@@ -2812,7 +2817,8 @@ def admit_missing_backlog_read_schema(conn: sqlite3.Connection) -> dict[str, obj
         after = backlog_read_schema_drift(conn)
         if after["missing"] or after["invalid"]:
             raise ValueError("AC dev schema admission postcondition failed")
-        conn.commit()
+        if commit:
+            conn.commit()
     except BaseException:
         conn.rollback()
         raise
