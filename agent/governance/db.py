@@ -22,6 +22,8 @@ import struct
 import urllib.request
 import urllib.error
 import urllib.parse
+import shutil
+import tempfile
 from contextlib import closing
 from pathlib import Path
 from collections.abc import Mapping, Sequence
@@ -3397,6 +3399,174 @@ def create_dev_cow_successor_receipt(
             "status": "created"}
 
 
+def _cow_historical_backlog_snapshot(
+    root: Path, operator: Mapping[str, object]
+) -> tuple[dict[str, object], list[tuple[object, ...]], list[str]]:
+    snapshot_sha = str(operator.get("snapshot_sha256") or "")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", snapshot_sha):
+        raise ValueError("AC dev COW successor historical snapshot authority is invalid")
+    archive = root / "archive" / "staging" / "dashboard-backlog-snapshots"
+    snapshot = archive / f"snapshot.{snapshot_sha.removeprefix('sha256:')}.sqlite"
+    identity = _cow_regular_identity(snapshot)
+    if identity["sha256"] != snapshot_sha:
+        raise ValueError("AC dev COW successor historical snapshot hash mismatch")
+    manifests = sorted(archive.glob("manifest.*.json"))
+    if len(manifests) != 1:
+        raise ValueError("AC dev COW successor historical snapshot manifest is ambiguous")
+    manifest, manifest_sha = _cow_raw_receipt(manifests[0], prefix="manifest")
+    uri = "file:" + urllib.parse.quote(str(snapshot)) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise ValueError("AC dev COW successor historical snapshot is corrupt")
+        columns = [str(row[1]) for row in conn.execute('PRAGMA table_info("backlog_bugs")')]
+        quoted = ",".join(_sqlite_quote_identifier(name) for name in columns)
+        rows = [tuple(row) for row in conn.execute(
+            f'SELECT {quoted} FROM "backlog_bugs" ORDER BY "bug_id"'
+        )]
+        status_index = columns.index("status")
+        statuses: dict[str, int] = {}
+        for row in rows:
+            status = str(row[status_index])
+            statuses[status] = statuses.get(status, 0) + 1
+        backlog_projection = _sqlite_logical_projection(conn).get("backlog_bugs")
+    finally:
+        conn.close()
+    if (
+        manifest.get("schema_version") != "ac_dev_dashboard_backlog_snapshot.v1"
+        or manifest.get("destination_path") != str(snapshot)
+        or manifest.get("destination_sha256") != snapshot_sha
+        or manifest.get("row_count") != len(rows)
+        or manifest.get("status_counts") != dict(sorted(statuses.items()))
+        or manifest_sha != "sha256:" + manifests[0].stem.removeprefix("manifest.")
+    ):
+        raise ValueError("AC dev COW successor historical snapshot manifest mismatch")
+    return {
+        "row_count": len(rows),
+        "status_counts": dict(sorted(statuses.items())),
+        "backlog_projection_sha256": backlog_projection,
+    }, rows, columns
+
+
+def _reconstruct_dev_cow_successor_payload(
+    root: Path, receipt: Mapping[str, object]
+) -> dict[str, object]:
+    operator_ref = dict(receipt.get("operator_evidence") or {})
+    operator_path = Path(str(operator_ref.get("path") or ""))
+    operator, operator_sha = _cow_raw_receipt(operator_path, prefix="cow-import")
+    predecessor_ref = dict(dict(receipt.get("predecessor") or {}).get("backup") or {})
+    predecessor_path = Path(str(predecessor_ref.get("path") or ""))
+    predecessor = _cow_regular_identity(predecessor_path)
+    history_ref = dict(receipt.get("history") or {})
+    linked_ref = dict(history_ref.get("linked_v3") or {})
+    adoption_ref = dict(history_ref.get("adoption") or {})
+    linked_path = Path(str(linked_ref.get("path") or ""))
+    adoption_path = Path(str(adoption_ref.get("path") or ""))
+    linked, linked_sha = _cow_raw_receipt(linked_path)
+    adoption, adoption_sha = _cow_raw_receipt(adoption_path, prefix="adoption")
+    quarantine_ref = dict(adoption.get("quarantine_manifest") or {})
+    quarantine_path = Path(str(quarantine_ref.get("path") or ""))
+    _quarantine, quarantine_sha = _cow_raw_receipt(quarantine_path, prefix="manifest")
+    if (
+        operator_path.parent != root / "archive" / "operator-exceptions"
+        or predecessor_path.parent != root / "archive" / "operator-exception-backups"
+        or linked_path.parent != root / "archive" / "schema-admission"
+        or adoption_path.parent != root / "archive" / "canonical-legacy-postimage-adoption"
+        or operator_ref != {"path": str(operator_path), "sha256": operator_sha, "payload": operator}
+        or linked_ref != {"path": str(linked_path), "sha256": linked_sha}
+        or adoption_ref != {"path": str(adoption_path), "sha256": adoption_sha}
+        or quarantine_ref != {"path": str(quarantine_path), "sha256": quarantine_sha}
+        or adoption.get("linked_v3_receipt") != str(linked_path)
+        or adoption.get("linked_v3_receipt_sha256") != linked_sha
+        or operator.get("schema_version") != "ac_dev_operator_exception_cow_import.v1"
+        or operator.get("qa_pass") is not False
+        or operator.get("release_authority") is not False
+        or not operator.get("decisions")
+        or operator.get("backup_sha256") != predecessor["sha256"]
+        or operator.get("target_sha256_before") != predecessor["sha256"]
+        or linked.get("schema_version") != "ac_dev_offline_schema_admission.v3"
+        or linked.get("stage") != "completed"
+        or linked.get("project_id") != AC_PROJECT_ID
+        or linked.get("port") != 40008
+        or dict(linked.get("database_identity") or {}).get("device")
+        != predecessor["device"]
+        or dict(linked.get("database_identity") or {}).get("inode")
+        != predecessor["inode"]
+        or adoption.get("schema_version")
+        != "ac_dev_canonical_legacy_postimage_adoption.v1"
+        or adoption.get("stage") != "completed"
+        or adoption.get("project_id") != AC_PROJECT_ID
+        or adoption.get("port") != 40008
+        or quarantine_path.parent.parent
+        != root / "quarantine" / "schema-admission-sidecars"
+        or _quarantine.get("schema_version")
+        != "aming-claw.schema-admission-sidecar-quarantine.v1"
+        or _quarantine.get("stage") != "completed"
+    ):
+        raise ValueError("AC dev COW successor historical artifact chain mismatch")
+    linked_sidecar = linked_path.with_suffix(".sha256")
+    if (
+        linked_sidecar.is_symlink()
+        or not linked_sidecar.is_file()
+        or linked_sidecar.read_text(encoding="utf-8")
+        != f"{linked_sha}  {linked_path.name}\n"
+    ):
+        raise ValueError("AC dev COW successor historical linked receipt mismatch")
+    snapshot, rows, columns = _cow_historical_backlog_snapshot(root, operator)
+
+    descriptor, temporary_name = tempfile.mkstemp(prefix="ac-cow-reconstruct-", suffix=".sqlite")
+    os.close(descriptor)
+    temporary = Path(temporary_name).resolve(strict=True)
+    try:
+        shutil.copyfile(predecessor_path, temporary)
+        os.chmod(temporary, 0o600)
+        conn = sqlite3.connect(str(temporary), isolation_level=None)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            admit_missing_backlog_read_schema(conn, commit=False)
+            quoted = ",".join(_sqlite_quote_identifier(name) for name in columns)
+            placeholders = ",".join("?" for _ in columns)
+            conn.executemany(
+                f'INSERT INTO "backlog_bugs" ({quoted}) VALUES ({placeholders})', rows
+            )
+            conn.commit()
+            if tuple(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()) != (0, 0, 0):
+                raise ValueError("AC dev COW successor reconstruction checkpoint failed")
+        finally:
+            conn.close()
+        reconstructed = _cow_database_observation(temporary)
+    finally:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                Path(str(temporary) + suffix).unlink()
+            except FileNotFoundError:
+                pass
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    physical = database.stat(follow_symlinks=False)
+    reconstructed["identity"] = {
+        "path": str(database), "device": int(physical.st_dev),
+        "inode": int(physical.st_ino), "size": reconstructed["identity"]["size"],
+        "nlink": int(physical.st_nlink), "sha256": operator.get("target_sha256_after"),
+    }
+    reconstructed.update(snapshot)
+    stable = verified_stable_database_binding()
+    _revalidate_stable_database_binding(stable)
+    return {
+        "schema_version": AC_DEV_COW_SUCCESSOR_SCHEMA, "stage": "completed",
+        "project_id": AC_PROJECT_ID, "port": 40008, "root": str(root),
+        "listener": {"host": "127.0.0.1", "port": 40008, "listening": False},
+        "genesis": {"raw_json": reconstructed["genesis_json"],
+                    "sha256": reconstructed["genesis_sha256"]},
+        "predecessor": {"backup": predecessor}, "successor": reconstructed,
+        "operator_evidence": {"path": str(operator_path), "sha256": operator_sha,
+                              "payload": operator},
+        "history": {"linked_v3": {"path": str(linked_path), "sha256": linked_sha},
+                    "adoption": {"path": str(adoption_path), "sha256": adoption_sha}},
+        "stable_binding": {"database": dict(stable["stable_database_identity"]),
+                           "runtime_commit": stable.get("commit")},
+    }
+
+
 def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, object]:
     """Revalidate immutable v2 issuance evidence, never mutable live rows."""
     root = Path(storage_root).expanduser().absolute()
@@ -3409,177 +3579,16 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
             or receipt.get("stage") != "completed" or receipt.get("project_id") != AC_PROJECT_ID
             or receipt.get("port") != 40008 or receipt.get("root") != str(root)):
         raise ValueError("AC dev COW successor receipt mismatch")
-    operator = dict(receipt.get("operator_evidence") or {})
-    predecessor = dict(dict(receipt.get("predecessor") or {}).get("backup") or {})
-    successor = dict(receipt.get("successor") or {})
-    successor_identity = dict(successor.get("identity") or {})
-    history = dict(receipt.get("history") or {})
-    linked = dict(history.get("linked_v3") or {})
-    adoption = dict(history.get("adoption") or {})
-
-    operator_payload, operator_sha = _cow_raw_receipt(
-        Path(str(operator.get("path") or "")), prefix="cow-import"
-    )
-    backup_identity = _cow_regular_identity(Path(str(predecessor.get("path") or "")))
-    linked_payload, linked_sha = _cow_raw_receipt(Path(str(linked.get("path") or "")))
-    adoption_payload, adoption_sha = _cow_raw_receipt(
-        Path(str(adoption.get("path") or "")), prefix="adoption"
-    )
-    linked_path = Path(str(linked.get("path") or "")).expanduser().absolute()
-    linked_sidecar = linked_path.with_suffix(".sha256")
-    source_schema = dict(successor.get("source_schema") or {})
-    source_inventory = source_schema.get("inventory")
-    source_inventory_hash = "sha256:" + hashlib.sha256(
-        json.dumps(source_inventory, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    genesis = dict(receipt.get("genesis") or {})
-    try:
-        genesis_value = json.loads(str(genesis.get("raw_json") or ""))
-    except ValueError as exc:
-        raise ValueError("AC dev COW successor receipt genesis is unreadable") from exc
-    database = root / AC_DATABASE_DEV_RELATIVE_PATH
-    database_metadata = database.stat(follow_symlinks=False)
-    stable = verified_stable_database_binding()
-    _revalidate_stable_database_binding(stable)
-    stable_identity = dict(stable.get("stable_database_identity") or {})
-    receipt_stable = dict(receipt.get("stable_binding") or {})
-    expected_top_level_fields = {
-        "schema_version", "stage", "project_id", "port", "root", "listener",
-        "genesis", "predecessor", "successor", "operator_evidence", "history",
-        "stable_binding",
-    }
-    expected_successor_fields = {
-        "identity", "quick_check", "row_count", "status_counts",
-        "managed_inventory", "managed_inventory_drift", "protected_inventory",
-        "protected_projection", "backlog_projection_sha256", "source_schema",
-        "governance_world_id", "genesis_json", "genesis_sha256",
-    }
-
-    def inventory_binding_valid(value: object) -> bool:
-        binding = dict(value or {}) if isinstance(value, Mapping) else {}
-        inventory = binding.get("inventory")
-        if not isinstance(inventory, list):
-            return False
-        encoded = json.dumps(
-            [tuple(row) for row in inventory],
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-        return binding.get("sha256") == "sha256:" + hashlib.sha256(encoded).hexdigest()
-
-    if (
-        set(receipt) != expected_top_level_fields
-        or receipt.get("listener")
-        != {"host": "127.0.0.1", "port": 40008, "listening": False}
-        or set(successor) != expected_successor_fields
-        or set(successor_identity)
-        != {"path", "device", "inode", "size", "nlink", "sha256"}
-        or set(source_schema) != {"required_tables", "inventory", "sha256"}
-        or set(dict(successor.get("managed_inventory") or {}))
-        != {"inventory", "sha256"}
-        or set(dict(successor.get("protected_inventory") or {}))
-        != {"inventory", "sha256"}
-        or set(genesis) != {"raw_json", "sha256"}
-        or set(dict(receipt.get("predecessor") or {})) != {"backup"}
-        or set(operator) != {"path", "sha256", "payload"}
-        or set(history) != {"linked_v3", "adoption"}
-        or set(linked) != {"path", "sha256"}
-        or set(adoption) != {"path", "sha256"}
-        or receipt_stable
-        != {"database": stable_identity, "runtime_commit": stable.get("commit")}
-        or operator.get("sha256") != operator_sha
-        or operator.get("payload") != operator_payload
-        or operator_payload.get("schema_version")
-        != "ac_dev_operator_exception_cow_import.v1"
-        or operator_payload.get("qa_pass") is not False
-        or operator_payload.get("release_authority") is not False
-        or not operator_payload.get("decisions")
-        or Path(str(operator.get("path") or "")).parent
-        != root / "archive" / "operator-exceptions"
-        or operator_payload.get("rows") != successor.get("row_count")
-        or successor.get("row_count") != 3603
-        or operator_payload.get("target_sha256_after")
-        != successor_identity.get("sha256")
-        or operator_payload.get("backup_sha256") != predecessor.get("sha256")
-        or operator_payload.get("target_sha256_before") != predecessor.get("sha256")
-        or backup_identity != predecessor
-        or Path(str(predecessor.get("path") or "")).parent
-        != root / "archive" / "operator-exception-backups"
-        or linked.get("sha256") != linked_sha
-        or linked_path.parent != root / "archive" / "schema-admission"
-        or linked_path.name != linked_sha.removeprefix("sha256:") + ".json"
-        or linked_sidecar.is_symlink()
-        or not linked_sidecar.is_file()
-        or linked_sidecar.read_text(encoding="utf-8")
-        != f"{linked_sha}  {linked_path.name}\n"
-        or linked_payload.get("schema_version") != "ac_dev_offline_schema_admission.v3"
-        or linked_payload.get("stage") != "completed"
-        or dict(linked_payload.get("database_identity") or {}).get("device")
-        != predecessor.get("device")
-        or dict(linked_payload.get("database_identity") or {}).get("inode")
-        != predecessor.get("inode")
-        or adoption.get("sha256") != adoption_sha
-        or Path(str(adoption.get("path") or "")).parent
-        != root / "archive" / "canonical-legacy-postimage-adoption"
-        or adoption_payload.get("schema_version")
-        != "ac_dev_canonical_legacy_postimage_adoption.v1"
-        or adoption_payload.get("stage") != "completed"
-        or adoption_payload.get("project_id") != AC_PROJECT_ID
-        or adoption_payload.get("port") != 40008
-        or adoption_payload.get("linked_v3_receipt") != linked.get("path")
-        or adoption_payload.get("linked_v3_receipt_sha256") != linked_sha
-        or source_schema.get("sha256") != source_inventory_hash
-        or successor.get("quick_check") != "ok"
-        or successor.get("managed_inventory_drift") != []
-        or not inventory_binding_valid(successor.get("managed_inventory"))
-        or not inventory_binding_valid(successor.get("protected_inventory"))
-        or sum(int(value) for value in dict(successor.get("status_counts") or {}).values())
-        != successor.get("row_count")
-        or not re.fullmatch(
-            r"sha256:[0-9a-f]{64}", str(successor_identity.get("sha256") or "")
-        )
-        or not re.fullmatch(
-            r"sha256:[0-9a-f]{64}",
-            str(successor.get("backlog_projection_sha256") or ""),
-        )
-        or genesis.get("sha256") != _world_genesis_hash(genesis_value)
-        or genesis_value.get("schema_version") != AC_WORLD_GENESIS_SCHEMA
-        or genesis_value.get("world_id") != AC_DEV_WORLD_ID
-        or genesis_value.get("project_id") != AC_PROJECT_ID
-        or genesis_value.get("source_only") is not True
-        or genesis_value.get("rows_copied") != 0
-        or genesis.get("raw_json")
-        != json.dumps(
-            genesis_value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        )
-        or successor.get("genesis_json") != genesis.get("raw_json")
-        or successor.get("genesis_sha256") != genesis.get("sha256")
-        or successor_identity.get("path") != str(database)
-        or successor_identity.get("device") != int(database_metadata.st_dev)
-        or successor_identity.get("inode") != int(database_metadata.st_ino)
-        or successor_identity.get("nlink") != int(database_metadata.st_nlink)
-        or (
-            stable_identity.get("device"),
-            stable_identity.get("inode"),
-        )
-        == (
-            successor_identity.get("device"),
-            successor_identity.get("inode"),
-        )
-    ):
-        raise ValueError("AC dev COW successor historical issuance evidence mismatch")
-    # The digest proves the exact immutable receipt bytes.  Current database
-    # size/hash/row count are intentionally not replayed: legitimate backlog
-    # writes mutate those after issuance and are validated by restart custody.
-    if digest != "sha256:" + receipts[0].name.removeprefix(
-        AC_DEV_COW_SUCCESSOR_PREFIX + "."
-    ).removesuffix(".json"):
-        raise ValueError("AC dev COW successor receipt replay drift")
+    expected = _reconstruct_dev_cow_successor_payload(root, receipt)
+    receipt_canonical = json.dumps(
+        receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    expected_canonical = json.dumps(
+        expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    if receipt_canonical != expected_canonical:
+        raise ValueError("AC dev COW successor reconstructed issuance payload mismatch")
     return receipt
-
 
 def _verify_current_dev_backlog_runtime_invariants(conn: sqlite3.Connection) -> None:
     """Validate mutable backlog state through schema/generation invariants."""

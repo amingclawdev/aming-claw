@@ -1537,6 +1537,12 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
     )
     receipt = Path(first["receipt"])
     raw = receipt.read_bytes()
+    expected_payload = json.loads(raw)
+    monkeypatch.setattr(
+        db,
+        "_reconstruct_dev_cow_successor_payload",
+        lambda _root, _receipt: expected_payload,
+    )
     assert receipt.name == f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(raw).hexdigest()}.json"
     assert legacy.read_bytes() == legacy_raw
     second = db.create_dev_cow_successor_receipt(
@@ -1554,7 +1560,7 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
         f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(wrong_raw).hexdigest()}.json"
     )
     wrong_receipt.write_bytes(wrong_raw)
-    with pytest.raises(ValueError, match="historical issuance"):
+    with pytest.raises(ValueError, match="reconstructed issuance"):
         db.validate_dev_cow_successor_receipt(root)
     wrong_receipt.unlink(); receipt.write_bytes(raw)
 
@@ -1571,7 +1577,7 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
         f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(tampered_raw).hexdigest()}.json"
     )
     tampered_receipt.write_bytes(tampered_raw)
-    with pytest.raises(ValueError, match="historical issuance"):
+    with pytest.raises(ValueError, match="reconstructed issuance"):
         db.validate_dev_cow_successor_receipt(root)
     assert tampered_receipt.read_bytes() == tampered_raw
 
@@ -1620,15 +1626,36 @@ def _real_cow_successor_cli_fixture(tmp_path, monkeypatch):
             path.unlink()
     before_sha = db._durable_database_sha256(backup)
     after_sha = db._durable_database_sha256(database)
+    snapshot_dir = root / "archive" / "staging" / "dashboard-backlog-snapshots"
+    snapshot_dir.mkdir(parents=True)
+    snapshot_temp = snapshot_dir / "snapshot.pending.sqlite"
+    shutil.copyfile(database, snapshot_temp)
+    snapshot_sha = db._durable_database_sha256(snapshot_temp)
+    snapshot = snapshot_dir / f"snapshot.{snapshot_sha.removeprefix('sha256:')}.sqlite"
+    snapshot_temp.rename(snapshot)
+    manifest_payload = {
+        "schema_version": "ac_dev_dashboard_backlog_snapshot.v1",
+        "destination_path": str(snapshot),
+        "destination_sha256": snapshot_sha,
+        "row_count": 3603,
+        "status_counts": {"OPEN": 3603},
+    }
+    manifest_raw = json.dumps(
+        manifest_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    manifest = snapshot_dir / f"manifest.{hashlib.sha256(manifest_raw).hexdigest()}.json"
+    manifest.write_bytes(manifest_raw)
     operator_payload = {"schema_version": "ac_dev_operator_exception_cow_import.v1",
                         "qa_pass": False, "release_authority": False, "rows": 3603,
                         "decisions": ["dec-real-sqlite"], "backup_sha256": before_sha,
+                        "snapshot_sha256": snapshot_sha,
                         "target_sha256_before": before_sha, "target_sha256_after": after_sha}
     operator_raw = json.dumps(operator_payload, sort_keys=True, separators=(",", ":")).encode()
     operator = root / "archive" / "operator-exceptions" / (
         f"cow-import.{hashlib.sha256(operator_raw).hexdigest()}.json")
     operator.parent.mkdir(parents=True); operator.write_bytes(operator_raw)
     linked_payload = {"schema_version": "ac_dev_offline_schema_admission.v3", "stage": "completed",
+                      "project_id": db.AC_PROJECT_ID, "port": 40008,
                       "database_identity": {"path": str(database), "device": backup_stat.st_dev,
                                             "inode": backup_stat.st_ino}}
     linked_raw = json.dumps(linked_payload, sort_keys=True, separators=(",", ":")).encode()
@@ -1640,6 +1667,21 @@ def _real_cow_successor_cli_fixture(tmp_path, monkeypatch):
                         "stage": "completed", "project_id": "aming-claw", "port": 40008,
                         "linked_v3_receipt": str(linked),
                         "linked_v3_receipt_sha256": "sha256:" + linked_digest}
+    quarantine_dir = root / "quarantine" / "schema-admission-sidecars" / "fixture"
+    quarantine_dir.mkdir(parents=True)
+    quarantine_payload = {
+        "schema_version": "aming-claw.schema-admission-sidecar-quarantine.v1",
+        "stage": "completed",
+    }
+    quarantine_raw = json.dumps(
+        quarantine_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    quarantine = quarantine_dir / f"manifest.{hashlib.sha256(quarantine_raw).hexdigest()}.json"
+    quarantine.write_bytes(quarantine_raw)
+    adoption_payload["quarantine_manifest"] = {
+        "path": str(quarantine),
+        "sha256": "sha256:" + hashlib.sha256(quarantine_raw).hexdigest(),
+    }
     adoption_raw = json.dumps(adoption_payload, sort_keys=True, separators=(",", ":")).encode()
     adoption = root / "archive" / "canonical-legacy-postimage-adoption" / (
         f"adoption.{hashlib.sha256(adoption_raw).hexdigest()}.json")
@@ -1711,7 +1753,7 @@ def test_ac_dev_cow_successor_v2_restart_allows_legitimate_fresh_backlog_row(
     assert Path(created["receipt"]).read_bytes() == receipt_raw
 
 
-def test_ac_dev_cow_successor_v2_rejects_rehashed_listener_and_stable_tampering(
+def test_ac_dev_cow_successor_v2_rejects_recursive_rehashed_tampering(
     tmp_path, monkeypatch
 ):
     from agent.governance import db
@@ -1745,6 +1787,17 @@ def test_ac_dev_cow_successor_v2_rejects_rehashed_listener_and_stable_tampering(
         ("stable_binding", "database", "inode", 99999),
         ("stable_binding", "database", "path", "/foreign/stable.db"),
         ("stable_binding", "path", "/foreign/stable"),
+        ("successor", "status_counts", {"FIXED": 1, "OPEN": 3602}),
+        ("successor", "backlog_projection_sha256", "sha256:" + "1" * 64),
+        ("successor", "source_schema", "sha256", "sha256:" + "2" * 64),
+        ("successor", "managed_inventory", "sha256", "sha256:" + "3" * 64),
+        ("successor", "protected_inventory", "sha256", "sha256:" + "4" * 64),
+        ("successor", "genesis_sha256", "sha256:" + "5" * 64),
+        ("successor", "row_count", 3603.0),
+        ("predecessor", "backup", "size", 1),
+        ("operator_evidence", "sha256", "sha256:" + "6" * 64),
+        ("history", "linked_v3", "sha256", "sha256:" + "7" * 64),
+        ("history", "adoption", "sha256", "sha256:" + "8" * 64),
     )
     for case in cases:
         payload = json.loads(original_raw)
@@ -1759,7 +1812,29 @@ def test_ac_dev_cow_successor_v2_rejects_rehashed_listener_and_stable_tampering(
         receipt_path.unlink()
         tampered_path.write_bytes(tampered_raw)
         try:
-            with pytest.raises(ValueError, match="historical issuance"):
+            with pytest.raises(ValueError, match="COW successor"):
+                db.validate_dev_cow_successor_receipt(root)
+        finally:
+            tampered_path.unlink()
+            receipt_path.write_bytes(original_raw)
+
+    structural_cases = []
+    payload = json.loads(original_raw)
+    payload["unexpected"] = "authority"
+    structural_cases.append(payload)
+    payload = json.loads(original_raw)
+    del payload["successor"]["status_counts"]
+    structural_cases.append(payload)
+    for payload in structural_cases:
+        tampered_raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        tampered_path = receipt_path.with_name(
+            f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}."
+            f"{hashlib.sha256(tampered_raw).hexdigest()}.json"
+        )
+        receipt_path.unlink()
+        tampered_path.write_bytes(tampered_raw)
+        try:
+            with pytest.raises(ValueError, match="COW successor"):
                 db.validate_dev_cow_successor_receipt(root)
         finally:
             tampered_path.unlink()
@@ -1904,7 +1979,7 @@ def test_ac_dev_cow_successor_public_cli_rejects_self_consistent_foreign_world(
     (archive / f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(crafted_raw).hexdigest()}.json").write_bytes(
         crafted_raw
     )
-    with pytest.raises(ValueError, match="canonical|historical issuance"):
+    with pytest.raises(ValueError, match="canonical|COW successor"):
         db.validate_dev_cow_successor_receipt(root)
 def test_ac_dev_source_upgrade_rejects_non_descendant_root_branch_db_and_process(tmp_path):
     from agent.governance import db
