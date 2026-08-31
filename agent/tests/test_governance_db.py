@@ -828,7 +828,7 @@ def test_v27_bootstrap_rejects_nonfresh_or_preloaded_world(
         "source_sha256": "sha256:" + "e" * 64,
     }
     process = {"pid": os.getpid(), "start_identity": "v27-bootstrap"}
-    storage_root, _ = _canonical_dev_world(tmp_path)
+    storage_root, stable = _canonical_dev_world(tmp_path)
 
     if defect == "existing-empty-root":
         storage_root.mkdir(parents=True)
@@ -839,6 +839,7 @@ def test_v27_bootstrap_rejects_nonfresh_or_preloaded_world(
             process_identity=process,
         )
         database = Path(first["database_path"])
+        _admit_existing_dev_world(storage_root, stable)
         if defect == "unknown-table":
             with sqlite3.connect(database) as connection:
                 connection.execute("CREATE TABLE injected_state (value TEXT)")
@@ -967,11 +968,24 @@ def _advance_dev_source(root: Path, value: str) -> str:
     ).stdout.strip()
 
 
+def _admit_existing_dev_world(storage_root: Path, stable: Path) -> None:
+    """Give restart/adoption fixtures the same canonical receipt as CLI start."""
+    from agent.governance import db
+
+    server_source = Path(db.__file__).with_name("server.py")
+    db.write_dev_launch_receipt(
+        storage_root,
+        stable_shared_volume=stable,
+        source_sha256="sha256:" + hashlib.sha256(server_source.read_bytes()).hexdigest(),
+        port=40008,
+    )
+
+
 def test_ac_dev_source_tip_cas_upgrade_is_descendant_and_genesis_immutable(tmp_path):
     from agent.governance import db
 
     root, commit_a = _dev_source_repo(tmp_path)
-    storage_root, _ = _canonical_dev_world(tmp_path)
+    storage_root, stable = _canonical_dev_world(tmp_path)
     source_a = {
         "root": str(root.resolve()),
         "branch": "codex/ac-dev",
@@ -984,6 +998,7 @@ def test_ac_dev_source_tip_cas_upgrade_is_descendant_and_genesis_immutable(tmp_p
         source_identity=source_a,
         process_identity=process_a,
     )
+    _admit_existing_dev_world(storage_root, stable)
     commit_b = _advance_dev_source(root, "B")
     source_b = {
         **source_a,
@@ -1031,19 +1046,21 @@ def test_ac_dev_source_tip_cas_upgrade_is_descendant_and_genesis_immutable(tmp_p
             expected_previous_process_identity=process_b,
             expected_database_identity=first["database_identity"],
         )
-    readback = db.bootstrap_dev_governance_store(
-        storage_root,
-        source_identity=source_b,
-        process_identity=process_b,
-    )
-    assert readback["source_tip_identity"] == source_b
+    # A restart cannot lie about the checked-out source after the worktree
+    # moves again, even when the stored source tip itself is still B.
+    with pytest.raises(ValueError, match="HEAD mismatch"):
+        db.bootstrap_dev_governance_store(
+            storage_root,
+            source_identity=source_b,
+            process_identity=process_b,
+        )
 
 
 def test_ac_dev_source_upgrade_rejects_non_descendant_root_branch_db_and_process(tmp_path):
     from agent.governance import db
 
     root, commit_a = _dev_source_repo(tmp_path)
-    storage_root, _ = _canonical_dev_world(tmp_path)
+    storage_root, stable = _canonical_dev_world(tmp_path)
     source_a = {
         "root": str(root.resolve()),
         "branch": "codex/ac-dev",
@@ -1056,6 +1073,7 @@ def test_ac_dev_source_upgrade_rejects_non_descendant_root_branch_db_and_process
         source_identity=source_a,
         process_identity=process_a,
     )
+    _admit_existing_dev_world(storage_root, stable)
     commit_b = _advance_dev_source(root, "B")
     source_b = {**source_a, "commit": commit_b, "source_sha256": "sha256:" + "b" * 64}
 
@@ -1109,6 +1127,112 @@ def test_ac_dev_source_upgrade_rejects_non_descendant_root_branch_db_and_process
             expected_previous_process_identity=process_a,
             expected_database_identity=first["database_identity"],
         )
+
+
+def test_verified_dev_adoption_recovers_real_committed_wal_without_source_advance(
+    tmp_path,
+):
+    """A stopped, canonical SQLite WAL is checkpointed rather than unlinked."""
+    from agent.governance import db
+
+    source_root, commit = _dev_source_repo(tmp_path)
+    source = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": commit, "source_sha256": "sha256:" + "a" * 64,
+    }
+    storage_root, stable = _canonical_dev_world(tmp_path)
+    first = db.bootstrap_dev_governance_store(
+        storage_root, source_identity=source,
+        process_identity={"pid": 111, "start_identity": "first"},
+    )
+    _admit_existing_dev_world(storage_root, stable)
+    database = Path(first["database_path"])
+    # Exit without closing: this leaves a real committed WAL/SHM pair while
+    # avoiding a live holder in the parent process.
+    code = (
+        "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+        "c.execute('PRAGMA journal_mode=WAL'); c.execute('PRAGMA wal_autocheckpoint=0'); "
+        "c.execute(\"INSERT OR REPLACE INTO schema_meta(key,value) VALUES('wal_recovery_probe','committed')\"); "
+        "c.commit(); os._exit(0)"
+    )
+    subprocess.run([sys.executable, "-c", code, str(database)], check=True)
+    wal = Path(str(database) + "-wal")
+    shm = Path(str(database) + "-shm")
+    assert wal.is_file() and wal.stat().st_size > 32
+    assert shm.is_file()
+    receipt_before = (storage_root / db.AC_DEV_LAUNCH_RECEIPT_NAME).read_bytes()
+
+    adopted = db.bootstrap_dev_governance_store(
+        storage_root, source_identity=source,
+        process_identity={"pid": 222, "start_identity": "restart"},
+        expected_source_tip_sha256=first["source_tip_sha256"],
+        expected_previous_process_identity={"pid": 111, "start_identity": "first"},
+        expected_database_identity=first["database_identity"],
+    )
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key='wal_recovery_probe'"
+        ).fetchone()[0] == "committed"
+    assert adopted["source_upgraded"] is False
+    assert adopted["source_tip_sha256"] == first["source_tip_sha256"]
+    assert (storage_root / db.AC_DEV_LAUNCH_RECEIPT_NAME).read_bytes() == receipt_before
+
+
+@pytest.mark.parametrize("defect", ["busy", "corrupt", "symlink", "toc_tou"])
+def test_verified_dev_adoption_failures_do_not_advance_source_or_receipt(
+    tmp_path, monkeypatch, defect
+):
+    from agent.governance import db
+
+    source_root, commit = _dev_source_repo(tmp_path)
+    source = {
+        "root": str(source_root.resolve()), "branch": "codex/ac-dev",
+        "commit": commit, "source_sha256": "sha256:" + "b" * 64,
+    }
+    storage_root, stable = _canonical_dev_world(tmp_path)
+    first = db.bootstrap_dev_governance_store(
+        storage_root, source_identity=source,
+        process_identity={"pid": 333, "start_identity": "first"},
+    )
+    _admit_existing_dev_world(storage_root, stable)
+    database = Path(first["database_path"])
+    receipt_path = storage_root / db.AC_DEV_LAUNCH_RECEIPT_NAME
+    receipt_before = receipt_path.read_bytes()
+    if defect == "busy":
+        monkeypatch.setattr(
+            db, "_assert_no_external_sqlite_holders",
+            lambda _database: (_ for _ in ()).throw(RuntimeError("external holders")),
+        )
+    elif defect == "corrupt":
+        database.write_bytes(b"not a sqlite database")
+    elif defect == "symlink":
+        outside = tmp_path / "outside-wal"
+        outside.write_bytes(b"outside")
+        Path(str(database) + "-wal").symlink_to(outside)
+    else:
+        monkeypatch.setattr(
+            db, "_assert_sqlite_adoption_identity",
+            lambda *_args: (_ for _ in ()).throw(ValueError("identity changed")),
+        )
+
+    with pytest.raises((RuntimeError, ValueError)):
+        db.bootstrap_dev_governance_store(
+            storage_root, source_identity=source,
+            process_identity={"pid": 444, "start_identity": "restart"},
+            expected_source_tip_sha256=first["source_tip_sha256"],
+            expected_previous_process_identity={"pid": 333, "start_identity": "first"},
+            expected_database_identity=first["database_identity"],
+        )
+    assert receipt_path.read_bytes() == receipt_before
+    # Failures before source upgrade cannot advance source-tip provenance.
+    if defect != "corrupt":
+        if defect == "symlink":
+            # Test-only fixture cleanup after the fail-closed assertion; the
+            # runtime itself never unlinks an untrusted companion.
+            Path(str(database) + "-wal").unlink()
+        with sqlite3.connect(database) as connection:
+            meta = dict(connection.execute("SELECT key, value FROM schema_meta"))
+        assert meta["governance_world_source_tip_sha256"] == first["source_tip_sha256"]
 
 
 def test_ac_dev_cutover_preflight_activation_idempotency_and_rollback(tmp_path):

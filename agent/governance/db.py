@@ -1819,6 +1819,181 @@ def _bind_dev_writer_lease_database_identity(database: Path) -> None:
         receipt["database_device"], receipt["database_inode"] = actual
 
 
+_SQLITE_ADOPTION_SUFFIXES = ("", "-wal", "-shm", "-journal")
+
+
+def _sqlite_adoption_identity(path: Path, *, required: bool) -> dict[str, object] | None:
+    """Capture one non-following SQLite artifact identity for adoption CAS.
+
+    This deliberately omits size and mtime: a successful checkpoint is expected
+    to change those.  Device/inode/type are the substitution boundary.
+    """
+
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if required:
+            raise ValueError("AC dev SQLite adoption artifact is missing")
+        return None
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("AC dev SQLite adoption artifact is not a regular file")
+    if path.resolve(strict=True) != path.absolute():
+        raise ValueError("AC dev SQLite adoption artifact escaped its world")
+    return {
+        "path": str(path.absolute()),
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "mode": int(stat.S_IFMT(metadata.st_mode)),
+    }
+
+
+def _sqlite_adoption_snapshot(root: Path, database: Path) -> dict[str, object]:
+    """Read physical identities without following caller-controlled paths."""
+
+    root_meta = root.stat(follow_symlinks=False)
+    if root.is_symlink() or not stat.S_ISDIR(root_meta.st_mode):
+        raise ValueError("AC dev SQLite adoption root identity is invalid")
+    return {
+        "root": {"device": int(root_meta.st_dev), "inode": int(root_meta.st_ino)},
+        "database": _sqlite_adoption_identity(database, required=True),
+        "companions": {
+            suffix: _sqlite_adoption_identity(Path(str(database) + suffix), required=False)
+            for suffix in ("-wal", "-shm", "-journal")
+        },
+    }
+
+
+def _assert_sqlite_adoption_identity(
+    before: Mapping[str, object], root: Path, database: Path
+) -> None:
+    """Reject root/database substitution; WAL/SHM may change only by SQLite."""
+
+    after = _sqlite_adoption_snapshot(root, database)
+    if after["root"] != before.get("root") or after["database"] != before.get("database"):
+        raise ValueError("AC dev SQLite adoption identity changed during recovery")
+    # A rollback journal is never a resumable dev-world artifact.  WAL/SHM may
+    # disappear after a successful TRUNCATE checkpoint, but a new journal is a
+    # concurrent/foreign writer signal and must fail closed.
+    if after["companions"].get("-journal") is not None:
+        raise ValueError("AC dev SQLite adoption found rollback journal")
+
+
+def _assert_no_external_sqlite_holders(database: Path) -> None:
+    """Fail closed when another process has one of this world's SQLite files open."""
+
+    paths = {str(Path(str(database) + suffix).absolute()) for suffix in _SQLITE_ADOPTION_SUFFIXES}
+    try:
+        result = subprocess.run(
+            ["lsof", "-n", "-Fpn", *sorted(paths)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("AC dev SQLite holder inspection is unavailable") from exc
+    pids = {
+        int(line[1:])
+        for line in result.stdout.splitlines()
+        if line.startswith("p") and line[1:].isdigit()
+    }
+    foreign = pids - {os.getpid()}
+    if foreign:
+        raise RuntimeError("AC dev SQLite adoption has external holders")
+
+
+def _validate_existing_adoption_receipt(root: Path) -> None:
+    """Validate a prior canonical receipt without requiring its old source hash.
+
+    The new receipt is written by the CLI only after this recovery and any
+    source-tip upgrade succeed.  Requiring the current hash here would make a
+    legitimate descendant restart impossible; accepting a copied receipt would
+    make it unsafe, so all physical stable/root fields are rechecked.
+    """
+
+    path = root / AC_DEV_LAUNCH_RECEIPT_NAME
+    if path.is_symlink() or not path.is_file() or path.resolve(strict=True) != path:
+        raise ValueError("existing AC dev launch receipt is missing or invalid")
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("existing AC dev launch receipt is unreadable") from exc
+    if not isinstance(receipt, Mapping):
+        raise ValueError("existing AC dev launch receipt is invalid")
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
+    stable = _absolute_non_symlink_root(
+        Path(str(binding.get("shared_volume_path") or "")), create=False
+    )
+    root_stat = root.stat(follow_symlinks=False)
+    stable_stat = stable.stat(follow_symlinks=False)
+    parent_stat = stable.parent.stat(follow_symlinks=False)
+    required = {
+        "schema_version": AC_DEV_LAUNCH_RECEIPT_SCHEMA,
+        "world_id": AC_DEV_WORLD_ID,
+        "project_id": AC_PROJECT_ID,
+        "runtime_plane": DEV_RUNTIME_PLANE,
+        "port": 40008,
+        "background": False,
+        "storage_root": str(root),
+        "storage_device": int(root_stat.st_dev),
+        "storage_inode": int(root_stat.st_ino),
+        "stable_shared_volume": str(stable),
+        "stable_shared_volume_device": int(stable_stat.st_dev),
+        "stable_shared_volume_inode": int(stable_stat.st_ino),
+        "stable_parent_device": int(parent_stat.st_dev),
+        "stable_parent_inode": int(parent_stat.st_ino),
+    }
+    if any(receipt.get(key) != value for key, value in required.items()):
+        raise ValueError("existing AC dev launch receipt mismatch")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("source_sha256") or "")):
+        raise ValueError("existing AC dev launch receipt source hash is invalid")
+
+
+def _recover_verified_existing_dev_sqlite(root: Path, database: Path) -> None:
+    """Bounded source-owned recovery for a stopped, verified dev world.
+
+    No unlink is performed.  SQLite owns any WAL/SHM changes through a fully
+    completed TRUNCATE checkpoint; errors leave source-tip/receipt state alone.
+    """
+
+    before = _sqlite_adoption_snapshot(root, database)
+    if before["companions"].get("-journal") is not None:
+        raise ValueError("AC dev SQLite adoption rejects rollback journal state")
+    wal = Path(str(database) + "-wal")
+    if wal.exists():
+        wal_size = wal.stat(follow_symlinks=False).st_size
+        if wal_size:
+            header = wal.read_bytes()[:32]
+            if len(header) != 32 or header[:4] not in (
+                b"\x37\x7f\x06\x82", b"\x37\x7f\x06\x83"
+            ):
+                raise ValueError("AC dev SQLite adoption WAL is malformed")
+            page_size = int.from_bytes(header[8:12], "big")
+            if page_size == 1:
+                page_size = 65536
+            if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+                raise ValueError("AC dev SQLite adoption WAL page size is malformed")
+            if (wal_size - 32) % (page_size + 24):
+                raise ValueError("AC dev SQLite adoption WAL frame layout is malformed")
+    _assert_no_external_sqlite_holders(database)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(str(database), timeout=0, isolation_level=None)
+        for pragma in ("integrity_check", "quick_check"):
+            rows = [str(row[0]).lower() for row in conn.execute(f"PRAGMA {pragma}")]
+            if rows != ["ok"]:
+                raise ValueError(f"AC dev SQLite adoption {pragma} failed")
+        result = tuple(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+        if len(result) != 3 or int(result[0]) != 0 or int(result[1]) != int(result[2]):
+            raise RuntimeError("AC dev SQLite adoption checkpoint is incomplete")
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("AC dev SQLite adoption recovery failed") from exc
+    finally:
+        if conn is not None:
+            conn.close()
+    _assert_sqlite_adoption_identity(before, root, database)
+    binding = verified_stable_database_binding()
+    _revalidate_stable_database_binding(binding)
+
+
 def _source_schema_table_contract() -> tuple[set[str], set[str], set[tuple[str, str, str]]]:
     """Return required tables and the exact baseline sqlite_master inventory."""
 
@@ -1934,18 +2109,29 @@ def bootstrap_dev_governance_store(
     ):
         raise ValueError("AC dev source/process bootstrap identity is incomplete")
     database = root / AC_DATABASE_DEV_RELATIVE_PATH
-    if root_existed and not database.exists():
+    created = not database.exists()
+    # A root that pre-existed without its DB is neither a fresh bootstrap nor a
+    # proven prior world.  Do not create child directories in that case.
+    if root_existed and created:
         raise ValueError("AC dev fresh bootstrap requires an absent dedicated root")
-    database.parent.mkdir(parents=True, exist_ok=True)
+    if not created:
+        _validate_existing_adoption_receipt(root)
+    else:
+        database.parent.mkdir(parents=True, exist_ok=True)
     if database.parent.is_symlink() or database.parent.resolve(strict=True) != database.parent:
         raise ValueError("AC dev governance directory cannot be a symlink")
     companions = [
-        candidate
-        for suffix in ("-wal", "-shm", "-journal")
+        candidate for suffix in ("-wal", "-shm", "-journal")
         if (candidate := Path(str(database) + suffix)).exists()
     ]
-    if companions:
+    # Only a verified existing world can recover SQLite's normal WAL/SHM
+    # artifacts.  A fresh ingress remains hostile to every preloaded byte.
+    if created and companions:
         raise ValueError("AC dev bootstrap rejects reused WAL/SHM/journal state")
+    if not created:
+        _sqlite_adoption_identity(database, required=True)
+    for companion in companions:
+        _sqlite_adoption_identity(companion, required=True)
     lease_created = str(database.absolute()) not in _DEV_DATABASE_WRITER_LEASES
     acquire_dev_runtime_writer_lease(root)
     genesis = {
@@ -1963,7 +2149,6 @@ def bootstrap_dev_governance_store(
     source_tip_revision = 1
     current_process_identity = dict(process)
     source_upgraded = False
-    created = not database.exists()
     if database.is_symlink():
         raise ValueError("AC dev governance database cannot be a symlink")
     conn: sqlite3.Connection | None = None
@@ -2122,7 +2307,12 @@ def bootstrap_dev_governance_store(
                     != current_process_identity
                 ):
                     raise ValueError("AC dev source upgrade process identity mismatch")
-                _verify_dev_source_upgrade(source_tip_identity, source)
+            # Receipt, stable binding, schema/genesis, physical identity and
+            # exact clean source lineage are now all verified before SQLite
+            # may touch WAL.  The same check is intentional on a no-op restart.
+            _verify_dev_source_upgrade(source_tip_identity, source)
+            _recover_verified_existing_dev_sqlite(root, database)
+            if source != source_tip_identity:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     locked_meta = dict(
