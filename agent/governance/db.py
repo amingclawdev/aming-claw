@@ -3398,7 +3398,7 @@ def create_dev_cow_successor_receipt(
 
 
 def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, object]:
-    """Cycle-free, source-owned revalidation of the unique COW successor."""
+    """Revalidate immutable v2 issuance evidence, never mutable live rows."""
     root = Path(storage_root).expanduser().absolute()
     archive = _cow_successor_archive(root)
     receipts = sorted(archive.glob(f"{AC_DEV_COW_SUCCESSOR_PREFIX}.*.json")) if archive.is_dir() else []
@@ -3410,18 +3410,171 @@ def validate_dev_cow_successor_receipt(storage_root: Path | str) -> dict[str, ob
             or receipt.get("port") != 40008 or receipt.get("root") != str(root)):
         raise ValueError("AC dev COW successor receipt mismatch")
     operator = dict(receipt.get("operator_evidence") or {})
-    predecessor = dict(receipt.get("predecessor") or {}).get("backup")
+    predecessor = dict(dict(receipt.get("predecessor") or {}).get("backup") or {})
+    successor = dict(receipt.get("successor") or {})
+    successor_identity = dict(successor.get("identity") or {})
     history = dict(receipt.get("history") or {})
     linked = dict(history.get("linked_v3") or {})
-    # Re-run the creator's complete observation and require byte-identical payload.
-    expected = create_dev_cow_successor_receipt(
-        root, operator_receipt=Path(str(operator.get("path") or "")),
-        predecessor_backup=Path(str(dict(predecessor or {}).get("path") or "")),
-        linked_v3_receipt=Path(str(linked.get("path") or "")),
+    adoption = dict(history.get("adoption") or {})
+
+    operator_payload, operator_sha = _cow_raw_receipt(
+        Path(str(operator.get("path") or "")), prefix="cow-import"
     )
-    if expected["receipt_sha256"] != digest:
+    backup_identity = _cow_regular_identity(Path(str(predecessor.get("path") or "")))
+    linked_payload, linked_sha = _cow_raw_receipt(Path(str(linked.get("path") or "")))
+    adoption_payload, adoption_sha = _cow_raw_receipt(
+        Path(str(adoption.get("path") or "")), prefix="adoption"
+    )
+    linked_path = Path(str(linked.get("path") or "")).expanduser().absolute()
+    linked_sidecar = linked_path.with_suffix(".sha256")
+    source_schema = dict(successor.get("source_schema") or {})
+    source_inventory = source_schema.get("inventory")
+    source_inventory_hash = "sha256:" + hashlib.sha256(
+        json.dumps(source_inventory, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    genesis = dict(receipt.get("genesis") or {})
+    try:
+        genesis_value = json.loads(str(genesis.get("raw_json") or ""))
+    except ValueError as exc:
+        raise ValueError("AC dev COW successor receipt genesis is unreadable") from exc
+    database = root / AC_DATABASE_DEV_RELATIVE_PATH
+    database_metadata = database.stat(follow_symlinks=False)
+    stable = verified_stable_database_binding()
+    _revalidate_stable_database_binding(stable)
+    stable_identity = dict(stable.get("stable_database_identity") or {})
+    receipt_stable = dict(receipt.get("stable_binding") or {})
+
+    def inventory_binding_valid(value: object) -> bool:
+        binding = dict(value or {}) if isinstance(value, Mapping) else {}
+        inventory = binding.get("inventory")
+        if not isinstance(inventory, list):
+            return False
+        encoded = json.dumps(
+            [tuple(row) for row in inventory],
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        return binding.get("sha256") == "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    if (
+        operator.get("sha256") != operator_sha
+        or operator.get("payload") != operator_payload
+        or operator_payload.get("schema_version")
+        != "ac_dev_operator_exception_cow_import.v1"
+        or operator_payload.get("qa_pass") is not False
+        or operator_payload.get("release_authority") is not False
+        or not operator_payload.get("decisions")
+        or Path(str(operator.get("path") or "")).parent
+        != root / "archive" / "operator-exceptions"
+        or operator_payload.get("rows") != successor.get("row_count")
+        or successor.get("row_count") != 3603
+        or operator_payload.get("target_sha256_after")
+        != successor_identity.get("sha256")
+        or operator_payload.get("backup_sha256") != predecessor.get("sha256")
+        or operator_payload.get("target_sha256_before") != predecessor.get("sha256")
+        or backup_identity != predecessor
+        or Path(str(predecessor.get("path") or "")).parent
+        != root / "archive" / "operator-exception-backups"
+        or linked.get("sha256") != linked_sha
+        or linked_path.parent != root / "archive" / "schema-admission"
+        or linked_path.name != linked_sha.removeprefix("sha256:") + ".json"
+        or linked_sidecar.is_symlink()
+        or not linked_sidecar.is_file()
+        or linked_sidecar.read_text(encoding="utf-8")
+        != f"{linked_sha}  {linked_path.name}\n"
+        or linked_payload.get("schema_version") != "ac_dev_offline_schema_admission.v3"
+        or linked_payload.get("stage") != "completed"
+        or dict(linked_payload.get("database_identity") or {}).get("device")
+        != predecessor.get("device")
+        or dict(linked_payload.get("database_identity") or {}).get("inode")
+        != predecessor.get("inode")
+        or adoption.get("sha256") != adoption_sha
+        or Path(str(adoption.get("path") or "")).parent
+        != root / "archive" / "canonical-legacy-postimage-adoption"
+        or adoption_payload.get("schema_version")
+        != "ac_dev_canonical_legacy_postimage_adoption.v1"
+        or adoption_payload.get("stage") != "completed"
+        or adoption_payload.get("project_id") != AC_PROJECT_ID
+        or adoption_payload.get("port") != 40008
+        or adoption_payload.get("linked_v3_receipt") != linked.get("path")
+        or adoption_payload.get("linked_v3_receipt_sha256") != linked_sha
+        or source_schema.get("sha256") != source_inventory_hash
+        or successor.get("quick_check") != "ok"
+        or successor.get("managed_inventory_drift") != []
+        or not inventory_binding_valid(successor.get("managed_inventory"))
+        or not inventory_binding_valid(successor.get("protected_inventory"))
+        or sum(int(value) for value in dict(successor.get("status_counts") or {}).values())
+        != successor.get("row_count")
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(successor_identity.get("sha256") or "")
+        )
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(successor.get("backlog_projection_sha256") or ""),
+        )
+        or genesis.get("sha256") != _world_genesis_hash(genesis_value)
+        or genesis_value.get("schema_version") != AC_WORLD_GENESIS_SCHEMA
+        or genesis_value.get("world_id") != AC_DEV_WORLD_ID
+        or genesis_value.get("project_id") != AC_PROJECT_ID
+        or genesis_value.get("source_only") is not True
+        or genesis_value.get("rows_copied") != 0
+        or genesis.get("raw_json")
+        != json.dumps(
+            genesis_value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        or successor.get("genesis_json") != genesis.get("raw_json")
+        or successor.get("genesis_sha256") != genesis.get("sha256")
+        or successor_identity.get("path") != str(database)
+        or successor_identity.get("device") != int(database_metadata.st_dev)
+        or successor_identity.get("inode") != int(database_metadata.st_ino)
+        or successor_identity.get("nlink") != int(database_metadata.st_nlink)
+        or receipt_stable.get("database") != stable_identity
+        or (
+            stable_identity.get("device"),
+            stable_identity.get("inode"),
+        )
+        == (
+            successor_identity.get("device"),
+            successor_identity.get("inode"),
+        )
+    ):
+        raise ValueError("AC dev COW successor historical issuance evidence mismatch")
+    # The digest proves the exact immutable receipt bytes.  Current database
+    # size/hash/row count are intentionally not replayed: legitimate backlog
+    # writes mutate those after issuance and are validated by restart custody.
+    if digest != "sha256:" + receipts[0].name.removeprefix(
+        AC_DEV_COW_SUCCESSOR_PREFIX + "."
+    ).removesuffix(".json"):
         raise ValueError("AC dev COW successor receipt replay drift")
     return receipt
+
+
+def _verify_current_dev_backlog_runtime_invariants(conn: sqlite3.Connection) -> None:
+    """Validate mutable backlog state through schema/generation invariants."""
+
+    if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        raise ValueError("existing AC dev world quick-check failed")
+    drift = backlog_read_schema_drift(conn)
+    if drift.get("missing") or drift.get("invalid"):
+        raise ValueError(
+            "existing AC dev backlog storage managed generation is invalid"
+        )
+    if (
+        backlog_read_schema_managed_inventory(conn)
+        != canonical_backlog_read_schema_managed_inventory()
+    ):
+        raise ValueError("existing AC dev backlog managed inventory changed")
+    with closing(sqlite3.connect(":memory:")) as canonical:
+        canonical.row_factory = sqlite3.Row
+        _configure_connection(canonical, busy_timeout=10000)
+        _ensure_schema(canonical)
+        ensure_backlog_read_schema(canonical)
+        expected_protected = backlog_read_schema_protected_inventory(canonical)
+    if backlog_read_schema_protected_inventory(conn) != expected_protected:
+        raise ValueError("existing AC dev backlog protected inventory changed")
 
 
 def validate_dev_preimage_only(
@@ -3836,6 +3989,8 @@ def bootstrap_dev_governance_store(
         else:
             _verify_existing_schema(conn)
             _verify_dev_world_schema_inventory(conn)
+            if cow_successor_receipt is not None:
+                _verify_current_dev_backlog_runtime_invariants(conn)
             meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
             try:
                 stored_genesis = json.loads(

@@ -1467,12 +1467,13 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
         "identity": {"path": str(database), "device": 7, "inode": 22,
                      "size": 2, "nlink": 1, "sha256": "sha256:" + "b" * 64},
         "quick_check": "ok", "row_count": 3603, "status_counts": {"OPEN": 3603},
-        "managed_inventory": {"sha256": "managed"}, "managed_inventory_drift": [],
-        "protected_inventory": {"sha256": "protected"},
+        "managed_inventory": {"inventory": [], "sha256": "sha256:" + hashlib.sha256(b"[]").hexdigest()}, "managed_inventory_drift": [],
+        "protected_inventory": {"inventory": [], "sha256": "sha256:" + hashlib.sha256(b"[]").hexdigest()},
         "protected_projection": {"schema_meta": "sha256:meta"},
+        "backlog_projection_sha256": "sha256:" + "7" * 64,
         "governance_world_id": db.AC_DEV_WORLD_ID,
         "source_schema": {"required_tables": ["backlog_bugs"], "inventory": [],
-                          "sha256": "sha256:" + "9" * 64},
+                          "sha256": "sha256:" + hashlib.sha256(b"[]").hexdigest()},
         "genesis_json": genesis_raw, "genesis_sha256": genesis_sha,
     }
     backup_observation = {**successor_observation,
@@ -1553,7 +1554,7 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
         f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(wrong_raw).hexdigest()}.json"
     )
     wrong_receipt.write_bytes(wrong_raw)
-    with pytest.raises(ValueError, match="ambiguous"):
+    with pytest.raises(ValueError, match="historical issuance"):
         db.validate_dev_cow_successor_receipt(root)
     wrong_receipt.unlink(); receipt.write_bytes(raw)
 
@@ -1562,10 +1563,17 @@ def test_ac_dev_cow_successor_creator_is_content_addressed_and_replays(tmp_path,
     with pytest.raises(ValueError, match="missing or ambiguous"):
         db.validate_dev_cow_successor_receipt(root)
     ambiguous.unlink()
-    successor_observation["identity"]["sha256"] = "sha256:" + "e" * 64
-    with pytest.raises(ValueError, match="mismatch"):
+    tampered = json.loads(raw)
+    tampered["successor"]["row_count"] = 3604
+    tampered_raw = json.dumps(tampered, sort_keys=True, separators=(",", ":")).encode()
+    receipt.unlink()
+    tampered_receipt = receipt.with_name(
+        f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(tampered_raw).hexdigest()}.json"
+    )
+    tampered_receipt.write_bytes(tampered_raw)
+    with pytest.raises(ValueError, match="historical issuance"):
         db.validate_dev_cow_successor_receipt(root)
-    assert receipt.read_bytes() == raw
+    assert tampered_receipt.read_bytes() == tampered_raw
 
 
 def test_ac_dev_cow_successor_validator_rejects_missing(tmp_path):
@@ -1666,6 +1674,73 @@ def test_ac_dev_cow_successor_public_cli_real_sqlite_create_and_replay(tmp_path,
     assert replay.exit_code == 0, replay.output
     assert json.loads(replay.output)["status"] == "already_created"
     assert receipt.read_bytes() == raw
+
+
+def test_ac_dev_cow_successor_v2_restart_allows_legitimate_fresh_backlog_row(
+    tmp_path, monkeypatch
+):
+    from agent.governance import db
+
+    root, database, backup, operator, linked = _real_cow_successor_cli_fixture(
+        tmp_path, monkeypatch
+    )
+    created = db.create_dev_cow_successor_receipt(
+        root,
+        operator_receipt=operator,
+        predecessor_backup=backup,
+        linked_v3_receipt=linked,
+    )
+    receipt_raw = Path(created["receipt"]).read_bytes()
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "INSERT INTO backlog_bugs(bug_id,created_at,updated_at,status) "
+        "VALUES (?,?,?,?)",
+        ("AC-FRESH-AFTER-V2", "2026-08-31", "2026-08-31", "OPEN"),
+    )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    db._verify_current_dev_backlog_runtime_invariants(connection)
+    connection.close()
+    for suffix in ("-wal", "-shm"):
+        path = Path(str(database) + suffix)
+        if path.exists():
+            path.unlink()
+
+    replay = db.validate_dev_cow_successor_receipt(root)
+    assert replay["successor"]["row_count"] == 3603
+    assert Path(created["receipt"]).read_bytes() == receipt_raw
+
+
+def test_current_dev_backlog_runtime_invariants_reject_schema_and_generation(
+    tmp_path
+):
+    from agent.governance import db
+
+    database = tmp_path / "current.sqlite"
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    db._configure_connection(connection, busy_timeout=1000)
+    db._ensure_schema(connection)
+    db.ensure_backlog_read_schema(connection)
+    db._verify_current_dev_backlog_runtime_invariants(connection)
+    connection.execute(
+        "UPDATE dashboard_backlog_cache_generation SET generation=0 "
+        "WHERE resource=?",
+        (db.BACKLOG_READ_SCHEMA_RESOURCE,),
+    )
+    connection.commit()
+    with pytest.raises(ValueError, match="managed generation"):
+        db._verify_current_dev_backlog_runtime_invariants(connection)
+    connection.execute(
+        "UPDATE dashboard_backlog_cache_generation SET generation=1 "
+        "WHERE resource=?",
+        (db.BACKLOG_READ_SCHEMA_RESOURCE,),
+    )
+    connection.execute("DROP TRIGGER trg_dashboard_backlog_cache_update")
+    connection.commit()
+    with pytest.raises(ValueError, match="managed generation"):
+        db._verify_current_dev_backlog_runtime_invariants(connection)
+    connection.close()
 
 
 def test_ac_dev_cow_successor_public_cli_wrong_real_schema_is_bounded(tmp_path, monkeypatch):
@@ -1772,7 +1847,7 @@ def test_ac_dev_cow_successor_public_cli_rejects_self_consistent_foreign_world(
     (archive / f"{db.AC_DEV_COW_SUCCESSOR_PREFIX}.{hashlib.sha256(crafted_raw).hexdigest()}.json").write_bytes(
         crafted_raw
     )
-    with pytest.raises(ValueError, match="protected preimage mismatch"):
+    with pytest.raises(ValueError, match="canonical|historical issuance"):
         db.validate_dev_cow_successor_receipt(root)
 def test_ac_dev_source_upgrade_rejects_non_descendant_root_branch_db_and_process(tmp_path):
     from agent.governance import db
