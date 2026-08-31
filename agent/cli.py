@@ -4065,7 +4065,16 @@ def _durable_dev_stop(dev_storage: Path) -> None:
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", linked_digest):
         raise click.ClickException("AC dev durable stop linked-v3 identity mismatch")
     linked_path = dev_storage / "archive" / "schema-admission" / f"{linked_digest[7:]}.json"
-    durable_phase, _bootstrap = _durable_start_phase(dev_storage)
+    # A live stop must not call the bootstrap start selector: that selector
+    # deliberately proves a stopped/free listener.  Phase is bound by this
+    # immutable completed launch receipt instead.
+    bootstrap_binding = receipt.get("dashboard_bootstrap")
+    if bootstrap_binding is None:
+        durable_phase = _DURABLE_START_LEGACY_ADOPTION
+    elif isinstance(bootstrap_binding, Mapping):
+        durable_phase = _DURABLE_START_COMPLETED_BOOTSTRAP
+    else:
+        raise click.ClickException("AC dev durable stop launch phase is malformed")
     validated_digest, _ = _validated_linked_v3_receipt(
         linked_path, dev_storage=dev_storage, database=database,
         database_identity=database_identity, source_identity=current_source,
