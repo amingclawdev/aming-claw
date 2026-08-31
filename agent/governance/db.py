@@ -3328,6 +3328,54 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
     managed_table = "dashboard_backlog_cache_generation"
     managed_names = _backlog_read_managed_object_names()
     managed_autoindex = "sqlite_autoindex_dashboard_backlog_cache_generation_1"
+    graph_classification = classify_graph_materialization_preimage(conn)
+    graph_registry = _graph_schema_owner_registry()
+    graph_owner_states = graph_classification.get("owner_states")
+    owner_state_values = (
+        [graph_owner_states.get(owner) for owner, _canonical in graph_registry]
+        if isinstance(graph_owner_states, dict)
+        else []
+    )
+    graph_overlay_exact = bool(
+        owner_state_values
+        and all(state == "exact" for state in owner_state_values)
+    )
+    graph_known_names = {
+        row[1] for _owner, canonical in graph_registry for row in canonical
+    }
+    graph_known_tables = {
+        row[2] for _owner, canonical in graph_registry for row in canonical
+        if row[0] == "table"
+    }
+    actual_graph_inventory = [
+        row for row in _graph_materialization_inventory(conn)
+        if row[1] in graph_known_names or row[2] in graph_known_tables
+    ]
+    with closing(sqlite3.connect(":memory:")) as source_memory:
+        source_memory.row_factory = sqlite3.Row
+        _configure_connection(source_memory, busy_timeout=10000)
+        _ensure_schema(source_memory)
+        baseline_graph_inventory = [
+            row for row in _graph_materialization_inventory(source_memory)
+            if row[1] in graph_known_names or row[2] in graph_known_tables
+        ]
+    graph_baseline_exact = actual_graph_inventory == baseline_graph_inventory
+    if not (graph_overlay_exact or graph_baseline_exact):
+        raise ValueError(
+            "AC dev source schema inventory mismatch: "
+            "graph owners must equal baseline or all be SQL-exact"
+        )
+    graph_exact_inventory = {
+        row for _owner, canonical in graph_registry for row in canonical
+        if graph_overlay_exact
+    }
+    graph_exact_objects = {
+        (kind, name, table) for kind, name, table, _sql in graph_exact_inventory
+    }
+    graph_exact_tables = {
+        name for kind, name, _table, _sql in graph_exact_inventory
+        if kind == "table"
+    }
     # This exception is deliberately all-or-nothing: the SQL-bearing five
     # objects must equal the source plan before *only* their exact namespace
     # can be removed from the baseline source-inventory comparison.
@@ -3343,12 +3391,21 @@ def _verify_dev_world_schema_inventory(conn: sqlite3.Connection) -> None:
                 "index", managed_autoindex, managed_table) not in accepted_overlay:
             accepted_overlay = set()
             managed_exact = False
-    unknown = sorted((actual - allowed) - ({managed_table} if managed_exact else set()))
+    unknown = sorted(
+        (actual - allowed)
+        - graph_exact_tables
+        - ({managed_table} if managed_exact else set())
+    )
     missing = sorted(required - actual)
     optional = allowed - required
     unknown_objects = sorted(
         item
-        for item in actual_objects - source_objects - accepted_overlay
+        for item in (
+            actual_objects
+            - source_objects
+            - accepted_overlay
+            - graph_exact_objects
+        )
         if not (item[0] in {"table", "index"} and item[2] in optional)
     )
     if unknown or missing or unknown_objects:

@@ -159,6 +159,25 @@ def _install_graph_owner_for_preimage_test(db, conn, ensure_schema):
         )
 
 
+def _install_all_graph_owners_for_inventory_test(db, conn):
+    from agent.governance import (
+        asset_impact,
+        asset_projection,
+        graph_correction_patches,
+        graph_events,
+        graph_snapshot_store,
+    )
+
+    for ensure_schema in (
+        graph_snapshot_store.ensure_schema,
+        graph_events.ensure_schema,
+        graph_correction_patches.ensure_schema,
+        asset_projection.ensure_schema,
+        asset_impact.ensure_schema,
+    ):
+        _install_graph_owner_for_preimage_test(db, conn, ensure_schema)
+
+
 def test_graph_materialization_preimage_classifier_accepts_only_exact_predecessor_without_write():
     from agent.governance import (
         asset_impact,
@@ -2541,6 +2560,7 @@ def test_current_dev_backlog_runtime_invariants_use_historical_phase_z_inventory
     db._ensure_schema(connection)
     db.admit_missing_authority_projection_schema(connection)
     db.ensure_backlog_read_schema(connection)
+    _install_all_graph_owners_for_inventory_test(db, connection)
     db._verify_dev_world_schema_inventory(connection)
     historical = db.backlog_read_schema_protected_inventory(connection)
     db._verify_current_dev_backlog_runtime_invariants(
@@ -3276,6 +3296,7 @@ def test_dev_schema_inventory_accepts_only_exact_backlog_overlay():
     db._ensure_schema(conn)
     try:
         db.admit_missing_backlog_read_schema(conn)
+        _install_all_graph_owners_for_inventory_test(db, conn)
         db._verify_dev_world_schema_inventory(conn)
         conn.execute("DROP TRIGGER trg_dashboard_backlog_cache_insert")
         conn.execute("CREATE TRIGGER trg_dashboard_backlog_cache_insert AFTER INSERT ON backlog_bugs BEGIN SELECT 1; END")
@@ -3283,6 +3304,89 @@ def test_dev_schema_inventory_accepts_only_exact_backlog_overlay():
             db._verify_dev_world_schema_inventory(conn)
     finally:
         conn.close()
+
+
+def test_dev_schema_inventory_subtracts_only_five_sql_exact_graph_owners_zero_write():
+    from governance import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    db._ensure_schema(conn)
+    db.admit_missing_backlog_read_schema(conn)
+    _install_all_graph_owners_for_inventory_test(db, conn)
+    conn.commit()
+    registry_names = {
+        row[1]
+        for _owner, canonical in db._graph_schema_owner_registry()
+        for row in canonical
+    }
+    assert {
+        "graph_correction_patches",
+        "graph_ref_events",
+        "graph_node_migrations",
+        "graph_semantic_projections",
+        "idx_pending_scope_branch",
+        "idx_pending_scope_status",
+    }.issubset(registry_names)
+    inventory_before = db._graph_materialization_inventory(conn)
+    changes_before = conn.total_changes
+
+    db._verify_dev_world_schema_inventory(conn)
+
+    assert conn.total_changes == changes_before
+    assert db._graph_materialization_inventory(conn) == inventory_before
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["owner_absent", "owner_partial", "owner_altered", "unknown_graph"],
+)
+def test_dev_schema_inventory_rejects_nonexact_graph_owner_without_write(drift):
+    from governance import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    db._ensure_schema(conn)
+    db.admit_missing_backlog_read_schema(conn)
+    _install_all_graph_owners_for_inventory_test(db, conn)
+    if drift == "owner_absent":
+        owner_inventory = dict(db._graph_schema_owner_registry())["graph_events"]
+        for kind, name, _table, _sql in owner_inventory:
+            if kind in {"view", "trigger", "index"} and not name.startswith(
+                "sqlite_autoindex_"
+            ):
+                conn.execute(f'DROP {kind.upper()} "{name}"')
+        for kind, name, _table, _sql in owner_inventory:
+            if kind == "table":
+                conn.execute(f'DROP TABLE "{name}"')
+    elif drift == "owner_partial":
+        conn.execute("DROP INDEX idx_pending_scope_branch")
+    elif drift == "owner_altered":
+        conn.execute("DROP INDEX idx_pending_scope_status")
+        conn.execute(
+            "CREATE INDEX idx_pending_scope_status "
+            "ON pending_scope_reconcile(project_id, branch_ref)"
+        )
+    else:
+        conn.execute("CREATE TABLE graph_unknown_inventory_owner(id TEXT PRIMARY KEY)")
+    conn.commit()
+    inventory_before = db._graph_materialization_inventory(conn)
+    schema_hash_before = hashlib.sha256(
+        repr(inventory_before).encode("utf-8")
+    ).hexdigest()
+    changes_before = conn.total_changes
+
+    with pytest.raises(ValueError, match="graph|source schema inventory"):
+        db._verify_dev_world_schema_inventory(conn)
+
+    assert conn.total_changes == changes_before
+    inventory_after = db._graph_materialization_inventory(conn)
+    assert hashlib.sha256(
+        repr(inventory_after).encode("utf-8")
+    ).hexdigest() == schema_hash_before
+    assert inventory_after == inventory_before
+    conn.close()
 
 
 def test_ac_dev_backlog_admission_binds_managed_and_protected_inventories():
