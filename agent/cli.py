@@ -3266,7 +3266,7 @@ def dev_create_cow_successor_receipt(
             predecessor_backup=predecessor_backup,
             linked_v3_receipt=linked_v3_receipt,
         )
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(json.dumps(result, sort_keys=True))
 

@@ -3001,14 +3001,36 @@ def _cow_database_observation(
         conn.execute("PRAGMA query_only=ON")
         if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
             raise ValueError("AC dev COW successor quick-check failed")
+        # Root/genesis/receipt/service validation already binds this complete
+        # SQLite world to aming-claw.  backlog_bugs itself intentionally has no
+        # project_id column, so authenticate its exact source-owned ABI before
+        # reading the whole project-bound table.
+        with closing(sqlite3.connect(":memory:")) as canonical:
+            canonical.row_factory = sqlite3.Row
+            _configure_connection(canonical, busy_timeout=10000)
+            _ensure_schema(canonical)
+            expected_sql_row = canonical.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='backlog_bugs'"
+            ).fetchone()
+            expected_columns = [tuple(row) for row in canonical.execute(
+                'PRAGMA table_info("backlog_bugs")'
+            )]
+        actual_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='backlog_bugs'"
+        ).fetchone()
+        actual_columns = [tuple(row) for row in conn.execute(
+            'PRAGMA table_info("backlog_bugs")'
+        )]
+        if (expected_sql_row is None or actual_sql_row is None
+                or _backlog_read_normalized_sql(actual_sql_row[0])
+                != _backlog_read_normalized_sql(expected_sql_row[0])
+                or actual_columns != expected_columns):
+            raise ValueError("AC dev COW successor backlog table ABI mismatch")
         meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
-        row_count = int(conn.execute(
-            "SELECT COUNT(*) FROM backlog_bugs WHERE project_id=?", (AC_PROJECT_ID,),
-        ).fetchone()[0])
+        row_count = int(conn.execute("SELECT COUNT(*) FROM backlog_bugs").fetchone()[0])
         status_counts = {
             str(status): int(count) for status, count in conn.execute(
-                "SELECT status,COUNT(*) FROM backlog_bugs WHERE project_id=? "
-                "GROUP BY status ORDER BY status", (AC_PROJECT_ID,),
+                "SELECT status,COUNT(*) FROM backlog_bugs GROUP BY status ORDER BY status"
             )
         }
         managed = backlog_read_schema_managed_inventory(conn)

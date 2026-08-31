@@ -7,6 +7,7 @@ import sqlite3
 import json
 import hashlib
 import subprocess
+import shutil
 from pathlib import Path
 from unittest import mock
 
@@ -1279,6 +1280,117 @@ def test_ac_dev_cow_successor_validator_rejects_missing(tmp_path):
     root.mkdir()
     with pytest.raises(ValueError, match="missing or ambiguous"):
         db.validate_dev_cow_successor_receipt(root)
+
+
+def _real_cow_successor_cli_fixture(tmp_path, monkeypatch):
+    from agent.governance import db
+
+    root = tmp_path / "dev"
+    database = root / db.AC_DATABASE_DEV_RELATIVE_PATH
+    backup = root / "archive" / "operator-exception-backups" / "old.sqlite"
+    backup.parent.mkdir(parents=True)
+    connection = sqlite3.connect(backup)
+    db._configure_connection(connection, busy_timeout=1000)
+    db._ensure_schema(connection)
+    backup_stat = backup.stat(follow_symlinks=False)
+    genesis = {"schema_version": db.AC_WORLD_GENESIS_SCHEMA, "world_id": db.AC_DEV_WORLD_ID,
+               "project_id": db.AC_PROJECT_ID, "source_only": True, "rows_copied": 0,
+               "database_identity": {"device": backup_stat.st_dev, "inode": backup_stat.st_ino}}
+    genesis_raw = json.dumps(genesis, sort_keys=True, separators=(",", ":"))
+    connection.executemany("INSERT OR REPLACE INTO schema_meta(key,value) VALUES (?,?)", [
+        ("governance_world_id", db.AC_DEV_WORLD_ID),
+        ("governance_world_genesis_json", genesis_raw),
+        ("governance_world_genesis_sha256", db._world_genesis_hash(genesis)),
+    ])
+    connection.commit(); connection.close()
+    database.parent.mkdir(parents=True)
+    shutil.copy2(backup, database)
+    connection = sqlite3.connect(database)
+    db.ensure_backlog_read_schema(connection)
+    connection.executemany(
+        "INSERT INTO backlog_bugs(bug_id,created_at,updated_at,status) VALUES (?,?,?,?)",
+        ((f"AC-{index:04d}", "2026-08-31", "2026-08-31", "OPEN") for index in range(3603)),
+    )
+    connection.commit(); connection.execute("PRAGMA wal_checkpoint(TRUNCATE)"); connection.close()
+    for path in (Path(str(database) + "-wal"), Path(str(database) + "-shm")):
+        if path.exists():
+            path.unlink()
+    before_sha = db._durable_database_sha256(backup)
+    after_sha = db._durable_database_sha256(database)
+    operator_payload = {"schema_version": "ac_dev_operator_exception_cow_import.v1",
+                        "qa_pass": False, "release_authority": False, "rows": 3603,
+                        "decisions": ["dec-real-sqlite"], "backup_sha256": before_sha,
+                        "target_sha256_before": before_sha, "target_sha256_after": after_sha}
+    operator_raw = json.dumps(operator_payload, sort_keys=True, separators=(",", ":")).encode()
+    operator = root / "archive" / "operator-exceptions" / (
+        f"cow-import.{hashlib.sha256(operator_raw).hexdigest()}.json")
+    operator.parent.mkdir(parents=True); operator.write_bytes(operator_raw)
+    linked_payload = {"schema_version": "ac_dev_offline_schema_admission.v3", "stage": "completed",
+                      "database_identity": {"path": str(database), "device": backup_stat.st_dev,
+                                            "inode": backup_stat.st_ino}}
+    linked_raw = json.dumps(linked_payload, sort_keys=True, separators=(",", ":")).encode()
+    linked_digest = hashlib.sha256(linked_raw).hexdigest()
+    linked = root / "archive" / "schema-admission" / f"{linked_digest}.json"
+    linked.parent.mkdir(parents=True); linked.write_bytes(linked_raw)
+    linked.with_suffix(".sha256").write_text(f"sha256:{linked_digest}  {linked.name}\n")
+    adoption_payload = {"schema_version": "ac_dev_canonical_legacy_postimage_adoption.v1",
+                        "stage": "completed", "project_id": "aming-claw", "port": 40008,
+                        "linked_v3_receipt": str(linked),
+                        "linked_v3_receipt_sha256": "sha256:" + linked_digest}
+    adoption_raw = json.dumps(adoption_payload, sort_keys=True, separators=(",", ":")).encode()
+    adoption = root / "archive" / "canonical-legacy-postimage-adoption" / (
+        f"adoption.{hashlib.sha256(adoption_raw).hexdigest()}.json")
+    adoption.parent.mkdir(parents=True); adoption.write_bytes(adoption_raw)
+    stable = tmp_path / "stable.db"; stable.write_bytes(b"stable")
+    stable_stat = stable.stat(follow_symlinks=False)
+    stable_identity = {"schema_version": "ac_stable_database_identity.v1",
+                       "device": stable_stat.st_dev, "inode": stable_stat.st_ino,
+                       "stable_relative_path_sha256": "sha256:" + hashlib.sha256(
+                           db.AC_DATABASE_STABLE_RELATIVE_PATH.encode()).hexdigest()}
+    monkeypatch.setattr(db, "verified_stable_database_binding", lambda: {
+        "database_path": str(stable), "stable_database_identity": stable_identity})
+    monkeypatch.setattr(db, "_default_cutover_listener_probe",
+                        lambda port: {"port": port, "listening": False, "pid": 0})
+    monkeypatch.setattr(db, "_assert_no_external_sqlite_holders", lambda _database: None)
+    return root, database, backup, operator, linked
+
+
+def test_ac_dev_cow_successor_public_cli_real_sqlite_create_and_replay(tmp_path, monkeypatch):
+    pytest.importorskip("click")
+    from click.testing import CliRunner
+    from agent.cli import main
+
+    root, _database, backup, operator, linked = _real_cow_successor_cli_fixture(tmp_path, monkeypatch)
+    args = ["dev-create-cow-successor-receipt", "--dev-storage-root", str(root),
+            "--operator-receipt", str(operator), "--predecessor-backup", str(backup),
+            "--linked-v3-receipt", str(linked)]
+    first = CliRunner().invoke(main, args)
+    assert first.exit_code == 0, first.output
+    receipt = Path(json.loads(first.output)["receipt"]); raw = receipt.read_bytes()
+    replay = CliRunner().invoke(main, args)
+    assert replay.exit_code == 0, replay.output
+    assert json.loads(replay.output)["status"] == "already_created"
+    assert receipt.read_bytes() == raw
+
+
+def test_ac_dev_cow_successor_public_cli_wrong_real_schema_is_bounded(tmp_path, monkeypatch):
+    pytest.importorskip("click")
+    from click.testing import CliRunner
+    from agent.cli import main
+    from agent.governance import db
+
+    root, database, backup, operator, linked = _real_cow_successor_cli_fixture(tmp_path, monkeypatch)
+    connection = sqlite3.connect(database)
+    connection.execute("ALTER TABLE backlog_bugs ADD COLUMN hostile TEXT")
+    connection.commit(); connection.close()
+    result = CliRunner().invoke(main, [
+        "dev-create-cow-successor-receipt", "--dev-storage-root", str(root),
+        "--operator-receipt", str(operator), "--predecessor-backup", str(backup),
+        "--linked-v3-receipt", str(linked)])
+    assert result.exit_code != 0
+    assert "backlog table ABI mismatch" in result.output
+    assert "Traceback" not in result.output
+    assert not list((root / db.AC_DEV_COW_SUCCESSOR_ARCHIVE).glob("successor.*.json"))
 def test_ac_dev_source_upgrade_rejects_non_descendant_root_branch_db_and_process(tmp_path):
     from agent.governance import db
 
