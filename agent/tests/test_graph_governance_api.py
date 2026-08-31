@@ -119,6 +119,149 @@ def test_canonical_ref_adoption_intent_is_exactly_route_scoped():
             task_id="cex-adoption-r2",
             allowed_actions=["canonical_ref_adoption"],
         )
+
+
+def _route_bound_adoption_fixture(conn):
+    now = datetime.now(timezone.utc)
+    issued = observer_route_context.issue_observer_write_route_context(
+        project_id="aming-claw",
+        backlog_id="AC-DEV-CANONICAL-REF-ADOPTION-ROUTE-BOUND-R2-20260831",
+        task_id="cex-adoption-r2",
+        target_files=["agent/cli.py"],
+        allowed_actions=["canonical_ref_adoption"],
+        ttl_hours=1,
+    )
+    intent = {
+        "schema_version": "canonical_ref_adoption_route_bound.v1",
+        "project_id": "aming-claw", "backlog_id": "AC-DEV-CANONICAL-REF-ADOPTION-ROUTE-BOUND-R2-20260831",
+        "action": "canonical_ref_adoption", "contract_execution_id": "cex-adoption-r2",
+        "generation": "gen-r2", "custody": "custody-r2", "canonical_ref": "refs/heads/codex/ac-dev",
+        "expected_commit": "a" * 40, "target_commit": "b" * 40, "target_tree": "c" * 40,
+        "source_content_sha256": "sha256:" + "d" * 64, "qa_content_sha256": "sha256:" + "e" * 64,
+        "issued_at": (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (now + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "replay_identity": "adoption-r2-once",
+    }
+    token = issued["route_token"]
+    token.setdefault("route_lineage", {})["canonical_ref_adoption"] = intent
+    observer_route_context.persist_route_token_ref(
+        conn, project_id="aming-claw", route_token_ref=issued["route_token_ref"], token=token
+    )
+    return issued["route_token_ref"], token, intent
+
+
+def test_canonical_ref_adoption_lifecycle_cas_and_terminal_resume(tmp_path):
+    database = tmp_path / "route.db"
+    conn = sqlite3.connect(database)
+    conn.row_factory = sqlite3.Row
+    ref, token, intent = _route_bound_adoption_fixture(conn)
+    initial = "sha256:" + "1" * 64
+    reserved = observer_route_context.canonical_ref_adoption_reserve(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], initial_receipt_sha256=initial,
+    )
+    assert reserved["phase"] == "reserved"
+    with pytest.raises(observer_route_context.RouteTokenRefError, match="already reserved"):
+        observer_route_context.canonical_ref_adoption_reserve(
+            conn, project_id="aming-claw", route_token_ref=ref, token=token,
+            replay_identity="other", initial_receipt_sha256=initial,
+        )
+    detached = "sha256:" + "2" * 64
+    observer_route_context.canonical_ref_adoption_advance(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], previous_receipt_sha256=initial,
+        next_phase="detached", receipt_sha256=detached,
+    )
+    with pytest.raises(observer_route_context.RouteTokenRefError, match="prior receipt"):
+        observer_route_context.canonical_ref_adoption_advance(
+            conn, project_id="aming-claw", route_token_ref=ref, token=token,
+            replay_identity=intent["replay_identity"], previous_receipt_sha256=initial,
+            next_phase="cas", receipt_sha256="sha256:" + "3" * 64,
+        )
+    cas = "sha256:" + "3" * 64
+    observer_route_context.canonical_ref_adoption_advance(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], previous_receipt_sha256=detached,
+        next_phase="cas", receipt_sha256=cas,
+    )
+    attached = "sha256:" + "4" * 64
+    observer_route_context.canonical_ref_adoption_advance(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], previous_receipt_sha256=cas,
+        next_phase="attached", receipt_sha256=attached,
+    )
+    with pytest.raises(observer_route_context.RouteTokenRefError):
+        observer_route_context.resolve_route_token_ref(conn, project_id="aming-claw", route_token_ref=ref)
+    resumed = observer_route_context.canonical_ref_adoption_resume(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], previous_receipt_sha256=attached,
+        expected_phase="attached",
+    )
+    assert resumed["phase"] == "attached"
+    conn.close()
+
+
+def test_canonical_ref_adoption_rejects_expiry_and_lineage_tamper(tmp_path):
+    conn = sqlite3.connect(tmp_path / "route.db")
+    conn.row_factory = sqlite3.Row
+    ref, token, intent = _route_bound_adoption_fixture(conn)
+    intent["expires_at"] = "2020-01-01T00:00:00Z"
+    # Persisted lineage, not caller intent, is authoritative; tamper is caught
+    # by both the immutable token digest and typed lifecycle validator.
+    row = conn.execute("SELECT route_lineage_json FROM observer_route_token_refs WHERE project_id=? AND route_token_ref=?", ("aming-claw", ref)).fetchone()
+    lineage = json.loads(row[0]); lineage["canonical_ref_adoption"]["expires_at"] = intent["expires_at"]
+    conn.execute("UPDATE observer_route_token_refs SET route_lineage_json=? WHERE project_id=? AND route_token_ref=?", (json.dumps(lineage, sort_keys=True, separators=(",", ":")), "aming-claw", ref)); conn.commit()
+    with pytest.raises(observer_route_context.RouteTokenRefError):
+        observer_route_context.canonical_ref_adoption_reserve(
+            conn, project_id="aming-claw", route_token_ref=ref, token=token,
+            replay_identity=intent["replay_identity"], initial_receipt_sha256="sha256:" + "1" * 64,
+        )
+
+
+def test_canonical_ref_adoption_concurrent_reserve_has_one_winner(tmp_path):
+    database = tmp_path / "route.db"
+    setup = sqlite3.connect(database); setup.row_factory = sqlite3.Row
+    ref, token, intent = _route_bound_adoption_fixture(setup); setup.close()
+
+    def reserve(replay):
+        conn = sqlite3.connect(database, timeout=2); conn.row_factory = sqlite3.Row
+        try:
+            return observer_route_context.canonical_ref_adoption_reserve(
+                conn, project_id="aming-claw", route_token_ref=ref, token=token,
+                replay_identity=replay, initial_receipt_sha256="sha256:" + "1" * 64,
+            )["replay_identity"]
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(reserve, identity) for identity in (intent["replay_identity"], "rival")]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except observer_route_context.RouteTokenRefError:
+                outcomes.append("rejected")
+    assert outcomes.count("rejected") == 1
+    assert set(outcomes) & {intent["replay_identity"], "rival"}
+
+
+def test_canonical_ref_adoption_issuance_rejects_boundary_expiry_and_reissue(tmp_path):
+    conn = sqlite3.connect(tmp_path / "route.db"); conn.row_factory = sqlite3.Row
+    ref, token, intent = _route_bound_adoption_fixture(conn)
+    expires = datetime.fromisoformat(intent["expires_at"].replace("Z", "+00:00"))
+    with pytest.raises(observer_route_context.RouteTokenRefError, match="expired"):
+        observer_route_context.canonical_ref_adoption_issuance_available(
+            conn, project_id="aming-claw", intent=intent, now=expires,
+        )
+    observer_route_context.canonical_ref_adoption_reserve(
+        conn, project_id="aming-claw", route_token_ref=ref, token=token,
+        replay_identity=intent["replay_identity"], initial_receipt_sha256="sha256:" + "1" * 64,
+    )
+    with pytest.raises(observer_route_context.RouteTokenRefError, match="lifecycle"):
+        observer_route_context.canonical_ref_adoption_issuance_available(
+            conn, project_id="aming-claw", intent=intent,
+        )
+    conn.close()
 from agent.governance.errors import (
     AuthError,
     GovernanceError,

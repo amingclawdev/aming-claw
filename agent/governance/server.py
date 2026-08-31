@@ -8747,6 +8747,32 @@ def handle_observer_route_context_issue(ctx: RequestContext):
             actual=_observer_route_context_issue_safe_actual(body.get("canonical_ref_adoption")),
             source_gate="canonical_ref_adoption_scope",
         )
+    if canonical_ref_adoption is not None:
+        # The server is the time authority for issuance.  A route intent cannot
+        # be pre-dated, post-dated, or replayed merely by resubmitting its JSON.
+        try:
+            from . import observer_route_context
+            conn = get_connection(project_id)
+            try:
+                observer_route_context.canonical_ref_adoption_issuance_available(
+                    conn,
+                    project_id=project_id,
+                    intent=canonical_ref_adoption,
+                    now=datetime.now(timezone.utc),
+                )
+            finally:
+                conn.close()
+        except observer_route_context.RouteTokenRefError as exc:
+            return _observer_route_context_issue_rejection(
+                status=409,
+                project_id=project_id,
+                body=body,
+                error=str(exc),
+                field="canonical_ref_adoption",
+                expected="unexpired, unique server-issued canonical_ref_adoption lifecycle",
+                actual=_observer_route_context_issue_safe_actual(body.get("canonical_ref_adoption")),
+                source_gate="canonical_ref_adoption_lifecycle",
+            )
     evidence_refs = body.get("evidence_refs")
     if evidence_refs is not None and not isinstance(evidence_refs, list):
         return _observer_route_context_issue_rejection(

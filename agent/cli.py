@@ -818,7 +818,78 @@ def _route_bound_adoption_intent(
                for key in ("source_content_sha256", "qa_content_sha256"))
     ):
         raise click.ClickException("canonical dev adoption route intent does not bind an exact target")
-    return {key: str(payload[key]) for key in required}
+    return {
+        **{key: str(payload[key]) for key in required},
+        "route_token_ref": route_token_ref,
+    }
+
+
+def _canonical_ref_adoption_lifecycle(
+    *, dev_database: Path, route_token_path: Path, intent: Mapping[str, str],
+    prior_receipt: Mapping[str, Any] | None, phase: str, result_receipt_sha256: str = "",
+) -> dict[str, Any]:
+    """Delegate adoption lifecycle mutation/verification to its route helper.
+
+    This CLI intentionally owns no SQL and never interprets the nested state.
+    It only supplies the phase receipt hashes produced by the Git operation.
+    """
+    from agent.governance import observer_route_context as route_context
+
+    token = _read_regular_json(route_token_path, label="route token")
+    route_token_ref = str(intent["route_token_ref"])
+    previous = str(
+        (prior_receipt or {}).get("receipt_sha256")
+        or route_context._sha256(dict(intent))
+    )
+    try:
+        conn = sqlite3.connect(str(dev_database))
+        conn.row_factory = sqlite3.Row
+        if result_receipt_sha256:
+            return route_context.canonical_ref_adoption_advance(
+                conn,
+                project_id="aming-claw",
+                route_token_ref=route_token_ref,
+                token=token,
+                replay_identity=intent["replay_identity"],
+                previous_receipt_sha256=previous,
+                next_phase={"detach": "detached", "cas": "cas", "attach": "attached"}[phase],
+                receipt_sha256=result_receipt_sha256,
+            )
+        if phase == "detach":
+            state = route_context.canonical_ref_adoption_reserve(
+                conn,
+                project_id="aming-claw",
+                route_token_ref=route_token_ref,
+                token=token,
+                replay_identity=intent["replay_identity"],
+                initial_receipt_sha256=previous,
+            )
+            return route_context.canonical_ref_adoption_resume(
+                conn,
+                project_id="aming-claw",
+                route_token_ref=route_token_ref,
+                token=token,
+                replay_identity=intent["replay_identity"],
+                previous_receipt_sha256=previous,
+                expected_phase=str(state["phase"]),
+            )
+        expected = {"cas": "detached", "attach": "cas"}[phase]
+        return route_context.canonical_ref_adoption_resume(
+            conn,
+            project_id="aming-claw",
+            route_token_ref=route_token_ref,
+            token=token,
+            replay_identity=intent["replay_identity"],
+            previous_receipt_sha256=previous,
+            expected_phase=expected,
+        )
+    except (OSError, sqlite3.Error, route_context.RouteTokenRefError) as exc:
+        raise click.ClickException("canonical dev adoption lifecycle rejected: " + str(exc)) from exc
+    finally:
+        try:
+            conn.close()
+        except UnboundLocalError:
+            pass
 
 
 def _require_regular_resume_receipt(
@@ -1092,9 +1163,16 @@ def dev_adopt_canonical(
             resume_receipt,
             expected_commit=intent["expected_commit"],
             target_commit=intent["target_commit"],
-            route_bound_intent=intent,
+            route_bound_intent={key: value for key, value in intent.items() if key != "route_token_ref"},
         )
         if resume_receipt else None
+    )
+    _canonical_ref_adoption_lifecycle(
+        dev_database=dev_database,
+        route_token_path=route_token,
+        intent=intent,
+        prior_receipt=prior,
+        phase=phase,
     )
 
     result = _adopt_canonical_dev_ref(
@@ -1107,8 +1185,18 @@ def dev_adopt_canonical(
         resume_receipt=prior,
         phase=phase,
     )
-    result["route_bound_intent"] = intent
+    result["route_bound_intent"] = {
+        key: value for key, value in intent.items() if key != "route_token_ref"
+    }
     result["receipt_sha256"] = _sha256_json({key: value for key, value in result.items() if key != "receipt_sha256"})
+    _canonical_ref_adoption_lifecycle(
+        dev_database=dev_database,
+        route_token_path=route_token,
+        intent=intent,
+        prior_receipt=prior,
+        phase=phase,
+        result_receipt_sha256=str(result["receipt_sha256"]),
+    )
     click.echo(json.dumps(result, indent=2, sort_keys=True))
 
 
