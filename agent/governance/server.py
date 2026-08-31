@@ -145422,6 +145422,159 @@ def _backlog_source_free_operation_authority(
     return authority
 
 
+def _completed_source_free_reconcile_authority(
+    conn,
+    *,
+    request_context: RequestContext | None,
+    project_id: str,
+    backlog_id: str,
+    route_token_ref: str,
+    source_free_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove one active route-bound observer may run the sole R6 reconcile."""
+
+    if (
+        request_context is None
+        or project_id != "aming-claw"
+        or source_free_authority.get("accepted") is not True
+        or not route_token_ref
+    ):
+        return {}
+    task_id = _onboard_service_execution_id(project_id, backlog_id)
+    body = (
+        request_context.body
+        if isinstance(request_context.body, Mapping)
+        else {}
+    )
+    session_id = str(body.get("observer_session_id") or "").strip()
+    if not session_id:
+        return {}
+    projection = _contract_chain_current_projection(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+        rebuild_if_missing=False,
+    )
+    resume = _onboard_runtime_resume_from_current_projection(projection)
+    if (
+        not _onboard_runtime_resume_is_complete(resume)
+        or str(resume.get("current_contract_execution_id") or "") != task_id
+        or str(resume.get("root_contract_execution_id") or "") != task_id
+    ):
+        return {}
+    storage_project_id = _route_registry_storage_project_id(project_id)
+    rows = conn.execute(
+        "SELECT route_token_ref, status FROM observer_route_token_refs "
+        "WHERE project_id=? AND backlog_id=? AND task_id=?",
+        (storage_project_id, backlog_id, task_id),
+    ).fetchall()
+    if (
+        len(rows) != 1
+        or str(_row_get(rows[0], "route_token_ref", "")) != route_token_ref
+        or str(_row_get(rows[0], "status", "")) != "active"
+    ):
+        return {}
+    try:
+        proof = _resolve_contract_runtime_observer_proof(
+            request_context,
+            conn,
+            project_id=project_id,
+            action="graph_current_full_reconcile",
+            backlog_id=backlog_id,
+            contract_execution_id=task_id,
+        )
+    except (PermissionDeniedError, ValueError):
+        return {}
+    if not isinstance(proof, Mapping):
+        return {}
+    from . import observer_route_context
+
+    try:
+        route = observer_route_context.resolve_route_token_ref(
+            conn,
+            project_id=project_id,
+            storage_project_id=storage_project_id,
+            route_token_ref=route_token_ref,
+            backlog_id=backlog_id,
+            task_id=task_id,
+        )
+    except observer_route_context.RouteTokenRefError:
+        return {}
+    session = observer_session.get_session(
+        conn, project_id=project_id, session_id=session_id
+    )
+    capabilities = (
+        session.get("capabilities")
+        if isinstance(session, Mapping)
+        and isinstance(session.get("capabilities"), Mapping)
+        else {}
+    )
+    provenance = (
+        capabilities.get("route_provenance")
+        if isinstance(capabilities.get("route_provenance"), Mapping)
+        else {}
+    )
+    exact_route = bool(
+        isinstance(route, Mapping)
+        and route.get("source_free_operation") is True
+        and list(route.get("target_files") or []) == []
+        and list(route.get("owned_files") or []) == []
+        and list(route.get("allowed_actions") or [])
+        == list(_OPERATOR_SOURCE_FREE_ACTIONS)
+        and str(provenance.get("route_token_ref") or "") == route_token_ref
+        and str(provenance.get("route_id") or "")
+        == str(route.get("route_id") or "")
+        and str(provenance.get("route_context_hash") or "")
+        == str(route.get("route_context_hash") or "")
+        and str(provenance.get("backlog_id") or "") == backlog_id
+        and str(provenance.get("task_id") or "") == task_id
+        and str(provenance.get("cex_id") or "") == task_id
+    )
+    world = _operator_supervised_direct_main_dev_world_authority()
+    target_commit = str(world.get("loaded_runtime_commit") or "").strip().lower()
+    if (
+        not exact_route
+        or world.get("accepted") is not True
+        or world.get("runtime_stale") is not False
+        or list(world.get("violations") or [])
+        or target_commit != str(world.get("target_head_commit") or "").strip().lower()
+        or not re.fullmatch(r"[0-9a-f]{40}", target_commit)
+    ):
+        return {}
+    copy_safe_body = {
+        "project_id": project_id,
+        "target_commit_sha": target_commit,
+        "activate": True,
+        "require_clean": True,
+        "semantic_use_ai": False,
+        "semantic_enrich": False,
+        "enqueue_stale": False,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "contract_execution_id": task_id,
+        "observer_session_id": session_id,
+        "observer_route_token_ref": route_token_ref,
+        "response_view": "compact",
+    }
+    authority = {
+        "accepted": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "route_token_ref": route_token_ref,
+        "observer_session_id": session_id,
+        "target_commit": target_commit,
+        "copy_safe_body": copy_safe_body,
+        "single_call_policy": True,
+        "old_graph_input_allowed": False,
+        "zero_write_projection": True,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
+
+
 _ACCEPTANCE_SCOPE_REPORT_UNSET = object()
 _ACCEPTANCE_FILE_FENCE_UNSET = object()
 _ACCEPTANCE_BEHAVIOR_CONTRACT_SCHEMA_VERSION = (
@@ -159443,6 +159596,7 @@ def _onboard_route_guide_completed_next_action(
     onboard_service_continuation_authority: Mapping[str, Any] | None = None,
     mf_parallel_entry_authority: Mapping[str, Any] | None = None,
     source_free_operation_authority: Mapping[str, Any] | None = None,
+    completed_source_free_reconcile_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     selected_role = str(role or "").strip() or "observer"
     selected_work_type = str(work_type or "").strip()
@@ -159487,6 +159641,39 @@ def _onboard_route_guide_completed_next_action(
             "next_step": (
                 "backlog row is terminal and contract runtime is complete; do not "
                 "issue a successor-enter route or current runtime write requirement."
+            ),
+        }
+    reconcile_authority = (
+        completed_source_free_reconcile_authority
+        if isinstance(completed_source_free_reconcile_authority, Mapping)
+        else {}
+    )
+    if reconcile_authority.get("accepted") is True:
+        reconcile_body = dict(reconcile_authority.get("copy_safe_body") or {})
+        return {
+            **base,
+            "id": "completed_system_operation_current_full_reconcile",
+            "action": "graph_current_full_reconcile",
+            "interface": "graph_current_full_reconcile",
+            "mcp_tool": "graph_current_full_reconcile",
+            "owner_role": "observer",
+            "requires_role": "observer",
+            "action_input": dict(reconcile_body),
+            "copy_safe_body": dict(reconcile_body),
+            "action_input_copy_safe": True,
+            "action_input_ready": True,
+            "action_input_missing_fields": [],
+            "server_derived_authority": dict(reconcile_authority),
+            "route_reissue_allowed": False,
+            "single_call_policy": True,
+            "old_graph_input_allowed": False,
+            "source_of_authority": (
+                "completed_onboard_service+active_operation_route+"
+                "active_route_bound_observer_session"
+            ),
+            "next_step": (
+                "call graph_current_full_reconcile exactly once with this body; "
+                "do not import, attach, or reuse old graph input"
             ),
         }
     operation_authority = (
@@ -169042,6 +169229,28 @@ def _onboard_route_guide_service_response(
         and str(work_type or "").strip() == "system_operation"
         else {}
     )
+    source_free_requested_route_ref = str(
+        (request_body or {}).get("route_token_ref")
+        or (request_body or {}).get("observer_route_token_ref")
+        or ""
+    ).strip()
+    completed_route_token_ref = (
+        source_free_requested_route_ref
+        if source_free_operation_authority
+        else route_token_ref
+    )
+    completed_source_free_reconcile_authority = (
+        _completed_source_free_reconcile_authority(
+            conn,
+            request_context=request_context,
+            project_id=project_id,
+            backlog_id=backlog_id,
+            route_token_ref=completed_route_token_ref,
+            source_free_authority=source_free_operation_authority,
+        )
+        if source_free_operation_authority and completed_route_token_ref
+        else {}
+    )
     next_action = _onboard_route_guide_service_next_action(
         role=role,
         work_type=work_type,
@@ -169056,7 +169265,7 @@ def _onboard_route_guide_service_response(
                 backlog_row_status=backlog_row_status,
                 project_id=project_id,
                 backlog_id=backlog_id,
-                route_token_ref=route_token_ref,
+                route_token_ref=completed_route_token_ref,
                 target_files=target_files,
                 request_body=batch_action_request_body,
                 onboard_service_continuation_authority=(
@@ -169065,6 +169274,9 @@ def _onboard_route_guide_service_response(
                 mf_parallel_entry_authority=mf_parallel_entry_authority,
                 source_free_operation_authority=(
                     source_free_operation_authority
+                ),
+                completed_source_free_reconcile_authority=(
+                    completed_source_free_reconcile_authority
                 ),
             )
         elif runtime_resume.get("scheduler_eligible") is False:
@@ -169079,7 +169291,7 @@ def _onboard_route_guide_service_response(
                 backlog_row_status=backlog_row_status,
                 project_id=project_id,
                 backlog_id=backlog_id,
-                route_token_ref=route_token_ref,
+                route_token_ref=completed_route_token_ref,
                 target_files=target_files,
                 request_body=batch_action_request_body,
                 onboard_service_continuation_authority=(
@@ -169088,6 +169300,9 @@ def _onboard_route_guide_service_response(
                 mf_parallel_entry_authority=mf_parallel_entry_authority,
                 source_free_operation_authority=(
                     source_free_operation_authority
+                ),
+                completed_source_free_reconcile_authority=(
+                    completed_source_free_reconcile_authority
                 ),
             )
     if wrong_family_contract_update_supersession:
@@ -169125,7 +169340,7 @@ def _onboard_route_guide_service_response(
             backlog_row_status=backlog_row_status,
             project_id=project_id,
             backlog_id=backlog_id,
-            route_token_ref=route_token_ref,
+            route_token_ref=completed_route_token_ref,
             target_files=target_files,
             request_body=batch_action_request_body,
             onboard_service_continuation_authority=(
@@ -169133,6 +169348,9 @@ def _onboard_route_guide_service_response(
             ),
             mf_parallel_entry_authority=mf_parallel_entry_authority,
             source_free_operation_authority=source_free_operation_authority,
+            completed_source_free_reconcile_authority=(
+                completed_source_free_reconcile_authority
+            ),
         )
         if str(fresh_action.get("action") or "") == "no_runtime_action":
             next_action = terminal_action

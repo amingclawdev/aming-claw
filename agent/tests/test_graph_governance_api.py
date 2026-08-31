@@ -199314,6 +199314,54 @@ def test_ac_dev_completed_source_free_public_route_issue_persists_no_direct_cex(
     first = server.handle_observer_route_context_issue(
         _ctx({"project_id": "aming-claw"}, method="POST", body=body)
     )
+    no_session = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"}, method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "system_operation",
+                "route_token_ref": first["route_token_ref"],
+            },
+        )
+    )
+    assert no_session["next_legal_action"]["action"] == "no_runtime_action"
+    register_status, registered = server.handle_observer_session_register(
+        _ctx(
+            {"project_id": "aming-claw"}, method="POST",
+            body={
+                "project_id": "aming-claw",
+                "route_token_ref": first["route_token_ref"],
+                "backlog_id": backlog_id,
+                "task_id": body["task_id"],
+                "cex_id": body["task_id"],
+            },
+        )
+    )
+    assert register_status == 201
+    heartbeat = server.handle_observer_session_heartbeat(
+        _ctx(
+            {
+                "project_id": "aming-claw",
+                "session_id": registered["observer_session_id"],
+            },
+            method="POST",
+            body={"session_token": registered["session_token"]},
+        )
+    )
+    assert heartbeat["ok"] is True
+    post_route = server.handle_project_onboard_route_guide(
+        _ctx(
+            {"project_id": "aming-claw"}, method="POST",
+            body={
+                "backlog_id": backlog_id,
+                "role": "observer",
+                "work_type": "system_operation",
+                "route_token_ref": first["route_token_ref"],
+                "observer_session_id": registered["observer_session_id"],
+            },
+        )
+    )
     replay = server.handle_observer_route_context_issue(
         _ctx({"project_id": "aming-claw"}, method="POST", body=body)
     )
@@ -199326,6 +199374,65 @@ def test_ac_dev_completed_source_free_public_route_issue_persists_no_direct_cex(
     assert first["contract_runtime_mutated"] is False
     assert replay["route_token_ref"] == first["route_token_ref"]
     assert replay["idempotent_replay"] is True
+    reconcile = post_route["next_legal_action"]
+    assert reconcile["id"] == "completed_system_operation_current_full_reconcile"
+    assert reconcile["route_reissue_allowed"] is False
+    assert reconcile["single_call_policy"] is True
+    assert reconcile["old_graph_input_allowed"] is False
+    assert reconcile["copy_safe_body"]["observer_session_id"] == registered[
+        "observer_session_id"
+    ]
+    assert reconcile["copy_safe_body"]["observer_route_token_ref"] == first[
+        "route_token_ref"
+    ]
+    assert reconcile["copy_safe_body"]["target_commit_sha"] == "a" * 40
+    guide_request = {
+        "backlog_id": backlog_id,
+        "role": "observer",
+        "work_type": "system_operation",
+        "route_token_ref": first["route_token_ref"],
+        "observer_session_id": registered["observer_session_id"],
+    }
+    conn.execute(
+        "UPDATE observer_sessions SET status='revoked', revoked_at=? "
+        "WHERE session_id=?",
+        ("2026-08-31T12:00:00Z", registered["observer_session_id"]),
+    )
+    conn.commit()
+    revoked_session = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=guide_request)
+    )
+    assert revoked_session["next_legal_action"]["action"] == "no_runtime_action"
+    conn.execute(
+        "UPDATE observer_sessions SET status='active', revoked_at='', "
+        "capabilities_json=? WHERE session_id=?",
+        (
+            json.dumps({"route_provenance": {"route_token_ref": "rtok-foreign"}}),
+            registered["observer_session_id"],
+        ),
+    )
+    conn.commit()
+    mismatched_session = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=guide_request)
+    )
+    assert mismatched_session["next_legal_action"]["action"] == "no_runtime_action"
+    conn.execute(
+        "UPDATE observer_sessions SET capabilities_json=? WHERE session_id=?",
+        (
+            json.dumps(registered["session"]["capabilities"]),
+            registered["observer_session_id"],
+        ),
+    )
+    conn.execute(
+        "UPDATE observer_route_token_refs SET status='revoked' "
+        "WHERE route_token_ref=?",
+        (first["route_token_ref"],),
+    )
+    conn.commit()
+    revoked_route = server.handle_project_onboard_route_guide(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=guide_request)
+    )
+    assert revoked_route["next_legal_action"]["action"] == "no_runtime_action"
     assert conn.execute(
         "SELECT COUNT(*) FROM contract_runtime_executions"
     ).fetchone()[0] == runtime_before
