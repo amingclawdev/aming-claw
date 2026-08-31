@@ -1649,6 +1649,54 @@ def test_ac_dev_offline_backlog_schema_admission_repairs_only_exact_missing_set(
         conn.close()
 
 
+def test_ac_dev_authority_projection_admission_is_complete_and_fail_closed():
+    """The Phase-Z offline capability admits only its exact six-owner ABI."""
+    from governance import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    db._ensure_schema(conn)
+    try:
+        pristine = db.authority_projection_schema_drift(conn)
+        assert pristine == {"missing": sorted(db.AC_AUTHORITY_SCHEMA_TABLES), "invalid": []}
+        result = db.admit_missing_authority_projection_schema(conn)
+        assert result["changed"] is True
+        assert set(result["missing"]) == set(db.AC_AUTHORITY_SCHEMA_TABLES)
+        assert db.authority_projection_schema_drift(conn) == {"missing": [], "invalid": []}
+        # Assert every source-derived physical index effect, including SQLite's
+        # PK/UNIQUE autoindexes rather than a brittle hand-maintained name list.
+        expected = db._canonical_authority_projection_schema_inventory(include_plan=True)
+        observed = db._sqlite_master_inventory(conn)
+        assert observed == expected
+        assert sum(len(conn.execute(f"PRAGMA index_list({table})").fetchall())
+                   for table in db.AC_AUTHORITY_SCHEMA_TABLES) >= 17
+        assert db.admit_missing_authority_projection_schema(conn) == {"changed": False, "missing": []}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("sql", (
+    "CREATE TABLE authority_shadow (id TEXT)",
+    "CREATE INDEX authority_shadow_index ON backlog_bugs(bug_id)",
+    "CREATE TABLE observer_route_token_refs (project_id TEXT)",
+))
+def test_ac_dev_authority_projection_admission_rejects_extra_altered_and_partial(sql):
+    from governance import db
+
+    conn = sqlite3.connect(":memory:")
+    db._ensure_schema(conn)
+    conn.execute(sql)
+    before = db._sqlite_master_inventory(conn)
+    try:
+        drift = db.authority_projection_schema_drift(conn)
+        assert drift["invalid"]
+        with pytest.raises(ValueError, match="rejects invalid"):
+            db.admit_missing_authority_projection_schema(conn)
+        assert db._sqlite_master_inventory(conn) == before
+    finally:
+        conn.close()
+
+
 def test_ac_dev_offline_backlog_schema_admission_rolls_back_unexpected_drift():
     from governance import db
 

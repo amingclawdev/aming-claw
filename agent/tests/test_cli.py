@@ -3915,6 +3915,45 @@ def test_dev_admit_schema_repairs_exact_missing_set_offline(tmp_path, monkeypatc
     assert json.loads(resumed.output)["status"] == "already_admitted"
 
 
+def test_dev_admit_authority_schema_offline_receipt_and_resume(tmp_path, monkeypatch):
+    """The new CLI path uses the same quarantine/backup receipt choreography."""
+    import agent.cli as cli
+    from agent.governance import db
+    import sqlite3
+
+    monkeypatch.setattr(cli, "_port_is_open", lambda _port: False)
+    root = tmp_path / "external-authority-world"
+    database = root / "governance" / "aming-claw" / "governance.db"
+    database.parent.mkdir(parents=True)
+    conn = sqlite3.connect(database)
+    db._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO schema_meta VALUES (?, ?)", [
+        ("governance_world_id", "ac-dev"),
+        ("governance_world_genesis_json", "{}"),
+        ("governance_world_source_tip_json", "{}"),
+    ])
+    conn.commit(); conn.close()
+    (root / "launch-receipt.json").write_text(
+        json.dumps({"world_id": "ac-dev", "project_id": "aming-claw", "port": 40008}),
+        encoding="utf-8",
+    )
+    command = ["dev-admit-authority-schema", "--dev-storage-root", str(root),
+               "--project-id", "aming-claw", "--port", "40008"]
+    first = CliRunner().invoke(main, command)
+    assert first.exit_code == 0, first.output
+    output = json.loads(first.output)
+    receipt = Path(output["receipt_path"])
+    assert output["status"] == "admitted" and receipt.is_file()
+    conn = sqlite3.connect(database)
+    try:
+        assert db.authority_projection_schema_drift(conn) == {"missing": [], "invalid": []}
+    finally:
+        conn.close()
+    resumed = CliRunner().invoke(main, command + ["--resume-receipt", str(receipt)])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.output)["status"] == "already_admitted"
+
+
 def test_dev_admit_schema_rejects_tampered_or_foreign_resume_before_effect(tmp_path, monkeypatch):
     import agent.cli as cli
     from agent.governance import db
