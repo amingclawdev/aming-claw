@@ -199143,6 +199143,72 @@ def test_ac_dev_source_free_structured_projection_is_wording_independent(
     )
 
 
+def test_ac_dev_source_free_projects_real_r4_durable_handoff_shape(conn):
+    backlog_id = "AC-DEV-SOURCE-FREE-R4-DURABLE-SHAPE"
+    _initialize_ac_dev_guide_schema(conn)
+    _insert_simple_mf_close_backlog(conn, backlog_id)
+    topology = (
+        "existing_unique_ac_observer;"
+        "_source_mutation_forbidden;"
+        "_no_implementation_worker;"
+        "_source_free_operation_only"
+    )
+    trigger = {
+        "subsystem_backlog_handoff": {
+            "schema_version": "judgment_subsystem_backlog_handoff.v1",
+            "execution_owner": "selected_subsystem_observer",
+            "selected_subsystem_gate_remains_authoritative": True,
+            "allowed_actions": [
+                "fresh_onboard_route_guide",
+                "fresh_route_issue",
+                "observer_session_register",
+                "observer_session_heartbeat",
+                "graph_query",
+                "task_timeline_append",
+                "single_full_reconcile",
+                "readback",
+                "honest_archive_or_close",
+                "backlog_close_if_authorized",
+            ],
+            "blocked_actions": [
+                "implementation_worker",
+                "source_mutation",
+                "file_edit",
+                "run_tests",
+                "git_diff",
+                "merge",
+                "old_graph_input",
+                "retry_r2_or_r3",
+                "reuse_old_session_or_route",
+                "bypass_reconcile",
+                "stable_40000_mutation",
+                "second_authority_runtime",
+                "synthesized_pass",
+            ],
+        },
+        "judgment_plan_precheck": {
+            "subject": {"normalized_topology": topology},
+            "evidence": {
+                "route_context": {"normalized_proposed_topology": topology}
+            },
+        },
+    }
+    conn.execute(
+        "UPDATE backlog_bugs SET status='OPEN', target_files='[]', test_files='[]', "
+        "chain_trigger_json=? WHERE bug_id=?",
+        (json.dumps(trigger), backlog_id),
+    )
+    conn.commit()
+
+    authority = server._backlog_source_free_operation_authority(
+        conn, project_id="aming-claw", backlog_id=backlog_id
+    )
+    assert authority["accepted"] is True
+    assert authority["allowed_actions"] == list(server._OPERATOR_SOURCE_FREE_ACTIONS)
+    assert authority["target_files"] == []
+    assert authority["source_mutation_forbidden"] is True
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

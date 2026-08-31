@@ -145280,12 +145280,16 @@ def _backlog_source_free_operation_authority(
         "observer_session_register": "observer_session_register",
         "observer_session_heartbeat": "observer_session_heartbeat",
         "single_full_reconcile": "graph_current_full_reconcile",
+        "graph_current_full_reconcile": "graph_current_full_reconcile",
         "readback": "graph_query",
+        "graph_query": "graph_query",
         "timeline_precheck": "task_timeline_append",
+        "task_timeline_append": "task_timeline_append",
         "honest_archive_or_close": "backlog_close",
         "honest_close_or_archive": "backlog_close",
         "close_r2_if_authorized": "backlog_close",
         "close_r3_if_authorized": "backlog_close",
+        "backlog_close_if_authorized": "backlog_close",
     }
     allowed_semantics = {
         allowed_action_semantics[action]
@@ -145293,41 +145297,36 @@ def _backlog_source_free_operation_authority(
         if action in allowed_action_semantics
     }
     expected_semantics = {"bootstrap", *_OPERATOR_SOURCE_FREE_ACTIONS}
-    expected_semantic_counts = {
-        "bootstrap": 2,
-        "observer_session_register": 1,
-        "observer_session_heartbeat": 1,
-        "graph_current_full_reconcile": 1,
-        "graph_query": 1,
-        "task_timeline_append": 1,
-        "backlog_close": 2,
-    }
-    semantic_counts = {
-        semantic: sum(
-            allowed_action_semantics.get(action) == semantic for action in allowed
-        )
-        for semantic in expected_semantics
-    }
     allowed_actions_closed = bool(allowed) and all(
         action in allowed_action_semantics for action in allowed
-    ) and semantic_counts == expected_semantic_counts
+    ) and len(allowed) == len(set(allowed))
 
-    blocked_authority_actions = {
-        "source_edit",
-        "empty_commit",
-        "old_graph_input",
-        "old_graph_migration",
-        "bypass_reconcile",
-        "stable_40000_mutation",
-        "second_authority_runtime",
-        "synthesized_pass",
+    blocked_semantic_aliases = {
+        "source_mutation": {"source_edit", "source_mutation"},
+        "source_artifact_mutation": {"empty_commit", "file_edit"},
+        "old_graph_input": {"old_graph_input"},
+        "reconcile_bypass": {"bypass_reconcile"},
+        "stable_mutation": {"stable_40000_mutation"},
+        "second_authority": {"second_authority_runtime"},
+        "synthesized_pass": {"synthesized_pass"},
     }
-    blocked_actions_closed = blocked_authority_actions.issubset(set(blocked))
+    blocked_set = set(blocked)
+    blocked_actions_closed = all(
+        aliases & blocked_set for aliases in blocked_semantic_aliases.values()
+    )
 
-    topology_pattern = re.compile(
-        r"^existing_unique_ac_observer;"
-        r"_no_implementation_worker_because_r[0-9]+_is_source_free;"
-        r"_role_distinct_qa_only_if_a_new_mutation_is_introduced$"
+    topology_patterns = (
+        re.compile(
+            r"^existing_unique_ac_observer;"
+            r"_no_implementation_worker_because_r[0-9]+_is_source_free;"
+            r"_role_distinct_qa_only_if_a_new_mutation_is_introduced$"
+        ),
+        re.compile(
+            r"^existing_unique_ac_observer;"
+            r"_source_mutation_forbidden;"
+            r"_no_implementation_worker;"
+            r"_source_free_operation_only$"
+        ),
     )
     subject_topology = str(subject.get("normalized_topology") or "").strip()
     evidence_topology = str(
@@ -145346,7 +145345,9 @@ def _backlog_source_free_operation_authority(
         "operation_actions_closed": allowed_actions_closed
         and allowed_semantics == expected_semantics,
         "source_mutation_blocked": blocked_actions_closed,
-        "no_worker_topology": bool(topology_pattern.fullmatch(subject_topology)),
+        "no_worker_topology": any(
+            pattern.fullmatch(subject_topology) for pattern in topology_patterns
+        ),
         "topology_independently_bound": subject_topology == evidence_topology,
     }
     if not all(required_contract_facts.values()):
