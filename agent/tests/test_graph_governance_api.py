@@ -198888,18 +198888,40 @@ def _prepare_ac_dev_direct_route_bootstrap(
     tmp_path,
     *,
     backlog_id: str,
+    source_free: bool = False,
 ):
     project_id = "aming-claw"
     _initialize_ac_dev_guide_schema(conn)
     _insert_simple_mf_close_backlog(conn, backlog_id)
-    conn.execute(
-        "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
-        (
-            json.dumps(["agent/governance/server.py"]),
-            json.dumps(["agent/tests/test_graph_governance_api.py"]),
-            backlog_id,
-        ),
-    )
+    if source_free:
+        conn.execute(
+            """
+            UPDATE backlog_bugs
+            SET status='OPEN', target_files='[]', test_files='[]',
+                acceptance_criteria=?, details_md=?
+            WHERE bug_id=?
+            """,
+            (
+                json.dumps(
+                    [
+                        "The exact observer session operation is authorized.",
+                        "HEAD remains exact and clean, with no source or empty commit.",
+                        "Exactly one full reconcile runs and close remains evidence-bound.",
+                    ]
+                ),
+                "Do not edit source, create an empty commit, or merge source.",
+                backlog_id,
+            ),
+        )
+    else:
+        conn.execute(
+            "UPDATE backlog_bugs SET target_files=?, test_files=? WHERE bug_id=?",
+            (
+                json.dumps(["agent/governance/server.py"]),
+                json.dumps(["agent/tests/test_graph_governance_api.py"]),
+                backlog_id,
+            ),
+        )
     conn.commit()
     root = tmp_path / "ac-dev-route-bootstrap"
     root.mkdir()
@@ -198956,6 +198978,79 @@ def _prepare_ac_dev_direct_route_bootstrap(
             guide["next_legal_action"]["copy_safe_body"]
         ),
     }
+
+
+def test_ac_dev_source_free_guide_issues_exact_empty_fence_route(
+    conn, monkeypatch, tmp_path
+):
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id="AC-DEV-SOURCE-FREE-ROUTE",
+        source_free=True,
+    )
+    body = prepared["issue_body"]
+    assert body["target_files"] == []
+    assert body["owned_files"] == []
+    assert body["source_free_operation"] is True
+    assert body["allowed_actions"] == list(server._OPERATOR_SOURCE_FREE_ACTIONS)
+
+    issued = server.handle_observer_route_context_issue(
+        _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+    )
+    assert issued["route_token"]["target_files"] == []
+    assert issued["route_token"]["source_free_operation"] is True
+    assert issued["route_token"]["source_mutation_forbidden"] is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["forged_source_free", "mixed_source_action", "missing_authority"],
+)
+def test_ac_dev_source_free_empty_fence_rejects_forgery_before_persistence(
+    conn, monkeypatch, tmp_path, mutation
+):
+    prepared = _prepare_ac_dev_direct_route_bootstrap(
+        conn,
+        monkeypatch,
+        tmp_path,
+        backlog_id=f"AC-DEV-SOURCE-FREE-REJECT-{mutation}",
+        source_free=mutation != "missing_authority",
+    )
+    body = copy.deepcopy(prepared["issue_body"])
+    if mutation == "forged_source_free":
+        body["source_free_operation"] = False
+    elif mutation == "mixed_source_action":
+        body["allowed_actions"].append("merge")
+    else:
+        body["target_files"] = []
+        body["owned_files"] = []
+        body["source_free_operation"] = True
+    before_changes = conn.total_changes
+    before_routes = conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0]
+    before_schema = tuple(
+        conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    )
+    with pytest.raises(GovernanceError) as rejected:
+        server.handle_observer_route_context_issue(
+            _ctx({"project_id": "aming-claw"}, method="POST", body=body)
+        )
+    assert rejected.value.code == "ac_dev_direct_route_bootstrap_not_guide_bound"
+    assert rejected.value.details["zero_write_rejection"] is True
+    assert conn.total_changes == before_changes
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observer_route_token_refs"
+    ).fetchone()[0] == before_routes
+    assert tuple(
+        conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    ) == before_schema
 
 
 def test_ac_dev_public_guide_route_issue_register_and_heartbeat_exact_chain(

@@ -112,6 +112,20 @@ BLOCKED_ACTIONS: tuple[str, ...] = (
     "close_without_worker_or_subagent_evidence",
 )
 
+# The only actions that may be carried by a route with no source-file fence.
+# This is intentionally a closed set of observer-owned operational facades;
+# none allocates a source worker, edits a file, or merges source.  The server
+# must separately prove the source-free contract authority before passing
+# ``source_free_operation=True`` to the mint.
+SOURCE_FREE_OPERATION_ALLOWED_ACTIONS: tuple[str, ...] = (
+    "observer_session_register",
+    "observer_session_heartbeat",
+    "graph_query",
+    "task_timeline_append",
+    "graph_current_full_reconcile",
+    "backlog_close",
+)
+
 REQUIRED_LANES: tuple[dict[str, str], ...] = (
     {
         "id": "observer_intent_capture",
@@ -156,6 +170,8 @@ ROUTE_ACTION_SCOPE_SCHEMA_VERSION = "observer_route_action_scope.v2"
 # observer work and must not advertise that a fresh mf_sub implementation lane
 # exists or is legally required.
 OBSERVER_ADMIN_CLOSE_EVIDENCE_ACTIONS: tuple[str, ...] = (
+    "observer_session_register",
+    "observer_session_heartbeat",
     "backlog_upsert",
     "backlog_close",
     "task_timeline_append",
@@ -562,6 +578,7 @@ def build_observer_write_route_token(
     parent_prompt_contract_hash: str = "",
     parent_visible_injection_manifest_hash: str = "",
     parent_route_token_ref: str = "",
+    source_free_operation: bool = False,
 ) -> dict[str, Any]:
     """Mint an Aming-owned, write-authorizing observer route token.
 
@@ -585,10 +602,25 @@ def build_observer_write_route_token(
         raise ValueError("task_id is required")
 
     target_files_list = sorted(_dedupe(_string_list(target_files)))
-    if not target_files_list:
+    if not target_files_list and not source_free_operation:
         raise ValueError("target_files must be a non-empty list of file paths")
 
     actions_list = _sanitize_allowed_actions(allowed_actions)
+    source_free_actions = {
+        _gate_normalized_action(action)
+        for action in SOURCE_FREE_OPERATION_ALLOWED_ACTIONS
+    }
+    if source_free_operation:
+        if target_files_list:
+            raise ValueError(
+                "source_free_operation requires an empty target_files fence"
+            )
+        outside_source_free_scope = sorted(set(actions_list) - source_free_actions)
+        if outside_source_free_scope:
+            raise ValueError(
+                "source_free_operation allowed_actions must be operation-only: "
+                + ", ".join(outside_source_free_scope)
+            )
     lane_requirements = _route_lane_requirements_for_actions(actions_list)
     required_lanes = lane_requirements["required_lanes"]
     required_evidence = lane_requirements["required_evidence"]
@@ -642,6 +674,9 @@ def build_observer_write_route_token(
         "date": date_str,
         "provider_hash": provider_evidence.get("hash", ""),
     }
+    if source_free_operation:
+        identity_base["source_free_operation"] = True
+        identity_base["source_mutation_forbidden"] = True
     digest = _stable_digest(identity_base, length=16)
     route_id = f"route-{date_str}-{digest}"
     route_context_hash = _sha256(identity_base)
@@ -691,11 +726,22 @@ def build_observer_write_route_token(
             "project_id": project_id,
             "backlog_id": backlog_id,
             "task_id": task_id,
+            **(
+                {
+                    "source_free_operation": True,
+                    "source_mutation_forbidden": True,
+                }
+                if source_free_operation
+                else {}
+            ),
         },
         "target_files": target_files_list,
         "provider": provider_evidence,
         "issued_at": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if source_free_operation:
+        token["source_free_operation"] = True
+        token["source_mutation_forbidden"] = True
     if parent_lineage:
         token["parent_route_lineage"] = parent_lineage
     return token
@@ -1092,6 +1138,7 @@ def issue_observer_write_route_context(
     parent_visible_injection_manifest_hash: str = "",
     parent_route_token_ref: str = "",
     canonical_ref_adoption: Mapping[str, Any] | None = None,
+    source_free_operation: bool = False,
 ) -> dict[str, Any]:
     """Native Aming-owned issuance entrypoint for an observer session.
 
@@ -1127,6 +1174,7 @@ def issue_observer_write_route_context(
         parent_prompt_contract_hash=parent_prompt_contract_hash,
         parent_visible_injection_manifest_hash=parent_visible_injection_manifest_hash,
         parent_route_token_ref=parent_route_token_ref,
+        source_free_operation=source_free_operation,
     )
     route_token_ref = derive_route_token_ref(token)
     merge_queue_id = derive_merge_queue_id(token)
@@ -2039,6 +2087,11 @@ def _registry_public_payload(
         "status": _string(row_dict.get("status")),
         "resolved_from_ref": True,
     }
+    if scope.get("source_free_operation") is True:
+        payload["source_free_operation"] = True
+        payload["source_mutation_forbidden"] = bool(
+            scope.get("source_mutation_forbidden") is True
+        )
     if expiry_status:
         payload["expiry_status"] = dict(expiry_status)
     return _with_registry_lineages(payload, row_dict)

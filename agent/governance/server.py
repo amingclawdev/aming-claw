@@ -144336,6 +144336,14 @@ _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS = (
     "backlog_close",
     "merge",
 )
+_OPERATOR_SOURCE_FREE_ACTIONS = (
+    "observer_session_register",
+    "observer_session_heartbeat",
+    "graph_query",
+    "task_timeline_append",
+    "graph_current_full_reconcile",
+    "backlog_close",
+)
 # Historical Direct Main routes could also authorize the read-only preflight
 # surface.  Keep that compatibility out of newly issued full-round routes, but
 # do not invalidate an otherwise exact durable root route solely because it
@@ -145204,6 +145212,69 @@ def _backlog_declared_direct_file_scope(conn, backlog_id: str) -> list[str]:
         seen.add(text)
         deduped.append(text)
     return deduped
+
+
+def _backlog_source_free_operation_authority(
+    conn,
+    *,
+    project_id: str,
+    backlog_id: str,
+) -> dict[str, Any]:
+    """Derive the narrow empty-fence authority from the durable backlog row.
+
+    Plain caller fields are deliberately not inputs.  Legacy backlog rows do
+    not have a typed source-free column, so this compatibility bridge requires
+    all of the explicit R2 contract statements as well as an empty durable file
+    scope.  Anything missing or ambiguous remains an ordinary source route.
+    """
+
+    if project_id != "aming-claw" or not backlog_id:
+        return {}
+    row = conn.execute(
+        """
+        SELECT status, target_files, test_files, acceptance_criteria, details_md
+        FROM backlog_bugs WHERE bug_id = ?
+        """,
+        (backlog_id,),
+    ).fetchone()
+    if row is None or str(_row_get(row, "status", "")).strip() != "OPEN":
+        return {}
+    row_files = sorted(
+        {
+            *_string_list_field(_row_get(row, "target_files", "")),
+            *_string_list_field(_row_get(row, "test_files", "")),
+        }
+    )
+    criteria = _string_list_field(_row_get(row, "acceptance_criteria", ""))
+    criteria_text = "\n".join(criteria).lower()
+    details_text = str(_row_get(row, "details_md", "") or "").lower()
+    required_contract_facts = {
+        "empty_file_scope": not row_files,
+        "source_free_declared": "no source or empty commit" in criteria_text,
+        "source_mutation_forbidden": "do not edit source" in details_text,
+        "session_operation_declared": "observer" in criteria_text
+        and "session" in criteria_text,
+        "reconcile_operation_declared": "reconcile" in criteria_text,
+        "close_operation_declared": "close" in criteria_text,
+    }
+    if not all(required_contract_facts.values()):
+        return {}
+    authority = {
+        "schema_version": "backlog.source_free_operation_authority.v1",
+        "accepted": True,
+        "server_derived": True,
+        "caller_claims_trusted": False,
+        "project_id": project_id,
+        "backlog_id": backlog_id,
+        "source_free_operation": True,
+        "source_mutation_forbidden": True,
+        "target_files": [],
+        "owned_files": [],
+        "allowed_actions": list(_OPERATOR_SOURCE_FREE_ACTIONS),
+        "contract_facts": required_contract_facts,
+    }
+    authority["authority_hash"] = stable_sha256(authority)
+    return authority
 
 
 _ACCEPTANCE_SCOPE_REPORT_UNSET = object()
@@ -148094,6 +148165,7 @@ def _operator_supervised_direct_main_route_authority_from_resolved(
     row_files: Sequence[str],
     route: Mapping[str, Any] | None,
     route_error: str = "",
+    source_free_operation: bool = False,
 ) -> dict[str, Any]:
     """Validate one resolved or freshly server-minted exact Direct route."""
 
@@ -148110,7 +148182,9 @@ def _operator_supervised_direct_main_route_authority_from_resolved(
         }
     )
     expected_actions = sorted(
-        _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+        _OPERATOR_SOURCE_FREE_ACTIONS
+        if source_free_operation
+        else _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
     )
     target_files = sorted(
         {
@@ -148141,9 +148215,11 @@ def _operator_supervised_direct_main_route_authority_from_resolved(
         route
         and str(route.get("caller_role") or "").strip() == "observer"
         and allowed_actions == expected_actions
-        and row_files
+        and (not row_files if source_free_operation else bool(row_files))
         and target_files == row_files
         and owned_files == row_files
+        and bool(route.get("source_free_operation")) is source_free_operation
+        and bool(route.get("source_mutation_forbidden")) is source_free_operation
         and all(route_identity.values())
     )
     authority = {
@@ -148167,6 +148243,8 @@ def _operator_supervised_direct_main_route_authority_from_resolved(
         "route_resolution_error": route_error,
         "zero_write_on_failure": True,
         "historical_backfill_allowed": False,
+        "source_free_operation": source_free_operation,
+        "source_mutation_forbidden": source_free_operation,
     }
     authority["authority_hash"] = stable_sha256(authority)
     return authority
@@ -148186,6 +148264,13 @@ def _operator_supervised_direct_main_route_authority(
 
     route_token_ref = str(route_token_ref or "").strip()
     row_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
+    source_free_operation = bool(
+        _backlog_source_free_operation_authority(
+            conn,
+            project_id=project_id,
+            backlog_id=backlog_id,
+        ).get("accepted")
+    )
     try:
         route = observer_route_context.resolve_route_token_ref(
             conn,
@@ -148207,6 +148292,7 @@ def _operator_supervised_direct_main_route_authority(
         row_files=row_files,
         route=route,
         route_error=route_error,
+        source_free_operation=source_free_operation,
     )
 
 
@@ -149150,6 +149236,14 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             selector_authority=selector_authority,
         )
     target_files = sorted(_backlog_declared_direct_file_scope(conn, backlog_id))
+    source_free_authority = _backlog_source_free_operation_authority(
+        conn,
+        project_id=project_id,
+        backlog_id=backlog_id,
+    )
+    source_free_operation = bool(
+        source_free_authority.get("accepted") is True and not target_files
+    )
     persisted_ref = (
         str(strict_records[0].get("route_token_ref") or "").strip()
         if strict_records
@@ -149258,7 +149352,9 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "target_files": target_files,
         "owned_files": target_files,
         "allowed_actions": list(
-            _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
+            _OPERATOR_SOURCE_FREE_ACTIONS
+            if source_free_operation
+            else _OPERATOR_SUPERVISED_DIRECT_MAIN_FULL_ROUND_ACTIONS
         ),
         "evidence_refs": [
             f"backlog:{backlog_id}",
@@ -149274,6 +149370,11 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             ),
         ],
     }
+    if source_free_operation:
+        # This fact is projected from the durable row/CEX authority.  The dev
+        # issuer accepts only the byte-for-byte guide body, so a caller cannot
+        # turn an ordinary route into an empty-fence route by adding this flag.
+        route_issue_body["source_free_operation"] = True
     if route_ready:
         graph_guidance = _onboard_parentless_direct_main_graph_query_guidance(
             project_id=project_id,
@@ -149327,11 +149428,18 @@ def _onboard_operator_supervised_direct_main_runtime_response(
             "requires_role": "observer",
             "action_input": dict(route_issue_body),
             "copy_safe_body": dict(route_issue_body),
-            "action_input_ready": bool(target_files),
-            "action_input_missing_fields": [] if target_files else ["target_files"],
+            "action_input_ready": bool(target_files or source_free_operation),
+            "action_input_missing_fields": (
+                [] if target_files or source_free_operation else ["target_files"]
+            ),
             "source_of_authority": (
                 "operator_supervised_direct_main.v1."
-                f"{selected_revision}+backlog_file_fence"
+                f"{selected_revision}+"
+                + (
+                    "backlog_source_free_operation_authority"
+                    if source_free_operation
+                    else "backlog_file_fence"
+                )
             ),
         }
 
@@ -149463,6 +149571,7 @@ def _onboard_operator_supervised_direct_main_runtime_response(
         "source_backed_contract_selected": True,
         "onboard_service_proxy_selected": False,
         "target_files": target_files,
+        "source_free_operation_authority": dict(source_free_authority),
         "route_authority": dict(route_authority),
         "observer_route_context_issue": {
             "required": not route_ready,
@@ -149831,6 +149940,9 @@ def _handle_ac_dev_direct_route_context_issue(
                     project_root=Path(
                         str(world.get("target_project_root") or "")
                     ),
+                    source_free_operation=bool(
+                        expected_body.get("source_free_operation") is True
+                    ),
                 )
                 token = (
                     issued.get("route_token")
@@ -149853,6 +149965,9 @@ def _handle_ac_dev_direct_route_context_issue(
                         route_token_ref=route_token_ref,
                         row_files=list(expected_body.get("target_files") or []),
                         route=resolved_route,
+                        source_free_operation=bool(
+                            expected_body.get("source_free_operation") is True
+                        ),
                     )
                 )
                 if route_authority.get("accepted") is not True:
