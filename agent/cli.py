@@ -2637,11 +2637,13 @@ def _durable_dev_launch(
     os.close(log_fd)
     try:
         process = _posix_process_identity(child.pid)
-        observed_argv = shlex.split(process["argv"])
-        if (len(observed_argv) != len(argv)
-                or Path(observed_argv[0]).resolve() != Path(argv[0]).resolve()
-                or observed_argv[1:] != argv[1:]):
-            raise click.ClickException("AC dev durable child argv identity mismatch")
+        # macOS ps renders argv without recoverable quoting, so exact list
+        # equality is proven by the child-owned readiness projection below.
+        # The OS readback here binds start/cwd and the unguessable launch id.
+        if process["cwd"] != str(source_root):
+            raise click.ClickException("AC dev durable child process identity mismatch")
+        if launch_id not in process["argv"]:
+            raise click.ClickException("AC dev durable child process identity mismatch")
         raw = b""
         while b"\n" not in raw and len(raw) < 65536:
             chunk = parent_sock.recv(65536 - len(raw))
