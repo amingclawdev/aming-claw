@@ -145580,6 +145580,71 @@ def _backlog_source_free_operation_authority(
     return authority
 
 
+def _source_free_reconcile_unique_active_session(
+    conn,
+    *,
+    project_id: str,
+    session_id: str,
+    route_token_ref: str,
+    route_id: str,
+    route_context_hash: str,
+    backlog_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Return the body-bound session iff route provenance has cardinality one."""
+
+    matching_active_sessions: list[dict[str, Any]] = []
+    try:
+        session_rows = conn.execute(
+            "SELECT * FROM observer_sessions WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        session_rows = []
+    for session_row in session_rows:
+        if (
+            observer_session.computed_session_status(session_row)
+            != observer_session.SESSION_STATUS_ACTIVE
+        ):
+            continue
+        capabilities_value = _row_get(session_row, "capabilities_json", "{}")
+        try:
+            candidate_capabilities = json.loads(str(capabilities_value or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        candidate_provenance = (
+            candidate_capabilities.get("route_provenance")
+            if isinstance(candidate_capabilities, Mapping)
+            and isinstance(candidate_capabilities.get("route_provenance"), Mapping)
+            else {}
+        )
+        if all(
+            str(candidate_provenance.get(field) or "") == expected
+            for field, expected in (
+                ("route_token_ref", route_token_ref),
+                ("route_id", route_id),
+                ("route_context_hash", route_context_hash),
+                ("backlog_id", backlog_id),
+                ("task_id", task_id),
+                ("cex_id", task_id),
+            )
+        ):
+            matching_active_sessions.append(
+                {
+                    "session_id": str(
+                        _row_get(session_row, "session_id", "")
+                    ),
+                    "capabilities": candidate_capabilities,
+                }
+            )
+    if (
+        len(matching_active_sessions) != 1
+        or matching_active_sessions[0]["session_id"] != session_id
+    ):
+        return {}
+    return matching_active_sessions[0]
+
+
 def _completed_source_free_reconcile_authority(
     conn,
     *,
@@ -145658,6 +145723,24 @@ def _completed_source_free_reconcile_authority(
         )
     except observer_route_context.RouteTokenRefError:
         return {}
+    route_id = str(route.get("route_id") or "") if isinstance(route, Mapping) else ""
+    route_context_hash = (
+        str(route.get("route_context_hash") or "")
+        if isinstance(route, Mapping)
+        else ""
+    )
+    unique_session = _source_free_reconcile_unique_active_session(
+        conn,
+        project_id=project_id,
+        session_id=session_id,
+        route_token_ref=route_token_ref,
+        route_id=route_id,
+        route_context_hash=route_context_hash,
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    if not unique_session:
+        return {}
     session = observer_session.get_session(
         conn, project_id=project_id, session_id=session_id
     )
@@ -145680,10 +145763,9 @@ def _completed_source_free_reconcile_authority(
         and list(route.get("allowed_actions") or [])
         == list(_OPERATOR_SOURCE_FREE_ACTIONS)
         and str(provenance.get("route_token_ref") or "") == route_token_ref
-        and str(provenance.get("route_id") or "")
-        == str(route.get("route_id") or "")
+        and str(provenance.get("route_id") or "") == route_id
         and str(provenance.get("route_context_hash") or "")
-        == str(route.get("route_context_hash") or "")
+        == route_context_hash
         and str(provenance.get("backlog_id") or "") == backlog_id
         and str(provenance.get("task_id") or "") == task_id
         and str(provenance.get("cex_id") or "") == task_id

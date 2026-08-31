@@ -20830,6 +20830,141 @@ def test_current_full_source_free_category_precedes_admission_and_bypasses_direc
     assert [call["activate"] for call in calls] == [False]
 
 
+def _insert_source_free_route_provenance_session(
+    conn,
+    *,
+    session_id,
+    token_hash,
+    last_seen_at,
+    provenance,
+):
+    observer_session.ensure_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO observer_sessions (
+          session_id,project_id,observer_kind,session_label,pid,cwd,
+          capabilities_json,token_hash,status,registered_at,last_seen_at,
+          closed_at,revoked_at
+        ) VALUES (?,?, 'codex','source-free-cardinality',0,'',?,?,?, ?,?,'','')
+        """,
+        (
+            session_id,
+            PID,
+            json.dumps({"route_provenance": provenance}),
+            token_hash,
+            observer_session.SESSION_STATUS_ACTIVE,
+            "2026-08-31T00:00:00Z",
+            last_seen_at,
+        ),
+    )
+
+
+@pytest.mark.parametrize("reverse_registration", [False, True])
+def test_source_free_reconcile_rejects_multiple_exact_active_sessions_order_independent(
+    conn,
+    reverse_registration,
+):
+    route_ref = f"rtok-source-free-cardinality-{int(reverse_registration)}"
+    task_id = f"cex-source-free-cardinality-{int(reverse_registration)}"
+    backlog_id = f"AC-SOURCE-FREE-CARDINALITY-{int(reverse_registration)}"
+    provenance = {
+        "route_token_ref": route_ref,
+        "route_id": f"route-{route_ref}",
+        "route_context_hash": _fake_sha(f"{route_ref}:context"),
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "cex_id": task_id,
+    }
+    sessions = [
+        ("obs-source-free-cardinality-a", "token-cardinality-a", "2999-01-01T00:00:00Z"),
+        ("obs-source-free-cardinality-b", "token-cardinality-b", "2998-12-31T23:59:58Z"),
+    ]
+    if reverse_registration:
+        sessions.reverse()
+    for session_id, token_hash, last_seen_at in sessions:
+        _insert_source_free_route_provenance_session(
+            conn,
+            session_id=session_id,
+            token_hash=f"{token_hash}-{int(reverse_registration)}",
+            last_seen_at=last_seen_at,
+            provenance=provenance,
+        )
+    conn.commit()
+    total_changes_before = conn.total_changes
+    schema_before = server.stable_sha256(
+        [tuple(row) for row in conn.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall()]
+    )
+
+    for body_session_id in (
+        "obs-source-free-cardinality-a",
+        "obs-source-free-cardinality-b",
+    ):
+        assert server._source_free_reconcile_unique_active_session(
+            conn,
+            project_id=PID,
+            session_id=body_session_id,
+            route_token_ref=route_ref,
+            route_id=f"route-{route_ref}",
+            route_context_hash=_fake_sha(f"{route_ref}:context"),
+            backlog_id=backlog_id,
+            task_id=task_id,
+        ) == {}
+    assert conn.total_changes == total_changes_before
+    assert server.stable_sha256(
+        [tuple(row) for row in conn.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall()]
+    ) == schema_before
+
+
+def test_source_free_reconcile_accepts_only_body_bound_unique_active_session(conn):
+    route_ref = "rtok-source-free-unique-session"
+    task_id = "cex-source-free-unique-session"
+    backlog_id = "AC-SOURCE-FREE-UNIQUE-SESSION"
+    session_id = "obs-source-free-unique-session"
+    provenance = {
+        "route_token_ref": route_ref,
+        "route_id": f"route-{route_ref}",
+        "route_context_hash": _fake_sha(f"{route_ref}:context"),
+        "backlog_id": backlog_id,
+        "task_id": task_id,
+        "cex_id": task_id,
+    }
+    _insert_source_free_route_provenance_session(
+        conn,
+        session_id=session_id,
+        token_hash="token-source-free-unique-session",
+        last_seen_at="2999-01-01T00:00:00Z",
+        provenance=provenance,
+    )
+    conn.commit()
+
+    accepted = server._source_free_reconcile_unique_active_session(
+        conn,
+        project_id=PID,
+        session_id=session_id,
+        route_token_ref=route_ref,
+        route_id=f"route-{route_ref}",
+        route_context_hash=_fake_sha(f"{route_ref}:context"),
+        backlog_id=backlog_id,
+        task_id=task_id,
+    )
+    assert accepted["session_id"] == session_id
+    assert accepted["capabilities"]["route_provenance"] == provenance
+    assert server._source_free_reconcile_unique_active_session(
+        conn,
+        project_id=PID,
+        session_id="obs-foreign-body-session",
+        route_token_ref=route_ref,
+        route_id=f"route-{route_ref}",
+        route_context_hash=_fake_sha(f"{route_ref}:context"),
+        backlog_id=backlog_id,
+        task_id=task_id,
+    ) == {}
+
+
 def test_current_full_reconcile_custom_run_ref_uses_graph_status_active_authority(
     conn,
     monkeypatch,
