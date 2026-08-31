@@ -3090,8 +3090,23 @@ def commit_completed_bootstrap_child_custody(
             "SELECT key,value FROM schema_meta ORDER BY key"
         )}
         changed = {key for key in after_meta if before_meta.get(key) != after_meta.get(key)}
-        if changed != set(_COMPLETED_BOOTSTRAP_CUSTODY_KEYS):
+        if (not changed or not changed <= set(_COMPLETED_BOOTSTRAP_CUSTODY_KEYS)
+                or "governance_world_current_process_json" not in changed
+                or "governance_world_source_tip_revision" not in changed
+                or any(after_meta.get(key) != custody_updates[key]
+                       for key in _COMPLETED_BOOTSTRAP_CUSTODY_KEYS)):
             raise ValueError("AC dev completed bootstrap custody wrote outside its authority")
+        try:
+            tip = json.loads(after_meta["governance_world_source_tip_json"])
+            revision_before = int(before_meta["governance_world_source_tip_revision"])
+            revision_after = int(after_meta["governance_world_source_tip_revision"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("AC dev completed bootstrap custody source tip is malformed") from exc
+        if (not isinstance(tip, Mapping)
+                or revision_after != revision_before + 1
+                or after_meta["governance_world_source_tip_sha256"]
+                != _world_source_tip_hash(dict(tip))):
+            raise ValueError("AC dev completed bootstrap custody source tip mismatch")
         if (backlog_read_schema_managed_inventory(conn) != dict(expected_managed_inventory)
                 or backlog_read_schema_protected_inventory(conn) != dict(expected_protected_inventory)
                 or _sqlite_logical_projection(
@@ -3116,7 +3131,8 @@ def commit_completed_bootstrap_child_custody(
             "database_sha256_after": _durable_database_sha256(database),
             "schema_meta_before": before_meta, "schema_meta_after": after_meta,
             "custody_delta": {key: {"before": before_meta[key], "after": after_meta[key]}
-                              for key in _COMPLETED_BOOTSTRAP_CUSTODY_KEYS}}
+                              for key in _COMPLETED_BOOTSTRAP_CUSTODY_KEYS},
+            "changed_custody_keys": sorted(changed)}
 
 
 def bootstrap_dev_governance_store(
