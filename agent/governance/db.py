@@ -1675,8 +1675,44 @@ def write_dev_launch_receipt(
 
 def validate_dev_launch_receipt(storage_root: Path | str, *, source_sha256: str) -> dict[str, object]:
     """Fail closed before a dev server opens SQLite or takes the writer lease."""
-    root = _dev_storage_root(create=False)
     supplied = Path(storage_root).expanduser().absolute()
+    try:
+        root = _dev_storage_root(create=False)
+    except ValueError:
+        # An isolated durable child is released only by the immutable
+        # completed receipt written after its unbound custody transaction.
+        root = _absolute_non_symlink_root(supplied, create=False)
+        runtime = root / "runtime" / "durable-launch"
+        candidates = list(runtime.glob("launch.*.json"))
+        if len(candidates) != 1:
+            raise ValueError("AC dev isolated durable launch receipt is missing")
+        candidate = candidates[0]
+        match = re.fullmatch(r"launch\.([0-9a-f]{64})\.json", candidate.name)
+        raw = candidate.read_bytes()
+        try:
+            durable = json.loads(raw)
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError("AC dev isolated durable launch receipt is unreadable") from exc
+        database = root / AC_DATABASE_DEV_RELATIVE_PATH
+        database_stat = database.stat(follow_symlinks=False)
+        if (candidate.is_symlink() or match is None
+                or hashlib.sha256(raw).hexdigest() != match.group(1)
+                or not isinstance(durable, Mapping)
+                or durable.get("schema_version") != "ac_dev_durable_launch.v1"
+                or durable.get("stage") != "completed"
+                or durable.get("pid") != os.getpid()
+                or durable.get("dev_storage_root") != str(root)
+                or durable.get("database_path") != str(database)
+                or durable.get("project_id") != AC_PROJECT_ID
+                or durable.get("port") != 40008
+                or durable.get("server_sha256") != source_sha256
+                or dict(durable.get("database_identity") or {}).get("device") != int(database_stat.st_dev)
+                or dict(durable.get("database_identity") or {}).get("inode") != int(database_stat.st_ino)
+                or durable.get("policy") != {"runtime_plane": "dev", "migration": "verify-only",
+                    "stable_deployment": "deny", "graph_activation": "deny",
+                    "background_workers": "deny"}):
+            raise ValueError("AC dev isolated durable launch receipt mismatch")
+        return dict(durable)
     if supplied != root:
         raise ValueError("AC dev launch receipt storage root mismatch")
     path = root / AC_DEV_LAUNCH_RECEIPT_NAME
